@@ -519,6 +519,18 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: companies from a trade registry ──
+    """
+    -- A registry company is identified by its tax code (CUI in Romania),
+    -- which the tax authority and the registry share: the key that later
+    -- joins a company found on a map to the same company in the registry.
+    -- `address` is the registered office (street and number), as filed.
+    ALTER TABLE companies ADD COLUMN cui TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN address TEXT DEFAULT '';
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_cui
+        ON companies(cui) WHERE cui != '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -538,6 +550,10 @@ _LAST_PROFILED = (
 )
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
+_COMPANY_FILL_COLUMNS = frozenset({
+    "name", "domain", "website", "industry", "location", "phone",
+    "cui", "address",
+})
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
     "sequence_json", "prospect_ids_json", "status",
@@ -613,14 +629,15 @@ class StateManager:
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
                     company_size, location, phone, source, source_url,
-                    external_id, notes, tech_stack_json, signals_json,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    external_id, cui, address, notes, tech_stack_json,
+                    signals_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
                     company.location, company.phone, company.source,
-                    company.source_url, company.external_id, company.notes,
+                    company.source_url, company.external_id, company.cui,
+                    company.address, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
                     company.updated_at.isoformat(),
@@ -629,7 +646,8 @@ class StateManager:
             await db.commit()
             if cursor.rowcount == 0:
                 # Uniqueness conflict: hand back the existing record's id.
-                for column, value in (("domain", company.domain),
+                for column, value in (("cui", company.cui),
+                                      ("domain", company.domain),
                                       ("external_id", company.external_id)):
                     if not value:
                         continue
@@ -726,6 +744,66 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
+
+    async def get_company_by_cui(self, cui: str) -> Company | None:
+        """Look a company up by its registry tax code (CUI)."""
+        cui = (cui or "").strip()
+        if not cui:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM companies WHERE cui = ?", (cui,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._company_from_row(row) if row else None
+
+    async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
+        """Set the given fields where the company has none yet, and always
+        set ``address``.
+
+        For a second source describing a company already on file: what the
+        first source said is kept, the gaps are filled. ``address`` is the
+        exception, overwritten whenever a non-empty one is given: it is the
+        registered office, the registry is the authority on it, and a
+        registry re-import is how a moved office reaches the record. Returns
+        the columns changed.
+        """
+        changed = []
+        async with self._connect() as db:
+            for column, value in fields.items():
+                if column not in _COMPANY_FILL_COLUMNS:
+                    raise ValueError(f"not a fillable company column: {column}")
+                if not value:
+                    continue
+                if column == "domain":
+                    value = _norm(value)
+                    # Another company already owns it: two records for one
+                    # site is a merge for a person to make, not this call.
+                    async with db.execute(
+                        "SELECT 1 FROM companies WHERE domain = ? AND id != ?",
+                        (value, company_id),
+                    ) as cur:
+                        if await cur.fetchone():
+                            continue
+                if column == "cui":
+                    async with db.execute(
+                        "SELECT 1 FROM companies WHERE cui = ? AND id != ?",
+                        (value, company_id),
+                    ) as cur:
+                        if await cur.fetchone():
+                            continue
+                only_empty = "" if column == "address" else \
+                    f" AND COALESCE(TRIM({column}), '') = ''"
+                cursor = await db.execute(
+                    f"UPDATE companies SET {column} = ?, updated_at = CURRENT_TIMESTAMP "
+                    f"WHERE id = ? AND COALESCE({column}, '') != ?{only_empty}",
+                    (value, company_id, value),
+                )
+                if cursor.rowcount:
+                    changed.append(column)
+            await db.commit()
+        return changed
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
         async with self._connect() as db:

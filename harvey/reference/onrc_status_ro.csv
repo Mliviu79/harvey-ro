@@ -1,0 +1,202 @@
+# Company status codes (stări firmă), as published in the ONRC open data
+# nomenclature n_stare (N_STARE_FIRMA.CSV) on data.gov.ro. Source: ONRC
+# open data, CC-BY 4.0. The status file of each 'firme' dataset
+# (OD_STARE_FIRMA.CSV) carries these codes; 1048 is "funcțiune" (operating).
+code,name_ro
+1035,transmitere dosar în județul în care este înmatriculată firma în vederea efectuării mențiunii de schimbare de sediu
+1036,trimitere în judecată
+1037,societatea mamă sub incidența Legii nr. 85/2006 privind procedura insolvenței
+1038,societatea mamă sub incidența Legii nr. 85/2014 privind procedura insolvenței
+1048,funcțiune
+1049,dizolvare
+1050,reorganizare - fuziune prin absorbție
+1051,reorganizare - fuziune prin contopire
+1052,lichidare
+1053,schimbare sediu în alt județ
+1054,reorganizare - divizare partială
+1055,reorganizare - divizare totală
+1056,schimbare formă juridică
+1057,reorganizare judiciară
+1065,reorganizare RA în S.C.
+1066,reorganizare subunitate a RA în S.C.
+1067,urmărire penală
+1068,reorganizare sucursală in S.C.
+1069,condamnare penală
+1070,faliment
+1071,reorganizare în cooperative de credit
+1072,majorare capital prin subscripție publică
+1073,insolvabilă (art.117 din Legea nr. 64/1995)
+1074,întrerupere temporară de activitate
+1075,înmatriculare respinsă
+1076,dizolvare - capital sub limita impusă de lege
+1077,rezervare pentru schimbare nume firmă
+1078,"declarare nulitate (art. 56, 58 din Legea nr. 31/1990)"
+1079,rezervare din oficiu
+1080,prelungire rezervare
+1081,în curs de înmatriculare
+1082,rezervare
+1083,este sub incidența Legii nr. 85/2006
+1084,radiată
+1085,valabilitate sediu expirată
+1086,înmatriculare perimată
+1087,"capital neechilibrat (prin excludere asociat, anulare hotărâre AGA, etc.)"
+1088,constituire prin subscripție publică
+1089,retragere licență de export pe credit
+1090,reorganizare - alte moduri
+1091,suspendare provizorie a executării sentinței
+1093,suspendarea executării sentinței
+1094,dizolvare urmare a expirării duratei de funcționare
+1097,transferat la ORC Ilfov
+1098,dizolvare de drept nemajorare capital cf. Legii nr. 314/2001
+1099,renunțare la judecată
+1100,dizolvare de drept asociat unic cf. Legii nr. 314/2001
+1101,denumire radiată ca urmare a sch denumirii
+1102,rezerv pt sch den pt sch sediului în alt jud
+1103,înreg. în vederea sch. sediului din alt județ
+1104,reorganizare SA în Institut Național
+1105,insolvabilă (art.131 din O.G. nr. 61/2002)
+1106,deschidere procedură cf.Legii nr. 64/1995 republicată
+1107,insolvență
+1108,închidere procedură cf. art.117 din Legea nr. 64/1995
+1109,"dizolvare de drept, cf art.30 din Legea nr. 359/2004"
+1110,intră sub incidența Legii nr. 359/2004
+1111,dizolvare de drept cu desființarea încheierii judecătorului delegat
+1112,"în funcțiune, sub incidența Legea nr. 359/2004 de la data expirării termenului acordat de instanță"
+1113,"dizolvare judiciară, cf art.237 din Legea nr. 31/1990"
+1114,suspendare procedură faliment
+1115,firma mamă în dizolvare
+1116,"închiderea procedurii reorganizării judiciare și a falimentului, cf art.118 din Legea nr. 64/1995"
+1117,înmatriculare suspendată
+1118,"închiderea procedurii reorganizării judiciare și a falimentului, cf art.132 din Legea nr. 64/1995"
+1119,suspendare procedură de insolvență
+1120,dizolvare conform art.235 din Legea nr. 31/1990
+1121,insolvență străină
+1122,fuziune efectivă la 01.06.2007
+1123,suspendare provizorie a procedurii de insolvență
+1125,reorganizare prin fuziune transfrontalieră
+1126,este sub incidența OUG nr. 91/2013
+1127,societatea mamă sub incidența OUG nr. 91/2013
+1128,"suspendare dizolvare cf. Legii 286/2009, Legii 135/2010"
+1129,"suspendare lichidare cf. Legii 286/2009, Legii 135/2010"
+1130,"suspendare fuziune cf. Legii 286/2009, Legii 135/2010"
+1131,"suspendare divizare cf. Legii 286/2009, Legii 135/2010"
+1132,"interzicerea de a desfășura anumite activități cf. Legii 286/2009, Legii 135/2010"
+1133,"dizolvare cf. Legii 286/2009, Legii 135/2010"
+1134,"suspendare activități cf. Legii 286/2009, Legii 135/2010"
+1135,"suspendare insolvență cf. Legii 286/2009, Legii 135/2010"
+1136,"suspendare faliment cf. Legii 286/2009, Legii 135/2010"
+1137,deschidere procedura de redresare financiara prin administrare speciala cf.Legii nr.503/2004
+1138,deschidere procedura de redresare financiara pe baza de plan de redresare financiara cf.Legii nr.503/2004
+1139,este sub incidența Legii nr. 85/2014
+1140,"interdicția inițierii procedurii de dizolvare sau lichidare cf. Legii 286/2009, Legii 135/2010"
+1141,"interdicția inițierii fuziunii cf. Legii 286/2009, Legii 135/2010"
+1142,"interdicția inițierii divizării cf. Legii 286/2009, Legii 135/2010"
+1143,"interdicția inițierii reducerii de capital social cf. Legii 286/2009, Legii 135/2010"
+1144,închiderea procedurii de redresare financiară și constatarea stării de insolvență
+1145,"dizolvare judiciară, cf. art. 227 din Legea 31/1990"
+1146,societatea mamă sub incidența Legii nr. 64/1995 privind procedura insolvenței
+1147,suspendare provizorie a executării sentinței având ca obiect intrarea în insolvență
+1148,suspendare provizorie a executării sentinței de intrare în faliment
+1149,reorganizare prin divizare transfrontalieră
+1150,reorganizare prin transformare transfrontalieră
+1151,suspendare/interzicere activitate cf. OG nr.99/2000
+1152,suspendare/interzicere activitate în baza Legii nr. 61/1991
+1153,Suspendare activitate conform Legii nr. 349/2002
+2035,"este înregistrată o hotărâre judecătorească de înlocuire lichidator definitivă, fără a fi irevocabilă"
+2037,cerere de radiere cf. art. 260 din Legea 31/1990 trimisă la tribunal spre soluționare
+2038,bilanțul anual nedepus la registrul comerțului pe anul 2009
+2039,"situație financiară anuală nedepusă pe anul 2015 la unitatea teritorială MFP, conform art.237 alin.1 lit.(f)"
+2040,"situație financiară anuală consolidată nedepusă pe anul 2015 la unitatea teritorială MFP, conform art.237 alin.1 lit.(f)"
+2041,"declarație că nu a desfășurat activitate, nedepusă pe anul 2015 la unitatea teritorială MFP, conform art.237 alin.1 lit.(g)"
+2042,"societatea nu a depus raportările contabile pe anul 2015 la unitatea teritorială MFP, conform art.237 alin.1 lit.(f)"
+2043,"societatea nu mai are organe statutare sau acestea nu se mai pot întruni, conform art. 237 alin.1 lit.(a)"
+2044,"acționarii/asociații au dispărut ori nu au domiciliul cunoscut ori reședința cunoscută, conform art. 237 alin.1 lit.(b)"
+2045,"nu mai sunt îndeplinite condițiile de validitate ale sediului social, conform art. 237 alin.1 lit.(c)"
+2046,"a încetat activitatea societății sau aceasta nu a fost reluată după perioada de suspendare,conform art.237 alin.1 lit.(d)"
+2047,cerere de radiere pentru firmele aflate sub incidența Legii 314/2001 trimisă la tribunal spre soluționare
+2048,"societatea nu și-a completat capitalul social, conform art.237 alin.1 lit.(e)"
+2049,înregistrare depunere cerere de fuziune și transmitere la tribunal
+2050,înregistrare depunere cerere de divizare și transmitere la tribunal
+2051,"este înregistrată o hotărâre judecătorească de fuziune definitivă, fără a fi irevocabilă"
+2052,"este înregistrată o hotărâre judecătorească de divizare definitivă, fără a fi irevocabilă"
+2053,cerere de radiere cf. art.237 din Legea nr. 31/1990 trimisă la tribunal spre soluționare
+2054,dosar trimis la tribunal pentru constatare perimare
+2055,cerere de radiere cf. Legii nr. 359/2004 trimisă la tribunal spre soluționare
+2056,dosar trimis la tribunal spre soluționare
+2057,înregistrare depunere cerere de înlocuire lichidator și transmitere la tribunal
+2060,este menționată o hotărâre de dizolvare judiciară cf. art.227 din Legea nr. 31/1990
+2062,este menționată o hotărâre de radiere cf. art.237 din Legea nr. 31/1990
+2065,mandat administratori expirat
+2066,denumire indisponibilă cf. art.39(alin.3) din Legea nr. 26/1990
+2067,capital neechilibrat
+2068,certificat de înmatriculare nepreschimbat în termenul legal
+2069,sediu expirat
+2070,mandat cenzori expirat
+2071,sediu radiat
+2072,sechestru părți sociale/acțiuni deținute de unul sau mai mulți asoc./acționari
+2074,bilanțul anual nedepus la registrul comerțului pe anul 2004
+2075,autorizație nepreschimbată în termenul legal
+2076,capital subscris sub limita legală
+2077,este menționată o hotărâre a adunării generale privind dizolvarea
+2078,este menționată o hotărâre de dizolvare judiciară cf. art.237 din Legea nr. 31/1990
+2079,valabilitate mandat administratori nespecificată
+2080,certificat de înmatriculare preschimbat
+2081,este menționat un recurs/sunt menționate recursuri
+2082,rezervare expirată
+2083,nu funcționează la sediul declarat
+2084,nu a fost numit administrator/consiliu de administrație
+2085,valabilitate mandat cenzori nespecificată
+2086,durata societății expirată
+2090,lichidator/lichidator judiciar numit fără revocarea administratorilor
+2091,cerere de dizolvare cf. art.237 din Legea nr. 31/1990 trimisă la tribunal spre soluționare
+2093,cerere de dizolvare cf. art.227 alin. (1) din Legea nr. 31/1990 trimisă la tribunal spre soluționare
+2097,capital neechilibrat ca urmare a denominării cf. Legii nr. 101/2005
+2098,s-a depus/transmis notificare pe Legea nr. 64/1995
+2099,înregistrare instituire măsuri asiguratorii
+2100,sechestru bunuri mobile și/sau imobile cu excepția părților sociale/acțiuni
+2101,bilanțul anual nedepus la registrul comerțului pe anul 2003
+2102,bilanțul anual nedepus la registrul comerțului pe anul 2002
+2103,bilanțul anual nedepus la registrul comerțului pe anul 2005
+2104,este menționată o opoziție/sunt menționate opoziții
+2105,suspendare executare procedură insolvență
+2106,suspendare executare procedură reorganizare
+2107,suspendare executare procedură faliment
+2108,suspendare executare procedură lichidare
+2109,suspendare executare procedură dizolvare
+2110,bilanțul anual nedepus la registrul comerțului pe anul 2006
+2112,bilanțul anual nedepus la registrul comerțului pe anul 2007
+2114,bilanțul anual nedepus la registrul comerțului pe anul 2008
+2115,înregistrare depunere cerere de numire lichidator și transmitere la tribunal
+2118,înregistrare depunere cerere de intervenție și transmitere dosar integral la tribunal
+2119,înregistrare depunere plângere și transmitere dosar integral la tribunal
+2120,perioadă de suspendare activitate expirată
+2121,este înregistrată o hotărâre judecătorească definitivă în soluționarea cererii de numire lichidator
+2123,neexercitarea dreptului de opțiune în una din formele prevăzute de OUG 44/2008 (sancționată cu radierea din registrul comerțului)
+2125,este menționată o hotărâre de radiere cf. Legii nr. 359/2004
+2126,Hotărâre judecătorească de atragere a răspunderii patrimoniale
+2127,"raspundere penala cf. Legii 286/2009, Legii 135/2010"
+2128,"pierdere, la data de 31.12.2014, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2129,Instituire ipotecă mobiliară asupra părților sociale/acțiunilor
+2130,Sechestru instituit asupra tuturor bunurilor mobile si imobile
+2131,Ridicare sechestru instituit asupra tuturor bunurilor mobile si imobile
+2132,Instituire confiscare specială conform Cod Penal
+2133,Ridicare confiscare specială conform Cod Penal
+2134,prelungire perioada de lichidare
+2135,este menționat un apel
+2136,"pierdere, la data de 31.12.2015, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2137,Instituire ipotecă
+2138,Ridicare ipoteca asupra fondului de comerț
+2139,este menționată o decizie a asociatului privind dizolvarea
+2140,"pierdere, la data de 31.12.2016, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2141,"pierdere, la data de 31.12.2017, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2142,"pierdere, la data de 31.12.2018, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2143,"pierdere, la data de 31.12.2019, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2144,"pierdere, la data de 31.12.2020, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2145,"pierdere, la data de 31.12.2021, a calității de microîntreprindere aparținând întreprinzătorului debutant"
+2146,sub incidența art.237 indice 2 alin.(1) din Legea societăților nr. 31/1990
+2147,sub incidența art.260 alin.(7) din Legea societăților nr. 31/1990
+2148,act de sediu desființat
+2149,societate în curs de transfer de sediu în alt stat
+2150,pierdere calitate de microîntreprindere aparținând întreprinzătorului debutant
+2151,sancțiuni internaționale
+2152,înscrisuri desființate

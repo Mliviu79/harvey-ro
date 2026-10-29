@@ -136,6 +136,22 @@ SIGNAL_CATALOG: list[dict] = [
 
     # ── Profile: what they are (free — HTML Harvey already fetches) ──
     {
+        "code": "ACTIVITY_CODE",
+        "label": "Registered activity (CAEN)",
+        "description": (
+            "An activity the company is authorised for in Romania's trade "
+            "registry (ONRC), as a 4-digit CAEN class such as 8623 for dental "
+            "practice: one row per class that matched your search words. "
+            "What the business is legally set up to do, as filed, not what "
+            "its website says. The dataset and its date are kept with it."
+        ),
+        "category": "profile",
+        "value_type": "text",
+        "collector": "registry",
+        "cost_note": "free (ONRC open data, data.gov.ro)",
+        "confidence_floor": 0.0,
+    },
+    {
         "code": "INCUMBENT_AGENCY",
         "label": "Has a marketing/web agency",
         "description": (
@@ -302,7 +318,8 @@ SIGNAL_CATALOG: list[dict] = [
     {
         "code": "CONTACT_FOUND",
         "label": "Named contact found",
-        "description": "A named person scraped from the team/about page, with their title.",
+        "description": ("A named person scraped from the team/about page, with their title, "
+                        "or an administrator named in Romania's trade registry (ONRC)."),
         "category": "people",
         "value_type": "text",
         "collector": "people",
@@ -312,7 +329,8 @@ SIGNAL_CATALOG: list[dict] = [
     {
         "code": "DECISION_MAKER_TITLE",
         "label": "Decision-maker title",
-        "description": "Title matches an owner/decision-maker pattern (Owner, President, Practice Manager, Marketing Director).",
+        "description": ("Title matches an owner/decision-maker pattern (Owner, President, Practice "
+                        "Manager, Marketing Director), or the company's administrator in the registry."),
         "category": "people",
         "value_type": "text",
         "collector": "people",

@@ -2197,6 +2197,25 @@ async def get_today():
         return {"items": [], "stats": stats, "error": str(e)}
 
 
+# ── CAEN: Romanian activity codes, found by words ──
+
+
+@app.get("/api/caen/search")
+async def search_caen(q: str = "", limit: int = 50):
+    """CAEN classes for some words (offline, no Claude), plus the codes a
+    registry filter should use for them."""
+    from harvey.caen import codes_for, revision_label, search
+
+    q = q[:200]
+    matches = search(q, limit=max(1, min(limit, 200)))
+    return {
+        "query": q,
+        "matches": [{**m._asdict(), "revision": revision_label(m.version)}
+                    for m in matches],
+        "codes": sorted(codes_for(q)),
+    }
+
+
 # ── Signals: Harvey proposes, the user confirms ──
 #
 # Nothing is collected until a human has said yes to it. This is the gate the

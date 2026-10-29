@@ -26,6 +26,10 @@ class Company(BaseModel):
     # dedup key for businesses that have no website — which are precisely the
     # best prospects for anyone selling one.
     external_id: str = ""
+    # Registry tax code (Romania's CUI): the identity a registry, the tax
+    # authority and a map listing can all be joined on.
+    cui: str = ""
+    address: str = ""         # registered office, street and number
     notes: str = ""
     # Buying signals: detected tools on their site, and timely triggers
     # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]

@@ -609,6 +609,118 @@ def cmd_contacts(args):
     asyncio.run(_contacts())
 
 
+def cmd_caen(args):
+    """Romanian activity (CAEN) classes for some words. Offline, no Claude."""
+    from harvey.caen import revision_label, search
+
+    words = " ".join(args.words)
+    matches = search(words, limit=args.limit)
+    if not matches:
+        print(f"\n  No CAEN class matches \"{words}\". Try another word, in "
+              "English or Romanian (e.g. dentist, farmacie, laborator).\n")
+        return
+    print()
+    for m in matches:
+        name = f"{m.name_ro} ({m.name_en})" if m.name_en else m.name_ro
+        print(f"  {m.code}  {revision_label(m.version):<5}  {name}")
+        print(f"               {m.why}")
+    print()
+
+
+def cmd_import_onrc(args):
+    """Companies (and their administrators) from Romania's trade registry.
+
+    Free open data, but big: the first run downloads ~1.5 GB once per
+    dataset into data/onrc/<date>/, and every run streams through it.
+    """
+    from harvey.collectors import onrc
+    from harvey.config import live_do_not_contact, load_config
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    async def _import():
+        import httpx
+
+        try:
+            names = onrc.counties(args.county)
+        except ValueError as e:
+            print(f"\n  {e} (Brașov, Brasov, BV; Bucharest is B).\n")
+            raise SystemExit(2)
+        county = ", ".join(names) if names else "all of Romania"
+        classes = onrc.parse_classes(args.activity or [], args.codes)
+        if not classes:
+            print("\n  No CAEN class matches that activity. Try harvey caen <words>, "
+                  "or give --codes 8623.\n")
+            raise SystemExit(2)
+
+        state = StateManager()
+        await state.init_db()
+        from harvey.signals import seed_signal_catalog
+        await seed_signal_catalog(state)
+        confirmed = await state.confirmed_signal_codes()
+        roles = [r for r in onrc.FILES if r != "people"
+                 or {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed]
+
+        timeout = httpx.Timeout(60.0, read=300.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            dataset = await onrc.latest_dataset(client)
+            print(f"\n  ONRC open data: {dataset.name} (registry as of {dataset.date})")
+
+            def progress(role, filename, size):
+                mb = f"{size / 1e6:.0f} MB" if size else "size unknown"
+                print(f"    downloading {filename} ({mb}), once per dataset...")
+
+            data_dir = Path(args.data_dir or PROJECT_ROOT / "data" / "onrc")
+            files = await onrc.fetch_files(client, dataset, data_dir,
+                                           roles=roles, progress=progress)
+
+        where = f"{args.locality}, {county}" if args.locality else county
+        print(f"  Looking for {', '.join(onrc.class_labels(classes))} in {where}"
+              f"{'' if args.include_inactive else ' (operating companies only)'}...\n")
+        report = await onrc.import_registry(
+            state, files, dataset, county=args.county, classes=classes,
+            locality=args.locality, active_only=not args.include_inactive,
+            dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()))
+
+        print(f"  {report.authorised} registrations authorised for "
+              f"{', '.join(report.classes)}")
+        if not args.include_inactive:
+            print(f"  {report.active} of them operating")
+        print(f"  {report.in_area} in {where}")
+        if report.catch_all_only:
+            print(f"    {report.catch_all_only} of them only on the old catch-all code "
+                  "8690 Rev.2, so may be other health activities")
+        if report.excluded:
+            print(f"  {report.excluded} skipped — on your do-not-contact list")
+        verb = "would be" if report.dry_run else "are"
+        print(f"  {report.new_companies} {verb} new, {report.known_companies} already on file"
+              + ("" if report.dry_run else f" ({report.updated_companies} filled in)"))
+        if "people" in roles:
+            print(f"  {report.administrators} administrators named")
+        if not report.dry_run:
+            print(f"  {report.observations} observations recorded")
+        for code in report.unconfirmed:
+            print(f"    {code} not confirmed, so not recorded "
+                  f"(harvey signals --confirm {code})")
+        for err in report.errors[:5]:
+            print(f"    ! {err}")
+        if not report.dry_run and not report.errors:
+            deleted = onrc.prune_downloads(data_dir, dataset, keep_people=args.keep_download)
+            for path in deleted:
+                print(f"  Deleted {path.parent.name}/{path.name}"
+                      + (" (birth data; --keep-download keeps it)"
+                         if path.name == onrc.FILES["people"] else " (older dataset)"))
+        print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
+        if report.dry_run:
+            print("  Dry run: nothing was saved. Re-run without --dry-run to import.\n")
+        elif report.errors:
+            raise SystemExit(1)
+        else:
+            print("  Next: harvey contacts (reads the sites of those with one)\n")
+
+    asyncio.run(_import())
+
+
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
@@ -1149,6 +1261,47 @@ def main():
     sub.add_argument("--limit", type=int, default=200,
                      help="Max companies to check, in batches of 10 (default: 200)")
     sub.set_defaults(func=cmd_contacts)
+
+    sub = subparsers.add_parser(
+        "caen", help="Find Romanian activity (CAEN) codes by words, e.g. 'harvey caen dentist'")
+    sub.add_argument("words", nargs="+",
+                     help="What the business does, in English or Romanian")
+    sub.add_argument("--limit", type=int, default=30,
+                     help="Max classes to show (default: 30)")
+    sub.set_defaults(func=cmd_caen)
+
+    sub = subparsers.add_parser(
+        "import-onrc",
+        help="Import Romanian companies by activity and county from the trade "
+             "registry's open data (free; ~1.5 GB download once per dataset)",
+        description="Finds operating companies in a county authorised for an "
+                    "activity (CAEN class), from ONRC's open data on data.gov.ro, "
+                    "with their administrators when CONTACT_FOUND is confirmed. "
+                    "A company already on file keeps what it has, with its gaps "
+                    "filled, except the registered address, which the registry's "
+                    "replaces. No Claude calls, and nothing is sent.")
+    sub.add_argument("activity", nargs="*",
+                     help="What the business does, in English or Romanian, one per "
+                          "argument (dentist farmacie); quote a phrase: \"medic de familie\"")
+    sub.add_argument("--county", default="",
+                     help="County names or codes, comma-separated: Brașov, Brasov or BV "
+                          "(Bucharest is B). Omit for the whole country")
+    sub.add_argument("--locality", default="",
+                     help="Only these towns or villages, comma-separated "
+                          "(Brașov, Săcele); works with or without --county")
+    sub.add_argument("--codes", default="",
+                     help="CAEN codes instead of (or as well as) words, e.g. 8623,8622")
+    sub.add_argument("--include-inactive", action="store_true",
+                     help="Also companies that aren't operating (struck off, insolvent...)")
+    sub.add_argument("--dry-run", action="store_true",
+                     help="Count what would be imported (the dataset is still "
+                          "downloaded); save nothing")
+    sub.add_argument("--data-dir", default="",
+                     help="Where the dataset files are cached (default: data/onrc)")
+    sub.add_argument("--keep-download", action="store_true",
+                     help="Keep the representatives file after the import (it holds "
+                          "every representative's birth data, so it is deleted by default)")
+    sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")
