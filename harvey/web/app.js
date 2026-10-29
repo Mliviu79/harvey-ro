@@ -286,7 +286,7 @@ function emptyState(glyph, title, copy, boxed, action) {
 let _lastFail = null;
 
 function offlineState() {
-  const server = _lastFail && _lastFail !== 'network';
+  const server = failedOnServer();
   return emptyState(icon('alert'),
     escHtml(t(server ? 'offline.server_title' : 'offline.title')),
     server ? escHtml(t('offline.server_copy', {status: _lastFail})) : t('offline.copy'), true,
@@ -294,9 +294,23 @@ function offlineState() {
       icon('refresh') + escHtml(t('offline.retry')) + '</button>');
 }
 
+// True when the last failed read got an HTTP answer (the server is up but
+// erred), false when nothing answered at all.
+function failedOnServer() {
+  return !!_lastFail && _lastFail !== 'network';
+}
+
+// A page whose data couldn't be loaded hides the parts that only make sense
+// with that data (forms, builders: marked .needs-data), so nothing invites
+// an edit or a spend against a blank page.
+function markLoadFailed(sectionId, failed) {
+  const sec = document.getElementById(sectionId);
+  if (sec) sec.classList.toggle('load-failed', !!failed);
+}
+
 // The one-line version, for a small card that has nothing to show.
 function offlineLine(cls) {
-  const server = _lastFail && _lastFail !== 'network';
+  const server = failedOnServer();
   return '<p class="' + (cls || 'muted small') + '">' +
     escHtml(t(server ? 'offline.server_short' : 'offline.short')) + '</p>';
 }
@@ -561,7 +575,11 @@ async function loadOverview() {
   if (nav) { nav.textContent = ov.companies ? fmtN(ov.companies) : ''; nav.className = 'nav-count soft' + (ov.companies ? ' on' : ''); }
 
   const total = ov.companies || 0;
-  const pct = n => total ? Math.round(100 * n / total) : 0;
+  // A share above zero never reads as 0% or an empty bar: 10 of 2,421 is
+  // "<1%" with a sliver of bar.
+  const exact = n => total ? 100 * n / total : 0;
+  const pct = n => n > 0 && exact(n) < 0.5 ? '<1' : Math.round(exact(n));
+  const bar = n => n > 0 ? Math.max(exact(n), 1.5) : 0;
   const tile = (label, value, note, share, ico) =>
     '<div class="stat">' +
       '<div class="stat-label">' + icon(ico) + escHtml(label) + '</div>' +
@@ -571,8 +589,8 @@ async function loadOverview() {
     '</div>';
   statsEl.innerHTML = '<div class="stat-strip">' +
     tile(t('ov.companies'), total, t('ov.companies_note', {n: ov.with_activity || 0}), null, 'companies') +
-    tile(t('ov.with_phone'), ov.with_phone || 0, t('ov.share', {p: pct(ov.with_phone || 0)}), pct(ov.with_phone || 0), 'phone') +
-    tile(t('ov.with_email'), ov.with_email || 0, t('ov.share', {p: pct(ov.with_email || 0)}), pct(ov.with_email || 0), 'mail') +
+    tile(t('ov.with_phone'), ov.with_phone || 0, t('ov.share', {p: pct(ov.with_phone || 0)}), bar(ov.with_phone || 0), 'phone') +
+    tile(t('ov.with_email'), ov.with_email || 0, t('ov.share', {p: pct(ov.with_email || 0)}), bar(ov.with_email || 0), 'mail') +
     tile(t('ov.contacts'), ov.contacts || 0, t('ov.contacts_note'), null, 'contacts') +
     tile(t('ov.people'), ov.people || 0, t('ov.people_note'), null, 'layers') +
   '</div>';
@@ -611,16 +629,18 @@ function renderRunsTable(el, runs, max) {
     el.innerHTML = '<p class="pad muted">' + escHtml(t('runs.none')) + '</p>';
     return;
   }
-  el.innerHTML = '<table class="nowrap compact"><thead><tr><th>' + escHtml(t('runs.what')) + '</th><th>' +
+  // On a phone each run is a small card (CSS: table.runs-table), labelled
+  // from data-label, so no column hides off-screen.
+  el.innerHTML = '<table class="nowrap compact runs-table"><thead><tr><th>' + escHtml(t('runs.what')) + '</th><th>' +
     escHtml(t('runs.status')) + '</th><th class="num">' + escHtml(t('runs.records')) + '</th><th class="num">' +
     escHtml(t('runs.cost')) + '</th><th>' + escHtml(t('runs.when')) + '</th></tr></thead><tbody>' +
     runs.slice(0, max || 25).map(r =>
-      '<tr><td><span class="cell-main">' + escHtml(runName(r)) + '</span>' +
+      '<tr><td class="run-what"><span class="cell-main">' + escHtml(runName(r)) + '</span>' +
         (r.provider ? ' <span class="muted">· ' + sourceLabel(r.provider) + '</span>' : '') + '</td>' +
       '<td>' + badge(r.status) + '</td>' +
-      '<td class="num mono">' + fmtN(r.records || 0) + '</td>' +
-      '<td class="num mono muted">' + (r.cost_usd ? escHtml(fmtUsd(r.cost_usd, 4)) : escHtml(t('runs.free'))) + '</td>' +
-      '<td class="muted">' + relTime(r.started_at) + '</td></tr>').join('') +
+      '<td class="num" data-label="' + escHtml(t('runs.records')) + '">' + fmtN(r.records || 0) + '</td>' +
+      '<td class="num muted" data-label="' + escHtml(t('runs.cost')) + '">' + (r.cost_usd ? escHtml(fmtUsd(r.cost_usd, 4)) : escHtml(t('runs.free'))) + '</td>' +
+      '<td class="muted run-when">' + relTime(r.started_at) + '</td></tr>').join('') +
     '</tbody></table>';
 }
 
@@ -709,7 +729,9 @@ async function loadToday() {
     return;
   }
 
-  const glyph = {bad: 'alert', warn: 'flag', good: 'check'};
+  // "good" items are optional next steps (read the sites, find more), not
+  // finished ones: an arrow, never the done-tick the clear queue uses.
+  const glyph = {bad: 'alert', warn: 'flag', good: 'arrow'};
   el.innerHTML = '<div class="queue">' + items.map(it => {
     const tone = escHtml(it.tone || 'warn');
     const words = todayItemText(it, _todayStats);
@@ -787,9 +809,11 @@ async function loadLiveStatus() {
   const d = await api('/api/live-status');
   if (!d || !Array.isArray(d.steps)) {
     // Keep the last good numbers on screen, but never let them pass for live.
+    const server = failedOnServer();
     const flag = el.querySelector('.live-flag');
-    if (flag) flag.textContent = t('live.stale');
-    else el.innerHTML = '<p class="muted live-flag">' + escHtml(t('live.offline')) + '</p>';
+    if (flag) flag.textContent = t(server ? 'live.stale_server' : 'live.stale');
+    else el.innerHTML = '<p class="muted live-flag">' +
+      escHtml(server ? t('live.server_error', {status: _lastFail}) : t('live.offline')) + '</p>';
     return;
   }
   const glyph = {done: icon('check'), running: '<span class="pulse"></span>', partial: '', waiting: ''};
@@ -917,7 +941,7 @@ async function loadFunnel() {
 async function loadTodayActivity() {
   const el = document.getElementById('today-activity');
   if (!el) return;
-  const data = await api('/api/activity');
+  const [data, runs] = await Promise.all([api('/api/activity'), api('/api/runs')]);
   if (!Array.isArray(data)) {  // offline: keep what's shown; Today's queue says so
     if (!el.querySelector('.timeline')) el.innerHTML = offlineLine();
     return;
@@ -925,7 +949,11 @@ async function loadTodayActivity() {
   // Heartbeats are noise here; the Activity tab keeps them.
   const shown = data.filter(a => a.agent !== 'main').slice(0, 8);
   if (!shown.length) {
-    el.innerHTML = '<p class="muted small">' + escHtml(t('today.activity_empty')) + '</p>';
+    // The Runs card beside this one may list imports and searches: point
+    // at it rather than claim nothing has happened.
+    const ran = Array.isArray(runs) && runs.length > 0;
+    el.innerHTML = '<p class="muted small">' +
+      escHtml(t(ran ? 'today.activity_empty_runs' : 'today.activity_empty')) + '</p>';
     return;
   }
   el.innerHTML = '<div class="timeline">' + shown.map(a =>
@@ -1061,6 +1089,7 @@ async function loadSignals() {
   const data = await api('/api/signals');
   const sumEl = document.getElementById('signals-summary');
   const grpEl = document.getElementById('signals-groups');
+  markLoadFailed('signals', !data || data.error);
   if (!data || data.error) { grpEl.innerHTML = offlineState(); sumEl.innerHTML = ''; return; }
   _signals = data;
 
@@ -1162,6 +1191,8 @@ let _discoverPoll = null;
 async function loadDiscoverProviders() {
   const el = document.getElementById('discover-providers');
   const data = await api('/api/discover/providers');
+  // Without the providers there is nothing to estimate or run against.
+  markLoadFailed('discover', !data || !data.providers);
   if (!data || !data.providers) { el.innerHTML = offlineState(); return; }
 
   _provider = _provider || data.selected || data.default;
@@ -1528,9 +1559,18 @@ function pageCohort(dir) {
 
 // ── Settings ──
 
+// Saving is only offered once the saved values have been read: a form
+// filled from nothing would look like a fresh install and invite
+// overwriting real keys.
+let _settingsLoaded = false;
+
 async function loadSettings() {
   const data = await api('/api/settings');
-  if (!data) return;
+  const errEl = document.getElementById('settings-error');
+  _settingsLoaded = !!data;
+  markLoadFailed('settings', !data);
+  if (!data) { if (errEl) errEl.innerHTML = offlineState(); return; }
+  if (errEl) errEl.innerHTML = '';
 
   const prov = data.provider || 'instantly';
   const provEl = document.getElementById('active-provider');
@@ -1634,6 +1674,7 @@ function saveVerifiers() {
 }
 
 async function saveEnv(payload, okMsg) {
+  if (!_settingsLoaded) { showToast(t('set.not_loaded'), 'error'); return; }
   const data = await api('/api/settings/env', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
@@ -1672,7 +1713,7 @@ async function testInstantly() {
     body: JSON.stringify({api_key: key})
   });
   if (!data) {
-    el.innerHTML = '<div class="test-result error">' + escHtml(t('set.unreachable')) + '</div>';
+    el.innerHTML = '<div class="test-result error">' + escHtml(t(failedOnServer() ? 'offline.server_short' : 'set.unreachable')) + '</div>';
     return;
   }
   el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(failMsg(data, '')) + '</div>';
@@ -1687,14 +1728,19 @@ async function loadHarveyStatus() {
 
   if (_locked) return;  // the header already says "Locked"
   if (!data) {
+    // "Offline" only when nothing answered; a server that answered with an
+    // error is up, and restarting the dashboard isn't the next step.
+    const server = failedOnServer();
+    const word = t(server ? 'status.server_error' : 'status.offline');
     headerDot.className = 'status-dot offline';
-    headerText.textContent = t('status.offline');
+    headerText.textContent = word;
     // The Controls card can't know either: say so instead of "Stopped".
     document.getElementById('control-dot').className = 'dot offline';
     const off = document.getElementById('control-label');
     off.className = 'label';
-    off.textContent = t('status.offline');
-    document.getElementById('control-meta').textContent = t('ctl.status_unknown');
+    off.textContent = word;
+    document.getElementById('control-meta').textContent = server
+      ? t('ctl.status_unknown_server', {status: _lastFail}) : t('ctl.status_unknown');
     document.getElementById('btn-start').style.display = 'none';
     document.getElementById('btn-stop').style.display = 'none';
     return;
@@ -1745,7 +1791,7 @@ async function loadLogs() {
   const data = await api('/api/harvey/logs');
   const el = document.getElementById('log-viewer');
   if (!data) {
-    el.textContent = t('ctl.logs_unreadable');
+    el.textContent = failedOnServer() ? t('offline.server_short') : t('ctl.logs_unreadable');
   } else if (data.lines && data.lines.length) {
     const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
     el.textContent = data.lines.join('\n');
@@ -2007,7 +2053,7 @@ function renderDeskContext(ctx) {
     ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' +
         escHtml(ctx.website.replace(/^https?:\/\//i, '')) + ' &#8599;</a>'
     : '';
-  const who = [ctx.contact, ctx.contact_title].filter(Boolean).map(escHtml).join(' &middot; ');
+  const who = [ctx.contact, roleText(ctx.contact_title)].filter(Boolean).map(escHtml).join(' &middot; ');
   const email = [ctx.email_status, ctx.score ? t('desk.score', {n: ctx.score}) : '']
     .filter(Boolean).map(escHtml).join(' &middot; ');
   const signals = Object.entries(ctx.signals || {})
@@ -2341,13 +2387,21 @@ async function loadControlSending() {
   const s = await api('/api/sending/status');
   if (!s) { el.innerHTML = '<p class="muted">' + escHtml(t('send.unreadable')) + '</p>'; return; }
   const words = sendingStateText(s);
-  el.innerHTML = '<div class="status-big"><div class="dot ' + (s.paused ? 'stopped' : s.live ? 'running' : 'stopped') + '"></div>' +
+  // Secondary to the agent card above it: same layout, smaller headline,
+  // so the sending state stays visible without competing.
+  el.innerHTML = '<div class="status-big compact"><div class="dot ' + (s.paused ? 'stopped' : s.live ? 'running' : 'stopped') + '"></div>' +
       '<span class="label">' + escHtml(words.title) + '</span></div>' +
     (words.detail ? '<div class="status-meta">' + escHtml(words.detail) + '</div>' : '') +
     '<div class="btn-group">' + sendingButton(s) + '</div>';
 }
 
 // ── Shared table pieces: pager, selection, actions menu ──
+
+// The search box's hint, short on a phone so it isn't cut mid-word.
+function searchPh(prefix) {
+  const narrow = typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches;
+  return prefix + (narrow ? '.search_ph_short' : '.search_ph');
+}
 
 const PAGE_SIZES = [25, 50, 100];
 
@@ -2442,8 +2496,8 @@ async function loadCompanies() {
     el.innerHTML = '<div class="toolbar">' +
       '<label class="search grow">' + icon('discover') +
         '<input class="form-input" id="company-search" type="search" autocomplete="off" ' +
-        'data-i18n-placeholder="co.search_ph" data-i18n-aria="co.search_label" ' +
-        'placeholder="' + escHtml(t('co.search_ph')) + '" aria-label="' + escHtml(t('co.search_label')) + '" ' +
+        'data-i18n-placeholder="' + searchPh('co') + '" data-i18n-aria="co.search_label" ' +
+        'placeholder="' + escHtml(t(searchPh('co'))) + '" aria-label="' + escHtml(t('co.search_label')) + '" ' +
         'oninput="companySearchInput(this.value)"></label>' +
       '<div id="company-actions"></div>' +
       '</div><div id="company-selbar"></div><div id="company-rows"></div>';
@@ -2705,14 +2759,14 @@ function renderDrawer() {
     const m = statusMeta(e.status || 'guess');
     return '<div class="drow"><span class="mini-dot t-' + m.tone + '"></span>' +
       (href ? '<a class="email" href="' + href + '">' + escHtml(e.email) + '</a>' : '<span class="email">' + escHtml(e.email) + '</span>') +
-      '<span class="drow-meta">' + [escHtml(m.label), escHtml(e.name), escHtml(e.title)].filter(Boolean).join(' · ') + '</span>' +
+      '<span class="drow-meta">' + [escHtml(m.label), escHtml(e.name), escHtml(roleText(e.title))].filter(Boolean).join(' · ') + '</span>' +
       '<button class="copy" onclick="copyText(' + jsq(e.email) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>';
   }).join('');
 
   const people = (c.people || []).map(p =>
     '<div class="person"><span class="avatar">' + initials(...String(p.name).split(' ')) + '</span>' +
     '<div class="cell-stack"><span class="cell-main">' + escHtml(p.name) + '</span>' +
-    (p.title ? '<span class="cell-sub">' + escHtml(p.title) + '</span>' : '') + '</div></div>').join('');
+    (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') + '</div></div>').join('');
 
   const contacts = (_drawer.contacts || []).map(p => {
     const name = [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '—';
@@ -2720,7 +2774,7 @@ function renderDrawer() {
     const em = p.email ? (mailHref(p.email) ? '<a class="email" href="' + mailHref(p.email) + '">' + escHtml(p.email) + '</a>' : escHtml(p.email)) + emailTag(p) : '';
     return '<div class="person"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
       '<div class="cell-stack"><span class="cell-main">' + escHtml(name) + '</span>' +
-      (p.title ? '<span class="cell-sub">' + escHtml(p.title) + '</span>' : '') +
+      (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') +
       ([em, ph].filter(Boolean).length ? '<span class="person-lines">' + [em, ph].filter(Boolean).join('<br>') + '</span>' : '') +
       '</div><span class="cell-sub">' + sourceLabel(p.source) + '</span></div>';
   }).join('');
@@ -2799,7 +2853,7 @@ async function loadProspects() {
     el.innerHTML = '<div class="toolbar">' +
       '<label class="search grow">' + icon('discover') +
         '<input class="form-input" id="contact-search" type="search" autocomplete="off" ' +
-        'data-i18n-placeholder="ct.search_ph" data-i18n-aria="ct.search_label" placeholder="' + escHtml(t('ct.search_ph')) + '" ' +
+        'data-i18n-placeholder="' + searchPh('ct') + '" data-i18n-aria="ct.search_label" placeholder="' + escHtml(t(searchPh('ct'))) + '" ' +
         'aria-label="' + escHtml(t('ct.search_label')) + '" oninput="contactSearchInput(this.value)"></label>' +
       '<div class="segmented" id="contact-filters" role="group" data-i18n-aria="ct.filter_label" aria-label="' + escHtml(t('ct.filter_label')) + '"></div>' +
       '<div id="contact-actions"></div>' +
@@ -2878,7 +2932,7 @@ function renderContacts() {
         (on ? ' checked' : '') + ' onchange="selectContact(' + i + ', this.checked)"></td>' +
       '<td class="ct-name"><div class="cell-row"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
         '<div class="cell-stack"><span class="cell-main">' + (name ? escHtml(name) : '<span class="muted">' + escHtml(t('ct.inbox')) + '</span>') + '</span>' +
-        '<span class="cell-sub">' + escHtml(p.title) + '</span></div></div></td>' +
+        '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span></div></div></td>' +
       '<td data-label="' + escHtml(t('ct.col.company')) + '"><div class="cell-stack">' +
         (p.company_id ? '<a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(p.company_id) + ');return false">' +
           escHtml(p.company_name || p.company) + '</a>' : '<span class="cell-main">' + escHtml(p.company) + '</span>') +
@@ -3328,7 +3382,10 @@ async function loadActivity() {
   renderRunsTable(document.getElementById('activity-runs'), runs, 25);
   if (!data) { el.innerHTML = offlineState(); return; }
   if (!data.length) {
-    el.innerHTML = emptyState(icon('activity'), escHtml(t('act.empty')), escHtml(t('act.empty_copy')));
+    // Runs listed above are activity too: never say "nothing yet" next to them.
+    el.innerHTML = Array.isArray(runs) && runs.length
+      ? emptyState(icon('activity'), escHtml(t('act.empty_log')), escHtml(t('act.empty_log_copy')))
+      : emptyState(icon('activity'), escHtml(t('act.empty')), escHtml(t('act.empty_copy')));
     return;
   }
   let html = '<div class="card"><div class="timeline">';

@@ -159,16 +159,16 @@
       <div class="subhead"><span data-i18n="ov.runs">Importuri și căutări recente</span>
         <span class="hint"><a href="#" onclick="goTab('activity');return false" data-i18n="common.see_all">Vezi tot</a></span></div>
       <div class="card flush" id="overview-runs"><p class="pad muted" data-i18n="common.loading">Se încarcă…</p></div>
-    </div>
-    <aside>
-      <div class="subhead" data-i18n="ov.setup">Pregătire</div>
-      <div class="card" id="overview-setup"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
       <div class="subhead" data-i18n="ov.import_title">Import din registru (ONRC)</div>
       <div class="card tip" id="overview-import">
         <p data-i18n-html="ov.import_body"></p>
         <pre class="cmd">harvey import-onrc stomatologie <span class="nb">--county BV</span></pre>
         <p class="muted" data-i18n-html="ov.import_more"></p>
       </div>
+    </div>
+    <aside>
+      <div class="subhead" data-i18n="ov.setup">Pregătire</div>
+      <div class="card" id="overview-setup"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
     </aside>
   </div>
 </div>
@@ -221,8 +221,8 @@
   <div id="signals-summary"></div>
   <div id="signals-groups"></div>
 
-  <div class="subhead" data-i18n="cohort.title">Constructor de grupuri</div>
-  <div class="card">
+  <div class="subhead needs-data" data-i18n="cohort.title">Constructor de grupuri</div>
+  <div class="card needs-data">
     <p class="lede" data-i18n="cohort.lede">O listă de firme e o interogare, nu un fișier. Alege semnalele pe care trebuie să le aibă o firmă, și pe cele care o exclud, și vezi câte se potrivesc acum.</p>
     <div id="cohort-builder"></div>
     <div id="cohort-result"></div>
@@ -237,13 +237,13 @@
       <p data-i18n="disc.lede">Găsește firme noi. Alegi sursa, vezi cât costă, apoi pornești căutarea: nimic nu se apelează până nu apeși butonul.</p>
     </div>
   </div>
-  <div id="discover-profile"></div>
+  <div class="needs-data" id="discover-profile"></div>
 
   <div class="subhead" data-i18n="disc.source">Sursă</div>
   <div id="discover-providers"></div>
 
-  <div class="subhead" data-i18n="disc.run">Căutare</div>
-  <div class="card">
+  <div class="subhead needs-data" data-i18n="disc.run">Căutare</div>
+  <div class="card needs-data">
     <div class="form-row" style="margin-bottom:4px">
       <div class="form-group">
         <label class="form-label" for="disc-preset" data-i18n="disc.preset">Caută</label>
@@ -279,7 +279,7 @@
       <button class="btn btn-danger" id="disc-stop" onclick="stopDiscovery()" style="display:none" data-i18n="disc.stop">Oprește</button>
     </div>
   </div>
-  <div id="discover-result"></div>
+  <div class="needs-data" id="discover-result"></div>
 </div>
 
 <!-- Companies -->
@@ -345,6 +345,8 @@
 <!-- Settings -->
 <div id="settings" class="section">
   <div class="section-head"><div><h2 data-i18n="set.title">Setări</h2><p data-i18n-html="set.lede"></p></div></div>
+  <div id="settings-error"></div>
+  <div class="needs-data" id="settings-body">
 
   <div class="subhead" data-i18n="set.modules">Module</div>
   <div class="card">
@@ -505,6 +507,7 @@
         <button class="btn btn-primary btn-sm" onclick="saveCloudflare()" data-i18n="set.save_cf">Salvează Cloudflare</button>
       </div>
     </div>
+  </div>
   </div>
 </div>
 

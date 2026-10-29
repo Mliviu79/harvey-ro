@@ -609,7 +609,7 @@ const I18N = {
 
     'help.title': 'Ajutor', 'help.lede': 'Ce este Harvey RO, cum funcționează și cum rezolvi problemele obișnuite.',
     'help.what': '<h2>Ce este Harvey RO?</h2><p>Un instrument care găsește firme din România și datele lor de contact: telefoane, adrese de email și persoane. Le ia din registrul comerțului (ONRC, date deschise), din hărți și din site-urile firmelor, și le pune într-o bază de date locală pe care o cauți după activitate (cod CAEN sau cuvinte), nume sau localitate.</p><p>Implicit nu trimite nimic. Partea de campanii de email există, dar stă ascunsă în modulul Email (Setări → Module).</p>',
-    'help.start': '<h2>Cum începi</h2><pre>1. Importă firme din registru:   harvey import-onrc stomatologie --county BV\n2. Sau caută firme noi:           fila Descoperă (OpenStreetMap e gratuit)\n3. Citește-le site-urile:         Descoperă → Citește site-urile (telefoane, persoane)\n4. Caută și exportă:              fila Firme → Acțiuni → Exportă CSV</pre><p>Căutarea merge cu cuvinte în română sau engleză (stomatologie, dentist), cu un cod CAEN (8623) sau cu o localitate. Toate cuvintele trebuie să se potrivească. În terminal, <code>harvey search</code> face aceeași căutare, iar <code>harvey caen</code> arată codurile CAEN pentru niște cuvinte.</p>',
+    'help.start': '<h2>Cum începi</h2><ol class="how-steps"><li><b>Importă firme din registru:</b> <code>harvey import-onrc stomatologie --county BV</code></li><li><b>Sau caută firme noi:</b> fila Descoperă (OpenStreetMap e gratuit)</li><li><b>Citește-le site-urile:</b> Descoperă → Citește site-urile (telefoane, persoane)</li><li><b>Caută și exportă:</b> fila Firme → Acțiuni → Exportă CSV</li></ol><p>Căutarea merge cu cuvinte în română sau engleză (stomatologie, dentist), cu un cod CAEN (8623) sau cu o localitate. Toate cuvintele trebuie să se potrivească. În terminal, <code>harvey search</code> face aceeași căutare, iar <code>harvey caen</code> arată codurile CAEN pentru niște cuvinte.</p>',
     'help.files_title': 'Unde stă totul',
     'help.files_lede': 'Tot ce folosește Harvey e în dosarul proiectului. Nimic nu se păstrează în altă parte.',
     'help.file.env': 'Cheile API și parolele (nu se trimit și nu se pun în git)',
@@ -619,6 +619,22 @@ const I18N = {
     'help.file.skills': 'Textele după care scrie Harvey (doar pentru modulul Email)',
     'help.email': '<h2>Modulul Email</h2><p>Harvey a pornit ca agent de vânzări prin email: scrie emailuri reci, le trimite după aprobarea ta și răspunde la mesaje. În Harvey RO partea asta e ascunsă implicit. Când pornești modulul Email la Setări → Module, apar filele Astăzi, Coadă de trimitere, Conversații și Campanii.</p><p>Modulul schimbă doar ce vezi. Modul de trimitere (cu aprobare sau pilot automat), oprirea de urgență și limitele zilnice rămân cum sunt configurate în <code>harvey.yaml</code>, fie că modulul e afișat sau nu.</p>',
     'help.issues': '<h2>Probleme obișnuite</h2><details><summary>„command not found: harvey”</summary><div class="faq-body">În afara Docker, activează întâi mediul virtual: <code>source .venv/bin/activate</code>. În Docker, rulează comenzile prin <code>docker compose run --rm harvey …</code>.</div></details><details><summary>Căutarea nu găsește nimic</summary><div class="faq-body">Toate cuvintele trebuie să se potrivească. Încearcă un singur cuvânt, un cod CAEN de 4 cifre sau o localitate. Diacriticele nu contează.</div></details><details><summary>Firmele n-au telefon sau email</summary><div class="faq-body">Registrul nu publică telefoane sau adrese de email. Le găsește citirea site-urilor (Descoperă → Citește site-urile) sau o sursă cu telefon, ca DataForSEO Business Listings. Firmele fără site rămân, de obicei, fără email.</div></details><details><summary>Panoul spune că e blocat</summary><div class="faq-body">Deschide linkul afișat de <code>harvey dashboard</code>, sau rulează <code>harvey dashboard --url</code> ca să-l vezi din nou.</div></details>',
+
+    // Server-vs-network wording, empty logs, stored role labels, short search hints.
+    'status.server_error': 'Eroare de server',
+    'ctl.status_unknown_server': 'Starea lui Harvey nu se poate citi: serverul a dat o eroare (HTTP {status}). Detaliile sunt în terminalul în care rulează harvey dashboard.',
+    'live.server_error': 'Nu se poate citi acum: serverul a dat o eroare (HTTP {status}).',
+    'live.stale_server': 'Serverul a dat o eroare; cifrele de mai jos pot fi vechi.',
+    'set.not_loaded': 'Setările nu s-au putut citi, așa că nu se salvează nimic. Reîncarcă pagina.',
+    'act.empty_log': 'Nicio acțiune în jurnal încă',
+    'act.empty_log_copy': 'Rulările de mai sus (importuri, căutări, citiri de site-uri) au lucrat deja. Aici apar acțiunile lui Harvey: contacte găsite, emailuri scrise și trimise, răspunsuri tratate.',
+    'today.activity_empty_runs': 'Nicio acțiune în jurnal încă. Importurile și căutările făcute sunt la Rulări.',
+    'co.search_ph_short': 'Activitate, CAEN, nume, localitate',
+    'ct.search_ph_short': 'Nume, firmă, email, telefon',
+    'role.general_inbox': 'Adresă generală', 'role.owner': 'Proprietar', 'role.co_owner': 'Coproprietar',
+    'role.founder': 'Fondator', 'role.co_founder': 'Cofondator', 'role.president': 'Președinte',
+    'role.principal': 'Titular', 'role.partner': 'Asociat', 'role.managing_partner': 'Asociat administrator',
+    'role.founding_partner': 'Asociat fondator', 'role.founding_attorney': 'Avocat fondator',
   },
   en: {
     'doc.title': 'Harvey RO — Contacts for Romanian businesses',
@@ -1147,7 +1163,7 @@ const I18N = {
 
     'help.title': 'Help', 'help.lede': 'What Harvey RO is, how it works, and how to fix the usual problems.',
     'help.what': '<h2>What is Harvey RO?</h2><p>A tool that finds Romanian businesses and how to reach them: phone numbers, email addresses and people. It reads the trade registry (ONRC open data), maps and the companies’ own websites, and keeps everything in a local database you search by activity (CAEN code or words), name or town.</p><p>It sends nothing by default. The email campaign part still exists, hidden behind the Email module (Settings → Modules).</p>',
-    'help.start': '<h2>Getting started</h2><pre>1. Import companies from the registry:  harvey import-onrc stomatologie --county BV\n2. Or find new businesses:               the Discover tab (OpenStreetMap is free)\n3. Read their websites:                  Discover → Read their sites (phones, people)\n4. Search and export:                    Companies tab → Actions → Export CSV</pre><p>Search takes words in Romanian or English (stomatologie, dentist), a CAEN code (8623) or a town. Every word must match. In a terminal, <code>harvey search</code> runs the same search and <code>harvey caen</code> shows the CAEN codes for some words.</p>',
+    'help.start': '<h2>Getting started</h2><ol class="how-steps"><li><b>Import companies from the registry:</b> <code>harvey import-onrc stomatologie --county BV</code></li><li><b>Or find new businesses:</b> the Discover tab (OpenStreetMap is free)</li><li><b>Read their websites:</b> Discover → Read their sites (phones, people)</li><li><b>Search and export:</b> Companies tab → Actions → Export CSV</li></ol><p>Search takes words in Romanian or English (stomatologie, dentist), a CAEN code (8623) or a town. Every word must match. In a terminal, <code>harvey search</code> runs the same search and <code>harvey caen</code> shows the CAEN codes for some words.</p>',
     'help.files_title': 'Where everything lives',
     'help.files_lede': 'Everything Harvey needs is inside this one project folder. Nothing is stored elsewhere.',
     'help.file.env': 'Your API keys and credentials (never shared or committed)',
@@ -1157,8 +1173,42 @@ const I18N = {
     'help.file.skills': 'What Harvey writes from (Email module only)',
     'help.email': '<h2>The Email module</h2><p>Harvey started as an email sales agent: it writes cold email, sends it after you approve it, and answers replies. In Harvey RO that part is hidden by default. Turn on the Email module under Settings → Modules and the Today, Outbox, Conversations and Campaigns tabs appear.</p><p>The module only changes what you see. Sending mode (approval or autopilot), the kill switch and daily limits stay as <code>harvey.yaml</code> sets them, whether the module is shown or not.</p>',
     'help.issues': '<h2>Common issues</h2><details><summary>"command not found: harvey"</summary><div class="faq-body">Outside Docker, activate the virtual environment first: <code>source .venv/bin/activate</code>. In Docker, run commands through <code>docker compose run --rm harvey …</code>.</div></details><details><summary>Search finds nothing</summary><div class="faq-body">Every word must match. Try one word, a 4-digit CAEN code or a town. Accents don’t matter.</div></details><details><summary>Companies have no phone or email</summary><div class="faq-body">The registry’s open data has no phone numbers or email addresses. Reading websites (Discover → Read their sites) finds them, or a source with phones such as DataForSEO Business Listings. Companies with no website usually stay without an email.</div></details><details><summary>The dashboard says it is locked</summary><div class="faq-body">Open the link <code>harvey dashboard</code> printed, or run <code>harvey dashboard --url</code> to print it again.</div></details>',
+
+    // Server-vs-network wording, empty logs, stored role labels, short search hints.
+    'status.server_error': 'Server error',
+    'ctl.status_unknown_server': 'Harvey’s state can’t be read: the server returned an error (HTTP {status}). The details are in the terminal running harvey dashboard.',
+    'live.server_error': 'Can’t read this right now: the server returned an error (HTTP {status}).',
+    'live.stale_server': 'The server returned an error — numbers below may be old.',
+    'set.not_loaded': 'Settings couldn’t be read, so nothing is saved. Reload the page.',
+    'act.empty_log': 'No actions in the log yet',
+    'act.empty_log_copy': 'The runs above (imports, searches, website reading) have already done work. Harvey’s own actions show up here: contacts found, emails written and sent, replies handled.',
+    'today.activity_empty_runs': 'No actions in the log yet. The imports and searches that ran are under Runs.',
+    'co.search_ph_short': 'Activity, CAEN, name, town',
+    'ct.search_ph_short': 'Name, company, email, phone',
+    'role.general_inbox': 'General inbox', 'role.owner': 'Owner', 'role.co_owner': 'Co-owner',
+    'role.founder': 'Founder', 'role.co_founder': 'Co-founder', 'role.president': 'President',
+    'role.principal': 'Principal', 'role.partner': 'Partner', 'role.managing_partner': 'Managing partner',
+    'role.founding_partner': 'Founding partner', 'role.founding_attorney': 'Founding attorney',
   },
 };
+
+// Role labels Harvey itself writes onto a contact, in English: scout's
+// "General inbox" and the owner/founder words collectors/people.py and
+// agents/scout.py fill in. They are shown in the dashboard's language; any
+// other title (copied from a site or the registry) is shown as stored.
+const ROLE_KEYS = new Map([
+  ['general inbox', 'general_inbox'], ['owner', 'owner'], ['co-owner', 'co_owner'],
+  ['founder', 'founder'], ['co-founder', 'co_founder'], ['proprietor', 'owner'],
+  ['president', 'president'], ['principal', 'principal'], ['partner', 'partner'],
+  ['managing partner', 'managing_partner'], ['founding partner', 'founding_partner'],
+  ['founding attorney', 'founding_attorney'],
+]);
+
+function roleText(raw, lang) {
+  const stored = raw === null || raw === undefined ? '' : String(raw);
+  const key = ROLE_KEYS.get(stored.trim().toLowerCase());
+  return key ? t('role.' + key, null, lang) : stored;
+}
 
 // Server-written text (signals, their groups, discovery providers).
 // The English is the server's own, so tServer() can tell when it changed.

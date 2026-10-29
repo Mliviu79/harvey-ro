@@ -65,7 +65,7 @@ def test_offline_and_server_error_states_under_node():
     if not node:
         pytest.skip("node is not installed")
     app = (WEB / "app.js").read_text(encoding="utf-8")
-    parts = [_js_function(app, n) for n in ("escHtml", "icon", "emptyState", "offlineState",
+    parts = [_js_function(app, n) for n in ("escHtml", "icon", "emptyState", "failedOnServer", "offlineState",
                                             "offlineLine", "pauseReason")]
     script = (
         f"require('vm').runInThisContext(require('fs').readFileSync({json.dumps(str(WEB / 'i18n.js'))}, 'utf8'));"
