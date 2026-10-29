@@ -9,6 +9,7 @@ so a human can eyeball what they're getting.
 import csv
 import io
 import logging
+import re
 
 from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 from harvey.state import StateManager
@@ -200,12 +201,31 @@ def _do_not_contact(config) -> list[str]:
                           "Fix it before exporting.") from e
 
 
+_PLAIN_NUMBER = re.compile(r"[+\-]?[0-9 ().\-/]+\Z")
+
+
+def csv_cell(value) -> str:
+    """A cell a spreadsheet shows as text, never runs as a formula.
+
+    Names, titles and addresses come from other people's websites, so a
+    cell starting with = + - @ is quoted — unless it is only digits and
+    phone punctuation ("+40 712 000 000"), which can't call anything.
+    """
+    text = "" if value is None else str(value)
+    if _PLAIN_NUMBER.match(text):
+        return text
+    # Spreadsheet software may ignore leading whitespace before formulas.
+    if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
+        return "'" + text
+    return text
+
+
 def to_csv(rows: list[dict], columns: list[str] = CSV_COLUMNS) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow(row)
+        writer.writerow({k: csv_cell(row.get(k)) for k in columns})
     return buf.getvalue()
 
 

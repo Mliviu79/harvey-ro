@@ -198,3 +198,17 @@ def test_cli_export_companies_defaults_to_companies_csv(tmp_path, monkeypatch):
     cli.main()
     assert "Alfa" in (tmp_path / "companies.csv").read_text(encoding="utf-8")
     assert not (tmp_path / "prospects.csv").exists()
+
+
+def test_csv_export_neutralizes_formula_cells():
+    from harvey.export import to_csv
+
+    text = to_csv([{"company_name": "=HYPERLINK(\"http://evil.example\")",
+                    "title": " @SUM(A1)", "phone": "+40 700 000 000",
+                    "first_name": "Ana", "score": 0}])
+    row = list(csv.DictReader(io.StringIO(text)))[0]
+    assert row["company_name"] == "'=HYPERLINK(\"http://evil.example\")"
+    assert row["title"] == "' @SUM(A1)"
+    assert row["phone"] == "+40 700 000 000"
+    assert row["first_name"] == "Ana"
+    assert row["score"] == "0"

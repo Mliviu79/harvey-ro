@@ -2433,11 +2433,8 @@ async def preview_cohort(request: Request):
 
 
 def _csv_cell(value):
-    text = str(value or "")
-    # Spreadsheet software may ignore leading whitespace before formulas.
-    if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
-        return "'" + text
-    return text
+    from harvey.export import csv_cell
+    return csv_cell(value or "")
 
 
 @app.get("/api/cohort.csv")
