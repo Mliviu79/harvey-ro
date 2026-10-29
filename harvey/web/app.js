@@ -272,20 +272,40 @@ function actionText(a) {
   return a.agent === 'main' ? t('act.heartbeat', {text: text}) : text;
 }
 
-function emptyState(glyph, title, copy) {
-  return '<div class="empty"><div class="glyph">' + glyph + '</div>' +
+// An empty or failed section: glyph, title, one short line. `boxed` gives
+// it a card of its own where the container isn't one already.
+function emptyState(glyph, title, copy, boxed, action) {
+  return '<div class="empty' + (boxed ? ' boxed' : '') + '"><div class="glyph">' + glyph + '</div>' +
     '<div class="title">' + title + '</div>' +
-    '<div class="copy">' + copy + '</div></div>';
+    '<div class="empty-copy">' + copy + '</div>' +
+    (action ? '<div class="empty-action">' + action + '</div>' : '') + '</div>';
 }
 
+// How the last read failed: 'network' (no answer at all) or the HTTP status
+// the server answered with. The two need different next steps.
+let _lastFail = null;
+
 function offlineState() {
-  return emptyState(icon('alert'), escHtml(t('offline.title')), t('offline.copy'));
+  const server = _lastFail && _lastFail !== 'network';
+  return emptyState(icon('alert'),
+    escHtml(t(server ? 'offline.server_title' : 'offline.title')),
+    server ? escHtml(t('offline.server_copy', {status: _lastFail})) : t('offline.copy'), true,
+    '<button type="button" class="btn btn-secondary btn-sm" onclick="loadCurrentTab()">' +
+      icon('refresh') + escHtml(t('offline.retry')) + '</button>');
+}
+
+// The one-line version, for a small card that has nothing to show.
+function offlineLine(cls) {
+  const server = _lastFail && _lastFail !== 'network';
+  return '<p class="' + (cls || 'muted small') + '">' +
+    escHtml(t(server ? 'offline.server_short' : 'offline.short')) + '</p>';
 }
 
 async function api(path, opts) {
   try {
     const r = await authFetch(path, opts);
     if (await lockIfRefused(r)) return null;
+    if (!r.ok) _lastFail = r.status;
     if (!r.ok) {
       // An action the server refused says why ("a run is already going");
       // pass that body on so the toast can show it. Reads stay null.
@@ -295,6 +315,7 @@ async function api(path, opts) {
     }
     return await r.json();
   } catch {
+    _lastFail = 'network';
     return null;
   }
 }
@@ -526,7 +547,15 @@ async function loadOverview() {
   renderOverviewHints();
   const [ov, runs, setup] = await Promise.all([api('/api/overview'), api('/api/runs'), api('/api/setup-status')]);
   const statsEl = document.getElementById('overview-stats');
-  if (!ov) { statsEl.innerHTML = offlineState(); return; }
+  if (!ov) {
+    // Don't leave the last numbers next to "can't reach the server".
+    statsEl.innerHTML = offlineState();
+    const runsEl = document.getElementById('overview-runs');
+    const setupEl = document.getElementById('overview-setup');
+    if (runsEl) runsEl.innerHTML = offlineLine('pad muted');
+    if (setupEl) setupEl.innerHTML = offlineLine();
+    return;
+  }
   navCount('nav-signals', ov.signals_proposed || 0);
   const nav = document.getElementById('nav-companies');
   if (nav) { nav.textContent = ov.companies ? fmtN(ov.companies) : ''; nav.className = 'nav-count soft' + (ov.companies ? ' on' : ''); }
@@ -659,7 +688,7 @@ async function loadToday() {
   if (data.error) {
     // A failed check must never read as "Nothing needs you".
     el.innerHTML = emptyState(icon('alert'), escHtml(t('today.error_title')),
-      escHtml(t('today.error_copy')) + ' ' + escHtml(data.error));
+      escHtml(t('today.error_copy')) + ' ' + escHtml(data.error), true);
     return;
   }
 
@@ -699,12 +728,18 @@ async function loadToday() {
 // A Today item in the dashboard's language, by its stable key. Items whose
 // wording the server builds from live detail (a pause reason, a hold) keep
 // the server's text.
+// The kill switch's reason is free text; the one the dashboard itself
+// writes reads in the dashboard's language.
+function pauseReason(why) {
+  return String(why || '').trim() === 'paused from dashboard' ? t('send.paused_by_dashboard') : String(why || '');
+}
+
 function todayItemText(it, stats) {
   const s = stats || {};
   const same = {title: it.title, detail: it.detail, action: it.action};
   const tr = (title, detail, action) => ({title: title, detail: detail, action: action});
   switch (it.key) {
-    case 'paused': return tr(t('today.item.paused'), t('today.item.paused_detail', {why: String(it.detail || '').split('. Nothing will go out')[0]}), t('today.item.paused_action'));
+    case 'paused': return tr(t('today.item.paused'), t('today.item.paused_detail', {why: pauseReason(String(it.detail || '').split('. Nothing will go out')[0])}), t('today.item.paused_action'));
     case 'setup': {
       const missing = ((_setup && _setup.checks) || []).filter(c => c.required && !c.done).slice(0, 3).map(checkLabel);
       return tr(t('today.item.setup'), missing.length ? missing.join(', ') : t('today.item.setup_detail'), t('today.item.setup_action'));
@@ -848,7 +883,10 @@ async function loadFunnel() {
   const el = document.getElementById('today-figures');
   if (!el) return;
   const data = await api('/api/stats');
-  if (!data) return;  // offline: keep the last numbers; Today's queue says so
+  if (!data) {  // offline: keep the last numbers; Today's queue says so
+    if (!el.querySelector('.legend-rows')) el.innerHTML = offlineLine();
+    return;
+  }
   if (data.error) { el.innerHTML = '<p class="muted small">' + escHtml(t('today.funnel_error')) + '</p>'; return; }
   const total = (data.prospects || {}).total || 0;
   const pipe = data.pipeline || {};
@@ -880,7 +918,10 @@ async function loadTodayActivity() {
   const el = document.getElementById('today-activity');
   if (!el) return;
   const data = await api('/api/activity');
-  if (!Array.isArray(data)) return;  // offline: Today's queue says so
+  if (!Array.isArray(data)) {  // offline: keep what's shown; Today's queue says so
+    if (!el.querySelector('.timeline')) el.innerHTML = offlineLine();
+    return;
+  }
   // Heartbeats are noise here; the Activity tab keeps them.
   const shown = data.filter(a => a.agent !== 'main').slice(0, 8);
   if (!shown.length) {
@@ -1648,6 +1689,14 @@ async function loadHarveyStatus() {
   if (!data) {
     headerDot.className = 'status-dot offline';
     headerText.textContent = t('status.offline');
+    // The Controls card can't know either: say so instead of "Stopped".
+    document.getElementById('control-dot').className = 'dot offline';
+    const off = document.getElementById('control-label');
+    off.className = 'label';
+    off.textContent = t('status.offline');
+    document.getElementById('control-meta').textContent = t('ctl.status_unknown');
+    document.getElementById('btn-start').style.display = 'none';
+    document.getElementById('btn-stop').style.display = 'none';
     return;
   }
   const running = !!data.running;
@@ -1695,7 +1744,9 @@ async function stopHarvey() {
 async function loadLogs() {
   const data = await api('/api/harvey/logs');
   const el = document.getElementById('log-viewer');
-  if (data && data.lines && data.lines.length) {
+  if (!data) {
+    el.textContent = t('ctl.logs_unreadable');
+  } else if (data.lines && data.lines.length) {
     const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
     el.textContent = data.lines.join('\n');
     if (stick) el.scrollTop = el.scrollHeight;
@@ -1864,7 +1915,7 @@ async function loadOutbox() {
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
   if (data.error) {
     // Never let a failed read pass for "Nothing to review".
-    desk.innerHTML = emptyState(icon('alert'), escHtml(t('ob.error')), escHtml(data.error));
+    desk.innerHTML = emptyState(icon('alert'), escHtml(t('ob.error')), escHtml(data.error), true);
     list.innerHTML = '';
     return;
   }
@@ -1895,7 +1946,7 @@ async function loadOutbox() {
   // bar for a thing that isn't happening is just noise.
   banner.innerHTML = sendingModeBanner(_sendingMode) + (data.paused
     ? '<div class="banner bad">' + icon('alert') + '<div><b>' + escHtml(t('ob.paused')) + '</b>' +
-        '<p>' + escHtml(t('ob.paused_detail', {why: data.paused})) + '</p></div></div>'
+        '<p>' + escHtml(t('ob.paused_detail', {why: pauseReason(data.paused)})) + '</p></div></div>'
     : '');
   // Only once there is mail to warn about: a fresh install sends nothing.
   const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;

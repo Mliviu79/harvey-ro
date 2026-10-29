@@ -158,15 +158,15 @@
     <div>
       <div class="subhead"><span data-i18n="ov.runs">Importuri și căutări recente</span>
         <span class="hint"><a href="#" onclick="goTab('activity');return false" data-i18n="common.see_all">Vezi tot</a></span></div>
-      <div class="card flush" id="overview-runs"></div>
+      <div class="card flush" id="overview-runs"><p class="pad muted" data-i18n="common.loading">Se încarcă…</p></div>
     </div>
     <aside>
       <div class="subhead" data-i18n="ov.setup">Pregătire</div>
-      <div class="card" id="overview-setup"></div>
+      <div class="card" id="overview-setup"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
       <div class="subhead" data-i18n="ov.import_title">Import din registru (ONRC)</div>
       <div class="card tip" id="overview-import">
         <p data-i18n-html="ov.import_body"></p>
-        <pre class="cmd">harvey import-onrc stomatologie --county BV</pre>
+        <pre class="cmd">harvey import-onrc stomatologie <span class="nb">--county BV</span></pre>
         <p class="muted" data-i18n-html="ov.import_more"></p>
       </div>
     </aside>
@@ -192,15 +192,15 @@
       <div id="today-queue"></div>
 
       <div class="subhead" data-i18n="today.pipeline_now">Unde e fiecare pas acum</div>
-      <div class="card" id="live-status"></div>
+      <div class="card" id="live-status"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
 
       <div class="subhead"><span data-i18n="today.recent">Activitate recentă</span> <span class="hint"><a href="#" onclick="goTab('activity');return false" data-i18n="common.see_all">Vezi tot</a></span></div>
-      <div class="card" id="today-activity"></div>
+      <div class="card" id="today-activity"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
     </div>
 
     <aside>
       <div class="subhead" data-i18n="today.by_stage">Contacte pe etape</div>
-      <div class="card" id="today-figures"></div>
+      <div class="card" id="today-figures"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
       <div class="facts" id="today-facts"></div>
       <div id="today-runs-block">
         <div class="subhead" data-i18n="today.runs">Rulări</div>
@@ -328,7 +328,7 @@
 <div id="activity" class="section">
   <div class="section-head"><div><h2 data-i18n="act.title">Activitate</h2><p data-i18n="act.lede">Jurnalul fiecărei acțiuni făcute de Harvey.</p></div></div>
   <div class="subhead" data-i18n="act.runs">Rulări (importuri, căutări, citiri de site-uri)</div>
-  <div class="card flush" id="activity-runs"></div>
+  <div class="card flush" id="activity-runs"><p class="pad muted" data-i18n="common.loading">Se încarcă…</p></div>
   <div class="subhead" data-i18n="act.log">Jurnal</div>
   <div id="activity-list"></div>
 </div>

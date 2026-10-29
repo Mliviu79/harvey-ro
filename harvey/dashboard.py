@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -51,7 +52,23 @@ def _resolve_config_file() -> Path:
 
 # No /docs, /redoc or /openapi.json: the API is for this UI only, and every
 # route except the static shell needs the token (see dashboard_auth).
-app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_url=None)
+@asynccontextmanager
+async def _lifespan(_app):
+    # Bring an existing database up to the current schema before the first
+    # request: pages that only read (Prezentare) never upgrade it, and the
+    # first one opened after an update would read tables that don't exist
+    # yet. A missing database stays missing until something writes.
+    if DB_PATH.exists():
+        from harvey.state import StateManager
+        try:
+            await StateManager(str(DB_PATH)).init_db()
+        except Exception:
+            logger.exception("could not upgrade %s", DB_PATH)
+    yield
+
+
+app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_url=None,
+              lifespan=_lifespan)
 token_store = auth.TokenStore(TOKEN_FILE)
 app.add_middleware(auth.DashboardGuard, store=token_store)
 

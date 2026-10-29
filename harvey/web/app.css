@@ -320,6 +320,7 @@ pre.cmd {
   background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line);
   font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
+pre.cmd .nb { white-space: nowrap; }
 
 .grid-main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: var(--sp-5); align-items: start; }
 @media (max-width: 1180px) { .grid-main { grid-template-columns: minmax(0, 1fr); } }
@@ -546,7 +547,7 @@ td.sel input, th.sel input { width: 15px; height: 15px; accent-color: var(--acce
 .co-name .cell-sub { margin-top: 3px; }
 .co-phone, .co-email { min-width: 170px; }
 .co-acts { min-width: 200px; max-width: 340px; }
-.co-src { font-size: var(--fs-caption); min-width: 90px; max-width: 130px; }
+.co-src { font-size: var(--fs-caption); min-width: 90px; white-space: nowrap; }
 .ct-name { min-width: 210px; }
 .ct-table td:nth-child(3) { min-width: 200px; max-width: 300px; }
 .ct-table td:nth-child(4), .ct-table td:nth-child(5) { min-width: 170px; }
@@ -764,6 +765,7 @@ tr:hover .copy, .copy:focus-visible, .drow .copy, .copy.done { opacity: 1; }
 .run .name { font-size: var(--fs-ui); font-weight: 500; }
 .run .when, .run .stats { font-size: var(--fs-caption); color: var(--text-3); }
 .run .stats { text-align: right; }
+.run .badge { justify-self: end; }
 
 .timeline { display: flex; flex-direction: column; }
 .tl-day { font-size: var(--fs-caption); font-weight: 600; color: var(--text-3); padding: var(--sp-4) 0 var(--sp-2); }
@@ -1079,6 +1081,7 @@ select.form-input { cursor: pointer; }
 .control-stack { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
 .status-big { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .status-big .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-3); }
+.status-big .dot.offline { background: var(--bad); box-shadow: 0 0 0 4px var(--bad-bg); }
 .status-big .dot.running { background: var(--good); box-shadow: 0 0 0 4px var(--good-bg); }
 .status-big .label { font-size: 1.2rem; font-weight: 600; letter-spacing: -0.015em; }
 .status-big .label.running { color: var(--good); }
@@ -1106,9 +1109,12 @@ select.form-input { cursor: pointer; }
 .empty { text-align: center; padding: var(--sp-7) var(--sp-5); }
 .empty .glyph { width: 40px; height: 40px; margin: 0 auto var(--sp-3); border-radius: 12px; display: flex; align-items: center; justify-content: center; background: var(--surface-2); color: var(--text-2); }
 .empty .title { font-size: var(--fs-body); font-weight: 600; margin-bottom: 4px; }
-.empty .copy { font-size: var(--fs-ui); color: var(--text-2); line-height: 1.6; max-width: 52ch; margin: 0 auto; text-wrap: pretty; opacity: 1; }
-.empty .copy b { color: var(--text); font-weight: 500; }
-.section > .empty, .content-inner > .empty, #companies-list > .empty, #prospects-table > .empty,
+.empty .empty-copy { font-size: var(--fs-ui); color: var(--text-2); line-height: 1.6; max-width: 52ch; margin: 0 auto; text-wrap: pretty; opacity: 1; }
+.empty .empty-copy b { color: var(--text); font-weight: 500; }
+.empty .empty-action { margin-top: var(--sp-4); }
+.empty.boxed { grid-column: 1 / -1; }
+#overview-stats > .empty { margin-bottom: var(--sp-2); }
+.section > .empty, .content-inner > .empty, .empty.boxed, #companies-list > .empty, #prospects-table > .empty,
 #campaigns-list > .empty, #conversations-list > .empty, #activity-list > .empty, #usage-tables > .empty {
   background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow-sheet);
 }

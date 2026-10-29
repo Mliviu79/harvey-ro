@@ -475,3 +475,25 @@ def test_romanian_plurals_and_numbers_under_node():
     assert (out["few"], out["many"]) == ("+3 numere", "+25 de numere")
     assert out["firms"] == "125 de firme"
     assert out["usd"].replace("\u00a0", " ") == "0,25 $"
+
+
+def test_startup_upgrades_an_older_database_before_any_page(monkeypatch, tmp_path):
+    # Prezentare only reads; after an update it used to hit tables the old
+    # schema didn't have, until some other page happened to upgrade it.
+    import sqlite3
+
+    from harvey.state import MIGRATIONS
+
+    db = tmp_path / "harvey.db"
+    with sqlite3.connect(db) as conn:
+        for version, script in enumerate(MIGRATIONS[:15], start=1):
+            conn.executescript(script)
+            conn.execute(f"PRAGMA user_version = {version}")
+    monkeypatch.setattr(dash, "DB_PATH", db)
+    dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    token = dash.token_store.get()
+    with TestClient(dash.app, base_url="http://127.0.0.1:5555",
+                    headers={"Authorization": f"Bearer {token}"}) as c:
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+        assert c.get("/api/overview").json()["with_activity"] == 0

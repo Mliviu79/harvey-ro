@@ -107,6 +107,11 @@ const I18N = {
 
     'offline.title': 'Panoul nu ajunge la server',
     'offline.copy': 'Procesul panoului s-a oprit, probabil. Pornește-l din nou cu <b>harvey dashboard</b> și reîncarcă pagina.',
+    'offline.server_title': 'Serverul a dat o eroare',
+    'offline.server_copy': 'Panoul rulează, dar cererea a eșuat (HTTP {status}). Detaliile sunt în terminalul în care rulează harvey dashboard. Reîncearcă peste câteva secunde.',
+    'offline.retry': 'Reîncearcă',
+    'offline.short': 'Nu se poate încărca: panoul nu ajunge la server.',
+    'offline.server_short': 'Nu se poate încărca: serverul a dat o eroare.',
 
     'lock.title': 'Panou blocat',
     'lock.help': 'Deschide linkul afișat de <code>harvey dashboard</code> în terminal, sau rulează <code>harvey dashboard --url</code> ca să-l afișeze din nou. Poți lipi și tokenul din <code>data/dashboard-token</code>:',
@@ -589,6 +594,9 @@ const I18N = {
     'send.waiting': {one: '{n} ciornă așteaptă decizia ta', few: '{n} ciorne așteaptă decizia ta', other: '{n} de ciorne așteaptă decizia ta'},
     'send.hidden_note': 'Filele modulului Email sunt ascunse; le arăți din Setări → Module.',
     'send.unreadable': 'Starea trimiterii nu s-a putut citi.',
+    'send.paused_by_dashboard': 'Oprită din panou',
+    'ctl.status_unknown': 'Starea lui Harvey nu se poate citi cât panoul nu ajunge la server.',
+    'ctl.logs_unreadable': 'Jurnalul nu s-a putut citi. Reîncearcă după ce panoul ajunge din nou la server.',
     'agent.scout': 'Căutare', 'agent.writer': 'Scriere', 'agent.sender': 'Trimitere', 'agent.handler': 'Răspunsuri',
     'agent.analyst': 'Analiză', 'agent.user': 'Tu', 'agent.main': 'Bucla principală',
     'set.cf_account': 'ID cont', 'set.cf_token': 'Token API', 'set.client_id': 'ID client', 'set.client_secret': 'Secret client',
@@ -637,6 +645,11 @@ const I18N = {
 
     'offline.title': 'Dashboard can’t reach the server',
     'offline.copy': 'The dashboard process may have stopped. Restart it with <b>harvey dashboard</b> and refresh this page.',
+    'offline.server_title': 'The server returned an error',
+    'offline.server_copy': 'The dashboard is running, but this request failed (HTTP {status}). The details are in the terminal running harvey dashboard. Try again in a few seconds.',
+    'offline.retry': 'Try again',
+    'offline.short': 'Can’t load this: the dashboard can’t reach the server.',
+    'offline.server_short': 'Can’t load this: the server returned an error.',
 
     'lock.title': 'Dashboard locked',
     'lock.help': 'Open the link that <code>harvey dashboard</code> printed in your terminal, or run <code>harvey dashboard --url</code> to print it again. You can also paste the token from <code>data/dashboard-token</code>:',
@@ -1119,6 +1132,9 @@ const I18N = {
     'send.waiting': {one: '{n} draft waiting on you', other: '{n} drafts waiting on you'},
     'send.hidden_note': 'The Email module’s tabs are hidden; show them in Settings → Modules.',
     'send.unreadable': 'Couldn’t read the sending state.',
+    'send.paused_by_dashboard': 'Paused from the dashboard',
+    'ctl.status_unknown': 'Harvey’s state can’t be read while the dashboard can’t reach the server.',
+    'ctl.logs_unreadable': 'Couldn’t read the log. Refresh once the dashboard reaches the server again.',
     'agent.scout': 'Scout', 'agent.writer': 'Writer', 'agent.sender': 'Sender', 'agent.handler': 'Handler',
     'agent.analyst': 'Analyst', 'agent.user': 'You', 'agent.main': 'Main loop',
     'set.cf_account': 'Account ID', 'set.cf_token': 'API token', 'set.client_id': 'Client ID', 'set.client_secret': 'Client secret',
