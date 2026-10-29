@@ -318,6 +318,17 @@ are left out of the search, since a board page names a board, not a website
 to profile. Confirm `HIRING_ROLE` and profiling reads the board their site links
 to and records the role; the search hit alone records nothing.
 
+**Romanian companies, by what they do.** `harvey import-onrc --county BV`
+reads ONRC's open data (free) and saves every operating company in the area
+with every CAEN class it is authorised for; add words or `--codes` to keep
+only some activities. The registry lists codes, so Harvey keeps the
+nomenclature next to them: `harvey search` (and the search box on the
+Companies tab) finds companies by the code (`8623`, Rev.2 or Rev.3), by the
+activity in Romanian or English with or without accents (`stomatologie`,
+`dental practice`, `dentist`), by name and by town, all at once
+(`harvey search 8623 cristian`). Companies from maps carry no CAEN, but
+their category is searched the same way.
+
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
 > **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.
@@ -615,6 +626,12 @@ harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock
 harvey signals               # review/confirm what to prospect against
 harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
+harvey import-onrc --county BV [dentist]  # Romanian companies from the trade registry (free);
+                             # no activity = every operating company in the area;
+                             # --administrators all|none; --dry-run counts
+harvey search 8623 brasov    # search companies on file by CAEN code, activity in words
+                             # (dentist, stomatologie), name or town; --json
+harvey caen 8623             # what a CAEN code means (every revision), or the codes for words
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens

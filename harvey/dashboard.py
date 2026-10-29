@@ -529,6 +529,38 @@ async def get_companies():
     return rows
 
 
+@app.get("/api/companies/search")
+async def search_companies(q: str = "", limit: int = 50, offset: int = 0):
+    """Companies on file matching every word of ``q`` (name, activity as a
+    CAEN code or in words, town), best first, each with its activities in
+    words. Local full-text search: no Claude, no network."""
+    q = q[:200]
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    empty = {"query": q, "total": 0, "offset": offset, "limit": limit, "companies": []}
+    if not q.strip() or not DB_PATH.exists():
+        return empty
+    try:
+        state = _state()
+        await state.init_db()
+        total, rows = await state.search_companies(q, limit=limit, offset=offset)
+    except Exception as e:
+        logger.warning("company search failed: %s", e)
+        return JSONResponse({**empty, "error": "search failed"}, status_code=500)
+    ids = [r["id"] for r in rows]
+    counts = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        counts = {r["company_id"]: r["n"] for r in await query_db(
+            f"SELECT company_id, COUNT(*) AS n FROM prospects "
+            f"WHERE company_id IN ({marks}) GROUP BY company_id", tuple(ids))}
+    for r in rows:
+        r.pop("score", None)
+        r["contact_count"] = counts.get(r["id"], 0)
+    return {"query": q, "total": total, "offset": offset, "limit": limit,
+            "companies": rows}
+
+
 @app.get("/api/companies/{company_id}/contacts")
 async def get_company_contacts(company_id: str):
     """Get all contacts for a specific company."""

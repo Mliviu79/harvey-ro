@@ -1994,16 +1994,46 @@ async function sendingToggle(action) {
   loadOutbox();
 }
 
+// The search box lives outside the rows, so the 15-second refresh re-renders
+// them without losing what you typed. With words in it the list comes from
+// the local company search (name, activity as a CAEN code or in words, town).
+let _companyQuery = '', _companySearchTimer = null;
+
 async function loadCompanies() {
   companyDrill = false;
   const el = document.getElementById('companies-list');
-  const data = await api('/api/companies');
-  if (!data) { el.innerHTML = offlineState(); return; }
+  if (!document.getElementById('company-rows')) {
+    el.innerHTML = '<div class="toolbar">' +
+      '<label class="search">' + icon('discover') +
+        '<input class="form-input" id="company-search" type="search" ' +
+        'placeholder="Search activity, CAEN code, name, town" aria-label="Search companies" ' +
+        'oninput="companySearchInput(this.value)"></label>' +
+      '</div><div id="company-rows"></div>';
+    document.getElementById('company-search').value = _companyQuery;
+  }
+  const rowsEl = document.getElementById('company-rows');
+  const q = _companyQuery.trim();
+  let data, total;
+  if (q) {
+    const res = await api('/api/companies/search?limit=200&q=' + encodeURIComponent(q));
+    if (!res || !document.getElementById('company-rows')) { rowsEl.innerHTML = offlineState(); return; }
+    if (q !== _companyQuery.trim()) return;      // a newer search is on its way
+    data = res.companies || [];
+    total = res.total || 0;
+  } else {
+    data = await api('/api/companies');
+    if (!data) { rowsEl.innerHTML = offlineState(); return; }
+    total = data.length;
+  }
   _companies = data;
   if (!data.length) {
-    el.innerHTML = emptyState(icon('companies'), 'No companies yet',
-      'Confirm your <b>Signals</b>, then find businesses on the <b>Discover</b> tab. ' +
-      'OpenStreetMap is free and needs no account.');
+    rowsEl.innerHTML = q
+      ? '<div class="table-card">' + emptyState(icon('discover'), 'No matches',
+          'No company on file matches every word. Try an activity in English or Romanian ' +
+          '(dentist, stomatologie), a CAEN code (8623) or a town.') + '</div>'
+      : emptyState(icon('companies'), 'No companies yet',
+          'Confirm your <b>Signals</b>, then find businesses on the <b>Discover</b> tab. ' +
+          'OpenStreetMap is free and needs no account.');
     return;
   }
   let html = '<div class="table-card"><table class="nowrap"><thead><tr><th>Company</th><th>Industry</th>' +
@@ -2017,15 +2047,40 @@ async function loadCompanies() {
     html += '<tr class="clickable" onclick="showCompanyContacts(' + i + ')">' +
       '<td><div class="cell-stack"><span class="cell-main">' + escHtml(c.name) + '</span>' +
         '<span class="cell-sub">' + domain + '</span></div></td>' +
-      '<td>' + (c.industry ? '<span class="tag">' + escHtml(c.industry) + '</span>' : '') + '</td>' +
+      '<td>' + companyActivities(c) + '</td>' +
       '<td>' + escHtml(c.location) + '</td>' +
       '<td class="muted">' + escHtml(c.company_size) + '</td>' +
       '<td class="num">' + (c.contact_count || 0) + '</td>' +
       '<td class="muted">' + sourceLabel(c.source) + '</td>' +
       '<td class="muted">' + relTime(c.created_at) + '</td></tr>';
   });
-  el.innerHTML = html + '</tbody></table></div>' +
-    '<div class="table-foot">' + data.length + ' compan' + (data.length === 1 ? 'y' : 'ies') + '</div>';
+  rowsEl.innerHTML = html + '</tbody></table></div>' +
+    '<div class="table-foot">' + (total > data.length ? data.length + ' of ' : '') +
+    total + ' compan' + (total === 1 ? 'y' : 'ies') + '</div>';
+}
+
+function companySearchInput(value) {
+  _companyQuery = value;
+  clearTimeout(_companySearchTimer);
+  _companySearchTimer = setTimeout(loadCompanies, 250);
+}
+
+// What a company does, in words: its CAEN classes when a search returned
+// them (the ones the words matched first), else the industry it came with.
+function companyActivities(c) {
+  const acts = c.activities || [];
+  if (!acts.length) return c.industry ? '<span class="tag">' + escHtml(c.industry) + '</span>' : '';
+  const shown = [], seen = new Set();
+  for (const a of acts) {
+    if (seen.has(a.code)) continue;
+    seen.add(a.code);
+    if (shown.length < 2 && (a.matched || !acts.some(x => x.matched))) shown.push(a);
+  }
+  const more = seen.size - shown.length;
+  return '<div class="cell-stack">' + shown.map(a =>
+    '<span class="cell-main" title="' + escHtml(a.name || '') + '">' + escHtml(a.code) + ' &mdash; ' +
+      escHtml(a.name_en || a.name || '') + '</span>').join('') +
+    (more > 0 ? '<span class="cell-sub">+' + more + ' more</span>' : '') + '</div>';
 }
 
 async function showCompanyContacts(index) {

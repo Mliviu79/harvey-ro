@@ -10,6 +10,8 @@ upgrade cleanly in place.
 """
 
 import json
+import re
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -132,6 +134,66 @@ def _utcnow() -> datetime:
 def _norm(value: str | None) -> str:
     """Normalize an identity key (email/domain) for dedup: strip + lowercase."""
     return (value or "").strip().lower()
+
+
+# ── Company search: words typed -> an FTS5 query ──
+
+# Joining words that would otherwise have to appear in the company's text.
+_SEARCH_STOPWORDS = frozenset({"de", "si", "la", "in", "pe", "cu", "din", "a",
+                               "of", "and", "the", "for"})
+
+
+def _fold_words(text: str) -> list[str]:
+    decomposed = unicodedata.normalize("NFKD", (text or "").lower())
+    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.findall(r"[a-z0-9]+", plain)
+
+
+def _search_term(word: str) -> str:
+    if word.isdigit() and len(word) == 4:
+        return f'"{word}"'
+    return f'"{word}"*' if len(word) >= 3 else f'"{word}"'
+
+
+def search_terms(query: str) -> tuple[str, list[str]]:
+    """(FTS5 MATCH expression, the folded words) for what someone typed.
+
+    Every word must match (AND); a word written with a leading minus
+    ("-pizza") must not. A 4-digit word is a CAEN code and matches exactly,
+    also typed as "86.23" or "8623/2"; any other word of 3+ letters matches
+    as a prefix. Single letters are dropped ("S.R.L." would otherwise match
+    every company). Each term is quoted, so nothing typed is read as FTS
+    syntax."""
+    query = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", query or "")
+    query = re.sub(r"\b(\d{4})/\d+\b", r"\1", query)
+    wanted: list[str] = []
+    unwanted: list[str] = []
+    for token in query.split()[:20]:
+        bucket = unwanted if token.startswith("-") and len(token) > 1 else wanted
+        bucket += [w for w in _fold_words(token)
+                   if len(w) > 1 and w not in _SEARCH_STOPWORDS]
+    wanted = list(dict.fromkeys(wanted))
+    unwanted = [w for w in dict.fromkeys(unwanted) if w not in wanted]
+    if not wanted:
+        return "", []
+    match = " AND ".join(_search_term(w) for w in wanted)
+    if unwanted:
+        match = f"({match})" + "".join(f" NOT {_search_term(w)}" for w in unwanted)
+    return match, wanted
+
+
+def _activity_matches(activity: dict, words: list[str]) -> bool:
+    """Whether a query word names this activity (its code, or a word of its
+    names or everyday words)."""
+    text = _fold_words(" ".join((activity.get("code", ""), activity.get("name", ""),
+                                 activity.get("name_en", ""), activity.get("keywords", ""))))
+    for w in words:
+        if w.isdigit() and len(w) == 4:
+            if w == activity.get("code"):
+                return True
+        elif any(t == w or (len(w) >= 3 and t.startswith(w)) for t in text):
+            return True
+    return False
 
 
 # ── Schema migrations ─────────────────────────────────────────────────
@@ -531,7 +593,155 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_cui
         ON companies(cui) WHERE cui != '';
     """,
+    # ── v16: what each company does, in codes and in words, searchable ──
+    """
+    -- The CAEN nomenclature, every revision (0 and 1 still describe old
+    -- registrations). Seeded at init from harvey/caen.py, which reads the
+    -- shipped CSV, so the file stays the one source.
+    CREATE TABLE IF NOT EXISTS caen_classes (
+        code TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        name_ro TEXT DEFAULT '',
+        name_en TEXT DEFAULT '',
+        keywords TEXT DEFAULT '',
+        PRIMARY KEY (code, version)
+    );
+
+    -- Every class a company is authorised for (all of them, not only the
+    -- ones an import asked for). Describes the company; observations stay
+    -- the provenance.
+    CREATE TABLE IF NOT EXISTS company_activities (
+        company_id TEXT NOT NULL,
+        code TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        confidence REAL DEFAULT 1.0,
+        PRIMARY KEY (company_id, code, version, source)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_activities_code
+        ON company_activities(code, version);
+
+    -- Local full-text search over name, activities (codes, Romanian and
+    -- English names, everyday words, plus the industry/category any source
+    -- gave) and place. Accent-insensitive. company_search_ids gives each
+    -- company a stable integer rowid, so one company's row is replaced by
+    -- rowid instead of scanning the index for its text id.
+    CREATE TABLE IF NOT EXISTS company_search_ids (
+        rid INTEGER PRIMARY KEY,
+        company_id TEXT NOT NULL UNIQUE
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS company_search USING fts5(
+        company_id UNINDEXED, name, activity, place,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE VIEW IF NOT EXISTS company_search_source AS
+    SELECT c.id AS company_id,
+           COALESCE(c.name, '') AS name,
+           TRIM(COALESCE((
+               SELECT group_concat(DISTINCT a.code || ' ' || COALESCE(k.name_ro, '')
+                      || ' ' || COALESCE(k.name_en, '') || ' ' || COALESCE(k.keywords, ''))
+               FROM company_activities a
+               LEFT JOIN caen_classes k ON k.code = a.code AND k.version = a.version
+               WHERE a.company_id = c.id), '') || ' ' || COALESCE(c.industry, '')) AS activity,
+           TRIM(COALESCE(c.location, '') || ' ' || COALESCE(c.address, '')) AS place
+    FROM companies c;
+
+    -- Backfill (before the triggers, so each row is written once):
+    -- activities already observed, then the index for every company on
+    -- file. Class names arrive with the seeding that follows this
+    -- migration, which rebuilds the index once more.
+    INSERT OR IGNORE INTO company_activities (company_id, code, version, source, confidence)
+        SELECT company_id,
+               substr(value_text, 1, instr(value_text, '/') - 1),
+               CAST(substr(value_text, instr(value_text, '/') + 1) AS INTEGER),
+               COALESCE(NULLIF(collector, ''), 'observation'),
+               MAX(COALESCE(confidence, 1.0))
+        FROM observations
+        WHERE signal_code = 'ACTIVITY_CODE' AND COALESCE(company_id, '') != ''
+          AND instr(value_text, '/') > 1
+        GROUP BY 1, 2, 3, 4;
+    INSERT OR IGNORE INTO company_search_ids (company_id) SELECT id FROM companies;
+    DELETE FROM company_search;
+    INSERT INTO company_search (rowid, company_id, name, activity, place)
+        SELECT i.rid, s.company_id, s.name, s.activity, s.place
+        FROM company_search_source s
+        JOIN company_search_ids i ON i.company_id = s.company_id;
+
+    -- Every write path goes through these, so the index can't drift.
+    CREATE TRIGGER IF NOT EXISTS trg_company_search_insert
+    AFTER INSERT ON companies
+    BEGIN
+        INSERT OR IGNORE INTO company_search_ids (company_id) VALUES (NEW.id);
+        DELETE FROM company_search WHERE rowid =
+            (SELECT rid FROM company_search_ids WHERE company_id = NEW.id);
+        INSERT INTO company_search (rowid, company_id, name, activity, place)
+            SELECT i.rid, s.company_id, s.name, s.activity, s.place
+            FROM company_search_source s
+            JOIN company_search_ids i ON i.company_id = s.company_id
+            WHERE s.company_id = NEW.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_company_search_update
+    AFTER UPDATE OF name, industry, location, address ON companies
+    BEGIN
+        INSERT OR IGNORE INTO company_search_ids (company_id) VALUES (NEW.id);
+        DELETE FROM company_search WHERE rowid =
+            (SELECT rid FROM company_search_ids WHERE company_id = NEW.id);
+        INSERT INTO company_search (rowid, company_id, name, activity, place)
+            SELECT i.rid, s.company_id, s.name, s.activity, s.place
+            FROM company_search_source s
+            JOIN company_search_ids i ON i.company_id = s.company_id
+            WHERE s.company_id = NEW.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_company_search_delete
+    AFTER DELETE ON companies
+    BEGIN
+        DELETE FROM company_search WHERE rowid =
+            (SELECT rid FROM company_search_ids WHERE company_id = OLD.id);
+        DELETE FROM company_search_ids WHERE company_id = OLD.id;
+        DELETE FROM company_activities WHERE company_id = OLD.id;
+    END;
+
+    -- A company's activities change a row at a time (hundreds for some
+    -- companies), so these only mark it; the writer reindexes each marked
+    -- company once when it is done (StateManager._flush_company_search).
+    CREATE TABLE IF NOT EXISTS company_search_dirty (
+        company_id TEXT PRIMARY KEY
+    );
+
+    CREATE TRIGGER IF NOT EXISTS trg_company_activities_insert
+    AFTER INSERT ON company_activities
+    BEGIN
+        INSERT OR IGNORE INTO company_search_dirty (company_id) VALUES (NEW.company_id);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_company_activities_delete
+    AFTER DELETE ON company_activities
+    BEGIN
+        INSERT OR IGNORE INTO company_search_dirty (company_id) VALUES (OLD.company_id);
+    END;
+
+    -- An ACTIVITY_CODE observation ("8623/3") is also an activity of the
+    -- company, whichever collector wrote it.
+    CREATE TRIGGER IF NOT EXISTS trg_observations_activity
+    AFTER INSERT ON observations
+    WHEN NEW.signal_code = 'ACTIVITY_CODE' AND COALESCE(NEW.company_id, '') != ''
+         AND instr(NEW.value_text, '/') > 1
+    BEGIN
+        INSERT OR IGNORE INTO company_activities
+            (company_id, code, version, source, confidence)
+        VALUES (NEW.company_id,
+                substr(NEW.value_text, 1, instr(NEW.value_text, '/') - 1),
+                CAST(substr(NEW.value_text, instr(NEW.value_text, '/') + 1) AS INTEGER),
+                COALESCE(NULLIF(NEW.collector, ''), 'observation'),
+                COALESCE(NEW.confidence, 1.0));
+    END;
+    """,
 ]
+
+# Settings key: fingerprint of the CAEN nomenclature loaded into caen_classes.
+CAEN_REFERENCE_KEY = "caen_reference"
 
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
@@ -598,6 +808,64 @@ class StateManager:
                     await db.executescript(script)
                     await db.execute(f"PRAGMA user_version = {target}")
                     await db.commit()
+
+            await self._seed_caen(db)
+
+    async def _seed_caen(self, db) -> bool:
+        """Load the CAEN nomenclature into caen_classes when the shipped one
+        differs from what the database holds (first run, or an updated CSV),
+        then rebuild the search index so it reads the new names. True when
+        it changed anything."""
+        import hashlib
+
+        from harvey.caen import reference_rows
+
+        rows = reference_rows()
+        fingerprint = hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = ?", (CAEN_REFERENCE_KEY,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row and row[0] == fingerprint:
+            return False
+        await db.execute("DELETE FROM caen_classes")
+        await db.executemany(
+            "INSERT INTO caen_classes (code, version, name_ro, name_en, keywords) "
+            "VALUES (?, ?, ?, ?, ?)", rows)
+        await self._rebuild_company_search(db)
+        await db.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = CURRENT_TIMESTAMP", (CAEN_REFERENCE_KEY, fingerprint))
+        await db.commit()
+        return True
+
+    @staticmethod
+    async def _rebuild_company_search(db):
+        await db.execute(
+            "INSERT OR IGNORE INTO company_search_ids (company_id) SELECT id FROM companies")
+        await db.execute("DELETE FROM company_search")
+        await db.execute(
+            "INSERT INTO company_search (rowid, company_id, name, activity, place) "
+            "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
+            "FROM company_search_source s "
+            "JOIN company_search_ids i ON i.company_id = s.company_id")
+        await db.execute("DELETE FROM company_search_dirty")
+
+    @staticmethod
+    async def _flush_company_search(db):
+        """Reindex the companies whose activities changed, once each. Runs
+        in the writer's transaction, before its commit."""
+        await db.execute(
+            "DELETE FROM company_search WHERE rowid IN (SELECT i.rid "
+            "FROM company_search_ids i JOIN company_search_dirty d USING (company_id))")
+        await db.execute(
+            "INSERT INTO company_search (rowid, company_id, name, activity, place) "
+            "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
+            "FROM company_search_dirty d "
+            "JOIN company_search_ids i ON i.company_id = d.company_id "
+            "JOIN company_search_source s ON s.company_id = d.company_id")
+        await db.execute("DELETE FROM company_search_dirty")
 
     # ── Companies ──
 
@@ -804,6 +1072,115 @@ class StateManager:
                     changed.append(column)
             await db.commit()
         return changed
+
+    # ── Company activities (CAEN) and local search ──
+
+    async def set_company_activities(
+        self, company_id: str, classes, source: str, confidence: float = 1.0,
+    ) -> int:
+        """Make ``classes`` [(code, version)] the company's activities from
+        ``source``: new ones added, ones that source no longer lists
+        removed (a re-import of a newer registry dataset drops a class the
+        company gave up). Other sources' rows are left alone. Returns how
+        many were added."""
+        wanted = list(dict.fromkeys((str(c).zfill(4), int(v)) for c, v in classes))
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT code, version FROM company_activities "
+                "WHERE company_id = ? AND source = ?", (company_id, source),
+            ) as cur:
+                have = {(r[0], r[1]) for r in await cur.fetchall()}
+            gone = have - set(wanted)
+            fresh = [pair for pair in wanted if pair not in have]
+            await db.executemany(
+                "DELETE FROM company_activities WHERE company_id = ? AND code = ? "
+                "AND version = ? AND source = ?",
+                [(company_id, c, v, source) for c, v in gone])
+            await db.executemany(
+                "INSERT OR IGNORE INTO company_activities "
+                "(company_id, code, version, source, confidence) VALUES (?, ?, ?, ?, ?)",
+                [(company_id, c, v, source, confidence) for c, v in fresh])
+            await self._flush_company_search(db)
+            await db.commit()
+        return len(fresh)
+
+    async def get_company_activities(self, company_ids) -> dict[str, list[dict]]:
+        """company id -> [{code, version, revision, name, name_en, keywords,
+        confidence}], by code, newest revision first. Each class once,
+        whichever sources reported it."""
+        from harvey.caen import revision_label
+
+        ids = list(dict.fromkeys(company_ids))
+        out: dict[str, list[dict]] = {i: [] for i in ids}
+        if not ids:
+            return out
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                async with db.execute(
+                    f"""SELECT a.company_id, a.code, a.version,
+                               MAX(a.confidence) AS confidence,
+                               COALESCE(k.name_ro, '') AS name,
+                               COALESCE(k.name_en, '') AS name_en,
+                               COALESCE(k.keywords, '') AS keywords
+                        FROM company_activities a
+                        LEFT JOIN caen_classes k
+                          ON k.code = a.code AND k.version = a.version
+                        WHERE a.company_id IN ({marks})
+                        GROUP BY a.company_id, a.code, a.version
+                        ORDER BY a.code, a.version DESC""", chunk,
+                ) as cur:
+                    for r in await cur.fetchall():
+                        row = dict(r)
+                        row["revision"] = revision_label(row["version"])
+                        out[row.pop("company_id")].append(row)
+        return out
+
+    async def search_companies(
+        self, query: str, limit: int = 50, offset: int = 0,
+    ) -> tuple[int, list[dict]]:
+        """Companies on file matching every word of ``query``, best first,
+        and how many match in all.
+
+        Searched locally (SQLite FTS5) over the name, the activities (CAEN
+        code, its Romanian and English names and everyday words, plus any
+        industry or map category a source gave) and the place. Accents
+        don't matter, words of 3+ letters match as prefixes ("stomatolog"
+        finds "stomatologică"), and a 4-digit code matches that class in
+        every revision. Each company comes with its activities in words,
+        the ones the query matched first (``matched``)."""
+        match, terms = search_terms(query)
+        if not match:
+            return 0, []
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT COUNT(*) FROM company_search WHERE company_search MATCH ?", (match,)
+            ) as cur:
+                (total,) = await cur.fetchone()
+            async with db.execute(
+                """SELECT c.id, c.name, c.cui, c.location, c.address, c.phone,
+                          c.website, c.domain, c.industry, c.source,
+                          bm25(company_search, 0.0, 4.0, 2.0, 1.0) AS score
+                   FROM company_search
+                   JOIN companies c ON c.id = company_search.company_id
+                   WHERE company_search MATCH ?
+                   ORDER BY score, c.name LIMIT ? OFFSET ?""",
+                (match, limit, offset),
+            ) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        activities = await self.get_company_activities([r["id"] for r in rows])
+        for row in rows:
+            acts = activities.get(row["id"], [])
+            for a in acts:
+                a["matched"] = _activity_matches(a, terms)
+            acts.sort(key=lambda a: not a["matched"])      # stable: keeps code order
+            row["activities"] = acts
+        return total, rows
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
         async with self._connect() as db:
@@ -1664,6 +2041,7 @@ class StateManager:
                  value_num, value_text, float(confidence), evidence_url,
                  observed_at, run_id),
             )
+            await self._flush_company_search(db)
             await db.commit()
         return obs_id
 
@@ -1692,6 +2070,7 @@ class StateManager:
                            COALESCE(?, CURRENT_TIMESTAMP), ?)""",
                 payload,
             )
+            await self._flush_company_search(db)
             await db.commit()
         return len(payload)
 

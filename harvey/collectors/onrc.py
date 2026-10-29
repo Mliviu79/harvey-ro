@@ -12,10 +12,15 @@ dataset of '^'-separated, BOM-prefixed UTF-8 files:
 Together they answer "every operating dental practice in Brașov, and who
 runs it" for free, without a single search. The files are big (the firms
 file alone is ~700 MB), so nothing here loads one into memory: each is
-streamed once, in the order that keeps the working set smallest. Activity
-first (the classes you asked for, nationwide), then status (only for
-those), then firms (only those, in your county), then representatives
-(only for the firms kept).
+streamed, in the order that keeps the working set smallest. With an
+activity filter: activity first (the classes you asked for, nationwide),
+then status (only for those), then firms (only those, in your county).
+Without one (every activity in a county or town): the firms file for the
+area's registration numbers, status for those, the firms file again for
+the ones kept. Then the activity file again for every class the kept
+firms are authorised for (saved as company_activities, so they can be
+searched by code or in words), then representatives (only for the firms
+kept, and only when wanted).
 
 What is kept is deliberately narrow. The representatives file also carries
 birth dates and places and home localities; only a natural person's name
@@ -27,8 +32,9 @@ Once an import has read it, the downloaded representatives file is deleted
 dataset: only the current one stays on disk.
 
 Every fact lands as an observation with the dataset it came from, under
-the same confirmation gate as discovery: companies are saved because you
-asked for them by name of activity and place, but ACTIVITY_CODE,
+the same confirmation gate as discovery: companies (and what they are
+authorised to do, which describes them like their industry) are saved
+because you asked for them by activity and place, but ACTIVITY_CODE,
 CONTACT_FOUND and DECISION_MAKER_TITLE rows are written only when you
 confirmed those signals.
 """
@@ -461,6 +467,26 @@ def matching_registrations(path: Path, classes: set[tuple[str, int | None]]
     return out
 
 
+def authorised_codes(path: Path, regs) -> dict[str, list[tuple[str, int]]]:
+    """Registration number -> every class it is authorised for, any
+    revision (the pre-2008 ones too: they describe old registrations), in
+    file order. Only for ``regs``: the national file is streamed, and only
+    the codes of these registrations are held."""
+    out: dict[str, list[tuple[str, int]]] = {}
+    for reg, code, ver in read_rows(path, ("COD_INMATRICULARE", "COD_CAEN_AUTORIZAT",
+                                           "VER_CAEN_AUTORIZAT")):
+        reg = reg.strip()
+        if reg not in regs:
+            continue
+        code, version = code.strip().zfill(4), _version(ver)
+        if version is None or not code.isdigit():
+            continue
+        have = out.setdefault(reg, [])
+        if (code, version) not in have:
+            have.append((code, version))
+    return out
+
+
 def active_registrations(path: Path, regs) -> set[str]:
     """Which of these registrations are operating: status 1048 and none of
     the closing statuses. One with no status row at all isn't counted."""
@@ -511,23 +537,43 @@ def _localities(spec: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,;]", spec or "") if p.strip()]
 
 
+def _in_area(county: list[str] | str | None, locality: list[str] | str):
+    """A test for (county, locality) as the firms file spells them."""
+    wanted = [county] if isinstance(county, str) else list(county or [])
+    want_counties = {_fold(c) for c in wanted if c}
+    places = _localities(locality) if isinstance(locality, str) else list(locality)
+
+    def test(row_county: str, row_locality: str) -> bool:
+        if want_counties and _fold(row_county) not in want_counties:
+            return False
+        return not places or any(_locality_matches(p, row_locality) for p in places)
+    return test
+
+
+def registrations_in_area(path: Path, county: list[str] | str | None = None,
+                          locality: list[str] | str = "") -> set[str]:
+    """Every registration number whose registered office is in the area,
+    whatever it does: the first pass of an import with no activity filter.
+    Only the numbers are held; the firms are read again for those kept."""
+    inside = _in_area(county, locality)
+    return {reg.strip() for reg, row_county, row_locality in read_rows(
+        path, ("COD_INMATRICULARE", "ADR_JUDET", "ADR_LOCALITATE"))
+        if inside(row_county, row_locality)}
+
+
 def matching_firms(path: Path, regs, county: list[str] | str | None = None,
                    locality: list[str] | str = "") -> list[Firm]:
     """The firms among these registrations whose registered office is in one
     of the counties (all of Romania when none) and, when given, one of the
     localities."""
-    wanted = [county] if isinstance(county, str) else list(county or [])
-    want_counties = {_fold(c) for c in wanted if c}
-    places = _localities(locality) if isinstance(locality, str) else list(locality)
+    inside = _in_area(county, locality)
     out = []
     for row in read_rows(path, _FIRM_COLUMNS):
         rec = dict(zip(_FIRM_COLUMNS, row))
         reg = rec["COD_INMATRICULARE"].strip()
         if reg not in regs:
             continue
-        if want_counties and _fold(rec["ADR_JUDET"]) not in want_counties:
-            continue
-        if places and not any(_locality_matches(p, rec["ADR_LOCALITATE"]) for p in places):
+        if not inside(rec["ADR_JUDET"], rec["ADR_LOCALITATE"]):
             continue
         form = rec["FORMA_JURIDICA"].strip().upper()
         website, domain = _website(rec["WEB"])
@@ -570,13 +616,19 @@ def administrators(path: Path, regs) -> dict[str, list[tuple[str, str, str]]]:
 
 # ── The import ──
 
+PROGRESS_EVERY = 500
+
+
 @dataclass
 class ImportReport:
     dataset: str = ""
     classes: list[str] = field(default_factory=list)
-    authorised: int = 0          # registrations authorised for a wanted class
-    active: int = 0              # ... of which operating
-    in_area: int = 0             # ... of which in the county/locality
+    # With an activity filter: registrations authorised for a wanted class,
+    # of which operating, of which in the county/locality. Without one:
+    # registrations in the area, of which operating, and in_area == active.
+    authorised: int = 0
+    active: int = 0
+    in_area: int = 0
     catch_all_only: int = 0      # ... matched only on Rev.2's catch-all 8690
     shared_domain: int = 0       # website domain already held by another business
     excluded: int = 0            # on the do-not-contact list
@@ -584,6 +636,7 @@ class ImportReport:
     known_companies: int = 0
     updated_companies: int = 0
     administrators: int = 0
+    activities: int = 0          # company activities (CAEN classes) added
     observations: int = 0
     unconfirmed: list[str] = field(default_factory=list)
     run_id: str = ""
@@ -634,6 +687,16 @@ def activity_value(code: str, version: int) -> str:
     return f"{code}/{version}"
 
 
+def _industry_class(codes: list[tuple[str, int]]) -> tuple[str, int] | None:
+    """The class that names a company's industry when nothing was asked
+    for: its first Rev.3 class, else its first Rev.2 one, else its first."""
+    for version in (3, 2):
+        for pair in codes:
+            if pair[1] == version:
+                return pair
+    return codes[0] if codes else None
+
+
 def _location(firm: Firm) -> str:
     county = firm.county
     parts = [firm.locality] if firm.locality else []
@@ -648,11 +711,13 @@ async def import_registry(
     dataset: Dataset,
     *,
     county: str = "",
-    classes: list[tuple[str, int | None]],
+    classes: list[tuple[str, int | None]] | None = None,
     locality: str = "",
     active_only: bool = True,
     dry_run: bool = False,
     do_not_contact: list[str] | None = None,
+    with_administrators: bool = True,
+    progress=None,
 ) -> ImportReport:
     """Read the registry files and save what matches.
 
@@ -660,6 +725,13 @@ async def import_registry(
     whole country. ``classes`` are (code, version) pairs, version None for "Rev.2 or
     Rev.3"; their order picks which class names the company's industry
     (Rev.2's catch-all 8690 last, when it stands in for a narrower class).
+    No classes imports every activity in the area, which then needs a
+    county or a locality (the whole country would be millions of rows).
+    Either way every class a kept company is authorised for is saved as
+    its activities, so it can be searched by any of them later
+    (``harvey search``). ``with_administrators`` False leaves the
+    representatives file unread. ``progress(done, total)`` is called every
+    few hundred companies while saving.
     Companies are matched to what is on file by CUI, then by registration
     number, never by website domain alone (a domain another business holds
     is counted in ``shared_domain`` and left off); a known one has its gaps filled, never
@@ -673,33 +745,51 @@ async def import_registry(
     from harvey.gate import do_not_contact_domain_match
     from harvey.signals import seed_signal_catalog
 
+    classes = list(classes or [])
     report = ImportReport(dataset=dataset.name, dry_run=dry_run)
     report.classes = class_labels(classes)
     names = counties(county)
-    if not classes:
-        raise ValueError("no activity: give words or CAEN codes")
+    if not classes and not names and not _localities(locality):
+        raise ValueError("every activity needs an area: give a county or a locality "
+                         "(or words or CAEN codes to search the whole country)")
 
     await seed_signal_catalog(state)
     confirmed = await state.confirmed_signal_codes()
-    people_codes = {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed
-    report.unconfirmed = [c for c in ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE")
-                          if c not in confirmed]
+    people_codes = {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed \
+        if with_administrators else set()
+    wanted_codes = ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE") \
+        if with_administrators else ("ACTIVITY_CODE",)
+    report.unconfirmed = [c for c in wanted_codes if c not in confirmed]
 
-    authorised = matching_registrations(files["caen"], set(classes))
-    report.authorised = len(authorised)
-    keep = active_registrations(files["status"], authorised.keys()) if active_only \
-        else set(authorised)
+    # Streamed in the order that keeps the working set smallest. With an
+    # activity filter: the wanted classes nationwide, their status, the
+    # firms in the area. Without one: the area's registrations (numbers
+    # only), their status, the firms kept. Then every class of the kept
+    # firms, and their representatives.
+    if classes:
+        authorised = matching_registrations(files["caen"], set(classes))
+        report.authorised = len(authorised)
+        candidates = set(authorised)
+    else:
+        authorised = {}
+        candidates = registrations_in_area(files["firms"], names, locality)
+        report.authorised = len(candidates)
+    keep = active_registrations(files["status"], candidates) if active_only \
+        else candidates
     report.active = len(keep)
     firms = matching_firms(files["firms"], keep, names, locality)
     report.in_area = len(firms)
-    people = administrators(files["people"], {f.reg for f in firms}) \
+    kept_regs = {f.reg for f in firms}
+    all_codes = authorised_codes(files["caen"], kept_regs)
+    people = administrators(files["people"], kept_regs) \
         if people_codes and "people" in files else {}
 
     if not dry_run:
         report.run_id = await state.start_run("import", provider="onrc", params={
             "dataset": dataset.name, "county": ", ".join(names or []) or "Romania",
             "locality": locality,
-            "classes": report.classes, "active_only": active_only})
+            "classes": report.classes or ["all activities"], "active_only": active_only,
+            "administrators": with_administrators})
 
     order = {pair: i for i, pair in enumerate(classes)}
     vague = CATCH_ALL if _catch_all_is_vague(classes) else None
@@ -710,15 +800,26 @@ async def import_registry(
 
     evidence = dataset.page
     try:
-        for firm in firms:
+        for done, firm in enumerate(firms, start=1):
+            if progress and done % PROGRESS_EVERY == 0:
+                progress(done, len(firms))
             if firm.domain and do_not_contact_domain_match(firm.domain, do_not_contact or []):
                 report.excluded += 1
                 continue
-            matched = sorted(authorised[firm.reg], key=rank)
-            code, version = matched[0]
-            if (code, version) == vague:
-                report.catch_all_only += 1
-            industry = describe(code, version) or ""
+            codes = list(all_codes.get(firm.reg, []))
+            if classes:
+                matched = sorted(authorised[firm.reg], key=rank)
+                codes += [pair for pair in matched if pair not in codes]
+                if matched[0] == vague:
+                    report.catch_all_only += 1
+                first = matched[0]
+            else:
+                # Nothing asked for: the company's activities hold every
+                # class; ACTIVITY_CODE records only classes someone asked
+                # for (a whole county would be ~600k observations).
+                matched = []
+                first = _industry_class(codes)
+            industry = (describe(*first) or "") if first else ""
             external = f"onrc:{firm.reg}"
             # Only the legal identity merges. The registry's website field is
             # self-declared: a domain another business already holds may be
@@ -756,6 +857,11 @@ async def import_registry(
                     location=_location(firm), address=firm.address,
                     source=SOURCE, source_url=evidence,
                 ))
+
+            # What the company does, all of it: describes the record (like
+            # its industry), so it isn't held behind the signal gate.
+            report.activities += await state.set_company_activities(
+                company_id, codes, source=COLLECTOR)
 
             rows: dict[tuple[str, str], float] = {}     # (signal, value) -> confidence
             if "ACTIVITY_CODE" in confirmed:

@@ -141,7 +141,8 @@ SIGNAL_CATALOG: list[dict] = [
         "description": (
             "An activity the company is authorised for in Romania's trade "
             "registry (ONRC), as a 4-digit CAEN class such as 8623 for dental "
-            "practice: one row per class that matched your search words. "
+            "practice: one row per class that matched your search words "
+            "(every class, when the import named no activity). "
             "What the business is legally set up to do, as filed, not what "
             "its website says. The dataset and its date are kept with it."
         ),

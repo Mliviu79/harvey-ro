@@ -3,7 +3,11 @@
 The registry (ONRC) files every company under 4-digit CAEN classes, but
 nobody prospects by typing "8623": they type "dentist" or "stomatologie".
 This module turns words into class codes and codes back into words, from
-the nomenclature ONRC publishes as open data (reference/caen_ro.csv).
+the nomenclature ONRC publishes as open data (reference/caen_ro.csv). It is
+also the one source of the database's caen_classes table (reference_rows():
+names, English names and the synonyms below as everyday words per class),
+which the local company search reads, so "dentist" finds a company filed
+under 8623.
 
 Two revisions are live: Rev.2 (2008) and Rev.3 (2025). Most classes kept
 their number, but some split: Rev.2's 8690 "other human health" became
@@ -317,3 +321,37 @@ def describe(code, version=None) -> str | None:
 
 def revision_label(version: int) -> str:
     return REVISION_LABELS.get(version, f"v{version}")
+
+
+def lookup(code) -> list[Match]:
+    """Every revision of one class, newest first, the pre-2008 ones too:
+    what a code on a registration means, whatever year it was filed."""
+    code = _normalize_code(code)
+    return [_match(code, v, "code") for v in (3, 2, 1, 0) if (code, v) in _classes()]
+
+
+@lru_cache(maxsize=1)
+def _keywords() -> dict[tuple[str, int], str]:
+    """(code, version) -> the everyday words that point at it, from SYNONYMS
+    read backwards: 8623 carries "dentist dental ... stomatolog ortodont"."""
+    out: dict[tuple[str, int], list[str]] = {}
+    for phrase, classes in SYNONYMS.items():
+        for pair in classes:
+            words = out.setdefault(pair, [])
+            for word in phrase.split():
+                if word not in words:
+                    words.append(word)
+    return {pair: " ".join(words) for pair, words in out.items()}
+
+
+def keywords(code, version) -> str:
+    return _keywords().get((_normalize_code(code), int(version)), "")
+
+
+def reference_rows() -> list[tuple[str, int, str, str, str]]:
+    """(code, version, name_ro, name_en, keywords) for every class, every
+    revision: what the database's caen_classes table is seeded from, so
+    the file, this module and the table never disagree."""
+    return [(code, version, name, ENGLISH_NAMES.get((code, version), ""),
+             _keywords().get((code, version), ""))
+            for (code, version), name in sorted(_classes().items())]

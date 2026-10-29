@@ -555,3 +555,112 @@ async def test_several_counties(state, files):
 async def test_several_localities(state, files):
     report = await run(state, files, locality="Cristian, Cluj-Napoca", county="")
     assert report.in_area == 2        # B in Cristian, D in Cluj-Napoca
+
+
+# ── Activities: every class of a kept company, searchable ──
+
+def activities(state, cui):
+    with sqlite3.connect(state.db_path) as db:
+        return sorted(db.execute(
+            "SELECT a.code, a.version, a.source FROM company_activities a "
+            "JOIN companies c ON c.id = a.company_id WHERE c.cui = ?", (cui,)).fetchall())
+
+
+@pytest.mark.asyncio
+async def test_every_authorised_class_of_a_kept_company_is_saved(state, files):
+    # Asked for dentists; A is also authorised for specialist practice.
+    report = await run(state, files)
+    assert activities(state, "90000017") == [("8622", 2, "registry"), ("8623", 2, "registry")]
+    assert report.activities == 4         # A: 2, B: 1, H: 1
+    # The signal still records what was asked for, as before.
+    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
+    total, rows = await state.search_companies("8622")
+    assert [r["cui"] for r in rows] == ["90000017"] and total == 1
+
+
+@pytest.mark.asyncio
+async def test_activities_are_saved_without_the_signal_confirmed(state, files):
+    await state.set_signal_status("ACTIVITY_CODE", "proposed")
+    await run(state, files)
+    assert obs(state, "ACTIVITY_CODE") == []
+    assert activities(state, "90000025") == [("8623", 3, "registry")]
+
+
+@pytest.mark.asyncio
+async def test_a_class_the_registry_drops_is_dropped(state, files, tmp_path):
+    await run(state, files)
+    files["caen"] = write(tmp_path / "less.csv", [r for r in CAEN if r[1] != "8622"])
+    await run(state, files)
+    assert activities(state, "90000017") == [("8623", 2, "registry")]
+
+
+@pytest.mark.asyncio
+async def test_no_activity_imports_everything_operating_in_the_area(state, files):
+    report = await run(state, files, classes=[])
+    # Brașov registrations: A B C E F G H P Q R; C struck off, G dissolved.
+    assert report.classes == []
+    assert report.authorised == 10 and report.active == 8 and report.in_area == 8
+    assert report.new_companies == 8
+    pharmacy = await state.get_company_by_cui("90000066")
+    assert pharmacy.industry == "Pharmacies"
+    assert activities(state, "90000066") == [("4773", 2, "registry")]
+    # E's pre-2008 code is kept as filed, though it never matches a filter
+    # (and this one isn't in the nomenclature, so it names no industry).
+    assert activities(state, "90000058") == [("8623", 1, "registry")]
+    assert (await state.get_company_by_cui("90000058")).industry == ""
+    # Nothing was asked for, so no class is singled out as an observation:
+    # the activities above are the record.
+    assert obs(state, "ACTIVITY_CODE") == []
+
+
+@pytest.mark.asyncio
+async def test_progress_is_reported_while_saving(state, files, monkeypatch):
+    monkeypatch.setattr(onrc, "PROGRESS_EVERY", 3)
+    seen = []
+    await run(state, files, classes=[], progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(3, 8), (6, 8)]
+
+
+@pytest.mark.asyncio
+async def test_no_activity_and_no_area_is_refused(state, files):
+    with pytest.raises(ValueError, match="needs an area"):
+        await run(state, files, classes=[], county="")
+
+
+@pytest.mark.asyncio
+async def test_no_activity_in_one_locality(state, files):
+    report = await run(state, files, classes=None, county="", locality="Cristian")
+    assert report.in_area == 1 and await state.get_company_by_cui("90000025")
+
+
+@pytest.mark.asyncio
+async def test_administrators_none_reads_no_representatives(state, files):
+    files["people"].unlink()        # proves the file isn't opened
+    report = await run(state, files, with_administrators=False)
+    assert report.administrators == 0 and not report.errors
+    assert obs(state, "CONTACT_FOUND") == [] and obs(state, "DECISION_MAKER_TITLE") == []
+    assert report.unconfirmed == []
+    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
+
+
+def test_authorised_codes_reads_only_the_registrations_asked_for(files):
+    got = onrc.authorised_codes(files["caen"], {"J08/920/2012", "J08/500/1999"})
+    assert got == {"J08/920/2012": [("8690", 2), ("8695", 3)],
+                   "J08/500/1999": [("8623", 1)]}
+
+
+def test_registrations_in_area(files):
+    assert onrc.registrations_in_area(files["firms"], ["Cluj"]) == {"J12/400/2012"}
+    assert onrc.registrations_in_area(files["firms"], None, "Cristian") == {"J2025000200088"}
+
+
+def test_cli_every_activity_needs_an_area(monkeypatch, capsys):
+    import sys
+
+    from harvey import cli
+
+    monkeypatch.setattr(sys, "argv", ["harvey", "import-onrc", "--administrators", "none"])
+    with pytest.raises(SystemExit) as exit_:
+        cli.main()
+    assert exit_.value.code == 2
+    assert "give a --county or a --locality" in capsys.readouterr().out

@@ -610,11 +610,20 @@ def cmd_contacts(args):
 
 
 def cmd_caen(args):
-    """Romanian activity (CAEN) classes for some words. Offline, no Claude."""
-    from harvey.caen import revision_label, search
+    """What CAEN classes mean: a code's name in every revision, or the
+    classes some words point to. A reference, not a filter: to find
+    companies, harvey search. Offline, no Claude."""
+    from harvey.caen import lookup, revision_label, search
 
     words = " ".join(args.words)
-    matches = search(words, limit=args.limit)
+    tokens = words.replace(",", " ").split()
+    if tokens and all(t.isdigit() and len(t) <= 4 for t in tokens):
+        matches = [m for t in tokens for m in lookup(t)]
+        if not matches:
+            print(f"\n  No CAEN class {words}.\n")
+            return
+    else:
+        matches = search(words, limit=args.limit)
     if not matches:
         print(f"\n  No CAEN class matches \"{words}\". Try another word, in "
               "English or Romanian (e.g. dentist, farmacie, laborator).\n")
@@ -622,9 +631,79 @@ def cmd_caen(args):
     print()
     for m in matches:
         name = f"{m.name_ro} ({m.name_en})" if m.name_en else m.name_ro
-        print(f"  {m.code}  {revision_label(m.version):<5}  {name}")
-        print(f"               {m.why}")
-    print()
+        old = "  (pre-2008, old registrations)" if m.version < 2 else ""
+        print(f"  {m.code}  {revision_label(m.version):<5}  {name}{old}")
+        if m.why != "code":
+            print(f"               {m.why}")
+    print(f"\n  To find companies doing this: harvey search {words}\n")
+
+
+def _activity_lines(activities: list[dict], show_all: bool = False) -> tuple[list[str], int]:
+    """One line per class ("8623 — Activități de asistență stomatologică
+    (Dental practice)  Rev.2/3"), the matched ones only when any matched.
+    Returns the lines and how many classes were left out."""
+    from harvey.caen import revision_label
+
+    chosen = activities if show_all or not any(a.get("matched") for a in activities) \
+        else [a for a in activities if a.get("matched")]
+    lines: dict[tuple[str, str], list[int]] = {}
+    for a in chosen:
+        name = a.get("name") or ""
+        if a.get("name_en"):
+            name = f"{name} ({a['name_en']})" if name else a["name_en"]
+        lines.setdefault((a["code"], name), []).append(a["version"])
+    out = []
+    for (code, name), versions in lines.items():
+        labels = sorted(versions)
+        rev = ("Rev." + "/".join(str(v) for v in labels)) if set(labels) <= {2, 3} \
+            else "/".join(revision_label(v) for v in labels)
+        out.append(f"{code} — {name}  {rev}" if name else f"{code}  {rev}")
+    shown_codes = {a["code"] for a in chosen}
+    return out, len({a["code"] for a in activities} - shown_codes)
+
+
+def cmd_search(args):
+    """Companies on file, by what they do (CAEN code or words) and where,
+    searched locally. No Claude, no network."""
+    import json as _json
+
+    from harvey.state import StateManager
+
+    words = " ".join(args.words)
+
+    async def _search():
+        state = StateManager()
+        await state.init_db()
+        total, rows = await state.search_companies(words, limit=args.limit,
+                                                   offset=args.offset)
+        if args.json:
+            print(_json.dumps({"query": words, "total": total, "offset": args.offset,
+                               "companies": rows}, ensure_ascii=False, indent=2))
+            return
+        if not rows:
+            print(f"\n  No company on file matches \"{words}\". Search by name, "
+                  "activity (in English or Romanian, or a CAEN code like 8623) or town.\n")
+            return
+        print(f"\n  {total} compan{'y' if total == 1 else 'ies'} match \"{words}\""
+              + (f", showing {args.offset + 1}-{args.offset + len(rows)}"
+                 if total > len(rows) else "") + "\n")
+        for row in rows:
+            ident = f"  CUI {row['cui']}" if row.get("cui") else ""
+            print(f"  {row['name']}{ident}")
+            details = [x for x in (row.get("location"), row.get("phone"),
+                                   row.get("website") or row.get("domain")) if x]
+            if details:
+                print("    " + " · ".join(details))
+            lines, more = _activity_lines(row.get("activities") or [])
+            for line in lines:
+                print(f"    {line}")
+            if more:
+                print(f"    + {more} other activit{'y' if more == 1 else 'ies'}")
+            if not lines and row.get("industry"):
+                print(f"    {row['industry']}")
+            print()
+
+    asyncio.run(_search())
 
 
 def cmd_import_onrc(args):
@@ -648,10 +727,15 @@ def cmd_import_onrc(args):
             raise SystemExit(2)
         county = ", ".join(names) if names else "all of Romania"
         classes = onrc.parse_classes(args.activity or [], args.codes)
-        if not classes:
+        if (args.activity or args.codes.strip()) and not classes:
             print("\n  No CAEN class matches that activity. Try harvey caen <words>, "
                   "or give --codes 8623.\n")
             raise SystemExit(2)
+        if not classes and not names and not args.locality.strip():
+            print("\n  Every activity in the whole country is millions of companies: "
+                  "give a --county or a --locality, or an activity.\n")
+            raise SystemExit(2)
+        with_admins = args.administrators == "all"
 
         state = StateManager()
         await state.init_db()
@@ -659,7 +743,7 @@ def cmd_import_onrc(args):
         await seed_signal_catalog(state)
         confirmed = await state.confirmed_signal_codes()
         roles = [r for r in onrc.FILES if r != "people"
-                 or {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed]
+                 or (with_admins and {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed)]
 
         timeout = httpx.Timeout(60.0, read=300.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
@@ -675,18 +759,26 @@ def cmd_import_onrc(args):
                                            roles=roles, progress=progress)
 
         where = f"{args.locality}, {county}" if args.locality else county
-        print(f"  Looking for {', '.join(onrc.class_labels(classes))} in {where}"
+        what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
+        print(f"  Looking for {what} in {where}"
               f"{'' if args.include_inactive else ' (operating companies only)'}...\n")
         report = await onrc.import_registry(
             state, files, dataset, county=args.county, classes=classes,
             locality=args.locality, active_only=not args.include_inactive,
-            dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()))
+            dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
+            with_administrators=with_admins,
+            progress=lambda done, total: print(f"  saved {done:,} of {total:,}...", flush=True))
 
-        print(f"  {report.authorised} registrations authorised for "
-              f"{', '.join(report.classes)}")
-        if not args.include_inactive:
-            print(f"  {report.active} of them operating")
-        print(f"  {report.in_area} in {where}")
+        if classes:
+            print(f"  {report.authorised} registrations authorised for "
+                  f"{', '.join(report.classes)}")
+            if not args.include_inactive:
+                print(f"  {report.active} of them operating")
+            print(f"  {report.in_area} in {where}")
+        else:
+            print(f"  {report.authorised} registrations in {where}")
+            if not args.include_inactive:
+                print(f"  {report.active} of them operating")
         if report.catch_all_only:
             print(f"    {report.catch_all_only} of them only on the old catch-all code "
                   "8690 Rev.2, so may be other health activities")
@@ -701,6 +793,8 @@ def cmd_import_onrc(args):
         if "people" in roles:
             print(f"  {report.administrators} administrators named")
         if not report.dry_run:
+            print(f"  {report.activities} activities (CAEN classes) recorded, "
+                  "searchable with harvey search")
             print(f"  {report.observations} observations recorded")
         for code in report.unconfirmed:
             print(f"    {code} not confirmed, so not recorded "
@@ -1266,26 +1360,44 @@ def main():
     sub.set_defaults(func=cmd_contacts)
 
     sub = subparsers.add_parser(
-        "caen", help="Find Romanian activity (CAEN) codes by words, e.g. 'harvey caen dentist'")
+        "caen", help="What a Romanian activity (CAEN) code means, or the codes "
+                     "for some words: 'harvey caen 8623', 'harvey caen dentist'")
     sub.add_argument("words", nargs="+",
-                     help="What the business does, in English or Romanian")
+                     help="A CAEN code, or what the business does in English or Romanian")
     sub.add_argument("--limit", type=int, default=30,
                      help="Max classes to show (default: 30)")
     sub.set_defaults(func=cmd_caen)
 
     sub = subparsers.add_parser(
+        "search", help="Search companies on file by activity (words or CAEN code), "
+                       "name or town: 'harvey search stomatologie brasov'",
+        description="Searches the companies already on file, locally: every word "
+                    "must match the name, an activity (CAEN code, its Romanian or "
+                    "English name, everyday words like dentist) or the place. "
+                    "Accents don't matter. Nothing is fetched or sent.")
+    sub.add_argument("words", nargs="+", help="Words, CAEN codes or towns")
+    sub.add_argument("--limit", type=int, default=20,
+                     help="Max companies to show (default: 20)")
+    sub.add_argument("--offset", type=int, default=0, help="Skip this many first")
+    sub.add_argument("--json", action="store_true", help="Print JSON")
+    sub.set_defaults(func=cmd_search)
+
+    sub = subparsers.add_parser(
         "import-onrc",
-        help="Import Romanian companies by activity and county from the trade "
-             "registry's open data (free; ~1.5 GB download once per dataset)",
-        description="Finds operating companies in a county authorised for an "
-                    "activity (CAEN class), from ONRC's open data on data.gov.ro, "
-                    "with their administrators when CONTACT_FOUND is confirmed. "
+        help="Import Romanian companies by county (and optionally activity) from "
+             "the trade registry's open data (free; ~1.5 GB download once per dataset)",
+        description="Finds operating companies in a county, authorised for an "
+                    "activity (CAEN class) or for any, from ONRC's open data on "
+                    "data.gov.ro, with every class each is authorised for (search "
+                    "them with harvey search) and their administrators when "
+                    "CONTACT_FOUND is confirmed. "
                     "A company already on file keeps what it has, with its gaps "
                     "filled, except the registered address, which the registry's "
                     "replaces. No Claude calls, and nothing is sent.")
     sub.add_argument("activity", nargs="*",
                      help="What the business does, in English or Romanian, one per "
-                          "argument (dentist farmacie); quote a phrase: \"medic de familie\"")
+                          "argument (dentist farmacie); quote a phrase: \"medic de familie\". "
+                          "Omit for every activity in the --county/--locality")
     sub.add_argument("--county", default="",
                      help="County names or codes, comma-separated: Brașov, Brasov or BV "
                           "(Bucharest is B). Omit for the whole country")
@@ -1301,6 +1413,10 @@ def main():
                           "downloaded); save nothing")
     sub.add_argument("--data-dir", default="",
                      help="Where the dataset files are cached (default: data/onrc)")
+    sub.add_argument("--administrators", choices=("all", "none"), default="all",
+                     help="all: name each company's administrators (when CONTACT_FOUND "
+                          "is confirmed; the default); none: don't read the "
+                          "representatives file")
     sub.add_argument("--keep-download", action="store_true",
                      help="Keep the representatives file after the import (it holds "
                           "every representative's birth data, so it is deleted by default)")
