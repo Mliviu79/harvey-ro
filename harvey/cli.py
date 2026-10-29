@@ -391,12 +391,20 @@ def cmd_usage(args):
 def cmd_export(args):
     """Export the prospect list as a sequencer-ready CSV."""
     from harvey.state import StateManager
-    from harvey.export import export_prospects_csv
+    from harvey.export import export_companies_csv, export_prospects_csv
 
     async def _export():
         state = StateManager()
         await state.init_db()
 
+        if args.companies:
+            out = args.out or "companies.csv"
+            count, _ = await export_companies_csv(state, out_path=out)
+            print(f"\n  Exported {count} companies to {out}  (one row per business, "
+                  "with its best contact where one was found)\n")
+            return
+
+        args.out = args.out or "prospects.csv"
         email_statuses = None
         if args.email_status:
             email_statuses = [s.strip() for s in args.email_status.split(",") if s.strip()]
@@ -550,6 +558,55 @@ def cmd_profile(args):
         print("\n  See what turned up: harvey dashboard → Signals\n")
 
     asyncio.run(_profile())
+
+
+async def backfill_contacts(make_scout, state, limit: int) -> tuple[int, int]:
+    """Run Scout's known-companies backfill until the backlog or ``limit`` runs out.
+
+    Returns (companies checked, contacts found). A fresh Scout per batch, as a
+    heartbeat cycle would have, so per-cycle caches don't pile up. Stops when
+    a batch holds only companies this run already handed to Scout: those
+    weren't marked checked, and asking again would loop forever.
+    """
+    from harvey.agents.scout import MAX_COMPANIES_PER_CYCLE
+
+    seen: set[str] = set()
+    found = 0
+    while len(seen) < limit:
+        batch = await state.companies_needing_prospects(limit=MAX_COMPANIES_PER_CYCLE)
+        new = {c["id"] for c in batch} - seen
+        if not new:
+            break
+        seen |= new
+        found += await make_scout()._prospect_via_known_companies()
+    return len(seen), found
+
+
+def cmd_contacts(args):
+    """Find contacts at companies already on file. Writes and sends nothing."""
+    from harvey.brain import Brain
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+    from harvey.agents.scout import Scout
+
+    async def _contacts():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        brain = Brain(state, config.brain)
+        await state.init_db()
+
+        print(f"\n  Looking for contacts at up to {args.limit} companies on file...\n")
+        checked, found = await backfill_contacts(
+            lambda: Scout(brain, state, config, env), state, args.limit)
+        if not checked:
+            print("  Nothing to check. Every company with a website has been "
+                  "looked at recently.\n")
+            return
+        print(f"  Checked {checked} companies → {found} contacts found")
+        print("  Get the list: harvey export --companies  (or --all for every contact)\n")
+
+    asyncio.run(_contacts())
 
 
 def cmd_discover(args):
@@ -1010,7 +1067,8 @@ def main():
     sub = subparsers.add_parser(
         "export", help="Export prospects as a sequencer-ready CSV"
     )
-    sub.add_argument("--out", default="prospects.csv", help="Output file (default: prospects.csv)")
+    sub.add_argument("--out", default="",
+                     help="Output file (default: prospects.csv, or companies.csv with --companies)")
     sub.add_argument(
         "--email-status", default="",
         help="Comma-separated statuses to include (default: verified,risky)",
@@ -1018,6 +1076,9 @@ def main():
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
     sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
     sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
+    sub.add_argument("--companies", action="store_true",
+                     help="One row per company (phone, location, best contact if any), "
+                          "including companies with no email found; other filters don't apply")
     sub.set_defaults(func=cmd_export)
 
     # harvey gmail auth|test
@@ -1076,6 +1137,18 @@ def main():
     sub.add_argument("--stale-days", type=int, default=90,
                      help="Re-read a site after this many days (default: 90)")
     sub.set_defaults(func=cmd_profile)
+
+    sub = subparsers.add_parser(
+        "contacts",
+        help="Find contacts at companies already on file (reads their sites; "
+             "no Claude calls, writes and sends nothing)",
+        description="Reads each company's own website for its owner or team and "
+                    "resolves their email. No Claude calls and nothing is written "
+                    "or sent, but email verification uses your Reoon/ZeroBounce/"
+                    "Hunter credits when those keys are set.")
+    sub.add_argument("--limit", type=int, default=200,
+                     help="Max companies to check, in batches of 10 (default: 200)")
+    sub.set_defaults(func=cmd_contacts)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")

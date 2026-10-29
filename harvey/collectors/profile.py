@@ -101,16 +101,31 @@ GOOGLE_ADS = (r"googleadservices\.com", r"gtag/js\?id=AW-", r"google_conversion"
               r"googletagmanager\.com/gtag/js\?id=AW-")
 META_PIXEL = (r"connect\.facebook\.net/[^\"']*fbevents\.js", r"fbq\s*\(\s*['\"]init")
 
+# Between Romanian words in raw HTML: a space, &nbsp;, or a URL's - or _.
+_RO_GAP = r"(?:[-_\s]|&nbsp;|&#160;)"
 BOOKING_HINTS = (r"calendly\.com", r"acuityscheduling", r"schedulicity",
                  r"squareup\.com/appointments", r"setmore", r"book(ing)?[-_]?now",
                  r"schedule[-_]?(an?[-_])?(appointment|estimate|consultation)",
-                 r"housecallpro", r"getjobber\.com", r"servicetitan")
+                 r"housecallpro", r"getjobber\.com", r"servicetitan",
+                 # Romanian: "programare(a) online", "programări online",
+                 # "programează-te (acum) online", "programează o consultație online",
+                 # "rezervă online". Each needs "online": "Programează-te telefonic"
+                 # and "Fă o programare la 0712 000 000" are phone booking.
+                 # A negation ("nu facem programări online") still matches.
+                 rf"program[aă]r(?:[ei]|ea){_RO_GAP}?online",
+                 rf"programeaz[aă]{_RO_GAP}?te{_RO_GAP}+(?:acum{_RO_GAP}+)?online",
+                 rf"programeaz[aă]{_RO_GAP}o{_RO_GAP}consulta[tțţ]ie{_RO_GAP}+online",
+                 rf"rezerv[aă]{_RO_GAP}?online")
 
 AI_CRAWLERS = ("gptbot", "google-extended", "ccbot", "anthropic-ai", "claudebot",
                "perplexitybot", "bytespider")
 
 TEAM_PATHS = ("/team", "/about", "/about-us", "/our-team", "/staff",
               "/leadership", "/meet-the-team", "/company/team")
+# A .ro site's team page is named in Romanian; tried first on .ro domains only.
+# The first page that exists is the only one read, so /contact (which most
+# .ro sites have) goes after every team page, never before them.
+RO_TEAM_PATHS = ("/echipa", "/echipa-noastra", "/medici", "/despre-noi")
 CAREERS_PATHS = ("/careers", "/jobs", "/join-us", "/employment", "/hiring",
                  "/about/careers", "/careers/")
 # A homepage link to the careers page beats guessing paths: careers.acme.com
@@ -168,7 +183,7 @@ def _is_name_token(token: str) -> bool:
 # Block-level tags separate a name, its title, and the bio that follows; the
 # first text chunk after the name heading is the title, nothing further.
 _BLOCK_BREAK = re.compile(r"(?i)<(?:/?(?:p|div|li|ul|ol|section|article|td|tr)\b[^>]*|br\s*/?)>")
-_CONNECTORS = frozenset("of and the for & to in at".split())
+_CONNECTORS = frozenset("of and the for & to in at de în și".split())
 
 
 def _title_chunks(raw_after: str) -> list[str]:
@@ -182,6 +197,14 @@ def _title_chunks(raw_after: str) -> list[str]:
     return chunks
 
 
+# Romanian titles are sentence case: "Medic primar medicină de familie" is a
+# title, not copy, when it opens with a role word. "Director" is left out: it
+# is English too, and "Director with over twenty years..." is a sentence.
+_RO_TITLE_START = re.compile(
+    r"(?i)^(?:medic|fondator|fondatoare|farmacist[ăa]?|stomatolog|coordonator|"
+    r"coordonatoare|asistent[ăa]?|kinetoterapeut[ăa]?|proprietar[ăa]?|psiholog)\b")
+
+
 def _reads_like_title(text: str) -> bool:
     """A job title is short and mostly capitalised; a sentence is neither.
 
@@ -192,7 +215,8 @@ def _reads_like_title(text: str) -> bool:
     if not words or len(words) > 10:
         return False
     lower = [w for w in words[1:] if w[:1].islower() and w.lower() not in _CONNECTORS]
-    return len(lower) <= 2 and title_looks_like_role(text)
+    limit = 6 if _RO_TITLE_START.match(text) else 2
+    return len(lower) <= limit and title_looks_like_role(text)
 
 DECISION_MAKER_TITLES = (
     "owner", "founder", "co-founder", "president", "ceo", "principal",
@@ -200,6 +224,8 @@ DECISION_MAKER_TITLES = (
     "office manager", "marketing director", "marketing manager",
     "director of marketing", "vice president", "vp ", "managing director",
     "chief", "director",
+    # Romanian ("director medical" is covered by "director")
+    "fondator", "fondatoare", "proprietar", "medic coordonator", "medic coordonatoare",
 )
 
 
@@ -210,7 +236,11 @@ ROLE_HINT = re.compile(
     r"office|project|account|service|technician|installer|inspector|"
     r"vice president|vp|executive|lead|head of|chief|proprietor|attorney|lawyer|"
     r"dentist|orthodontist|periodontist|endodontist|hygienist|dds|dmd|esq|cpa|"
-    r"administrator|paralegal|associate|co-?owner|co-?founder)\b", re.I)
+    r"administrator|paralegal|associate|co-?owner|co-?founder|"
+    # Romanian; [ăa] takes the feminine form with or without its accent
+    r"medic|stomatolog|ortodont|farmacist[ăa]?|fondator|fondatoare|proprietar[ăa]?|"
+    r"asistent[ăa]?|kinetoterapeut[ăa]?|fizioterapeut[ăa]?|psiholog|coordonator|"
+    r"coordonatoare)\b", re.I)
 
 
 def title_looks_like_role(text: str) -> bool:
@@ -1016,7 +1046,8 @@ class ProfileCollector:
         customer quoted as "Founder at Quillnest") are rejected.
         """
         from harvey.collectors.people import (
-            drop_quoted, people_from_lines, split_person_name, title_names_other_org,
+            NAME_LOWER, NAME_UPPER, drop_quoted, people_from_lines,
+            romanian_title_needs_honorific, split_person_name, title_names_other_org,
         )
 
         text_html = _strip_code(drop_quoted(html))
@@ -1040,8 +1071,9 @@ class ProfileCollector:
         # Tag names match any case; the NAME must not — under a blanket (?i)
         # "Customer care" passes the Firstname Lastname capitalisation test.
         for m in re.finditer(
-            r"(?s)<((?i:h[1-5]|strong|b))[^>]*>\s*((?:Dr\.?\s+)?[A-Z][a-z'\-]+(?:\s+[A-Z]\.?)?"
-            r"(?:\s+(?:[A-Z][a-zA-Z'\-]+|van|von|de|der|del|la|le|di|da)){1,3}"
+            rf"(?s)<((?i:h[1-5]|strong|b))[^>]*>\s*((?:(?:Prof\.?\s+)?Dr\.?\s+)?"
+            rf"[{NAME_UPPER}][{NAME_LOWER}'\-]+(?:\s+[{NAME_UPPER}]\.?)?"
+            rf"(?:\s+(?:[{NAME_UPPER}][{NAME_UPPER}{NAME_LOWER}'\-]+|van|von|de|der|del|la|le|di|da)){{1,3}}"
             r"(?:,?\s+(?:DDS|DMD|MD|Esq\.?|CPA|Jr\.?|Sr\.?|II|III))?)\s*</(?i:\1)>(?=(.{0,220}))",
             text_html
         ):
@@ -1076,7 +1108,12 @@ class ProfileCollector:
                           if _reads_like_title(c)), "")
             if not title:
                 continue
-            add(split[0], split[1], title, re.sub(r"(?i)^dr\.?\s+", "", name))
+            # "Igienizare Profesională" over "Medic primar stomatolog" is a
+            # service card; a Romanian medical title needs a Dr./Prof. name.
+            full_name = re.sub(r"(?i)^(?:prof\.?\s+)?dr\.?\s+", "", name)
+            if full_name == name and romanian_title_needs_honorific(title):
+                continue
+            add(split[0], split[1], title, full_name)
         # Name and title on consecutive lines, or "Name, Title" on one.
         for p in people_from_lines(html, domain, site_name):
             if all(_is_name_token(t) for t in p["first_name"].split() + p["last_name"].split()):
@@ -1246,7 +1283,10 @@ class ProfileCollector:
 
         # team page → people
         if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE"):
-            turl, thtml = await self._first_present(site, TEAM_PATHS)
+            paths = TEAM_PATHS
+            if domain.lower().rstrip(".").endswith(".ro"):
+                paths = RO_TEAM_PATHS + TEAM_PATHS + ("/contact",)
+            turl, thtml = await self._first_present(site, paths)
             if thtml:
                 for person in self.detect_people(thtml, domain=domain,
                                                  site_name=self.site_names.get(company_id, "")):

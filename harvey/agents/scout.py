@@ -79,6 +79,8 @@ MAX_SITE_PAGES = 6
 # inbox pages, the check that a second domain is theirs — shares this cap.
 MAX_SITE_FETCHES = 10
 FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us")
+# A .ro site's pages are named in Romanian; those go first, inside the same cap.
+RO_FALLBACK_SITE_PATHS = ("/despre-noi", "/echipa", "/contact")
 # Named decision makers taken from one company per visit, likeliest first.
 MAX_CONTACTS_PER_COMPANY = 2
 # With no evidence of a company's email format, guess first@ only when
@@ -92,9 +94,14 @@ LOCAL_BUSINESS_SOURCES = ("discover:osm", "discover:dataforseo_listings")
 # Company-inbox fallback: pages that publish a general address, and the
 # only mailboxes it will use, most likely read by the owner first. An
 # allowlist, not a blocklist: a personal address (jane.doe@) on a contact
-# page is a person Harvey chose not to target, never "the team".
+# page is a person Harvey chose not to target, never "the team". A
+# practice's own mailbox (cabinet@, clinica@, farmacia@) reads like office@;
+# its front desk (reception@, receptie@, programari@) comes after the general
+# inbox.
 INBOX_PAGES = ("/contact", "/contact-us")
-INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
+INBOX_PREFERRED = ("owner", "office", "cabinet", "clinica", "farmacia", "farmacie",
+                   "info", "contact", "contactus", "hello", "reception", "frontdesk",
+                   "receptie", "receptia", "secretariat", "programari", "programare",
                    "team", "service", "sales", "estimates", "quotes",
                    "inquiries", "enquiries", "admin", "support")
 MAX_PROSPECTS_PER_CYCLE = 25
@@ -1443,7 +1450,10 @@ Respond ONLY with the JSON array."""
 
         links = people_mod.menu_links(home_text, home_url, limit=MAX_SITE_PAGES - 1)
         if len(links) < 2:
-            links += [f"{base}{p}" for p in FALLBACK_SITE_PATHS]
+            paths = FALLBACK_SITE_PATHS
+            if key.endswith(".ro"):
+                paths = tuple(dict.fromkeys(RO_FALLBACK_SITE_PATHS + paths))
+            links += [f"{base}{p}" for p in paths]
         for url in links:
             if len(site["pages"]) >= MAX_SITE_PAGES:
                 break

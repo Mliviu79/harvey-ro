@@ -10,7 +10,7 @@ import csv
 import io
 import logging
 
-from harvey.gate import do_not_contact_match
+from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.export")
@@ -21,6 +21,15 @@ CSV_COLUMNS = [
     "email", "first_name", "last_name", "company_name", "title",
     "website", "linkedin_url", "industry", "personalization",
     "email_status", "score", "seniority", "source", "status", "created_at",
+    # Appended, not inserted, so existing sequencer column mappings still line up.
+    "phone", "location",
+]
+
+# One row per business, whether or not anyone there has an email yet: for a
+# local business the phone and the address are often all there is.
+COMPANY_CSV_COLUMNS = [
+    "name", "website", "domain", "phone", "location", "industry",
+    "email", "email_status", "contact_name", "contact_title", "source",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -71,6 +80,8 @@ async def collect_prospects(
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, params) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
+        async with db.execute("SELECT id, phone, location FROM companies") as cursor:
+            companies = {r["id"]: dict(r) for r in await cursor.fetchall()}
 
     if not include_all:
         # A list for another sequencer is still contact: leave out anyone on
@@ -80,6 +91,7 @@ async def collect_prospects(
 
     out = []
     for r in rows:
+        company = companies.get(r.get("company_id") or "", {})
         out.append({
             "email": r.get("email", ""),
             "first_name": r.get("first_name", ""),
@@ -96,6 +108,78 @@ async def collect_prospects(
             "source": r.get("source", ""),
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
+            "phone": r.get("phone") or company.get("phone") or "",
+            "location": company.get("location") or "",
+        })
+    return out
+
+
+# Which contact speaks for a company in the business export: the most
+# deliverable address first, then the higher score. An invalid (bounced)
+# address is never shown: that contact ranks below one with no email at all
+# and, if picked anyway, is exported without its address.
+_EMAIL_STATUS_RANK = {"verified": 0, "risky": 1, "guess": 2}
+
+
+async def collect_companies(state: StateManager, config=None) -> list[dict]:
+    """One export-ready dict per company, with its best contact if any.
+
+    Suppression mirrors the prospect export: a company whose domain is on
+    compliance.do_not_contact is left out, and an opted-out prospect or an
+    address on that list is never the contact shown.
+    """
+    import aiosqlite
+
+    async with aiosqlite.connect(state.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM companies ORDER BY name COLLATE NOCASE, created_at"
+        ) as cursor:
+            companies = [dict(r) for r in await cursor.fetchall()]
+        async with db.execute(
+            "SELECT * FROM prospects WHERE company_id != '' AND status IS NOT ?",
+            ("opted_out",),
+        ) as cursor:
+            prospects = [dict(r) for r in await cursor.fetchall()]
+
+    entries = _do_not_contact(config)
+    by_company: dict[str, list[dict]] = {}
+    for p in prospects:
+        if do_not_contact_match(p.get("email") or "", entries):
+            continue
+        if p.get("email_status") == "invalid":
+            p = {**p, "email": "", "bounced": True}
+        by_company.setdefault(p["company_id"], []).append(p)
+
+    out = []
+    for c in companies:
+        if do_not_contact_domain_match(c.get("domain") or "", entries):
+            continue
+        contacts = sorted(
+            by_company.get(c["id"], []),
+            key=lambda p: (
+                not p.get("email"),
+                bool(p.get("bounced")),
+                _EMAIL_STATUS_RANK.get(p.get("email_status") or "", 3),
+                -(p.get("score") or 0),
+            ),
+        )
+        best = contacts[0] if contacts else {}
+        name = " ".join(
+            part for part in (best.get("first_name"), best.get("last_name")) if part
+        )
+        out.append({
+            "name": c.get("name", ""),
+            "website": c.get("website", ""),
+            "domain": c.get("domain", ""),
+            "phone": c.get("phone") or best.get("phone") or "",
+            "location": c.get("location", ""),
+            "industry": c.get("industry", ""),
+            "email": best.get("email", ""),
+            "email_status": best.get("email_status", "") if best.get("email") else "",
+            "contact_name": name,
+            "contact_title": best.get("title", ""),
+            "source": c.get("source", ""),
         })
     return out
 
@@ -116,9 +200,9 @@ def _do_not_contact(config) -> list[str]:
                           "Fix it before exporting.") from e
 
 
-def to_csv(rows: list[dict]) -> str:
+def to_csv(rows: list[dict], columns: list[str] = CSV_COLUMNS) -> str:
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
         writer.writerow(row)
@@ -151,4 +235,17 @@ async def export_prospects_csv(
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             f.write(text)
         logger.info(f"Exported {len(rows)} prospects to {out_path}")
+    return len(rows), text
+
+
+async def export_companies_csv(
+    state: StateManager, out_path: str | None = None, config=None,
+) -> tuple[int, str]:
+    """Export one row per company to CSV. Returns (row_count, csv_text)."""
+    rows = await collect_companies(state, config=config)
+    text = to_csv(rows, COMPANY_CSV_COLUMNS)
+    if out_path:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            f.write(text)
+        logger.info(f"Exported {len(rows)} companies to {out_path}")
     return len(rows), text

@@ -20,6 +20,7 @@ Each person comes back as a dict:
 import html as html_lib
 import json
 import re
+import unicodedata
 from urllib.parse import unquote, urljoin, urlparse
 
 from harvey.collectors.profile import (
@@ -27,6 +28,17 @@ from harvey.collectors.profile import (
 )
 
 # ── what a name is ───────────────────────────────────────────────────────
+
+# Letters a name may be spelled with, as regex character-class contents:
+# ASCII plus the accented Latin letters ("Ștefan Mureșan", "José Núñez").
+NAME_UPPER = "A-Z" + "".join(c for c in map(chr, range(0xC0, 0x250)) if c.isupper() and c.isalpha())
+NAME_LOWER = "a-z" + "".join(c for c in map(chr, range(0xC0, 0x250)) if c.islower() and c.isalpha())
+
+
+def fold_ascii(text: str) -> str:
+    """"Echipă" -> "Echipa", "Mureșan" -> "Muresan": accents dropped."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c))
+
 
 # Ordinary words that headings, nav links and section titles are built from.
 # One of these in a "name" means it isn't one ("Team of Experts", "Meet The
@@ -52,20 +64,37 @@ software sports medicine fitness salon spa dental medical clinic insurance finan
 properties inc llc pllc ltd corp co
 coach pastor father mother judge mayor senator governor captain sergeant sheriff officer
 uncle aunt grandpa grandma mom dad memory memoriam late former
-""".split())
+""".split()) | frozenset("""
+echipa noastra nostru nostri noastre noi despre cine suntem medic medici medicii medicul doctorul
+specialist specialisti specialistii personal medicala medicale clinica clinici cabinet cabinetul
+stomatologie stomatologic stomatologica dentar dentara farmacie farmacia laborator analize centru
+recuperare kinetoterapie fizioterapie programare programari programeaza acum servicii preturi
+tarife acasa bine ati venit pacienti pacientii sanatate pentru
+chirurgie ortodontie parodontologie endodontie pedodontie profilaxie implant implantologie
+radiologie protetica proteze fatete ceramice dentare stomatologice digitala moderna orala
+microscop urgente copii adulti intrebari frecvente politica cookies termeni conditii
+confidentialitate galerie foto program lucru orar luni miercuri vineri sambata duminica
+consultatie consultatii valorile misiunea viziunea tehnologie clinicii strada str bulevardul
+bd calea piata soseaua sef farmacist contacteaza recenzii sfantul sfanta sf
+""".split())   # Romanian, compared with accents folded ("Noastră" -> "noastra").
+# Left out because they are also given names or surnames: prima, joi,
+# marti, laser; and ne, which is too short to be safe. The heading's other word
+# catches "Prima Consultație", "Parodontologie Laser", "Contactează Ne".
 
 # Particles that sit lower-case inside a surname ("Van de Wal", "de la Cruz").
 _PARTICLES = frozenset("van von de der den del della di da la le du dos das st".split())
-_HONORIFIC = re.compile(r"^(?:dr|mr|mrs|ms|miss|prof|rev|hon)\.?\s+", re.I)
+# A run of them: "Prof. Dr.", "Conf. univ. dr."
+_HONORIFIC = re.compile(r"^(?:(?:dr|mr|mrs|ms|miss|prof|rev|hon|conf|univ)\.?\s+)+", re.I)
 # Credentials and suffixes that follow a name: "John Smith, DDS", "Calvin Marsh, Esq."
 _CREDENTIAL = (r"(?:dds|dmd|md|do|dvm|od|phd|jd|esq|cpa|pe|ra|rn|np|pa|mba|ms|ma|"
                r"facs|fagd|ccc-slp|jr|sr|ii|iii|iv)")
 _CREDENTIAL_TAIL = re.compile(rf"(?:\s*,?\s+{_CREDENTIAL}\.?)+\s*$", re.I)
-_NAME_TOKEN = re.compile(r"^[A-Z][a-z]+(?:[-'’][A-Z]?[a-z]+)*\.?$|^[A-Z]\.$|^[A-Z]$")
+_NAME_WORD = rf"[{NAME_UPPER}][{NAME_LOWER}]+(?:[-'’][{NAME_UPPER}]?[{NAME_LOWER}]+)*"
+_NAME_TOKEN = re.compile(rf"^{_NAME_WORD}\.?$|^[{NAME_UPPER}]\.$|^[{NAME_UPPER}]$")
 
 
 def _word_ok(token: str) -> bool:
-    low = token.strip(".,'’").lower()
+    low = fold_ascii(token.strip(".,'’")).lower()
     if not low or low in COMMON_WORDS or low in NON_NAME_WORDS:
         return False
     return not _NOUN_SUFFIX.search(low)
@@ -90,7 +119,7 @@ def split_person_name(text: str) -> tuple[str, str] | None:
     if any(ch.isdigit() for ch in text) or "@" in text:
         return None
     first = tokens[0]
-    if not re.match(r"^[A-Z][a-z]+(?:[-'’][A-Z]?[a-z]+)*$", first) or not _word_ok(first):
+    if not re.match(rf"^{_NAME_WORD}$", first) or not _word_ok(first):
         return None
     rest = tokens[1:]
     # Surname: any particles that start it, then capitalised words.
@@ -103,7 +132,8 @@ def split_person_name(text: str) -> tuple[str, str] | None:
         if not (_NAME_TOKEN.match(t) and (len(t.strip(".")) == 1 or _word_ok(t))):
             return None
     last_word = surname[-1]
-    if not re.match(r"^[A-Z][a-zA-Z]*(?:[-'’][A-Z]?[a-zA-Z]+)*$", last_word) or len(last_word) < 2:
+    if not re.match(rf"^[{NAME_UPPER}][{NAME_UPPER}{NAME_LOWER}]*(?:[-'’][{NAME_UPPER}]?[{NAME_UPPER}{NAME_LOWER}]+)*$",
+                    last_word) or len(last_word) < 2:
         return None
     if last_word.isupper() and len(last_word) > 2:      # "RAY T", "HVAC"
         return None
@@ -126,9 +156,12 @@ def is_person_name(text: str) -> bool:
 _OWNER_FAMILY = ("owner", "co-owner", "founder", "co-founder", "cofounder", "president",
                  "ceo", "chief executive", "chief executive officer", "principal",
                  "proprietor", "managing partner", "founding partner", "managing member",
-                 "owner/operator", "owner-operator")
+                 "owner/operator", "owner-operator",
+                 "fondator", "fondatoare", "co-fondator", "cofondator", "proprietar")
 _OWNER_TITLE = re.compile(
     r"\b(?:co-?owner|owner|co-?founder|founder|proprietor|ceo|chief executive(?: officer)?|"
+    # Romanian; "proprietar" stops short of English "proprietary" at the \b
+    r"(?:co-?)?fondator(?:ul)?|(?:co-?)?fondatoare(?:a)?|proprietar[ăa]?|"
     r"president|managing (?:partner|member)|founding (?:partner|attorney|dentist|doctor)|"
     r"principal(?! (?:designer|engineer|consultant|architect|associate|scientist|developer)))\b", re.I)
 # Words that make an owner title about someone else ("Assistant to the CEO")
@@ -154,6 +187,40 @@ def is_owner_title(title: str) -> bool:
     if not title or _SUBORDINATE.search(title) or _FORMER.search(title):
         return False
     return bool(_OWNER_TITLE.search(title) or _PARTNER_ONLY.match(title))
+
+
+# Romanian role words. On their own they are weak evidence: a service heading
+# ("Sedare Conștientă", "Ecografie Doppler") reads as a name, and the line
+# under it is often "Medic primar ...". "specialist" is a role word in both
+# languages, so it never counts as English evidence beside a Romanian one.
+_RO_ROLE = re.compile(r"\b(?:medic|stomatolog|ortodont|farmacist[ăa]?|asistent[ăa]?|kinetoterapeut[ăa]?|"
+                      r"fizioterapeut[ăa]?|psiholog|coordonator|coordonatoare)\b", re.I)
+_RO_OWNER_ROLE = re.compile(r"(?i)^(?:co-?)?fondat(?:or|oare)|^proprietar")
+# The honorific a Romanian doctor's name carries on the site: "Dr.", "Prof. Dr.",
+# "Conf. univ. dr.".
+_DOCTOR_PREFIX = re.compile(r"^(?:(?:dr|prof|conf|univ)\.?\s+)+", re.I)
+
+
+def _has_doctor_prefix(raw_name: str) -> bool:
+    return bool(_DOCTOR_PREFIX.match(re.sub(r"(?i)^\s*(?:meet|introducing)\s+", "", raw_name or "")))
+
+
+def romanian_title_needs_honorific(title: str) -> bool:
+    """True when the only role evidence in a title is Romanian and it isn't
+    an owner title: then the name it belongs to must have carried a Dr./Prof./
+    Conf. prefix on the page before it counts as a person.
+
+    "Medic primar stomatolog" under "Igienizare Profesională" is a service
+    card, not a doctor; under "Dr. Ana Pop" it is one. "Office Manager",
+    "Medic primar, DDS" (any English role word from profile.ROLE_HINT) and
+    "Fondator" / "Proprietară" (owner titles) don't need the prefix.
+    """
+    title = title or ""
+    if not _RO_ROLE.search(title) or is_owner_title(title):
+        return False
+    return not any(not _RO_ROLE.fullmatch(m.group(0)) and not _RO_OWNER_ROLE.match(m.group(0))
+                   and m.group(0).lower() != "specialist"
+                   for m in ROLE_HINT.finditer(title))
 
 
 def _clean_for_target(title: str, target: str) -> str:
@@ -196,7 +263,7 @@ def owner_rank(title: str, owner: bool = False) -> int:
     """How surely this title is the decision maker (higher first)."""
     low = (title or "").lower()
     if is_owner_title(title):
-        if re.search(r"\b(?:co-?owner|owner|proprietor)\b", low):
+        if re.search(r"\b(?:co-?owner|owner|proprietor|proprietar[ăa]?)\b", low):
             return 100
         return 95
     if owner:
@@ -222,7 +289,7 @@ contracting home homes repair center clinic health care analytics software labs
 
 
 def _alnum(text: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    return re.sub(r"[^a-z0-9]", "", fold_ascii(text).lower())
 
 
 def _domain_label(domain: str) -> str:
@@ -255,7 +322,7 @@ def surname_on_the_door(last_name: str, domain: str, site_name: str = "") -> boo
     """The person's surname is in the business name: "Ashby & Kerr",
     hollisfamilydental.test. Owners name their practices after themselves."""
     blob = _business_blob(domain, site_name)
-    for part in re.findall(r"[A-Za-z]+", last_name or ""):
+    for part in re.findall(r"[A-Za-z]+", fold_ascii(last_name)):
         p = part.lower()
         if len(p) >= 4 and p not in _GENERIC_BUSINESS_WORDS and p in blob:
             return True
@@ -358,11 +425,11 @@ def _sentences(html: str) -> list[str]:
     out = []
     for block in text.split("\n"):
         block = re.sub(r"\s+", " ", block).strip()
-        # "Dr. Maren", "Elliot T. Marwood": an abbreviation's full stop
-        # is not the end of a sentence.
-        block = re.sub(r"\b(Dr|Mr|Mrs|Ms|Prof|St|Jr|Sr|Inc|Co|Ltd|[A-Z])\. ", "\\1.\xa0", block)
+        # "Dr. Maren", "Elliot T. Marwood", "Conf. univ. dr. Irina": an
+        # abbreviation's full stop is not the end of a sentence.
+        block = re.sub(r"\b(Dr|dr|Mr|Mrs|Ms|Prof|Conf|univ|St|Jr|Sr|Inc|Co|Ltd|[A-Z])\. ", "\\1.\xa0", block)
         if block:
-            out.extend(s.strip() for s in re.split(r"(?<=[.!?]) +(?=[A-Z])", block) if s.strip())
+            out.extend(s.strip() for s in re.split(rf"(?<=[.!?]) +(?=[{NAME_UPPER}])", block) if s.strip())
     return out
 
 
@@ -370,13 +437,16 @@ def _sentences(html: str) -> list[str]:
 
 # A line that is a quotation: a testimonial, so the next line is its author.
 _QUOTE_LINE = re.compile(r"^\s*[\"“‘']|[\"”’]\s*$|[★⭐]")
-_SEPARATED = re.compile(r"^(?P<name>[^,|–—\-]{4,45}?)\s*(?:,|\||–|—|\s-\s)\s*(?P<title>.{2,80})$")
+# A hyphen between letters is part of the name ("Ana-Maria", "Ștefănescu-Pop");
+# one between spaces separates the title.
+_SEPARATED = re.compile(r"^(?P<name>(?:[^,|–—\-]|(?<=\w)-(?=\w)){4,45}?)\s*(?:,|\||–|—|\s-\s)\s*(?P<title>.{2,80})$")
 # On one line after a comma, only an unmistakable job title counts: "Nate
 # Calloway, proud advocate for the trades." is a tagline.
 _STRONG_ROLE = re.compile(
     r"\b(?:owner|co-?owner|founder|co-?founder|president|ceo|cfo|coo|cto|cmo|cro|chief|principal|"
     r"partner|proprietor|director|manager|attorney|lawyer|dds|dmd|md|esq|cpa|dentist|"
-    r"orthodontist|officer|head of|vp|vice president|superintendent|estimator|administrator)\b", re.I)
+    r"orthodontist|officer|head of|vp|vice president|superintendent|estimator|administrator|"
+    r"medic|stomatolog|farmacist[ăa]?|fondator|fondatoare|proprietar[ăa]?|coordonator)\b", re.I)
 
 
 def _person(first, last, title, *, source, evidence, url="", owner=False, full_name=""):
@@ -414,8 +484,10 @@ def people_from_lines(html: str, domain: str = "", site_name: str = "", url: str
                 continue
             if title_names_other_org(title, domain, site_name):
                 continue
+            if romanian_title_needs_honorific(title) and not _has_doctor_prefix(raw):
+                continue
             seen.add(key)
-            found.append(_person(first, last, title, source="card", full_name=raw,
+            found.append(_person(first, last, title, source="card", full_name=_DOCTOR_PREFIX.sub("", raw),
                                  evidence=f"{raw} — {title}", url=url))
     return found
 
@@ -500,9 +572,11 @@ def people_from_schema(html: str, url: str = "") -> list[dict]:
 
 # ── owners named in prose ────────────────────────────────────────────────
 
-_CAP = r"[A-Z][a-z]+(?:[-'’][A-Z]?[a-z]+)*"
-_NAME_RE = (rf"(?:Dr\.?\s+)?(?P<name>{_CAP}(?:\s+[A-Z]\.)?(?:\s+(?:{'|'.join(sorted(_PARTICLES))}))*"
+_CAP = _NAME_WORD
+_NAME_RE = (rf"(?:Dr\.?\s+)?(?P<name>{_CAP}(?:\s+[{NAME_UPPER}]\.)?(?:\s+(?:{'|'.join(sorted(_PARTICLES))}))*"
             rf"\s+{_CAP}(?:\s+{_CAP})?)")
+# Romanian academic titles stack up before the name: "Prof. Dr.", "Conf. univ. dr."
+_RO_NAME_RE = r"(?:(?i:prof|conf|univ|dr)\.?\s+){0,3}" + _NAME_RE.removeprefix(r"(?:Dr\.?\s+)?")
 _OWNER_WORD = (r"(?P<title>(?i:co-?owner|owner|co-?founder|founder|proprietor|president|ceo|"
                r"principal|managing partner|founding partner|founding attorney|partners?))")
 _ADJ = r"(?:(?:our|the|its|current|proud|longtime|second[- ]generation|third[- ]generation|" \
@@ -529,6 +603,15 @@ _PROSE = (
     (re.compile(rf"{_NAME_RE}\s+(?i:co-?founded|founded|started|launched|established|opened)\s+"
                 rf"(?P<org>(?i:the\s+(?:company|business|firm|practice|agency))|[A-Z][\w&'’.-]*(?:\s+(?:[A-Z][\w&'’.-]*|&))*)"),
      "Founder"),
+    # Romanian: "fondată de Dr. Ioana Țurcanu", "fondat în 2009 de ...",
+    # "înființată de Conf. univ. dr. ..."
+    (re.compile(rf"(?i:\b(?:fondat|[îi]nfiin[țţt]at)[ăa]?\s+(?:(?:în|in)\s+\d{{4}}\s+)?de)\s+{_RO_NAME_RE}"),
+     "Founder"),
+    # "Fondatorul clinicii, Dr. Vlad Stănescu, ...", "Fondatoarea, Prof. Dr. ..."
+    (re.compile(rf"(?i:\b(?:co-?)?fondat(?:orul|oarea)(?:\s+(?:clinicii|cabinetului|centrului|"
+                rf"practicii|laboratorului|farmaciei))?\s*,?)\s+{_RO_NAME_RE}"), "Founder"),
+    # "Ioana Țurcanu a fondat clinica în 2009"
+    (re.compile(rf"{_RO_NAME_RE}\s+a\s+(?i:co-?fondat|fondat|[îi]nfiin[țţt]at)\b"), "Founder"),
     # "the office of Dr. Maren Hollis Pryor", "the practice of Dr. ..."
     (re.compile(rf"(?i:\b(?:the\s+)?(?:office|practice|clinic)\s+of)\s+Dr\.?\s+{_NAME_RE}"), "Owner"),
 )
@@ -707,9 +790,15 @@ def find_people(pages: list[tuple[str, str]], domain: str, site_name: str = "") 
 
 _LINK_WEIGHTS = (
     (3, r"team|meet|leadership|staff|people|doctors?|dentists?|attorneys?|"
-        r"lawyers?|physicians?|providers?|owners?|founders?|principals?|partners|who-?we-?are|bios?"),
-    (2, r"about|story|history|company|firm|practice|family"),
-    (1, r"contact"),
+        r"lawyers?|physicians?|providers?|owners?|founders?|principals?|partners|who-?we-?are|bios?|"
+        # Romanian, matched with accents folded ("Echipă" -> "echipa"). "personal"
+        # is an English word too: only "personalul" or "personal medical", never a
+        # bare "Personal" (banking) or "personal injury".
+        r"echipa(?:[- ]noastra)?|medici(?:i(?:[- ]nostri)?)?|doctori(?:i(?:[- ]nostri)?)?|"
+        r"specialisti(?:i(?:[- ]nostri)?)?|personal(?:ul|[- ]medical)"),
+    (2, r"about|story|history|company|firm|practice|family|"
+        r"despre(?:[- ]noi)?|cine[- ]suntem|clinica|cabinet(?:ul)?"),
+    (1, r"contact|contacte|contacteaza[- ]ne"),
 )
 # A keyword counts in a whole path segment ("/our-team/", "/attorneys/",
 # "/meet-the-dentists.html") or a short menu label ("Meet the Team") — not
@@ -752,8 +841,9 @@ def menu_links(html: str, page_url: str, limit: int = 5) -> list[str]:
         key = _norm_url(url)
         if key in seen or p.path.rstrip("/") in ("", "/index.html", "/index.php", "/home"):
             continue
-        text = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"(?s)<[^>]+>", " ", m.group(2)))).strip().lower()
-        segments = [re.sub(r"\.(?:html?|php|aspx?)$", "", seg) for seg in unquote(p.path).lower().split("/") if seg]
+        text = fold_ascii(re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"(?s)<[^>]+>", " ", m.group(2)))).strip().lower())
+        segments = [re.sub(r"\.(?:html?|php|aspx?)$", "", seg)
+                    for seg in fold_ascii(unquote(p.path)).lower().split("/") if seg]
         label = text if len(text.split()) <= 4 else ""
         score = 0
         for weight, pattern in _LINK_WEIGHTS:
@@ -792,7 +882,7 @@ _AT_DOT = re.compile(
     r"([a-z0-9\-]{1,63}(?:\s{0,3}(?:\[\s{0,3}dot\s{0,3}\]|\(\s{0,3}dot\s{0,3}\)|\{\s{0,3}dot\s{0,3}\}|\.)\s{0,3}[a-z0-9\-]{1,63}){1,4})", re.I)
 _KNOWN_TLDS = frozenset("""
 com net org edu gov io co us biz info me ca uk au nz ie de fr es it nl be ch at se no dk fi
-pl pt mx br in ai app dev law legal dental agency marketing design studio tech solutions
+pl pt ro eu mx br in ai app dev law legal dental agency marketing design studio tech solutions
 services company group pro health care clinic roofing law
 """.split())
 # Recognised obfuscation schemes only: a mailto-ish element carrying a local

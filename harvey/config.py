@@ -75,6 +75,10 @@ class ICPConfig(BaseModel):
     # Each variant runs in every city alongside the industry itself, so the
     # estimate grows with it. Empty → each industry is its own one search.
     keyword_variants: dict[str, list[str]] = {}
+    # Language code the DataForSEO SERP and Maps providers search in, e.g.
+    # "ro" for Romanian results. Every other provider (DataForSEO Listings,
+    # Serper, Scavio, TinyFish, OpenStreetMap) ignores it.
+    search_language: str = "en"
 
 
 class WarmupConfig(BaseModel):

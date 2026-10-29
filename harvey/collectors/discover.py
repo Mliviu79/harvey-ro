@@ -26,6 +26,7 @@ import base64
 import logging
 import math
 import re
+import unicodedata
 from html import unescape
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
@@ -384,6 +385,7 @@ class DiscoveryQuery:
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
     preset: str = ""                 # PRESETS key that built it, if any
+    language: str = "en"             # search language code for SERP providers
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -667,7 +669,7 @@ class DataForSEOSerp(DiscoveryProvider):
     async def fetch(self, client, env, query):
         keyword = query.keyword()
         items = await self._post(client, env, "serp/google/organic/live/advanced", {
-            "keyword": keyword, "language_code": "en", "depth": query.depth,
+            "keyword": keyword, "language_code": query.language, "depth": query.depth,
             "device": "desktop", **_dfs_location(query, self.POINT_RADIUS)})
 
         # One Business per identity: a company in the pack AND at organic 14
@@ -747,7 +749,7 @@ class DataForSEOMaps(DataForSEOSerp):
     async def fetch(self, client, env, query):
         keyword = query.keyword()
         items = await self._post(client, env, "serp/google/maps/live/advanced", {
-            "keyword": keyword, "language_code": "en", "depth": query.depth,
+            "keyword": keyword, "language_code": query.language, "depth": query.depth,
             **_dfs_location(query, self.ZOOM)})
         out = []
         for item in items:
@@ -1065,6 +1067,58 @@ class OpenStreetMap(DiscoveryProvider):
         "contractor": ['craft=builder', 'office=construction_company'],
         "landscap": ['craft=gardener', 'shop=garden_centre'],
     }
+    # Medical practices, English and Romanian. A term qualifies only when
+    # EVERY word of the accent-folded term is in MEDICAL_WORDS (below), so
+    # "lawn doctor", "tax clinic" or "pharmacy software" never borrow a medical
+    # category. It then takes the first key here that starts a word of it, so
+    # the specific ones come first: "clinica stomatologica" is a dentist,
+    # "laborator analize medicale" a lab, and "medic" (which also catches
+    # "cabinet medical") is the last resort.
+    MEDICAL_TAG_MAP = {
+        "dental": ['amenity=dentist'],
+        "dentar": ['amenity=dentist'],
+        "stomatolog": ['amenity=dentist'],
+        "ortodon": ['amenity=dentist'],
+        "pharmac": ['amenity=pharmacy'],
+        "farmaci": ['amenity=pharmacy'],
+        "laborator": ['healthcare=laboratory'],
+        "medical lab": ['healthcare=laboratory'],
+        "physio": ['healthcare=physiotherapist'],
+        "kinetoterap": ['healthcare=physiotherapist'],
+        "fizioterap": ['healthcare=physiotherapist'],
+        "recuperare": ['healthcare=physiotherapist'],
+        "clinic": ['amenity=clinic', 'healthcare=clinic'],
+        "policlinic": ['amenity=clinic', 'healthcare=clinic'],
+        "doctor": ['amenity=doctors', 'healthcare=doctor'],
+        "medic": ['amenity=doctors', 'healthcare=doctor'],
+    }
+    # The words a medical practice term may be made of: the stems above plus
+    # the generic words that sit around them ("cabinet", "family", "general
+    # practice", "specialist"). Word prefixes, so inflections match
+    # ("medicala", "familiei", "privata"). Anything else ("lawn", "spa",
+    # "billing", "veterinara", "equipment") means it is not a practice we
+    # have a category for, and the term raises like any unmapped one.
+    MEDICAL_WORDS = (
+        "dentist", "dental", "dentar", "stomatolog", "ortodon", "pharmac",
+        "farmac", "laborator", "analize", "physio", "kinetoterap",
+        "fizioterap", "recuperare", "clinic", "policlinic", "doctor", "medic",
+        "cabinet", "family", "familie", "general", "practice", "office",
+        "privat", "specialist", "primar", "urgent",
+    )
+    # Short words match whole only: as prefixes "de" would let in "design",
+    # "si" "sistem" and "lab" "label". "s" is the one in "doctor's office".
+    MEDICAL_JOINERS = frozenset({"de", "si", "and", "s", "lab", "labs"})
+    # Medical-vocabulary words that are still not a practice: a drug maker,
+    # a public insurer, a doctorate, clinical research, a dental lab.
+    MEDICAL_REFUSE = re.compile(
+        r"\b(?:pharmaceutic|farmaceutic|medicare|medicaid|doctora|clinical\b"
+        r"|dental lab|laborator\w* dentar)")
+
+    @staticmethod
+    def _fold(text: str) -> str:
+        """Lowercase without diacritics, so "clinică" and "clinica" match alike."""
+        return "".join(ch for ch in unicodedata.normalize("NFKD", text.lower())
+                       if not unicodedata.combining(ch))
 
     def _tags(self, term: str) -> list[str]:
         """The OSM tags that actually carry this kind of business, or none.
@@ -1080,6 +1134,15 @@ class OpenStreetMap(DiscoveryProvider):
         for needle, tags in self.TAG_MAP.items():
             if needle in low:
                 return tags
+        folded = self._fold(term)
+        words = re.findall(r"[a-z]+", folded)
+        if not words or self.MEDICAL_REFUSE.search(folded) or not all(
+                w in self.MEDICAL_JOINERS or w.startswith(self.MEDICAL_WORDS)
+                for w in words):
+            return []
+        for needle, tags in self.MEDICAL_TAG_MAP.items():
+            if re.search(r"\b" + re.escape(needle), folded):
+                return tags
         return []
 
     async def fetch(self, client, env, query):
@@ -1089,9 +1152,10 @@ class OpenStreetMap(DiscoveryProvider):
             return []
         tags = self._tags(query.term)
         if not tags:
+            known = sorted({**self.TAG_MAP, **self.MEDICAL_TAG_MAP})
             raise RuntimeError(
                 f"OpenStreetMap has no category for {query.term!r}. It can only "
-                f"search mapped trades ({', '.join(sorted(self.TAG_MAP))}). Use a "
+                f"search mapped trades ({', '.join(known)}). Use a "
                 f"listings or SERP provider for this one.")
         lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
         radius_m = int(float(radius_km or 25) * 1000)
@@ -1147,7 +1211,8 @@ class OpenStreetMap(DiscoveryProvider):
                 address=" ".join(x for x in (tags.get("addr:housenumber"),
                                              tags.get("addr:street")) if x),
                 location=city or query.location,
-                category=tags.get("craft") or tags.get("shop") or tags.get("office") or "",
+                category=(tags.get("craft") or tags.get("shop") or tags.get("office")
+                          or tags.get("healthcare") or tags.get("amenity") or ""),
                 has_website=bool(site),
                 external_id=f"osm:{el.get('type')}/{el.get('id')}",
                 source_url=f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
@@ -1627,10 +1692,12 @@ def build_queries(config, cities: list[str] | None = None,
             v.strip() for t in terms for v in [t, *variants.get(t, [])] if v.strip()))
         places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
+    language = getattr(icp, "search_language", "") or "en"
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""), preset=preset if spec else "")
+                       coordinate=coords.get(place, ""), preset=preset if spec else "",
+                       language=language)
         for term in terms
         for place in places
     ]
