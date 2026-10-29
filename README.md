@@ -1,4 +1,11 @@
-# Harvey
+# Harvey RO
+
+> **Based on [Harvey](https://github.com/ethanplusai/harvey) by Ethan Rogers (MIT).**
+> Harvey RO is an independent project that is turning it into a contact finder
+> for Romanian businesses: ONRC registry import, activity search by CAEN code
+> in words, Romanian website reading, and phone extraction. It does not track
+> or contribute back to the original project. Credit for the original design
+> and code belongs to Harvey's author and contributors; see `LICENSE`.
 
 **An autonomous sales agent that runs on your Claude Code or Codex subscription.**
 
@@ -117,8 +124,8 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 ### Easiest: let Claude set it up
 
 ```bash
-git clone https://github.com/ethanplusai/harvey.git
-cd harvey
+git clone https://github.com/Mliviu79/harvey-ro.git
+cd harvey-ro
 claude
 ```
 
@@ -158,8 +165,8 @@ above on macOS or Windows. On a remote Linux host, reach the dashboard through
 an SSH tunnel rather than exposing its port to the network.
 
 ```bash
-git clone https://github.com/ethanplusai/harvey.git
-cd harvey
+git clone https://github.com/Mliviu79/harvey-ro.git
+cd harvey-ro
 
 # Create the credentials file only if you do not already have one.
 test -e .env || cp .env.example .env

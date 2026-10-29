@@ -42,9 +42,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ethanplusai/harvey"
-Issues = "https://github.com/ethanplusai/harvey/issues"
-Changelog = "https://github.com/ethanplusai/harvey/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Mliviu79/harvey-ro"
+Issues = "https://github.com/Mliviu79/harvey-ro/issues"
+Changelog = "https://github.com/Mliviu79/harvey-ro/blob/main/CHANGELOG.md"
 
 [project.scripts]
 harvey = "harvey.cli:main"
