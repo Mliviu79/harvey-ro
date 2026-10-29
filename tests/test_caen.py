@@ -73,9 +73,10 @@ def test_everyday_romanian_words_find_their_class(words, code):
     assert code in caen.codes_for(words)
 
 
-def test_nurse_words_do_not_capture_medical_care():
-    # Folded, "asistentă" (a nurse) and "asistență" (care) are one word.
-    assert "8694" not in caen.codes_for("asistență medicală")
+def test_folded_look_alikes_are_offered_not_hidden():
+    # Folded, "asistentă" (a nurse) and "asistență" (care) are one word:
+    # best effort brings both, the nurses' class and the medical practices.
+    assert {"8694", "8621", "8622"} <= caen.codes_for("asistență medicală")
 
 
 def test_a_short_stem_is_not_a_longer_word():
@@ -92,10 +93,9 @@ def test_every_english_name_belongs_to_a_real_class():
 
 @pytest.mark.parametrize("words", ["dentist", "dental", "stomatolog", "Stomatologie"])
 def test_dental_words_in_both_languages(words):
-    # Synonym classes first; classes that merely mention the word may follow
-    # in search(), but codes_for() keeps to what the synonym means.
+    # The synonym's classes first; classes whose name holds the word follow.
     assert _found(words)[:2] == [("8623", 3), ("8623", 2)]
-    assert caen.codes_for(words) == {"8623"}
+    assert caen.classes_for(words)[:2] == [("8623", 3), ("8623", 2)]
 
 
 @pytest.mark.parametrize("words, code", [
@@ -106,8 +106,7 @@ def test_dental_words_in_both_languages(words):
     ("veterinary", "7500"),
 ])
 def test_everyday_words_find_their_class_in_both_revisions(words, code):
-    assert caen.codes_for(words) == {code}
-    assert _found(words)[:2] == [(code, 3), (code, 2)]
+    assert caen.classes_for(words)[:2] == [(code, 3), (code, 2)]
 
 
 def test_multi_word_synonym_wins_over_its_parts():
@@ -124,8 +123,7 @@ def test_multi_word_synonym_wins_over_its_parts():
     ("psiholog", "8693"), ("psychologist", "8693"),
 ])
 def test_split_classes_answer_with_rev3_and_the_old_rev2_catch_all(words, rev3):
-    assert _found(words)[:2] == [(rev3, 3), ("8690", 2)]
-    assert caen.codes_for(words) == {rev3, "8690"}
+    assert caen.classes_for(words)[:2] == [(rev3, 3), ("8690", 2)]
 
 
 @pytest.mark.parametrize("words", ["ortodont", "ortodonție", "orthodontist",
@@ -169,13 +167,13 @@ def test_vet_is_offered_but_labelled_as_not_human_health():
 @pytest.mark.parametrize("words", ["stomatologică", "stomatologica", "STOMATOLOGICĂ",
                                    "asistență stomatologică", "asistenţă stomatologică"])
 def test_accents_cedillas_and_inflection_are_ignored(words):
-    assert caen.search(words)[0][:2] == ("8623", 3)
-    assert caen.codes_for(words) == {"8623"}
+    assert caen.classes_for(words)[:2] == [("8623", 3), ("8623", 2)]
 
 
 def test_name_search_needs_every_word():
-    found = _found("asistență medicală")
-    assert set(found) == {("8621", 3), ("8621", 2), ("8622", 3), ("8622", 2)}
+    found = set(_found("asistență medicală"))
+    assert {("8621", 3), ("8621", 2), ("8622", 3), ("8622", 2)} <= found
+    assert ("8610", 3) not in found     # "asistență spitalicească": not medicală
 
 
 def test_name_search_does_not_confuse_similar_words():

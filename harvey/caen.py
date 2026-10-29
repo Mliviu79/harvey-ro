@@ -282,17 +282,15 @@ def search(words: str, limit: int | None = None) -> list[Match]:
 
 def classes_for(words: str) -> list[tuple[str, int]]:
     """(code, version) pairs the words point to, best first, across Rev.2
-    and Rev.3.
-
-    When a synonym knows the words, only its classes: "stomatologică" means
-    dental practices, not the factories whose name also says "stomatologice".
-    Otherwise every class search() found by name. The version matters when
-    reading the registry, where a code means different things in different
+    and Rev.3: search()'s answer, so the classes an everyday word names
+    come first and every class whose name also holds the words follows.
+    Best effort, nothing hidden: "asistență medicală" brings medical
+    practices and the nurses' class alike (folded, "asistentă" and
+    "asistență" are one word). The version matters when reading the
+    registry, where a code means different things in different
     nomenclatures.
     """
-    found = search(words)
-    chosen = [m for m in found if m.why.startswith("synonym ")] or found
-    return list(dict.fromkeys((m.code, m.version) for m in chosen))
+    return list(dict.fromkeys((m.code, m.version) for m in search(words)))
 
 
 def codes_for(words: str) -> set[str]:
