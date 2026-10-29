@@ -11,6 +11,7 @@ import io
 import logging
 import re
 
+from harvey.collectors.phones import PhoneHit, phone_hit, phone_region
 from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 from harvey.state import StateManager
 
@@ -31,6 +32,9 @@ CSV_COLUMNS = [
 COMPANY_CSV_COLUMNS = [
     "name", "website", "domain", "phone", "location", "industry",
     "email", "email_status", "contact_name", "contact_title", "source",
+    # Appended: phone stays the main number (international format when it
+    # parses); other_phones are the rest the company's site published.
+    "phone_type", "other_phones",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -142,6 +146,16 @@ async def collect_companies(state: StateManager, config=None) -> list[dict]:
             ("opted_out",),
         ) as cursor:
             prospects = [dict(r) for r in await cursor.fetchall()]
+        async with db.execute(
+            "SELECT company_id, value_text FROM observations "
+            "WHERE signal_code = 'PHONE_NUMBER' AND value_text != '' "
+            "ORDER BY observed_at, rowid"
+        ) as cursor:
+            site_phones: dict[str, list[str]] = {}
+            for r in await cursor.fetchall():
+                numbers = site_phones.setdefault(r["company_id"], [])
+                if r["value_text"] not in numbers:
+                    numbers.append(r["value_text"])
 
     entries = _do_not_contact(config)
     by_company: dict[str, list[dict]] = {}
@@ -169,11 +183,15 @@ async def collect_companies(state: StateManager, config=None) -> list[dict]:
         name = " ".join(
             part for part in (best.get("first_name"), best.get("last_name")) if part
         )
+        region = phone_region(c.get("location") or "", config, c.get("domain") or "")
+        phone, phone_type, other_phones = _phone_columns(
+            (c.get("phone") or best.get("phone") or "").strip(), region,
+            site_phones.get(c["id"], []))
         out.append({
             "name": c.get("name", ""),
             "website": c.get("website", ""),
             "domain": c.get("domain", ""),
-            "phone": c.get("phone") or best.get("phone") or "",
+            "phone": phone,
             "location": c.get("location", ""),
             "industry": c.get("industry", ""),
             "email": best.get("email", ""),
@@ -181,8 +199,52 @@ async def collect_companies(state: StateManager, config=None) -> list[dict]:
             "contact_name": name,
             "contact_title": best.get("title", ""),
             "source": c.get("source", ""),
+            "phone_type": phone_type,
+            "other_phones": other_phones,
         })
     return out
+
+
+def _listed_phones(raw: str, region) -> list:
+    """A stored phone cell as numbers: one, or several as OpenStreetMap
+    writes them ("+40 268 000 101;+40 740 000 102", "... / ..."). A piece
+    that doesn't parse stays as written."""
+    whole = phone_hit(raw, region)
+    if whole is not None or not raw:
+        return [whole] if whole is not None else []
+    out: list = []
+    for piece in (p.strip() for p in re.split(r"[;,]", raw)):
+        if not piece:
+            continue
+        hit = phone_hit(piece, region)
+        if hit is not None:
+            out.append(hit)
+            continue
+        # "/" only splits when every side is a number: "0268/000.101" is one.
+        parts = [p.strip() for p in piece.split("/") if p.strip()]
+        hits = [phone_hit(p, region) for p in parts]
+        if len(parts) > 1 and all(hits):
+            out.extend(hits)
+        else:
+            out.append(piece)
+    return out
+
+
+def _phone_columns(raw: str, region, site: list[str]) -> tuple[str, str, str]:
+    """phone, phone_type and other_phones. The stored cell's first number is
+    the phone; its other numbers, then the site's (E.164 observations), are
+    other_phones, each once, all in the international format "; "-joined."""
+    listed = _listed_phones(raw, region)
+    main = listed[0] if listed and isinstance(listed[0], PhoneHit) else None
+    others, seen = [], {main.number} if main else set()
+    rest = listed[1:] if main else []
+    for item in rest + [phone_hit(n) or n for n in site]:
+        key = item.number if isinstance(item, PhoneHit) else item
+        if key in seen:
+            continue
+        seen.add(key)
+        others.append(item.display if isinstance(item, PhoneHit) else item)
+    return (main.display if main else raw, main.type if main else "", "; ".join(others))
 
 
 def _do_not_contact(config) -> list[str]:
@@ -201,7 +263,7 @@ def _do_not_contact(config) -> list[str]:
                           "Fix it before exporting.") from e
 
 
-_PLAIN_NUMBER = re.compile(r"[+\-]?[0-9 ().\-/]+\Z")
+_PLAIN_NUMBER = re.compile(r"[+\-]?[0-9 ().\-/;+]+\Z")
 
 
 def csv_cell(value) -> str:
@@ -209,7 +271,8 @@ def csv_cell(value) -> str:
 
     Names, titles and addresses come from other people's websites, so a
     cell starting with = + - @ is quoted — unless it is only digits and
-    phone punctuation ("+40 712 000 000"), which can't call anything.
+    phone punctuation ("+40 712 000 000", or several split by "; "), which
+    can't call anything.
     """
     text = "" if value is None else str(value)
     if _PLAIN_NUMBER.match(text):

@@ -23,6 +23,7 @@ from harvey.public_http import public_http_client
 from harvey.startups import funding_text
 
 from harvey.collectors.ats import detect_board, matching_roles, read_board, role_keywords
+from harvey.collectors.phones import MAX_PHONES, phone_region, phones_from_html
 
 from harvey.collectors.discover import (
     name_from_domain, name_matches_domain, site_name_from_html,
@@ -835,14 +836,19 @@ class ProfileCollector:
     """
 
     def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 12.0,
-                 role_keywords: list[str] | None = None):
+                 role_keywords: list[str] | None = None, config=None):
         self.state = state
+        # Where a business's national phone numbers are read when its
+        # location doesn't name a country (prospect_country, icp.geography).
+        self.config = config
         self.confirmed = confirmed if confirmed is not None else set()
         self.timeout = timeout
         # icp.hiring_signals (or icp.titles): which open roles are worth a row.
         self.role_keywords = list(role_keywords or [])
         self._client: httpx.AsyncClient | None = None
         self.site_names: dict[str, str] = {}
+        # The first phone each company's pages publish, for _fill_phone.
+        self.phones: dict[str, str] = {}
         # Hosts that answered with a bot challenge (SiteGround's 202,
         # Cloudflare's "Just a moment...") rather than a page.
         self.challenged: set[str] = set()
@@ -1122,9 +1128,12 @@ class ProfileCollector:
 
     # ── the stage itself ──
 
-    async def profile_company(self, company_id: str, domain: str) -> list[dict]:
+    async def profile_company(self, company_id: str, domain: str,
+                              location: str = "") -> list[dict]:
         """Collect every confirmed profile signal for one business."""
         obs: list[dict] = []
+        # Pages fetched for other signals, read again for phone numbers.
+        pages: list[tuple[str, str]] = []
         domain = domain.lower().replace("www.", "").strip("/")
         if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
             # YC's own sites forbid scraping; they're never a prospect anyway.
@@ -1148,6 +1157,7 @@ class ProfileCollector:
                 logger.info(f"profile: {domain} unreachable")
             return obs
         self.site_names[company_id] = site_name_from_html(home, domain)
+        pages.append((site, home))
 
         # Ads (they are spending TODAY — the strongest budget signal here)
         add("RUNNING_GOOGLE_ADS", num=1 if self._any(home, GOOGLE_ADS) else 0)
@@ -1268,6 +1278,8 @@ class ProfileCollector:
                 add("CONTACT_FORM_URL", text=site, url=site)
             else:
                 curl, chtml = await self._first_present(site, CONTACT_PATHS)
+                if chtml:
+                    pages.append((curl, chtml))
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
                     add("CONTACT_FORM_URL", text=curl, url=curl)
 
@@ -1288,6 +1300,7 @@ class ProfileCollector:
                 paths = RO_TEAM_PATHS + TEAM_PATHS + ("/contact",)
             turl, thtml = await self._first_present(site, paths)
             if thtml:
+                pages.append((turl, thtml))
                 for person in self.detect_people(thtml, domain=domain,
                                                  site_name=self.site_names.get(company_id, "")):
                     label = f"{person['first_name']} {person['last_name']}"
@@ -1298,7 +1311,21 @@ class ProfileCollector:
                         add("DECISION_MAKER_TITLE",
                             text=f"{label} — {person['title']}", url=turl)
 
+        self._phones(company_id, pages, phone_region(location, getattr(self, "config", None), domain), add)
         return obs
+
+    def _phones(self, company_id: str, pages: list[tuple[str, str]], region, add) -> None:
+        """PHONE_NUMBER for each number the fetched pages publish (a tel:
+        link or schema.org markup at full confidence), and the first one
+        kept for _fill_phone."""
+        seen: set[str] = set()
+        for url, html in pages:
+            for hit in phones_from_html(html, region):
+                if hit.number in seen or len(seen) >= MAX_PHONES:
+                    continue
+                seen.add(hit.number)
+                self.__dict__.setdefault("phones", {}).setdefault(company_id, hit.display)
+                add("PHONE_NUMBER", text=hit.number, conf=hit.confidence, url=url)
 
     async def _improve_name(self, company: dict, domain: str):
         """Replace a name the domain doesn't back up ("Denver, CO | HOA
@@ -1316,6 +1343,19 @@ class ProfileCollector:
             logger.info(f"profile: {domain} named '{better}' (was '{current}')")
         except Exception as e:
             logger.debug(f"rename_company failed for {domain}: {e}")
+
+    async def _fill_phone(self, company: dict):
+        """The site's first number as the company's phone, only when it has
+        none — a listing's number is kept. Contact data like a published
+        email, so it doesn't wait for PHONE_NUMBER to be confirmed."""
+        phone = self.phones.pop(company["id"], "")
+        if not phone:
+            return
+        try:
+            if await self.state.fill_company_phone(company["id"], phone):
+                logger.info(f"profile: {company.get('domain')} phone {phone} from its site")
+        except Exception as e:
+            logger.debug(f"fill_company_phone failed for {company.get('domain')}: {e}")
 
     async def _mark_checked(self, company_id: str):
         try:
@@ -1335,7 +1375,8 @@ class ProfileCollector:
             if not domain:
                 continue
             try:
-                obs = await self.profile_company(company["id"], domain)
+                obs = await self.profile_company(company["id"], domain,
+                                                 company.get("location") or "")
             except Exception as e:
                 logger.warning(f"profile failed for {domain}: {e}")
                 await self._mark_checked(company["id"])
@@ -1345,6 +1386,7 @@ class ProfileCollector:
             # forever instead of rotating through the rest of the backlog.
             await self._mark_checked(company["id"])
             await self._improve_name(company, domain)
+            await self._fill_phone(company)
             if obs:
                 total += await self.state.add_observations(obs, run_id=run_id)
                 logger.info(f"profile: {domain} → {len(obs)} observation(s)")
@@ -1371,7 +1413,8 @@ async def profile_companies(state, companies: list[dict], config=None) -> tuple[
     run_id = await state.start_run("profile", provider="http")
     try:
         keywords = role_keywords(getattr(config, "icp", None))
-        async with ProfileCollector(state, confirmed, role_keywords=keywords) as collector:
+        async with ProfileCollector(state, confirmed, role_keywords=keywords,
+                                    config=config) as collector:
             n = await collector.run(companies, run_id=run_id)
         await state.finish_run(run_id, records=n, cost_usd=0.0)
         return n, run_id

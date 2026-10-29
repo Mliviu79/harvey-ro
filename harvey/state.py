@@ -1884,7 +1884,7 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                f"""SELECT c.id, c.name, c.domain
+                f"""SELECT c.id, c.name, c.domain, c.location
                    FROM companies c
                    {_LAST_PROFILED_JOIN}
                    WHERE c.domain != ''
@@ -1933,6 +1933,20 @@ class StateManager:
                 (name, company_id),
             )
             await db.commit()
+
+    async def fill_company_phone(self, company_id: str, phone: str) -> bool:
+        """Set a company's phone only when it has none: a listing's number
+        is never overwritten by one read off the site. True when set."""
+        if not company_id or not phone:
+            return False
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE companies SET phone = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND COALESCE(TRIM(phone), '') = ''",
+                (phone, company_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def companies_needing_prospects(
         self, limit: int = 10, stale_days: int = 14

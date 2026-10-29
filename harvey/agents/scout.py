@@ -39,6 +39,7 @@ from bs4 import BeautifulSoup
 from harvey.brain import Brain
 from harvey.collectors import people as people_mod
 from harvey.collectors.discover import site_name_from_html
+from harvey.collectors.phones import MAX_PHONES, phone_region, phones_from_html
 from harvey.collectors.profile import _reads_like_title, looks_like_challenge
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.email_finder import (
@@ -1681,7 +1682,50 @@ Respond ONLY with the JSON array."""
             )
             if inbox:
                 contacts.append(inbox)
+        await self._observe_phones(company_id, domain)
         return contacts
+
+    async def _observe_phones(self, company_id: str, domain: str):
+        """The phone numbers on the pages already read for people and the
+        inbox. The first fills the company's phone when it has none (a
+        listing's number is kept), like a published email needing no
+        confirmation; every number is a PHONE_NUMBER row only when the user
+        confirmed that signal."""
+        if not company_id:
+            return
+        # Only a read this cycle already made: never a request of its own.
+        site = getattr(self, "_site_reads", {}).get(self._host(domain)) or {}
+        pages = list(site.get("pages", [])) + list(site.get("extra_pages", []))
+        if not pages:
+            return
+        try:
+            company = await self.state.get_company(company_id)
+        except Exception:
+            company = None
+        location = (getattr(company, "location", "") or "") if company else ""
+        region = phone_region(location, getattr(self, "config", None), self._host(domain))
+        hits, seen = [], set()
+        for url, html in pages:
+            for hit in phones_from_html(html, region):
+                if hit.number not in seen and len(hits) < MAX_PHONES:
+                    seen.add(hit.number)
+                    hits.append((url, hit))
+        if not hits:
+            return
+        try:
+            await self.state.fill_company_phone(company_id, hits[0][1].display)
+            confirmed = await self.state.confirmed_signal_codes()
+            if "PHONE_NUMBER" in (confirmed or set()):
+                await self.state.add_observations([{
+                    "signal_code": "PHONE_NUMBER", "company_id": company_id,
+                    # Not "profile": a profile-collector row would count as the
+                    # company being profiled and hold back its profile run.
+                    "collector": "people", "value_text": hit.number,
+                    "confidence": hit.confidence,
+                    "evidence_url": url,
+                } for url, hit in hits])
+        except Exception as e:
+            logger.debug(f"Phone numbers not stored for {domain}: {e}")
 
     async def _observe_likely_owner(self, company_id: str, member: dict):
         """Record LIKELY_OWNER for a company — only when the user confirmed
@@ -1777,6 +1821,9 @@ Respond ONLY with the JSON array."""
                 resp = await self._site_fetch(site, url)
                 if resp is not None:
                     pages.append((url, getattr(resp, "text", "") or ""))
+                    # Kept for _observe_phones: a contact page is where a
+                    # practice prints its number.
+                    site.setdefault("extra_pages", []).append(pages[-1])
 
         candidates = []
         for _, text in pages:
