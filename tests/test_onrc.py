@@ -270,16 +270,38 @@ async def test_rerun_updates_without_duplicating(state, files):
 
 
 @pytest.mark.asyncio
-async def test_merges_into_a_company_found_by_its_website(state, files):
+async def test_a_shared_website_is_never_a_merge(state, files):
+    # The registry's website field is self-declared: the business already on
+    # file under that domain keeps its own identity, address and contacts.
     known = await state.add_company(Company(
         name="Clinica Zâmbet", domain="zambet-exemplu.example.ro",
         source="discover:osm", location="Brașov, Romania"))
+    report = await run(state, files)
+    assert (report.new_companies, report.known_companies) == (3, 0)
+    assert report.shared_domain == 1
+    registry = await state.get_company_by_cui("90000017")
+    assert registry.id != known
+    assert registry.domain == ""
+    assert registry.website == "https://zambet-exemplu.example.ro"
+    other = await state.get_company_by_domain("zambet-exemplu.example.ro")
+    assert other.id == known and other.cui == "" and other.address == ""
+    with sqlite3.connect(state.db_path) as db:
+        assert not db.execute("SELECT 1 FROM observations WHERE company_id = ?",
+                              (known,)).fetchall()
+
+
+@pytest.mark.asyncio
+async def test_merges_into_the_same_legal_company(state, files):
+    known = await state.add_company(Company(
+        name="Clinica Zâmbet", cui="90000017", source="discover:osm",
+        location="Brașov, Romania"))
     report = await run(state, files)
     assert (report.new_companies, report.known_companies) == (2, 1)
     merged = await state.get_company_by_cui("90000017")
     assert merged.id == known
     assert merged.name == "Clinica Zâmbet"            # kept, not replaced
     assert merged.address == "Str. Exemplului 12, 500123"   # gap filled
+    assert merged.domain == "zambet-exemplu.example.ro"
     assert report.updated_companies == 1
 
 

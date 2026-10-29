@@ -578,6 +578,7 @@ class ImportReport:
     active: int = 0              # ... of which operating
     in_area: int = 0             # ... of which in the county/locality
     catch_all_only: int = 0      # ... matched only on Rev.2's catch-all 8690
+    shared_domain: int = 0       # website domain already held by another business
     excluded: int = 0            # on the do-not-contact list
     new_companies: int = 0
     known_companies: int = 0
@@ -660,7 +661,8 @@ async def import_registry(
     Rev.3"; their order picks which class names the company's industry
     (Rev.2's catch-all 8690 last, when it stands in for a narrower class).
     Companies are matched to what is on file by CUI, then by registration
-    number, then by website domain; a known one has its gaps filled, never
+    number, never by website domain alone (a domain another business holds
+    is counted in ``shared_domain`` and left off); a known one has its gaps filled, never
     its existing values replaced, except the registered-office address,
     which is always refreshed: the registry is the authority on it, and a
     re-import is how a moved office reaches the record. ``dry_run`` reads everything and writes
@@ -718,9 +720,18 @@ async def import_registry(
                 report.catch_all_only += 1
             industry = describe(code, version) or ""
             external = f"onrc:{firm.reg}"
+            # Only the legal identity merges. The registry's website field is
+            # self-declared: a domain another business already holds may be
+            # a shared group site or simply wrong, so it is a possible match
+            # for review, never a reason to hang these administrators and
+            # this address on that business.
             existing = (await state.get_company_by_cui(firm.cui)
-                        or await state.get_company_by_external_id(external)
-                        or (await state.get_company_by_domain(firm.domain) if firm.domain else None))
+                        or await state.get_company_by_external_id(external))
+            domain, website = firm.domain, firm.website
+            holder = await state.get_company_by_domain(domain) if domain else None
+            if holder and (existing is None or holder.id != existing.id):
+                report.shared_domain += 1
+                domain = ""
             if existing:
                 report.known_companies += 1
             else:
@@ -733,15 +744,15 @@ async def import_registry(
             if existing:
                 company_id = existing.id
                 changed = await state.fill_company_fields(
-                    company_id, cui=firm.cui, name=firm.name, website=firm.website,
-                    domain=firm.domain, industry=industry, location=_location(firm),
+                    company_id, cui=firm.cui, name=firm.name, website=website,
+                    domain=domain, industry=industry, location=_location(firm),
                     address=firm.address)
                 if changed:
                     report.updated_companies += 1
             else:
                 company_id = await state.add_company(Company(
                     name=firm.name, cui=firm.cui, external_id=external,
-                    website=firm.website, domain=firm.domain, industry=industry,
+                    website=website, domain=domain, industry=industry,
                     location=_location(firm), address=firm.address,
                     source=SOURCE, source_url=evidence,
                 ))

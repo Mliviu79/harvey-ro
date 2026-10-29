@@ -690,6 +690,9 @@ def cmd_import_onrc(args):
         if report.catch_all_only:
             print(f"    {report.catch_all_only} of them only on the old catch-all code "
                   "8690 Rev.2, so may be other health activities")
+        if report.shared_domain:
+            print(f"  {report.shared_domain} list a website another business on file already "
+                  "has: kept as separate records, possible matches to review")
         if report.excluded:
             print(f"  {report.excluded} skipped — on your do-not-contact list")
         verb = "would be" if report.dry_run else "are"
