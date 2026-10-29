@@ -8,6 +8,10 @@ services:
     # Supported on native Linux. Keep the dashboard's loopback-only bind.
     network_mode: host
     command: ["dashboard"]
+    environment:
+      # The obscura service below. BROWSER_CDP_URL in .env overrides it;
+      # BROWSER_CDP_URL=off reads every site over plain HTTP.
+      HARVEY_BROWSER_CDP_DEFAULT: http://127.0.0.1:9230
     volumes:
       # Mount the checkout directory, not individual config files: setup and
       # training atomically replace files and create harvey.local.yaml.
@@ -26,6 +30,130 @@ services:
           create_host_path: false
     restart: unless-stopped
     init: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The default browser for pages plain HTTP can't read (JavaScript-only
+  # sites). Obscura's published image, pinned by digest: render build,
+  # distroless, non-root (uid 65532). It blocks private and local addresses
+  # on its own. Harvey uses host networking, so the CDP port is published on
+  # the host's loopback only, and Obscura refuses a non-loopback bind without
+  # a token: set BROWSER_CDP_TOKEN in .env (openssl rand -hex 32). The port
+  # must be the same on both sides; Obscura checks the Host header.
+  obscura:
+    image: h4ckf0r0day/obscura:0.2.5@sha256:354c3d2a0fa2dd2939debe6903aa26c35d121329245dfa42aa7d1c292a209814
+    command: ["serve", "--host", "0.0.0.0", "--port", "9230"]
+    environment:
+      OBSCURA_CDP_TOKEN: ${BROWSER_CDP_TOKEN:-}
+    ports:
+      - "127.0.0.1:9230:9230"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 512
+    cpus: 2
+    healthcheck:
+      # distroless has no shell or curl: the binary probes itself. Any HTTP
+      # answer (401 without the token) means the server is up.
+      test: ["CMD", "/obscura", "--allow-private-network", "fetch",
+             "http://127.0.0.1:9230/json/version", "--dump", "original", "--quiet"]
+      interval: 1m
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Chromium for LinkedIn and the sites that refuse Obscura (its
+  # TLS fingerprint isn't a browser's). Start it with
+  #   docker compose --profile chromium up -d
+  # and set BROWSER_CDP_FALLBACK_URL=http://127.0.0.1:9231 in .env. Chromium's
+  # CDP port has no authentication: it is published on loopback only.
+  #
+  # Unlike Obscura, Chromium has no block of its own on private addresses,
+  # and Harvey can't see a redirect's hops from outside. So every request it
+  # makes goes through chromium-egress, a proxy that refuses private, local
+  # and metadata addresses (docker/browser-egress.conf): a public page that
+  # redirects or connects to the host's own services (the dashboard,
+  # databases) gets a refusal instead.
+  chromium:
+    image: chromedp/headless-shell:156.0.8078.12@sha256:f70908c8020555a3bf89a070140913b443a03ead28c1a66563c3912a3b32b08d
+    profiles: ["chromium"]
+    command: ["--proxy-server=http://chromium-egress:3128",
+              # Loopback too: nothing is reached without the proxy's check.
+              "--proxy-bypass-list=<-loopback>",
+              "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+    depends_on: [chromium-egress]
+    user: "65534:65534"
+    environment:
+      HOME: /tmp
+    ports:
+      - "127.0.0.1:9231:9222"
+    shm_size: 1g
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    pids_limit: 1024
+    cpus: 2
+    healthcheck:
+      test: ["CMD", "bash", "-c",
+             "exec 3<>/dev/tcp/127.0.0.1/9223 && printf 'GET /json/version HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q webSocketDebuggerUrl <&3"]
+      interval: 1m
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Chromium's only way out (see above). No published port: only the
+  # browsers on this compose network reach it.
+  chromium-egress:
+    image: ubuntu/squid:6.6-24.04_beta@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    profiles: ["chromium"]
+    command: ["-f", "/etc/squid/browser-egress.conf", "-NYC"]
+    user: "13:13"
+    volumes:
+      - type: bind
+        source: ./docker/browser-egress.conf
+        target: /etc/squid/browser-egress.conf
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/spool/squid:uid=13,gid=13
+      - /var/log/squid:uid=13,gid=13
+      - /run:uid=13,gid=13
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3128"]
+      interval: 1m
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:

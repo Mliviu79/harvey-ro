@@ -2,8 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PIP_NO_CACHE_DIR=1
 
 # System deps (curl needed for the Claude CLI installer)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,12 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps first (cached layer — rebuilds only when requirements change),
-# then Chromium + its system libraries in the same layer cleanup pass.
+# Python deps first (cached layer — rebuilds only when requirements change).
+# No browser in this image: Playwright only connects over CDP to the
+# obscura service (and the optional chromium one) from docker-compose.yml.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/* /root/.cache
+    && rm -rf /root/.cache
 
 # Match the checkout owner on Linux; remain non-root.
 ARG HARVEY_UID=1000
@@ -26,7 +25,7 @@ RUN test "$HARVEY_UID" -gt 0 && test "$HARVEY_GID" -gt 0 \
     && groupadd --gid "$HARVEY_GID" harvey \
     && useradd --create-home --uid "$HARVEY_UID" --gid "$HARVEY_GID" harvey \
     && mkdir -p /app/data \
-    && chown -R harvey:harvey /app /ms-playwright
+    && chown -R harvey:harvey /app
 
 # Copy project (config/prompts are typically bind-mounted over these at runtime)
 COPY --chown=harvey:harvey harvey/ harvey/

@@ -50,3 +50,11 @@ import harvey.humanize  # noqa: E402
 def _no_installed_humanizer(monkeypatch, tmp_path):
     """Tests never pick up the operator's real ~/.claude Humanizer skill."""
     monkeypatch.setattr(harvey.humanize, "SKILL_PATH", tmp_path / "no-humanizer.md")
+
+
+@pytest.fixture(autouse=True)
+def _no_browser_services(monkeypatch):
+    """Tests never reach a real browser service from a developer's .env."""
+    for name in ("BROWSER_CDP_URL", "BROWSER_CDP_FALLBACK_URL", "BROWSER_CDP_TOKEN",
+                 "HARVEY_BROWSER_CDP_DEFAULT"):
+        monkeypatch.delenv(name, raising=False)

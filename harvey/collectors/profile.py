@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from harvey.browser import HTTP, PageReader
 from harvey.public_http import public_http_client
 from harvey.startups import funding_text
 
@@ -862,26 +863,51 @@ class ProfileCollector:
             headers={"User-Agent": random.choice(USER_AGENTS),
                      "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
         )
+        self._pages = PageReader()
         return self
 
     async def __aexit__(self, *exc):
         if self._client:
             await self._client.aclose()
+        if getattr(self, "_pages", None) is not None:
+            await self._pages.aclose()
+
+    def _method(self, url: str) -> str:
+        """What produced the page at ``url``: "http", or the browser."""
+        pages = getattr(self, "_pages", None)
+        return pages.method(url) if pages is not None else HTTP
 
     async def _get(self, url: str) -> str:
+        """The page's HTML over HTTP, or rendered by a browser when HTTP got
+        a JavaScript shell or a block (harvey/browser.py); "" when neither
+        produced a page."""
+        pages = getattr(self, "_pages", None)
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        if pages is not None and pages.browser_first(url):
+            page = await pages.render(url)
+            if page is not None:
+                return page.text
         try:
             resp = await self._client.get(url)
         except (httpx.HTTPError, ValueError) as e:
             logger.debug(f"fetch failed {url}: {e}")
             return ""
-        if resp.status_code in (200, 202, 403, 429, 503) and looks_like_challenge(
-                resp.text or "", resp.status_code):
-            self.challenged.add(urlparse(url).netloc.lower().removeprefix("www."))
+        blocked = resp.status_code in (200, 202, 403, 429, 503) and looks_like_challenge(
+            resp.text or "", resp.status_code)
+        ctype = resp.headers.get("content-type", "")
+        html_ok = ("html" in ctype or "xml" in ctype or "text" in ctype)
+        if pages is not None and (blocked or resp.status_code != 200 or html_ok):
+            page = await pages.after_http(url, html=resp.text if html_ok else "",
+                                          status=resp.status_code, blocked=blocked)
+            if page is not None:
+                self.challenged.discard(host)
+                return page.text
+        if blocked:
+            self.challenged.add(host)
             return ""
         if resp.status_code != 200:
             return ""
-        ctype = resp.headers.get("content-type", "")
-        if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
+        if not html_ok:
             return ""
         return resp.text
 
@@ -1142,8 +1168,11 @@ class ProfileCollector:
         def add(code, *, num=None, text="", conf=1.0, url=""):
             if not self.wants(code):
                 return
+            method = self._method(url or site)
             obs.append({
-                "signal_code": code, "company_id": company_id, "collector": "profile",
+                "signal_code": code, "company_id": company_id,
+                # Provenance: a rendered page says which browser read it.
+                "collector": "profile" if method == HTTP else f"profile:{method}",
                 "value_num": num, "value_text": text, "confidence": conf,
                 "evidence_url": url or site,
             })

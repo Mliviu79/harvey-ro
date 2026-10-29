@@ -751,7 +751,7 @@ _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 # (written by any path, including ones that never stamp the column).
 _LAST_PROFILED_JOIN = """LEFT JOIN (
                        SELECT company_id, MAX(observed_at) AS last_seen
-                       FROM observations WHERE collector = 'profile'
+                       FROM observations WHERE collector LIKE 'profile%'
                        GROUP BY company_id
                    ) p ON p.company_id = c.id"""
 _LAST_PROFILED = (

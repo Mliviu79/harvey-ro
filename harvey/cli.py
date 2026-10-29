@@ -578,7 +578,13 @@ async def backfill_contacts(make_scout, state, limit: int) -> tuple[int, int]:
         if not new:
             break
         seen |= new
-        found += await make_scout()._prospect_via_known_companies()
+        scout = make_scout()
+        try:
+            found += await scout._prospect_via_known_companies()
+        finally:
+            close = getattr(scout, "close_browser", None)
+            if close is not None:
+                await close()
     return len(seen), found
 
 

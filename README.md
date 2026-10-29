@@ -177,12 +177,41 @@ export HARVEY_UID=$(id -u) HARVEY_GID=$(id -g)
 # Sign in to Claude on the host first; ~/.claude must already exist.
 # The image ships Claude only; Codex is not included.
 docker compose build
+# Setup also writes BROWSER_CDP_TOKEN, the obscura browser's password.
 docker compose run --rm harvey setup
 
 docker compose up -d
 docker compose logs harvey
 # Open the private unlock link printed in the logs.
 ```
+
+**Browsers.** The Harvey image ships no browser. Compose also starts
+`obscura`, a light headless browser that renders sites whose content
+arrives by JavaScript (plain HTTP is still tried first; only JavaScript
+shells and blocked pages go to the browser). Harvey uses it by default;
+`BROWSER_CDP_URL=off` in `.env` keeps every site on plain HTTP. Obscura
+needs `BROWSER_CDP_TOKEN` in `.env`, which setup writes. On an install set
+up before that, add one (until then the obscura container keeps restarting
+and Harvey reads over HTTP), then `docker compose up -d`:
+
+```bash
+grep -q '^BROWSER_CDP_TOKEN=.' .env || printf '\nBROWSER_CDP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> .env
+```
+
+Chromium is optional, for LinkedIn and for the sites that refuse Obscura
+(Cloudflare and others that check the TLS fingerprint): start it with
+`docker compose --profile chromium up -d` and set
+`BROWSER_CDP_FALLBACK_URL=http://127.0.0.1:9231` in `.env`. Both listen on
+the host's loopback only (9230, 9231). Without either, Harvey reads sites
+over HTTP only and says so once in the log.
+
+Obscura refuses private and local addresses on its own; Chromium doesn't,
+and a public page can redirect or connect it to services on your machine
+(the dashboard, databases). So the profile also starts `chromium-egress`,
+a proxy that every Chromium request goes through and that refuses private,
+local and metadata addresses (`docker/browser-egress.conf`). If you point
+`BROWSER_CDP_FALLBACK_URL` at a Chromium of your own instead, give it a
+proxy like that one.
 
 Compose mounts the checkout directory at `/app`. Setup credentials, both YAML
 config files, training output, knowledge files, and `data/` remain in that

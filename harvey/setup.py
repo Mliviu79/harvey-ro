@@ -4,6 +4,7 @@ import asyncio
 import getpass
 import logging
 import os
+import secrets
 import shutil
 from pathlib import Path
 
@@ -757,6 +758,11 @@ class SetupWizard:
         for key, value in self.env_vars.items():
             if value or key not in merged:
                 merged[key] = value
+        # The obscura service's CDP password (docker-compose.yml reads it
+        # from .env). Made once; never replaced, so a running service keeps
+        # matching.
+        if not merged.get("BROWSER_CDP_TOKEN"):
+            merged["BROWSER_CDP_TOKEN"] = secrets.token_hex(32)
 
         lines = [f"{key}={value}" for key, value in merged.items()]
         ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")

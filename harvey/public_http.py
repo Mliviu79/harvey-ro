@@ -40,6 +40,62 @@ def _public_address(value: str) -> str:
     return str(address)
 
 
+async def _public_addresses(url: httpx.URL, connect_budget: float) -> list[str]:
+    """The checked public addresses ``url`` may connect to, IPv4 first.
+
+    Raises UnsafeURLError for a URL outside the boundary, ValueError when it
+    resolves to a non-public address, and asyncio.TimeoutError/OSError when
+    DNS fails.
+    """
+    host = url.raw_host.decode("ascii")
+    if (url.scheme not in {"http", "https"} or not host
+            or url.username or url.password or "%" in host
+            or host.rstrip(".").lower() == "localhost"
+            or host.rstrip(".").lower().endswith(".localhost")):
+        raise UnsafeURLError("Only public HTTP(S) websites are allowed")
+    port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise UnsafeURLError("Invalid website port")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return [_public_address(host)]
+    # Include DNS time in the client's connect budget, with a
+    # finite default even if the caller disables other timeouts.
+    answers = await asyncio.wait_for(
+        asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+        timeout=connect_budget,
+    )
+    addresses = list(dict.fromkeys(_public_address(row[4][0]) for row in answers))
+    if not addresses:
+        raise ValueError("DNS returned no addresses")
+    # Many operator machines have no IPv6 route even when DNS
+    # publishes AAAA first. Prefer a validated IPv4 answer.
+    addresses.sort(key=lambda value: ipaddress.ip_address(value).version)
+    return addresses
+
+
+async def check_public_url(url: str, timeout: float = 10.0) -> None:
+    """Raise UnsafeURLError unless ``url`` is a public HTTP(S) website now.
+
+    The same boundary as public_http_client, for clients that connect on
+    their own (a browser): the check happens before the request, so unlike
+    the pinned transport it cannot rule out DNS rebinding.
+    """
+    try:
+        await _public_addresses(httpx.URL(url), timeout)
+    except UnsafeURLError:
+        raise
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise UnsafeURLError("Website resolves to a non-public destination") from exc
+    except asyncio.TimeoutError as exc:
+        raise UnsafeURLError("Website DNS resolution timed out") from exc
+    except OSError as exc:
+        raise UnsafeURLError("Website DNS resolution failed") from exc
+
+
 class PublicHTTPTransport(httpx.AsyncBaseTransport):
     def __init__(self):
         # Different domains may resolve to the same IP. Do not reuse a TLS
@@ -51,38 +107,13 @@ class PublicHTTPTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = request.url
         host = url.raw_host.decode("ascii")
-        if (url.scheme not in {"http", "https"} or not host
-                or url.username or url.password or "%" in host
-                or host.rstrip(".").lower() == "localhost"
-                or host.rstrip(".").lower().endswith(".localhost")):
-            raise UnsafeURLError("Only public HTTP(S) websites are allowed", request=request)
-        port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
-        if not 1 <= port <= 65535:
-            raise UnsafeURLError("Invalid website port", request=request)
         timeout = request.extensions.get("timeout", {}).get("connect")
         connect_budget = timeout if timeout is not None else 10.0
         deadline = monotonic() + connect_budget
-
         try:
-            literal = ipaddress.ip_address(host)
-        except ValueError:
-            literal = None
-        try:
-            if literal is not None:
-                addresses = [_public_address(host)]
-            else:
-                # Include DNS time in the client's connect budget, with a
-                # finite default even if the caller disables other timeouts.
-                answers = await asyncio.wait_for(
-                    asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
-                    timeout=connect_budget,
-                )
-                addresses = list(dict.fromkeys(_public_address(row[4][0]) for row in answers))
-                if not addresses:
-                    raise ValueError("DNS returned no addresses")
-                # Many operator machines have no IPv6 route even when DNS
-                # publishes AAAA first. Prefer a validated IPv4 answer.
-                addresses.sort(key=lambda value: ipaddress.ip_address(value).version)
+            addresses = await _public_addresses(url, connect_budget)
+        except UnsafeURLError as exc:
+            raise UnsafeURLError(str(exc), request=request) from exc
         except ValueError as exc:
             raise UnsafeURLError("Website resolves to a non-public destination", request=request) from exc
         except asyncio.TimeoutError as exc:

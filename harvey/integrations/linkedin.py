@@ -8,11 +8,13 @@ protect the user's LinkedIn account from restriction.
 import asyncio
 import json
 import logging
+import os
 import random
-from datetime import date
+import re
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 logger = logging.getLogger("harvey.linkedin")
 
@@ -21,6 +23,54 @@ from harvey.paths import PROJECT_ROOT
 DATA_DIR = PROJECT_ROOT / "data"
 COOKIES_PATH = DATA_DIR / "linkedin_cookies.json"
 ACTIVITY_PATH = DATA_DIR / "linkedin_activity.json"
+# Written when a login that sent the password didn't reach the feed (a
+# checkpoint, a refusal, a stall). While it exists
+# Harvey never tries to log in again on its own: repeated automatic logins
+# are how accounts get locked. Delete it after signing in by hand.
+LOGIN_HOLD_PATH = DATA_DIR / "linkedin_login_hold.json"
+
+LOGIN_URL = "https://www.linkedin.com/login"
+# LinkedIn's login page (React, generated ids, no <form>, a type=button
+# submit). The old #username / #password / button[type=submit] are kept as
+# a second choice in case an older page is served.
+EMAIL_SELECTORS = ('input[type="email"]:visible', "#username")
+PASSWORD_SELECTORS = ('input[type="password"]:visible', "#password")
+SIGN_IN_TEXT = re.compile(r"^\s*Sign in\s*$")
+LOGIN_FORM_TIMEOUT_MS = 15000
+# The feed never goes network-idle, and Obscura reports idle too early:
+# after submitting, poll the URL instead.
+LOGIN_POLL_S = 0.5
+LOGIN_WAIT_S = 30.0
+_CHALLENGE_WORDS = ("checkpoint", "challenge", "captcha", "verify", "add-phone",
+                    "two-step")
+
+
+def classify_url(url: str) -> str:
+    """"feed", "challenge", "login" or "other" for a LinkedIn URL."""
+    path = urlparse(url or "").path.lower()
+    if path.startswith("/feed") or path.startswith("/mynetwork"):
+        return "feed"
+    if any(word in path for word in _CHALLENGE_WORDS):
+        return "challenge"
+    if path.startswith("/login") or path.startswith("/uas/login") or path in ("", "/"):
+        return "login"
+    return "other"
+
+
+def browser_endpoint(env=None) -> tuple[str, str]:
+    """(cdp_url, token) of the browser LinkedIn should use: the fallback
+    (Chromium) first, since LinkedIn refuses Obscura; then the primary;
+    ("", "") to launch a local Chromium (a pip install with
+    `playwright install chromium`)."""
+    from harvey.browser import primary_url
+    env = os.environ if env is None else env
+    fallback = (env.get("BROWSER_CDP_FALLBACK_URL") or "").strip()
+    if fallback:
+        return fallback, ""
+    primary = primary_url(env)
+    if primary:
+        return primary, (env.get("BROWSER_CDP_TOKEN") or "").strip()
+    return "", ""
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -43,6 +93,8 @@ class LinkedInAutomation:
         self.context = None
         self.page = None
         self._pw = None
+        self._remote = False
+        self._login_result: Optional[bool] = None
         self._activity = self._load_activity()
 
     # ── Daily activity caps ──
@@ -127,7 +179,14 @@ class LinkedInAutomation:
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
-        self.browser = await self._pw.chromium.launch(headless=True)
+        cdp_url, token = browser_endpoint()
+        if cdp_url:
+            headers = {"Authorization": f"Bearer {token}"} if token else None
+            self.browser = await self._pw.chromium.connect_over_cdp(
+                cdp_url, headers=headers, timeout=15000)
+            self._remote = True
+        else:
+            self.browser = await self._pw.chromium.launch(headless=True)
 
         # Always use the same fingerprint (viewport + UA), whether or not
         # we have saved cookies — a changing fingerprint is a red flag.
@@ -169,6 +228,9 @@ class LinkedInAutomation:
         except Exception as e:
             logger.debug(f"Could not save cookies on shutdown: {e}")
         try:
+            if self._remote and self.context:
+                # A shared browser service: close only what Harvey opened.
+                await self.context.close()
             if self.browser:
                 await self.browser.close()
         except Exception as e:
@@ -187,62 +249,161 @@ class LinkedInAutomation:
 
     # ── Auth ──
 
+    @staticmethod
+    def login_hold() -> Optional[dict]:
+        """The reason Harvey stopped logging in, or None."""
+        try:
+            if LOGIN_HOLD_PATH.exists():
+                data = json.loads(LOGIN_HOLD_PATH.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {"reason": "unknown"}
+        except (ValueError, OSError):
+            return {"reason": "unreadable hold file"}
+        return None
+
+    @staticmethod
+    def _hold(reason: str):
+        try:
+            LOGIN_HOLD_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LOGIN_HOLD_PATH.write_text(json.dumps(
+                {"reason": reason, "at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+        except OSError as e:
+            logger.debug(f"Could not write LinkedIn login hold: {e}")
+        logger.warning(
+            f"LinkedIn login stopped: {reason}. Harvey won't try again on its own. "
+            f"Sign in to LinkedIn by hand in a normal browser, then delete "
+            f"data/{LOGIN_HOLD_PATH.name}.")
+
+    async def _first_visible(self, selectors, timeout_ms: int):
+        """The first selector that shows up, or None."""
+        per = max(1000, timeout_ms // len(selectors))
+        for selector in selectors:
+            try:
+                await self.page.wait_for_selector(selector, state="visible", timeout=per)
+                return selector
+            except Exception:
+                continue
+        return None
+
+    async def _sign_in_button(self):
+        button = self.page.locator("button:visible", has_text=SIGN_IN_TEXT).first
+        try:
+            if await button.count():
+                return button
+        except Exception:
+            pass
+        return self.page.locator('button[type="submit"]:visible').first
+
     async def login(self) -> bool:
-        """Log into LinkedIn."""
-        if not self.page:
-            await self.start()
+        """Log into LinkedIn, once. Never retried: any failure returns
+        False, and once the credentials may have been sent (a checkpoint, a
+        refused password, a submit that didn't reach the feed) it also puts
+        a hold on automatic logins (see LOGIN_HOLD_PATH). Scout makes a new
+        instance every cycle, so only the hold stops the next attempt."""
+        if self._login_result is not None:
+            return self._login_result
+        self._login_result = False
+
+        hold = self.login_hold()
+        if hold:
+            logger.warning(
+                f"LinkedIn login is on hold ({hold.get('reason', 'unknown')}, "
+                f"{hold.get('at', '')}). Delete {LOGIN_HOLD_PATH.name} in data/ "
+                f"after signing in by hand.")
+            return False
 
         if not self.email or not self.password:
             logger.warning("LinkedIn credentials not configured; cannot log in.")
             return False
 
+        if not self.page:
+            await self.start()
+
+        status = None
         try:
-            await self.page.goto(
-                "https://www.linkedin.com/login", timeout=30000
-            )
-            await self._wait_settled()
+            resp = await self.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+            status = getattr(resp, "status", None)
         except Exception as e:
-            logger.error(f"Could not load LinkedIn login page: {e}")
+            logger.error(f"Could not load LinkedIn login page: {type(e).__name__}")
+            return False
+
+        where = classify_url(self.page.url)
+        if where == "feed":
+            # A saved cookie session redirected straight past the form.
+            logger.info("Already logged into LinkedIn.")
+            self._login_result = True
+            return True
+        if where == "challenge":
+            self._hold("LinkedIn showed a security checkpoint before the login form")
+            return False
+
+        email_sel = await self._first_visible(EMAIL_SELECTORS, LOGIN_FORM_TIMEOUT_MS)
+        pass_sel = email_sel and await self._first_visible(PASSWORD_SELECTORS, 5000)
+        if not email_sel or not pass_sel:
+            hint = (" LinkedIn refuses some browsers (Obscura gets a 403): set "
+                    "BROWSER_CDP_FALLBACK_URL to the Chromium service."
+                    if status in (403, 429, 999) else
+                    " The page may have changed.")
+            logger.error(f"LinkedIn login form not found (HTTP {status}); "
+                         f"no credentials were sent.{hint}")
             return False
 
         await self._random_delay(1, 3)
-
-        # Check if already logged in (cookie session redirected us)
-        if "feed" in self.page.url or "mynetwork" in self.page.url:
-            logger.info("Already logged into LinkedIn.")
-            return True
-
+        clicking = False
         try:
-            await self.page.fill("#username", self.email)
+            await self.page.locator(email_sel).first.fill(self.email)
             await self._random_delay(0.5, 1.5)
-            await self.page.fill("#password", self.password)
+            await self.page.locator(pass_sel).first.fill(self.password)
             await self._random_delay(0.5, 1.5)
-            await self.page.click('button[type="submit"]')
-            await self._wait_settled()
-
-            if "feed" in self.page.url or "mynetwork" in self.page.url:
-                logger.info("Successfully logged into LinkedIn.")
-                # Save cookies for future sessions
-                cookies = await self.context.cookies()
-                self._save_cookies_sync(cookies)
-                return True
-
-            # Check for security challenge
-            if "checkpoint" in self.page.url or "challenge" in self.page.url:
-                logger.warning(
-                    "LinkedIn security checkpoint detected. "
-                    "Please log in manually and save cookies."
-                )
-                return False
-
-            logger.warning(f"Login may have failed. Current URL: {self.page.url}")
-            return False
-
+            button = await self._sign_in_button()
+            clicking = True
+            await button.click()
         except Exception as e:
             # Never include credentials in logged errors.
-            msg = str(e).replace(self.password, "***") if self.password else str(e)
-            logger.error(f"LinkedIn login failed: {msg}")
+            msg = str(e)
+            for secret in (self.password, self.email):
+                if secret:
+                    msg = msg.replace(secret, "***")
+            logger.error(f"LinkedIn login could not submit the form: {msg.splitlines()[0][:200] if msg else type(e).__name__}")
+            if clicking:
+                # The click may have gone through: count it as an attempt.
+                self._hold("the login form failed while submitting")
             return False
+
+        where = "login"
+        waited = 0.0
+        while waited < LOGIN_WAIT_S:
+            await asyncio.sleep(LOGIN_POLL_S)
+            waited += LOGIN_POLL_S
+            where = classify_url(self.page.url)
+            if where != "login":
+                break
+
+        if where == "feed":
+            logger.info("Successfully logged into LinkedIn.")
+            try:
+                self._save_cookies_sync(await self.context.cookies())
+            except Exception as e:
+                logger.debug(f"Could not save LinkedIn cookies: {e}")
+            self._login_result = True
+            return True
+        if where == "challenge":
+            self._hold("LinkedIn asked for a security check after the password")
+            return False
+        if where == "login":
+            refused = False
+            try:
+                refused = await self.page.evaluate(
+                    "() => !!document.querySelector('#error-for-password, #error-for-username, "
+                    "[role=alert]')")
+            except Exception:
+                pass
+            self._hold("LinkedIn refused the email or password" if refused else
+                       "the login didn't leave the login page")
+            return False
+        self._hold(f"the login landed somewhere unexpected "
+                   f"({urlparse(self.page.url).path[:60]})")
+        return False
 
     # ── Search ──
 

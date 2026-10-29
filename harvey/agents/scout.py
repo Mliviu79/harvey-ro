@@ -49,6 +49,7 @@ from harvey.integrations.email_finder import (
 from harvey.integrations.linkedin import LinkedInAutomation
 from harvey.models.company import Company
 from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
+from harvey.browser import HTTP, PageReader
 from harvey.public_http import public_http_client
 from harvey.state import StateManager
 from harvey.untrusted import UNTRUSTED_RULE, fence
@@ -199,11 +200,14 @@ class Scout:
             strategies.append(("profile_search", self._prospect_via_profile_search))
         strategies.append(("company_discovery", self._prospect_via_company_discovery))
 
-        for name, strategy in strategies:
-            try:
-                prospects_found += await strategy()
-            except Exception as e:
-                logger.warning(f"Scout: strategy '{name}' failed: {e}")
+        try:
+            for name, strategy in strategies:
+                try:
+                    prospects_found += await strategy()
+                except Exception as e:
+                    logger.warning(f"Scout: strategy '{name}' failed: {e}")
+        finally:
+            await self.close_browser()
 
         await self.state.log_action(
             action_type="prospect",
@@ -314,6 +318,7 @@ class Scout:
 
             if resp is not None:
                 last_status = resp.status_code
+                self.__dict__["_last_status"] = resp.status_code
                 if resp.status_code in (200, 202, 403, 429, 503) and self._looks_blocked(
                         getattr(resp, "text", "") or "", resp.status_code):
                     # A bot challenge won't clear on retry: note it and stop.
@@ -1363,7 +1368,7 @@ Respond ONLY with the JSON array."""
             f"https://{domain}", f"https://www.{domain}",
             f"http://{domain}", f"http://www.{domain}",
         ):
-            resp = await self._fetch(base, timeout=SCRAPE_TIMEOUT, retries=retries)
+            resp = await self._fetch_page(base, retries=retries)
             if resp is not None:
                 return base, resp
             if self.challenged(domain):
@@ -1483,7 +1488,51 @@ Respond ONLY with the JSON array."""
         if site.get("fetches", 0) >= MAX_SITE_FETCHES:
             return None
         site["fetches"] = site.get("fetches", 0) + 1
-        return await self._fetch(url, timeout=SCRAPE_TIMEOUT, retries=1)
+        return await self._fetch_page(url, retries=1)
+
+    # ── Website pages: HTTP first, a browser when HTTP isn't enough ──
+
+    def _pages(self) -> PageReader:
+        reader = self.__dict__.get("_page_reader")
+        if reader is None:
+            reader = self.__dict__["_page_reader"] = PageReader()
+        return reader
+
+    async def close_browser(self):
+        """Disconnect from the browser services, if this cycle used them."""
+        reader = self.__dict__.pop("_page_reader", None)
+        if reader is not None:
+            await reader.aclose()
+
+    def _page_method(self, url: str) -> str:
+        reader = self.__dict__.get("_page_reader")
+        return reader.method(url) if reader is not None else HTTP
+
+    async def _fetch_page(self, url: str, *, retries: int = 1):
+        """A page of a company's own website: _fetch over HTTP, or the page
+        rendered by a browser when HTTP got a JavaScript shell or a block
+        (harvey/browser.py). The single place Scout reads websites; returns
+        an httpx.Response, a RenderedPage (same .text/.url), or None."""
+        pages = self._pages()
+        if pages.browser_first(url):
+            page = await pages.render(url)
+            if page is not None:
+                return page
+        was_challenged = self.challenged(url)
+        self.__dict__["_last_status"] = None
+        resp = await self._fetch(url, timeout=SCRAPE_TIMEOUT, retries=retries)
+        if resp is None:
+            blocked = ((self.challenged(url) and not was_challenged)
+                       or self.__dict__.get("_last_status") == 403)
+            if not blocked:
+                return None
+            page = await pages.after_http(url, blocked=True)
+            if page is not None:
+                getattr(self, "_challenged", set()).discard(self._host(url))
+            return page
+        page = await pages.after_http(url, html=getattr(resp, "text", "") or "",
+                                      status=getattr(resp, "status_code", 200))
+        return page or resp
 
     async def _scrape_team_page(self, domain: str) -> list[dict]:
         """The people a company's own site names, likeliest decision maker
@@ -1720,7 +1769,9 @@ Respond ONLY with the JSON array."""
                     "signal_code": "PHONE_NUMBER", "company_id": company_id,
                     # Not "profile": a profile-collector row would count as the
                     # company being profiled and hold back its profile run.
-                    "collector": "people", "value_text": hit.number,
+                    "collector": ("people" if self._page_method(url) == HTTP
+                                  else f"people:{self._page_method(url)}"),
+                    "value_text": hit.number,
                     "confidence": hit.confidence,
                     "evidence_url": url,
                 } for url, hit in hits])

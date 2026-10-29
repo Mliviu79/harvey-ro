@@ -55,6 +55,14 @@ async def test_a_profiled_company_drops_out(state):
 
 
 @pytest.mark.asyncio
+async def test_a_company_read_through_the_browser_drops_out_too(state):
+    cid = await state.add_company(Company(name="Baker", domain="baker.com"))
+    await state.add_observation("TECH_STACK", company_id=cid,
+                                collector="profile:browser", value_text="wix")
+    assert await state.count_companies_needing_profile() == 0
+
+
+@pytest.mark.asyncio
 async def test_a_stale_profile_comes_back_round(state):
     """Re-reading on a schedule is what makes 'they dropped their agency'
     visible. A company profiled last year is not done forever."""

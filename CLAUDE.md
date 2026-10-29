@@ -70,6 +70,12 @@ Then install the browser for LinkedIn prospecting:
 ```bash
 python -m playwright install chromium
 ```
+(Docker installs don't: the image has no browser. Compose runs an `obscura`
+service for JavaScript-only websites, used by default (`BROWSER_CDP_URL=off`
+turns it off; setup writes its `BROWSER_CDP_TOKEN` to `.env`), and an
+optional Chromium under `--profile chromium`, behind an egress proxy that
+refuses private addresses, for LinkedIn and sites that block Obscura,
+`BROWSER_CDP_FALLBACK_URL`.)
 
 ### Step 2: API Keys (`.env`)
 
@@ -355,5 +361,6 @@ harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or reco
 - **SQLite errors**: The `data/` directory is created automatically on first run
 - **Claude headless mode fails**: User needs `claude login` and an active Max subscription
 - **Codex calls fail** (`brain.provider: codex`): the log line says why — `codex login` with ChatGPT (also when the login "has expired or is due for renewal": Harvey never renews it), install the supported Codex version (`harvey status --check` shows what's wrong without a model call; while Codex is unusable Harvey pauses whole cycles on purpose), pick a `brain.model` without code mode, or remove whatever Codex config layer is forcing tools/hooks/MCP back on. Never weaken Harvey's isolation checks to get past it.
+- **LinkedIn login stopped / "on hold"**: any login that sent the password and didn't reach the feed (a checkpoint, a refused password, a stall) writes `data/linkedin_login_hold.json` and Harvey never logs in again on its own. Have the user sign in by hand in a normal browser, then delete that file. "Login form not found (HTTP 403)" means the browser was refused: set `BROWSER_CDP_FALLBACK_URL` to the Chromium service.
 - **Instantly API 401**: Wrong API key or needs the Growth plan for API access
 - **Google search rate limiting**: Harvey automatically falls back to DuckDuckGo and Bing. For reliable search, add a Serper API key ($5/mo).
