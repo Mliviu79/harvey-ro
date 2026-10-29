@@ -774,6 +774,204 @@ _CONVERSATION_COLUMNS = frozenset({
 })
 
 
+# ── Company writes shared by StateManager and CompanyBatch ──
+# Each takes an open connection and never commits: the caller decides
+# whether that is one write or a few thousand.
+
+def _company_from_row(row) -> Company:
+    d = dict(row)
+    for json_col, field in (("tech_stack_json", "tech_stack"), ("signals_json", "signals")):
+        raw = d.pop(json_col, None)
+        try:
+            parsed = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            parsed = []
+        d[field] = parsed if isinstance(parsed, list) else []
+    return Company(**d)
+
+
+async def _company_by(db, column: str, value: str) -> Company | None:
+    if column not in ("cui", "domain", "external_id") or not value:
+        return None
+    # "!= ''" lets SQLite use the partial unique indexes on cui and
+    # external_id (WHERE ... != ''); "= ?" alone can't, and scans the table.
+    async with db.execute(f"SELECT * FROM companies WHERE {column} = ? AND {column} != ''",
+                          (value,)) as cur:
+        row = await cur.fetchone()
+        if not row:
+            return None
+        names = [c[0] for c in cur.description]
+    return _company_from_row(dict(zip(names, row)))
+
+
+async def _insert_company(db, company: Company) -> str:
+    if not company.id:
+        company.id = _new_id()
+    company.domain = _norm(company.domain)
+    cursor = await db.execute(
+        """INSERT OR IGNORE INTO companies
+           (id, name, domain, website, description, industry,
+            company_size, location, phone, source, source_url,
+            external_id, cui, address, notes, tech_stack_json,
+            signals_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            company.id, company.name, company.domain, company.website,
+            company.description, company.industry, company.company_size,
+            company.location, company.phone, company.source,
+            company.source_url, company.external_id, company.cui,
+            company.address, company.notes,
+            json.dumps(company.tech_stack), json.dumps(company.signals),
+            company.created_at.isoformat(),
+            company.updated_at.isoformat(),
+        ),
+    )
+    if cursor.rowcount == 0:
+        # Uniqueness conflict: hand back the existing record's id.
+        for column, value in (("cui", company.cui),
+                              ("domain", company.domain),
+                              ("external_id", company.external_id)):
+            if not value:
+                continue
+            async with db.execute(
+                f"SELECT id FROM companies WHERE {column} = ? AND {column} != ''", (value,)
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    company.id = row[0]
+                    break
+    return company.id
+
+
+async def _fill_company_fields(db, company_id: str, fields: dict) -> list[str]:
+    changed = []
+    for column, value in fields.items():
+        if column not in _COMPANY_FILL_COLUMNS:
+            raise ValueError(f"not a fillable company column: {column}")
+        if not value:
+            continue
+        if column == "domain":
+            value = _norm(value)
+            # Another company already owns it: two records for one
+            # site is a merge for a person to make, not this call.
+            async with db.execute(
+                "SELECT 1 FROM companies WHERE domain = ? AND id != ?",
+                (value, company_id),
+            ) as cur:
+                if await cur.fetchone():
+                    continue
+        if column == "cui":
+            async with db.execute(
+                "SELECT 1 FROM companies WHERE cui = ? AND cui != '' AND id != ?",
+                (value, company_id),
+            ) as cur:
+                if await cur.fetchone():
+                    continue
+        only_empty = "" if column == "address" else \
+            f" AND COALESCE(TRIM({column}), '') = ''"
+        cursor = await db.execute(
+            f"UPDATE companies SET {column} = ?, updated_at = CURRENT_TIMESTAMP "
+            f"WHERE id = ? AND COALESCE({column}, '') != ?{only_empty}",
+            (value, company_id, value),
+        )
+        if cursor.rowcount:
+            changed.append(column)
+    return changed
+
+
+async def _set_company_activities(db, company_id: str, classes, source: str,
+                                  confidence: float = 1.0) -> int:
+    wanted = list(dict.fromkeys((str(c).zfill(4), int(v)) for c, v in classes))
+    async with db.execute(
+        "SELECT code, version FROM company_activities "
+        "WHERE company_id = ? AND source = ?", (company_id, source),
+    ) as cur:
+        have = {(r[0], r[1]) for r in await cur.fetchall()}
+    gone = have - set(wanted)
+    fresh = [pair for pair in wanted if pair not in have]
+    if gone:
+        await db.executemany(
+            "DELETE FROM company_activities WHERE company_id = ? AND code = ? "
+            "AND version = ? AND source = ?",
+            [(company_id, c, v, source) for c, v in gone])
+    if fresh:
+        await db.executemany(
+            "INSERT OR IGNORE INTO company_activities "
+            "(company_id, code, version, source, confidence) VALUES (?, ?, ?, ?, ?)",
+            [(company_id, c, v, source, confidence) for c, v in fresh])
+    return len(fresh)
+
+
+async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
+    if not rows:
+        return 0
+    payload = [
+        (
+            _new_id(), r.get("company_id", ""), r.get("prospect_id", ""),
+            r["signal_code"], r.get("collector", ""), r.get("value_num"),
+            r.get("value_text", ""), float(r.get("confidence", 1.0)),
+            r.get("evidence_url", ""), r.get("observed_at"),
+            r.get("run_id", run_id),
+        )
+        for r in rows
+    ]
+    await db.executemany(
+        """INSERT INTO observations
+               (id, company_id, prospect_id, signal_code, collector,
+                value_num, value_text, confidence, evidence_url,
+                observed_at, run_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+        payload,
+    )
+    return len(payload)
+
+
+class CompanyBatch:
+    """Company writes on one shared connection (StateManager.batch()).
+
+    The same rules as the StateManager methods of the same names, without a
+    connection and a commit each: a registry import saving thousands of
+    companies spends its time on the writes, not on opening the database.
+    Reads see the batch's own uncommitted writes."""
+
+    def __init__(self, db):
+        self.db = db
+
+    async def get_company_by_cui(self, cui: str) -> Company | None:
+        return await _company_by(self.db, "cui", (cui or "").strip())
+
+    async def get_company_by_external_id(self, external_id: str) -> Company | None:
+        return await _company_by(self.db, "external_id", external_id)
+
+    async def get_company_by_domain(self, domain: str) -> Company | None:
+        return await _company_by(self.db, "domain", _norm(domain))
+
+    async def add_company(self, company: Company) -> str:
+        return await _insert_company(self.db, company)
+
+    async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
+        return await _fill_company_fields(self.db, company_id, fields)
+
+    async def set_company_activities(self, company_id: str, classes, source: str,
+                                     confidence: float = 1.0) -> int:
+        return await _set_company_activities(self.db, company_id, classes, source,
+                                             confidence)
+
+    async def observed(self, company_id: str, evidence_url: str) -> set[tuple[str, str]]:
+        """(signal_code, value_text) already recorded for the company from
+        this evidence (one registry dataset): what a re-import must not add
+        again."""
+        async with self.db.execute(
+            "SELECT signal_code, value_text FROM observations "
+            "WHERE company_id = ? AND evidence_url = ?", (company_id, evidence_url),
+        ) as cur:
+            return {(r[0], r[1]) for r in await cur.fetchall()}
+
+    async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
+        return await _insert_observations(self.db, rows, run_id)
+
+
 class StateManager:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or str(DB_PATH)
@@ -790,6 +988,22 @@ class StateManager:
             yield db
         finally:
             await db.close()
+
+    @asynccontextmanager
+    async def batch(self):
+        """A CompanyBatch: many company writes on one connection, committed
+        once at the end (rolled back if the block raises), with the search
+        index refreshed once for every company touched. For importers that
+        save thousands of companies, where opening a connection and
+        committing per call is most of the time."""
+        async with self._connect() as db:
+            try:
+                yield CompanyBatch(db)
+                await self._flush_company_search(db)
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
 
     async def init_db(self):
         """Create/upgrade the schema. Safe to call on every startup."""
@@ -871,15 +1085,7 @@ class StateManager:
 
     @staticmethod
     def _company_from_row(row: aiosqlite.Row) -> Company:
-        d = dict(row)
-        for json_col, field in (("tech_stack_json", "tech_stack"), ("signals_json", "signals")):
-            raw = d.pop(json_col, None)
-            try:
-                parsed = json.loads(raw) if raw else []
-            except (json.JSONDecodeError, TypeError):
-                parsed = []
-            d[field] = parsed if isinstance(parsed, list) else []
-        return Company(**d)
+        return _company_from_row(row)
 
     async def add_company(self, company: Company) -> str:
         """Insert a company, or return the id of the one already recorded.
@@ -889,44 +1095,10 @@ class StateManager:
         website still has to dedup across re-runs, and for anyone selling
         websites those are the best prospects on the list.
         """
-        if not company.id:
-            company.id = _new_id()
-        company.domain = _norm(company.domain)
         async with self._connect() as db:
-            cursor = await db.execute(
-                """INSERT OR IGNORE INTO companies
-                   (id, name, domain, website, description, industry,
-                    company_size, location, phone, source, source_url,
-                    external_id, cui, address, notes, tech_stack_json,
-                    signals_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    company.id, company.name, company.domain, company.website,
-                    company.description, company.industry, company.company_size,
-                    company.location, company.phone, company.source,
-                    company.source_url, company.external_id, company.cui,
-                    company.address, company.notes,
-                    json.dumps(company.tech_stack), json.dumps(company.signals),
-                    company.created_at.isoformat(),
-                    company.updated_at.isoformat(),
-                ),
-            )
+            company_id = await _insert_company(db, company)
             await db.commit()
-            if cursor.rowcount == 0:
-                # Uniqueness conflict: hand back the existing record's id.
-                for column, value in (("cui", company.cui),
-                                      ("domain", company.domain),
-                                      ("external_id", company.external_id)):
-                    if not value:
-                        continue
-                    async with db.execute(
-                        f"SELECT id FROM companies WHERE {column} = ?", (value,)
-                    ) as cur:
-                        row = await cur.fetchone()
-                        if row:
-                            company.id = row[0]
-                            break
-        return company.id
+        return company_id
 
     async def update_company_signals(
         self,
@@ -990,12 +1162,7 @@ class StateManager:
 
     async def get_company_by_domain(self, domain: str) -> Company | None:
         async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM companies WHERE domain = ?", (_norm(domain),)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return self._company_from_row(row) if row else None
+            return await _company_by(db, "domain", _norm(domain))
 
     async def get_company_by_external_id(self, external_id: str) -> Company | None:
         """Look a company up by its provider-stable id.
@@ -1006,12 +1173,7 @@ class StateManager:
         if not external_id:
             return None
         async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM companies WHERE external_id = ?", (external_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return self._company_from_row(row) if row else None
+            return await _company_by(db, "external_id", external_id)
 
     async def get_company_by_cui(self, cui: str) -> Company | None:
         """Look a company up by its registry tax code (CUI)."""
@@ -1019,12 +1181,7 @@ class StateManager:
         if not cui:
             return None
         async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM companies WHERE cui = ?", (cui,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return self._company_from_row(row) if row else None
+            return await _company_by(db, "cui", cui)
 
     async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
         """Set the given fields where the company has none yet, and always
@@ -1037,39 +1194,8 @@ class StateManager:
         registry re-import is how a moved office reaches the record. Returns
         the columns changed.
         """
-        changed = []
         async with self._connect() as db:
-            for column, value in fields.items():
-                if column not in _COMPANY_FILL_COLUMNS:
-                    raise ValueError(f"not a fillable company column: {column}")
-                if not value:
-                    continue
-                if column == "domain":
-                    value = _norm(value)
-                    # Another company already owns it: two records for one
-                    # site is a merge for a person to make, not this call.
-                    async with db.execute(
-                        "SELECT 1 FROM companies WHERE domain = ? AND id != ?",
-                        (value, company_id),
-                    ) as cur:
-                        if await cur.fetchone():
-                            continue
-                if column == "cui":
-                    async with db.execute(
-                        "SELECT 1 FROM companies WHERE cui = ? AND id != ?",
-                        (value, company_id),
-                    ) as cur:
-                        if await cur.fetchone():
-                            continue
-                only_empty = "" if column == "address" else \
-                    f" AND COALESCE(TRIM({column}), '') = ''"
-                cursor = await db.execute(
-                    f"UPDATE companies SET {column} = ?, updated_at = CURRENT_TIMESTAMP "
-                    f"WHERE id = ? AND COALESCE({column}, '') != ?{only_empty}",
-                    (value, company_id, value),
-                )
-                if cursor.rowcount:
-                    changed.append(column)
+            changed = await _fill_company_fields(db, company_id, fields)
             await db.commit()
         return changed
 
@@ -1083,26 +1209,11 @@ class StateManager:
         removed (a re-import of a newer registry dataset drops a class the
         company gave up). Other sources' rows are left alone. Returns how
         many were added."""
-        wanted = list(dict.fromkeys((str(c).zfill(4), int(v)) for c, v in classes))
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT code, version FROM company_activities "
-                "WHERE company_id = ? AND source = ?", (company_id, source),
-            ) as cur:
-                have = {(r[0], r[1]) for r in await cur.fetchall()}
-            gone = have - set(wanted)
-            fresh = [pair for pair in wanted if pair not in have]
-            await db.executemany(
-                "DELETE FROM company_activities WHERE company_id = ? AND code = ? "
-                "AND version = ? AND source = ?",
-                [(company_id, c, v, source) for c, v in gone])
-            await db.executemany(
-                "INSERT OR IGNORE INTO company_activities "
-                "(company_id, code, version, source, confidence) VALUES (?, ?, ?, ?, ?)",
-                [(company_id, c, v, source, confidence) for c, v in fresh])
+            added = await _set_company_activities(db, company_id, classes, source, confidence)
             await self._flush_company_search(db)
             await db.commit()
-        return len(fresh)
+        return added
 
     async def get_company_activities(self, company_ids) -> dict[str, list[dict]]:
         """company id -> [{code, version, revision, name, name_en, keywords,
@@ -2050,29 +2161,11 @@ class StateManager:
         must not lose everything it observed."""
         if not rows:
             return 0
-        payload = [
-            (
-                _new_id(), r.get("company_id", ""), r.get("prospect_id", ""),
-                r["signal_code"], r.get("collector", ""), r.get("value_num"),
-                r.get("value_text", ""), float(r.get("confidence", 1.0)),
-                r.get("evidence_url", ""), r.get("observed_at"),
-                r.get("run_id", run_id),
-            )
-            for r in rows
-        ]
         async with self._connect() as db:
-            await db.executemany(
-                """INSERT INTO observations
-                       (id, company_id, prospect_id, signal_code, collector,
-                        value_num, value_text, confidence, evidence_url,
-                        observed_at, run_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
-                payload,
-            )
+            added = await _insert_observations(db, rows, run_id)
             await self._flush_company_search(db)
             await db.commit()
-        return len(payload)
+        return added
 
     async def yc_batch(self, company_id: str) -> str | None:
         """The YC batch the company says it's in ("" when it doesn't say

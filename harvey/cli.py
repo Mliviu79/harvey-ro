@@ -706,20 +706,287 @@ def cmd_search(args):
     asyncio.run(_search())
 
 
-def cmd_import_onrc(args):
-    """Companies (and their administrators) from Romania's trade registry.
+def _registry_path(args) -> Path:
+    from harvey.registry import REGISTRY_PATH
+    return Path(getattr(args, "registry", "") or REGISTRY_PATH)
 
-    Free open data, but big: the first run downloads ~1.5 GB once per
-    dataset into data/onrc/<date>/, and every run streams through it.
-    """
+
+def _onrc_dir(args) -> Path:
+    from harvey.paths import PROJECT_ROOT
+    return Path(getattr(args, "data_dir", "") or PROJECT_ROOT / "data" / "onrc")
+
+
+def _print_load_progress(step, rows):
+    if rows is None:
+        print(f"    {step}...", flush=True)
+    else:
+        print(f"    {step}: {rows:,} rows read", flush=True)
+
+
+async def _ensure_registry(path: Path, data_dir: Path, name: str = "latest",
+                           with_people: bool = True, force: bool = False,
+                           offline_ok: bool = False) -> dict:
+    """The registry at ``path`` holding dataset ``name`` ("latest": the
+    newest on data.gov.ro), downloading any missing file into
+    data_dir/<date>/ and building it when it isn't loaded yet. With
+    ``offline_ok``, a registry already loaded is used as it is when
+    data.gov.ro can't be reached; without one, the newest dataset already
+    downloaded into data_dir is loaded instead. Returns its meta."""
+    import httpx
+
+    from harvey import registry
+    from harvey.collectors import onrc
+
+    roles = [r for r in onrc.FILES if r != "people" or with_people]
+    have = registry.status(path)
+    if have and have.get("schema") != registry.SCHEMA_VERSION:
+        print(f"  {path.name} was loaded by an older Harvey; loading it again.")
+        have, force = None, True
+    local = onrc.local_dataset(data_dir, name, roles) if name != "latest" else None
+    if local:
+        dataset, files = local
+    else:
+        timeout = httpx.Timeout(60.0, read=300.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                dataset = await (onrc.latest_dataset(client) if name == "latest"
+                                 else onrc.dataset_named(client, name))
+                if have and have.get("dataset") == dataset.name and not force:
+                    return have
+
+                def progress(role, filename, size):
+                    mb = f"{size / 1e6:.0f} MB" if size else "size unknown"
+                    print(f"    downloading {filename} ({mb}), once per dataset...",
+                          flush=True)
+
+                files = await onrc.fetch_files(client, dataset, data_dir, roles=roles,
+                                               progress=progress)
+        except httpx.HTTPError as e:
+            why = f"data.gov.ro unreachable ({e.__class__.__name__})"
+            if have and offline_ok:
+                print(f"  {why}; using the registry already loaded ({have.get('dataset')})")
+                return have
+            local = _newest_local_dataset(data_dir, roles) if name == "latest" else None
+            if not local:
+                print(f"\n  {why}, and no complete dataset is downloaded in {data_dir}."
+                      + (f" The registry holds {have.get('dataset')}."
+                         if have else "") + " Try again when online.\n")
+                raise SystemExit(2)
+            dataset, files = local
+            print(f"  {why}; using {dataset.name}, already downloaded")
+    if have and have.get("dataset") == dataset.name and not force:
+        return have
+    print(f"  Loading {dataset.name} (registry as of {dataset.date}) into {path.name}; "
+          "a few minutes, once per dataset...", flush=True)
+    try:
+        return registry.build(files, dataset, path, progress=_print_load_progress)
+    except registry.RegistryBusy as e:
+        if have and offline_ok:
+            print(f"  Another load is running; using the registry already loaded "
+                  f"({have.get('dataset')})")
+            return have
+        print(f"\n  {e}.\n")
+        raise SystemExit(2)
+
+
+def _newest_local_dataset(data_dir: Path, roles):
+    """The newest dataset fully downloaded under data_dir/<date>/, or None."""
+    from datetime import date
+
+    from harvey.collectors import onrc
+
+    folders = sorted((p.name for p in Path(data_dir).glob("????-??-??") if p.is_dir()),
+                     reverse=True)
+    for folder in folders:
+        try:
+            when = date.fromisoformat(folder)
+        except ValueError:
+            continue
+        found = onrc.local_dataset(data_dir, f"firme-{when:%d-%m-%Y}", roles)
+        if found:
+            return found
+    return None
+
+
+def _print_registry_status(meta: dict | None, path: Path):
+    if not meta:
+        print(f"\n  No registry loaded at {path}. harvey registry load\n")
+        return
+    size = int(meta.get("bytes", 0)) / 1e9
+    print(f"\n  {meta.get('dataset')} (registry as of {meta.get('date')})")
+    print(f"  loaded {meta.get('loaded_at')} UTC in {meta.get('load_seconds')} s, "
+          f"{size:.2f} GB at {meta.get('path')}")
+    print(f"  {int(meta.get('firms', 0)):,} registrations, "
+          f"{int(meta.get('operating', 0)):,} operating")
+    print(f"  {int(meta.get('activities', 0)):,} authorised activities (CAEN classes)")
+    if meta.get("with_administrators") == "1":
+        print(f"  {int(meta.get('administrators', 0)):,} administrators (name and role)")
+    else:
+        print("  no administrators (loaded without the representatives file)")
+    print(f"  Source: ONRC open data, {meta.get('page')} (CC-BY 4.0)\n")
+
+
+def _print_registry_rows(total: int, rows: list[dict], words: str, offset: int,
+                         more: bool = False):
+    if not rows:
+        print(f"\n  No registry firm matches \"{words}\". Search by name, activity "
+              "(dentist, farmacie, 8623), county (BV, Brașov) or town.\n")
+        return
+    print(f"\n  {'More than ' if more else ''}{total:,} firm{'' if total == 1 else 's'} "
+          f"match \"{words}\""
+          + (f", showing {offset + 1}-{offset + len(rows)}" if total > len(rows) else "")
+          + "\n")
+    for row in rows:
+        ident = f"  CUI {row['cui']}" if row.get("cui") else ""
+        print(f"  {row['name']}{ident}  {row['reg']}")
+        place = ", ".join(x for x in (row.get("address"), row.get("locality"),
+                                      row.get("county")) if x)
+        details = [x for x in (place, row.get("website"),
+                               None if row.get("operating") else row.get("status")) if x]
+        if details:
+            print("    " + " · ".join(details))
+        lines, more = _activity_lines(row.get("activities") or [])
+        for line in lines[:4]:
+            print(f"    {line}")
+        more += max(0, len(lines) - 4)
+        if more:
+            print(f"    + {more} other activit{'y' if more == 1 else 'ies'}")
+        print()
+
+
+def _print_pull_report(report, where: str = ""):
+    if report.shared_domain:
+        print(f"  {report.shared_domain} list a website another business on file already "
+              "has: kept as separate records, possible matches to review")
+    if report.catch_all_only:
+        print(f"  {report.catch_all_only} only on the old catch-all code 8690 Rev.2, so "
+              "may be other health activities")
+    if report.excluded:
+        print(f"  {report.excluded} skipped — on your do-not-contact list")
+    verb = "would be" if report.dry_run else "are"
+    print(f"  {report.new_companies} {verb} new, {report.known_companies} already on file"
+          + ("" if report.dry_run else f" ({report.updated_companies} filled in)"))
+    print(f"  {report.administrators} administrators named")
+    if not report.dry_run:
+        print(f"  {report.activities} activities (CAEN classes) recorded, "
+              "searchable with harvey search")
+        print(f"  {report.observations} observations recorded")
+    for code in report.unconfirmed:
+        print(f"    {code} not confirmed, so not recorded "
+              f"(harvey signals --confirm {code})")
+    for err in report.errors[:5]:
+        print(f"    ! {err}")
+
+
+# registry pull copies at most this many firms unless --limit says how many.
+PULL_WITHOUT_LIMIT = 10_000
+
+
+def _pull_progress(dry_run: bool):
+    verb = "checked" if dry_run else "saved"
+    return lambda done, total: print(f"  {verb} {done:,} of {total:,}...", flush=True)
+
+
+def cmd_registry(args):
+    """The whole trade registry in data/registry.db: load it once per
+    dataset, search it, pull chosen firms into Harvey. No Claude."""
+    import json as _json
+
+    from harvey import registry
+
+    path = _registry_path(args)
+    action = args.registry_action
+
+    if action == "status":
+        meta = registry.status(path)
+        if args.json:
+            print(_json.dumps(meta, ensure_ascii=False, indent=2))
+        else:
+            _print_registry_status(meta, path)
+        return
+
+    if action == "load":
+        async def _load():
+            print(f"\n  ONRC open data: {args.dataset} dataset")
+            meta = await _ensure_registry(
+                path, _onrc_dir(args), args.dataset,
+                with_people=args.administrators == "all", force=args.force)
+            _print_registry_status(registry.status(path) or meta, path)
+        asyncio.run(_load())
+        return
+
+    words = " ".join(args.words)
+    try:
+        con = registry.connect(path)
+    except FileNotFoundError:
+        print(f"\n  No registry loaded at {path}. Run harvey registry load first "
+              "(downloads ~1.5 GB once per dataset).\n")
+        raise SystemExit(2)
+
+    if action == "search":
+        found = registry.search(con, words, all_statuses=args.all_statuses,
+                                limit=args.limit, offset=args.offset)
+        if args.json:
+            print(_json.dumps({"query": words, "total": found["total"],
+                               "more": found["more"], "offset": args.offset,
+                               "firms": found["rows"]}, ensure_ascii=False, indent=2))
+        else:
+            _print_registry_rows(found["total"], found["rows"], words, args.offset,
+                                 found["more"])
+        return
+
+    if action == "pull":
+        from harvey.config import live_do_not_contact, load_config
+        from harvey.state import StateManager
+
+        q = registry.resolve(con, words, all_statuses=args.all_statuses)
+        if not q.match:
+            print("\n  Say what to pull: words, a CAEN code, a county (BV) or a town.\n")
+            raise SystemExit(2)
+        if args.limit is None and not args.dry_run:
+            n = registry.count(con, q, PULL_WITHOUT_LIMIT + 1)
+            if n > PULL_WITHOUT_LIMIT:
+                print(f"\n  More than {PULL_WITHOUT_LIMIT:,} firms match \"{words}\". "
+                      "Narrow the words, or say how many with --limit N.\n")
+                raise SystemExit(2)
+
+        async def _pull():
+            state = StateManager()
+            await state.init_db()
+            meta = registry.status(path) or {}
+            with_admins = args.administrators == "all"
+            if with_admins and meta.get("with_administrators") != "1":
+                print("  (this registry was loaded without administrators: "
+                      "harvey registry load --force)")
+            report = await registry.pull(
+                state, con, q, limit=args.limit, with_administrators=with_admins,
+                dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
+                progress=_pull_progress(args.dry_run))
+            print(f"\n  {report.in_area:,} firm{'' if report.in_area == 1 else 's'} "
+                  f"matching \"{words}\" from {meta.get('dataset')}"
+                  + (f" (first {args.limit:,})" if args.limit else ""))
+            _print_pull_report(report)
+            print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
+            if report.dry_run:
+                print("  Dry run: nothing was saved.\n")
+            elif report.errors:
+                raise SystemExit(1)
+            else:
+                print("  Next: harvey search, or harvey contacts (reads their sites)\n")
+
+        asyncio.run(_pull())
+
+
+def cmd_import_onrc(args):
+    """Companies (and their administrators) from Romania's trade registry,
+    by area and activity: a shortcut for harvey registry load (when the
+    latest dataset isn't loaded yet) and harvey registry pull."""
+    from harvey import registry
     from harvey.collectors import onrc
     from harvey.config import live_do_not_contact, load_config
-    from harvey.paths import PROJECT_ROOT
     from harvey.state import StateManager
 
     async def _import():
-        import httpx
-
         try:
             names = onrc.counties(args.county)
         except ValueError as e:
@@ -731,82 +998,36 @@ def cmd_import_onrc(args):
             print("\n  No CAEN class matches that activity. Try harvey caen <words>, "
                   "or give --codes 8623.\n")
             raise SystemExit(2)
-        if not classes and not names and not args.locality.strip():
+        localities = onrc._localities(args.locality)
+        if not classes and not names and not localities:
             print("\n  Every activity in the whole country is millions of companies: "
                   "give a --county or a --locality, or an activity.\n")
             raise SystemExit(2)
         with_admins = args.administrators == "all"
 
+        path = _registry_path(args)
+        meta = await _ensure_registry(path, _onrc_dir(args), "latest",
+                                      with_people=with_admins, offline_ok=True)
+        print(f"\n  ONRC open data: {meta.get('dataset')} (registry as of {meta.get('date')})")
+        if with_admins and meta.get("with_administrators") != "1":
+            print("  (this registry was loaded without administrators: "
+                  "harvey registry load --force)")
+
         state = StateManager()
         await state.init_db()
-        from harvey.signals import seed_signal_catalog
-        await seed_signal_catalog(state)
-        confirmed = await state.confirmed_signal_codes()
-        roles = [r for r in onrc.FILES if r != "people"
-                 or (with_admins and {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed)]
-
-        timeout = httpx.Timeout(60.0, read=300.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            dataset = await onrc.latest_dataset(client)
-            print(f"\n  ONRC open data: {dataset.name} (registry as of {dataset.date})")
-
-            def progress(role, filename, size):
-                mb = f"{size / 1e6:.0f} MB" if size else "size unknown"
-                print(f"    downloading {filename} ({mb}), once per dataset...")
-
-            data_dir = Path(args.data_dir or PROJECT_ROOT / "data" / "onrc")
-            files = await onrc.fetch_files(client, dataset, data_dir,
-                                           roles=roles, progress=progress)
-
+        con = registry.connect(path)
+        q = registry.resolve(con, "", classes=classes, counties=names or [],
+                             localities=localities, all_statuses=args.include_inactive)
         where = f"{args.locality}, {county}" if args.locality else county
         what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
         print(f"  Looking for {what} in {where}"
-              f"{'' if args.include_inactive else ' (operating companies only)'}...\n")
-        report = await onrc.import_registry(
-            state, files, dataset, county=args.county, classes=classes,
-            locality=args.locality, active_only=not args.include_inactive,
-            dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
-            with_administrators=with_admins,
-            progress=lambda done, total: print(f"  saved {done:,} of {total:,}...", flush=True))
-
-        if classes:
-            print(f"  {report.authorised} registrations authorised for "
-                  f"{', '.join(report.classes)}")
-            if not args.include_inactive:
-                print(f"  {report.active} of them operating")
-            print(f"  {report.in_area} in {where}")
-        else:
-            print(f"  {report.authorised} registrations in {where}")
-            if not args.include_inactive:
-                print(f"  {report.active} of them operating")
-        if report.catch_all_only:
-            print(f"    {report.catch_all_only} of them only on the old catch-all code "
-                  "8690 Rev.2, so may be other health activities")
-        if report.shared_domain:
-            print(f"  {report.shared_domain} list a website another business on file already "
-                  "has: kept as separate records, possible matches to review")
-        if report.excluded:
-            print(f"  {report.excluded} skipped — on your do-not-contact list")
-        verb = "would be" if report.dry_run else "are"
-        print(f"  {report.new_companies} {verb} new, {report.known_companies} already on file"
-              + ("" if report.dry_run else f" ({report.updated_companies} filled in)"))
-        if "people" in roles:
-            print(f"  {report.administrators} administrators named")
-        if not report.dry_run:
-            print(f"  {report.activities} activities (CAEN classes) recorded, "
-                  "searchable with harvey search")
-            print(f"  {report.observations} observations recorded")
-        for code in report.unconfirmed:
-            print(f"    {code} not confirmed, so not recorded "
-                  f"(harvey signals --confirm {code})")
-        for err in report.errors[:5]:
-            print(f"    ! {err}")
-        if not report.dry_run and not report.errors:
-            deleted = onrc.prune_downloads(data_dir, dataset, keep_people=args.keep_download)
-            for path in deleted:
-                print(f"  Deleted {path.parent.name}/{path.name}"
-                      + (" (birth data; --keep-download keeps it)"
-                         if path.name == onrc.FILES["people"] else " (older dataset)"))
+              f"{'' if args.include_inactive else ' (operating companies only)'}...")
+        report = await registry.pull(
+            state, con, q, with_administrators=with_admins, dry_run=args.dry_run,
+            do_not_contact=live_do_not_contact(load_config()), area=where,
+            progress=_pull_progress(args.dry_run))
+        print(f"  {report.in_area:,} match\n")
+        _print_pull_report(report)
         print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
         if report.dry_run:
             print("  Dry run: nothing was saved. Re-run without --dry-run to import.\n")
@@ -1383,12 +1604,65 @@ def main():
     sub.set_defaults(func=cmd_search)
 
     sub = subparsers.add_parser(
+        "registry",
+        help="Romania's whole trade registry (ONRC open data), loaded once per dataset "
+             "into data/registry.db: load, status, search, pull",
+        description="Loads every firm in ONRC's open data (all statuses, every "
+                    "authorised CAEN class, administrators' names and roles) into a "
+                    "local database once per dataset, searches it in words, and pulls "
+                    "the firms you choose into Harvey. Free; no Claude calls.")
+    registry_sub = sub.add_subparsers(dest="registry_action", required=True)
+
+    def _registry_common(p):
+        p.add_argument("--registry", default="",
+                       help="The registry database (default: data/registry.db)")
+
+    r = registry_sub.add_parser("load", help="Download the dataset (if missing) and load it")
+    r.add_argument("--dataset", default="latest",
+                   help="latest (default) or a dataset name like firme-19-10-2026")
+    r.add_argument("--administrators", choices=("all", "none"), default="all",
+                   help="none: skip the representatives file (no administrators)")
+    r.add_argument("--force", action="store_true",
+                   help="Load again even when this dataset is already loaded")
+    r.add_argument("--data-dir", default="",
+                   help="Where the dataset files are kept (default: data/onrc)")
+    _registry_common(r)
+    r = registry_sub.add_parser("status", help="Which dataset is loaded, and its size")
+    r.add_argument("--json", action="store_true", help="Print JSON")
+    _registry_common(r)
+    r = registry_sub.add_parser(
+        "search", help="Search every firm: words, CAEN code, county (BV), town")
+    r.add_argument("words", nargs="+",
+                   help="All must match: name, activity (dentist, farmacie, 8623), county "
+                        "(BV, Brașov) or town; -word excludes")
+    r.add_argument("--all-statuses", action="store_true",
+                   help="Also firms that aren't operating (struck off, insolvent...)")
+    r.add_argument("--limit", type=int, default=20, help="Firms to show (default: 20)")
+    r.add_argument("--offset", type=int, default=0, help="Skip this many first")
+    r.add_argument("--json", action="store_true", help="Print JSON")
+    _registry_common(r)
+    r = registry_sub.add_parser(
+        "pull", help="Copy the firms a search matches into Harvey (what import-onrc and Find use)")
+    r.add_argument("words", nargs="+", help="The same words as registry search")
+    r.add_argument("--limit", type=int, default=None,
+                   help="Only the first N matches (default: all, up to 10,000)")
+    r.add_argument("--administrators", choices=("all", "none"), default="all",
+                   help="all: name each firm's administrators (when CONTACT_FOUND is "
+                        "confirmed); none: leave them out")
+    r.add_argument("--all-statuses", action="store_true",
+                   help="Also firms that aren't operating")
+    r.add_argument("--dry-run", action="store_true", help="Count; save nothing")
+    _registry_common(r)
+    sub.set_defaults(func=cmd_registry)
+
+    sub = subparsers.add_parser(
         "import-onrc",
         help="Import Romanian companies by county (and optionally activity) from "
-             "the trade registry's open data (free; ~1.5 GB download once per dataset)",
+             "the trade registry's open data (free; loads data/registry.db once per dataset)",
         description="Finds operating companies in a county, authorised for an "
-                    "activity (CAEN class) or for any, from ONRC's open data on "
-                    "data.gov.ro, with every class each is authorised for (search "
+                    "activity (CAEN class) or for any, in the local copy of ONRC's "
+                    "open data (harvey registry; loaded first when the latest dataset "
+                    "isn't), with every class each is authorised for (search "
                     "them with harvey search) and their administrators when "
                     "CONTACT_FOUND is confirmed. "
                     "A company already on file keeps what it has, with its gaps "
@@ -1409,17 +1683,16 @@ def main():
     sub.add_argument("--include-inactive", action="store_true",
                      help="Also companies that aren't operating (struck off, insolvent...)")
     sub.add_argument("--dry-run", action="store_true",
-                     help="Count what would be imported (the dataset is still "
-                          "downloaded); save nothing")
+                     help="Count what would be imported (the registry is still "
+                          "loaded); save nothing")
     sub.add_argument("--data-dir", default="",
-                     help="Where the dataset files are cached (default: data/onrc)")
+                     help="Where the dataset files are kept (default: data/onrc)")
     sub.add_argument("--administrators", choices=("all", "none"), default="all",
                      help="all: name each company's administrators (when CONTACT_FOUND "
-                          "is confirmed; the default); none: don't read the "
-                          "representatives file")
+                          "is confirmed; the default); none: leave them out")
     sub.add_argument("--keep-download", action="store_true",
-                     help="Keep the representatives file after the import (it holds "
-                          "every representative's birth data, so it is deleted by default)")
+                     help=argparse.SUPPRESS)     # downloads are always kept now
+    sub.add_argument("--registry", default="", help=argparse.SUPPRESS)
     sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(

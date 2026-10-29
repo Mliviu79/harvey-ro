@@ -333,6 +333,16 @@ each class also carries the everyday Romanian words people type
 `harvey caen` and `import-onrc` all understand it. Companies from maps
 carry no CAEN, but their category is searched the same way.
 
+**The whole registry, loaded once.** ONRC publishes one national snapshot per
+dataset, so Harvey loads all of it once: `harvey registry load` downloads the
+files into `data/onrc/<date>/` (only the ones missing; they are kept) and
+builds `data/registry.db`, every firm in Romania with its status, CAEN classes
+and administrators' names and roles, in a few minutes. Then
+`harvey registry search dentist BV` answers in well under a second, and
+`harvey import-onrc dentist --county BV` brings the matching firms into
+Harvey to look for their contacts. A newer dataset is built aside and swapped in whole, one load at a
+time; offline, the newest dataset already downloaded is used.
+
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
 > **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.
@@ -630,7 +640,9 @@ harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock
 harvey signals               # review/confirm what to prospect against
 harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
-harvey import-onrc --county BV [dentist]  # Romanian companies from the trade registry (free);
+harvey registry load         # the whole trade registry into data/registry.db, once per dataset
+harvey registry search dentist BV  # every firm in Romania: words, CAEN code, county, town
+harvey import-onrc --county BV [dentist]  # load + pull in one step (free);
                              # no activity = every operating company in the area;
                              # --administrators all|none; --dry-run counts
 harvey search 8623 brasov    # search companies on file by CAEN code, activity in words

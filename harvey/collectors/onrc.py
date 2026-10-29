@@ -20,16 +20,18 @@ area's registration numbers, status for those, the firms file again for
 the ones kept. Then the activity file again for every class the kept
 firms are authorised for (saved as company_activities, so they can be
 searched by code or in words), then representatives (only for the firms
-kept, and only when wanted).
+kept, and only when wanted). harvey/registry.py loads the same files once
+per dataset into a local database instead, with every firm in it, and
+searches that; this module's streaming import still works on its own.
 
 What is kept is deliberately narrow. The representatives file also carries
 birth dates and places and home localities; only a natural person's name
 and role are read. A CUI that is really a personal numeric code (13
 digits, as some sole traders' rows have) is dropped. Sole traders and
 family businesses get no street address, since theirs is usually a home.
-Once an import has read it, the downloaded representatives file is deleted
-(``harvey import-onrc --keep-download`` keeps it), and so is any older
-dataset: only the current one stays on disk.
+The downloaded files themselves are kept as published (data/onrc/<date>/):
+prune_downloads() deletes the representatives file and older datasets, but
+only when called.
 
 Every fact lands as an observation with the dataset it came from, under
 the same confirmation gate as discovery: companies (and what they are
@@ -280,7 +282,10 @@ def _website(raw: str) -> tuple[str, str]:
     also holds phone numbers and typos: only a plausible host counts."""
     from harvey.collectors.discover import is_junk, normalize_domain
 
-    domain = normalize_domain((raw or "").strip())
+    try:
+        domain = normalize_domain((raw or "").strip())
+    except ValueError:          # "http://[..." and the like: not a URL at all
+        return "", ""
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)*\.[a-z]{2,}", domain):
         return "", ""
     if is_junk(domain):
@@ -317,6 +322,24 @@ def _trusted_url(url: str) -> bool:
     return parsed.scheme == "https" and (host == "data.gov.ro" or host.endswith(".data.gov.ro"))
 
 
+def _dataset_from_package(package: dict) -> Dataset | None:
+    """The package as a Dataset, or None when it is missing a file an
+    import reads or links one outside data.gov.ro."""
+    when = _dataset_date(package.get("name", ""))
+    if not when:
+        return None
+    by_name = {(r.get("name") or "").upper(): r for r in package.get("resources") or []}
+    files = {}
+    for role, filename in FILES.items():
+        res = by_name.get(filename)
+        if not res or not _trusted_url(res.get("url", "")):
+            return None
+        size = res.get("size")
+        files[role] = (res["url"], int(size) if isinstance(size, int) or
+                       (isinstance(size, str) and size.isdigit()) else None)
+    return Dataset(package["name"], when.isoformat(), files)
+
+
 async def latest_dataset(client: httpx.AsyncClient) -> Dataset:
     """The newest "firme-DD-MM-YYYY" dataset ONRC has published, by the
     date in its name, that has every file an import reads."""
@@ -330,18 +353,39 @@ async def latest_dataset(client: httpx.AsyncClient) -> Dataset:
         (p for p in results if _dataset_date(p.get("name", ""))),
         key=lambda p: _dataset_date(p["name"]), reverse=True)
     for package in candidates:
-        by_name = {(r.get("name") or "").upper(): r for r in package.get("resources") or []}
-        files = {}
-        for role, filename in FILES.items():
-            res = by_name.get(filename)
-            if not res or not _trusted_url(res.get("url", "")):
-                break
-            size = res.get("size")
-            files[role] = (res["url"], int(size) if isinstance(size, int) or
-                           (isinstance(size, str) and size.isdigit()) else None)
-        else:
-            return Dataset(package["name"], _dataset_date(package["name"]).isoformat(), files)
+        dataset = _dataset_from_package(package)
+        if dataset:
+            return dataset
     raise RuntimeError("no complete ONRC 'firme' dataset found on data.gov.ro")
+
+
+async def dataset_named(client: httpx.AsyncClient, name: str) -> Dataset:
+    """One dataset by its name ("firme-19-10-2026")."""
+    if not _dataset_date(name):
+        raise ValueError(f"not an ONRC dataset name: {name!r} (firme-DD-MM-YYYY)")
+    resp = await client.get(f"{CKAN_API}/package_show", params={"id": name})
+    resp.raise_for_status()
+    dataset = _dataset_from_package((resp.json() or {}).get("result") or {})
+    if not dataset:
+        raise RuntimeError(f"{name} is missing a registry file on data.gov.ro")
+    return dataset
+
+
+def local_dataset(root: Path, name: str, roles=FILES) -> tuple[Dataset, dict[str, Path]] | None:
+    """A dataset already downloaded under root/<date>/, without asking
+    data.gov.ro: (Dataset, role -> file) when every one of ``roles`` is
+    there at a believable size, else None."""
+    when = _dataset_date(name)
+    if not when:
+        raise ValueError(f"not an ONRC dataset name: {name!r} (firme-DD-MM-YYYY)")
+    folder = Path(root) / when.isoformat()
+    out = {}
+    for role in roles:
+        path = folder / FILES[role]
+        if not path.is_file() or not _size_ok(role, path.stat().st_size, None):
+            return None
+        out[role] = path
+    return Dataset(name, when.isoformat(), {}), out
 
 
 async def fetch_files(client: httpx.AsyncClient, dataset: Dataset, root: Path,
@@ -392,13 +436,15 @@ _DATE_FOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def prune_downloads(root: Path, dataset: Dataset, keep_people: bool = False) -> list[Path]:
-    """Delete what an import no longer needs; returns what was deleted.
+    """Delete downloads no longer needed; returns what was deleted. Never
+    called automatically: the files are kept as published unless someone
+    asks for this.
 
     The representatives file holds the birth date and place and the home
-    locality of every company representative in Romania, of which an
-    import keeps only names and roles: unless ``keep_people``, it goes as
-    soon as an import has read it (the next import fetches it again).
-    Older datasets go too, so only the current one stays cached. Only the
+    locality of every company representative in Romania, of which the
+    registry keeps only names and roles: unless ``keep_people``, it goes
+    (the next load fetches it again). Older datasets go too, so only the
+    current one stays on disk. Only the
     registry's own files (and interrupted .part downloads) in date-named
     folders are touched; a folder is removed once nothing else is in it.
     """
@@ -561,6 +607,26 @@ def registrations_in_area(path: Path, county: list[str] | str | None = None,
         if inside(row_county, row_locality)}
 
 
+def parse_firm(rec: dict) -> Firm:
+    """One row of the firms file (column name -> raw value) as a Firm:
+    names with Romanian's comma-below letters, a real CUI or none, no street
+    address for a sole trader or family business, a website only when it
+    looks like one."""
+    form = rec["FORMA_JURIDICA"].strip().upper()
+    website, domain = _website(rec["WEB"]) if rec["WEB"].strip() else ("", "")
+    return Firm(
+        reg=rec["COD_INMATRICULARE"].strip(),
+        name=_comma_below(" ".join(rec["DENUMIRE"].split())),
+        cui=valid_cui(rec["CUI"]),
+        form=form,
+        county=_comma_below(rec["ADR_JUDET"].strip()),
+        locality=clean_locality(rec["ADR_LOCALITATE"]),
+        address="" if form in PERSONAL_FORMS else _address(rec),
+        website=website, domain=domain,
+        registered=rec["DATA_INMATRICULARE"].strip(),
+    )
+
+
 def matching_firms(path: Path, regs, county: list[str] | str | None = None,
                    locality: list[str] | str = "") -> list[Firm]:
     """The firms among these registrations whose registered office is in one
@@ -570,25 +636,26 @@ def matching_firms(path: Path, regs, county: list[str] | str | None = None,
     out = []
     for row in read_rows(path, _FIRM_COLUMNS):
         rec = dict(zip(_FIRM_COLUMNS, row))
-        reg = rec["COD_INMATRICULARE"].strip()
-        if reg not in regs:
+        if rec["COD_INMATRICULARE"].strip() not in regs:
             continue
         if not inside(rec["ADR_JUDET"], rec["ADR_LOCALITATE"]):
             continue
-        form = rec["FORMA_JURIDICA"].strip().upper()
-        website, domain = _website(rec["WEB"])
-        out.append(Firm(
-            reg=reg,
-            name=_comma_below(" ".join(rec["DENUMIRE"].split())),
-            cui=valid_cui(rec["CUI"]),
-            form=form,
-            county=_comma_below(rec["ADR_JUDET"].strip()),
-            locality=clean_locality(rec["ADR_LOCALITATE"]),
-            address="" if form in PERSONAL_FORMS else _address(rec),
-            website=website, domain=domain,
-            registered=rec["DATA_INMATRICULARE"].strip(),
-        ))
+        out.append(parse_firm(rec))
     return out
+
+
+PEOPLE_COLUMNS = ("COD_INMATRICULARE", "PERSOANA_IMPUTERNICITA", "CALITATE")
+
+
+def parse_person(name: str, role: str) -> tuple[str, str, str] | None:
+    """(first, last, role) for a representative who runs the company, or
+    None: companies acting as representatives, insolvency practitioners and
+    any name holding digits (an id where a name should be) are left out."""
+    title = _role(role)
+    if not title or re.search(r"\d", name) or _LEGAL_ENTITY.search(_fold(name)):
+        return None
+    first, last = split_person(name)
+    return (first, last, title) if first else None
 
 
 def administrators(path: Path, regs) -> dict[str, list[tuple[str, str, str]]]:
@@ -597,20 +664,16 @@ def administrators(path: Path, regs) -> dict[str, list[tuple[str, str, str]]]:
     as representatives, insolvency practitioners and any name holding
     digits (an id where a name should be) are left out."""
     out: dict[str, list[tuple[str, str, str]]] = {}
-    for reg, name, role in read_rows(path, ("COD_INMATRICULARE",
-                                            "PERSOANA_IMPUTERNICITA", "CALITATE")):
+    for reg, name, role in read_rows(path, PEOPLE_COLUMNS):
         reg = reg.strip()
         if reg not in regs:
             continue
-        title = _role(role)
-        if not title or re.search(r"\d", name) or _LEGAL_ENTITY.search(_fold(name)):
-            continue
-        first, last = split_person(name)
-        if not first:
+        person = parse_person(name, role)
+        if not person:
             continue
         people = out.setdefault(reg, [])
-        if all((first, last) != (f, l) for f, l, _ in people):
-            people.append((first, last, title))
+        if all(person[:2] != (f, l) for f, l, _ in people):
+            people.append(person)
     return out
 
 
@@ -705,6 +768,192 @@ def _location(firm: Firm) -> str:
     return ", ".join(parts + ["Romania"])
 
 
+# Companies saved per transaction. Big enough that committing is noise,
+# small enough that an interrupted import keeps most of what it saved.
+SAVE_BATCH = 500
+# The ImportReport counts save_firms adds to as it saves.
+_REPORT_COUNTS = ("catch_all_only", "shared_domain", "excluded", "new_companies",
+                  "known_companies", "updated_companies", "administrators",
+                  "activities", "observations")
+
+
+def _class_matcher(classes):
+    """A test for whether (code, version) is one of ``classes``; a class
+    with version None stands for Rev.2 and Rev.3 alike."""
+    exact = {(c, v) for c, v in classes if v is not None}
+    either = {c for c, v in classes if v is None}
+    return lambda pair: pair in exact or (pair[0] in either and pair[1] in (2, 3))
+
+
+async def save_firms(
+    state,
+    firms: list[Firm],
+    dataset: Dataset,
+    report: ImportReport,
+    *,
+    codes: dict[str, list[tuple[str, int]]],
+    people: dict[str, list[tuple[str, str, str]]] | None = None,
+    classes: list[tuple[str, int | None]] | None = None,
+    run_params: dict | None = None,
+    with_administrators: bool = True,
+    dry_run: bool = False,
+    do_not_contact: list[str] | None = None,
+    progress=None,
+) -> ImportReport:
+    """Save registry firms into the working database, SAVE_BATCH per
+    transaction. Shared by the streaming import and harvey registry pull.
+
+    ``codes`` holds every class each firm (by registration number) is
+    authorised for; ``classes`` the ones the request named, in its order:
+    those a firm holds are its ACTIVITY_CODE observations, and the first
+    names its industry (otherwise its first Rev.3 class does). ``people``
+    are its administrators. Companies are matched to what is on file by
+    CUI, then by registration number, never by website domain alone (a
+    domain another business holds is counted in ``shared_domain`` and left
+    off); a known one has its gaps filled, never its existing values
+    replaced, except the registered-office address, which is always
+    refreshed: the registry is the authority on it, and a re-import is how
+    a moved office reaches the record. ``dry_run`` reads everything and
+    writes nothing. Observations are written once per dataset: re-importing
+    the same dataset adds nothing, a newer one adds its readings beside the
+    old. ``progress(done, total)`` is called every PROGRESS_EVERY companies.
+    """
+    from harvey.caen import describe
+    from harvey.gate import do_not_contact_domain_match
+    from harvey.signals import seed_signal_catalog
+
+    classes = list(classes or [])
+    people = people or {}
+    await seed_signal_catalog(state)
+    confirmed = await state.confirmed_signal_codes()
+    wanted_codes = ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE") \
+        if with_administrators else ("ACTIVITY_CODE",)
+    report.unconfirmed = [c for c in wanted_codes if c not in confirmed]
+    if not with_administrators:
+        people = {}
+
+    named = _class_matcher(classes)
+    order = {pair: i for i, pair in enumerate(classes)}
+    vague = CATCH_ALL if _catch_all_is_vague(classes) else None
+
+    def rank(pair):
+        return (pair == vague,
+                min(order.get(pair, len(order)), order.get((pair[0], None), len(order))))
+
+    if not dry_run:
+        report.run_id = await state.start_run("import", provider="onrc",
+                                              params=run_params or {})
+    evidence = dataset.page
+
+    async def save(batch, firm: Firm):
+        if firm.domain and do_not_contact_domain_match(firm.domain, do_not_contact or []):
+            report.excluded += 1
+            return
+        firm_codes = list(codes.get(firm.reg, []))
+        matched = sorted({pair for pair in firm_codes if named(pair)}, key=rank) \
+            if classes else []
+        if matched and matched[0] == vague:
+            report.catch_all_only += 1
+        # Nothing asked for (or matched by name only): ACTIVITY_CODE records
+        # only classes someone asked for (a whole county would be ~600k
+        # observations), and the company's first current class names it.
+        first = matched[0] if matched else _industry_class(firm_codes)
+        industry = (describe(*first) or "") if first else ""
+        external = f"onrc:{firm.reg}"
+        # Only the legal identity merges. The registry's website field is
+        # self-declared: a domain another business already holds may be
+        # a shared group site or simply wrong, so it is a possible match
+        # for review, never a reason to hang these administrators and
+        # this address on that business.
+        existing = (await batch.get_company_by_cui(firm.cui)
+                    or await batch.get_company_by_external_id(external))
+        domain, website = firm.domain, firm.website
+        holder = await batch.get_company_by_domain(domain) if domain else None
+        if holder and (existing is None or holder.id != existing.id):
+            report.shared_domain += 1
+            domain = ""
+        if existing:
+            report.known_companies += 1
+        else:
+            report.new_companies += 1
+        admins = people.get(firm.reg, [])
+        report.administrators += len(admins)
+        if dry_run:
+            return
+
+        if existing:
+            company_id = existing.id
+            changed = await batch.fill_company_fields(
+                company_id, cui=firm.cui, name=firm.name, website=website,
+                domain=domain, industry=industry, location=_location(firm),
+                address=firm.address)
+            if changed:
+                report.updated_companies += 1
+        else:
+            company_id = await batch.add_company(Company(
+                name=firm.name, cui=firm.cui, external_id=external,
+                website=website, domain=domain, industry=industry,
+                location=_location(firm), address=firm.address,
+                source=SOURCE, source_url=evidence,
+            ))
+
+        # What the company does, all of it: describes the record (like
+        # its industry), so it isn't held behind the signal gate.
+        report.activities += await batch.set_company_activities(
+            company_id, firm_codes, source=COLLECTOR)
+
+        rows: dict[tuple[str, str], float] = {}     # (signal, value) -> confidence
+        if "ACTIVITY_CODE" in confirmed:
+            for pair in matched:
+                rows[("ACTIVITY_CODE", activity_value(*pair))] = \
+                    CATCH_ALL_CONFIDENCE if pair == vague else 1.0
+        for first_name, last, title in admins:
+            text = f"{first_name} {last} — {title}"
+            if "CONTACT_FOUND" in confirmed:
+                rows.setdefault(("CONTACT_FOUND", text), 1.0)
+            if "DECISION_MAKER_TITLE" in confirmed and \
+                    _fold(title).startswith(_DECISION_MAKERS):
+                rows.setdefault(("DECISION_MAKER_TITLE", text), 1.0)
+        if rows:
+            seen = await batch.observed(company_id, evidence)
+            fresh = [{"company_id": company_id, "signal_code": code_,
+                      "collector": COLLECTOR, "value_text": text,
+                      "confidence": confidence, "evidence_url": evidence,
+                      "run_id": report.run_id}
+                     for (code_, text), confidence in rows.items()
+                     if (code_, text) not in seen]
+            if fresh:
+                report.observations += await batch.add_observations(
+                    fresh, run_id=report.run_id)
+
+    try:
+        done = 0
+        for start in range(0, len(firms), SAVE_BATCH):
+            # A batch that fails is rolled back, so are its counts.
+            counts = {k: getattr(report, k) for k in _REPORT_COUNTS}
+            try:
+                async with state.batch() as batch:
+                    for firm in firms[start:start + SAVE_BATCH]:
+                        done += 1
+                        if progress and done % PROGRESS_EVERY == 0:
+                            progress(done, len(firms))
+                        await save(batch, firm)
+            except Exception:
+                for k, v in counts.items():
+                    setattr(report, k, v)
+                raise
+        if not dry_run:
+            await state.finish_run(report.run_id, status="completed",
+                                   records=report.new_companies + report.known_companies)
+    except Exception as e:
+        logger.exception("onrc import failed")
+        report.errors.append(str(e))
+        if not dry_run:
+            await state.finish_run(report.run_id, status="failed",
+                                   records=report.new_companies, error=str(e))
+    return report
+
+
 async def import_registry(
     state,
     files: dict[str, Path],
@@ -719,7 +968,7 @@ async def import_registry(
     with_administrators: bool = True,
     progress=None,
 ) -> ImportReport:
-    """Read the registry files and save what matches.
+    """Read the registry files and save what matches (save_firms).
 
     ``county`` and ``locality`` take comma-separated lists; no county is the
     whole country. ``classes`` are (code, version) pairs, version None for "Rev.2 or
@@ -730,19 +979,8 @@ async def import_registry(
     Either way every class a kept company is authorised for is saved as
     its activities, so it can be searched by any of them later
     (``harvey search``). ``with_administrators`` False leaves the
-    representatives file unread. ``progress(done, total)`` is called every
-    few hundred companies while saving.
-    Companies are matched to what is on file by CUI, then by registration
-    number, never by website domain alone (a domain another business holds
-    is counted in ``shared_domain`` and left off); a known one has its gaps filled, never
-    its existing values replaced, except the registered-office address,
-    which is always refreshed: the registry is the authority on it, and a
-    re-import is how a moved office reaches the record. ``dry_run`` reads everything and writes
-    nothing. Observations are written once per dataset: re-importing the
-    same dataset adds nothing, a newer one adds its readings beside the old.
+    representatives file unread.
     """
-    from harvey.caen import describe
-    from harvey.gate import do_not_contact_domain_match
     from harvey.signals import seed_signal_catalog
 
     classes = list(classes or [])
@@ -757,9 +995,6 @@ async def import_registry(
     confirmed = await state.confirmed_signal_codes()
     people_codes = {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed \
         if with_administrators else set()
-    wanted_codes = ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE") \
-        if with_administrators else ("ACTIVITY_CODE",)
-    report.unconfirmed = [c for c in wanted_codes if c not in confirmed]
 
     # Streamed in the order that keeps the working set smallest. With an
     # activity filter: the wanted classes nationwide, their status, the
@@ -771,7 +1006,6 @@ async def import_registry(
         report.authorised = len(authorised)
         candidates = set(authorised)
     else:
-        authorised = {}
         candidates = registrations_in_area(files["firms"], names, locality)
         report.authorised = len(candidates)
     keep = active_registrations(files["status"], candidates) if active_only \
@@ -781,123 +1015,25 @@ async def import_registry(
     report.in_area = len(firms)
     kept_regs = {f.reg for f in firms}
     all_codes = authorised_codes(files["caen"], kept_regs)
+    if classes:
+        # A class asked for that the full read skipped (no version) still
+        # counts, as it did when it was matched.
+        for reg, hits in authorised.items():
+            if reg in kept_regs:
+                have = all_codes.setdefault(reg, [])
+                have += [pair for pair in hits if pair not in have]
     people = administrators(files["people"], kept_regs) \
         if people_codes and "people" in files else {}
 
-    if not dry_run:
-        report.run_id = await state.start_run("import", provider="onrc", params={
+    return await save_firms(
+        state, firms, dataset, report, codes=all_codes, people=people,
+        classes=classes, with_administrators=with_administrators,
+        dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
+        run_params={
             "dataset": dataset.name, "county": ", ".join(names or []) or "Romania",
             "locality": locality,
             "classes": report.classes or ["all activities"], "active_only": active_only,
             "administrators": with_administrators})
-
-    order = {pair: i for i, pair in enumerate(classes)}
-    vague = CATCH_ALL if _catch_all_is_vague(classes) else None
-
-    def rank(pair):
-        return (pair == vague,
-                min(order.get(pair, len(order)), order.get((pair[0], None), len(order))))
-
-    evidence = dataset.page
-    try:
-        for done, firm in enumerate(firms, start=1):
-            if progress and done % PROGRESS_EVERY == 0:
-                progress(done, len(firms))
-            if firm.domain and do_not_contact_domain_match(firm.domain, do_not_contact or []):
-                report.excluded += 1
-                continue
-            codes = list(all_codes.get(firm.reg, []))
-            if classes:
-                matched = sorted(authorised[firm.reg], key=rank)
-                codes += [pair for pair in matched if pair not in codes]
-                if matched[0] == vague:
-                    report.catch_all_only += 1
-                first = matched[0]
-            else:
-                # Nothing asked for: the company's activities hold every
-                # class; ACTIVITY_CODE records only classes someone asked
-                # for (a whole county would be ~600k observations).
-                matched = []
-                first = _industry_class(codes)
-            industry = (describe(*first) or "") if first else ""
-            external = f"onrc:{firm.reg}"
-            # Only the legal identity merges. The registry's website field is
-            # self-declared: a domain another business already holds may be
-            # a shared group site or simply wrong, so it is a possible match
-            # for review, never a reason to hang these administrators and
-            # this address on that business.
-            existing = (await state.get_company_by_cui(firm.cui)
-                        or await state.get_company_by_external_id(external))
-            domain, website = firm.domain, firm.website
-            holder = await state.get_company_by_domain(domain) if domain else None
-            if holder and (existing is None or holder.id != existing.id):
-                report.shared_domain += 1
-                domain = ""
-            if existing:
-                report.known_companies += 1
-            else:
-                report.new_companies += 1
-            admins = people.get(firm.reg, [])
-            report.administrators += len(admins)
-            if dry_run:
-                continue
-
-            if existing:
-                company_id = existing.id
-                changed = await state.fill_company_fields(
-                    company_id, cui=firm.cui, name=firm.name, website=website,
-                    domain=domain, industry=industry, location=_location(firm),
-                    address=firm.address)
-                if changed:
-                    report.updated_companies += 1
-            else:
-                company_id = await state.add_company(Company(
-                    name=firm.name, cui=firm.cui, external_id=external,
-                    website=website, domain=domain, industry=industry,
-                    location=_location(firm), address=firm.address,
-                    source=SOURCE, source_url=evidence,
-                ))
-
-            # What the company does, all of it: describes the record (like
-            # its industry), so it isn't held behind the signal gate.
-            report.activities += await state.set_company_activities(
-                company_id, codes, source=COLLECTOR)
-
-            rows: dict[tuple[str, str], float] = {}     # (signal, value) -> confidence
-            if "ACTIVITY_CODE" in confirmed:
-                for pair in matched:
-                    rows[("ACTIVITY_CODE", activity_value(*pair))] = \
-                        CATCH_ALL_CONFIDENCE if pair == vague else 1.0
-            for first, last, title in admins:
-                text = f"{first} {last} — {title}"
-                if "CONTACT_FOUND" in confirmed:
-                    rows.setdefault(("CONTACT_FOUND", text), 1.0)
-                if "DECISION_MAKER_TITLE" in confirmed and \
-                        _fold(title).startswith(_DECISION_MAKERS):
-                    rows.setdefault(("DECISION_MAKER_TITLE", text), 1.0)
-            if rows:
-                seen = {(o["signal_code"], o["value_text"])
-                        for o in await state.get_observations(company_id=company_id, limit=2000)
-                        if o.get("evidence_url") == evidence}
-                fresh = [{"company_id": company_id, "signal_code": code_,
-                          "collector": COLLECTOR, "value_text": text,
-                          "confidence": confidence, "evidence_url": evidence,
-                          "run_id": report.run_id}
-                         for (code_, text), confidence in rows.items()
-                         if (code_, text) not in seen]
-                if fresh:
-                    report.observations += await state.add_observations(
-                        fresh, run_id=report.run_id)
-        if not dry_run:
-            await state.finish_run(report.run_id, status="completed",
-                                   records=report.new_companies + report.known_companies)
-    except Exception as e:
-        logger.exception("onrc import failed")
-        report.errors.append(str(e))
-        if not dry_run:
-            await state.finish_run(report.run_id, status="failed",
-                                   records=report.new_companies, error=str(e))
-    return report
 
 
 def parse_classes(words: str | list[str] = "", codes: str = "") -> list[tuple[str, int | None]]:

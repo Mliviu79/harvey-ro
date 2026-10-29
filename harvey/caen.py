@@ -131,6 +131,7 @@ ENGLISH_NAMES: dict[tuple[str, int], str] = {
 
 # Joining words that would otherwise match half the nomenclature.
 _STOPWORDS = {"ale", "cel", "cea", "cu", "din", "fara", "pentru", "prin", "sau",
+              "de", "si", "la", "in", "pe", "a",
               "activitati", "activitate", "and", "for", "the", "incl", "not"}
 
 

@@ -338,7 +338,9 @@ harvey gmail test            # Verify the Gmail connection
 harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
-harvey import-onrc dentist --county BV  # Romanian companies + administrators from the trade registry (free; --dry-run counts). No activity = every operating company in the area (county or --locality required); --administrators all|none. Every authorised CAEN class is saved per company
+harvey registry load          # The whole ONRC trade registry into data/registry.db, once per dataset (downloads only missing files into data/onrc/<date>/ and keeps them; --dataset firme-DD-MM-YYYY; status shows what is loaded)
+harvey registry search dentist BV  # Every firm in Romania: name, activity words, CAEN code, county (BV, Brașov), town; operating only unless --all-statuses; --json
+harvey import-onrc dentist --county BV  # Shortcut: loads the latest dataset if needed, then pulls by area + activity (--dry-run counts). No activity = every operating company in the area (county or --locality required); --administrators all|none. Every authorised CAEN class is saved per company
 harvey search <words|code>   # Search companies on file locally: CAEN code (8623), activity in RO/EN words (stomatologie, dentist), name, town — all words must match, -word excludes; --json
 harvey caen <code|words>     # CAEN reference: a code's name in every revision, or the codes for some words (not a filter)
 harvey sending pause|resume  # Kill switch for all outbound

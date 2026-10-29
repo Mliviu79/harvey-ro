@@ -201,6 +201,13 @@ def test_both_revisions_and_explicit_codes():
     assert onrc.parse_classes("", "8623, 862") == [("8623", None), ("0862", None)]
 
 
+def test_a_website_field_that_is_not_a_url():
+    assert onrc._website("http://[exemplu") == ("", "")
+    assert onrc._website("0700 000 000") == ("", "")
+    assert onrc._website("www.exemplu.example.ro") == (
+        "https://exemplu.example.ro", "exemplu.example.ro")
+
+
 def test_malformed_rows_are_skipped(tmp_path):
     path = write(tmp_path / "x.csv", [("A", "B"), ("1", "2"), ("3", "4", "extra")])
     assert list(onrc.read_rows(path, ("B",))) == [("2",)]
