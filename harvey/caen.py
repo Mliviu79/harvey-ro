@@ -18,7 +18,8 @@ are kept so old registrations still describe() correctly, but search never
 returns them: their numbers mean different things (8513 was dental then,
 it's secondary education now).
 
-Matching order: the hand-kept synonyms below first, then the Romanian
+Matching order: the hand-kept synonyms below and the everyday Romanian
+words in reference/caen_cuvinte.csv first, then the Romanian
 class names (and the English ones, health classes only) word by word,
 ignoring accents and small inflections ("stomatologică" finds
 "stomatologic"). Deterministic, no network, no Claude.
@@ -141,7 +142,7 @@ def _fold(text: str) -> str:
 
 def _tokens(text: str) -> list[str]:
     return [t for t in re.findall(r"[a-z0-9]+", _fold(text))
-            if len(t) >= 3 or t == "gp"]
+            if len(t) >= 3 or t in _short_words()]
 
 
 def _content(tokens: list[str]) -> list[str]:
@@ -169,7 +170,7 @@ def _same_word(a: str, b: str) -> int:
     if common < 5:
         return 0
     tails = sorted((len(a) - common, len(b) - common))
-    return 1 if (tails[0] == 0 and tails[1] <= 3) or tails <= [1, 2] else 0
+    return 1 if (tails[0] == 0 and tails[1] <= 3) or (tails[0] == 1 and tails[1] <= 2) else 0
 
 
 @lru_cache(maxsize=1)
@@ -226,18 +227,17 @@ def _synonym_hits(tokens: list[str]) -> list[tuple[int, str, tuple]]:
     order. Longer phrases claim their words first, so "medic de familie"
     wins over a bare "medic". A generic place word ("clinică") is dropped
     when another synonym names the activity."""
-    phrases = sorted(SYNONYMS, key=lambda p: (-len(_tokens(p)), p))
+    synonyms = _synonyms()
     used: set[int] = set()
     hits = []
-    for phrase in phrases:
-        words = _tokens(phrase)
+    for phrase, words in _phrases():
         for start in range(len(tokens) - len(words) + 1):
             span = range(start, start + len(words))
             if used & set(span):
                 continue
             if all(_same_word(tokens[i], w) or _swapped(tokens[i], w)
                    for i, w in zip(span, words)):
-                hits.append((start, phrase, SYNONYMS[phrase]))
+                hits.append((start, phrase, synonyms[phrase]))
                 used |= set(span)
                 break
     specific = [h for h in hits if h[1] not in GENERIC_PLACES]
@@ -331,11 +331,58 @@ def lookup(code) -> list[Match]:
 
 
 @lru_cache(maxsize=1)
+def _everyday() -> dict[str, tuple[tuple[str, int], ...]]:
+    """Everyday Romanian words -> classes, from reference/caen_cuvinte.csv:
+    what people type ("brutărie", "service auto", "avocat") for classes
+    whose official names say it differently. Kept as data so anyone can
+    add a word without touching code. Phrases are stored folded
+    ("brutarie"), the way queries are compared."""
+    text = resources.files("harvey").joinpath("reference/caen_cuvinte.csv") \
+        .read_text(encoding="utf-8")
+    rows = csv.DictReader(line for line in io.StringIO(text) if not line.startswith("#"))
+    out: dict[str, list[tuple[str, int]]] = {}
+    for r in rows:
+        pair = (r["code"], int(r["version"]))
+        for word in r["cuvinte"].split(";"):
+            phrase = " ".join(re.findall(r"[a-z0-9]+", _fold(word)))
+            if phrase and pair not in out.setdefault(phrase, []):
+                out[phrase].append(pair)
+    return {phrase: tuple(pairs) for phrase, pairs in out.items()}
+
+
+@lru_cache(maxsize=1)
+def _synonyms() -> dict[str, tuple[tuple[str, int], ...]]:
+    """SYNONYMS plus the everyday words file. A phrase in both points at
+    the classes of both, SYNONYMS' first."""
+    merged = {phrase: list(pairs) for phrase, pairs in SYNONYMS.items()}
+    for phrase, pairs in _everyday().items():
+        have = merged.setdefault(phrase, [])
+        have += [pair for pair in pairs if pair not in have]
+    return {phrase: tuple(pairs) for phrase, pairs in merged.items()}
+
+
+@lru_cache(maxsize=1)
+def _short_words() -> frozenset[str]:
+    """Two-letter words that still mean something here ("gp", "it"), so
+    the tokenizer keeps them."""
+    return frozenset({"gp"} | {w for phrase in _everyday() for w in phrase.split()
+                               if len(w) == 2})
+
+
+@lru_cache(maxsize=1)
+def _phrases() -> list[tuple[str, list[str]]]:
+    """(phrase, its words) for every synonym, longest phrase first."""
+    out = [(phrase, _tokens(phrase)) for phrase in _synonyms()]
+    return sorted(((p, w) for p, w in out if w), key=lambda pw: (-len(pw[1]), pw[0]))
+
+
+@lru_cache(maxsize=1)
 def _keywords() -> dict[tuple[str, int], str]:
-    """(code, version) -> the everyday words that point at it, from SYNONYMS
-    read backwards: 8623 carries "dentist dental ... stomatolog ortodont"."""
+    """(code, version) -> the everyday words that point at it, from the
+    synonyms read backwards: 8623 carries "dentist dental ... stomatolog
+    ortodont"."""
     out: dict[tuple[str, int], list[str]] = {}
-    for phrase, classes in SYNONYMS.items():
+    for phrase, classes in _synonyms().items():
         for pair in classes:
             words = out.setdefault(pair, [])
             for word in phrase.split():

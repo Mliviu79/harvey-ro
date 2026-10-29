@@ -1,0 +1,1012 @@
+# Cuvinte uzuale pentru clasele CAEN: ce scrie lumea când caută o firmă
+# ("brutărie", "service auto", "avocat") acolo unde denumirea oficială spune
+# altfel. Everyday Romanian words per CAEN class, read by harvey/caen.py for
+# the company search, `harvey caen` and import-onrc. version: 2 = CAEN Rev.2,
+# 3 = CAEN Rev.3. Words are separated by ";". Add words freely: each one
+# should make someone who types it expect companies of that class.
+code,version,cuvinte
+0111,2,fermă cerealieră;cultură de grâu;cultură de porumb;floarea-soarelui;rapiță;agricultor;fermier
+0113,2,legumicultură;legumicultor;sere de legume;solarii;cultură de cartofi;zarzavaturi;ciupercărie
+0119,2,floricultură;cultivare flori;sere de flori;plante furajere;lucernă
+0121,2,viticultură;viticultor;podgorie;viță-de-vie
+0124,2,pomicultură;pomicultor;livadă;livadă de meri;livadă de pruni;cireșe;caise
+0125,2,afine;căpșuni;zmeură;nuci;alune;cultură de afine
+0128,2,plante medicinale;plante aromatice;lavandă;ceaiuri din plante
+0130,2,pepinieră;răsaduri;puieți;butași;material săditor
+0141,2,fermă de vaci;fermă de vaci de lapte;vaci de lapte;lapte de vacă;crescător de vaci
+0142,2,fermă de bovine;îngrășare bovine;taurine;vițel;crescător de vite
+0143,2,herghelie;crescător de cai;cai de rasă
+0145,2,stână;cioban;fermă de oi;fermă de capre;oierit;crescător de oi
+0146,2,fermă de porci;porcine;crescătorie de porci;suine
+0147,2,fermă de păsări;avicultură;fermă avicolă;crescătorie de pui;găini ouătoare;ouă
+0149,2,apicultură;apicultor;stupină;miere;albine;crescătorie de iepuri;melcărie
+0150,2,fermă mixtă;gospodărie agricolă;fermă de familie
+0161,2,lucrări agricole;arat;semănat;stropit culturi;servicii agricole
+0162,2,însămânțări artificiale;servicii zootehnice;potcovar;tuns oi
+0163,2,uscare cereale;depozitare cereale;siloz;sortare legume
+0164,2,semințe;tratare semințe;producție de semințe
+0170,2,vânătoare;fond de vânătoare;vânător;turism cinegetic
+0210,2,silvicultură;ocol silvic;plantare puieți;împăduriri
+0220,2,exploatare forestieră;exploatare lemn;tăieri de pădure;drujbist;bușteni;lemn de foc
+0230,2,ciuperci de pădure;fructe de pădure;culegere plante medicinale;hribi
+0240,2,servicii silvice;amenajare silvică;inventar forestier;pază pădure
+0312,2,pescar
+0321,2,midii;fermă de midii
+0322,2,păstrăvărie;crescătorie de pește;heleșteu;fermă piscicolă;crap
+0510,2,mină de cărbune;huilă;minerit cărbune
+0520,2,lignit;carieră de lignit;exploatare minieră cărbune
+0610,2,foraj petrolier;sondă;țiței;zăcământ de petrol
+0620,2,exploatare gaze;zăcământ de gaze
+0811,2,carieră de piatră;piatră de construcție;calcar;piatră spartă
+0812,2,balastieră;balast;nisip;pietriș;agregate;carieră de nisip;argilă
+0893,2,salină;sare gemă;exploatare de sare
+0910,2,servicii petroliere;intervenții sonde
+0990,2,servicii miniere;foraj geologic;prospecțiuni geologice
+1011,2,abator;tranșare carne;procesare carne
+1012,2,abator de păsări;carne de pui;procesare pui
+1013,2,mezeluri;carmangerie;afumătorie;salam;cârnați;preparate din carne;fabrică de mezeluri
+1020,2,procesare pește;pește afumat;conserve de pește;afumătorie de pește
+1031,2,chipsuri;cartofi prăjiți congelați
+1032,2,sucuri naturale;suc de mere;sucuri presate la rece
+1039,2,conserve de legume;zacuscă;dulceață;gem;murături;fructe uscate;legume congelate
+1041,2,ulei presat la rece;presă de ulei;ulei de floarea-soarelui;oloiniță
+1051,2,lactate;fabrică de lapte;brânzeturi;brânză;caș;telemea;iaurt;lăptărie
+1052,2,înghețată artizanală;gelaterie
+1061,2,moară;morărit;făină;mălai;morar
+1071,2,brutărie;brutar;panificație;patiserie;cofetărie;covrigărie;pâine;plăcintărie
+1072,2,biscuiți;napolitane;turtă dulce;covrigei;patiserie congelată
+1073,2,paste făinoase;paste proaspete;tăiței de casă;macaroane
+1082,2,ciocolaterie;ciocolată artizanală;bomboane;praline;dulciuri;rahat
+1083,2,prăjitorie de cafea;cafea de specialitate;cafea proaspăt prăjită;ceai
+1084,2,condimente;mirodenii;sosuri;muștar;oțet
+1085,2,mâncare gătită;mâncare la caserolă;meniuri gata preparate;semipreparate
+1086,2,alimente dietetice;mâncare pentru bebeluși;alimente fără gluten
+1089,2,suplimente alimentare;drojdie;supe concentrate;miere ambalată
+1091,2,nutreț combinat;furaje;hrană pentru animale;fabrică de furaje
+1092,2,hrană pentru câini;hrană pentru pisici
+1101,2,distilerie;țuică;pălincă;rachiu;vișinată;lichior;gin
+1102,2,cramă;vinărie;vin;crame;producător de vin;podgorie
+1103,2,cidru;vin de fructe
+1104,2,hidromel
+1105,2,berărie;bere artizanală;microberărie;fabrică de bere;bere
+1106,2,malț;malțerie
+1107,2,apă minerală;apă plată;îmbuteliere apă;băuturi răcoritoare;sucuri carbogazoase
+1310,2,filatură;fire textile;tors lână
+1320,2,țesătorie;țesături;țesături tradiționale
+1330,2,vopsire textile;imprimare textile;finisaj textil
+1391,2,metraje tricotate
+1392,2,lenjerie de pat;perdele;draperii;huse;textile de casă;prosoape
+1393,2,covoare;mochete;covoare țesute manual
+1394,2,frânghii;sfori;plase
+1395,2,textile nețesute
+1396,2,textile tehnice;benzi textile
+1399,2,broderie;dantelă;pâslă
+1411,2,îmbrăcăminte din piele;geci de piele
+1412,2,îmbrăcăminte de lucru;echipamente de protecție;uniforme;haine de lucru
+1413,2,confecții;fabrică de confecții;croitorie;atelier de croitorie;costume;rochii;ie tradițională
+1414,2,lenjerie intimă;lenjerie de corp;cămăși;pijamale
+1419,2,accesorii vestimentare;pălării;mănuși;îmbrăcăminte pentru copii
+1420,2,blănuri;blănărie;cojocar;cojoace
+1431,2,ciorapi;dresuri;șosete
+1439,2,tricotaje;pulovere;articole tricotate
+1511,2,tăbăcărie;pielărie;piele naturală;argăsire
+1512,2,marochinărie;genți din piele;poșete;portofele;curele;șelărie;harnașament
+1520,2,încălțăminte;fabrică de pantofi;pantofi;cizmar;cizmărie;ghete;bocanci
+1610,2,gater;cherestea;rindeluire lemn;lemn de construcții;scânduri;grinzi
+1621,2,pal;placaj;mdf;osb;furnir
+1622,2,parchet;parchet din lemn masiv
+1623,2,tâmplărie din lemn;tâmplar;dulgherie;dulgher;scări din lemn;case din lemn;uși din lemn;ferestre din lemn
+1624,2,paleți;europaleți;lăzi din lemn
+1629,2,obiecte din lemn;sculptură în lemn;împletituri din răchită;coșuri împletite;articole din plută;peleți;brichete din lemn
+1712,2,fabrică de hârtie;carton
+1721,2,cutii de carton;ambalaje din carton;carton ondulat;ambalaje din hârtie
+1722,2,hârtie igienică;șervețele;prosoape de hârtie;scutece
+1723,2,caiete;plicuri;agende
+1724,2,tapet
+1811,2,tipografie de ziare
+1812,2,tipografie;print digital;tipar offset;printuri;cărți de vizită;flyere;serigrafie;personalizare tricouri
+1813,2,dtp;tehnoredactare
+1814,2,legătorie de cărți
+1820,2,multiplicare cd;multiplicare dvd
+1920,2,rafinărie;produse petroliere;lubrifianți
+2011,2,oxigen;azot lichid;gaze tehnice;gaze industriale
+2015,2,îngrășăminte;îngrășăminte chimice;azotat
+2016,2,granule plastice;polimeri
+2020,2,pesticide;erbicide;insecticide;produse fitosanitare
+2030,2,vopsele;lacuri;fabrică de vopsea;chituri;tencuieli decorative
+2041,2,detergenți;săpun;săpunuri naturale;produse de curățenie;dezinfectanți
+2042,2,cosmetice;produse cosmetice;parfumuri;creme;cosmetice naturale
+2051,2,explozivi;artificii;materiale pirotehnice
+2052,2,adezivi;lipici
+2053,2,uleiuri esențiale
+2059,2,antigel;aditivi;chimicale
+2110,2,substanțe active farmaceutice
+2120,2,fabrică de medicamente;medicamente;producător de medicamente;industria farmaceutică
+2211,2,reșapare;reșapare anvelope
+2219,2,garnituri de cauciuc;furtunuri;articole din cauciuc
+2221,2,folie;folie plastic;țevi din plastic;profile pvc
+2222,2,ambalaje din plastic;pungi;sacoșe;preforme pet;caserole
+2223,2,tâmplărie pvc;termopane;ferestre pvc;uși pvc;geamuri termopan
+2229,2,injecție mase plastice;articole din plastic;piese din plastic
+2312,2,geamuri;geamgiu;sticlă securizată;oglinzi;geam termopan
+2313,2,sticlărie;sticle;borcane;articole din sticlă
+2331,2,faianță;gresie;plăci ceramice
+2332,2,cărămidă;țiglă;cărămidărie;blocuri ceramice
+2341,2,olărit;olar;olărie;vase din ceramică;ceramică decorativă
+2342,2,obiecte sanitare;vase de toaletă;chiuvete
+2351,2,ciment;fabrică de ciment
+2352,2,var hidratat
+2361,2,prefabricate din beton;pavele;borduri;bolțari;tuburi din beton;bca
+2362,2,plăci de gips-carton;elemente decorative din ipsos
+2363,2,beton;stație de betoane;beton marfă;betoane
+2364,2,mortar;mortar uscat;adezivi pentru gresie
+2369,2,articole din beton;statui din beton;articole decorative din ipsos
+2370,2,marmură;granit;pietrar;monumente funerare;blaturi din granit;piatră naturală;cioplitor în piatră
+2391,2,discuri abrazive;șmirghel
+2399,2,vată minerală;vată bazaltică;bitum;mixturi asfaltice
+2410,2,oțelărie;combinat siderurgic;siderurgie
+2420,2,țevi din oțel;țevi sudate
+2442,2,profile din aluminiu
+2451,2,turnătorie;turnătorie de fontă;piese turnate din fontă
+2452,2,turnătorie de oțel;piese turnate din oțel;turnătorie
+2453,2,turnătorie de aluminiu;piese turnate din aluminiu;turnătorie
+2454,2,turnătorie
+2511,2,construcții metalice;hale metalice;structuri metalice;confecții metalice;sudură
+2512,2,tâmplărie din aluminiu;uși metalice;porți metalice;uși din aluminiu;ferestre din aluminiu;fațade cortină
+2521,2,cazane;radiatoare;calorifere
+2529,2,rezervoare metalice;cisterne;containere metalice;silozuri metalice
+2540,2,armament;muniție;arme
+2550,2,forjă;forjare;ștanțare;ambutisare
+2561,2,zincare;cromare;vopsire în câmp electrostatic;galvanizare;tratamente termice;sablare
+2562,2,strungărie;strungar;prelucrări mecanice;frezare;prelucrare cnc;debitare laser;sudură;sudor
+2571,2,cuțite;tacâmuri;foarfeci
+2572,2,feronerie;balamale;yale;lacăte;încuietori
+2573,2,matrițe;sculerie
+2592,2,cutii metalice;doze;ambalaje metalice
+2593,2,plasă de sârmă;gard de plasă;sârmă ghimpată;arcuri;lanțuri;cuie
+2594,2,șuruburi;piulițe;buloane
+2599,2,fier forjat;confecții metalice;obiecte din metal;garduri metalice
+2611,2,plăci electronice;pcb;montaj electronic
+2612,2,componente electronice
+2620,2,asamblare calculatoare
+2630,2,echipamente de telecomunicații;antene
+2640,2,boxe;amplificatoare;televizoare
+2651,2,aparate de măsură;contoare;senzori;echipamente de automatizare
+2670,2,instrumente optice;aparate foto
+2711,2,motoare electrice;generatoare;transformatoare
+2712,2,tablouri electrice;aparataj electric;tablouri de distribuție
+2720,2,baterii auto
+2732,2,cabluri electrice;conductori electrici;fire electrice
+2733,2,prize;întrerupătoare;conectori
+2740,2,corpuri de iluminat;lustre;lămpi;iluminat led;aplice
+2752,2,sobe;șeminee;sobe de teracotă;grătare
+2790,2,echipamente electrice;panouri electrice
+2813,2,pompe de apă
+2814,2,robinete;vane;baterii sanitare
+2815,2,rulmenți;angrenaje;reductoare;cutii de viteze
+2821,2,cuptoare industriale;cuptoare de pâine
+2822,2,macarale;poduri rulante;stivuitoare;lifturi;ascensoare;elevatoare
+2825,2,instalații frigorifice;echipamente de ventilație;camere frigorifice
+2829,2,cântare;echipamente de filtrare;mașini de ambalat
+2830,2,utilaje agricole;mașini agricole;remorci agricole;pluguri;tractoare
+2841,2,mașini-unelte;strunguri;mașini cnc
+2892,2,utilaje de construcții;utilaje miniere
+2893,2,utilaje pentru industria alimentară;echipamente pentru brutării
+2896,2,utilaje pentru mase plastice
+2899,2,utilaje industriale;linii de producție;roboți industriali
+2910,2,fabrică de automobile
+2920,2,remorci;semiremorci;caroserii;carosare;rulote
+2931,2,cablaje auto;instalații electrice auto
+2932,2,componente auto;industria auto;furnizor auto
+3011,2,șantier naval;construcții navale;nave
+3012,2,ambarcațiuni;bărci;iahturi;șalupe
+3020,2,vagoane;material rulant;locomotive
+3030,2,aeronave;avioane;industria aeronautică
+3092,2,fabrică de biciclete;scaune cu rotile;cărucioare pentru copii
+3099,2,căruțe;atelaje
+3101,2,mobilier de birou;mobilier comercial;mobilier pentru magazine;mobilă de birou
+3102,2,mobilă de bucătărie;bucătării la comandă;mobilă la comandă
+3103,2,saltele;somiere;fabrică de saltele
+3109,2,mobilă;fabrică de mobilă;mobilă la comandă;mobilier;tâmplărie de mobilă;tâmplar;canapele;dormitoare
+3212,2,bijuterii;bijutier;giuvaergiu;bijuterii din aur;bijuterii din argint;atelier de bijuterii
+3213,2,bijuterii fantezie;bijuterii handmade;accesorii handmade
+3220,2,instrumente muzicale;lutier;lutierie;viori;chitare
+3230,2,articole sportive;echipament sportiv;schiuri
+3240,2,jucării;jocuri de societate;jucării din lemn
+3250,2,tehnică dentară;tehnician dentar;laborator dentar;proteze dentare;proteze ortopedice;dispozitive medicale
+3291,2,mături;perii;pensule
+3299,2,lumânări;articole handmade;umbrele;sicrie
+0111,3,fermă cerealieră;cultură de grâu;cultură de porumb;floarea-soarelui;rapiță;agricultor;fermier
+0113,3,legumicultură;legumicultor;sere de legume;solarii;cultură de cartofi;zarzavaturi;ciupercărie
+0119,3,floricultură;cultivare flori;sere de flori;plante furajere;lucernă
+0121,3,viticultură;viticultor;podgorie;viță-de-vie
+0124,3,pomicultură;pomicultor;livadă;livadă de meri;livadă de pruni;cireșe;caise
+0125,3,afine;căpșuni;zmeură;nuci;alune;cultură de afine
+0128,3,plante medicinale;plante aromatice;lavandă;ceaiuri din plante
+0130,3,pepinieră;răsaduri;puieți;butași;material săditor
+0141,3,fermă de vaci;fermă de vaci de lapte;vaci de lapte;lapte de vacă;crescător de vaci
+0142,3,fermă de bovine;îngrășare bovine;taurine;vițel;crescător de vite
+0143,3,herghelie;crescător de cai;cai de rasă
+0145,3,stână;cioban;fermă de oi;fermă de capre;oierit;crescător de oi
+0146,3,fermă de porci;porcine;crescătorie de porci;suine
+0147,3,fermă de păsări;avicultură;fermă avicolă;crescătorie de pui;găini ouătoare;ouă
+0148,3,apicultură;apicultor;stupină;miere;albine;crescătorie de iepuri;melcărie
+0150,3,fermă mixtă;gospodărie agricolă;fermă de familie
+0161,3,lucrări agricole;arat;semănat;stropit culturi;servicii agricole
+0162,3,însămânțări artificiale;servicii zootehnice;potcovar;tuns oi
+0163,3,uscare cereale;depozitare cereale;siloz;sortare legume;semințe;tratare semințe
+0170,3,vânătoare;fond de vânătoare;vânător;turism cinegetic
+0210,3,silvicultură;ocol silvic;plantare puieți;împăduriri
+0220,3,exploatare forestieră;exploatare lemn;tăieri de pădure;drujbist;bușteni;lemn de foc
+0230,3,ciuperci de pădure;fructe de pădure;culegere plante medicinale;hribi
+0240,3,servicii silvice;amenajare silvică;inventar forestier;pază pădure
+0312,3,pescar
+0321,3,midii;fermă de midii
+0322,3,păstrăvărie;crescătorie de pește;heleșteu;fermă piscicolă;crap
+0510,3,mină de cărbune;huilă;minerit cărbune
+0520,3,lignit;carieră de lignit;exploatare minieră cărbune
+0610,3,foraj petrolier;sondă;țiței;zăcământ de petrol
+0620,3,exploatare gaze;zăcământ de gaze
+0811,3,carieră de piatră;piatră de construcție;calcar;piatră spartă
+0812,3,balastieră;balast;nisip;pietriș;agregate;carieră de nisip;argilă
+0893,3,salină;sare gemă;exploatare de sare
+0910,3,servicii petroliere;intervenții sonde
+0990,3,servicii miniere;foraj geologic;prospecțiuni geologice
+1011,3,abator;tranșare carne;procesare carne
+1012,3,abator de păsări;carne de pui;procesare pui
+1013,3,mezeluri;carmangerie;afumătorie;salam;cârnați;preparate din carne;fabrică de mezeluri
+1020,3,procesare pește;pește afumat;conserve de pește;afumătorie de pește
+1031,3,chipsuri;cartofi prăjiți congelați
+1032,3,sucuri naturale;suc de mere;sucuri presate la rece
+1039,3,conserve de legume;zacuscă;dulceață;gem;murături;fructe uscate;legume congelate
+1041,3,ulei presat la rece;presă de ulei;ulei de floarea-soarelui;oloiniță
+1051,3,lactate;fabrică de lapte;brânzeturi;brânză;caș;telemea;iaurt;lăptărie
+1052,3,înghețată artizanală;gelaterie
+1061,3,moară;morărit;făină;mălai;morar
+1071,3,brutărie;brutar;panificație;patiserie;cofetărie;covrigărie;pâine;plăcintărie
+1072,3,biscuiți;napolitane;turtă dulce;covrigei;patiserie congelată
+1073,3,paste făinoase;paste proaspete;tăiței de casă;macaroane
+1082,3,ciocolaterie;ciocolată artizanală;bomboane;praline;dulciuri;rahat
+1083,3,prăjitorie de cafea;cafea de specialitate;cafea proaspăt prăjită;ceai
+1084,3,condimente;mirodenii;sosuri;muștar;oțet
+1085,3,mâncare gătită;mâncare la caserolă;meniuri gata preparate;semipreparate
+1086,3,alimente dietetice;mâncare pentru bebeluși;alimente fără gluten
+1089,3,suplimente alimentare;drojdie;supe concentrate;miere ambalată
+1091,3,nutreț combinat;furaje;hrană pentru animale;fabrică de furaje
+1092,3,hrană pentru câini;hrană pentru pisici
+1101,3,distilerie;țuică;pălincă;rachiu;vișinată;lichior;gin
+1102,3,cramă;vinărie;vin;crame;producător de vin;podgorie
+1103,3,cidru;vin de fructe
+1104,3,hidromel
+1105,3,berărie;bere artizanală;microberărie;fabrică de bere;bere
+1106,3,malț;malțerie
+1107,3,apă minerală;apă plată;îmbuteliere apă;băuturi răcoritoare;sucuri carbogazoase
+1310,3,filatură;fire textile;tors lână
+1320,3,țesătorie;țesături;țesături tradiționale
+1330,3,vopsire textile;imprimare textile;finisaj textil
+1391,3,metraje tricotate
+1392,3,lenjerie de pat;perdele;draperii;huse;textile de casă;prosoape
+1393,3,covoare;mochete;covoare țesute manual
+1394,3,frânghii;sfori;plase
+1395,3,textile nețesute
+1396,3,textile tehnice;benzi textile
+1399,3,broderie;dantelă;pâslă
+1410,3,tricotaje;pulovere;ciorapi;șosete;dresuri
+1421,3,confecții;fabrică de confecții;croitorie;atelier de croitorie;costume;rochii;ie tradițională
+1422,3,lenjerie intimă;lenjerie de corp;cămăși;pijamale
+1423,3,îmbrăcăminte de lucru;echipamente de protecție;uniforme;haine de lucru
+1424,3,îmbrăcăminte din piele;geci de piele;blănuri;blănărie;cojocar;cojoace
+1429,3,accesorii vestimentare;pălării;mănuși;îmbrăcăminte pentru copii
+1511,3,tăbăcărie;pielărie;piele naturală;argăsire
+1512,3,marochinărie;genți din piele;poșete;portofele;curele;șelărie;harnașament
+1520,3,încălțăminte;fabrică de pantofi;pantofi;cizmar;cizmărie;ghete;bocanci
+1611,3,gater;cherestea;rindeluire lemn;lemn de construcții;scânduri;grinzi
+1612,3,uscare lemn;impregnare lemn;tratare lemn
+1621,3,pal;placaj;mdf;osb;furnir
+1622,3,parchet;parchet din lemn masiv
+1623,3,dulgherie;dulgher;scări din lemn;case din lemn
+1624,3,paleți;europaleți;lăzi din lemn
+1625,3,uși din lemn;ferestre din lemn;tâmplărie din lemn;tâmplar;geamuri termopan din lemn
+1626,3,peleți;brichete din lemn;combustibil din biomasă
+1628,3,obiecte din lemn;sculptură în lemn;împletituri din răchită;coșuri împletite;articole din plută
+1712,3,fabrică de hârtie;carton
+1721,3,cutii de carton;ambalaje din carton;carton ondulat;ambalaje din hârtie
+1722,3,hârtie igienică;șervețele;prosoape de hârtie;scutece
+1723,3,caiete;plicuri;agende
+1724,3,tapet
+1811,3,tipografie de ziare
+1812,3,tipografie;print digital;tipar offset;printuri;cărți de vizită;flyere;serigrafie;personalizare tricouri
+1813,3,dtp;tehnoredactare
+1814,3,legătorie de cărți
+1820,3,multiplicare cd;multiplicare dvd
+1920,3,rafinărie;produse petroliere;lubrifianți
+2011,3,oxigen;azot lichid;gaze tehnice;gaze industriale
+2015,3,îngrășăminte;îngrășăminte chimice;azotat
+2016,3,granule plastice;polimeri
+2020,3,pesticide;erbicide;insecticide;produse fitosanitare
+2030,3,vopsele;lacuri;fabrică de vopsea;chituri;tencuieli decorative
+2041,3,detergenți;săpun;săpunuri naturale;produse de curățenie;dezinfectanți
+2042,3,cosmetice;produse cosmetice;parfumuri;creme;cosmetice naturale
+2051,3,biodiesel;biocombustibili;bioetanol
+2059,3,antigel;aditivi;chimicale;adezivi;lipici;uleiuri esențiale
+2110,3,substanțe active farmaceutice
+2120,3,fabrică de medicamente;medicamente;producător de medicamente;industria farmaceutică
+2211,3,reșapare;reșapare anvelope
+2212,3,garnituri de cauciuc;furtunuri;articole din cauciuc
+2221,3,folie;folie plastic;țevi din plastic;profile pvc
+2222,3,ambalaje din plastic;pungi;sacoșe;preforme pet;caserole
+2223,3,tâmplărie pvc;termopane;ferestre pvc;uși pvc;geamuri termopan
+2224,3,jgheaburi pvc;articole din plastic pentru construcții
+2225,3,prelucrare mase plastice;vopsire plastic
+2226,3,injecție mase plastice;articole din plastic;piese din plastic
+2312,3,geamuri;geamgiu;sticlă securizată;oglinzi;geam termopan
+2313,3,sticlărie;sticle;borcane;articole din sticlă
+2331,3,faianță;gresie;plăci ceramice
+2332,3,cărămidă;țiglă;cărămidărie;blocuri ceramice
+2341,3,olărit;olar;olărie;vase din ceramică;ceramică decorativă
+2342,3,obiecte sanitare;vase de toaletă;chiuvete
+2351,3,ciment;fabrică de ciment
+2352,3,var hidratat
+2361,3,prefabricate din beton;pavele;borduri;bolțari;tuburi din beton;bca
+2362,3,plăci de gips-carton;elemente decorative din ipsos
+2363,3,beton;stație de betoane;beton marfă;betoane
+2364,3,mortar;mortar uscat;adezivi pentru gresie
+2366,3,articole din beton;statui din beton;articole decorative din ipsos
+2370,3,marmură;granit;pietrar;monumente funerare;blaturi din granit;piatră naturală;cioplitor în piatră
+2391,3,discuri abrazive;șmirghel
+2399,3,vată minerală;vată bazaltică;bitum;mixturi asfaltice
+2410,3,oțelărie;combinat siderurgic;siderurgie
+2420,3,țevi din oțel;țevi sudate
+2442,3,profile din aluminiu
+2451,3,turnătorie;turnătorie de fontă;piese turnate din fontă
+2452,3,turnătorie de oțel;piese turnate din oțel;turnătorie
+2453,3,turnătorie de aluminiu;piese turnate din aluminiu;turnătorie
+2454,3,turnătorie
+2511,3,construcții metalice;hale metalice;structuri metalice;confecții metalice;sudură
+2512,3,tâmplărie din aluminiu;uși metalice;porți metalice;uși din aluminiu;ferestre din aluminiu;fațade cortină
+2521,3,cazane;radiatoare;calorifere
+2522,3,rezervoare metalice;cisterne;containere metalice;silozuri metalice
+2530,3,armament;muniție;arme
+2540,3,forjă;forjare;ștanțare;ambutisare
+2551,3,zincare;cromare;vopsire în câmp electrostatic;galvanizare;sablare
+2552,3,tratamente termice;călire
+2553,3,strungărie;strungar;prelucrări mecanice;frezare;prelucrare cnc;debitare laser;sudură;sudor
+2561,3,cuțite;tacâmuri;foarfeci
+2562,3,feronerie;balamale;yale;lacăte;încuietori
+2563,3,matrițe;sculerie
+2592,3,cutii metalice;doze;ambalaje metalice
+2593,3,plasă de sârmă;gard de plasă;sârmă ghimpată;arcuri;lanțuri;cuie
+2594,3,șuruburi;piulițe;buloane
+2599,3,fier forjat;confecții metalice;obiecte din metal;garduri metalice
+2611,3,componente electronice
+2612,3,plăci electronice;pcb;montaj electronic
+2620,3,asamblare calculatoare
+2630,3,echipamente de telecomunicații;antene
+2640,3,boxe;amplificatoare;televizoare
+2651,3,aparate de măsură;contoare;senzori;echipamente de automatizare
+2670,3,instrumente optice;aparate foto
+2711,3,motoare electrice;generatoare;transformatoare
+2712,3,tablouri electrice;aparataj electric;tablouri de distribuție
+2720,3,baterii auto
+2732,3,cabluri electrice;conductori electrici;fire electrice
+2733,3,prize;întrerupătoare;conectori
+2740,3,corpuri de iluminat;lustre;lămpi;iluminat led;aplice
+2752,3,sobe;șeminee;sobe de teracotă;grătare
+2790,3,echipamente electrice;panouri electrice
+2813,3,pompe de apă
+2814,3,robinete;vane;baterii sanitare
+2815,3,rulmenți;angrenaje;reductoare;cutii de viteze
+2821,3,cuptoare industriale;cuptoare de pâine
+2822,3,macarale;poduri rulante;stivuitoare;lifturi;ascensoare;elevatoare
+2825,3,instalații frigorifice;echipamente de ventilație;camere frigorifice
+2829,3,cântare;echipamente de filtrare;mașini de ambalat
+2830,3,utilaje agricole;mașini agricole;remorci agricole;pluguri;tractoare
+2841,3,mașini-unelte;strunguri;mașini cnc
+2892,3,utilaje de construcții;utilaje miniere
+2893,3,utilaje pentru industria alimentară;echipamente pentru brutării
+2896,3,utilaje pentru mase plastice
+2897,3,imprimante 3d
+2899,3,utilaje industriale;linii de producție;roboți industriali
+2910,3,fabrică de automobile
+2920,3,remorci;semiremorci;caroserii;carosare;rulote
+2931,3,cablaje auto;instalații electrice auto
+2932,3,componente auto;industria auto;furnizor auto
+3011,3,șantier naval;construcții navale;nave
+3012,3,ambarcațiuni;bărci;iahturi;șalupe
+3020,3,vagoane;material rulant;locomotive
+3031,3,aeronave;avioane;industria aeronautică;drone
+3092,3,fabrică de biciclete;scaune cu rotile;cărucioare pentru copii
+3099,3,căruțe;atelaje
+3100,3,mobilă;fabrică de mobilă;mobilă la comandă;mobilier;mobilă de bucătărie;saltele;canapele;tâmplar
+3212,3,bijuterii;bijutier;giuvaergiu;bijuterii din aur;bijuterii din argint;atelier de bijuterii
+3213,3,bijuterii fantezie;bijuterii handmade;accesorii handmade
+3220,3,instrumente muzicale;lutier;lutierie;viori;chitare
+3230,3,articole sportive;echipament sportiv;schiuri
+3240,3,jucării;jocuri de societate;jucării din lemn
+3250,3,tehnică dentară;tehnician dentar;laborator dentar;proteze dentare;proteze ortopedice;dispozitive medicale
+3291,3,mături;perii;pensule
+3299,3,lumânări;articole handmade;umbrele;sicrie
+3312,2,reparații utilaje;service utilaje;reparații mașini industriale
+3312,3,reparații utilaje;service utilaje;reparații mașini industriale
+3314,2,rebobinare motoare electrice;reparații motoare electrice;reparații transformatoare
+3314,3,rebobinare motoare electrice;reparații motoare electrice;reparații transformatoare
+3315,2,reparații nave;reparații bărci;service bărci
+3315,3,reparații nave;reparații bărci;service bărci
+3316,2,mentenanță aeronave;reparații avioane
+3316,3,mentenanță aeronave;reparații avioane
+3317,2,reparații vagoane;reparații locomotive;reparații material rulant
+3317,3,reparații vagoane;reparații locomotive;reparații material rulant
+3320,2,montaj utilaje;montaj industrial;montaj linii de producție
+3320,3,montaj utilaje;montaj industrial;montaj linii de producție
+3511,2,centrală electrică;parc fotovoltaic;parc eolian;centrală fotovoltaică;hidrocentrală;microhidrocentrală;energie regenerabilă
+3511,3,centrală electrică;termocentrală
+3512,3,parc fotovoltaic;parc eolian;centrală fotovoltaică;hidrocentrală;microhidrocentrală;energie regenerabilă;energie eoliană
+3513,2,distribuitor energie electrică;operator de distribuție energie
+3514,3,distribuitor energie electrică;operator de distribuție energie
+3514,2,furnizor energie electrică;furnizor de curent;furnizor de energie
+3515,3,furnizor energie electrică;furnizor de curent;furnizor de energie
+3516,3,stocare energie;baterii de stocare
+3522,2,distribuitor gaze naturale;operator de distribuție gaze
+3522,3,distribuitor gaze naturale;operator de distribuție gaze
+3523,2,furnizor gaze naturale;furnizor de gaz
+3523,3,furnizor gaze naturale;furnizor de gaz
+3540,3,broker energie;broker gaze naturale;trader energie
+3530,2,termoficare;agent termic;energie termică
+3530,3,termoficare;agent termic;energie termică
+3600,2,apă potabilă;furnizor apă;operator apă canal;apă și canal
+3600,3,apă potabilă;furnizor apă;operator apă canal;apă și canal
+3700,2,canalizare;stație de epurare;vidanjare;apă și canal
+3700,3,canalizare;stație de epurare;vidanjare;apă și canal
+3811,2,salubrizare;colectare gunoi;ridicare gunoi;gunoi menajer;colectare deșeuri;evacuare moloz
+3811,3,salubrizare;colectare gunoi;ridicare gunoi;gunoi menajer;colectare deșeuri;evacuare moloz
+3812,2,deșeuri medicale;colectare uleiuri uzate;colectare baterii uzate
+3812,3,deșeuri medicale;colectare uleiuri uzate;colectare baterii uzate
+3821,2,groapă de gunoi;depozit de deșeuri;compostare
+3832,3,groapă de gunoi;depozit de deșeuri
+3823,3,compostare;tratare deșeuri
+3822,2,incinerare deșeuri
+3831,3,incinerare deșeuri;incinerator
+3831,2,dezmembrări auto;dezmembrări;casare auto
+3832,2,reciclare;centru de reciclare;reciclare deșeuri;reciclare plastic;reciclare hârtie;fier vechi
+3821,3,reciclare;centru de reciclare;reciclare deșeuri;reciclare plastic;reciclare hârtie;dezmembrări auto;casare auto;fier vechi
+3900,2,ecologizare;depoluare
+3900,3,ecologizare;depoluare
+4110,2,dezvoltator imobiliar;promotor imobiliar;ansamblu rezidențial;proiect imobiliar
+4120,2,firmă de construcții;constructor;construcții case;construcții civile;construcții industriale;antreprenor general;case la roșu;construcții la cheie
+4100,3,firmă de construcții;constructor;construcții case;construcții civile;construcții industriale;antreprenor general;case la roșu;construcții la cheie
+4211,2,asfaltare;asfaltări;construcții drumuri;drumuri și poduri
+4211,3,asfaltare;asfaltări;construcții drumuri;drumuri și poduri
+4212,2,construcții feroviare
+4212,3,construcții feroviare
+4213,2,construcții poduri;drumuri și poduri
+4213,3,construcții poduri;drumuri și poduri
+4221,2,rețele apă canal;rețele de gaze;branșamente gaze;branșamente apă;foraj puțuri;puțuri forate
+4221,3,rețele apă canal;rețele de gaze;branșamente gaze;branșamente apă;foraj puțuri;puțuri forate
+4222,2,rețele electrice;linii electrice;branșamente electrice;rețele de fibră optică
+4222,3,rețele electrice;linii electrice;branșamente electrice;rețele de fibră optică
+4291,2,diguri;regularizare râuri
+4291,3,diguri;regularizare râuri
+4311,2,demolări;demolare
+4311,3,demolări;demolare
+4312,2,excavații;terasamente;săpături;nivelare teren;defrișări
+4312,3,excavații;terasamente;săpături;nivelare teren;defrișări
+4313,2,foraje geotehnice;studiu geotehnic
+4313,3,foraje geotehnice;studiu geotehnic
+4321,2,electrician;electricieni;tablouri electrice;montaj panouri fotovoltaice;instalare panouri solare;sisteme de alarmă;montaj camere video;sisteme de supraveghere
+4321,3,electrician;electricieni;tablouri electrice;montaj panouri fotovoltaice;instalare panouri solare;sisteme de alarmă;montaj camere video;sisteme de supraveghere
+4322,2,instalator;instalatori;montaj centrale termice;montaj aer condiționat;instalații termice;pompe de căldură;încălzire în pardoseală
+4322,3,instalator;instalatori;montaj centrale termice;montaj aer condiționat;instalații termice;pompe de căldură;încălzire în pardoseală
+4329,2,montaj lifturi;ascensoare;automatizări porți;porți automate;izolații termice;termoizolații;anvelopare
+4323,3,izolații termice;termoizolații;anvelopare;izolare fațade
+4324,3,montaj lifturi;ascensoare;automatizări porți;porți automate
+4331,2,gips-carton;tencuieli;tencuieli mecanizate;gletuire;ipsosar
+4331,3,gips-carton;tencuieli;tencuieli mecanizate;gletuire;ipsosar
+4332,2,termopane;geamuri termopan;tâmplărie pvc;tâmplărie aluminiu;montaj ferestre;montaj uși;dulgher;tâmplar
+4332,3,termopane;geamuri termopan;tâmplărie pvc;tâmplărie aluminiu;montaj ferestre;montaj uși;dulgher;tâmplar
+4333,2,faianțar;gresie și faianță;montaj gresie;parchetar;montaj parchet;pardoseli epoxidice
+4333,3,faianțar;gresie și faianță;montaj gresie;parchetar;montaj parchet;pardoseli epoxidice
+4334,2,zugrav;zugravi;zugrăvit;geamgiu;montaj tapet
+4334,3,zugrav;zugravi;zugrăvit;geamgiu;montaj tapet
+4339,2,finisaje interioare;amenajări interioare;renovări;renovare apartament
+4335,3,finisaje interioare;amenajări interioare;renovări;renovare apartament
+4391,2,acoperișuri;acoperiș;montaj acoperișuri;șarpantă;dulgher;tinichigiu acoperișuri;jgheaburi;burlane
+4341,3,acoperișuri;acoperiș;montaj acoperișuri;șarpantă;dulgher;tinichigiu acoperișuri;jgheaburi;burlane
+4391,3,zidar;zidari
+4399,2,hidroizolații;schele;închiriere schele;cofraje;fundații;turnare beton;zidar;construcție piscine
+4342,3,hidroizolații;schele;închiriere schele;cofraje;fundații;turnare beton;construcție piscine
+4511,2,dealer auto;parc auto;mașini second hand;vânzări auto;showroom auto;mașini noi
+4781,3,dealer auto;parc auto;mașini second hand;vânzări auto;showroom auto;mașini noi;dealer camioane;remorci
+4519,2,dealer camioane;vânzări camioane;remorci;rulote
+4671,3,import auto;import mașini;dealer camioane
+4520,2,service auto;mecanic auto;vulcanizare;tinichigerie;vopsitorie auto;spălătorie auto;electrician auto
+4531,2,distribuitor piese auto;distribuitor anvelope
+4672,3,distribuitor piese auto;distribuitor anvelope
+4532,2,piese auto;magazin piese auto;anvelope;accesorii auto;jante;uleiuri auto
+4782,3,piese auto;magazin piese auto;anvelope;accesorii auto;jante;uleiuri auto
+4540,2,motociclete;moto;service moto;piese moto;magazin moto;scutere;atv
+4783,3,motociclete;moto;piese moto;magazin moto;scutere;atv
+4621,2,achiziții cereale;comerț cereale;furaje;semințe agricole
+4621,3,achiziții cereale;comerț cereale;furaje;semințe agricole
+4622,2,depozit de flori;flori angro
+4622,3,depozit de flori;flori angro
+4631,2,depozit de fructe și legume;distribuitor fructe și legume
+4631,3,depozit de fructe și legume;distribuitor fructe și legume
+4632,2,distribuitor carne;depozit de carne
+4632,3,distribuitor carne;depozit de carne;distribuitor pește
+4633,2,distribuitor lactate;distribuitor ouă;distribuitor ulei
+4633,3,distribuitor lactate;distribuitor ouă;distribuitor ulei
+4634,2,distribuitor băuturi;depozit de băuturi;distribuitor vinuri;distribuitor bere
+4634,3,distribuitor băuturi;depozit de băuturi;distribuitor vinuri;distribuitor bere
+4635,2,distribuitor țigări;distribuitor tutun
+4635,3,distribuitor țigări;distribuitor tutun
+4636,2,distribuitor dulciuri;dulciuri angro
+4636,3,distribuitor dulciuri;dulciuri angro
+4637,2,distribuitor cafea;cafea angro;distribuitor condimente
+4637,3,distribuitor cafea;cafea angro;distribuitor condimente
+4638,2,distribuitor pește
+4639,2,cash and carry;depozit alimentar;distribuitor alimentar;angro alimentar
+4639,3,cash and carry;depozit alimentar;distribuitor alimentar;angro alimentar
+4641,2,distribuitor textile;materiale textile angro
+4641,3,distribuitor textile;materiale textile angro
+4642,2,îmbrăcăminte angro;haine angro;distribuitor încălțăminte
+4642,3,îmbrăcăminte angro;haine angro;distribuitor încălțăminte
+4643,2,distribuitor electrocasnice
+4643,3,distribuitor electrocasnice
+4644,2,distribuitor detergenți;distribuitor produse de curățenie
+4644,3,distribuitor detergenți;distribuitor produse de curățenie
+4645,2,distribuitor cosmetice;cosmetice angro
+4645,3,distribuitor cosmetice;cosmetice angro
+4646,2,distribuitor medicamente;depozit farmaceutic;distribuție farmaceutică
+4646,3,distribuitor medicamente;depozit farmaceutic;distribuție farmaceutică;distribuitor dispozitive medicale;consumabile medicale
+4647,2,distribuitor mobilă;distribuitor corpuri de iluminat
+4647,3,distribuitor mobilă;distribuitor corpuri de iluminat;mobilier de birou;mobilă de birou
+4648,2,bijuterii angro;distribuitor ceasuri
+4648,3,bijuterii angro;distribuitor ceasuri
+4649,2,distribuitor jucării;distribuitor papetărie;distribuitor articole sportive
+4649,3,distribuitor jucării;distribuitor papetărie;distribuitor articole sportive
+4651,2,distribuitor it;distribuitor calculatoare;distribuitor laptopuri;distribuitor software
+4652,2,distribuitor telefoane;distribuitor componente electronice;echipamente de telecomunicații
+4650,3,distribuitor it;distribuitor calculatoare;distribuitor laptopuri;distribuitor software;distribuitor telefoane;distribuitor componente electronice;echipamente de telecomunicații
+4661,2,utilaje agricole;mașini agricole;tractoare;piese tractoare;echipamente agricole
+4661,3,utilaje agricole;mașini agricole;tractoare;piese tractoare;echipamente agricole
+4662,2,strunguri;utilaje cnc
+4662,3,strunguri;utilaje cnc
+4663,2,utilaje de construcții;excavatoare;buldoexcavatoare
+4663,3,utilaje de construcții;excavatoare;buldoexcavatoare
+4664,2,mașini de cusut;utilaje textile
+4665,2,mobilier de birou;mobilă de birou
+4666,2,copiatoare;imprimante;echipamente de birou
+4669,2,utilaje industriale;echipamente industriale;stivuitoare;generatoare
+4664,3,utilaje industriale;echipamente industriale;stivuitoare;generatoare;mașini de cusut;copiatoare
+4671,2,distribuitor carburanți;distribuitor combustibili;motorină angro;peleți
+4681,3,distribuitor carburanți;distribuitor combustibili;motorină angro;peleți
+4672,2,depozit metalurgic;distribuitor oțel;profile metalice;oțel beton;tablă
+4682,3,depozit metalurgic;distribuitor oțel;profile metalice;oțel beton;tablă
+4673,2,depozit materiale de construcții;materiale de construcții;cherestea;depozit de cherestea;bca;obiecte sanitare;gresie și faianță
+4683,3,depozit materiale de construcții;materiale de construcții;cherestea;depozit de cherestea;bca;obiecte sanitare;gresie și faianță
+4674,2,distribuitor materiale de instalații;materiale sanitare;țevi;distribuitor centrale termice
+4684,3,distribuitor materiale de instalații;materiale sanitare;țevi;distribuitor centrale termice
+4675,2,îngrășăminte;distribuitor îngrășăminte;pesticide;produse fitosanitare;distribuitor chimicale
+4685,3,îngrășăminte;distribuitor îngrășăminte;pesticide;produse fitosanitare;distribuitor chimicale
+4676,2,distribuitor ambalaje
+4686,3,distribuitor ambalaje
+4677,2,fier vechi;deșeuri metalice;centru de colectare fier vechi
+4687,3,fier vechi;deșeuri metalice;centru de colectare fier vechi
+4690,2,cash and carry;depozit angro
+4690,3,cash and carry;depozit angro
+4711,2,supermarket;hipermarket;minimarket;magazin alimentar;alimentară;magazin mixt;băcănie;magazin de cartier
+4711,3,supermarket;hipermarket;minimarket;magazin alimentar;alimentară;magazin mixt;băcănie;magazin de cartier
+4719,2,magazin universal;bazar
+4712,3,magazin universal;bazar
+4721,2,aprozar;fructe și legume;magazin de legume
+4721,3,aprozar;fructe și legume;magazin de legume
+4722,2,măcelărie;măcelar;carmangerie;magazin de carne
+4722,3,măcelărie;măcelar;carmangerie;magazin de carne
+4723,2,pescărie;magazin de pește
+4723,3,pescărie;magazin de pește
+4724,2,brutărie;cofetărie;patiserie;covrigărie;plăcintărie;simigerie;gogoșerie
+4724,3,brutărie;cofetărie;patiserie;covrigărie;plăcintărie;simigerie;gogoșerie
+4725,2,magazin de băuturi;vinotecă;magazin de vinuri;băuturi alcoolice
+4725,3,magazin de băuturi;vinotecă;magazin de vinuri;băuturi alcoolice
+4726,2,tutungerie;tabac;magazin de tutun;vape shop;țigări electronice
+4726,3,tutungerie;tabac;magazin de tutun;vape shop;țigări electronice
+4729,2,magazin bio;plafar;magazin naturist;produse naturiste;delicatese;magazin de lactate
+4727,3,magazin bio;plafar;magazin naturist;produse naturiste;delicatese;magazin de lactate
+4730,2,benzinărie;stație de carburant;stație de alimentare;peco;pompă de benzină;stație gpl
+4730,3,benzinărie;stație de carburant;stație de alimentare;peco;pompă de benzină;stație gpl
+4741,2,magazin it;magazin de calculatoare;laptopuri;componente pc
+4742,2,magazin gsm;telefoane mobile;magazin de telefoane;accesorii gsm
+4743,2,magazin de electronice;electronice;televizoare;sisteme audio
+4740,3,magazin it;magazin de calculatoare;laptopuri;componente pc;magazin gsm;telefoane mobile;magazin de telefoane;accesorii gsm
+4751,2,mercerie;magazin de stofe;metraj;materiale textile
+4751,3,mercerie;magazin de stofe;metraj;materiale textile
+4752,2,bricolaj;magazin de bricolaj;fierărie;feronerie;magazin de vopsele;materiale de construcții;scule
+4752,3,bricolaj;magazin de bricolaj;fierărie;feronerie;magazin de vopsele;materiale de construcții;scule
+4753,2,covoare;magazin de covoare;mochetă;tapet;parchet laminat
+4753,3,covoare;magazin de covoare;mochetă;tapet;parchet laminat
+4754,2,electrocasnice;magazin de electrocasnice;frigidere;mașini de spălat
+4754,3,electrocasnice;magazin de electrocasnice;frigidere;mașini de spălat;magazin de electronice;electronice;televizoare
+4759,2,magazin de mobilă;mobilă;mobilier;saltele;corpuri de iluminat;lustre;articole de menaj;instrumente muzicale
+4755,3,magazin de mobilă;mobilă;mobilier;saltele;corpuri de iluminat;lustre;articole de menaj;veselă
+4761,2,librărie;magazin de cărți
+4761,3,librărie;magazin de cărți
+4762,2,papetărie;birotică;rechizite;chioșc de ziare
+4762,3,papetărie;birotică;rechizite;chioșc de ziare
+4763,2,magazin de muzică;viniluri
+4769,3,viniluri;instrumente muzicale;magazin de instrumente muzicale
+4764,2,articole sportive;magazin sport;echipament sportiv;biciclete;magazin de biciclete;magazin de pescuit;articole de pescuit
+4763,3,articole sportive;magazin sport;echipament sportiv;biciclete;magazin de biciclete;magazin de pescuit;articole de pescuit
+4765,2,magazin de jucării;jucării;jocuri de societate
+4764,3,magazin de jucării;jucării;jocuri de societate
+4771,2,magazin de haine;haine;butic;boutique;magazin de modă;rochii de mireasă;lenjerie intimă
+4771,3,magazin de haine;haine;butic;boutique;magazin de modă;rochii de mireasă;lenjerie intimă
+4772,2,magazin de încălțăminte;magazin de pantofi;pantofi;genți;marochinărie
+4772,3,magazin de încălțăminte;magazin de pantofi;pantofi;genți;marochinărie
+4774,2,magazin ortopedic;articole ortopedice;ortopedie;aparatură medicală;proteze auditive
+4774,3,magazin ortopedic;articole ortopedice;ortopedie;aparatură medicală;proteze auditive
+4775,2,parfumerie;parfumuri;magazin de cosmetice;cosmetice;drogherie
+4775,3,parfumerie;parfumuri;magazin de cosmetice;cosmetice;drogherie
+4776,2,florărie;florar;flori;aranjamente florale;pet shop;petshop;magazin de animale;hrană pentru animale
+4776,3,florărie;florar;flori;aranjamente florale;pet shop;petshop;magazin de animale;hrană pentru animale
+4777,2,bijuterie;magazin de bijuterii;bijutier;giuvaergiu;ceasornicărie
+4777,3,bijuterie;magazin de bijuterii;bijutier;giuvaergiu;ceasornicărie
+4778,2,magazin de suveniruri;suveniruri;galerie de artă;armurerie;lemne de foc;butelii;peleți
+4778,3,magazin de suveniruri;suveniruri;armurerie;lemne de foc;butelii;peleți;galerie de artă
+4779,2,second hand;magazin second hand;haine second hand;consignație;anticariat;antichități
+4779,3,second hand;magazin second hand;haine second hand;consignație;anticariat;antichități
+4781,2,tarabă;chioșc alimentar;piață agroalimentară
+4791,2,magazin online;comerț online;vânzări online;ecommerce;e-commerce;magazin virtual
+4791,3,marketplace
+4792,3,marketplace
+4799,2,vânzări directe;vending;automate de cafea
+4910,2,operator feroviar;transport feroviar de călători
+4911,3,operator feroviar;transport feroviar de călători
+4920,2,transport feroviar de marfă;operator feroviar de marfă
+4920,3,transport feroviar de marfă;operator feroviar de marfă
+4931,2,transport public;transport în comun;regie de transport;autobuze urbane
+4931,3,transport public;transport în comun;regie de transport;autobuze urbane;curse regulate;transport județean;maxi taxi
+4932,2,taxi;taxiuri;taximetrist;dispecerat taxi;ride sharing;transport alternativ;închiriere mașină cu șofer;limuzine
+4933,3,taxi;taxiuri;taximetrist;dispecerat taxi;ride sharing;transport alternativ;închiriere mașină cu șofer;limuzine
+4939,2,transport persoane;curse regulate;maxi taxi;închiriere autocar;închiriere microbuz;transport turistic;transport internațional de persoane
+4932,3,închiriere autocar;închiriere microbuz;transport turistic;transport ocazional;transport internațional de persoane
+4934,3,teleferic;telegondolă;telescaun
+4941,2,transport marfă;transportator;transport tir;firmă de transport;transport internațional de mărfuri;transport agabaritic;transport frigorific
+4941,3,transport marfă;transportator;transport tir;firmă de transport;transport internațional de mărfuri;transport agabaritic;transport frigorific
+4942,2,mutări;firmă de mutări;relocare;transport mobilă;hamali
+4942,3,mutări;firmă de mutări;relocare;transport mobilă;hamali
+5010,2,croaziere;feribot
+5010,3,croaziere;feribot
+5030,2,plimbări cu vaporul;transport fluvial de persoane;bac
+5030,3,plimbări cu vaporul;transport fluvial de persoane;bac
+5020,2,transport naval de marfă
+5020,3,transport naval de marfă
+5040,2,transport fluvial de marfă;barje
+5040,3,transport fluvial de marfă;barje
+5110,2,companie aeriană;linie aeriană;zboruri charter
+5110,3,companie aeriană;linie aeriană;zboruri charter
+5121,2,cargo aerian
+5121,3,cargo aerian
+5210,2,spații de depozitare;depozit frigorific;self storage;antrepozit
+5210,3,spații de depozitare;depozit frigorific;self storage;antrepozit
+5221,2,parcare;autogară;tractări auto;tractare auto;asistență rutieră
+5221,3,parcare;autogară;tractări auto;tractare auto;asistență rutieră
+5222,2,agent naval;servicii portuare;operator portuar
+5222,3,agent naval;servicii portuare;operator portuar
+5223,2,handling aeroportuar;servicii aeroportuare
+5223,3,handling aeroportuar;servicii aeroportuare
+5224,2,manipulare marfă;încărcare descărcare
+5224,3,manipulare marfă;încărcare descărcare
+5229,2,casă de expediții;expeditor de mărfuri;freight forwarding;comisionar vamal;broker vamal;vămuire;logistică;firmă de logistică
+5225,3,logistică;firmă de logistică;servicii logistice
+5231,3,casă de expediții;expeditor de mărfuri;freight forwarding;comisionar vamal;broker vamal;vămuire
+5310,2,poștă;oficiu poștal
+5310,3,poștă;oficiu poștal
+5320,2,curierat;curier;firmă de curierat;curier rapid;livrare colete
+5320,3,curierat;curier;firmă de curierat;curier rapid;livrare colete
+5510,2,hotel;motel;hostel;pensiune;apart hotel;resort;cazare
+5510,3,hotel;motel;hostel;pensiune;apart hotel;resort;cazare
+5520,2,pensiune;agropensiune;cabană;casă de vacanță;vilă turistică;regim hotelier;apartamente în regim hotelier;cazare
+5520,3,pensiune;agropensiune;cabană;casă de vacanță;vilă turistică;regim hotelier;apartamente în regim hotelier;cazare
+5530,2,camping;glamping;tabără;tabere de copii;parc de rulote
+5530,3,camping;glamping;tabără;tabere de copii;parc de rulote
+5540,3,rezervări cazare;platformă de rezervări hoteliere
+5590,2,cămin studențesc;internat;cazare muncitori;cămin de nefamiliști
+5590,3,cămin studențesc;internat;cazare muncitori;cămin de nefamiliști
+5610,2,pizzerie;fast food;bistro;shaormerie;autoservire;braserie;cofetărie;food truck
+5611,3,pizzerie;fast food;bistro;shaormerie;autoservire;braserie;cofetărie;sushi
+5612,3,food truck;rulotă alimentară;street food
+5621,2,catering;catering pentru evenimente;servicii catering
+5621,3,catering;catering pentru evenimente;servicii catering
+5629,2,cantină;catering pentru firme;catering școli;bufet
+5622,3,cantină;catering pentru firme;catering școli;bufet
+5630,2,bar;pub;cafenea;cârciumă;club de noapte;terasă;ceainărie;coffee shop
+5630,3,bar;pub;cafenea;cârciumă;club de noapte;terasă;ceainărie;coffee shop
+5640,3,livrare mâncare;platformă de livrare mâncare
+5811,2,editură;editură de carte;publicare cărți
+5811,3,editură;editură de carte;publicare cărți
+5813,2,ziar;cotidian;presă scrisă;publicație locală
+5812,3,ziar;cotidian;presă scrisă;publicație locală
+5814,2,revistă;publicație lunară
+5813,3,revistă;publicație lunară
+5821,2,jocuri video;dezvoltare jocuri;studio de jocuri;game studio;gamedev
+5821,3,jocuri video;dezvoltare jocuri;studio de jocuri;game studio;gamedev
+5829,2,software;editare software;saas;aplicații software
+5829,3,software;editare software;saas;aplicații software
+5911,2,producție video;casă de producție;filmare;filmări nunți;videograf;producție film;producție tv;videoclipuri
+5911,3,producție video;casă de producție;filmare;filmări nunți;videograf;producție film;producție tv;videoclipuri
+5912,2,montaj video;editare video;efecte vizuale;vfx;color grading;dublaj
+5912,3,montaj video;editare video;efecte vizuale;vfx;color grading;dublaj
+5913,2,distribuitor de film
+5913,3,distribuitor de film
+5914,2,cinema;cinematograf;sală de cinema
+5914,3,cinema;cinematograf;sală de cinema
+5920,2,studio de înregistrări;studio muzical;studio audio;casă de discuri;producător muzical;podcast
+5920,3,studio de înregistrări;studio muzical;studio audio;casă de discuri;producător muzical;podcast
+6010,2,radio;post de radio;radio online
+6010,3,radio;post de radio;radio online
+6020,2,televiziune;post tv;televiziune locală;canal tv
+6020,3,televiziune;post tv;televiziune locală;canal tv
+6391,2,agenție de știri;agenție de presă
+6031,3,agenție de știri;agenție de presă
+6110,2,cablu tv;televiziune prin cablu;internet prin cablu;furnizor internet;isp;fibră optică
+6120,2,operator mobil;telefonie mobilă;internet mobil;internet wireless
+6130,2,internet prin satelit;tv prin satelit
+6110,3,cablu tv;furnizor internet;isp;fibră optică;operator de telecomunicații;telefonie mobilă;internet wireless;internet prin satelit
+6120,3,operator virtual;mvno
+6190,2,voip;telefonie voip;internet café
+6190,3,voip;telefonie voip
+6201,2,it;dezvoltare software;programator;software la comandă;aplicații mobile;software;web design;realizare site-uri;firmă it
+6210,3,it;dezvoltare software;programator;software la comandă;aplicații mobile;software;web design;realizare site-uri;firmă it
+6202,2,it;consultanță it;consultant it;integrare sisteme;securitate cibernetică;audit it
+6203,2,it;outsourcing it;administrare servere;administrare rețele
+6220,3,it;consultanță it;consultant it;integrare sisteme;securitate cibernetică;audit it;outsourcing it;administrare servere;administrare rețele
+6209,2,it;suport it;helpdesk;recuperare date;instalare software
+6290,3,it;suport it;helpdesk;recuperare date;instalare software
+6311,2,hosting;găzduire web;data center;centru de date;cloud;servere dedicate;procesare date
+6310,3,hosting;găzduire web;data center;centru de date;cloud;servere dedicate;procesare date
+6312,2,portal web;site de anunțuri;motor de căutare;site de știri
+6391,3,portal web;site de anunțuri;motor de căutare;site de știri
+6399,2,monitorizare presă
+6392,3,monitorizare presă
+6419,2,bancă;bănci;cooperativă de credit
+6419,3,bancă;bănci;cooperativă de credit
+6491,2,leasing auto
+6491,3,leasing auto
+6492,2,ifn;credite;credit nebancar;împrumuturi;microcredite;amanet;casă de amanet
+6492,3,ifn;credite;credit nebancar;împrumuturi;microcredite;amanet;casă de amanet
+6499,2,factoring
+6499,3,factoring
+6512,2,rca;casco;asigurări auto;asigurare locuință
+6512,3,rca;casco;asigurări auto;asigurare locuință
+6530,2,pensie privată;pilonul ii
+6530,3,pensie privată;pilonul ii
+6611,2,bursa de valori
+6611,3,bursa de valori
+6612,2,casă de schimb valutar;schimb valutar;broker bursier;tranzacționare acțiuni
+6612,3,casă de schimb valutar;schimb valutar;broker bursier;tranzacționare acțiuni
+6619,2,broker de credite;intermediere credite;consultant financiar
+6619,3,broker de credite;intermediere credite;consultant financiar
+6621,2,constatare daune;evaluator daune;inspector daune
+6621,3,constatare daune;evaluator daune;inspector daune
+6622,2,broker de asigurări;agent de asigurări;rca;agenție de asigurări
+6622,3,broker de asigurări;agent de asigurări;rca;agenție de asigurări
+6810,2,apartamente de vânzare;vânzare apartamente;vânzare case
+6811,3,apartamente de vânzare;vânzare apartamente;vânzare case
+6812,3,dezvoltator imobiliar;dezvoltare imobiliară;ansamblu rezidențial
+6820,2,regim hotelier;apartamente în regim hotelier;închiriere apartamente;închiriere birouri;închiriere spații comerciale;chirie;coworking
+6820,3,regim hotelier;apartamente în regim hotelier;închiriere apartamente;închiriere birouri;închiriere spații comerciale;chirie;coworking
+6831,2,agenție imobiliară;agent imobiliar;imobiliare;broker imobiliar;evaluator imobiliar;evaluare imobiliară
+6831,3,agenție imobiliară;agent imobiliar;imobiliare;broker imobiliar
+6832,2,administrator bloc;administrare bloc;administrator imobil;property management
+6832,3,administrator bloc;administrare bloc;administrator imobil;property management;evaluator imobiliar;evaluare imobiliară
+6910,2,avocat;avocatură;cabinet de avocatură;notar;birou notarial;executor judecătoresc;mediator;consilier juridic
+6910,3,avocat;avocatură;cabinet de avocatură;notar;birou notarial;executor judecătoresc;mediator;consilier juridic
+6920,2,contabil;expert contabil;cabinet contabil;firmă de contabilitate;auditor;consultant fiscal;salarizare
+6920,3,contabil;expert contabil;cabinet contabil;firmă de contabilitate;auditor;consultant fiscal;salarizare
+7020,3,fonduri europene;consultant fonduri europene;accesare fonduri europene;scriere proiecte;plan de afaceri;consultant management
+7021,2,agenție de pr;relații publice;consultant pr
+7022,2,fonduri europene;consultant fonduri europene;accesare fonduri europene;scriere proiecte;plan de afaceri;consultant management
+7111,2,arhitect;birou de arhitectură;urbanism;proiectare case
+7111,3,arhitect;birou de arhitectură;urbanism;proiectare case
+7112,2,proiectant;proiectare instalații;topograf;topografie;cadastru;dirigint de șantier;expert tehnic;studiu geotehnic
+7112,3,proiectant;proiectare instalații;topograf;topografie;cadastru;dirigint de șantier;expert tehnic;studiu geotehnic
+7120,2,itp;stație itp;inspecție tehnică periodică;laborator de încercări;metrologie
+7120,3,itp;stație itp;inspecție tehnică periodică;laborator de încercări;metrologie
+7311,2,agenție de marketing;marketing online;marketing digital;social media;seo;reclame;panouri publicitare;promovare online
+7311,3,agenție de marketing;marketing online;marketing digital;social media;seo;reclame;panouri publicitare;promovare online
+7312,2,spațiu publicitar;regie publicitară
+7312,3,spațiu publicitar;regie publicitară
+7320,2,sondaje;sondaj de opinie;cercetare de piață;studii de piață
+7320,3,sondaje;sondaj de opinie;cercetare de piață;studii de piață
+7330,3,agenție de pr;relații publice;consultant pr
+7410,2,designer;design interior;designer de interior;design grafic;grafician;design vestimentar;creator de modă;designer grafic
+7411,3,design vestimentar;designer vestimentar;creator de modă;design de produs
+7412,3,design grafic;designer grafic;grafician;design logo;identitate vizuală;branding
+7413,3,design interior;designer de interior;arhitect de interior
+7420,2,fotograf;studio foto;fotograf de nuntă;fotograf evenimente;ședință foto
+7420,3,fotograf;studio foto;fotograf de nuntă;fotograf evenimente;ședință foto
+7430,2,traducător;traduceri;birou de traduceri;traducător autorizat;interpret
+7430,3,traducător;traduceri;birou de traduceri;traducător autorizat;interpret
+7490,2,agenție de modele;impresar;certificat energetic;auditor energetic
+7499,3,certificat energetic;auditor energetic;agenție de modele;impresar
+7711,2,rent a car;închirieri auto;închiriere mașini;închiriere autoturisme;leasing operațional
+7711,3,rent a car;închirieri auto;închiriere mașini;închiriere autoturisme;leasing operațional
+7712,2,închiriere camioane
+7712,3,închiriere camioane
+7721,2,închiriere biciclete;închiriere schiuri;închiriere echipament de schi;închiriere caiace;închiriere trotinete
+7721,3,închiriere biciclete;închiriere schiuri;închiriere echipament de schi;închiriere caiace;închiriere trotinete
+7722,3,închiriere costume;închiriere rochii;închiriere rochii de mireasă;închiriere mobilier evenimente
+7729,2,închiriere costume;închiriere rochii;închiriere rochii de mireasă;închiriere mobilier evenimente
+7731,2,închiriere utilaje agricole;închiriere tractoare
+7731,3,închiriere utilaje agricole;închiriere tractoare
+7732,2,închiriere utilaje;închiriere utilaje construcții;închiriere schele;închiriere excavator;închiriere cofraje
+7732,3,închiriere utilaje;închiriere utilaje construcții;închiriere schele;închiriere excavator;închiriere cofraje
+7733,2,închiriere copiatoare;închiriere imprimante;închiriere laptopuri
+7733,3,închiriere copiatoare;închiriere imprimante;închiriere laptopuri
+7739,2,închiriere containere;închiriere generatoare;închiriere toalete ecologice;închiriere stivuitoare
+7739,3,închiriere containere;închiriere generatoare;închiriere toalete ecologice;închiriere stivuitoare
+7740,2,franciză;francize
+7740,3,franciză;francize
+7810,2,recrutare;agenție de recrutare;recrutare personal;headhunting;agenție de plasare;muncă în străinătate;locuri de muncă
+7810,3,recrutare;agenție de recrutare;recrutare personal;headhunting;agenție de plasare;muncă în străinătate;locuri de muncă
+7820,2,muncă temporară;agent de muncă temporară;personal temporar;leasing de personal
+7820,3,muncă temporară;agent de muncă temporară;personal temporar;leasing de personal;outsourcing resurse umane;externalizare personal
+7830,2,outsourcing resurse umane;externalizare personal
+7911,2,agenție de turism;agenție de voiaj;bilete de avion;excursii;pachete turistice;vacanțe
+7911,3,agenție de turism;agenție de voiaj;bilete de avion;excursii;pachete turistice;vacanțe
+7912,2,touroperator;operator de turism;circuite turistice;turoperator
+7912,3,touroperator;operator de turism;circuite turistice;turoperator
+7990,2,ghid turistic;ghid montan;rezervări hoteliere;centru de informare turistică
+7990,3,ghid turistic;ghid montan;rezervări hoteliere;centru de informare turistică
+8001,3,pază;firmă de pază;agent de pază;paznic;bodyguard;transport valori;detectiv;detectiv particular
+8009,3,sisteme de alarmă;alarme;monitorizare alarme;dispecerat monitorizare;intervenție rapidă
+8010,2,pază;firmă de pază;agent de pază;paznic;bodyguard;pază și protecție;transport valori
+8020,2,sisteme de alarmă;alarme;monitorizare alarme;dispecerat monitorizare;intervenție rapidă
+8030,2,detectiv;detectiv particular;investigații private
+8110,2,facility management
+8110,3,facility management
+8121,2,firmă de curățenie;curățenie birouri;curățenie apartamente;curățenie după constructor;menaj
+8121,3,firmă de curățenie;curățenie birouri;curățenie apartamente;curățenie după constructor;menaj
+8122,2,curățenie industrială;spălare geamuri;alpinism utilitar;coșar;curățare coșuri de fum;curățare fațade
+8122,3,curățenie industrială;spălare geamuri;alpinism utilitar;coșar;curățare coșuri de fum;curățare fațade
+8123,3,dezinsecție;deratizare;dezinfecție;ddd;deszăpezire;măturat stradal
+8129,2,dezinsecție;deratizare;dezinfecție;ddd;deszăpezire;măturat stradal
+8130,2,grădinar;amenajare grădini;amenajări peisagistice;peisagist;întreținere spații verzi;spații verzi;tuns gazon;toaletare arbori
+8130,3,grădinar;amenajare grădini;amenajări peisagistice;peisagist;întreținere spații verzi;spații verzi;tuns gazon;toaletare arbori
+8210,3,copy center;printare documente;scanare documente;tehnoredactare
+8219,2,copy center;printare documente;scanare documente;tehnoredactare
+8220,2,telemarketing;centru de apel;suport clienți
+8220,3,telemarketing;centru de apel;suport clienți
+8230,2,organizare evenimente;organizator evenimente;organizare conferințe;team building;event planner;organizare nunți
+8230,3,organizare evenimente;organizator evenimente;organizare conferințe;team building;event planner;organizare nunți
+8291,2,recuperare creanțe;recuperare datorii;colectare creanțe
+8291,3,recuperare creanțe;recuperare datorii;colectare creanțe
+8411,2,primărie;consiliu județean;consiliu local;prefectură
+8411,3,primărie;consiliu județean;consiliu local;prefectură
+8421,2,ambasadă;consulat
+8421,3,ambasadă;consulat
+8422,2,armată;unitate militară
+8422,3,armată;unitate militară
+8423,2,instanță;tribunal;judecătorie;curte de apel;parchet
+8423,3,instanță;tribunal;judecătorie;curte de apel;parchet
+8424,2,poliție;jandarmerie;poliția locală
+8424,3,poliție;jandarmerie;poliția locală
+8425,2,pompieri;isu;situații de urgență
+8425,3,pompieri;isu;situații de urgență
+8430,2,casa de pensii;casa de asigurări de sănătate
+8430,3,casa de pensii;casa de asigurări de sănătate
+8510,2,grădiniță;grădinițe;grădiniță privată
+8510,3,grădiniță;grădinițe;grădiniță privată
+8520,2,școală primară;școală generală
+8520,3,școală primară;școală generală
+8531,2,liceu;liceu teoretic;colegiu național;gimnaziu;școală generală
+8531,3,liceu;liceu teoretic;colegiu național;gimnaziu;școală generală
+8532,2,liceu tehnologic;școală profesională;școală de meserii;colegiu tehnic
+8532,3,liceu tehnologic;școală profesională;școală de meserii;colegiu tehnic
+8533,3,școală postliceală;postliceală;școală sanitară postliceală
+8540,3,universitate;facultate;studii universitare
+8541,2,școală postliceală;postliceală;școală sanitară postliceală
+8542,2,universitate;facultate;studii universitare
+8551,2,școală de înot;cursuri de înot;școală de schi;instructor de schi;școală de tenis;arte marțiale;karate
+8551,3,școală de înot;cursuri de înot;școală de schi;instructor de schi;școală de tenis;arte marțiale;karate
+8552,2,școală de limbi străine;cursuri de engleză;școală de muzică;lecții de pian;școală de dans;cursuri de dans;școală de actorie;balet
+8552,3,școală de muzică;lecții de pian;cursuri de chitară;școală de dans;cursuri de dans;școală de actorie;cursuri de pictură;balet
+8553,2,școală de șoferi;școală auto;instructor auto;permis de conducere
+8553,3,școală de șoferi;școală auto;instructor auto;permis de conducere
+8559,2,meditații;after school;cursuri de calificare;formare profesională;cursuri de programare;cursuri autorizate anc
+8559,3,meditații;after school;școală de limbi străine;cursuri de engleză;cursuri de calificare;formare profesională;cursuri de programare;cursuri autorizate anc
+8610,2,spital;spital privat;maternitate;sanatoriu
+8610,3,spital;spital privat;maternitate;sanatoriu
+8622,2,dermatolog;cardiolog;ginecolog;oftalmolog;pediatru;ortoped;neurolog;orl
+8622,3,dermatolog;cardiolog;ginecolog;oftalmolog;pediatru;ortoped;neurolog;orl
+8690,2,ambulanță privată;rmn;moașă;acupunctură;homeopatie;logoped;nutriționist;masaj terapeutic
+8691,3,analize medicale;laborator de analize;rmn;tomografie;radiografie;ecografie
+8692,3,ambulanță privată;transport medical
+8693,3,consiliere psihologică;cabinet de psihologie
+8694,3,moașă;îngrijire medicală la domiciliu
+8695,3,masaj terapeutic;balneofizioterapie
+8696,3,acupunctură;homeopatie;medicină naturistă;fitoterapie;reflexoterapie
+8699,3,logoped;logopedie;nutriționist;dietetician
+8710,2,îngrijire paliativă;centru de îngrijire;hospice
+8710,3,îngrijire paliativă;centru de îngrijire;hospice
+8720,2,dezalcoolizare;tratarea dependențelor;centru de reabilitare
+8720,3,dezalcoolizare;tratarea dependențelor;centru de reabilitare
+8730,2,cămin de bătrâni;azil de bătrâni;casă de bătrâni;cămin pentru vârstnici;centru rezidențial pentru vârstnici
+8730,3,cămin de bătrâni;azil de bătrâni;casă de bătrâni;cămin pentru vârstnici;centru rezidențial pentru vârstnici
+8790,2,centru de plasament;casă de tip familial
+8799,3,centru de plasament;casă de tip familial
+8810,2,îngrijire vârstnici la domiciliu;îngrijitor bătrâni;centru de zi pentru vârstnici
+8810,3,îngrijire vârstnici la domiciliu;îngrijitor bătrâni;centru de zi pentru vârstnici
+8891,2,creșă;after school;bonă;babysitting
+8891,3,creșă;after school;bonă;babysitting
+8899,2,cantină socială;banca de alimente
+8899,3,cantină socială;banca de alimente
+9001,2,trupă;formație;formație nuntă;orchestră;dj;actor;teatru;solist
+9002,2,sonorizare;lumini scenă;scenotehnică;închiriere scenă
+9003,2,pictor;sculptor;artist plastic;scriitor;compozitor
+9004,2,sală de spectacole;sală de concerte;teatru
+9011,3,scriitor;compozitor;textier
+9012,3,pictor;sculptor;artist plastic
+9020,3,trupă;formație;formație nuntă;orchestră;dj;actor;teatru;solist
+9031,3,sală de spectacole;sală de concerte;teatru
+9039,3,sonorizare;lumini scenă;scenotehnică;închiriere scenă
+9103,2,castel;cetate;monument istoric
+9104,2,zoo;grădină botanică;parc național;parc natural
+9122,3,castel;cetate;monument istoric
+9130,3,restaurator de artă;restaurare de artă;restaurare monumente
+9141,3,zoo;grădină botanică
+9142,3,parc național;parc natural
+9200,2,cazino;pariuri sportive;agenție de pariuri;sală de jocuri;păcănele;loto
+9200,3,cazino;pariuri sportive;agenție de pariuri;sală de jocuri;păcănele;loto
+9311,2,sală de sport;teren de fotbal;bazin de înot;piscină;teren de tenis;patinoar;bowling;teren de padel
+9311,3,sală de sport;teren de fotbal;bazin de înot;piscină;teren de tenis;patinoar;bowling;teren de padel
+9312,2,club de fotbal;echipă de fotbal;academie de fotbal;club sportiv
+9312,3,club de fotbal;echipă de fotbal;academie de fotbal;club sportiv
+9313,2,sală de fitness;sală de forță;sală de sport;pilates;aerobic;crossfit;antrenor personal;yoga
+9313,3,sală de fitness;sală de forță;sală de sport;pilates;aerobic;crossfit;antrenor personal;yoga
+9319,2,federație sportivă;organizare competiții sportive
+9319,3,federație sportivă;organizare competiții sportive
+9321,2,parc acvatic;aquapark;carusel
+9321,3,parc acvatic;aquapark;carusel
+9329,2,loc de joacă;loc de joacă pentru copii;escape room;paintball;discotecă;animatori petreceri;petreceri copii
+9329,3,loc de joacă;loc de joacă pentru copii;escape room;paintball;discotecă;animatori petreceri;petreceri copii
+9411,2,patronat;cameră de comerț
+9411,3,patronat;cameră de comerț
+9412,2,ordin profesional;colegiu profesional;barou
+9412,3,ordin profesional;colegiu profesional;barou
+9420,2,sindicat
+9420,3,sindicat
+9491,2,biserică;parohie;mănăstire;schit;eparhie;cult religios
+9491,3,biserică;parohie;mănăstire;schit;eparhie;cult religios
+9492,2,partid politic;partid
+9492,3,partid politic;partid
+9499,2,asociație;fundație;ong
+9499,3,asociație;fundație;ong
+9510,3,reparații calculatoare;reparații laptop;service laptop;service pc;depanare calculatoare;service gsm;service telefoane;reparații telefoane
+9511,2,reparații calculatoare;reparații laptop;service laptop;service pc;depanare calculatoare
+9512,2,service gsm;service telefoane;reparații telefoane
+9521,2,reparații televizoare;service tv;depanare radio-tv;service electronice
+9521,3,reparații televizoare;service tv;depanare radio-tv;service electronice
+9522,2,reparații electrocasnice;service electrocasnice;reparații mașini de spălat;reparații frigidere
+9522,3,reparații electrocasnice;service electrocasnice;reparații mașini de spălat;reparații frigidere
+9523,2,cizmar;cizmărie;reparații încălțăminte
+9523,3,cizmar;cizmărie;reparații încălțăminte
+9524,2,tapițer;tapițerie;retapițare;recondiționare mobilă
+9524,3,tapițer;tapițerie;retapițare;recondiționare mobilă
+9525,2,ceasornicar;reparații ceasuri;reparații bijuterii
+9525,3,ceasornicar;reparații ceasuri;reparații bijuterii
+9529,2,copiere chei;reparații biciclete;service biciclete;retușuri haine;reparații haine;acordor pian
+9529,3,copiere chei;reparații biciclete;service biciclete;retușuri haine;reparații haine;acordor pian
+9531,3,service auto;mecanic auto;vulcanizare;tinichigerie;vopsitorie auto;spălătorie auto;electrician auto;reparații auto
+9532,3,service moto;mecanic moto;reparații motociclete
+9601,2,curățătorie;curățătorie chimică;spălătorie haine;spălătorie rufe;spălătorie covoare;călcătorie
+9602,2,frizerie;frizer;coafor;coafeză;salon de înfrumusețare;manichiură;cosmetică;barbershop
+9603,2,servicii funerare;funerarii;crematoriu;cimitir
+9604,2,spa;saună;salon de masaj;masaj;solar;centru spa
+9609,2,tatuaje;piercing;salon canin;toaletaj canin;frizerie canină;pensiune canină;agenție matrimonială
+9610,3,curățătorie;curățătorie chimică;spălătorie haine;spălătorie rufe;spălătorie covoare;călcătorie
+9621,3,frizerie;frizer;coafor;coafeză;salon de coafură;barbershop
+9622,3,salon de înfrumusețare;manichiură;pedichiură;cosmetică;cosmeticiană;piercing;solar;tatuaje
+9623,3,spa;saună;baie de abur;centru spa;masaj;salon de masaj
+9630,3,servicii funerare;funerarii;crematoriu;cimitir
+9699,3,salon canin;toaletaj canin;frizerie canină;pensiune canină;agenție matrimonială

@@ -326,8 +326,12 @@ nomenclature next to them: `harvey search` (and the search box on the
 Companies tab) finds companies by the code (`8623`, Rev.2 or Rev.3), by the
 activity in Romanian or English with or without accents (`stomatologie`,
 `dental practice`, `dentist`), by name and by town, all at once
-(`harvey search 8623 cristian`). Companies from maps carry no CAEN, but
-their category is searched the same way.
+(`harvey search 8623 cristian`). Official class names are bureaucratic, so
+each class also carries the everyday Romanian words people type
+(`brutărie`, `instalator`, `service auto`, `avocat`, `IT`), kept in
+`harvey/reference/caen_cuvinte.csv`: add a word there and search,
+`harvey caen` and `import-onrc` all understand it. Companies from maps
+carry no CAEN, but their category is searched the same way.
 
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 

@@ -42,6 +42,47 @@ def test_every_synonym_points_at_a_real_class():
     assert missing == []
 
 
+def test_every_everyday_word_points_at_a_current_class():
+    classes = caen._classes()
+    wrong = [(phrase, c) for phrase, cs in caen._everyday().items() for c in cs
+             if c not in classes or c[1] not in caen.CURRENT_VERSIONS]
+    assert wrong == []
+
+
+def test_everyday_words_file_feeds_lookup_and_keywords(monkeypatch):
+    monkeypatch.setattr(caen, "_everyday", lambda: {
+        "brutarie": (("1071", 3), ("1071", 2)), "it": (("6210", 3),)})
+    for cached in (caen._synonyms, caen._short_words, caen._phrases, caen._keywords):
+        cached.cache_clear()
+    try:
+        assert caen.classes_for("Brutărie")[:2] == [("1071", 3), ("1071", 2)]
+        assert caen.classes_for("IT") == [("6210", 3)]
+        assert "brutarie" in caen.keywords("1071", 2)
+        assert "dentist" in caen.keywords("8623", 3)       # SYNONYMS still there
+    finally:
+        for cached in (caen._synonyms, caen._short_words, caen._phrases, caen._keywords):
+            cached.cache_clear()
+
+
+@pytest.mark.parametrize("words, code", [
+    ("brutărie", "1071"), ("pâine", "1071"), ("avocat", "6910"), ("instalator", "4322"),
+    ("service auto", "4520"), ("itp", "7120"), ("contabil", "6920"), ("IT", "6201"),
+    ("frizerie", "9602"), ("rent a car", "7711"), ("agenție imobiliară", "6831"),
+])
+def test_everyday_romanian_words_find_their_class(words, code):
+    assert code in caen.codes_for(words)
+
+
+def test_nurse_words_do_not_capture_medical_care():
+    # Folded, "asistentă" (a nurse) and "asistență" (care) are one word.
+    assert "8694" not in caen.codes_for("asistență medicală")
+
+
+def test_a_short_stem_is_not_a_longer_word():
+    assert caen._same_word("radiologie", "radio") == 0
+    assert caen._same_word("stomatologice", "stomatologica") == 1
+
+
 def test_every_english_name_belongs_to_a_real_class():
     assert [k for k in caen.ENGLISH_NAMES if k not in caen._classes()] == []
 
