@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import stat
@@ -183,17 +184,48 @@ def _check_harvey_pid() -> int | None:
 # ── Setup Status ──
 
 
+# Where a container runtime leaves its mark; module-level so tests can point
+# it somewhere else.
+CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
+
+
+def _python_environment() -> str:
+    """How Harvey's Python dependencies are provided: "venv" (a .venv in the
+    checkout), "docker" (the image carries them), "installed" (pip-installed
+    into the running Python), or "" when none of those holds."""
+    if (PROJECT_ROOT / ".venv").is_dir():
+        return "venv"
+    if any(marker.exists() for marker in CONTAINER_MARKERS):
+        return "docker"
+    try:
+        from importlib.metadata import PackageNotFoundError, distribution
+        try:
+            distribution("harvey")
+            return "installed"
+        except PackageNotFoundError:
+            return ""
+    except Exception:
+        return ""
+
+
 @app.get("/api/setup-status")
 async def get_setup_status():
     """Check what's configured and what still needs setup."""
     checks = []
 
-    # 1. Venv
+    # 1. Python environment: a .venv in the checkout, or none needed at all
+    # (the Docker image, or Harvey installed into the running Python).
+    env_kind = _python_environment()
     checks.append({
-        "id": "venv", "label": "Python virtual environment",
-        "done": (PROJECT_ROOT / ".venv").is_dir(),
+        "id": "venv",
+        "label": {"docker": "Python environment (Docker image)",
+                  "installed": "Python environment (Harvey installed)"}.get(
+                      env_kind, "Python virtual environment"),
+        "done": bool(env_kind),
+        "env": env_kind,      # stable, for the dashboard's own wording
         "required": True,
         "help": "Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e .",
+        "scope": "finding",
     })
 
     # 2. Env file
@@ -204,6 +236,7 @@ async def get_setup_status():
         "done": env_exists,
         "required": True,
         "help": "Go to the Settings tab to enter your API keys.",
+        "scope": "finding",
     })
 
     # 3. Email provider configured (matches channels.email.provider)
@@ -231,9 +264,11 @@ async def get_setup_status():
         provider_help = "Enter your Instantly API key in Settings."
     checks.append({
         "id": "email_provider", "label": f"Email provider configured ({provider})",
+        "provider": provider,
         "done": provider_done,
         "required": True,
         "help": provider_help,
+        "scope": "email",
     })
 
     # 4. Email verification (needed for addresses to be sendable, not 'guess')
@@ -244,6 +279,7 @@ async def get_setup_status():
         "required": True,
         "help": "Add a Reoon (free 600/mo), ZeroBounce, or Hunter key in Settings — "
                 "without one, found emails stay 'guess' and are never sent.",
+        "scope": "finding",
     })
 
     # 5. Config valid
@@ -259,9 +295,11 @@ async def get_setup_status():
             pass
     checks.append({
         "id": "config", "label": f"Harvey configured ({config_path.name})",
+        "file": config_path.name,
         "done": config_valid,
         "required": True,
         "help": "Train Harvey on your product. Use the trainer or set up manually through Claude.",
+        "scope": "email",
     })
 
     # 6. Product trained
@@ -271,6 +309,7 @@ async def get_setup_status():
         "done": product_trained,
         "required": True,
         "help": "Run: harvey train https://yourwebsite.com (or set up through Claude).",
+        "scope": "email",
     })
 
     # 7. LinkedIn (optional)
@@ -281,6 +320,7 @@ async def get_setup_status():
         "done": bool(linkedin_email) and bool(linkedin_pass),
         "required": False,
         "help": "Optional. Enter your LinkedIn credentials in Settings to enable LinkedIn prospecting.",
+        "scope": "finding",
     })
 
     # 8. Cloudflare (optional)
@@ -291,6 +331,7 @@ async def get_setup_status():
         "done": bool(cf_id) and bool(cf_token),
         "required": False,
         "help": "Optional. For JavaScript-rendered website crawling during training.",
+        "scope": "email",
     })
 
     # 9. Warmup service: TrulyInbox connected, or another service the user named
@@ -308,12 +349,14 @@ async def get_setup_status():
         "label": {"connected": "Warmup: TrulyInbox connected",
                   "other": "Warmup: your own warmup service"}.get(choice, "Warm up your mailbox"),
         "done": bool(choice),
+        "choice": choice or "",
         # Instantly warms its own accounts, so there it's a suggestion, not a step.
         "required": provider != "instantly",
         "help": ("A new mailbox needs 2-4 weeks of warmup before cold email, and warmup "
                  "keeps it out of spam after that. We recommend TrulyInbox: connect it and "
                  "Harvey shows whether your mailbox is warmed."),
         "link": ti.AFFILIATE_URL,
+        "scope": "email",
     })
 
     required_checks = [c for c in checks if c["required"]]
@@ -518,15 +561,169 @@ async def test_instantly(request: Request):
 # ── Companies ──
 
 
-@app.get("/api/companies")
-async def get_companies():
-    """All companies with contact counts."""
-    rows = await query_db("""
-        SELECT c.*,
-            (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
-        FROM companies c ORDER BY c.created_at DESC LIMIT 200
-    """)
+COMPANY_PAGE_MAX = 200
+
+
+def _page_args(limit, offset, default: int = 50) -> tuple[int, int]:
+    try:
+        limit = int(limit) if limit not in (None, "") else default
+        offset = int(offset) if offset not in (None, "") else 0
+    except (TypeError, ValueError):
+        limit, offset = default, 0
+    return max(1, min(limit, COMPANY_PAGE_MAX)), max(0, offset)
+
+
+def _load_config_quietly():
+    try:
+        from harvey.config import load_config
+        return load_config(str(_resolve_config_file()))
+    except Exception:
+        return None
+
+
+def _split_person(text: str) -> dict:
+    """A CONTACT_FOUND value ("Ana Pop — administrator") as name and title."""
+    name, sep, title = (text or "").partition(" — ")
+    return {"name": name.strip(), "title": title.strip() if sep else ""}
+
+
+def _blocked_entries(config) -> list[str]:
+    """compliance.do_not_contact, as the exports read it. Unreadable: logged
+    and treated as empty here (the exports themselves refuse to run then)."""
+    from harvey.export import _do_not_contact
+    try:
+        return _do_not_contact(config)
+    except Exception as e:
+        logger.warning("do_not_contact couldn't be read: %s", e)
+        return []
+
+
+async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
+    """Add what the phone/email-first views show: the phones (main one in
+    international format, its type, the others the site published), the
+    email addresses on file (most deliverable first, bounced ones left out),
+    the activities in words, and how many contacts and named people each has.
+    Additive: every key the row already had stays."""
+    from harvey.collectors.phones import phone_region
+    from harvey.export import _EMAIL_STATUS_RANK, _phone_columns
+    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
+
+    ids = [r["id"] for r in rows if r.get("id")]
+    if not ids:
+        return rows
+    # The same suppression as the exports: an address (or a whole domain) on
+    # compliance.do_not_contact is never offered here either.
+    blocked = _blocked_entries(config)
+    marks = _in(ids)
+    site_phones: dict[str, list[str]] = {}
+    for r in await query_db(
+            "SELECT company_id, value_text FROM observations WHERE signal_code = 'PHONE_NUMBER' "
+            f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
+            tuple(ids)):
+        numbers = site_phones.setdefault(r["company_id"], [])
+        if r["value_text"] not in numbers:
+            numbers.append(r["value_text"])
+    people: dict[str, list[dict]] = {}
+    for r in await query_db(
+            "SELECT company_id, value_text FROM observations WHERE signal_code = 'CONTACT_FOUND' "
+            f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
+            tuple(ids)):
+        found = people.setdefault(r["company_id"], [])
+        person = _split_person(r["value_text"])
+        if person["name"] and person not in found:
+            found.append(person)
+    contacts: dict[str, list[dict]] = {}
+    for p in await query_db(
+            "SELECT company_id, first_name, last_name, title, email, email_status, phone, "
+            "score, status FROM prospects "
+            f"WHERE company_id IN ({marks}) ORDER BY score DESC, created_at", tuple(ids)):
+        contacts.setdefault(p["company_id"], []).append(p)
+    activities = {}
+    try:
+        state = _state()
+        await state.init_db()
+        activities = await state.get_company_activities(ids)
+    except Exception as e:
+        logger.warning("company activities failed: %s", e)
+
+    for row in rows:
+        cid = row.get("id")
+        mine = contacts.get(cid, [])
+        if "activities" not in row:
+            row["activities"] = activities.get(cid, [])
+        row["contact_count"] = len(mine)
+        row["people"] = people.get(cid, [])
+        emails, seen = [], set()
+        company_blocked = bool(blocked) and do_not_contact_domain_match(row.get("domain") or "", blocked)
+        for p in sorted(mine, key=lambda p: _EMAIL_STATUS_RANK.get(p.get("email_status") or "", 3)):
+            email = (p.get("email") or "").strip()
+            if (not email or email in seen or p.get("email_status") == "invalid"
+                    or p.get("status") == "opted_out" or company_blocked
+                    or (blocked and do_not_contact_match(email, blocked))):
+                continue
+            seen.add(email)
+            emails.append({"email": email, "status": p.get("email_status") or "",
+                           "name": " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x),
+                           "title": p.get("title") or ""})
+        row["emails"] = emails
+        raw = (row.get("phone") or next((p["phone"] for p in mine if p.get("phone")), "") or "").strip()
+        try:
+            region = phone_region(row.get("location") or "", config, row.get("domain") or "")
+            main, kind, others = _phone_columns(raw, region, site_phones.get(cid, []))
+        except Exception:
+            main, kind, others = raw, "", ""
+        row["phone_display"] = main
+        row["phone_type"] = kind
+        row["other_phones"] = [x for x in others.split("; ") if x]
     return rows
+
+
+_COMPANY_COLUMNS = ("c.id, c.name, c.cui, c.domain, c.website, c.industry, c.company_size, "
+                    "c.location, c.address, c.phone, c.source, c.source_url, c.description, "
+                    "c.external_id, c.created_at, c.updated_at")
+
+
+@app.get("/api/companies")
+async def get_companies(limit: int | None = None, offset: int | None = None):
+    """Companies with contact counts. Without ``limit``/``offset`` it is the
+    original list (newest 200). With either, one page as
+    {total, offset, limit, companies}, each enriched for the phone/email-first
+    table (see _enrich_companies)."""
+    if limit is None and offset is None:
+        return await query_db("""
+            SELECT c.*,
+                (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
+            FROM companies c ORDER BY c.created_at DESC LIMIT 200
+        """)
+    limit, offset = _page_args(limit, offset)
+    total = await _scalar("SELECT COUNT(*) AS n FROM companies")
+    rows = await query_db(
+        f"SELECT {_COMPANY_COLUMNS} FROM companies c "
+        "ORDER BY c.created_at DESC, c.rowid DESC LIMIT ? OFFSET ?", (limit, offset))
+    rows = await _enrich_companies(rows, _load_config_quietly())
+    return {"total": total, "offset": offset, "limit": limit, "companies": rows}
+
+
+_CUI_QUERY = re.compile(r"\s*(?:RO\s*)?(\d{2,10})\s*", re.IGNORECASE)
+
+
+async def _company_search(state, q: str, limit: int, offset: int) -> tuple[int, list[dict]]:
+    """The local search, plus a CUI typed on its own ("10004070", "RO
+    10004070"): when a company has that tax id, it is the answer. A bare
+    four-digit number stays a CAEN code unless written with RO."""
+    m = _CUI_QUERY.fullmatch(q or "")
+    if m and (len(m.group(1)) != 4 or q.strip().upper().startswith("RO")):
+        digits = m.group(1)
+        hits = await query_db(
+            "SELECT id, name, cui, location, address, phone, website, domain, industry, source "
+            "FROM companies WHERE cui != '' AND REPLACE(UPPER(REPLACE(cui, ' ', '')), 'RO', '') = ? "
+            "ORDER BY name", (digits,))
+        if hits:
+            activities = await state.get_company_activities([h["id"] for h in hits])
+            for h in hits:
+                h["activities"] = activities.get(h["id"], [])
+            return len(hits), hits[offset:offset + limit]
+    return await state.search_companies(q, limit=limit, offset=offset)
 
 
 @app.get("/api/companies/search")
@@ -543,20 +740,13 @@ async def search_companies(q: str = "", limit: int = 50, offset: int = 0):
     try:
         state = _state()
         await state.init_db()
-        total, rows = await state.search_companies(q, limit=limit, offset=offset)
+        total, rows = await _company_search(state, q, limit=limit, offset=offset)
     except Exception as e:
         logger.warning("company search failed: %s", e)
         return JSONResponse({**empty, "error": "search failed"}, status_code=500)
-    ids = [r["id"] for r in rows]
-    counts = {}
-    if ids:
-        marks = ",".join("?" * len(ids))
-        counts = {r["company_id"]: r["n"] for r in await query_db(
-            f"SELECT company_id, COUNT(*) AS n FROM prospects "
-            f"WHERE company_id IN ({marks}) GROUP BY company_id", tuple(ids))}
     for r in rows:
         r.pop("score", None)
-        r["contact_count"] = counts.get(r["id"], 0)
+    rows = await _enrich_companies(rows, _load_config_quietly())
     return {"query": q, "total": total, "offset": offset, "limit": limit,
             "companies": rows}
 
@@ -569,6 +759,18 @@ async def get_company_contacts(company_id: str):
         (company_id,),
     )
     return rows
+
+
+@app.get("/api/companies/{company_id}")
+async def get_company(company_id: str):
+    """One company for the detail panel: its record, every phone and email
+    on file, the named people, its activities in words."""
+    rows = await query_db(f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE c.id = ?",
+                          (company_id,))
+    if not rows:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    (row,) = await _enrich_companies(rows, _load_config_quietly())
+    return row
 
 
 # ── Feedback ──
@@ -942,16 +1144,119 @@ async def get_usage():
     }
 
 
-@app.get("/api/prospects")
-async def get_prospects():
-    rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
-    # Someone whose opt-out was undone keeps a way to see what happened.
-    undone = {r["pid"] for r in await query_db(
+# Contacts filter buckets (the Contacts tab's status filter).
+_CONTACT_BUCKETS = {
+    "todo": "p.status IN ('new', 'queued')",
+    "contacted": "p.status = 'contacted'",
+    "replied": "p.status IN ('replied', 'interested', 'meeting')",
+    "closed": ("COALESCE(p.status, '') NOT IN "
+               "('new', 'queued', 'contacted', 'replied', 'interested', 'meeting')"),
+}
+
+
+async def _opt_out_undone_ids() -> set:
+    return {r["pid"] for r in await query_db(
         "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
         "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
+
+
+# Romanian letters folded to plain ones inside SQLite (its lower() only
+# knows ASCII), so "sablon" finds "Șablon" and "brasov" finds "Brașov".
+_FOLD_PAIRS = (("ă", "a"), ("â", "a"), ("î", "i"), ("ș", "s"), ("ş", "s"), ("ț", "t"),
+               ("ţ", "t"), ("Ă", "a"), ("Â", "a"), ("Î", "i"), ("Ș", "s"), ("Ş", "s"),
+               ("Ț", "t"), ("Ţ", "t"))
+_PHONE_PUNCT = (" ", "+", "-", ".", "(", ")", "/")
+
+
+def _sql_fold(expr: str) -> str:
+    for a, b in _FOLD_PAIRS:
+        expr = f"REPLACE({expr}, '{a}', '{b}')"
+    return f"LOWER({expr})"
+
+
+def _sql_digits(expr: str) -> str:
+    for ch in _PHONE_PUNCT:
+        expr = f"REPLACE({expr}, '{ch}', '')"
+    return expr
+
+
+def _fold_text(text: str) -> str:
+    import unicodedata
+    plain = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in plain if not unicodedata.combining(ch)).lower()
+
+
+_CONTACT_TEXT = _sql_fold("(" + " || ' ' || ".join(f"COALESCE({col}, '')" for col in (
+    "p.first_name", "p.last_name", "p.company", "p.email", "p.title", "p.phone",
+    "c.phone", "c.name", "c.location", "c.cui")) + ")")
+_CONTACT_PHONES = _sql_digits("(COALESCE(p.phone, '') || ' ' || COALESCE(c.phone, ''))")
+
+
+def _contact_search(q: str) -> tuple[list[str], list]:
+    """WHERE conditions for the Contacts search: every word must appear in
+    the name, company, email, title, place, CUI or phone, accents ignored.
+    A number also matches a phone however it is written: "0778 000" finds
+    "+40 778 000 …"."""
+    where, params = [], []
+    for word in (q or "")[:200].split()[:8]:
+        folded = _fold_text(word)
+        like = "%" + folded.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        conds, args = [f"{_CONTACT_TEXT} LIKE ? ESCAPE '\\'"], [like]
+        digits = re.sub(r"[\s+\-.()/]", "", word)
+        if digits.isdigit() and len(digits) >= 3:
+            forms = {digits}
+            if digits.startswith("0") and not digits.startswith("00"):
+                forms.add("40" + digits[1:])           # national 07… = international +40 7…
+            elif digits.startswith("0040"):
+                forms.add(digits[2:])
+            for form in sorted(forms):
+                conds.append(f"{_CONTACT_PHONES} LIKE ?")
+                args.append("%" + form + "%")
+        where.append("(" + " OR ".join(conds) + ")")
+        params += args
+    return where, params
+
+
+@app.get("/api/prospects")
+async def get_prospects(limit: int | None = None, offset: int | None = None,
+                        q: str = "", filter: str = "all"):
+    """Contacts. Without ``limit``/``offset``: the original list (newest
+    200). With either: one page as {total, offset, limit, counts,
+    prospects}, searched by ``q`` (see _contact_search) and
+    narrowed by ``filter`` (all, todo, contacted, replied, closed); counts
+    are per filter for the same search. Each row also carries its company's
+    phone, place and CUI."""
+    if limit is None and offset is None:
+        rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
+        # Someone whose opt-out was undone keeps a way to see what happened.
+        undone = await _opt_out_undone_ids()
+        for r in rows:
+            r["opt_out_undone"] = r.get("id") in undone
+        return rows
+
+    limit, offset = _page_args(limit, offset)
+    where, params = _contact_search(q)
+    base = "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id"
+    searched = (" WHERE " + " AND ".join(where)) if where else ""
+    counts = {"all": await _scalar(f"SELECT COUNT(*) AS n {base}{searched}", tuple(params))}
+    for key, cond in _CONTACT_BUCKETS.items():
+        counts[key] = await _scalar(
+            f"SELECT COUNT(*) AS n {base} WHERE {cond}" + (" AND " + " AND ".join(where) if where else ""),
+            tuple(params))
+    bucket = _CONTACT_BUCKETS.get(filter)
+    conds = where + ([bucket] if bucket else [])
+    clause = (" WHERE " + " AND ".join(conds)) if conds else ""
+    rows = await query_db(
+        "SELECT p.*, COALESCE(c.phone, '') AS company_phone, COALESCE(c.location, '') AS "
+        "company_location, COALESCE(c.cui, '') AS company_cui, COALESCE(c.name, '') AS company_name "
+        f"{base}{clause} ORDER BY p.created_at DESC, p.rowid DESC LIMIT ? OFFSET ?",
+        (*params, limit, offset))
+    undone = await _opt_out_undone_ids()
     for r in rows:
         r["opt_out_undone"] = r.get("id") in undone
-    return rows
+    return {"total": counts[filter] if bucket else counts["all"],
+            "offset": offset, "limit": limit, "filter": filter if bucket else "all",
+            "counts": counts, "prospects": rows}
 
 
 def _state():
@@ -1394,6 +1699,14 @@ async def outbox_reject(item_id: str):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+@app.get("/api/sending/status")
+async def sending_status():
+    """The kill switch, the sending mode and what is queued: read only, so
+    the dashboard can show it (and offer the pause) with or without the
+    Email module's tabs."""
+    return await _sending_summary(_load_config_quietly())
+
+
 @app.post("/api/sending/{action}")
 async def sending_toggle(action: str):
     if action not in ("pause", "resume"):
@@ -1412,8 +1725,10 @@ async def sending_toggle(action: str):
 
 
 @app.get("/api/export/prospects.csv")
-async def export_prospects(all: bool = False, min_score: int = 0, email_status: str = ""):
-    """Sequencer-ready CSV download of the prospect list."""
+async def export_prospects(all: bool = False, min_score: int = 0, email_status: str = "",
+                           bom: bool = False):
+    """Sequencer-ready CSV download of the prospect list. ``bom`` prefixes a
+    UTF-8 byte order mark (the dashboard asks for it, for Excel)."""
     from harvey.state import StateManager
     from harvey.export import export_prospects_csv
 
@@ -1428,10 +1743,279 @@ async def export_prospects(all: bool = False, min_score: int = 0, email_status: 
         logger.warning("Prospect export failed: %s", e)
         text = ""
     return PlainTextResponse(
-        text,
+        (CSV_BOM if bom else "") + text,
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="prospects.csv"'},
     )
+
+
+EXPORT_MAX_IDS = 5000
+EXPORT_SEARCH_MAX = 100000
+
+
+async def _export_request(request: Request) -> tuple[list[str] | None, str]:
+    """{"ids": [...]} or {"q": "..."} (or neither: everything) from an
+    export POST. Raises ValueError on a malformed body."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise ValueError("expected a JSON object")
+    ids = body.get("ids")
+    if ids is not None:
+        if (not isinstance(ids, list) or len(ids) > EXPORT_MAX_IDS
+                or any(not isinstance(i, str) or len(i) > 128 for i in ids)):
+            raise ValueError(f"ids must be a list of at most {EXPORT_MAX_IDS} ids")
+        ids = list(dict.fromkeys(ids))
+    q = body.get("q") or ""
+    if not isinstance(q, str):
+        raise ValueError("q must be text")
+    return ids, q[:200]
+
+
+async def _search_all_ids(state, q: str) -> tuple[list[str], int]:
+    """Every company id a search matches, best first, and how many matched
+    in all (more than returned when the export cap cuts it short)."""
+    ids: list[str] = []
+    total, offset = None, 0
+    while total is None or (offset < total and offset < EXPORT_SEARCH_MAX):
+        total, found = await _company_search(state, q, limit=500, offset=offset)
+        if not found:
+            break
+        ids += [r["id"] for r in found]
+        offset += len(found)
+    return ids[:EXPORT_SEARCH_MAX], total or 0
+
+
+async def _export_company_rows(request: Request) -> tuple[list[dict], int]:
+    """(rows, how many matched): the rows to export, and the full count
+    when a search export was cut at EXPORT_SEARCH_MAX."""
+    from harvey.export import collect_companies
+
+    ids, q = await _export_request(request)
+    state = _state()
+    await state.init_db()
+    config = _load_config_quietly()
+    if ids is None and q.strip():
+        # Every match of the search, in the order the search ranks them.
+        ids, matched = await _search_all_ids(state, q)
+        rank = {cid: i for i, cid in enumerate(ids)}
+        rows = await collect_companies(state, config=config, ids=ids)
+        rows = sorted(rows, key=lambda r: rank.get(r["id"], len(rank)))
+    else:
+        rows = await collect_companies(state, config=config, ids=ids)
+        matched = len(rows)
+    activities = await state.get_company_activities([r["id"] for r in rows])
+    for r in rows:
+        acts = activities.get(r["id"], [])
+        seen, listed = set(), []
+        for a in acts:                       # each class once, newest revision first
+            if a["code"] not in seen:
+                seen.add(a["code"])
+                listed.append({"code": a["code"], "name": a.get("name") or a.get("name_en") or ""})
+        r["activity_list"] = listed
+        r["activities"] = "; ".join(f"{a['code']} {a['name']}".strip() for a in listed)
+    return rows, max(matched, len(rows))
+
+
+# The dashboard's company CSV: the CLI's columns, then the registry identity
+# and the activities a Romanian user looks for first.
+def _dashboard_company_columns() -> list[str]:
+    from harvey.export import COMPANY_CSV_COLUMNS
+    return [*COMPANY_CSV_COLUMNS, "cui", "address", "activities"]
+
+
+# Downloads from the dashboard open in a spreadsheet: a UTF-8 byte order
+# mark lets Excel read ș, ț and ă right. The CLI's files are unchanged.
+CSV_BOM = "\ufeff"
+
+
+def _csv_download(text: str, filename: str, extra: dict | None = None) -> PlainTextResponse:
+    return PlainTextResponse(
+        CSV_BOM + text, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', **(extra or {})})
+
+
+def _truncated_header(rows: list[dict], matched: int) -> dict:
+    return {"X-Export-Matched": str(matched), "X-Export-Rows": str(len(rows))}
+
+
+@app.post("/api/export/companies.csv")
+async def export_companies_csv_api(request: Request):
+    """Companies as CSV (the `harvey export --companies` columns plus cui,
+    address and activities): the ids given, every match of a search ``q``,
+    or all of them. Cells go through the export's formula guard."""
+    from harvey.export import to_csv
+    try:
+        rows, matched = await _export_company_rows(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.warning("Company export failed: %s", e)
+        return JSONResponse({"error": "Company export failed"}, status_code=500)
+    return _csv_download(to_csv(rows, _dashboard_company_columns()), "companies.csv",
+                         _truncated_header(rows, matched))
+
+
+@app.post("/api/export/companies.json")
+async def export_companies_json_api(request: Request):
+    """The same companies as JSON, with the id, CUI, address and activities."""
+    from harvey.export import COMPANY_CSV_COLUMNS
+    try:
+        rows, matched = await _export_company_rows(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.warning("Company export failed: %s", e)
+        return JSONResponse({"error": "Company export failed"}, status_code=500)
+    keys = ("id", "cui", *COMPANY_CSV_COLUMNS, "address")
+    return JSONResponse(
+        {"companies": [{**{k: r.get(k, "") for k in keys}, "activities": r.get("activity_list", [])}
+                       for r in rows],
+         "count": len(rows), "matched": matched},
+        headers={"Content-Disposition": 'attachment; filename="companies.json"',
+                 **_truncated_header(rows, matched)})
+
+
+@app.post("/api/export/prospects.csv")
+async def export_selected_prospects(request: Request):
+    """The contacts picked in the dashboard, as the prospect CSV. Opted-out
+    contacts and addresses on compliance.do_not_contact stay out, as in every
+    outreach export; no deliverability filter (they were chosen by hand),
+    but a bounced address is never handed out: that row goes without it."""
+    from harvey.export import CSV_COLUMNS, collect_prospects, to_csv
+    try:
+        ids, _ = await _export_request(request)
+        if ids is None:
+            raise ValueError("ids are required")
+        state = _state()
+        await state.init_db()
+        rows = await collect_prospects(state, email_statuses=[], ids=ids,
+                                       config=_load_config_quietly())
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.warning("Prospect export failed: %s", e)
+        return JSONResponse({"error": "Prospect export failed"}, status_code=500)
+    for r in rows:
+        if r.get("email_status") == "invalid":
+            r["email"] = ""
+    return _csv_download(to_csv(rows, CSV_COLUMNS), "contacts.csv")
+
+
+# ── Dashboard modules and overview ──
+#
+# Modules only change what the dashboard SHOWS. Nothing the heartbeat reads
+# looks at them: sending, approval, autopilot and the kill switch work the
+# same whether the Email module is on or off.
+
+UI_MODULES = {"email": "ui.module.email"}
+
+
+async def _modules() -> dict:
+    state = _state()
+    await state.init_db()
+    return {name: (await state.get_setting(key)) == "on" for name, key in UI_MODULES.items()}
+
+
+@app.get("/api/ui/modules")
+async def get_ui_modules():
+    """Which optional dashboard modules are shown (all off by default)."""
+    try:
+        return {"modules": await _modules()}
+    except Exception as e:
+        logger.warning("modules read failed: %s", e)
+        return {"modules": dict.fromkeys(UI_MODULES, False)}
+
+
+@app.post("/api/ui/modules")
+async def set_ui_modules(request: Request):
+    """{"email": true|false}: show or hide a module's tabs. Visibility only."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if (not isinstance(body, dict) or not body
+            or any(k not in UI_MODULES or not isinstance(v, bool) for k, v in body.items())):
+        return JSONResponse({"success": False,
+                             "message": 'expected {"email": true} or {"email": false}'},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    for name, on in body.items():
+        await state.set_setting(UI_MODULES[name], "on" if on else "")
+    return {"success": True, "modules": await _modules()}
+
+
+@app.get("/api/overview")
+async def get_overview():
+    """The landing page's counts: companies, how many have a phone or an
+    email on file (counted as the Companies table shows them: no bounced,
+    opted-out or do-not-contact address), contacts and named people, plus
+    whether email can go out right now (``sending``), so the page can say so
+    even while the Email module's tabs are hidden."""
+    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
+
+    has_phone = ("(COALESCE(c.phone, '') != '' OR EXISTS (SELECT 1 FROM observations o "
+                 "WHERE o.company_id = c.id AND o.signal_code = 'PHONE_NUMBER' AND o.value_text != '') "
+                 "OR EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id AND p.phone != ''))")
+    phone_ids = {r["id"] for r in await query_db(f"SELECT c.id FROM companies c WHERE {has_phone}")}
+    config = _load_config_quietly()
+    blocked = _blocked_entries(config)
+    email_ids = set()
+    for r in await query_db(
+            "SELECT p.company_id, p.email, COALESCE(c.domain, '') AS domain FROM prospects p "
+            "JOIN companies c ON c.id = p.company_id WHERE p.email != '' "
+            "AND COALESCE(p.email_status, '') != 'invalid' AND p.status IS NOT 'opted_out'"):
+        if r["company_id"] in email_ids:
+            continue
+        if blocked and (do_not_contact_match(r["email"], blocked)
+                        or do_not_contact_domain_match(r["domain"], blocked)):
+            continue
+        email_ids.add(r["company_id"])
+    return {
+        "companies": await _scalar("SELECT COUNT(*) AS n FROM companies"),
+        "with_phone": len(phone_ids),
+        "with_email": len(email_ids),
+        "with_both": len(phone_ids & email_ids),
+        "contacts": await _scalar("SELECT COUNT(*) AS n FROM prospects"),
+        "people": await _scalar(
+            "SELECT COUNT(*) AS n FROM (SELECT DISTINCT company_id, value_text FROM observations "
+            "WHERE signal_code = 'CONTACT_FOUND' AND value_text != '')"),
+        "with_activity": await _scalar(
+            "SELECT COUNT(DISTINCT company_id) AS n FROM company_activities"),
+        "signals_proposed": await _scalar(
+            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'proposed'"),
+        "signals_confirmed": await _scalar(
+            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'confirmed'"),
+        "sending": await _sending_summary(config),
+    }
+
+
+async def _sending_summary(config) -> dict:
+    """What email will do with nobody watching: the kill switch, the mode
+    (autopilot sends without asking), and what is queued. Read only."""
+    paused = ""
+    try:
+        state = _state()
+        await state.init_db()
+        paused = await state.get_setting("sending_paused") or ""
+    except Exception as e:
+        logger.warning("sending state couldn't be read: %s", e)
+    autopilot = None
+    try:
+        if config is not None:
+            autopilot = not config.channels.email.require_approval
+    except Exception:
+        autopilot = None
+    queued = await _scalar("SELECT COUNT(*) AS n FROM outbox WHERE status IN ('approved', 'sending')")
+    waiting = await _scalar("SELECT COUNT(*) AS n FROM outbox WHERE status = 'pending_review'")
+    return {"paused": paused, "autopilot": autopilot, "queued": queued, "waiting": waiting,
+            # Something can go out without anyone pressing a button.
+            "live": not paused and (bool(autopilot) or queued > 0)}
 
 
 @app.get("/api/campaigns")
@@ -1966,7 +2550,7 @@ async def get_live_status():
     reading = any(r["stage"] == "profile" for r in running)
     finding = any(r["stage"] == "discover" for r in running)
 
-    def step(label, done, total, active, detail, info=False):
+    def step(label, done, total, active, detail, info=False, key="", vars=None):
         if active:
             state_ = "running"
         elif info:
@@ -1977,8 +2561,9 @@ async def get_live_status():
             state_ = "partial"
         else:
             state_ = "waiting"
+        # key + vars: stable, so the dashboard can say it in its own language.
         return {"label": label, "done": done, "total": total,
-                "state": state_, "detail": detail}
+                "state": state_, "detail": detail, "key": key, "vars": vars or {}}
 
     profile_eta = next((r["eta_min"] for r in running if r["stage"] == "profile"), None)
     read_detail = f"{profiled} of {with_site} read"
@@ -1989,40 +2574,62 @@ async def get_live_status():
 
     steps = [
         step("Find businesses", companies, 0, finding,
-             f"{companies} businesses found", info=True),
-        step("Read their websites", profiled, with_site, reading, read_detail),
+             f"{companies} businesses found", info=True, key="find",
+             vars={"companies": companies}),
+        step("Read their websites", profiled, with_site, reading, read_detail, key="read",
+             vars={"profiled": profiled, "with_site": with_site, "no_site": no_site,
+                   "eta_min": profile_eta if reading else None}),
         step("Find emails", checked, profiled, finding_emails,
-             f"{checked} of {profiled} checked · {len(with_email)} emails found"),
+             f"{checked} of {profiled} checked · {len(with_email)} emails found",
+             key="emails", vars={"checked": checked, "profiled": profiled,
+                                 "emails": len(with_email)}),
         step("Check emails are real", len(with_email) - unconfirmed, len(with_email), False,
              f"{by_status.get('verified', 0)} verified · {by_status.get('risky', 0)} risky · "
              f"{unconfirmed} not confirmed"
-             + (f" · {by_status['invalid']} bad" if by_status.get("invalid") else "")),
+             + (f" · {by_status['invalid']} bad" if by_status.get("invalid") else ""),
+             key="verify", vars={"verified": by_status.get("verified", 0),
+                                 "risky": by_status.get("risky", 0),
+                                 "unconfirmed": unconfirmed,
+                                 "invalid": by_status.get("invalid", 0)}),
         step("Write first emails", len(drafted), len(deliverable | drafted), False,
-             f"{len(drafted)} written · see Campaigns"),
+             f"{len(drafted)} written · see Campaigns", key="write",
+             vars={"written": len(drafted)}),
         step("Sent", len(sent & drafted), len(drafted), False,
-             f"{len(sent & drafted)} of {len(drafted)} sent"),
+             f"{len(sent & drafted)} of {len(drafted)} sent", key="sent",
+             vars={"sent": len(sent & drafted), "written": len(drafted)}),
         step("Replies", replies, 0, False,
-             f"{replies} replies" if replies else "No replies yet", info=True),
+             f"{replies} replies" if replies else "No replies yet", info=True,
+             key="replies", vars={"replies": replies}),
     ]
 
     next_tab = ""   # where the next step is done, when it's done in the dashboard
+    next_vars: dict = {}
     if reading or finding:
+        next_key = "working"
         next_up = "Wait — Harvey is working. This page updates by itself."
     elif finding_emails:
+        next_key = "finding_emails"
         next_up = "Wait — emails are being found."
     elif stopped:
+        next_key = "stopped"
         next_up, next_tab = "A job stopped before finishing. Run it again.", "discover"
     elif harvey_sends and awaiting_review:
+        next_key, next_vars = "review", {"n": awaiting_review}
         next_up, next_tab = f"Review the {awaiting_review} draft(s) waiting in the Outbox.", "outbox"
     elif by_hand:
+        next_key, next_vars = "by_hand", {"n": len(by_hand)}
         next_up, next_tab = f"Open Campaigns and send the {len(by_hand)} unsent email(s).", "campaigns"
     elif profiled > checked:
+        next_key, next_vars = "find_emails", {"n": profiled - checked}
         next_up, next_tab = f"Find emails for the {profiled - checked} businesses not checked yet.", "controls"
     elif deliverable - drafted:
+        next_key, next_vars = "write", {"n": len(deliverable - drafted)}
         next_up, next_tab = f"Write first emails for {len(deliverable - drafted)} more contact(s).", "controls"
     elif not companies:
+        next_key = "start"
         next_up, next_tab = "Search for businesses to get started.", "discover"
     else:
+        next_key = "more"
         next_up, next_tab = "Search more cities or industries to get more leads.", "discover"
 
     return {
@@ -2030,6 +2637,8 @@ async def get_live_status():
         "running": [dict(r, eta_text=_eta_text(r["eta_min"])) for r in running],
         "stopped": stopped,
         "next": next_up,
+        "next_key": next_key,
+        "next_vars": next_vars,
         "next_tab": next_tab,
         "cost_usd": round(cost, 4),
         "updated_at": now.isoformat() + "Z",

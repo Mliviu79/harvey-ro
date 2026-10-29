@@ -47,12 +47,14 @@ async def collect_prospects(
     statuses: list[str] | None = None,
     include_all: bool = False,
     config=None,
+    ids: list[str] | None = None,
 ) -> list[dict]:
     """Fetch prospects matching the filters as export-ready dicts.
 
     Default view is the *deliverable* list (verified + risky emails).
     Outreach exports exclude opted-out prospects even with explicit filters.
-    ``include_all`` disables every filter for a full dump.
+    ``include_all`` disables every filter for a full dump. ``ids`` keeps
+    only those prospects (on top of the other filters).
     """
     import aiosqlite
 
@@ -75,6 +77,12 @@ async def collect_prospects(
             placeholders = ",".join("?" for _ in statuses)
             where.append(f"status IN ({placeholders})")
             params.extend(statuses)
+
+    if ids is not None:
+        if not ids:
+            return []
+        where.append(f"id IN ({','.join('?' for _ in ids)})")
+        params.extend(ids)
 
     sql = "SELECT * FROM prospects"
     if where:
@@ -125,9 +133,13 @@ async def collect_prospects(
 # and, if picked anyway, is exported without its address.
 _EMAIL_STATUS_RANK = {"verified": 0, "risky": 1, "guess": 2}
 
+_ID_CHUNK = 900
 
-async def collect_companies(state: StateManager, config=None) -> list[dict]:
+
+async def collect_companies(state: StateManager, config=None,
+                            ids: list[str] | None = None) -> list[dict]:
     """One export-ready dict per company, with its best contact if any.
+    ``ids`` keeps only those companies, in the usual order.
 
     Suppression mirrors the prospect export: a company whose domain is on
     compliance.do_not_contact is left out, and an opted-out prospect or an
@@ -135,27 +147,46 @@ async def collect_companies(state: StateManager, config=None) -> list[dict]:
     """
     import aiosqlite
 
+    # With ids, only those rows are read (in chunks, under SQLite's
+    # variable limit): a one-company export doesn't load the whole database.
+    chunks = [None] if ids is None else [
+        ids[i:i + _ID_CHUNK] for i in range(0, len(ids), _ID_CHUNK)]
+    companies: list[dict] = []
+    prospects: list[dict] = []
+    site_phones: dict[str, list[str]] = {}
+    phone_rows: list = []
     async with aiosqlite.connect(state.db_path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM companies ORDER BY name COLLATE NOCASE, created_at"
-        ) as cursor:
-            companies = [dict(r) for r in await cursor.fetchall()]
-        async with db.execute(
-            "SELECT * FROM prospects WHERE company_id != '' AND status IS NOT ?",
-            ("opted_out",),
-        ) as cursor:
-            prospects = [dict(r) for r in await cursor.fetchall()]
-        async with db.execute(
-            "SELECT company_id, value_text FROM observations "
-            "WHERE signal_code = 'PHONE_NUMBER' AND value_text != '' "
-            "ORDER BY observed_at, rowid"
-        ) as cursor:
-            site_phones: dict[str, list[str]] = {}
-            for r in await cursor.fetchall():
-                numbers = site_phones.setdefault(r["company_id"], [])
-                if r["value_text"] not in numbers:
-                    numbers.append(r["value_text"])
+        for chunk in chunks:
+            if chunk is not None and not chunk:
+                continue
+            only, params = "", ()
+            if chunk is not None:
+                only, params = f" IN ({','.join('?' for _ in chunk)})", tuple(chunk)
+            async with db.execute(
+                "SELECT * FROM companies" + (f" WHERE id{only}" if only else "")
+                + " ORDER BY name COLLATE NOCASE, created_at", params,
+            ) as cursor:
+                companies += [dict(r) for r in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT * FROM prospects WHERE company_id != '' AND status IS NOT ?"
+                + (f" AND company_id{only}" if only else ""),
+                ("opted_out", *params),
+            ) as cursor:
+                prospects += [dict(r) for r in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT company_id, value_text FROM observations "
+                "WHERE signal_code = 'PHONE_NUMBER' AND value_text != ''"
+                + (f" AND company_id{only}" if only else "")
+                + " ORDER BY observed_at, rowid", params,
+            ) as cursor:
+                phone_rows += list(await cursor.fetchall())
+    if len(chunks) > 1:
+        companies.sort(key=lambda c: ((c.get("name") or "").casefold(), c.get("created_at") or ""))
+    for r in phone_rows:
+        numbers = site_phones.setdefault(r["company_id"], [])
+        if r["value_text"] not in numbers:
+            numbers.append(r["value_text"])
 
     entries = _do_not_contact(config)
     by_company: dict[str, list[dict]] = {}
@@ -201,6 +232,10 @@ async def collect_companies(state: StateManager, config=None) -> list[dict]:
             "source": c.get("source", ""),
             "phone_type": phone_type,
             "other_phones": other_phones,
+            # Not CSV columns (to_csv leaves them out): for JSON and lookups.
+            "id": c.get("id", ""),
+            "cui": c.get("cui", "") or "",
+            "address": c.get("address", "") or "",
         })
     return out
 

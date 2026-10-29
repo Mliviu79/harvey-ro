@@ -1,8 +1,8 @@
-let currentTab = 'today';
-let companyDrill = false;      // true while viewing a single company's contacts
+let currentTab = 'overview';
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
+let _modules = { email: false };   // dashboard modules (visibility only)
 
 // ── Appearance ──
 //
@@ -11,27 +11,29 @@ let _desk = { items: [], i: 0 };
 // it. Stored per-browser; nothing is sent anywhere.
 
 const THEMES = ['auto', 'light', 'dark'];
+const THEME_ICONS = {auto: 'contrast', light: 'sun', dark: 'moon'};
+
+function currentTheme() {
+  try { const s = localStorage.getItem('harvey-theme'); return THEMES.includes(s) ? s : 'auto'; }
+  catch { return 'auto'; }
+}
 
 function applyTheme(mode) {
   const root = document.documentElement;
   if (mode === 'auto') root.removeAttribute('data-theme');
   else root.setAttribute('data-theme', mode);
   const btn = document.getElementById('theme-btn');
-  if (btn) btn.textContent = mode;
+  if (btn) {
+    btn.innerHTML = icon(THEME_ICONS[mode] || 'contrast') + '<span>' + escHtml(t('theme.' + mode)) + '</span>';
+    btn.title = t('theme.title');
+  }
 }
 
 function cycleTheme() {
-  const now = localStorage.getItem('harvey-theme') || 'auto';
-  const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
+  const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
   try { localStorage.setItem('harvey-theme', next); } catch { /* private mode */ }
   applyTheme(next);
 }
-
-(function initTheme() {
-  let saved = 'auto';
-  try { saved = localStorage.getItem('harvey-theme') || 'auto'; } catch { /* ignore */ }
-  applyTheme(THEMES.includes(saved) ? saved : 'auto');
-})();
 
 // ── Utilities ──
 
@@ -65,72 +67,49 @@ function safeHref(u) {
   return /^https?:\/\//i.test(s) ? escHtml(s) : '';
 }
 
+// tel: and mailto: links from collected data: only the characters a number
+// or an address can hold, so nothing else ever reaches the href.
+function telHref(n) {
+  // The number the text starts with, and nothing after it: a stray
+  // extension ("int. 12"), a second number ("; 0740 …" or " / 0740 …") or
+  // junk must never add digits to the one that gets dialled.
+  const lead = String(n || '').split(/[;,]|\s\/\s/)[0].match(/^\s*\+?[\d\s().\-\/]*/);
+  const digits = (lead ? lead[0] : '').replace(/[^\d+]/g, '');
+  return /^\+?\d{4,16}$/.test(digits) ? 'tel:' + digits : '';
+}
+
+function mailHref(e) {
+  const s = String(e || '').trim();
+  return /^[^\s@<>"'(),;:\\]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(s) ? 'mailto:' + escHtml(s) : '';
+}
+
 // ── One status vocabulary ──
 //
 // Harvey's tables each carry their own words for state: a prospect is `new`,
 // a campaign is `draft`, an email is `pending_review`, a signal is `proposed`.
-// Five of those mean "waiting on you" and the old dashboard styled every one
-// differently. Everything now resolves through this map, so a status reads the
-// same way no matter which table it came out of.
+// Everything resolves through this map (label key in i18n.js, then tone), so
+// a status reads the same way no matter which table it came out of.
 //
 // tone: waiting (needs a human) | active (in flight) | good | bad | idle
 const STATUS = {
-  // prospects
-  new:            ['New', 'active'],
-  contacted:      ['Contacted', 'active'],
-  replied:        ['Replied', 'good'],
-  interested:     ['Interested', 'good'],
-  meeting:        ['Meeting booked', 'note'],
-  not_interested: ['Not interested', 'bad'],
-  bounced:        ['Bounced', 'bad'],
-  write_failed:   ["Couldn't write", 'bad'],
-  queued:         ['Queued', 'active'],
-  opted_out:      ['Opted out', 'bad'],
-  // campaigns
-  draft:          ['Draft', 'waiting'],
-  active:         ['Active', 'good'],
-  completed:      ['Completed', 'idle'],
-  paused:         ['Paused', 'bad'],
-  // conversations
-  open:           ['Open', 'active'],
-  closed:         ['Closed', 'idle'],
-  closed_won:     ['Won', 'good'],
-  closed_lost:    ['Lost', 'bad'],
-  objection:      ['Objection', 'waiting'],
-  question:       ['Question', 'active'],
-  ooo:            ['Out of office', 'idle'],
-  wrong_person:   ['Wrong person', 'waiting'],
-  unsubscribe:    ['Unsubscribed', 'bad'],
-  escalate:       ['Needs a human', 'bad'],
-  needs_human:    ['Needs you', 'waiting'],
-  // outbox
-  pending_review: ['Waiting on you', 'waiting'],
-  approved:       ['Approved', 'good'],
-  sending:        ['Sending now', 'active'],
-  scheduled:      ['Scheduled', 'active'],
-  sent:           ['Sent', 'good'],
-  failed:         ['Failed', 'bad'],
-  rejected:       ['Rejected', 'idle'],
-  cancelled:      ['Cancelled', 'idle'],
-  // signals
-  proposed:       ['Waiting on you', 'waiting'],
-  confirmed:      ['Confirmed', 'good'],
-  // email deliverability
-  verified:       ['Verified', 'good'],
-  risky:          ['Catch-all', 'waiting'],
-  guess:          ['Unverified', 'idle'],
-  invalid:        ['Invalid', 'bad'],
-  // runs
-  running:        ['Running', 'active'],
-  stale:          ['Stale', 'bad'],
-  stalled:        ['Stopped', 'bad'],
+  new: 'active', contacted: 'active', replied: 'good', interested: 'good', meeting: 'note',
+  not_interested: 'bad', bounced: 'bad', write_failed: 'bad', queued: 'active', opted_out: 'bad',
+  draft: 'waiting', active: 'good', completed: 'idle', paused: 'bad',
+  open: 'active', closed: 'idle', closed_won: 'good', closed_lost: 'bad', objection: 'waiting',
+  question: 'active', ooo: 'idle', wrong_person: 'waiting', unsubscribe: 'bad', escalate: 'bad',
+  needs_human: 'waiting',
+  pending_review: 'waiting', approved: 'good', sending: 'active', scheduled: 'active', sent: 'good',
+  failed: 'bad', rejected: 'idle', cancelled: 'idle',
+  proposed: 'waiting', confirmed: 'good',
+  verified: 'good', risky: 'waiting', guess: 'idle', invalid: 'bad',
+  running: 'active', stale: 'bad', stalled: 'bad',
 };
 
 function statusMeta(status) {
   const key = String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  const hit = own(STATUS, key);
-  if (hit) return { label: hit[0], tone: hit[1] };
-  const label = String(status || 'unknown').replace(/_/g, ' ');
+  const tone = own(STATUS, key);
+  if (tone) return { label: t('st.' + key), tone: tone };
+  const label = String(status || t('st.unknown')).replace(/_/g, ' ');
   return { label: label.charAt(0).toUpperCase() + label.slice(1), tone: 'idle' };
 }
 
@@ -142,15 +121,24 @@ function badge(status) {
 function formatDate(d) {
   if (!d) return '';
   try {
-    let t = String(d).trim().replace(' ', 'T');
-    if (/^\d{4}-\d\d-\d\dT/.test(t) && !/[zZ]$|[+-]\d\d:?\d\d$/.test(t)) t += 'Z';  // stored UTC
-    const dt = new Date(t);
+    let s = String(d).trim().replace(' ', 'T');
+    if (/^\d{4}-\d\d-\d\dT/.test(s) && !/[zZ]$|[+-]\d\d:?\d\d$/.test(s)) s += 'Z';  // stored UTC
+    const dt = new Date(s);
     if (isNaN(dt)) return escHtml(d);
-    return dt.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    return dt.toLocaleString(intlLocale(), {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
   } catch { return escHtml(d); }
 }
 
 // ── Small render helpers ──
+
+// t() for a sentence with a count in it (plural forms pick on the number),
+// escaped, with the number in bold.
+function tBold(key, n) {
+  const num = fmtN(n);
+  const text = escHtml(t(key, {n: n}));
+  const at = text.indexOf(num);
+  return at < 0 ? text : text.slice(0, at) + '<b>' + num + '</b>' + text.slice(at + num.length);
+}
 
 // The sprite in index.html holds every icon; this just references one.
 function icon(name, cls) {
@@ -166,26 +154,26 @@ function initials(first, last) {
 
 // Stored times are UTC, often without a zone ("2026-10-21 03:07:57").
 function parseTs(d) {
-  let t = String(d || '').trim().replace(' ', 'T');
-  if (t && !/[zZ]$|[+-]\d\d:?\d\d$/.test(t)) t += 'Z';
-  return new Date(t);
+  let s = String(d || '').trim().replace(' ', 'T');
+  if (s && !/[zZ]$|[+-]\d\d:?\d\d$/.test(s)) s += 'Z';
+  return new Date(s);
 }
 
-// "3m ago", "5h ago", "Yesterday", then a date: recent things read faster.
+// "3 min ago", "5 h ago", "yesterday", then a date: recent things read faster.
 function relTime(d) {
   if (!d) return '';
   const dt = parseTs(d);
   if (isNaN(dt)) return escHtml(d);
   const mins = Math.round((Date.now() - dt) / 60000);
-  if (mins < -1 && mins > -60) return 'in ' + -mins + 'm';
-  if (mins < -1 && mins > -60 * 24) return 'in ' + Math.round(-mins / 60) + 'h';
-  if (mins >= -1 && mins < 1) return 'just now';
-  if (mins >= 1 && mins < 60) return mins + 'm ago';
-  if (mins >= 60 && mins < 60 * 24) return Math.round(mins / 60) + 'h ago';
-  if (mins >= 60 * 24 && mins < 60 * 48) return 'Yesterday';
+  let rtf = null;
+  try { rtf = new Intl.RelativeTimeFormat(intlLocale(), {numeric: 'auto', style: 'short'}); } catch { /* old browser */ }
+  if (Math.abs(mins) < 1) return escHtml(t('time.now'));
+  if (rtf && mins > -60 && mins < 60) return escHtml(rtf.format(-mins, 'minute'));
+  if (rtf && mins > -60 * 24 && mins < 60 * 24) return escHtml(rtf.format(-Math.round(mins / 60), 'hour'));
+  if (rtf && mins >= 60 * 24 && mins < 60 * 48) return escHtml(rtf.format(-1, 'day'));
   const opts = {month: 'short', day: 'numeric'};
   if (dt.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
-  return dt.toLocaleDateString('en-US', opts);
+  return escHtml(dt.toLocaleDateString(intlLocale(), opts));
 }
 
 function dayLabel(d) {
@@ -194,14 +182,14 @@ function dayLabel(d) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const that = new Date(dt); that.setHours(0, 0, 0, 0);
   const diff = Math.round((today - that) / 86400000);
-  if (diff === 0) return 'Today';
-  if (diff === 1) return 'Yesterday';
-  return dt.toLocaleDateString('en-US', {weekday: 'long', month: 'short', day: 'numeric'});
+  if (diff === 0) return t('time.today');
+  if (diff === 1) return t('time.yesterday');
+  return dt.toLocaleDateString(intlLocale(), {weekday: 'long', month: 'short', day: 'numeric'});
 }
 
 function timeOfDay(d) {
   const dt = parseTs(d);
-  return isNaN(dt) ? '' : dt.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'});
+  return isNaN(dt) ? '' : dt.toLocaleTimeString(intlLocale(), {hour: 'numeric', minute: '2-digit'});
 }
 
 // Columns of a tiny bar chart; the last day is "today".
@@ -209,8 +197,8 @@ function sparkBars(values, title) {
   const vals = (values || []).map(v => Number(v) || 0);
   if (!vals.length) return '';
   const max = Math.max(...vals, 1);
-  return '<span class="spark" role="img" aria-label="' + escHtml(title || 'trend') + '">' +
-    vals.map((v, i) => '<i class="' + (v ? 'on' : '') + '" style="height:' +
+  return '<span class="spark" role="img" aria-label="' + escHtml(title || '') + '">' +
+    vals.map(v => '<i class="' + (v ? 'on' : '') + '" style="height:' +
       Math.max(2, Math.round(v / max * 28)) + 'px" title="' + v + '"></i>').join('') + '</span>';
 }
 
@@ -226,52 +214,62 @@ function meterHtml(pct, segments) {
 }
 
 const SOURCE_LABELS = {
-  company_website: 'Team page', known_company_backfill: 'Team page',
-  scraped_mailto: 'Published address', hunter_domain_search: 'Hunter', linkedin_search: 'LinkedIn',
-  job_board: 'Job board', web_search: 'Web search', company_inbox: 'Company inbox',
-  osm: 'OpenStreetMap', dataforseo_listings: 'DataForSEO', dataforseo_serp: 'DataForSEO SERP', dataforseo_maps: 'DataForSEO Maps',
-  serper: 'Serper', tinyfish: 'TinyFish', scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search',
+  company_website: 'src.team_page', known_company_backfill: 'src.team_page',
+  scraped_mailto: 'src.published', hunter_domain_search: 'Hunter', linkedin_search: 'LinkedIn',
+  job_board: 'src.job_board', web_search: 'src.web_search', company_inbox: 'src.company_inbox',
+  osm: 'OpenStreetMap', dataforseo_listings: 'DataForSEO', dataforseo_serp: 'DataForSEO SERP',
+  dataforseo_maps: 'DataForSEO Maps', serper: 'Serper', tinyfish: 'TinyFish',
+  scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search', 'registry:onrc': 'src.onrc', onrc: 'src.onrc',
 };
 function sourceLabel(s) {
   if (!s) return '';
-  return escHtml(Object.prototype.hasOwnProperty.call(SOURCE_LABELS, s) ? SOURCE_LABELS[s]
-    : String(s).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
+  const hit = own(SOURCE_LABELS, s);
+  if (hit) return escHtml(hit.startsWith('src.') ? t(hit) : hit);
+  return escHtml(String(s).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
 }
 
 const AGENT_ICONS = {scout: 'discover', writer: 'pen', sender: 'campaigns', handler: 'message',
                      analyst: 'usage', user: 'contacts', main: 'refresh'};
+function agentName(agent) {
+  const key = 'agent.' + String(agent || '');
+  const label = t(key);
+  return label === key ? String(agent || '') : label;
+}
+
 // One plain sentence per logged action, from the details each agent records.
+// Values from the log are escaped before they go into the sentence.
 function actionText(a) {
   const d = a.details || {};
   const who = escHtml(d.prospect_email || d.prospect || d.to || '');
   const camp = escHtml(d.campaign_name || d.campaign || '');
   const intent = d.intent ? ' · ' + escHtml(String(d.intent).replace(/_/g, ' ')) : '';
-  const n = (v, one, many) => (Number(v) || 0) + ' ' + ((Number(v) || 0) === 1 ? one : many);
+  const n = v => Number(v) || 0;
   switch (a.action_type) {
-    case 'prospect': return 'Found ' + n(d.prospects_found, 'new contact', 'new contacts');
-    case 'write_campaign': return 'Wrote “' + camp + '” for ' + n(d.prospect_count, 'contact', 'contacts');
-    case 'write_failed': return 'Couldn’t write for some contacts' + (camp ? ' in “' + camp + '”' : '');
-    case 'stage_campaign': return 'Queued ' + n(d.staged, 'email', 'emails') + ' from “' + camp + '”' +
+    case 'prospect': return t('act.prospect', {n: n(d.prospects_found)});
+    case 'write_campaign': return t('act.write_campaign', {camp: camp, n: n(d.prospect_count)});
+    case 'write_failed': return t(camp ? 'act.write_failed_in' : 'act.write_failed', {camp: camp});
+    case 'stage_campaign': return t('act.stage_campaign', {n: n(d.staged), camp: camp}) +
       (d.mode ? ' · ' + escHtml(d.mode) : '');
-    case 'send_campaign': return 'Sent “' + camp + '” to Instantly · ' + n(d.leads_added, 'lead', 'leads');
-    case 'email_sent': return d.kind === 'reply' ? 'Sent a reply to ' + who
-      : 'Sent email ' + escHtml(String(d.step || 1)) + ' to ' + who;
-    case 'reply': return 'Answered ' + who + intent;
-    case 'reply_queued': return 'Drafted a reply to ' + who + intent;
-    case 'opt_out': return who + ' opted out' + (d.why ? ' · ' + escHtml(d.why) : '');
-    case 'opt_out_undone': return 'You undid ' + (who || 'a contact') + '’s opt-out';
-    case 'reply_after_opt_out': return who + ' wrote again after opting out · no reply sent';
-    case 'escalation': return 'Flagged ' + who + ' for you' + (d.reason ? ' · ' + escHtml(d.reason) : '');
-    case 'bounce': return 'Email to ' + who + ' bounced';
-    case 'manual_send': return 'You marked a contact as emailed by hand';
-    case 'manual_send_undone': return 'You undid a hand-sent mark';
-    case 'outbox_edited': return 'You edited a draft';
+    case 'send_campaign': return t('act.send_campaign', {camp: camp, n: n(d.leads_added)});
+    case 'email_sent': return d.kind === 'reply' ? t('act.reply_sent', {who: who})
+      : t('act.email_sent', {step: escHtml(String(d.step || 1)), who: who});
+    case 'reply': return t('act.reply', {who: who}) + intent;
+    case 'reply_queued': return t('act.reply_queued', {who: who}) + intent;
+    case 'opt_out': return t('act.opt_out', {who: who}) + (d.why ? ' · ' + escHtml(d.why) : '');
+    case 'opt_out_undone': return t('act.opt_out_undone', {who: who || t('act.a_contact')});
+    case 'reply_after_opt_out': return t('act.reply_after_opt_out', {who: who});
+    case 'escalation': return t('act.escalation', {who: who}) + (d.reason ? ' · ' + escHtml(d.reason) : '');
+    case 'bounce': return t('act.bounce', {who: who});
+    case 'manual_send': return t('act.manual_send');
+    case 'manual_send_undone': return t('act.manual_send_undone');
+    case 'outbox_edited': return t('act.outbox_edited');
+    case 'sending_mode': return t('act.sending_mode', {mode: escHtml(d.mode || '')});
     case 'conversation_status':
-      return d.to === 'closed' ? 'You closed a conversation'
-        : d.from === 'needs_human' ? 'You handed a conversation back to Harvey' : 'You reopened a conversation';
+      return d.to === 'closed' ? t('act.convo_closed')
+        : d.from === 'needs_human' ? t('act.convo_handed_back') : t('act.convo_reopened');
   }
   const text = escHtml(String(a.action_type || '').replace(/_/g, ' '));
-  return a.agent === 'main' ? 'Heartbeat: ' + text : text;
+  return a.agent === 'main' ? t('act.heartbeat', {text: text}) : text;
 }
 
 function emptyState(glyph, title, copy) {
@@ -281,8 +279,7 @@ function emptyState(glyph, title, copy) {
 }
 
 function offlineState() {
-  return emptyState('&#9888;', 'Dashboard can\'t reach the server',
-    'The dashboard process may have stopped. Restart it with <b>harvey dashboard</b> and refresh this page.');
+  return emptyState(icon('alert'), escHtml(t('offline.title')), t('offline.copy'));
 }
 
 async function api(path, opts) {
@@ -316,10 +313,8 @@ async function lockIfRefused(r) {
     try { why = ((await r.json()) || {}).message || ''; } catch { /* ignore */ }
   }
   showLock(r.status === 503
-    ? 'The dashboard server can\'t use its token file, so it is refusing every request. ' + why
-    : authToken()
-      ? 'The saved token was not accepted (the dashboard may have a new one).'
-      : 'This tab doesn\'t have the dashboard token yet.');
+    ? t('lock.server', {why: why})
+    : authToken() ? t('lock.rejected') : t('lock.missing'));
   return true;
 }
 
@@ -332,7 +327,7 @@ function showLock(reason) {
   const dot = document.getElementById('header-dot');
   const text = document.getElementById('header-status-text');
   if (dot) dot.className = 'status-dot offline';
-  if (text) text.textContent = 'Locked';
+  if (text) text.textContent = t('status.locked');
 }
 
 function hideLock() {
@@ -347,23 +342,24 @@ function unlockWithToken(event) {
   const value = (input.value || '').trim();
   input.value = '';
   if (!setAuthToken(value)) {
-    document.getElementById('lock-reason').textContent =
-      'That doesn\'t look like a dashboard token. Copy it again from the link or data/dashboard-token.';
+    document.getElementById('lock-reason').textContent = t('lock.bad_format');
     return;
   }
   hideLock();
-  loadCurrentTab();
-  loadHarveyStatus();
+  init();
 }
 
 // Downloads go through the same authorised fetch and are handed to the
 // browser as a local blob, so no download URL ever carries the token.
-async function downloadCsv(path, filename, btn) {
+async function downloadCsv(path, filename, btn, opts) {
   if (btn) btn.disabled = true;
   try {
-    const r = await authFetch(path);
+    const r = await authFetch(path, opts);
     if (await lockIfRefused(r)) return;
-    if (!r.ok) { showToast('Export failed.', 'error'); return; }
+    if (!r.ok) { showToast(t('export.failed'), 'error'); return; }
+    const matched = Number(r.headers.get('X-Export-Matched') || 0);
+    const rows = Number(r.headers.get('X-Export-Rows') || 0);
+    if (matched > rows) showToast(t('export.truncated', {rows: rows, matched: matched}), 'error');
     const href = URL.createObjectURL(await r.blob());
     const a = document.createElement('a');
     a.href = href;
@@ -373,18 +369,25 @@ async function downloadCsv(path, filename, btn) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(href), 10000);
   } catch {
-    showToast('Export failed — is the dashboard still running?', 'error');
+    showToast(t('export.failed_offline'), 'error');
   } finally {
     if (btn) btn.disabled = false;
   }
 }
 
+function postDownload(path, filename, body) {
+  return downloadCsv(path, filename, null, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
+  });
+}
+
 function showToast(msg, type) {
-  const t = document.createElement('div');
-  t.className = 'toast ' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 2600);
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'success');
+  el.setAttribute('role', 'status');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2800);
 }
 
 function toggleVisibility(inputId) {
@@ -392,36 +395,262 @@ function toggleVisibility(inputId) {
   el.type = el.type === 'password' ? 'text' : 'password';
 }
 
-// ── Tabs ──
+// The Clipboard API needs a secure context; opened by LAN address (Docker on
+// another machine) it isn't there, so fall back to a hidden textarea.
+function copyFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+  document.body.appendChild(ta);
+  const focus = document.activeElement;
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { ok = false; }
+  ta.remove();
+  if (focus && focus.focus) focus.focus();
+  if (!ok) throw new Error('copy refused');
+}
+
+async function copyText(text, btn) {
+  try {
+    const value = String(text || '');
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(value);
+    else copyFallback(value);
+    showToast(t('common.copied', {text: text}), 'success');
+    if (btn) { btn.classList.add('done'); setTimeout(() => btn.classList.remove('done'), 1200); }
+  } catch {
+    showToast(t('common.copy_failed'), 'error');
+  }
+}
+
+// ── Tabs and modules ──
 
 function showTab(id, btn) {
+  if (!document.getElementById(id)) id = 'overview';
+  const section = document.getElementById(id);
+  if (section.dataset.module && !_modules[section.dataset.module]) id = 'overview';
   currentTab = id;
-  if (id === 'companies') companyDrill = false;
-  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-  if (btn) btn.classList.add('active');
+  closeMenus();
+  document.querySelectorAll('.section').forEach(s => s.classList.toggle('active', s.id === id));
+  document.querySelectorAll('nav button').forEach(b => {
+    const on = b.dataset.tab === id;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  try { sessionStorage.setItem('harvey-tab', id); } catch { /* ignore */ }
   loadCurrentTab();
+  window.scrollTo(0, 0);
 }
 
 function loadCurrentTab() {
   switch (currentTab) {
+    case 'overview': loadOverview(); break;
     case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
-    case 'companies': if (!companyDrill) loadCompanies(); break;
+    case 'companies': loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'outbox': loadOutbox(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadSendingModeCard(); break;
-    case 'controls': loadHarveyStatus(); loadLogs(); break;
+    case 'settings': loadSettings(); loadModulesCard(); if (_modules.email) loadSendingModeCard(); break;
+    case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
 
-// ── Today: what needs a human ──
+// Jump to a tab from a link that isn't itself a nav button.
+function goTab(id) {
+  showTab(id, document.querySelector('nav button[data-tab="' + id + '"]'));
+}
+
+function applyModules() {
+  document.querySelectorAll('[data-module]').forEach(el => {
+    if (el.classList.contains('section')) return;      // tabs show through showTab
+    el.hidden = !_modules[el.dataset.module];
+  });
+  const sec = document.getElementById(currentTab);
+  if (sec && sec.dataset.module && !_modules[sec.dataset.module]) showTab('overview');
+}
+
+async function loadModules() {
+  const data = await api('/api/ui/modules');
+  if (data && data.modules) _modules = Object.assign({email: false}, data.modules);
+  applyModules();
+}
+
+function loadModulesCard() {
+  const box = document.getElementById('module-email');
+  const label = document.getElementById('module-email-state');
+  if (box) box.checked = !!_modules.email;
+  if (label) label.textContent = t(_modules.email ? 'mod.on' : 'mod.off');
+}
+
+async function setModule(name, on) {
+  const res = await api('/api/ui/modules', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[name]: !!on}),
+  });
+  if (res && res.success) {
+    _modules = Object.assign({email: false}, res.modules);
+    applyModules();
+    showToast(t(on ? 'mod.email.shown' : 'mod.email.hidden'), 'success');
+    if (currentTab === 'overview') loadOverview();
+    if (_modules.email) loadSendingModeCard();
+  } else {
+    showToast(failMsg(res, t('mod.failed')), 'error');
+  }
+  loadModulesCard();
+}
+
+// ── Language ──
+
+function switchLang(lang) {
+  setLang(lang);
+  document.querySelectorAll('.lang-switch button').forEach(b => {
+    const on = b.dataset.lang === getLang();
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+  applyTheme(currentTheme());
+  if (!_locked) { loadHarveyStatus(); loadCurrentTab(); }
+  if (_drawer.id) renderDrawer();
+  if (currentTab !== 'settings') loadModulesCard();
+}
+
+// ── Overview: the landing page ──
+
+async function loadOverview() {
+  renderOverviewHints();
+  const [ov, runs, setup] = await Promise.all([api('/api/overview'), api('/api/runs'), api('/api/setup-status')]);
+  const statsEl = document.getElementById('overview-stats');
+  if (!ov) { statsEl.innerHTML = offlineState(); return; }
+  navCount('nav-signals', ov.signals_proposed || 0);
+  const nav = document.getElementById('nav-companies');
+  if (nav) { nav.textContent = ov.companies ? fmtN(ov.companies) : ''; nav.className = 'nav-count soft' + (ov.companies ? ' on' : ''); }
+
+  const total = ov.companies || 0;
+  const pct = n => total ? Math.round(100 * n / total) : 0;
+  const tile = (label, value, note, share, ico) =>
+    '<div class="stat">' +
+      '<div class="stat-label">' + icon(ico) + escHtml(label) + '</div>' +
+      '<div class="stat-value' + (value ? '' : ' zero') + '">' + fmtN(value) + '</div>' +
+      (share !== null ? '<div class="share" role="img" aria-label="' + escHtml(note) + '"><span style="width:' + share + '%"></span></div>' : '') +
+      '<div class="stat-note">' + escHtml(note) + '</div>' +
+    '</div>';
+  statsEl.innerHTML = '<div class="stat-strip">' +
+    tile(t('ov.companies'), total, t('ov.companies_note', {n: ov.with_activity || 0}), null, 'companies') +
+    tile(t('ov.with_phone'), ov.with_phone || 0, t('ov.share', {p: pct(ov.with_phone || 0)}), pct(ov.with_phone || 0), 'phone') +
+    tile(t('ov.with_email'), ov.with_email || 0, t('ov.share', {p: pct(ov.with_email || 0)}), pct(ov.with_email || 0), 'mail') +
+    tile(t('ov.contacts'), ov.contacts || 0, t('ov.contacts_note'), null, 'contacts') +
+    tile(t('ov.people'), ov.people || 0, t('ov.people_note'), null, 'layers') +
+  '</div>';
+
+  renderOverviewSending(ov.sending);
+  renderRunsTable(document.getElementById('overview-runs'), runs, 6);
+  renderOverviewSetup(setup, ov);
+}
+
+function renderOverviewHints() {
+  const el = document.getElementById('overview-hints');
+  if (!el) return;
+  const examples = ['stomatologie', '8623', 'instalator Brașov', 'restaurant'];
+  el.innerHTML = '<span class="muted">' + escHtml(t('ov.try')) + '</span>' + examples.map(x =>
+    '<button type="button" class="chip-btn" onclick="overviewSearchFor(' + jsq(x) + ')">' + escHtml(x) + '</button>').join('');
+}
+
+function overviewSearch(event) {
+  event.preventDefault();
+  overviewSearchFor(document.getElementById('overview-q').value);
+}
+
+function overviewSearchFor(q) {
+  _co.q = String(q || '').trim();
+  _co.offset = 0;
+  _co.selected.clear();
+  const box = document.getElementById('company-search');
+  if (box) box.value = _co.q;
+  goTab('companies');
+}
+
+function renderRunsTable(el, runs, max) {
+  if (!el) return;
+  if (!Array.isArray(runs)) { el.innerHTML = '<p class="pad muted">' + escHtml(t('runs.unreadable')) + '</p>'; return; }
+  if (!runs.length) {
+    el.innerHTML = '<p class="pad muted">' + escHtml(t('runs.none')) + '</p>';
+    return;
+  }
+  el.innerHTML = '<table class="nowrap compact"><thead><tr><th>' + escHtml(t('runs.what')) + '</th><th>' +
+    escHtml(t('runs.status')) + '</th><th class="num">' + escHtml(t('runs.records')) + '</th><th class="num">' +
+    escHtml(t('runs.cost')) + '</th><th>' + escHtml(t('runs.when')) + '</th></tr></thead><tbody>' +
+    runs.slice(0, max || 25).map(r =>
+      '<tr><td><span class="cell-main">' + escHtml(runName(r)) + '</span>' +
+        (r.provider ? ' <span class="muted">· ' + sourceLabel(r.provider) + '</span>' : '') + '</td>' +
+      '<td>' + badge(r.status) + '</td>' +
+      '<td class="num mono">' + fmtN(r.records || 0) + '</td>' +
+      '<td class="num mono muted">' + (r.cost_usd ? escHtml(fmtUsd(r.cost_usd, 4)) : escHtml(t('runs.free'))) + '</td>' +
+      '<td class="muted">' + relTime(r.started_at) + '</td></tr>').join('') +
+    '</tbody></table>';
+}
+
+function runName(r) {
+  const key = 'runs.stage.' + String(r.stage || '');
+  const label = t(key);
+  return label === key ? String(r.stage || '') : label;
+}
+
+// Setup checks that matter for finding contacts (scope "finding"), plus
+// whether any signal is confirmed and any company is on file.
+function renderOverviewSetup(setup, ov) {
+  const el = document.getElementById('overview-setup');
+  if (!el) return;
+  const checks = ((setup && setup.checks) || []).filter(c => c.scope === 'finding');
+  const rows = checks.map(c => ({done: c.done, label: checkLabel(c), help: checkHelp(c), optional: !c.required}));
+  rows.push({done: (ov.signals_confirmed || 0) > 0, label: t('ov.check.signals'),
+             help: t('ov.check.signals_help'), tab: 'signals'});
+  rows.push({done: (ov.companies || 0) > 0, label: t('ov.check.companies'),
+             help: t('ov.check.companies_help'), tab: 'discover'});
+  const needed = rows.filter(r => !r.optional);
+  const done = needed.filter(r => r.done).length;
+  el.innerHTML = '<div class="setup-head"><span class="setup-pct">' +
+      escHtml(t('ov.setup_done', {done: done, total: needed.length})) + '</span></div>' +
+    '<div class="bar" style="margin-bottom:6px"><span style="width:' +
+      Math.round(100 * done / Math.max(1, needed.length)) + '%;background:var(--accent)"></span></div>' +
+    rows.map(r =>
+      '<div class="check-item">' +
+        (r.done ? '<span class="check-icon done">' + icon('check') + '</span>' : '<span class="check-icon pending"></span>') +
+        '<div class="check-info"><div class="check-label' + (r.done ? ' done' : '') + '">' + escHtml(r.label) +
+          (r.optional ? '<span class="optional-tag">' + escHtml(t('common.optional')) + '</span>' : '') + '</div>' +
+          (!r.done ? '<div class="check-help">' + escHtml(r.help) +
+            (r.tab ? ' <a href="#" onclick="goTab(' + jsq(r.tab) + ');return false">' + escHtml(t('common.open')) + '</a>' : '') +
+          '</div>' : '') +
+        '</div></div>').join('');
+}
+
+// Setup-check wording, by the check's stable id (the server's English is
+// the fallback for an id this dashboard doesn't know).
+function checkLabel(c) {
+  if (c.id === 'venv') return t('check.venv.' + (['docker', 'installed'].includes(c.env) ? c.env : 'venv'));
+  if (c.id === 'email_provider') return t('check.email_provider', {provider: c.provider || ''});
+  if (c.id === 'config') return t('check.config', {file: c.file || 'harvey.yaml'});
+  if (c.id === 'warmup_service') return t('check.warmup.' + (c.choice || 'none'));
+  const key = 'check.' + c.id;
+  const label = t(key);
+  return label === key ? (c.label || c.id) : label;
+}
+
+function checkHelp(c) {
+  const key = c.id === 'email_provider' ? 'check.help.email_provider.' + (c.provider || 'instantly')
+    : 'check.help.' + c.id;
+  const help = t(key);
+  return help === key ? (c.help || '') : help;
+}
+
+// ── Today: what needs a human (Email module) ──
+
+let _setup = null;
 
 async function loadToday() {
   const data = await api('/api/today');
@@ -429,8 +658,8 @@ async function loadToday() {
   if (!data) { el.innerHTML = offlineState(); return; }
   if (data.error) {
     // A failed check must never read as "Nothing needs you".
-    el.innerHTML = emptyState(icon('alert'), 'Couldn\'t check what needs you',
-      'The dashboard hit an error reading Harvey\'s data: ' + escHtml(data.error));
+    el.innerHTML = emptyState(icon('alert'), escHtml(t('today.error_title')),
+      escHtml(t('today.error_copy')) + ' ' + escHtml(data.error));
     return;
   }
 
@@ -445,9 +674,8 @@ async function loadToday() {
   if (!items.length) {
     el.innerHTML = '<div class="queue-clear">' +
       '<div class="queue-icon">' + icon('check') + '</div><div>' +
-      '<div class="qtitle">Nothing needs you</div>' +
-      '<div class="qdetail">Harvey has everything it needs. Anything that requires a ' +
-      'decision — an email to approve, a signal to confirm — shows up here.</div>' +
+      '<div class="qtitle">' + escHtml(t('today.clear_title')) + '</div>' +
+      '<div class="qdetail">' + escHtml(t('today.clear_copy')) + '</div>' +
       '</div></div>';
     return;
   }
@@ -455,19 +683,68 @@ async function loadToday() {
   const glyph = {bad: 'alert', warn: 'flag', good: 'check'};
   el.innerHTML = '<div class="queue">' + items.map(it => {
     const tone = escHtml(it.tone || 'warn');
+    const words = todayItemText(it, _todayStats);
     return '<div class="queue-item ' + tone + '">' +
       '<div class="queue-icon">' + icon(glyph[it.tone] || 'flag') + '</div>' +
       '<div class="qtext">' +
-        '<div class="qtitle">' + escHtml(it.title) + '</div>' +
-        '<div class="qdetail">' + escHtml(it.detail) + '</div>' +
+        '<div class="qtitle">' + escHtml(words.title) + '</div>' +
+        '<div class="qdetail">' + escHtml(words.detail) + '</div>' +
       '</div>' +
       '<button class="btn btn-secondary btn-sm" onclick="goTab(' + jsq(it.tab) + ')">' +
-        escHtml(it.action) + icon('arrow') + '</button>' +
+        escHtml(words.action) + icon('arrow') + '</button>' +
     '</div>';
   }).join('') + '</div>';
 }
 
+// A Today item in the dashboard's language, by its stable key. Items whose
+// wording the server builds from live detail (a pause reason, a hold) keep
+// the server's text.
+function todayItemText(it, stats) {
+  const s = stats || {};
+  const same = {title: it.title, detail: it.detail, action: it.action};
+  const tr = (title, detail, action) => ({title: title, detail: detail, action: action});
+  switch (it.key) {
+    case 'paused': return tr(t('today.item.paused'), t('today.item.paused_detail', {why: String(it.detail || '').split('. Nothing will go out')[0]}), t('today.item.paused_action'));
+    case 'setup': {
+      const missing = ((_setup && _setup.checks) || []).filter(c => c.required && !c.done).slice(0, 3).map(checkLabel);
+      return tr(t('today.item.setup'), missing.length ? missing.join(', ') : t('today.item.setup_detail'), t('today.item.setup_action'));
+    }
+    case 'signals': return tr(t('today.item.signals', {n: s.signals_proposed || 0}), t('today.item.signals_detail'), t('today.item.signals_action'));
+    case 'signals-none': return tr(t('today.item.signals_none'), t('today.item.signals_none_detail'), t('today.item.signals_action'));
+    case 'discover': return tr(t('today.item.discover'), t('today.item.discover_detail'), t('today.item.discover_action'));
+    case 'profile': return tr(t('today.item.profile', {n: s.unprofiled || 0}), t('today.item.profile_detail'), t('today.item.profile_action'));
+    case 'needs-human': return tr(t('today.item.needs_human', {n: s.needs_human || 0}), t('today.item.needs_human_detail'), t('today.item.needs_human_action'));
+    case 'outbox': return tr(t('today.item.outbox', {n: s.outbox_pending || 0}),
+      /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
+    case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
+  }
+  if (/Open the log/.test(it.action || '')) same.action = t('today.item.open_log');
+  return same;
+}
+
 // ── Live status: the "what's happening?" answer, kept on screen ──
+
+function liveStepText(s) {
+  const v = s.vars || {};
+  switch (s.key) {
+    case 'find': return [t('live.find'), t('live.find_d', {n: v.companies || 0})];
+    case 'read': return [t('live.read'), t('live.read_d', {done: v.profiled || 0, total: v.with_site || 0}) +
+      (v.eta_min !== null && v.eta_min !== undefined ? ' · ' + etaText(v.eta_min) : '') +
+      (v.no_site ? ' · ' + t('live.read_nosite', {n: v.no_site}) : '')];
+    case 'emails': return [t('live.emails'), t('live.emails_d', {done: v.checked || 0, total: v.profiled || 0, n: v.emails || 0})];
+    case 'verify': return [t('live.verify'), t('live.verify_d', {v: v.verified || 0, r: v.risky || 0, u: v.unconfirmed || 0}) +
+      (v.invalid ? ' · ' + t('live.verify_bad', {n: v.invalid}) : '')];
+    case 'write': return [t('live.write'), t('live.write_d', {n: v.written || 0})];
+    case 'sent': return [t('live.sent'), t('live.sent_d', {done: v.sent || 0, total: v.written || 0})];
+    case 'replies': return [t('live.replies'), v.replies ? t('live.replies_d', {n: v.replies}) : t('live.replies_none')];
+  }
+  return [s.label, s.detail];
+}
+
+function etaText(min) {
+  if (min === null || min === undefined) return '';
+  return min < 1 ? t('live.eta_soon') : t('live.eta', {n: Math.round(min)});
+}
 
 async function loadLiveStatus() {
   const el = document.getElementById('live-status');
@@ -476,9 +753,8 @@ async function loadLiveStatus() {
   if (!d || !Array.isArray(d.steps)) {
     // Keep the last good numbers on screen, but never let them pass for live.
     const flag = el.querySelector('.live-flag');
-    if (flag) flag.textContent = "Can't reach Harvey right now — numbers below may be old.";
-    else el.innerHTML = '<p class="muted live-flag">Can\'t reach Harvey right now. ' +
-      'Is the dashboard window still open?</p>';
+    if (flag) flag.textContent = t('live.stale');
+    else el.innerHTML = '<p class="muted live-flag">' + escHtml(t('live.offline')) + '</p>';
     return;
   }
   const glyph = {done: icon('check'), running: '<span class="pulse"></span>', partial: '', waiting: ''};
@@ -489,70 +765,73 @@ async function loadLiveStatus() {
     const bar = s.total
       ? '<div class="bar"><span style="width:' + pct + '%;background:' + fill[st] + '"></span></div>'
       : '';
+    const [label, detail] = liveStepText(s);
     return '<div class="step">' +
       '<span class="step-icon ' + st + '">' + glyph[st] + '</span>' +
-      '<span class="step-label">' + escHtml(s.label) + '</span>' +
-      '<span class="step-detail">' + escHtml(s.detail) + '</span>' + bar +
+      '<span class="step-label">' + escHtml(label) + '</span>' +
+      '<span class="step-detail">' + escHtml(detail) + '</span>' + bar +
     '</div>';
   }).join('');
-  const jobName = r => r.stage === 'profile' ? 'Reading websites'
-    : r.stage === 'discover' ? 'Searching for businesses (' + (r.provider || '') + ')'
-    : String(r.stage || 'Job');
+  const jobName = r => r.stage === 'profile' ? t('live.job_profile')
+    : r.stage === 'discover' ? t('live.job_discover', {provider: r.provider || ''})
+    : String(r.stage || t('live.job'));
   const running = d.running || [];
   const runningHtml = running.length
     ? running.map(r => '<span class="live-now"><span class="pulse"></span>' + escHtml(jobName(r)) +
-        ' · ' + r.elapsed_min + ' min' + (r.eta_text ? ' · ' + escHtml(r.eta_text) : '') + '</span>').join('')
-    : '<span class="live-now">Nothing running right now</span>';
+        ' · ' + escHtml(t('live.minutes', {n: r.elapsed_min})) + (r.eta_min !== null && r.eta_min !== undefined ? ' · ' + escHtml(etaText(r.eta_min)) : '') + '</span>').join('')
+    : '<span class="live-now">' + escHtml(t('live.nothing')) + '</span>';
   const stoppedHtml = (d.stopped || []).length
     ? '<div class="banner bad" style="margin:8px 0 0">' + icon('alert') + '<p style="color:inherit">' +
-      (d.stopped || []).map(r => escHtml(jobName(r))).join(', ') + ' stopped before finishing.</p></div>'
+      escHtml(t('live.stopped', {jobs: (d.stopped || []).map(jobName).join(', ')})) + '</p></div>'
     : '';
+  const nextKey = d.next_key ? 'live.next.' + d.next_key : '';
+  const next = nextKey && t(nextKey, d.next_vars || {}) !== nextKey ? t(nextKey, d.next_vars || {}) : d.next;
   el.innerHTML =
     '<div class="live-head">' + runningHtml +
-      '<span class="setup-pct">Cost so far $' + Number(d.cost_usd || 0).toFixed(2) + '</span></div>' +
+      '<span class="setup-pct">' + escHtml(t('live.cost', {cost: fmtUsd(d.cost_usd || 0, 2)})) + '</span></div>' +
     stoppedHtml +
     '<div class="steps">' + rows + '</div>' +
-    (d.next ? '<div class="live-next">' + icon('arrow') + '<span><b>Next</b> · ' + escHtml(d.next) + '</span>' +
-      (d.next_tab ? '<button class="btn btn-secondary btn-sm" onclick="goTab(' + jsq(d.next_tab) + ')">Go</button>' : '') +
+    (next ? '<div class="live-next">' + icon('arrow') + '<span><b>' + escHtml(t('live.next')) + '</b> · ' + escHtml(next) + '</span>' +
+      (d.next_tab ? '<button class="btn btn-secondary btn-sm" onclick="goTab(' + jsq(d.next_tab) + ')">' + escHtml(t('common.go')) + '</button>' : '') +
       '</div>' : '') +
-    '<div class="live-flag">Updated ' + new Date().toLocaleTimeString() + ' · refreshes every 10 seconds</div>';
+    '<div class="live-flag">' + escHtml(t('live.updated', {time: new Date().toLocaleTimeString(intlLocale())})) + '</div>';
 }
 
 // KPI cards. Totals come from /api/today; the 14-day bars from /api/trend.
 function renderFigures(stats) {
   const el = document.getElementById('today-kpis');
   if (!el) return;
-  const t = _trend || {};
+  const tr = _trend || {};
   const sum = a => (a || []).reduce((x, y) => x + (Number(y) || 0), 0);
   const last7 = a => sum((a || []).slice(-7));
   const card = (label, value, spark, note) =>
-    '<div class="kpi"><div class="kpi-label">' + label + '</div>' +
+    '<div class="kpi"><div class="kpi-label">' + escHtml(label) + '</div>' +
     '<div class="kpi-main"><span class="kpi-value' + (value ? '' : ' zero') + '">' + value + '</span>' + spark + '</div>' +
     '<span class="kpi-note">' + note + '</span></div>';
 
   // Instantly sends from its own servers, so the Outbox never sees them.
   const sent = stats.email_provider === 'instantly'
-    ? card('Emails sent', '&mdash;', '', 'Instantly tracks sends')
-    : card('Emails sent', sum(t.sent), sparkBars(t.sent, 'Emails sent per day, last 14 days'),
-           'last 14 days · <b>' + (stats.outbox_approved || 0) + '</b> scheduled');
+    ? card(t('kpi.sent'), '&mdash;', '', escHtml(t('kpi.sent_instantly')))
+    : card(t('kpi.sent'), fmtN(sum(tr.sent)), sparkBars(tr.sent, t('kpi.sent_spark')),
+           tBold('kpi.sent_note', stats.outbox_approved || 0));
   const waiting = (stats.outbox_pending || 0) + (stats.needs_human || 0);
   const waitNote = [
-    stats.outbox_pending ? stats.outbox_pending + ' to approve' : '',
-    stats.needs_human ? stats.needs_human + ' handed to you' : '',
-  ].filter(Boolean).join(' · ') || 'nothing to approve';
+    stats.outbox_pending ? t('kpi.to_approve', {n: stats.outbox_pending}) : '',
+    stats.needs_human ? t('kpi.handed', {n: stats.needs_human}) : '',
+  ].filter(Boolean).join(' · ') || t('kpi.nothing_to_approve');
   const facts = document.getElementById('today-facts');
   if (facts) facts.innerHTML =
-    '<span><b>' + (stats.companies || 0) + '</b> companies</span>' +
-    '<span><b>' + (stats.unprofiled || 0) + '</b> sites not read yet</span>' +
-    '<span><b>' + (stats.signals_confirmed || 0) + '</b> signals on</span>';
+    '<span>' + tBold('kpi.fact_companies', stats.companies || 0) + '</span>' +
+    '<span>' + tBold('kpi.fact_unread', stats.unprofiled || 0) + '</span>' +
+    '<span>' + tBold('kpi.fact_signals', stats.signals_confirmed || 0) + '</span>';
 
   el.innerHTML = '<div class="kpis">' +
-    card('Contacts found', stats.prospects || 0, sparkBars(t.found, 'Contacts found per day, last 14 days'),
-         '<b>+' + last7(t.found) + '</b> this week') +
+    card(t('kpi.found'), fmtN(stats.prospects || 0), sparkBars(tr.found, t('kpi.found_spark')),
+         tBold('kpi.this_week', last7(tr.found))) +
     sent +
-    card('Conversations', stats.open_conversations || 0, sparkBars(t.replies, 'New replies per day, last 14 days'),
-         '<b>' + sum(t.replies) + '</b> new in 14 days') +
-    card('Waiting on you', waiting, '', waitNote) +
+    card(t('kpi.conversations'), fmtN(stats.open_conversations || 0), sparkBars(tr.replies, t('kpi.replies_spark')),
+         tBold('kpi.new_14', sum(tr.replies))) +
+    card(t('kpi.waiting'), fmtN(waiting), '', escHtml(waitNote)) +
   '</div>';
 }
 
@@ -560,8 +839,8 @@ let _todayStats = {};
 let _trend = null;
 
 async function loadTrend() {
-  const t = await api('/api/trend?days=14&tz=' + -new Date().getTimezoneOffset());
-  if (t && Array.isArray(t.days)) { _trend = t; renderFigures(_todayStats); }
+  const tr = await api('/api/trend?days=14&tz=' + -new Date().getTimezoneOffset());
+  if (tr && Array.isArray(tr.days)) { _trend = tr; renderFigures(_todayStats); }
 }
 
 // Contacts by stage: one bar, one legend, from /api/stats.
@@ -570,29 +849,29 @@ async function loadFunnel() {
   if (!el) return;
   const data = await api('/api/stats');
   if (!data) return;  // offline: keep the last numbers; Today's queue says so
-  if (data.error) { el.innerHTML = '<p class="muted" style="font-size:13px">Couldn\'t read the pipeline.</p>'; return; }
+  if (data.error) { el.innerHTML = '<p class="muted small">' + escHtml(t('today.funnel_error')) + '</p>'; return; }
   const total = (data.prospects || {}).total || 0;
   const pipe = data.pipeline || {};
   const stages = [
-    ['To write', pipe.to_write || 0, 'c-accent-soft'],
-    ['Contacted', pipe.contacted || 0, 'c-accent'],
-    ['Replied', pipe.replied || 0, 'c-active'],
-    ['Interested', pipe.interested || 0, 'c-good'],
-    ['Ready to meet', pipe.ready_to_meet || 0, 'c-note'],
-    ['Closed out', pipe.closed_out || 0, 'c-idle'],
+    [t('stage.to_write'), pipe.to_write || 0, 'c-accent-soft'],
+    [t('stage.contacted'), pipe.contacted || 0, 'c-accent'],
+    [t('stage.replied'), pipe.replied || 0, 'c-active'],
+    [t('stage.interested'), pipe.interested || 0, 'c-good'],
+    [t('stage.ready'), pipe.ready_to_meet || 0, 'c-note'],
+    [t('stage.closed'), pipe.closed_out || 0, 'c-idle'],
   ];
   if (!total) {
-    el.innerHTML = '<p class="muted" style="font-size:13px">No contacts yet. Scout adds them as it finds people.</p>';
+    el.innerHTML = '<p class="muted small">' + escHtml(t('today.funnel_empty')) + '</p>';
     return;
   }
   el.innerHTML =
-    '<div class="funnel-bar" role="img" aria-label="Contacts by stage">' +
+    '<div class="funnel-bar" role="img" aria-label="' + escHtml(t('today.by_stage')) + '">' +
       stages.filter(s => s[1] > 0).map(s =>
-        '<span class="seg ' + s[2] + '" style="flex:' + s[1] + '" title="' + s[0] + ': ' + s[1] + '"></span>').join('') +
+        '<span class="seg ' + s[2] + '" style="flex:' + s[1] + '" title="' + escHtml(s[0]) + ': ' + s[1] + '"></span>').join('') +
     '</div>' +
     '<div class="legend-rows">' + stages.map(s =>
-      '<div class="legend-row"><span class="legend-key"><i class="' + s[2] + '"></i>' + s[0] + '</span>' +
-      '<span class="legend-val">' + s[1] + '</span>' +
+      '<div class="legend-row"><span class="legend-key"><i class="' + s[2] + '"></i>' + escHtml(s[0]) + '</span>' +
+      '<span class="legend-val">' + fmtN(s[1]) + '</span>' +
       '<span class="legend-pct">' + Math.round(100 * s[1] / total) + '%</span></div>'
     ).join('') + '</div>';
 }
@@ -605,8 +884,7 @@ async function loadTodayActivity() {
   // Heartbeats are noise here; the Activity tab keeps them.
   const shown = data.filter(a => a.agent !== 'main').slice(0, 8);
   if (!shown.length) {
-    el.innerHTML = '<p class="muted" style="font-size:13px">' +
-      'Nothing yet. Every action Harvey takes shows up here.</p>';
+    el.innerHTML = '<p class="muted small">' + escHtml(t('today.activity_empty')) + '</p>';
     return;
   }
   el.innerHTML = '<div class="timeline">' + shown.map(a =>
@@ -614,22 +892,15 @@ async function loadTodayActivity() {
       '<span class="tl-time">' + relTime(a.created_at) + '</span>' +
       '<span class="tl-icon">' + icon(own(AGENT_ICONS, a.agent) || 'activity') + '</span>' +
       '<span class="tl-text">' + actionText(a) + '</span>' +
-      '<span class="tl-agent">' + escHtml(a.agent) + '</span>' +
+      '<span class="tl-agent">' + escHtml(agentName(a.agent)) + '</span>' +
     '</div>').join('') + '</div>';
 }
 
 function navCount(id, n) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.textContent = n > 0 ? n : '';
+  el.textContent = n > 0 ? fmtN(n) : '';
   el.className = 'nav-count' + (n > 0 ? ' on' : '');
-}
-
-// Jump to a tab from a link that isn't itself a nav button.
-function goTab(id) {
-  const btns = [...document.querySelectorAll('nav button')];
-  const btn = btns.find(b => (b.getAttribute('onclick') || '').includes("'" + id + "'"));
-  showTab(id, btn);
 }
 
 async function loadRuns() {
@@ -645,20 +916,21 @@ async function loadRuns() {
   if (block) block.style.display = '';
   el.innerHTML = '<div class="runs">' + runs.slice(0, 5).map(r =>
     '<div class="run">' +
-      '<span class="name">' + escHtml(r.stage) + '</span>' + badge(r.status) +
+      '<span class="name">' + escHtml(runName(r)) + '</span>' + badge(r.status) +
       '<span class="when">' + relTime(r.started_at) + '</span>' +
-      '<span class="stats">' + (r.records || 0) + ' records · ' +
-        (r.cost_usd ? '$' + Number(r.cost_usd).toFixed(4) : 'free') + '</span>' +
+      '<span class="stats">' + escHtml(t('runs.records_n', {n: r.records || 0})) + ' · ' +
+        (r.cost_usd ? escHtml(fmtUsd(r.cost_usd, 4)) : escHtml(t('runs.free'))) + '</span>' +
     '</div>').join('') + '</div>';
 }
 
-// ── Setup checklist (lives on Today, and disappears once it's done) ──
+// ── Setup checklist (Today, Email module; disappears once it's done) ──
 
 async function loadSetupStatus() {
   const el = document.getElementById('today-setup');
   if (!el) return;
   const data = await api('/api/setup-status');
   if (!data || !data.checks) { el.innerHTML = ''; return; }
+  _setup = data;
 
   const pct = data.percent || 0;
   // Finished setup disappears completely rather than greeting you forever.
@@ -671,9 +943,9 @@ async function loadSetupStatus() {
       (c.done ? '<span class="check-icon done">' + icon('check') + '</span>'
               : '<span class="check-icon pending"></span>') +
       '<div class="check-info">' +
-        '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
-          (optional ? '<span class="optional-tag">optional</span>' : '') + '</div>' +
-        (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
+        '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(checkLabel(c)) +
+          (optional ? '<span class="optional-tag">' + escHtml(t('common.optional')) + '</span>' : '') + '</div>' +
+        (!c.done ? '<div class="check-help">' + escHtml(checkHelp(c)) + '</div>' : '') +
         (!c.done && c.id === 'warmup_service' ? warmupServiceActions(c) : '') +
       '</div></div>';
 
@@ -683,14 +955,14 @@ async function loadSetupStatus() {
 
   el.innerHTML =
     '<div class="card setup-card">' +
-      '<div class="setup-head"><div><h3>Finish setting up Harvey</h3>' +
-        '<p class="muted">Harvey starts finding prospects and sending once these are done.</p></div>' +
-        '<span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
+      '<div class="setup-head"><div><h3>' + escHtml(t('setup.title')) + '</h3>' +
+        '<p class="muted">' + escHtml(t('setup.lede')) + '</p></div>' +
+        '<span class="setup-pct">' + escHtml(t('setup.done', {done: done, total: required.length})) + '</span></div>' +
       '<div class="bar thick" style="margin-bottom:8px"><span style="width:' + pct + '%;background:var(--accent)"></span></div>' +
       required.map(c => renderCheck(c, false)).join('') +
       (optional.length
-        ? '<details style="margin-top:10px"><summary class="muted" ' +
-          'style="font-size:12px">' + optional.length + ' optional</summary>' +
+        ? '<details style="margin-top:10px"><summary class="muted small">' +
+          escHtml(t('setup.optional_n', {n: optional.length})) + '</summary>' +
           '<div style="margin-top:6px">' +
           optional.map(c => renderCheck(c, true)).join('') + '</div></details>'
         : '') +
@@ -701,12 +973,12 @@ async function loadSetupStatus() {
 function warmupServiceActions(c) {
   return '<div class="btn-group warmup-actions">' +
       '<a class="btn btn-primary btn-sm" href="' + safeHref(c.link) + '" target="_blank" ' +
-        'rel="noopener sponsored">Get TrulyInbox</a>' +
+        'rel="noopener sponsored">' + escHtml(t('warmup.get')) + '</a>' +
       '<input class="form-input" id="trulyinbox-key" type="password" autocomplete="off" ' +
-        'placeholder="Paste your TrulyInbox API key" aria-label="TrulyInbox API key" ' +
+        'placeholder="' + escHtml(t('warmup.key_ph')) + '" aria-label="' + escHtml(t('warmup.key_label')) + '" ' +
         'onkeydown="if (event.key === \'Enter\') connectTrulyInbox()">' +
-      '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">Connect</button>' +
-      '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">I use another service</button>' +
+      '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">' + escHtml(t('warmup.connect')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">' + escHtml(t('warmup.other')) + '</button>' +
     '</div>';
 }
 
@@ -722,10 +994,10 @@ async function connectTrulyInbox() {
   if (go) go.disabled = false;
   if (data && data.success) {
     input.value = '';
-    showToast(data.message || 'TrulyInbox connected', 'success');
+    showToast(data.message || t('warmup.connected'), 'success');
     loadSetupStatus();
   } else {
-    showToast((data && data.message) || 'Could not connect TrulyInbox', 'error');
+    showToast((data && data.message) || t('warmup.failed'), 'error');
   }
 }
 
@@ -736,6 +1008,14 @@ async function useOtherWarmup() {
 
 // ── Signals: Harvey proposes, you confirm ──
 
+// A server-written text in this dashboard's language: the translation is
+// used only while the server's English still matches the English it was
+// made from, so a changed description never shows a stale translation.
+function tServer(key, english) {
+  if (getLang() === 'en' || !english) return english || '';
+  return hasKey('en', key) && t(key, null, 'en') === english ? t(key) : english;
+}
+
 async function loadSignals() {
   const data = await api('/api/signals');
   const sumEl = document.getElementById('signals-summary');
@@ -745,14 +1025,14 @@ async function loadSignals() {
 
   const s = data.summary || {};
   navCount('nav-signals', s.proposed || 0);
-  const parts = [['Confirmed', s.confirmed || 0, 'c-good'], ['Waiting on you', s.proposed || 0, 'c-wait'],
-                 ['Turned off', s.rejected || 0, 'c-idle']];
+  const parts = [[t('sig.confirmed'), s.confirmed || 0, 'c-good'], [t('sig.waiting'), s.proposed || 0, 'c-wait'],
+                 [t('sig.off'), s.rejected || 0, 'c-idle']];
   const all = parts.reduce((x, p) => x + p[1], 0) || 1;
   sumEl.innerHTML = '<div class="card sig-summary"><div class="funnel-bar">' +
     parts.filter(p => p[1]).map(p => '<span class="seg ' + p[2] + '" style="flex:' + p[1] + '"></span>').join('') +
     '</div><div class="funnel-legend">' + parts.map(p =>
-      '<div class="legend-item"><span class="legend-key"><i class="' + p[2] + '"></i>' + p[0] + '</span>' +
-      '<span class="legend-val">' + p[1] + '<small>' + Math.round(100 * p[1] / all) + '%</small></span></div>'
+      '<div class="legend-item"><span class="legend-key"><i class="' + p[2] + '"></i>' + escHtml(p[0]) + '</span>' +
+      '<span class="legend-val">' + fmtN(p[1]) + '<small>' + Math.round(100 * p[1] / all) + '%</small></span></div>'
     ).join('') + '</div></div>';
 
   grpEl.innerHTML = (data.groups || []).map(g => {
@@ -762,14 +1042,15 @@ async function loadSignals() {
     const undecided = g.signals.filter(x => x.status === 'proposed').length;
     return '<div class="sig-group">' +
       '<div class="sig-group-head"><div>' +
-        '<h3>' + escHtml(g.label) + '</h3><p>' + escHtml(g.blurb) + '</p>' +
+        '<h3>' + escHtml(tServer('sig.group.' + g.key + '.label', g.label)) + '</h3><p>' +
+        escHtml(tServer('sig.group.' + g.key + '.blurb', g.blurb)) + '</p>' +
       '</div>' +
       (undecided
-        ? '<div style="display:flex;gap:6px;flex-shrink:0">' +
+        ? '<div class="btn-row">' +
             '<button class="btn btn-primary btn-sm" onclick="setSignals(' + pending +
-              ', \'confirmed\')">Confirm all ' + undecided + '</button>' +
+              ', \'confirmed\')">' + escHtml(t('sig.confirm_all', {n: undecided})) + '</button>' +
             '<button class="btn btn-secondary btn-sm" onclick="setSignals(' + pending +
-              ', \'rejected\')">Skip all ' + undecided + '</button>' +
+              ', \'rejected\')">' + escHtml(t('sig.skip_all', {n: undecided})) + '</button>' +
           '</div>'
         : '') +
       '</div>' +
@@ -780,34 +1061,36 @@ async function loadSignals() {
   renderCohortBuilder();
 }
 
+function sigLabel(sig) {
+  return tServer('sigc.' + sig.code + '.label', sig.label || sig.code);
+}
+
 function sigRow(sig) {
   const free = /free|included/i.test(sig.cost_note || '');
   const costCls = free ? 'free' : (/\$/.test(sig.cost_note || '') ? 'paid' : '');
   const seen = sig.companies
-    ? '<span class="cost-chip">seen on ' + sig.companies +
-      (sig.companies === 1 ? ' company' : ' companies') + ' so far</span>' : '';
+    ? '<span class="cost-chip">' + escHtml(t('sig.seen', {n: sig.companies})) + '</span>' : '';
   const floor = sig.confidence_floor > 0
-    ? '<span class="cost-chip">only recorded above ' +
-      Math.round(sig.confidence_floor * 100) + '% confidence</span>' : '';
+    ? '<span class="cost-chip">' + escHtml(t('sig.floor', {p: Math.round(sig.confidence_floor * 100)})) + '</span>' : '';
 
   const decide = sig.status === 'confirmed'
     ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-        '],\'rejected\')">Turn off</button>'
+        '],\'rejected\')">' + escHtml(t('sig.turn_off')) + '</button>'
     : sig.status === 'rejected'
       ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'confirmed\')">Turn on</button>'
+          '],\'confirmed\')">' + escHtml(t('sig.turn_on')) + '</button>'
       : '<button class="btn btn-primary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'confirmed\')">Confirm</button>' +
+          '],\'confirmed\')">' + escHtml(t('sig.confirm')) + '</button>' +
         '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'rejected\')">Skip</button>';
+          '],\'rejected\')">' + escHtml(t('sig.skip')) + '</button>';
 
   return '<div class="sig-row ' + (sig.status === 'rejected' ? 'rejected' : '') + '">' +
     '<div class="sig-main">' +
-      '<div class="sig-label">' + escHtml(sig.label || sig.code) +
+      '<div class="sig-label">' + escHtml(sigLabel(sig)) +
         '<span class="sig-code">' + escHtml(sig.code) + '</span></div>' +
-      '<div class="sig-desc">' + escHtml(sig.description) + '</div>' +
+      '<div class="sig-desc">' + escHtml(tServer('sigc.' + sig.code + '.desc', sig.description)) + '</div>' +
       '<div class="sig-meta">' +
-        '<span class="cost-chip ' + costCls + '">' + escHtml(sig.cost_note || 'cost unknown') + '</span>' +
+        '<span class="cost-chip ' + costCls + '">' + escHtml(tServer('sigc.' + sig.code + '.cost', sig.cost_note) || t('sig.cost_unknown')) + '</span>' +
         floor + seen + badge(sig.status) +
       '</div>' +
     '</div>' +
@@ -822,14 +1105,10 @@ async function setSignals(codes, status) {
     body: JSON.stringify({codes: codes, status: status}),
   });
   if (data && data.success) {
-    showToast(
-      status === 'confirmed'
-        ? 'Confirmed ' + data.changed + ' signal' + (data.changed === 1 ? '' : 's') +
-          ' — Harvey will collect ' + (data.changed === 1 ? 'it' : 'them') + ' from now on.'
-        : data.changed + ' signal' + (data.changed === 1 ? '' : 's') + ' turned off.',
-      'success');
+    showToast(status === 'confirmed' ? t('sig.toast_confirmed', {n: data.changed})
+                                     : t('sig.toast_off', {n: data.changed}), 'success');
   } else {
-    showToast(failMsg(data, 'Could not update that signal.'), 'error');
+    showToast(failMsg(data, t('sig.toast_failed')), 'error');
   }
   loadSignals();
 }
@@ -845,26 +1124,27 @@ async function loadDiscoverProviders() {
   if (!data || !data.providers) { el.innerHTML = offlineState(); return; }
 
   _provider = _provider || data.selected || data.default;
+  const pv = (p, field) => tServer('prov.' + p.key + '.' + field, p[field]);
   el.innerHTML = '<div class="prov-grid">' + data.providers.map(p => {
     const ready = p.configured
-      ? '<span class="badge t-good">ready</span>'
-      : '<span class="badge t-waiting">needs a key</span>';
-    return '<div class="prov-card ' + (p.key === _provider ? 'selected' : '') +
-      '" onclick="pickProvider(' + jsq(p.key) + ')">' +
-      '<div class="prov-head"><h3>' + escHtml(p.label) + '</h3>' + ready + '</div>' +
-      '<div class="blurb">' + escHtml(p.blurb) + '</div>' +
-      '<div class="row"><span class="k">Cost</span><span class="v">' +
-        escHtml(p.cost_note) + '</span></div>' +
-      '<div class="row"><span class="k">Free</span><span class="v">' +
-        escHtml(p.free_tier) + '</span></div>' +
+      ? '<span class="badge t-good">' + escHtml(t('disc.ready')) + '</span>'
+      : '<span class="badge t-waiting">' + escHtml(t('disc.needs_key')) + '</span>';
+    return '<button type="button" class="prov-card ' + (p.key === _provider ? 'selected' : '') +
+      '" aria-pressed="' + (p.key === _provider) + '" onclick="pickProvider(' + jsq(p.key) + ')">' +
+      '<div class="prov-head"><h3>' + escHtml(pv(p, 'label')) + '</h3>' + ready + '</div>' +
+      '<div class="blurb">' + escHtml(pv(p, 'blurb')) + '</div>' +
+      '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' +
+        escHtml(pv(p, 'cost_note')) + '</span></div>' +
+      '<div class="row"><span class="k">' + escHtml(t('disc.free')) + '</span><span class="v">' +
+        escHtml(pv(p, 'free_tier')) + '</span></div>' +
       (p.needs_key
-        ? '<div class="row"><span class="k">Setup</span><span class="v">' +
-          escHtml(p.env_keys.join(', ')) + ' in .env &middot; ' +
-          '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer">get a key</a>' +
-          '</span></div>'
+        ? '<div class="row"><span class="k">' + escHtml(t('disc.setup')) + '</span><span class="v">' +
+          escHtml(t('disc.env_keys', {keys: p.env_keys.join(', ')})) + ' &middot; ' +
+          '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' +
+          escHtml(t('disc.get_key')) + '</a></span></div>'
         : '') +
-      (p.caveat ? '<div class="caveat">' + escHtml(p.caveat) + '</div>' : '') +
-    '</div>';
+      (p.caveat ? '<div class="caveat">' + escHtml(pv(p, 'caveat')) + '</div>' : '') +
+    '</button>';
   }).join('') + '</div>';
 
   const running = data.running;
@@ -879,8 +1159,8 @@ async function loadDiscoverProviders() {
     // A finished run leaves the button stuck on "Running…" otherwise.
     const btn = document.getElementById('disc-run');
     btn.disabled = true;
-    btn.textContent = 'Estimate first';
-    showToast(data.running_kind === 'profile' ? 'Finished reading websites.' : 'Discovery finished.', 'success');
+    btn.textContent = t('disc.estimate_first');
+    showToast(data.running_kind === 'profile' ? t('disc.profile_done') : t('disc.done'), 'success');
   }
   renderDiscoverResult(data.last_report, running);
 }
@@ -888,7 +1168,7 @@ async function loadDiscoverProviders() {
 function pickProvider(key) {
   _provider = key;
   document.getElementById('disc-run').disabled = true;
-  document.getElementById('disc-run').textContent = 'Estimate first';
+  document.getElementById('disc-run').textContent = t('disc.estimate_first');
   document.getElementById('discover-estimate').innerHTML = '';
   loadDiscoverProviders();
 }
@@ -908,14 +1188,14 @@ function discoverBody() {
 
 async function estimateDiscovery() {
   const el = document.getElementById('discover-estimate');
-  el.innerHTML = '<p class="muted" style="font-size:13px">Pricing it…</p>';
+  el.innerHTML = '<p class="muted small">' + escHtml(t('disc.pricing')) + '</p>';
   const data = await api('/api/discover/estimate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(discoverBody()),
   });
   if (!data || data.error) {
     el.innerHTML = '<div class="test-result error">' +
-      escHtml((data && data.error) || 'Could not estimate.') + '</div>';
+      escHtml((data && data.error) || t('disc.estimate_failed')) + '</div>';
     return;
   }
 
@@ -923,35 +1203,34 @@ async function estimateDiscovery() {
   const over = data.estimated_cost > cap;
   el.innerHTML = '<div class="estimate-box">' +
     '<div class="amount ' + (data.free ? 'free' : 'paid') + '">' +
-      (data.free ? 'Free' : '$' + data.estimated_cost.toFixed(4)) + '</div>' +
-    '<div class="muted" style="font-size:13px;margin-top:2px">' +
-      data.query_count + ' quer' + (data.query_count === 1 ? 'y' : 'ies') +
-      (data.free ? '' : ' &middot; cap is $' + cap.toFixed(2)) + '</div>' +
-    (over ? '<div class="test-result error" style="margin-top:12px">' +
-      'Over your cap. Raise the cap or narrow the search.</div>' : '') +
+      (data.free ? escHtml(t('disc.free_amount')) : escHtml(fmtUsd(data.estimated_cost, 4))) + '</div>' +
+    '<div class="muted small" style="margin-top:2px">' +
+      escHtml(t('disc.queries', {n: data.query_count})) +
+      (data.free ? '' : ' &middot; ' + escHtml(t('disc.cap_is', {cap: fmtUsd(cap, 2)}))) + '</div>' +
+    (over ? '<div class="test-result error" style="margin-top:12px">' + escHtml(t('disc.over_cap')) + '</div>' : '') +
     '<div class="query-list">' +
       data.queries.slice(0, 40).map(escHtml).join('<br>') +
-      (data.queries.length > 40 ? '<br>… and ' + (data.queries.length - 40) + ' more' : '') +
+      (data.queries.length > 40 ? '<br>' + escHtml(t('disc.more_queries', {n: data.queries.length - 40})) : '') +
     '</div></div>';
 
   const btn = document.getElementById('disc-run');
   btn.disabled = over;
-  btn.textContent = over ? 'Over cap'
-    : (data.free ? 'Run — free' : 'Run — spend up to $' + data.estimated_cost.toFixed(2));
+  btn.textContent = over ? t('disc.over')
+    : (data.free ? t('disc.run_free') : t('disc.run_paid', {cost: fmtUsd(data.estimated_cost, 2)}));
 }
 
 async function runDiscovery() {
   const btn = document.getElementById('disc-run');
   btn.disabled = true;
-  btn.textContent = 'Running…';
+  btn.textContent = t('disc.running');
   const data = await api('/api/discover/run', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(discoverBody()),
   });
   if (data && data.success) {
-    showToast('Discovery started — ' + data.queries + ' queries.', 'success');
+    showToast(t('disc.started', {n: data.queries}), 'success');
   } else {
-    showToast((data && data.message) || 'Could not start.', 'error');
+    showToast((data && data.message) || t('disc.start_failed'), 'error');
     btn.disabled = false;
   }
   loadDiscoverProviders();
@@ -959,34 +1238,33 @@ async function runDiscovery() {
 
 async function stopDiscovery() {
   const data = await api('/api/discover/stop', {method: 'POST'});
-  showToast(data && data.success ? 'Stopping after the current query.'
-                                 : failMsg(data, 'Could not stop.'), data && data.success ? 'success' : 'error');
+  showToast(data && data.success ? t('disc.stopping')
+                                 : failMsg(data, t('disc.stop_failed')), data && data.success ? 'success' : 'error');
   loadDiscoverProviders();
 }
 
 // Companies found but not looked at: reading their sites is free and
-// model-free, and it is what makes an email specific.
+// model-free, and it is where phones and people come from.
 function renderProfileCard(pending, running) {
   const el = document.getElementById('discover-profile');
   if (!el) return;
   if (!pending) { el.innerHTML = ''; return; }
-  el.innerHTML = '<div class="subhead">Read websites</div><div class="card"><div class="queue-item good" style="padding:0;border:0;box-shadow:none">' +
-    '<div class="qtext"><div class="qtitle">' + pending + ' compan' + (pending === 1 ? 'y' : 'ies') +
-    ' not looked at yet</div><div class="qdetail">Free, no account needed. Harvey reads each site for ' +
-    'who their agency is, what they are missing, and whether they run ads. Up to 200 per run.</div></div>' +
+  el.innerHTML = '<div class="subhead">' + escHtml(t('disc.read_title')) + '</div><div class="card"><div class="queue-item good bare">' +
+    '<div class="qtext"><div class="qtitle">' + escHtml(t('disc.unread', {n: pending})) +
+    '</div><div class="qdetail">' + escHtml(t('disc.read_detail')) + '</div></div>' +
     '<button class="btn btn-primary btn-sm" onclick="runProfile(this)"' + (running ? ' disabled' : '') + '>' +
-    (running ? 'Busy…' : 'Read their sites') + '</button></div></div>';
+    escHtml(running ? t('disc.busy') : t('disc.read_go')) + '</button></div></div>';
 }
 
 async function runProfile(btn) {
   btn.disabled = true;
-  btn.textContent = 'Starting…';
+  btn.textContent = t('disc.starting');
   const data = await api('/api/profile/run', {method: 'POST'});
   if (data && data.success) {
-    showToast(data.pending ? 'Reading ' + Math.min(data.pending, 200) + ' websites.' : 'Every site is already read.', 'success');
+    showToast(data.pending ? t('disc.reading', {n: Math.min(data.pending, 200)}) : t('disc.all_read'), 'success');
     if (data.pending && !_discoverPoll) _discoverPoll = setInterval(loadDiscoverProviders, 4000);
   } else {
-    showToast(failMsg(data, 'Could not start.'), 'error');
+    showToast(failMsg(data, t('disc.start_failed')), 'error');
   }
   loadDiscoverProviders();
 }
@@ -994,39 +1272,38 @@ async function runProfile(btn) {
 function renderDiscoverResult(report, running) {
   const el = document.getElementById('discover-result');
   if (running) {
-    el.innerHTML = '<div class="card"><h2>Running…</h2>' +
-      '<p class="muted" style="font-size:13px">Harvey is working through the ' +
-      'queries. Results land in Companies, and the run log is on Today.</p></div>';
+    el.innerHTML = '<div class="card"><h2>' + escHtml(t('disc.running')) + '</h2>' +
+      '<p class="muted small">' + escHtml(t('disc.running_detail')) + '</p></div>';
     return;
   }
   if (!report) { el.innerHTML = ''; return; }
 
   const stat = (label, value, tone) =>
-    '<div class="stat-card"><div class="label">' + label + '</div>' +
+    '<div class="stat-card"><div class="label">' + escHtml(label) + '</div>' +
     '<div class="value"' + (tone ? ' style="color:var(--' + tone + ')"' : '') + '>' +
     value + '</div></div>';
 
   if (report.profiled_companies !== undefined && report.new_companies === undefined) {
-    el.innerHTML = '<div class="subhead">Last run</div><div class="stats-grid">' +
-      stat('Websites read', report.profiled_companies || 0, 'accent') +
-      stat('Facts recorded', report.profile_observations || 0) +
-      stat('Cost', 'free') + '</div>' +
-      (report.stopped ? '<div class="test-result error" style="margin-top:14px">Stopped early: ' + escHtml(report.stopped) + '</div>' : '');
+    el.innerHTML = '<div class="subhead">' + escHtml(t('disc.last_run')) + '</div><div class="stats-grid">' +
+      stat(t('disc.sites_read'), fmtN(report.profiled_companies || 0), 'accent') +
+      stat(t('disc.facts'), fmtN(report.profile_observations || 0)) +
+      stat(t('runs.cost'), escHtml(t('runs.free'))) + '</div>' +
+      (report.stopped ? '<div class="test-result error" style="margin-top:14px">' + escHtml(t('disc.stopped_early', {why: report.stopped})) + '</div>' : '');
     return;
   }
-  el.innerHTML = '<div class="subhead">Last run</div>' +
+  el.innerHTML = '<div class="subhead">' + escHtml(t('disc.last_run')) + '</div>' +
     '<div class="stats-grid">' +
-      stat('New companies', report.new_companies || 0, 'accent') +
-      stat('Already known', report.known_companies || 0) +
-      stat('Observations', report.observations || 0) +
-      stat('Filtered as junk', report.junk || 0) +
-      (report.profiled_companies ? stat('Websites read', report.profiled_companies) : '') +
-      stat('Actual cost', report.actual_cost ? '$' + report.actual_cost.toFixed(4) : 'free') +
+      stat(t('disc.new'), fmtN(report.new_companies || 0), 'accent') +
+      stat(t('disc.known'), fmtN(report.known_companies || 0)) +
+      stat(t('disc.observations'), fmtN(report.observations || 0)) +
+      stat(t('disc.junk'), fmtN(report.junk || 0)) +
+      (report.profiled_companies ? stat(t('disc.sites_read'), fmtN(report.profiled_companies)) : '') +
+      stat(t('disc.actual_cost'), report.actual_cost ? escHtml(fmtUsd(report.actual_cost, 4)) : escHtml(t('runs.free'))) +
     '</div>' +
     (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
-      'Stopped early: ' + escHtml(report.stopped) + '</div>' : '') +
+      escHtml(t('disc.stopped_early', {why: report.stopped})) + '</div>' : '') +
     ((report.errors || []).length
-      ? '<div class="card" style="margin-top:14px"><h2>Problems</h2>' +
+      ? '<div class="card" style="margin-top:14px"><h2>' + escHtml(t('disc.problems')) + '</h2>' +
         (report.errors || []).slice(0, 8).map(e =>
           '<div class="check-help">' + escHtml(e) + '</div>').join('') + '</div>'
       : '');
@@ -1048,46 +1325,43 @@ function renderCohortBuilder() {
     .filter(s => s.status === 'confirmed');
 
   if (!confirmed.length) {
-    el.innerHTML = '<p class="muted" style="font-size:13px">' +
-      'Confirm some signals above and they become the building blocks here.</p>';
+    el.innerHTML = '<p class="muted small">' + escHtml(t('cohort.empty')) + '</p>';
     document.getElementById('cohort-result').innerHTML = '';
     return;
   }
 
   const col = (title, key, hint) =>
-    '<div><div class="subhead" style="margin-top:0">' + title +
-      ' <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">' +
-      hint + '</span></div><div class="cohort-grid">' +
+    '<div><div class="subhead" style="margin-top:0">' + escHtml(title) +
+      ' <span class="hint">' + escHtml(hint) + '</span></div><div class="cohort-grid">' +
     confirmed.map(s =>
       '<label class="cohort-pick"><input type="checkbox" ' +
         (_cohort[key].has(s.code) ? 'checked ' : '') +
         'onchange="toggleCohort(\'' + key + '\',' + jsq(s.code) + ',this.checked)">' +
-        '<span>' + escHtml(s.label || s.code) + '</span>' +
-        '<span class="n">' + (s.companies || 0) + '</span></label>'
+        '<span>' + escHtml(sigLabel(s)) + '</span>' +
+        '<span class="n">' + fmtN(s.companies || 0) + '</span></label>'
     ).join('') + '</div></div>';
 
   // Numeric signals (ranks, ratings) take a range: "organic rank 11-30".
   const numeric = confirmed.filter(s => s.value_type === 'num');
   const bound = (code, side) => {
     const v = (_cohort.ranges[code] || {})[side];
-    return '<input type="number" class="cohort-bound" placeholder="' + side + '" ' +
+    return '<input type="number" class="cohort-bound" placeholder="' + escHtml(t('cohort.' + side)) + '" ' +
       'value="' + (v === undefined || v === null ? '' : escHtml(String(v))) + '" ' +
       'aria-label="' + escHtml(code) + ' ' + side + '" ' +
       'onchange="setCohortRange(' + jsq(code) + ',' + jsq(side) + ',this.value)">';
   };
   const rangeCol = numeric.length ?
-    '<div style="height:18px"></div><div><div class="subhead" style="margin-top:0">In range ' +
-      '<span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">' +
-      '&mdash; e.g. organic rank 11 to 30; leave a side blank for no limit</span></div>' +
+    '<div class="spacer"></div><div><div class="subhead" style="margin-top:0">' + escHtml(t('cohort.range')) +
+      ' <span class="hint">' + escHtml(t('cohort.range_hint')) + '</span></div>' +
       '<div class="cohort-grid">' +
       numeric.map(s =>
-        '<div class="cohort-pick cohort-range"><span>' + escHtml(s.label || s.code) + '</span>' +
-          bound(s.code, 'min') + '<span class="muted">to</span>' + bound(s.code, 'max') + '</div>'
+        '<div class="cohort-pick cohort-range"><span>' + escHtml(sigLabel(s)) + '</span>' +
+          bound(s.code, 'min') + '<span class="muted">' + escHtml(t('cohort.to')) + '</span>' + bound(s.code, 'max') + '</div>'
       ).join('') + '</div></div>' : '';
 
-  el.innerHTML = col('Must have', 'require', '&mdash; every company in the cohort carries all of these') +
-    '<div style="height:18px"></div>' +
-    col('Must not have', 'exclude', '&mdash; disqualifiers') + rangeCol;
+  el.innerHTML = col(t('cohort.must'), 'require', t('cohort.must_hint')) +
+    '<div class="spacer"></div>' +
+    col(t('cohort.must_not'), 'exclude', t('cohort.must_not_hint')) + rangeCol;
 }
 
 function setCohortRange(code, side, value) {
@@ -1118,7 +1392,7 @@ async function runCohort() {
   const ranges = _cohortRanges();
   if (!require.length && !ranges.length) { el.innerHTML = ''; return; }
   // Remove the prior export button as soon as its criteria become stale.
-  el.innerHTML = '<p class="muted">Loading cohort…</p>';
+  el.innerHTML = '<p class="muted">' + escHtml(t('cohort.loading')) + '</p>';
 
   const data = await api('/api/cohort', {
     method: 'POST',
@@ -1132,14 +1406,14 @@ async function runCohort() {
     return;
   }
 
-  let html = '<div style="border-top:1px solid var(--border);margin-top:20px;padding-top:20px">' +
-    '<div class="cohort-size">' + data.size + '</div>' +
-    '<div class="muted" style="font-size:13px;margin-top:2px">compan' +
-      (data.size === 1 ? 'y matches' : 'ies match') + ' this cohort right now</div>';
+  let html = '<div class="cohort-out">' +
+    '<div class="cohort-size">' + fmtN(data.size) + '</div>' +
+    '<div class="muted small" style="margin-top:2px">' + escHtml(t('cohort.match', {n: data.size})) + '</div>';
 
   if (data.companies && data.companies.length) {
     html += '<div class="table-card" style="margin-top:16px"><table><thead><tr>' +
-      '<th>Company</th><th>Domain</th><th>Industry</th><th>Location</th>' +
+      '<th>' + escHtml(t('cohort.company')) + '</th><th>' + escHtml(t('cohort.domain')) + '</th><th>' +
+      escHtml(t('cohort.industry')) + '</th><th>' + escHtml(t('cohort.location')) + '</th>' +
       '</tr></thead><tbody>' +
       data.companies.map(c =>
         '<tr><td>' + escHtml(c.name) + '</td><td class="muted">' + escHtml(c.domain) + '</td>' +
@@ -1149,20 +1423,17 @@ async function runCohort() {
 
     const first = data.offset + 1, last = data.offset + data.companies.length;
     const hasPrev = data.offset > 0, hasNext = last < data.size;
-    html += '<div style="display:flex;align-items:center;gap:8px;margin-top:10px">' +
-      '<span class="muted" style="font-size:12px">Showing ' + first + '&ndash;' + last +
-        ' of ' + data.size + '</span>' +
+    html += '<div class="pager-row">' +
+      '<span class="muted small">' + escHtml(t('page.range', {from: first, to: last, total: data.size})) + '</span>' +
       '<span style="flex:1"></span>' +
       '<button class="btn btn-secondary btn-sm" onclick="pageCohort(-1)"' +
-        (hasPrev ? '' : ' disabled') + '>Prev</button>' +
+        (hasPrev ? '' : ' disabled') + '>' + escHtml(t('page.prev')) + '</button>' +
       '<button class="btn btn-secondary btn-sm" onclick="pageCohort(1)"' +
-        (hasNext ? '' : ' disabled') + '>Next</button>' +
-      '<button class="btn btn-secondary btn-sm" onclick="exportCohort(this)">Export CSV</button>' +
+        (hasNext ? '' : ' disabled') + '>' + escHtml(t('page.next')) + '</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="exportCohort(this)">' + escHtml(t('cohort.export')) + '</button>' +
       '</div>';
   } else if (data.size === 0) {
-    html += '<p class="muted" style="font-size:13px;margin-top:12px">' +
-      'No company carries all of those yet. Either loosen the cohort, or run ' +
-      'prospecting to collect more.</p>';
+    html += '<p class="muted small" style="margin-top:12px">' + escHtml(t('cohort.none')) + '</p>';
   } else if (_cohortOffset > 0) {
     // The cohort shrank under us (a re-profile, a delete): back to page one.
     _cohortOffset = 0;
@@ -1185,7 +1456,7 @@ async function exportCohort(button) {
     .map(([code, r]) => code + ':' + (r.min ?? '') + ':' + (r.max ?? ''));
   if (ranges.length) qs.set('ranges', ranges.join(','));
   button.disabled = true;
-  button.textContent = 'Exporting…';
+  button.textContent = t('export.exporting');
   let url;
   let link;
   try {
@@ -1195,12 +1466,12 @@ async function exportCohort(button) {
     url = URL.createObjectURL(await response.blob());
     link = document.createElement('a');
     link.href = url;
-    link.download = 'cohort.csv';
+    link.download = 'grup-' + new Date().toISOString().slice(0, 10) + '.csv';
     document.body.appendChild(link);
     link.click();
-    button.textContent = 'Export CSV';
+    button.textContent = t('cohort.export');
   } catch (error) {
-    button.textContent = 'Export failed — retry';
+    button.textContent = t('export.retry');
   } finally {
     if (link) link.remove();
     // Give the browser time to start consuming the download before revoking.
@@ -1220,26 +1491,24 @@ async function loadSettings() {
   const data = await api('/api/settings');
   if (!data) return;
 
-  // Active provider indicator
   const prov = data.provider || 'instantly';
   const provEl = document.getElementById('active-provider');
   if (provEl) provEl.textContent = prov;
 
   // Secret fields never echo a value — show a "saved" placeholder instead.
-  const savedPh = (id, isSet, base) => {
+  const savedPh = (id, isSet, baseKey) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.value = '';
-    el.placeholder = isSet ? 'Saved — enter new value to change' : base;
+    el.placeholder = isSet ? t('set.saved_ph') : t(baseKey);
   };
-  const tag = (id, ok, okLabel) => {
+  const tag = (id, ok) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.className = 'email-tag ' + (ok ? 'verified' : 'guess');
-    el.textContent = ok ? okLabel : 'not set';
+    el.textContent = ok ? t('set.tag_set') : t('set.tag_not_set');
   };
 
-  // Non-secret values repopulate
   document.getElementById('gmail-id').value = data.gmail_client_id || '';
   document.getElementById('smtp-host').value = data.smtp_host || '';
   document.getElementById('smtp-port').value = data.smtp_port || '';
@@ -1252,40 +1521,36 @@ async function loadSettings() {
   document.getElementById('linkedin-email').value = data.linkedin_email || '';
   document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
 
-  savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
-  savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
-  savedPh('imap-pass', data.imap_password_set, 'Same as SMTP password');
+  savedPh('gmail-secret', data.gmail_client_secret_set, 'set.ph.gmail_secret');
+  savedPh('smtp-pass', data.smtp_password_set, 'set.ph.smtp_pass');
+  savedPh('imap-pass', data.imap_password_set, 'set.same_smtp_pass');
   document.getElementById('imap-same-pass').checked = !data.imap_password_set;
-  savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
-  savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
-  savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
-  savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup');
-  savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
-  savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
+  savedPh('instantly-key', data.instantly_api_key_set, 'set.ph.instantly');
+  savedPh('reoon-key', data.reoon_api_key_set, 'set.ph.reoon');
+  savedPh('zerobounce-key', data.zerobounce_api_key_set, 'set.ph.zerobounce');
+  savedPh('hunter-key', data.hunter_api_key_set, 'set.ph.hunter');
+  savedPh('linkedin-password', data.linkedin_password_set, 'set.ph.password');
+  savedPh('cf-api-token', data.cloudflare_api_token_set, 'set.ph.cf_token');
 
-  // Gmail auth status chip
-  const g = document.getElementById('gmail-status');
-  if (g) {
-    if (data.gmail_authorized) { g.className = 'email-tag verified'; g.textContent = 'authorized'; }
-    else if (data.gmail_client_secret_set) { g.className = 'email-tag risky'; g.textContent = 'run: harvey gmail auth'; }
-    else { g.className = 'email-tag guess'; g.textContent = 'not set up'; }
-  }
-  const m = document.getElementById('m365-status');
-  if (m) {
-    if (data.m365_authorized) { m.className = 'email-tag verified'; m.textContent = 'authorized'; }
-    else if (data.m365_client_id) { m.className = 'email-tag risky'; m.textContent = 'run: harvey microsoft auth'; }
-    else { m.className = 'email-tag guess'; m.textContent = 'not set up'; }
-  }
-  tag('reoon-status', data.reoon_api_key_set, 'set');
-  tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
-  tag('hunter-status', data.hunter_api_key_set, 'set');
+  const chip = (id, authorized, started, cmd) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (authorized) { el.className = 'email-tag verified'; el.textContent = t('set.authorized'); }
+    else if (started) { el.className = 'email-tag risky'; el.textContent = t('set.run_cmd', {cmd: cmd}); }
+    else { el.className = 'email-tag guess'; el.textContent = t('set.not_set_up'); }
+  };
+  chip('gmail-status', data.gmail_authorized, data.gmail_client_secret_set, 'harvey gmail auth');
+  chip('m365-status', data.m365_authorized, data.m365_client_id, 'harvey microsoft auth');
+  tag('reoon-status', data.reoon_api_key_set);
+  tag('zerobounce-status', data.zerobounce_api_key_set);
+  tag('hunter-status', data.hunter_api_key_set);
 }
 
 function saveGmail() {
   const payload = {GMAIL_CLIENT_ID: document.getElementById('gmail-id').value.trim()};
   const sec = document.getElementById('gmail-secret').value;
   if (sec) payload.GMAIL_CLIENT_SECRET = sec;
-  saveEnv(payload, 'Gmail OAuth saved. Now run "harvey gmail auth" in your terminal.').then(loadSettings);
+  saveEnv(payload, t('set.saved_gmail')).then(loadSettings);
 }
 
 function saveSmtp() {
@@ -1305,14 +1570,14 @@ function saveSmtp() {
   const imapPass = document.getElementById('imap-pass').value;
   if (imapPass) payload.IMAP_PASSWORD = imapPass;
   else if (document.getElementById('imap-same-pass').checked) payload.IMAP_PASSWORD = '';
-  saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+  saveEnv(payload, t('set.saved_smtp')).then(loadSettings);
 }
 
 function saveMicrosoft() {
   const client = document.getElementById('m365-client').value.trim();
-  if (!client) { showToast('Paste the Application (client) ID first.', 'error'); return; }
+  if (!client) { showToast(t('set.m365_need_id'), 'error'); return; }
   saveEnv({M365_CLIENT_ID: client, M365_TENANT_ID: document.getElementById('m365-tenant').value.trim()},
-          'Saved. Now run "harvey microsoft auth" in your terminal.').then(loadSettings);
+          t('set.saved_m365')).then(loadSettings);
 }
 
 function saveVerifiers() {
@@ -1323,8 +1588,8 @@ function saveVerifiers() {
   if (r) payload.REOON_API_KEY = r;
   if (z) payload.ZEROBOUNCE_API_KEY = z;
   if (h) payload.HUNTER_API_KEY = h;
-  if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
-  saveEnv(payload, 'Verification keys saved.').then(loadSettings);
+  if (!Object.keys(payload).length) { showToast(t('set.need_key'), 'error'); return; }
+  saveEnv(payload, t('set.saved_verifiers')).then(loadSettings);
 }
 
 async function saveEnv(payload, okMsg) {
@@ -1333,40 +1598,40 @@ async function saveEnv(payload, okMsg) {
     body: JSON.stringify(payload)
   });
   if (data && data.success) showToast(okMsg, 'success');
-  else showToast((data && data.message) || 'Save failed — is the dashboard still running?', 'error');
+  else showToast((data && data.message) || t('set.save_failed'), 'error');
 }
 
 // Secrets are only sent when typed: an empty box means "keep the saved one".
 function saveInstantly() {
   const key = document.getElementById('instantly-key').value.trim();
-  if (!key) { showToast('Enter a new key first. The saved one is kept.', 'error'); return; }
-  saveEnv({INSTANTLY_API_KEY: key}, 'Instantly API key saved.');
+  if (!key) { showToast(t('set.need_new_key'), 'error'); return; }
+  saveEnv({INSTANTLY_API_KEY: key}, t('set.saved_instantly'));
 }
 
 function saveLinkedIn() {
   const payload = {LINKEDIN_EMAIL: document.getElementById('linkedin-email').value.trim()};
   const pass = document.getElementById('linkedin-password').value;
   if (pass) payload.LINKEDIN_PASSWORD = pass;
-  saveEnv(payload, 'LinkedIn credentials saved.');
+  saveEnv(payload, t('set.saved_linkedin'));
 }
 
 function saveCloudflare() {
   const payload = {CLOUDFLARE_ACCOUNT_ID: document.getElementById('cf-account-id').value.trim()};
   const token = document.getElementById('cf-api-token').value.trim();
   if (token) payload.CLOUDFLARE_API_TOKEN = token;
-  saveEnv(payload, 'Cloudflare credentials saved.');
+  saveEnv(payload, t('set.saved_cf'));
 }
 
 async function testInstantly() {
   const key = document.getElementById('instantly-key').value.trim();
   const el = document.getElementById('instantly-test-result');
-  el.innerHTML = '<div class="test-result pending">Testing&hellip;</div>';
+  el.innerHTML = '<div class="test-result pending">' + escHtml(t('set.testing')) + '</div>';
   const data = await api('/api/settings/test-instantly', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({api_key: key})
   });
   if (!data) {
-    el.innerHTML = '<div class="test-result error">Could not reach the dashboard server.</div>';
+    el.innerHTML = '<div class="test-result error">' + escHtml(t('set.unreachable')) + '</div>';
     return;
   }
   el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(failMsg(data, '')) + '</div>';
@@ -1382,25 +1647,25 @@ async function loadHarveyStatus() {
   if (_locked) return;  // the header already says "Locked"
   if (!data) {
     headerDot.className = 'status-dot offline';
-    headerText.textContent = 'Offline';
+    headerText.textContent = t('status.offline');
     return;
   }
   const running = !!data.running;
 
   headerDot.className = 'status-dot ' + (running ? 'running' : 'stopped');
-  headerText.textContent = running ? 'Harvey is running' : 'Harvey is stopped';
+  headerText.textContent = running ? t('status.running') : t('status.stopped');
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
   const label = document.getElementById('control-label');
   label.className = 'label ' + (running ? 'running' : 'stopped');
-  label.textContent = running ? 'Running' : 'Stopped';
+  label.textContent = running ? t('ctl.running') : t('ctl.stopped');
 
   const meta = document.getElementById('control-meta');
   if (running && data.pid) {
     let info = 'PID ' + escHtml(String(data.pid));
-    if (data.started_at) info += ' &middot; started ' + formatDate(data.started_at);
+    if (data.started_at) info += ' &middot; ' + escHtml(t('ctl.started', {when: formatDate(data.started_at)}));
     meta.innerHTML = info;
   } else {
-    meta.innerHTML = 'Harvey wakes every few minutes, does what needs doing, and sleeps.';
+    meta.textContent = t('ctl.idle');
   }
 
   document.getElementById('btn-start').style.display = running ? 'none' : '';
@@ -1411,8 +1676,8 @@ async function startHarvey() {
   const btn = document.getElementById('btn-start');
   btn.disabled = true;
   const data = await api('/api/harvey/start', {method: 'POST'});
-  if (data && data.success) showToast('Harvey started.', 'success');
-  else showToast((data && data.message) || 'Failed to start.', 'error');
+  if (data && data.success) showToast(t('ctl.started_toast'), 'success');
+  else showToast((data && data.message) || t('ctl.start_failed'), 'error');
   btn.disabled = false;
   loadHarveyStatus();
 }
@@ -1421,8 +1686,8 @@ async function stopHarvey() {
   const btn = document.getElementById('btn-stop');
   btn.disabled = true;
   const data = await api('/api/harvey/stop', {method: 'POST'});
-  if (data && data.success) showToast('Harvey stopped.', 'success');
-  else showToast((data && data.message) || 'Failed to stop.', 'error');
+  if (data && data.success) showToast(t('ctl.stopped_toast'), 'success');
+  else showToast((data && data.message) || t('ctl.stop_failed'), 'error');
   btn.disabled = false;
   loadHarveyStatus();
 }
@@ -1435,21 +1700,21 @@ async function loadLogs() {
     el.textContent = data.lines.join('\n');
     if (stick) el.scrollTop = el.scrollHeight;
   } else {
-    el.textContent = 'No logs yet. Start Harvey to see activity.';
+    el.textContent = t('ctl.no_logs');
   }
 }
 
-// ── Pipeline data ──
+// ── Usage ──
 
 // Calls today per subscription — each labelled with the provider it ran on.
 function brainCallChips(data) {
-  const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
+  const chip = (label, n) => '<span class="chip">' + t('use.calls_today', {who: label}) + ' <b>' + escHtml(String(n || 0)) + '</b></span>';
   const codex = data.codex_calls_today || 0;
   const st = data.brain_status || {};
   // A paused brain must not look healthy: say so, and why.
   const paused = st.status === 'paused'
     ? '<span class="chip" title="' + escHtml(st.reason || '') + '">' +
-      escHtml(st.provider === 'codex' ? 'Codex' : 'Brain') + ' <b>paused</b>: ' +
+      escHtml(st.provider === 'codex' ? 'Codex' : t('use.brain')) + ' <b>' + t('use.paused') + '</b>: ' +
       escHtml((st.reason || '').slice(0, 120)) + '</span>'
     : '';
   if (data.brain_provider === 'codex') {
@@ -1466,14 +1731,13 @@ function fmtTokens(n) {
   return String(n);
 }
 
-
 function emailTag(p) {
   if (!p.email) return '';
   // Fall back to the legacy boolean for rows predating email_status.
   const status = p.email_status || (p.email_verified ? 'verified' : 'guess');
   if (!own(STATUS, status)) return '';
   const m = statusMeta(status);
-  return ' <span class="mini t-' + m.tone + '" title="Email ' + escHtml(m.label.toLowerCase()) + '">' +
+  return ' <span class="mini t-' + m.tone + '" title="' + escHtml(t('email.status_title', {s: m.label})) + '">' +
     escHtml(m.label) + '</span>';
 }
 
@@ -1483,23 +1747,21 @@ function emailTag(p) {
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
-  const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
+  const title = provider === 'codex' ? t('use.quota_codex') : t('use.quota_claude');
   let html = '<h2>' + escHtml(title) + '</h2>';
   if (!data.quota || !Object.keys(data.quota).length) {
-    const why = provider === 'codex'
-      ? "Quota unavailable: Harvey couldn't read your ChatGPT plan's limits (check codex login, the Codex CLI version, and network)."
-      : "Quota unavailable: Harvey couldn't read your Claude subscription's limits (check claude login and network).";
-    return html + '<p class="muted">' + escHtml(why) + ' Until it can, budgets count Harvey\'s own calls.</p>';
+    const why = provider === 'codex' ? t('use.quota_codex_none') : t('use.quota_claude_none');
+    return html + '<p class="muted">' + escHtml(why) + ' ' + escHtml(t('use.quota_fallback')) + '</p>';
   }
-  const labels = {five_hour: '5-hour window', seven_day: 'Weekly', primary: 'Primary window',
-                  secondary: 'Secondary window', limit_reached: 'Usage limit reached'};
   for (const [key, w] of Object.entries(data.quota)) {
     const pct = Math.min(100, Math.max(0, w.utilization || 0));
     const color = pct >= 80 ? 'yellow' : 'green';
-    const resets = w.resets_at ? 'resets ' + formatDate(w.resets_at) : '';
+    const resets = w.resets_at ? t('use.resets', {when: formatDate(w.resets_at)}) : '';
+    const lkey = 'use.window.' + key;
+    const label = t(lkey) === lkey ? key : t(lkey);
     html += '<div class="progress-wrap">' +
       '<div class="progress-label">' +
-        '<span class="text">' + escHtml(labels[key] || key) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
+        '<span class="text">' + escHtml(label) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
         '<span class="pct">' + pct.toFixed(0) + '%</span>' +
       '</div>' +
       '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>' +
@@ -1520,30 +1782,30 @@ async function loadUsage() {
 
   // Totals cards — usage-first (calls is the headline; tokens as chips).
   // No dollars: on a subscription plan usage isn't billed per token.
-  const t = data.totals || {};
+  const tot = data.totals || {};
   const card = (label, p) => {
     p = p || {};
-    return '<div class="stat-card"><div class="label">' + label + '</div>' +
-      '<div class="value">' + (p.calls || 0) + '</div>' +
+    return '<div class="stat-card"><div class="label">' + escHtml(label) + '</div>' +
+      '<div class="value">' + fmtN(p.calls || 0) + '</div>' +
       '<div class="breakdown">' +
-        '<span class="chip">calls</span>' +
-        '<span class="chip">out <b>' + fmtTokens(p.output_tokens) + '</b></span>' +
-        '<span class="chip">in <b>' + fmtTokens(p.input_tokens) + '</b></span>' +
-        '<span class="chip">cached <b>' + fmtTokens(p.cache_read_tokens) + '</b></span>' +
+        '<span class="chip">' + escHtml(t('use.calls')) + '</span>' +
+        '<span class="chip">' + escHtml(t('use.out')) + ' <b>' + fmtTokens(p.output_tokens) + '</b></span>' +
+        '<span class="chip">' + escHtml(t('use.in')) + ' <b>' + fmtTokens(p.input_tokens) + '</b></span>' +
+        '<span class="chip">' + escHtml(t('use.cached')) + ' <b>' + fmtTokens(p.cache_read_tokens) + '</b></span>' +
       '</div></div>';
   };
-  statsEl.innerHTML = card('Today', t.today) + card('Last 7 Days', t.week) + card('Last 30 Days', t.month);
+  statsEl.innerHTML = card(t('use.today'), tot.today) + card(t('use.week'), tot.week) + card(t('use.month'), tot.month);
 
   // Daily columns — output tokens per day (the work done)
   const dailyEl = document.getElementById('usage-daily');
   const days = (data.by_day || []).slice(-30);
   if (days.length) {
     const maxOut = Math.max(...days.map(d => d.output_tokens || 0), 1);
-    dailyEl.innerHTML = '<h2>Output tokens per day <span class="hint muted" style="font-weight:400">last ' +
-      days.length + ' days · peak ' + fmtTokens(maxOut) + '</span></h2>' +
-      '<div class="chart-cols" role="img" aria-label="Output tokens per day">' + days.map(d =>
-        '<span class="col" title="' + escHtml(d.day || '') + ': ' + fmtTokens(d.output_tokens) + ' out, ' +
-          (d.calls || 0) + ' calls"><i style="height:' + Math.max(2, (d.output_tokens || 0) / maxOut * 100) + '%"></i></span>'
+    dailyEl.innerHTML = '<h2>' + escHtml(t('use.per_day')) + ' <span class="hint muted">' +
+      escHtml(t('use.per_day_hint', {n: days.length, peak: fmtTokens(maxOut)})) + '</span></h2>' +
+      '<div class="chart-cols" role="img" aria-label="' + escHtml(t('use.per_day')) + '">' + days.map(d =>
+        '<span class="col" title="' + escHtml(d.day || '') + ': ' + fmtTokens(d.output_tokens) + ' · ' +
+          escHtml(t('use.calls_n', {n: d.calls || 0})) + '"><i style="height:' + Math.max(2, (d.output_tokens || 0) / maxOut * 100) + '%"></i></span>'
       ).join('') + '</div>' +
       '<div class="chart-axis"><span>' + escHtml(days[0].day || '') + '</span><span>' +
         escHtml(days[days.length - 1].day || '') + '</span></div>';
@@ -1552,18 +1814,18 @@ async function loadUsage() {
     dailyEl.style.display = 'none';
   }
 
-  // Breakdown tables — calls + tokens, no cost column
   const tablesEl = document.getElementById('usage-tables');
-  const table = (title, rows, keyName) => {
+  const table = (title, rows, field) => {
     if (!rows || !rows.length) return '';
     const max = Math.max(...rows.map(r => r.calls || 0), 1);
-    let h = '<div class="card flush"><div class="card-head"><h3>' + title + '</h3></div><table><thead><tr>' +
-      '<th>' + keyName + '</th><th>Calls</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th>' +
-      '</tr></thead><tbody>';
+    let h = '<div class="card flush"><div class="card-head"><h3>' + escHtml(title) + '</h3></div><table><thead><tr>' +
+      '<th>' + escHtml(t('use.col.' + field)) + '</th><th>' + escHtml(t('use.calls')) + '</th><th class="num">' +
+      escHtml(t('use.input')) + '</th><th class="num">' + escHtml(t('use.output')) + '</th><th class="num">' +
+      escHtml(t('use.cache_read')) + '</th></tr></thead><tbody>';
     for (const r of rows) {
-      h += '<tr><td class="cell-main">' + escHtml(String(r[keyName.toLowerCase()] || '')) + '</td>' +
+      h += '<tr><td class="cell-main">' + escHtml(String(r[field] || '')) + '</td>' +
         '<td><span class="meter-row"><span class="bar" style="width:120px"><span style="width:' +
-          (100 * (r.calls || 0) / max) + '%;background:var(--accent)"></span></span><span class="v">' + (r.calls || 0) + '</span></span></td>' +
+          (100 * (r.calls || 0) / max) + '%;background:var(--accent)"></span></span><span class="v">' + fmtN(r.calls || 0) + '</span></span></td>' +
         '<td class="num muted">' + fmtTokens(r.input_tokens) + '</td>' +
         '<td class="num">' + fmtTokens(r.output_tokens) + '</td>' +
         '<td class="num muted">' + fmtTokens(r.cache_read_tokens) + '</td></tr>';
@@ -1573,20 +1835,19 @@ async function loadUsage() {
 
   const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
   if (!anyRows) {
-    tablesEl.innerHTML = emptyState(icon('usage'), 'No usage recorded yet',
-      'Once Harvey starts making model calls (Claude or Codex), every one is logged here with exact calls and tokens by provider, agent and task.');
+    tablesEl.innerHTML = emptyState(icon('usage'), escHtml(t('use.empty_title')), escHtml(t('use.empty_copy')));
   } else {
     const providers = data.by_provider || [];
     const showProviders = providers.length > 1 || (providers.length === 1 && providers[0].provider !== 'claude');
     tablesEl.innerHTML =
-      (showProviders ? table('By Provider (30 days)', providers, 'Provider') : '') +
-      table('By Agent (30 days)', data.by_agent, 'Agent') +
-      table('By Task (30 days)', data.by_task, 'Task') +
-      table('By Model (30 days)', data.by_model, 'Model');
+      (showProviders ? table(t('use.by_provider'), providers, 'provider') : '') +
+      table(t('use.by_agent'), data.by_agent, 'agent') +
+      table(t('use.by_task'), data.by_task, 'task') +
+      table(t('use.by_model'), data.by_model, 'model');
   }
 }
 
-// ── Outbox: a decisions desk, not a wall of drafts ──
+// ── Outbox: a decisions desk, not a wall of drafts (Email module) ──
 //
 // Approving mail is a queue of one-at-a-time judgements. Showing all of them
 // stacked invites a single "approve all" reflex, which is exactly the review
@@ -1603,7 +1864,7 @@ async function loadOutbox() {
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
   if (data.error) {
     // Never let a failed read pass for "Nothing to review".
-    desk.innerHTML = emptyState(icon('alert'), 'Couldn\'t read the Outbox', escHtml(data.error));
+    desk.innerHTML = emptyState(icon('alert'), escHtml(t('ob.error')), escHtml(data.error));
     list.innerHTML = '';
     return;
   }
@@ -1621,44 +1882,39 @@ async function loadOutbox() {
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
 
+  const approvable = pending.length - pending.filter(p => heldReason(p)).length;
   actions.innerHTML =
-    (pending.length && !data.paused
-      ? (pending.length > pending.filter(p => heldReason(p)).length
-        ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" ' +
-          'title="Emails Harvey held are left for you to approve one by one">Approve all ' +
-          (pending.length - pending.filter(p => heldReason(p)).length) + '</button>' : '') : '') +
+    (pending.length && !data.paused && approvable
+      ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" title="' +
+        escHtml(t('ob.approve_all_title')) + '">' + escHtml(t('ob.approve_all', {n: approvable})) + '</button>' : '') +
     (data.paused
-      ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
-        'Resume sending</button>'
-      : '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">' +
-        'Pause all sending</button>');
+      ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' + escHtml(t('ob.resume')) + '</button>'
+      : '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">' + escHtml(t('ob.pause')) + '</button>');
 
   // The kill switch gets a banner only when it's actually on — a permanent
   // bar for a thing that isn't happening is just noise.
   banner.innerHTML = sendingModeBanner(_sendingMode) + (data.paused
-    ? '<div class="banner bad">' + icon('alert') + '<div><b>Sending is paused</b>' +
-        '<p>' + escHtml(data.paused) + '. Approved mail stays queued until you resume.</p></div></div>'
+    ? '<div class="banner bad">' + icon('alert') + '<div><b>' + escHtml(t('ob.paused')) + '</b>' +
+        '<p>' + escHtml(t('ob.paused_detail', {why: data.paused})) + '</p></div></div>'
     : '');
   // Only once there is mail to warn about: a fresh install sends nothing.
   const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;
   if (data.compliance_notice && anyMail) {
     banner.innerHTML +=
-      '<div class="banner wait">' + icon('alert') + '<div><b>Add your postal address</b>' +
+      '<div class="banner wait">' + icon('alert') + '<div><b>' + escHtml(t('ob.postal')) + '</b>' +
         '<p>' + escHtml(data.compliance_notice) + '</p></div></div>';
   }
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
-    '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
-      _sendingMode && _sendingMode.mode === 'autopilot'
-        ? 'Autopilot is on, so Harvey sends on its own. Anything it holds for you shows up here.'
-        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
+    '<div class="card">' + emptyState(icon('check'), escHtml(t('ob.empty')),
+      escHtml(_sendingMode && _sendingMode.mode === 'autopilot' ? t('ob.empty_auto') : t('ob.empty_copy'))) +
     '</div>';
 
   const table = (title, rows, cols) => {
     if (!rows || !rows.length) return '';
-    let h = '<div class="subhead">' + title + ' <span class="hint">' + rows.length + '</span></div>' +
+    let h = '<div class="subhead">' + escHtml(title) + ' <span class="hint">' + rows.length + '</span></div>' +
       '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
-      cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
+      cols.map(c => '<th>' + escHtml(c[0]) + '</th>').join('') + '</tr></thead><tbody>';
     for (const r of rows) {
       h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
         (c[3] ? c[1](r) : escHtml(String(c[1](r) ?? ''))) + '</td>').join('') + '</tr>';
@@ -1667,56 +1923,56 @@ async function loadOutbox() {
   };
 
   list.innerHTML =
-    table('Approved &amp; scheduled', data.approved, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
+    table(t('ob.approved'), data.approved, [
+      [t('ob.to'), r => r.to_email], [t('ob.step'), r => r.step], [t('ob.subject'), r => r.subject],
+      [t('ob.sends'), r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
     ]) +
-    table('Recently sent', data.sent, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sent', r => formatDate(r.sent_at), true],
+    table(t('ob.sent'), data.sent, [
+      [t('ob.to'), r => r.to_email], [t('ob.step'), r => r.step], [t('ob.subject'), r => r.subject],
+      [t('ob.sent_at'), r => formatDate(r.sent_at), true],
     ]) +
-    table('Didn\'t send', data.failed, [
-      ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
-      ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
+    table(t('ob.failed'), data.failed, [
+      [t('ob.to'), r => r.to_email], [t('ob.status'), r => badge(r.status), false, true],
+      [t('ob.reason'), r => r.error, true], [t('ob.updated'), r => formatDate(r.updated_at), true],
     ]);
 }
 
 const CONTACT_SOURCES = {
-  known_company_backfill: 'team page on their site',
-  company_website: 'team page on their site',
-  scraped_mailto: 'address published on their site',
-  linkedin_search: 'LinkedIn search',
-  hunter_domain_search: 'Hunter domain search',
-  job_board: 'job board',
-  web_search: 'web search',
+  known_company_backfill: 'csrc.team_page',
+  company_website: 'csrc.team_page',
+  scraped_mailto: 'csrc.published',
+  linkedin_search: 'csrc.linkedin',
+  hunter_domain_search: 'csrc.hunter',
+  job_board: 'csrc.job_board',
+  web_search: 'csrc.web_search',
 };
 
 // What the draft is built on, so every claim can be checked against it.
 function renderDeskContext(ctx) {
   if (!ctx) return '';
-  const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + v + '</div>' : '';
+  const row = (k, v) => v ? '<div class="k">' + escHtml(k) + '</div><div class="v">' + v + '</div>' : '';
   const href = safeHref(ctx.website);
   const site = href
     ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' +
         escHtml(ctx.website.replace(/^https?:\/\//i, '')) + ' &#8599;</a>'
     : '';
   const who = [ctx.contact, ctx.contact_title].filter(Boolean).map(escHtml).join(' &middot; ');
-  const email = [ctx.email_status, ctx.score ? 'score ' + ctx.score : '']
+  const email = [ctx.email_status, ctx.score ? t('desk.score', {n: ctx.score}) : '']
     .filter(Boolean).map(escHtml).join(' &middot; ');
   const signals = Object.entries(ctx.signals || {})
     .map(([k, v]) => escHtml(k) + ': <b>' + escHtml(v) + '</b>').join('<br>');
+  const src = own(CONTACT_SOURCES, ctx.contact_source);
   return '<div class="desk-context">' +
-    row('Company', escHtml(ctx.company)) +
-    row('Website', site) +
-    row('About', escHtml(ctx.description)) +
-    row('Contact', who) +
-    row('Found via', escHtml(Object.prototype.hasOwnProperty.call(CONTACT_SOURCES, ctx.contact_source)
-      ? CONTACT_SOURCES[ctx.contact_source] : ctx.contact_source)) +
-    row('Email', email) +
-    row('Signals', signals) +
-    row('Campaign', ctx.campaign ? escHtml(ctx.campaign) +
-      ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
-    row('Writer notes', escHtml(ctx.notes)) +
+    row(t('desk.company'), escHtml(ctx.company)) +
+    row(t('desk.website'), site) +
+    row(t('desk.about'), escHtml(ctx.description)) +
+    row(t('desk.contact'), who) +
+    row(t('desk.found_via'), escHtml(src ? t(src) : ctx.contact_source)) +
+    row(t('desk.email'), email) +
+    row(t('desk.signals'), signals) +
+    row(t('desk.campaign'), ctx.campaign ? escHtml(ctx.campaign) +
+      ' <span class="muted">' + escHtml(t('desk.campaign_note')) + '</span>' : '') +
+    row(t('desk.notes'), escHtml(ctx.notes)) +
   '</div>';
 }
 
@@ -1730,52 +1986,43 @@ let _sendingMode = null, _autopilotArmed = false, _modeBusy = false;
 function sendingModeBanner(m) {
   if (!m) return '';
   if (m.mode === 'autopilot') {
-    return '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>Autopilot is on</b>' +
-      '<p>Harvey sends email on its own. It holds anything that links to a site that isn’t yours or ' +
-      'quotes its own instructions; those wait here' + (m.held ? ' (' + m.held + ' now)' : '') + '.</p></div>' +
+    return '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>' + t('mode.auto_on') + '</b>' +
+      '<p>' + t('mode.auto_on_detail') + (m.held ? ' ' + t('mode.held_now', {n: m.held}) : '') + '.</p></div>' +
       '<button class="btn btn-secondary btn-sm" onclick="setSendingMode(\'approval\')"' +
-        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+        (_modeBusy ? ' disabled' : '') + '>' + t('mode.turn_off') + '</button></div>';
   }
   const instantly = m.provider === 'instantly';
-  return '<div class="banner mode-banner">' + icon('check') + '<div><b>Approval mode</b>' +
-    '<p>' + (instantly
-      ? 'Instantly can’t hold single emails, so campaigns aren’t sent to Instantly until you turn on autopilot.'
-      : 'Every email Harvey writes waits here until you approve it.') +
-    ' <a href="#" onclick="goTab(\'settings\');return false">About autopilot</a></p></div></div>';
+  return '<div class="banner mode-banner">' + icon('check') + '<div><b>' + t('mode.approval') + '</b>' +
+    '<p>' + (instantly ? t('mode.approval_instantly') : t('mode.approval_detail')) +
+    ' <a href="#" onclick="goTab(\'settings\');return false">' + t('mode.about') + '</a></p></div></div>';
 }
 
 function sendingModeCard(m) {
-  if (!m) return '<div class="card muted">Couldn’t read the sending mode.</div>';
+  if (!m) return '<div class="card muted">' + t('mode.unreadable') + '</div>';
   const auto = m.mode === 'autopilot';
   const instantly = m.provider === 'instantly';
-  const domains = (m.your_domains || []).map(escHtml).join(', ') || 'none yet';
-  let html = '<div class="card mode-card"><h3>Sending mode: ' + (auto ? 'Autopilot' : 'Approval') + '</h3>' +
-    '<p><b>Approval</b> (the default): every email Harvey writes, first emails, follow-ups and replies, ' +
-      'waits in the Outbox until you approve it.' +
-      (instantly ? ' On Instantly, which can’t hold single emails, that means campaigns aren’t deployed.' : '') + '</p>' +
-    '<p><b>Autopilot</b>: Harvey sends on its own, on schedule, within your daily limit and quiet hours. ' +
-      'Opt-outs, bounces and Pause all sending work the same. It still holds an email for you when it links ' +
-      'to, or gives an address at, a site that isn’t yours, or quotes Harvey’s own instructions: text from ' +
-      'websites and replies can try to steer what it writes. The first reply after you undo an opt-out waits too.</p>' +
-    '<p class="muted">Counted as yours: ' + domains + (m.booking_page ? '; your booking page ' + escHtml(m.booking_page) : '') +
-      '. Add others under <code>channels.email.link_domains</code> in <code>' + escHtml(m.file) + '</code>.</p>';
+  const domains = (m.your_domains || []).map(escHtml).join(', ') || t('mode.no_domains');
+  let html = '<div class="card mode-card"><h3>' + t('mode.card_title', {mode: auto ? t('mode.autopilot') : t('mode.approval_word')}) + '</h3>' +
+    '<p>' + t('mode.explain_approval') + (instantly ? ' ' + t('mode.explain_instantly') : '') + '</p>' +
+    '<p>' + t('mode.explain_auto') + '</p>' +
+    '<p class="muted">' + t('mode.yours', {domains: domains}) +
+      (m.booking_page ? t('mode.booking', {page: escHtml(m.booking_page)}) : '') +
+      t('mode.add_others', {file: escHtml(m.file)}) + '</p>';
   if (auto) {
-    html += '<div class="convo-actions"><span class="muted">Turning it off works at once: emails autopilot ' +
-      'approved that haven’t gone out come back to the Outbox.' +
-      (instantly ? ' Campaigns already on Instantly keep running until you pause them there.' : '') + '</span>' +
+    html += '<div class="convo-actions"><span class="muted">' + t('mode.off_now') +
+      (instantly ? ' ' + t('mode.off_instantly') : '') + '</span>' +
       '<button class="btn btn-primary btn-sm" onclick="setSendingMode(\'approval\')"' +
-        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+        (_modeBusy ? ' disabled' : '') + '>' + t('mode.turn_off') + '</button></div>';
   } else if (_autopilotArmed) {
-    html += '<div class="convo-actions mode-confirm"><span class="muted">Approve a batch or two by hand first ' +
-      'and read what Harvey writes. Type <b>autopilot</b> to turn it on. It starts from Harvey’s next cycle.</span>' +
-      '<input class="form-input" id="autopilot-confirm" autocomplete="off" aria-label="Type autopilot to confirm" ' +
+    html += '<div class="convo-actions mode-confirm"><span class="muted">' + t('mode.confirm_text') + '</span>' +
+      '<input class="form-input" id="autopilot-confirm" autocomplete="off" aria-label="' + t('mode.confirm_label') + '" ' +
         'oninput="document.getElementById(\'autopilot-go\').disabled = this.value.trim().toLowerCase() !== \'autopilot\'" ' +
         'onkeydown="if (event.key === \'Enter\' && this.value.trim().toLowerCase() === \'autopilot\') setSendingMode(\'autopilot\')">' +
-      '<button class="btn btn-primary btn-sm" id="autopilot-go" disabled onclick="setSendingMode(\'autopilot\')">Turn on autopilot</button>' +
-      '<button class="btn btn-ghost btn-sm" onclick="_autopilotArmed=false;renderSendingModeCard()">Cancel</button></div>';
+      '<button class="btn btn-primary btn-sm" id="autopilot-go" disabled onclick="setSendingMode(\'autopilot\')">' + t('mode.turn_on') + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_autopilotArmed=false;renderSendingModeCard()">' + t('common.cancel') + '</button></div>';
   } else {
     html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
-      'onclick="_autopilotArmed=true;renderSendingModeCard()">Turn on autopilot…</button></div>';
+      'onclick="_autopilotArmed=true;renderSendingModeCard()">' + t('mode.turn_on_dots') + '</button></div>';
   }
   return html + '</div>';
 }
@@ -1809,13 +2056,11 @@ async function setSendingMode(mode) {
     if (res && res.success) {
       _autopilotArmed = false;
       showToast(mode === 'autopilot'
-        ? 'Autopilot is on from Harvey’s next cycle. Held emails still wait for you.'
-        : 'Autopilot is off. Every email waits for you' +
-          (res.requeued ? '; ' + res.requeued + ' queued by autopilot came back to the Outbox.' : '.') +
-          (_sendingMode && _sendingMode.provider === 'instantly'
-            ? ' Campaigns already on Instantly keep running: pause them in Instantly.' : ''), 'success');
+        ? t('mode.toast_on')
+        : t('mode.toast_off') + (res.requeued ? ' ' + t('mode.toast_requeued', {n: res.requeued}) : '') +
+          (_sendingMode && _sendingMode.provider === 'instantly' ? ' ' + t('mode.toast_instantly') : ''), 'success');
     } else {
-      showToast(failMsg(res, 'Couldn’t change the sending mode.'), 'error');
+      showToast(failMsg(res, t('mode.toast_failed')), 'error');
     }
   } finally {
     _modeBusy = false;
@@ -1840,9 +2085,9 @@ function renderDesk(items, i) {
     return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
       '<div class="di-text"><div class="to">' + escHtml(who) +
-        (heldReason(it) ? ' <span class="tag t-bad" title="Harvey held this instead of sending it">Held</span>' : '') +
+        (heldReason(it) ? ' <span class="tag t-bad" title="' + escHtml(t('desk.held_title')) + '">' + escHtml(t('desk.held')) + '</span>' : '') +
         '</div>' +
-      '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
+      '<div class="sub">' + escHtml(it.subject || t('desk.no_subject')) + '</div></div>' +
     '</div>';
   }).join('');
 
@@ -1850,47 +2095,46 @@ function renderDesk(items, i) {
   const unsaved = (editing && _desk.unsaved) || {subject: cur.subject || '', body: cur.body || ''};
   // A reply keeps its subject: Gmail threads by it.
   const fixedSubject = cur.kind === 'reply'
-    ? ' readonly title="A reply keeps its subject so it stays in the thread"' : '';
+    ? ' readonly title="' + escHtml(t('desk.reply_subject')) + '"' : '';
   const draft = editing
     ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
         fixedSubject + ' oninput="deskKeep()">' +
       '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
         escHtml(unsaved.body) + '</textarea>'
-    : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
+    : '<div class="subject">' + escHtml(cur.subject || t('desk.no_subject')) + '</div>' +
       '<div class="body">' + escHtml(cur.body) + '</div>';
   // Cold email leaves with the footer underneath; show it as it will go out.
   // Not added again when the body already ends with it, as in the Sender.
   const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
     ? _desk.footer : '';
   const footer = added
-    ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
+    ? '<div class="desk-footer" title="' + escHtml(t('desk.footer_title')) + '">' +
         escHtml(added) + '</div>' : '';
   const actions = editing
-    ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
-      '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
+    ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">' + escHtml(t('common.save')) + '</button>' +
+      '<button class="btn btn-secondary" onclick="deskEdit(null)">' + escHtml(t('common.cancel')) + '</button>'
     : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')">' +
-        'Approve <kbd>A</kbd></button>' +
+        escHtml(t('desk.approve')) + ' <kbd>A</kbd></button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
-        'Edit <kbd>E</kbd></button>' +
+        escHtml(t('desk.edit')) + ' <kbd>E</kbd></button>' +
       '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
-        'Reject <kbd>R</kbd></button>';
+        escHtml(t('desk.reject')) + ' <kbd>R</kbd></button>';
 
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
-      '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
-        '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
-        '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
+      '<div class="to-line">' + escHtml(t('desk.to')) + ' <b>' + escHtml(cur.to_email) + '</b>' +
+        '<span class="tag">' + escHtml(cur.kind === 'reply' ? t('desk.reply') : t('desk.email_n', {n: cur.step})) + '</span>' +
+        '<span class="muted">' + escHtml(t('desk.sends', {when: formatDate(cur.send_at)})) + '</span></div>' +
       renderDeskContext(cur.context) +
       (heldReason(cur)
-        ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>Harvey held this instead of sending it</b>' +
-          '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
-          'email can try to steer what Harvey writes.</div></div></div>'
+        ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>' + escHtml(t('desk.held_title')) + '</b>' +
+          '<div>' + escHtml(heldReason(cur)) + '. ' + escHtml(t('desk.held_detail')) + '</div></div></div>'
         : '') +
       draft + footer +
       '<div class="desk-actions">' + actions +
-        '<span class="muted" style="font-size:12px;margin-left:auto">' +
-          (i + 1) + ' of ' + items.length + '</span>' +
+        '<span class="muted small" style="margin-left:auto">' +
+          escHtml(t('desk.of', {i: i + 1, n: items.length})) + '</span>' +
       '</div>' +
     '</div></div>';
 }
@@ -1914,14 +2158,14 @@ function deskKeep() {
 // stored version of it: Save or Cancel first.
 function deskBusy() {
   if (!_desk.editing) return false;
-  showToast('Save or cancel your edit first.', 'error');
+  showToast(t('desk.busy'), 'error');
   return true;
 }
 
 async function deskSave(id) {
   const subject = document.getElementById('desk-subject').value.trim();
   const body = document.getElementById('desk-body').value.trim();
-  if (!subject || !body) { showToast('Subject and body are both required.', 'error'); return; }
+  if (!subject || !body) { showToast(t('desk.need_both'), 'error'); return; }
   let data = null;
   try {
     const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
@@ -1934,10 +2178,10 @@ async function deskSave(id) {
   if (data && data.success) {
     _desk.editing = null;
     _desk.unsaved = null;
-    showToast('Saved. Still waiting for your approval.', 'success');
+    showToast(t('desk.saved'), 'success');
     loadOutbox();
   } else {
-    showToast((data && data.message) || 'Save failed.', 'error');
+    showToast((data && data.message) || t('desk.save_failed'), 'error');
   }
 }
 
@@ -1947,8 +2191,17 @@ function deskGo(n) {
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
 }
 
-// Keyboard review. Ignored while typing into a field, so Settings still works.
+// Keyboard: Escape closes menus and the company panel everywhere; the
+// Outbox review keys work only on the Outbox, never while typing.
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && (_drawer.id || document.querySelector('.menu.open'))) {
+    const open = document.querySelector('.menu.open');
+    const wasInMenu = open && open.contains(document.activeElement);
+    closeMenus();
+    if (_drawer.id) closeDrawer();
+    else if (open && wasInMenu) { const b = open.querySelector('.menu-btn'); if (b) b.focus(); }
+    return;
+  }
   if (currentTab !== 'outbox' || e.metaKey || e.ctrlKey || e.altKey) return;
   // Mid-edit, A would approve the stored draft, not what's typed. Only
   // Escape (cancel) works until the edit is saved or cancelled.
@@ -1959,7 +2212,7 @@ document.addEventListener('keydown', e => {
     return;
   }
   const tag = (e.target.tagName || '').toLowerCase();
-  if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+  if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
   const cur = _desk.items[_desk.i];
   const k = e.key.toLowerCase();
   if (k === 'j') { e.preventDefault(); deskGo(_desk.i + 1); }
@@ -1972,256 +2225,679 @@ document.addEventListener('keydown', e => {
 async function outboxAct(id, action) {
   if (deskBusy()) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
-  else showToast(failMsg(data, 'Action failed.'), 'error');
+  if (data && data.success) showToast(action === 'approve' ? t('desk.approved') : t('desk.rejected'), 'success');
+  else showToast(failMsg(data, t('desk.action_failed')), 'error');
   loadOutbox();
 }
 
 async function outboxApproveAll() {
   if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).' + (data.held
-    ? ' ' + data.held + ' Harvey held ' + (data.held === 1 ? 'is' : 'are') + ' left for you to read and approve one by one.'
-    : ''), 'success');
-  else showToast(failMsg(data, 'Approve-all failed.'), 'error');
+  if (data && data.success) showToast(t('desk.approved_all', {n: data.approved}) +
+    (data.held ? ' ' + t('desk.held_left', {n: data.held}) : ''), 'success');
+  else showToast(failMsg(data, t('desk.approve_all_failed')), 'error');
   loadOutbox();
 }
 
 async function sendingToggle(action) {
   const data = await api('/api/sending/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
-  else showToast(failMsg(data, action === 'pause' ? 'Could not pause sending.' : 'Could not resume sending.'), 'error');
-  loadOutbox();
+  if (data && data.success) showToast(action === 'pause' ? t('ob.paused_toast') : t('ob.resumed_toast'), 'success');
+  else showToast(failMsg(data, action === 'pause' ? t('ob.pause_failed') : t('ob.resume_failed')), 'error');
+  if (currentTab === 'outbox') loadOutbox();
+  else loadCurrentTab();
 }
 
-// The search box lives outside the rows, so the 15-second refresh re-renders
-// them without losing what you typed. With words in it the list comes from
-// the local company search (name, activity as a CAEN code or in words, town).
-let _companyQuery = '', _companySearchTimer = null;
+// What email will do with nobody watching, said outside the Email module
+// too: hiding the module's tabs must never hide that mail can still go out,
+// or the switch that stops it.
+function sendingStateText(s) {
+  if (s.paused) return {tone: 'idle', title: t('send.paused'), detail: t('send.paused_detail')};
+  const parts = [];
+  let title = t('send.quiet');
+  if (s.autopilot) {
+    title = t('send.live_auto');
+    if (s.queued) parts.push(t('send.queued', {n: s.queued}));
+  } else if (s.queued) {
+    title = t('send.live_queued', {n: s.queued});
+    parts.push(t('send.approval'));
+  } else if (s.autopilot === false) {
+    parts.push(t('send.approval'));
+  }
+  if (s.waiting) parts.push(t('send.waiting', {n: s.waiting}));
+  return {tone: s.live ? 'wait' : 'good', title: title, detail: parts.join(' · ')};
+}
+
+function sendingButton(s) {
+  return s.paused
+    ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' + escHtml(t('ob.resume')) + '</button>'
+    : '<button class="btn btn-danger btn-sm" onclick="sendingToggle(\'pause\')">' + escHtml(t('ob.pause')) + '</button>';
+}
+
+// Overview: a notice only while mail can go out and the module is hidden.
+function renderOverviewSending(s) {
+  const el = document.getElementById('overview-sending');
+  if (!el) return;
+  if (!s || !s.live || _modules.email) { el.innerHTML = ''; return; }
+  const words = sendingStateText(s);
+  el.innerHTML = '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>' + escHtml(words.title) + '</b>' +
+    '<p>' + (words.detail ? escHtml(words.detail) + '. ' : '') + escHtml(t('send.hidden_note')) + '</p></div>' + sendingButton(s) + '</div>';
+}
+
+// Controls: always there, whatever the modules.
+async function loadControlSending() {
+  const el = document.getElementById('control-sending');
+  if (!el) return;
+  const s = await api('/api/sending/status');
+  if (!s) { el.innerHTML = '<p class="muted">' + escHtml(t('send.unreadable')) + '</p>'; return; }
+  const words = sendingStateText(s);
+  el.innerHTML = '<div class="status-big"><div class="dot ' + (s.paused ? 'stopped' : s.live ? 'running' : 'stopped') + '"></div>' +
+      '<span class="label">' + escHtml(words.title) + '</span></div>' +
+    (words.detail ? '<div class="status-meta">' + escHtml(words.detail) + '</div>' : '') +
+    '<div class="btn-group">' + sendingButton(s) + '</div>';
+}
+
+// ── Shared table pieces: pager, selection, actions menu ──
+
+const PAGE_SIZES = [25, 50, 100];
+
+function pagerHtml(state, total, fn) {
+  const from = total ? state.offset + 1 : 0;
+  const to = Math.min(total, state.offset + state.limit);
+  return '<div class="pager">' +
+    '<span class="pager-range">' + escHtml(t('page.range', {from: from, to: to, total: total})) + '</span>' +
+    '<label class="pager-size"><span>' + escHtml(t('page.per_page')) + '</span>' +
+      '<select class="form-input" onchange="' + fn + '(\'size\', this.value)" aria-label="' + escHtml(t('page.per_page')) + '">' +
+      PAGE_SIZES.map(n => '<option value="' + n + '"' + (n === state.limit ? ' selected' : '') + '>' + n + '</option>').join('') +
+      '</select></label>' +
+    '<span class="pager-btns">' +
+      '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'prev\')"' + (state.offset > 0 ? '' : ' disabled') +
+        ' aria-label="' + escHtml(t('page.prev')) + '" title="' + escHtml(t('page.prev')) + '">' + icon('chev-left') + '</button>' +
+      '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'next\')"' + (to < total ? '' : ' disabled') +
+        ' aria-label="' + escHtml(t('page.next')) + '" title="' + escHtml(t('page.next')) + '">' + icon('chev-right') + '</button>' +
+    '</span></div>';
+}
+
+function pageMove(state, how, value) {
+  if (how === 'size') { state.limit = Number(value) || 50; state.offset = 0; savePageSize(state.limit); }
+  else if (how === 'prev') state.offset = Math.max(0, state.offset - state.limit);
+  else if (how === 'next') state.offset += state.limit;
+}
+
+function savePageSize(n) { try { localStorage.setItem('harvey-page-size', String(n)); } catch { /* ignore */ } }
+function loadPageSize() {
+  try { const n = Number(localStorage.getItem('harvey-page-size')); return PAGE_SIZES.includes(n) ? n : 50; }
+  catch { return 50; }
+}
+
+function closeMenus() {
+  document.querySelectorAll('.menu.open').forEach(m => {
+    m.classList.remove('open');
+    const b = m.querySelector('.menu-btn');
+    if (b) b.setAttribute('aria-expanded', 'false');
+  });
+}
+
+function toggleMenu(btn, event) {
+  if (event) event.stopPropagation();
+  const menu = btn.closest('.menu');
+  const open = !menu.classList.contains('open');
+  closeMenus();
+  if (open) {
+    menu.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+    const first = menu.querySelector('.menu-list button:not(:disabled)');
+    if (first) first.focus();
+  }
+}
+
+document.addEventListener('click', e => { if (!e.target.closest('.menu')) closeMenus(); });
+
+function menuHtml(id, items) {
+  return '<div class="menu" id="' + id + '">' +
+    '<button class="btn btn-secondary menu-btn" aria-haspopup="true" aria-expanded="false" onclick="toggleMenu(this, event)">' +
+      escHtml(t('actions.title')) + icon('chev-down') + '</button>' +
+    '<div class="menu-list" role="menu">' + items.map(it => it.sep
+      ? '<div class="menu-sep" role="separator">' + (it.label ? escHtml(it.label) : '') + '</div>'
+      : '<button role="menuitem" onclick="closeMenus();' + it.action + '"' + (it.disabled ? ' disabled' : '') + '>' +
+          icon(it.icon || 'download') + '<span>' + escHtml(it.label) + '</span>' +
+          (it.note ? '<span class="menu-note">' + escHtml(it.note) + '</span>' : '') + '</button>').join('') +
+    '</div></div>';
+}
+
+// Phones show the rows as cards without the table header, so the
+// select-all box moves above them.
+function selectPageMobile(allOn, fn) {
+  return '<label class="sel-page-mobile"><input type="checkbox"' + (allOn ? ' checked' : '') +
+    ' onchange="' + fn + '(this.checked)"><span>' + escHtml(t('sel.page')) + '</span></label>';
+}
+
+function stamp() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+
+// ── Companies: phone and email first ──
+//
+// Server-side pages: /api/companies/search when there is a query, else
+// /api/companies. The search box and the selection live outside the rows,
+// so the 15-second refresh re-renders them without losing either.
+
+let _co = { q: '', offset: 0, limit: 50, total: 0, selected: new Set(), timer: null, gen: 0 };
 
 async function loadCompanies() {
-  companyDrill = false;
   const el = document.getElementById('companies-list');
   if (!document.getElementById('company-rows')) {
     el.innerHTML = '<div class="toolbar">' +
-      '<label class="search">' + icon('discover') +
-        '<input class="form-input" id="company-search" type="search" ' +
-        'placeholder="Search activity, CAEN code, name, town" aria-label="Search companies" ' +
+      '<label class="search grow">' + icon('discover') +
+        '<input class="form-input" id="company-search" type="search" autocomplete="off" ' +
+        'data-i18n-placeholder="co.search_ph" data-i18n-aria="co.search_label" ' +
+        'placeholder="' + escHtml(t('co.search_ph')) + '" aria-label="' + escHtml(t('co.search_label')) + '" ' +
         'oninput="companySearchInput(this.value)"></label>' +
-      '</div><div id="company-rows"></div>';
-    document.getElementById('company-search').value = _companyQuery;
+      '<div id="company-actions"></div>' +
+      '</div><div id="company-selbar"></div><div id="company-rows"></div>';
+    document.getElementById('company-search').value = _co.q;
   }
   const rowsEl = document.getElementById('company-rows');
-  const q = _companyQuery.trim();
-  let data, total;
-  if (q) {
-    const res = await api('/api/companies/search?limit=200&q=' + encodeURIComponent(q));
-    if (!res || !document.getElementById('company-rows')) { rowsEl.innerHTML = offlineState(); return; }
-    if (q !== _companyQuery.trim()) return;      // a newer search is on its way
-    data = res.companies || [];
-    total = res.total || 0;
-  } else {
-    data = await api('/api/companies');
-    if (!data) { rowsEl.innerHTML = offlineState(); return; }
-    total = data.length;
+  const q = _co.q.trim();
+  const gen = ++_co.gen;
+  const res = q
+    ? await api('/api/companies/search?limit=' + _co.limit + '&offset=' + _co.offset + '&q=' + encodeURIComponent(q))
+    : await api('/api/companies?limit=' + _co.limit + '&offset=' + _co.offset);
+  if (gen !== _co.gen) return;                       // a newer page or search is on its way
+  if (!res || !document.getElementById('company-rows')) { rowsEl.innerHTML = offlineState(); return; }
+  const data = res.companies || [];
+  _co.total = res.total || 0;
+  if (!data.length && _co.offset > 0 && _co.total > 0) {   // the list shrank: back to page one
+    _co.offset = 0;
+    return loadCompanies();
   }
   _companies = data;
+  renderCompanyActions();
+  renderCompanySelbar();
   if (!data.length) {
-    rowsEl.innerHTML = q
-      ? '<div class="table-card">' + emptyState(icon('discover'), 'No matches',
-          'No company on file matches every word. Try an activity in English or Romanian ' +
-          '(dentist, stomatologie), a CAEN code (8623) or a town.') + '</div>'
-      : emptyState(icon('companies'), 'No companies yet',
-          'Confirm your <b>Signals</b>, then find businesses on the <b>Discover</b> tab. ' +
-          'OpenStreetMap is free and needs no account.');
+    const onlyExcluded = q && q.split(/\s+/).every(w => w.startsWith('-'));
+    rowsEl.innerHTML = '<div class="table-card">' + (q
+      ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t(onlyExcluded ? 'co.only_excluded' : 'co.no_match_copy')))
+      : emptyState(icon('companies'), escHtml(t('co.empty')), t('co.empty_copy'))) + '</div>';
     return;
   }
-  let html = '<div class="table-card"><table class="nowrap"><thead><tr><th>Company</th><th>Industry</th>' +
-    '<th>Location</th><th>Size</th><th class="num">Contacts</th><th>Source</th><th>Added</th></tr></thead><tbody>';
+  const allOn = data.every(c => _co.selected.has(c.id));
+  let html = selectPageMobile(allOn, 'selectCompanyPage') + '<div class="table-card"><table class="data co-table"><thead><tr>' +
+    '<th class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.page')) + '"' + (allOn ? ' checked' : '') +
+      ' onchange="selectCompanyPage(this.checked)"></th>' +
+    '<th>' + escHtml(t('co.col.company')) + '</th><th>' + escHtml(t('co.col.phone')) + '</th><th>' +
+    escHtml(t('co.col.email')) + '</th><th>' + escHtml(t('co.col.activities')) + '</th><th>' +
+    escHtml(t('co.col.source')) + '</th></tr></thead><tbody>';
   data.forEach((c, i) => {
-    const website = c.website || (c.domain ? 'https://' + c.domain : '');
-    const domain = safeHref(website)
-      ? '<a href="' + safeHref(website) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' +
-        escHtml(c.domain || website.replace(/^https?:\/\//i, '')) + '</a>'
-      : escHtml(c.domain);
-    html += '<tr class="clickable" onclick="showCompanyContacts(' + i + ')">' +
-      '<td><div class="cell-stack"><span class="cell-main">' + escHtml(c.name) + '</span>' +
-        '<span class="cell-sub">' + domain + '</span></div></td>' +
-      '<td>' + companyActivities(c) + '</td>' +
-      '<td>' + escHtml(c.location) + '</td>' +
-      '<td class="muted">' + escHtml(c.company_size) + '</td>' +
-      '<td class="num">' + (c.contact_count || 0) + '</td>' +
-      '<td class="muted">' + sourceLabel(c.source) + '</td>' +
-      '<td class="muted">' + relTime(c.created_at) + '</td></tr>';
+    const on = _co.selected.has(c.id);
+    html += '<tr class="clickable' + (on ? ' selected' : '') + '" onclick="rowOpen(event, ' + i + ')">' +
+      '<td class="sel" data-label=""><input type="checkbox" aria-label="' + escHtml(t('sel.row', {name: c.name})) + '"' +
+        (on ? ' checked' : '') + ' onchange="selectCompany(' + i + ', this.checked)"></td>' +
+      '<td class="co-name"><div class="cell-stack"><button type="button" class="link-btn cell-main" onclick="openCompany(' + jsq(c.id) + ')" ' +
+        'aria-haspopup="dialog">' + escHtml(c.name) + '</button>' +
+        '<span class="cell-sub">' + companyIdLine(c) + '</span></div></td>' +
+      '<td class="co-phone" data-label="' + escHtml(t('co.col.phone')) + '">' + phoneCell(c) + '</td>' +
+      '<td class="co-email" data-label="' + escHtml(t('co.col.email')) + '">' + emailCell(c) + '</td>' +
+      '<td class="co-acts" data-label="' + escHtml(t('co.col.activities')) + '">' + companyActivities(c) + '</td>' +
+      '<td class="co-src muted" data-label="' + escHtml(t('co.col.source')) + '">' + sourceLabel(c.source) + '</td></tr>';
   });
-  rowsEl.innerHTML = html + '</tbody></table></div>' +
-    '<div class="table-foot">' + (total > data.length ? data.length + ' of ' : '') +
-    total + ' compan' + (total === 1 ? 'y' : 'ies') + '</div>';
+  rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_co, _co.total, 'pageCompanies');
+}
+
+function companyIdLine(c) {
+  const place = String(c.location || '').replace(/,\s*Romania$/i, '');
+  return [c.cui ? '<span class="mono">' + escHtml(t('co.cui', {cui: c.cui})) + '</span>' : '',
+          place ? escHtml(place) : ''].filter(Boolean).join('<span class="dot-sep">·</span>');
+}
+
+function phoneCell(c) {
+  const main = c.phone_display || c.phone || '';
+  if (!main) return '<span class="none">' + escHtml(t('co.no_phone')) + '</span>';
+  const href = telHref(main);
+  const others = (c.other_phones || []).length;
+  const kind = c.phone_type ? t('phone.' + c.phone_type) : '';
+  return '<div class="contact-cell">' +
+    '<div class="contact-line">' + (href
+      ? '<a class="mono tel" href="' + href + '" onclick="event.stopPropagation()">' + escHtml(main) + '</a>'
+      : '<span class="mono">' + escHtml(main) + '</span>') +
+      '<button class="copy" onclick="event.stopPropagation();copyText(' + jsq(main) + ', this)" aria-label="' +
+        escHtml(t('common.copy')) + '" title="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>' +
+    ((kind && kind !== 'phone.' + c.phone_type) || others
+      ? '<div class="cell-sub">' + [kind && kind !== 'phone.' + c.phone_type ? escHtml(kind) : '',
+          others ? escHtml(t('co.more_phones', {n: others})) : ''].filter(Boolean).join(' · ') + '</div>' : '') +
+    '</div>';
+}
+
+function emailCell(c) {
+  const emails = c.emails || [];
+  if (!emails.length) return '<span class="none">' + escHtml(t('co.no_email')) + '</span>';
+  const e = emails[0];
+  const href = mailHref(e.email);
+  const m = statusMeta(e.status || 'guess');
+  return '<div class="contact-cell"><div class="contact-line">' +
+    '<span class="mini-dot t-' + m.tone + '" title="' + escHtml(m.label) + '"></span>' +
+    (href ? '<a class="email" href="' + href + '" onclick="event.stopPropagation()">' + escHtml(e.email) + '</a>'
+          : '<span class="email">' + escHtml(e.email) + '</span>') +
+    '<button class="copy" onclick="event.stopPropagation();copyText(' + jsq(e.email) + ', this)" aria-label="' +
+      escHtml(t('common.copy')) + '" title="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>' +
+    '<div class="cell-sub">' + [escHtml(m.label), e.name ? escHtml(e.name) : '',
+      emails.length > 1 ? escHtml(t('co.more_emails', {n: emails.length - 1})) : ''].filter(Boolean).join(' · ') + '</div></div>';
+}
+
+function rowOpen(event, i) {
+  if (event.target.closest('a, button, input, label, select')) return;
+  const c = _companies[i];
+  if (c) openCompany(c.id);
+}
+
+function selectCompany(i, on) {
+  const c = _companies[i];
+  if (!c) return;
+  if (on) _co.selected.add(c.id); else _co.selected.delete(c.id);
+  loadCompaniesSelectionOnly();
+}
+
+function selectCompanyPage(on) {
+  _companies.forEach(c => { if (on) _co.selected.add(c.id); else _co.selected.delete(c.id); });
+  loadCompaniesSelectionOnly();
+}
+
+// Re-mark the rows without fetching the page again.
+function loadCompaniesSelectionOnly() {
+  document.querySelectorAll('#company-rows tbody tr').forEach((tr, i) => {
+    const c = _companies[i];
+    const on = !!(c && _co.selected.has(c.id));
+    tr.classList.toggle('selected', on);
+    const box = tr.querySelector('td.sel input');
+    if (box) box.checked = on;
+  });
+  const allOn = _companies.length > 0 && _companies.every(c => _co.selected.has(c.id));
+  document.querySelectorAll('#company-rows thead input, #company-rows .sel-page-mobile input')
+    .forEach(box => { box.checked = allOn; });
+  renderCompanyActions();
+  renderCompanySelbar();
+}
+
+function renderCompanySelbar() {
+  const el = document.getElementById('company-selbar');
+  if (!el) return;
+  const n = _co.selected.size;
+  el.innerHTML = n ? '<div class="selbar"><b>' + escHtml(t('sel.count', {n: n})) + '</b>' +
+    '<button class="btn btn-ghost btn-sm" onclick="clearCompanySelection()">' + escHtml(t('sel.clear')) + '</button></div>' : '';
+}
+
+function clearCompanySelection() {
+  _co.selected.clear();
+  loadCompaniesSelectionOnly();
+}
+
+function renderCompanyActions() {
+  const el = document.getElementById('company-actions');
+  if (!el) return;
+  const n = _co.selected.size;
+  const all = _co.q.trim() ? t('actions.all_results', {n: _co.total}) : t('actions.all_companies', {n: _co.total});
+  el.innerHTML = menuHtml('company-menu', [
+    {sep: true, label: t('actions.selection', {n: n})},
+    {label: t('actions.csv'), action: 'exportCompanies(\'csv\', true)', disabled: !n},
+    {label: t('actions.json'), action: 'exportCompanies(\'json\', true)', disabled: !n},
+    {sep: true, label: all},
+    {label: t('actions.csv'), action: 'exportCompanies(\'csv\', false)', disabled: !_co.total},
+    {label: t('actions.json'), action: 'exportCompanies(\'json\', false)', disabled: !_co.total},
+  ]);
+}
+
+function exportCompanies(format, selection) {
+  const body = selection ? {ids: [..._co.selected]} : (_co.q.trim() ? {q: _co.q.trim()} : {});
+  const name = 'firme-' + (selection ? 'selectie' : _co.q.trim() ? 'cautare' : 'toate') + '-' + stamp() + '.' + format;
+  postDownload('/api/export/companies.' + format, name, body);
+}
+
+function pageCompanies(how, value) {
+  pageMove(_co, how, value);
+  loadCompanies().then(() => {
+    const top = document.getElementById('companies');
+    if (top && how !== 'size') top.scrollIntoView({block: 'start'});
+  });
 }
 
 function companySearchInput(value) {
-  _companyQuery = value;
-  clearTimeout(_companySearchTimer);
-  _companySearchTimer = setTimeout(loadCompanies, 250);
+  _co.q = value;
+  _co.offset = 0;
+  clearTimeout(_co.timer);
+  _co.timer = setTimeout(loadCompanies, 250);
 }
 
-// What a company does, in words: its CAEN classes when a search returned
-// them (the ones the words matched first), else the industry it came with.
-function companyActivities(c) {
+// What a company does, in words: its CAEN classes (the ones a search
+// matched first), else the industry it came with. Names as the registry
+// writes them, in Romanian.
+function companyActivities(c, all) {
   const acts = c.activities || [];
-  if (!acts.length) return c.industry ? '<span class="tag">' + escHtml(c.industry) + '</span>' : '';
+  if (!acts.length) return c.industry ? '<span class="tag">' + escHtml(c.industry) + '</span>' : '<span class="none">—</span>';
   const shown = [], seen = new Set();
   for (const a of acts) {
     if (seen.has(a.code)) continue;
     seen.add(a.code);
-    if (shown.length < 2 && (a.matched || !acts.some(x => x.matched))) shown.push(a);
+    if (all || (shown.length < 2 && (a.matched || !acts.some(x => x.matched)))) shown.push(a);
   }
   const more = seen.size - shown.length;
-  return '<div class="cell-stack">' + shown.map(a =>
-    '<span class="cell-main" title="' + escHtml(a.name || '') + '">' + escHtml(a.code) + ' &mdash; ' +
-      escHtml(a.name_en || a.name || '') + '</span>').join('') +
-    (more > 0 ? '<span class="cell-sub">+' + more + ' more</span>' : '') + '</div>';
+  return '<div class="acts">' + shown.map(a =>
+    '<div class="act' + (a.matched ? ' matched' : '') + '" title="' + escHtml((a.name || '') + (a.revision ? ' (' + a.revision + ')' : '')) + '">' +
+      '<span class="code">' + escHtml(a.code) + '</span><span class="aname">' +
+      escHtml(a.name || a.name_en || '') + '</span></div>').join('') +
+    (more > 0 ? '<div class="cell-sub">' + escHtml(t('co.more_acts', {n: more})) + '</div>' : '') + '</div>';
 }
 
-async function showCompanyContacts(index) {
-  const company = _companies[index];
-  if (!company) return;
-  companyDrill = true;
-  const el = document.getElementById('companies-list');
-  const data = await api('/api/companies/' + encodeURIComponent(company.id) + '/contacts');
-  let html = '<button class="btn btn-ghost btn-sm" onclick="loadCompanies()" style="margin-bottom:12px">' +
-    '&larr; All companies</button>' +
-    '<div class="card flush"><div class="card-head"><h3>' + escHtml(company.name) + '</h3>' +
-    '<span class="meta">' + escHtml([company.industry, company.location].filter(Boolean).join(' · ')) + '</span></div>';
-  if (!data || !data.length) {
-    html += '<div class="empty"><div class="copy">No contacts found at this company yet.</div></div></div>';
-  } else {
-    html += '<table><thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>LinkedIn</th><th>Status</th><th>Source</th></tr></thead><tbody>';
-    for (const p of data) {
-      const phoneIcon = p.phone_verified ? ' <span class="muted">&#10003;</span>' : '';
-      html += '<tr><td><div class="cell-row"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
-          '<div class="cell-stack"><span class="cell-main">' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</span>' +
-          '<span class="cell-sub">' + escHtml(p.title) + '</span></div></div></td>' +
-        '<td>' + escHtml(p.email) + emailTag(p) + '</td>' +
-        '<td>' + escHtml(p.phone) + phoneIcon + '</td>' +
-        '<td>' + (safeHref(p.linkedin_url) ? '<a href="' + safeHref(p.linkedin_url) + '" target="_blank" rel="noopener noreferrer">Profile</a>' : '') + '</td>' +
-        '<td>' + badge(p.status) + '</td><td class="muted">' + sourceLabel(p.source) + '</td></tr>';
-    }
-    html += '</tbody></table></div>';
-  }
-  el.innerHTML = html;
+// ── The company panel ──
+
+let _drawer = { id: null, data: null, contacts: null, opener: null };
+
+async function openCompany(id) {
+  _drawer = { id: id, data: null, contacts: null, opener: document.activeElement };
+  const drawer = document.getElementById('drawer');
+  document.getElementById('drawer-backdrop').hidden = false;
+  drawer.hidden = false;
+  document.body.classList.add('drawer-open');
+  renderDrawer();
+  const [data, contacts] = await Promise.all([
+    api('/api/companies/' + encodeURIComponent(id)),
+    api('/api/companies/' + encodeURIComponent(id) + '/contacts'),
+  ]);
+  if (_drawer.id !== id) return;
+  _drawer.data = data || {error: true};
+  _drawer.contacts = Array.isArray(contacts) ? contacts : [];
+  renderDrawer();
+  // The panel itself takes focus (Tab reaches the close button next), so
+  // a mouse click doesn't light up a focus ring.
+  drawer.focus({preventScroll: true});
 }
+
+function closeDrawer() {
+  const opener = _drawer.opener;
+  _drawer = { id: null, data: null, contacts: null, opener: null };
+  document.getElementById('drawer').hidden = true;
+  document.getElementById('drawer-backdrop').hidden = true;
+  document.body.classList.remove('drawer-open');
+  if (opener && opener.focus) opener.focus();
+}
+
+function renderDrawer() {
+  const el = document.getElementById('drawer-body');
+  const c = _drawer.data;
+  const head = (title, sub) => '<div class="drawer-head"><div class="drawer-title"><h2 id="drawer-title">' + title + '</h2>' +
+    (sub ? '<div class="drawer-sub">' + sub + '</div>' : '') + '</div>' +
+    '<button class="btn btn-ghost btn-icon drawer-close" onclick="closeDrawer()" aria-label="' + escHtml(t('common.close')) + '">' +
+    icon('x') + '</button></div>';
+  if (!c) { el.innerHTML = head(escHtml(t('common.loading')), '') + '<div class="drawer-scroll"><div class="skeleton"></div><div class="skeleton"></div></div>'; return; }
+  if (c.error) { el.innerHTML = head(escHtml(t('drawer.error')), '') ; return; }
+
+  const section = (title, ico, body, count) => '<section class="dsec"><h3>' + icon(ico) + escHtml(title) +
+    (count ? '<span class="count">' + fmtN(count) + '</span>' : '') + '</h3>' + body + '</section>';
+  const none = text => '<p class="none">' + escHtml(text) + '</p>';
+
+  const phones = [];
+  const mainPhone = c.phone_display || c.phone;
+  if (mainPhone) phones.push({n: mainPhone, kind: c.phone_type, main: true});
+  (c.other_phones || []).forEach(n => phones.push({n: n}));
+  const phoneRows = phones.map(p => {
+    const href = telHref(p.n);
+    const kind = p.kind ? t('phone.' + p.kind) : '';
+    return '<div class="drow">' +
+      (href ? '<a class="mono big tel" href="' + href + '">' + escHtml(p.n) + '</a>' : '<span class="mono big">' + escHtml(p.n) + '</span>') +
+      '<span class="drow-meta">' + [p.main ? escHtml(t('drawer.main')) : '', kind && kind !== 'phone.' + p.kind ? escHtml(kind) : '']
+        .filter(Boolean).join(' · ') + '</span>' +
+      '<button class="copy" onclick="copyText(' + jsq(p.n) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>';
+  }).join('');
+
+  const emailRows = (c.emails || []).map(e => {
+    const href = mailHref(e.email);
+    const m = statusMeta(e.status || 'guess');
+    return '<div class="drow"><span class="mini-dot t-' + m.tone + '"></span>' +
+      (href ? '<a class="email" href="' + href + '">' + escHtml(e.email) + '</a>' : '<span class="email">' + escHtml(e.email) + '</span>') +
+      '<span class="drow-meta">' + [escHtml(m.label), escHtml(e.name), escHtml(e.title)].filter(Boolean).join(' · ') + '</span>' +
+      '<button class="copy" onclick="copyText(' + jsq(e.email) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>';
+  }).join('');
+
+  const people = (c.people || []).map(p =>
+    '<div class="person"><span class="avatar">' + initials(...String(p.name).split(' ')) + '</span>' +
+    '<div class="cell-stack"><span class="cell-main">' + escHtml(p.name) + '</span>' +
+    (p.title ? '<span class="cell-sub">' + escHtml(p.title) + '</span>' : '') + '</div></div>').join('');
+
+  const contacts = (_drawer.contacts || []).map(p => {
+    const name = [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '—';
+    const ph = p.phone ? (telHref(p.phone) ? '<a class="mono tel" href="' + telHref(p.phone) + '">' + escHtml(p.phone) + '</a>' : escHtml(p.phone)) : '';
+    const em = p.email ? (mailHref(p.email) ? '<a class="email" href="' + mailHref(p.email) + '">' + escHtml(p.email) + '</a>' : escHtml(p.email)) + emailTag(p) : '';
+    return '<div class="person"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
+      '<div class="cell-stack"><span class="cell-main">' + escHtml(name) + '</span>' +
+      (p.title ? '<span class="cell-sub">' + escHtml(p.title) + '</span>' : '') +
+      ([em, ph].filter(Boolean).length ? '<span class="person-lines">' + [em, ph].filter(Boolean).join('<br>') + '</span>' : '') +
+      '</div><span class="cell-sub">' + sourceLabel(p.source) + '</span></div>';
+  }).join('');
+
+  const site = safeHref(c.website || (c.domain ? 'https://' + c.domain : ''));
+  const facts = [
+    [t('drawer.cui'), c.cui ? '<span class="mono">' + escHtml(c.cui) + '</span>' : ''],
+    [t('drawer.address'), escHtml(c.address)],
+    [t('drawer.place'), escHtml(String(c.location || '').replace(/,\s*Romania$/i, ''))],
+    [t('drawer.website'), site ? '<a href="' + site + '" target="_blank" rel="noopener noreferrer">' +
+      escHtml(String(c.website || c.domain).replace(/^https?:\/\//i, '')) + ' &#8599;</a>' : ''],
+    [t('drawer.source'), sourceLabel(c.source) + (safeHref(c.source_url) ? ' · <a href="' + safeHref(c.source_url) +
+      '" target="_blank" rel="noopener noreferrer">' + escHtml(t('drawer.evidence')) + '</a>' : '')],
+    [t('drawer.added'), relTime(c.created_at)],
+  ].filter(f => f[1]);
+
+  el.innerHTML = head(escHtml(c.name), companyIdLine(c)) +
+    '<div class="drawer-scroll">' +
+    section(t('drawer.phones'), 'phone', phoneRows || none(t('drawer.no_phones')), phones.length) +
+    section(t('drawer.emails'), 'mail', emailRows || none(t('drawer.no_emails')), (c.emails || []).length) +
+    section(t('drawer.people'), 'contacts', people || none(t('drawer.no_people')), (c.people || []).length) +
+    (contacts ? section(t('drawer.contacts'), 'layers', contacts, (_drawer.contacts || []).length) : '') +
+    section(t('drawer.activities'), 'companies', companyActivities(c, true)) +
+    section(t('drawer.details'), 'pin', '<dl class="facts-list">' + facts.map(f => '<dt>' + escHtml(f[0]) + '</dt><dd>' + f[1] + '</dd>').join('') + '</dl>') +
+    '</div>' +
+    '<div class="drawer-foot"><button class="btn btn-secondary btn-sm" onclick="exportOne(\'csv\')">' + icon('download') + 'CSV</button>' +
+    '<button class="btn btn-secondary btn-sm" onclick="exportOne(\'json\')">' + icon('download') + 'JSON</button></div>';
+}
+
+function exportOne(format) {
+  if (!_drawer.id) return;
+  postDownload('/api/export/companies.' + format, 'firma-' + (_drawer.data && _drawer.data.cui || _drawer.id) + '.' + format,
+               {ids: [_drawer.id]});
+}
+
+// Focus stays inside the panel while it is open.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Tab' || !_drawer.id) return;
+  const items = [...document.querySelectorAll('#drawer a[href], #drawer button:not(:disabled)')];
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  else if (!e.target.closest('#drawer')) { e.preventDefault(); first.focus(); }
+});
 
 async function submitFeedback(entityType, entityId, promptText) {
-  const comment = prompt(promptText || 'Add your feedback:');
+  const comment = prompt(promptText || t('fb.prompt'));
   if (!comment) return;
   const data = await api('/api/feedback', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({entity_type: entityType, entity_id: entityId, comment: comment})
   });
-  if (data && data.success) showToast(entityType === 'campaign'
-    ? 'Saved. Harvey follows it in the emails it writes from now on.'
-    : 'Saved. Harvey uses it if it writes this person\'s first email (Gmail, SMTP or Microsoft 365).', 'success');
-  else showToast((data && data.message) || 'Could not save feedback.', 'error');
+  if (data && data.success) showToast(entityType === 'campaign' ? t('fb.saved_campaign') : t('fb.saved_contact'), 'success');
+  else showToast((data && data.message) || t('fb.failed'), 'error');
 }
 
 function fbProspect(i) {
   const p = _prospects[i];
-  if (p) submitFeedback('contact', p.id, 'Anything Harvey should know before writing to this person?');
+  if (p) submitFeedback('contact', p.id, t('fb.contact_prompt'));
 }
 
 function fbCampaign(i) {
   const c = _campaigns[i];
-  if (c) submitFeedback('campaign', c.id, 'What should Harvey do differently in the emails it writes next? (e.g. "shorter; don\'t mention reviews")');
+  if (c) submitFeedback('campaign', c.id, t('fb.campaign_prompt'));
 }
 
-// Search and status filter live outside the table, so the 15-second refresh
-// re-renders rows without losing what you typed.
-let _contactQuery = '', _contactFilter = 'all';
-const CONTACT_FILTERS = [
-  ['all', 'All', null],
-  ['todo', 'To write', ['new', 'queued']],
-  ['contacted', 'Contacted', ['contacted']],
-  ['replied', 'Replied', ['replied', 'interested', 'meeting']],
-  ['closed', 'Closed out', null],
-];
+// ── Contacts: same pattern as Companies ──
+
+let _ct = { q: '', filter: 'all', offset: 0, limit: 50, total: 0, counts: {}, selected: new Set(), timer: null, gen: 0 };
+const CONTACT_FILTERS = ['all', 'todo', 'contacted', 'replied', 'closed'];
 
 async function loadProspects() {
   const el = document.getElementById('prospects-table');
-  const data = await api('/api/prospects');
-  if (!data) { el.innerHTML = offlineState(); return; }
-  _prospects = data;
-  if (!data.length) {
-    el.innerHTML = emptyState(icon('contacts'), 'No contacts yet',
-      'Harvey hasn\'t found any prospects. Once it\'s running, the Scout agent searches the web for people matching your ideal customer profile in <b>harvey.yaml</b>.');
-    return;
-  }
   if (!document.getElementById('contact-rows')) {
     el.innerHTML = '<div class="toolbar">' +
-      '<label class="search">' + icon('discover') +
-        '<input class="form-input" id="contact-search" type="search" placeholder="Search name, company, email" ' +
-        'aria-label="Search contacts" oninput="_contactQuery=this.value;renderContacts()"></label>' +
-      '<div class="segmented" id="contact-filters" role="group" aria-label="Filter by status"></div>' +
-      '</div><div id="contact-rows"></div>';
-    // A rebuild after an offline blip must show the search still applied.
-    document.getElementById('contact-search').value = _contactQuery;
+      '<label class="search grow">' + icon('discover') +
+        '<input class="form-input" id="contact-search" type="search" autocomplete="off" ' +
+        'data-i18n-placeholder="ct.search_ph" data-i18n-aria="ct.search_label" placeholder="' + escHtml(t('ct.search_ph')) + '" ' +
+        'aria-label="' + escHtml(t('ct.search_label')) + '" oninput="contactSearchInput(this.value)"></label>' +
+      '<div class="segmented" id="contact-filters" role="group" data-i18n-aria="ct.filter_label" aria-label="' + escHtml(t('ct.filter_label')) + '"></div>' +
+      '<div id="contact-actions"></div>' +
+      '</div><div id="contact-selbar"></div><div id="contact-rows"></div>';
+    document.getElementById('contact-search').value = _ct.q;
   }
+  const filter = _modules.email ? _ct.filter : 'all';
+  const gen = ++_ct.gen;
+  const res = await api('/api/prospects?limit=' + _ct.limit + '&offset=' + _ct.offset +
+    '&filter=' + encodeURIComponent(filter) + '&q=' + encodeURIComponent(_ct.q.trim()));
+  if (gen !== _ct.gen) return;
+  const rowsEl = document.getElementById('contact-rows');
+  if (!res || !rowsEl) { if (rowsEl) rowsEl.innerHTML = offlineState(); return; }
+  _ct.total = res.total || 0;
+  _ct.counts = res.counts || {};
+  if (!(res.prospects || []).length && _ct.offset > 0 && _ct.total > 0) { _ct.offset = 0; return loadProspects(); }
+  _prospects = res.prospects || [];
   renderContacts();
 }
 
-function contactMatches(p, f) {
-  const known = ['new', 'queued', 'contacted', 'replied', 'interested', 'meeting'];
-  if (f === 'all') return true;
-  if (f === 'closed') return !known.includes(p.status);
-  const hit = CONTACT_FILTERS.find(x => x[0] === f);
-  return !!(hit && hit[2] && hit[2].includes(p.status));
+function contactSearchInput(value) {
+  _ct.q = value;
+  _ct.offset = 0;
+  clearTimeout(_ct.timer);
+  _ct.timer = setTimeout(loadProspects, 250);
 }
 
-function setContactFilter(f) { _contactFilter = f; renderContacts(); }
+function setContactFilter(f) { _ct.filter = f; _ct.offset = 0; loadProspects(); }
+
+function pageContacts(how, value) {
+  pageMove(_ct, how, value);
+  loadProspects().then(() => {
+    const top = document.getElementById('prospects');
+    if (top && how !== 'size') top.scrollIntoView({block: 'start'});
+  });
+}
 
 function renderContacts() {
   const rowsEl = document.getElementById('contact-rows');
   const filtersEl = document.getElementById('contact-filters');
   if (!rowsEl) return;
-  const q = _contactQuery.trim().toLowerCase();
-  const found = p => !q || [p.first_name, p.last_name, p.company, p.email, p.title].join(' ').toLowerCase().includes(q);
-  filtersEl.innerHTML = CONTACT_FILTERS.map(f =>
-    '<button class="' + (f[0] === _contactFilter ? 'on' : '') + '" aria-pressed="' + (f[0] === _contactFilter) + '" onclick="setContactFilter(\'' + f[0] + '\')">' +
-      f[1] + ' <span class="n">' + _prospects.filter(p => contactMatches(p, f[0]) && found(p)).length + '</span></button>'
-  ).join('');
+  const email = !!_modules.email;
+  filtersEl.hidden = !email;
+  filtersEl.innerHTML = email ? CONTACT_FILTERS.map(f =>
+    '<button class="' + (f === _ct.filter ? 'on' : '') + '" aria-pressed="' + (f === _ct.filter) + '" onclick="setContactFilter(\'' + f + '\')">' +
+      escHtml(t('ct.filter.' + f)) + ' <span class="n">' + fmtN(_ct.counts[f] || 0) + '</span></button>'
+  ).join('') : '';
+  renderContactActions();
+  renderContactSelbar();
 
-  const rows = _prospects.map((p, i) => [p, i]).filter(([p]) => contactMatches(p, _contactFilter) && found(p));
-  if (!rows.length) {
-    rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), 'No matches',
-      'Nothing matches that search and filter.') + '</div>';
+  if (!_prospects.length) {
+    rowsEl.innerHTML = '<div class="table-card">' + (_ct.q.trim() || _ct.filter !== 'all'
+      ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t('ct.no_match_copy')))
+      : emptyState(icon('contacts'), escHtml(t('ct.empty')), escHtml(t('ct.empty_copy')))) + '</div>';
     return;
   }
-  let html = '<div class="table-card"><table class="nowrap"><thead><tr><th>Name</th><th>Company</th><th>Email</th>' +
-    '<th>Score</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
-  for (const [p, i] of rows) {
-    html += '<tr><td><div class="cell-row"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
-        '<div class="cell-stack"><span class="cell-main">' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</span>' +
+  const allOn = _prospects.every(p => _ct.selected.has(p.id));
+  let html = selectPageMobile(allOn, 'selectContactPage') + '<div class="table-card"><table class="data ct-table"><thead><tr>' +
+    '<th class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.page')) + '"' + (allOn ? ' checked' : '') +
+      ' onchange="selectContactPage(this.checked)"></th>' +
+    '<th>' + escHtml(t('ct.col.name')) + '</th><th>' + escHtml(t('ct.col.company')) + '</th><th>' +
+    escHtml(t('co.col.phone')) + '</th><th>' + escHtml(t('co.col.email')) + '</th>' +
+    (email ? '<th>' + escHtml(t('ct.col.status')) + '</th>' : '') +
+    '<th>' + escHtml(t('co.col.source')) + '</th><th>' + escHtml(t('ct.col.added')) + '</th>' +
+    (email ? '<th></th>' : '') + '</tr></thead><tbody>';
+  _prospects.forEach((p, i) => {
+    const on = _ct.selected.has(p.id);
+    const name = [p.first_name, p.last_name].filter(Boolean).join(' ');
+    // A company cell can hold several numbers ("+40 …;+40 …"): show the first.
+    const phones = String(p.phone || p.company_phone || '').split(/\s*[;,]\s*/).filter(Boolean);
+    const phone = phones[0] || '';
+    const phoneHref = telHref(phone);
+    const mh = mailHref(p.email);
+    html += '<tr class="' + (on ? 'selected' : '') + '">' +
+      '<td class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.row', {name: name || p.email})) + '"' +
+        (on ? ' checked' : '') + ' onchange="selectContact(' + i + ', this.checked)"></td>' +
+      '<td class="ct-name"><div class="cell-row"><span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
+        '<div class="cell-stack"><span class="cell-main">' + (name ? escHtml(name) : '<span class="muted">' + escHtml(t('ct.inbox')) + '</span>') + '</span>' +
         '<span class="cell-sub">' + escHtml(p.title) + '</span></div></div></td>' +
-      '<td>' + escHtml(p.company) + '</td>' +
-      '<td><div class="cell-stack"><span>' + escHtml(p.email) + '</span>' +
-        '<span class="cell-sub">' + [emailTag(p).trim(), p.phone ? escHtml(p.phone) +
-          (p.phone_verified ? ' <span class="verified" title="Phone verified">&#10003;</span>' : '') : '']
-          .filter(Boolean).join(' · ') + '</span>' +
-        '</div></td>' +
-      '<td>' + (p.score || p.score === 0 ? meterHtml(p.score) : '') + '</td>' +
-      '<td>' + badge(p.status) + '</td>' +
-      '<td class="muted">' + sourceLabel(p.source) + '</td>' +
-      '<td class="muted" style="white-space:nowrap">' + relTime(p.created_at) + '</td>' +
-      '<td><div class="cell-row">' + (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
+      '<td data-label="' + escHtml(t('ct.col.company')) + '"><div class="cell-stack">' +
+        (p.company_id ? '<a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(p.company_id) + ');return false">' +
+          escHtml(p.company_name || p.company) + '</a>' : '<span class="cell-main">' + escHtml(p.company) + '</span>') +
+        '<span class="cell-sub">' + escHtml(String(p.company_location || '').replace(/,\s*Romania$/i, '')) + '</span></div></td>' +
+      '<td data-label="' + escHtml(t('co.col.phone')) + '">' + (phone
+        ? '<div class="contact-line">' + (phoneHref ? '<a class="mono tel" href="' + phoneHref + '">' + escHtml(phone) + '</a>' : '<span class="mono">' + escHtml(phone) + '</span>') +
+          '<button class="copy" onclick="copyText(' + jsq(phone) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>' +
+          (!p.phone ? '<div class="cell-sub">' + escHtml(t('ct.company_phone')) +
+            (phones.length > 1 ? ' · ' + escHtml(t('co.more_phones', {n: phones.length - 1})) : '') + '</div>' : (p.phone_verified ? '<div class="cell-sub verified">' + escHtml(t('ct.phone_verified')) + '</div>' : ''))
+        : '<span class="none">' + escHtml(t('co.no_phone')) + '</span>') + '</td>' +
+      '<td data-label="' + escHtml(t('co.col.email')) + '">' + (p.email
+        ? '<div class="contact-line">' + (mh ? '<a class="email" href="' + mh + '">' + escHtml(p.email) + '</a>' : '<span class="email">' + escHtml(p.email) + '</span>') +
+          '<button class="copy" onclick="copyText(' + jsq(p.email) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>' +
+          '<div class="cell-sub">' + emailTag(p) + '</div>'
+        : '<span class="none">' + escHtml(t('co.no_email')) + '</span>') + '</td>' +
+      (email ? '<td data-label="' + escHtml(t('ct.col.status')) + '">' + badge(p.status) + '</td>' : '') +
+      '<td class="muted" data-label="' + escHtml(t('co.col.source')) + '">' + sourceLabel(p.source) + '</td>' +
+      '<td class="muted nowrap" data-label="' + escHtml(t('ct.col.added')) + '">' + relTime(p.created_at) + '</td>' +
+      (email ? '<td><div class="cell-row">' + (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
-          'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
-          (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
+          'aria-expanded="' + (_optOut.id === p.id) + '" title="' + escHtml(t('ct.optout_title')) + '">' +
+          escHtml(p.status === 'opted_out' ? t('ct.why') : t('ct.optout_history')) + '</button>' : '') +
         '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
-        'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
-    if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
-  }
-  rowsEl.innerHTML = html + '</tbody></table></div>' +
-    '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+        'title="' + escHtml(t('ct.feedback_title')) + '">' + escHtml(t('ct.feedback')) + '</button></div></td>' : '') +
+      '</tr>';
+    if (email && _optOut.id === p.id) html += '<tr class="detail-row"><td colspan="9">' + optOutPanel(p) + '</td></tr>';
+  });
+  rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_ct, _ct.total, 'pageContacts');
+}
+
+function selectContact(i, on) {
+  const p = _prospects[i];
+  if (!p) return;
+  if (on) _ct.selected.add(p.id); else _ct.selected.delete(p.id);
+  renderContacts();
+}
+
+function selectContactPage(on) {
+  _prospects.forEach(p => { if (on) _ct.selected.add(p.id); else _ct.selected.delete(p.id); });
+  renderContacts();
+}
+
+function renderContactSelbar() {
+  const el = document.getElementById('contact-selbar');
+  if (!el) return;
+  const n = _ct.selected.size;
+  el.innerHTML = n ? '<div class="selbar"><b>' + escHtml(t('sel.count', {n: n})) + '</b>' +
+    '<button class="btn btn-ghost btn-sm" onclick="_ct.selected.clear();renderContacts()">' + escHtml(t('sel.clear')) + '</button></div>' : '';
+}
+
+function renderContactActions() {
+  const el = document.getElementById('contact-actions');
+  if (!el) return;
+  const n = _ct.selected.size;
+  el.innerHTML = menuHtml('contact-menu', [
+    {sep: true, label: t('actions.selection', {n: n})},
+    {label: t('actions.csv'), action: 'exportContacts()', disabled: !n},
+    {sep: true, label: t('actions.all_contacts')},
+    {label: t('actions.deliverable'), note: t('actions.deliverable_note'), action: 'exportAllContacts(false)'},
+    {label: t('actions.everything'), note: t('actions.everything_note'), action: 'exportAllContacts(true)'},
+  ]);
+}
+
+function exportAllContacts(everything) {
+  downloadCsv('/api/export/prospects.csv?bom=true' + (everything ? '&all=true' : ''),
+              'contacte-' + (everything ? 'toate' : 'sigure') + '-' + stamp() + '.csv');
+}
+
+function exportContacts() {
+  postDownload('/api/export/prospects.csv', 'contacte-selectie-' + stamp() + '.csv', {ids: [..._ct.selected]});
 }
 
 // Why someone is opted out, and undoing it. Harvey never moves anyone off
@@ -2229,10 +2905,10 @@ function renderContacts() {
 // something else) needs you: see what triggered it, then undo it here.
 let _optOut = {id: null, data: null, armed: false, busy: false};
 const OPT_OUT_RULES = {
-  phrase: 'Matched an opt-out phrase',
-  no_thanks: 'Matched “no thanks”',
-  only_words: 'Their reply was only an opt-out word',
-  model: 'The model’s judgement (no phrase matched)',
+  phrase: 'optout.rule.phrase',
+  no_thanks: 'optout.rule.no_thanks',
+  only_words: 'optout.rule.only_words',
+  model: 'optout.rule.model',
 };
 
 async function toggleOptOut(i) {
@@ -2250,38 +2926,36 @@ async function toggleOptOut(i) {
 function optOutPanel(p) {
   const d = _optOut.data;
   const name = escHtml([p.first_name, p.last_name].filter(Boolean).join(' ') || p.email);
-  if (!d) return '<div class="optout-panel muted">Loading…</div>';
-  if (d.error) return '<div class="optout-panel muted">Couldn’t load the opt-out record. Try again.</div>';
-  let html = '<div class="optout-panel"><h4>' + (d.opted_out ? 'Why Harvey stopped emailing ' : 'Opt-out history for ') +
-    name + '</h4>';
+  if (!d) return '<div class="optout-panel muted">' + escHtml(t('common.loading')) + '</div>';
+  if (d.error) return '<div class="optout-panel muted">' + escHtml(t('optout.load_failed')) + '</div>';
+  let html = '<div class="optout-panel"><h4>' + t(d.opted_out ? 'optout.why_title' : 'optout.history_title', {name: name}) + '</h4>';
   if (d.recorded) {
+    const rule = own(OPT_OUT_RULES, d.rule);
     html += '<p>' + escHtml(d.why) + '</p><div class="optout-meta">' +
-      escHtml(own(OPT_OUT_RULES, d.rule) || d.rule || '') + (d.at ? ' · ' + relTime(d.at) : '') + '</div>';
+      escHtml(rule ? t(rule) : d.rule || '') + (d.at ? ' · ' + relTime(d.at) : '') + '</div>';
   } else if (d.opted_out || (d.history || []).length) {
-    html += '<p>They opted out before Harvey kept a record of why.' +
-      (d.message ? ' The last thing they wrote:' : ' There’s no reply from them on file.') + '</p>';
+    html += '<p>' + escHtml(t('optout.no_record')) + ' ' +
+      escHtml(d.message ? t('optout.last_message') : t('optout.no_reply')) + '</p>';
   }
   if (d.message) {
-    html += '<div class="thread-msg received"><div class="sender">' + escHtml(p.first_name || 'They') +
+    html += '<div class="thread-msg received"><div class="sender">' + escHtml(p.first_name || t('optout.they')) +
       (d.at ? ' &middot; ' + relTime(d.at) : '') + '</div>' + escHtml(d.message) + '</div>';
   }
   const undone = (d.history || []).filter(h => h.action === 'opt_out_undone');
   if (undone.length) {
-    html += '<div class="optout-meta">' + undone.map(h => 'You undid an opt-out ' + relTime(h.at)).join(' · ') + '</div>';
+    html += '<div class="optout-meta">' + undone.map(h => escHtml(t('optout.you_undid')) + ' ' + relTime(h.at)).join(' · ') + '</div>';
   }
   if (!d.opted_out) {
-    html += '<div class="convo-actions"><span class="muted">Not opted out now (' +
-      escHtml(statusMeta(d.status).label) + ').</span></div>';
+    html += '<div class="convo-actions"><span class="muted">' +
+      escHtml(t('optout.not_now', {status: statusMeta(d.status).label})) + '</span></div>';
   } else if (_optOut.armed) {
-    html += '<div class="convo-actions"><span class="muted">Harvey will treat them as having replied. Nothing is ' +
-      'sent automatically, emails the opt-out cancelled stay cancelled, and Harvey’s answer to their next ' +
-      'reply waits for your approval, even on autopilot. Only undo it if they didn’t mean to opt out.</span>' +
+    html += '<div class="convo-actions"><span class="muted">' + escHtml(t('optout.confirm_text')) + '</span>' +
       '<button class="btn btn-primary btn-sm" onclick="undoOptOut()"' + (_optOut.busy ? ' disabled' : '') +
-        '>Confirm undo</button>' +
-      '<button class="btn btn-ghost btn-sm" onclick="_optOut.armed=false;renderContacts()">Cancel</button></div>';
+        '>' + escHtml(t('optout.confirm')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_optOut.armed=false;renderContacts()">' + escHtml(t('common.cancel')) + '</button></div>';
   } else {
     html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
-      'onclick="_optOut.armed=true;renderContacts()">Undo opt-out</button></div>';
+      'onclick="_optOut.armed=true;renderContacts()">' + escHtml(t('optout.undo')) + '</button></div>';
   }
   return html + '</div>';
 }
@@ -2295,8 +2969,8 @@ async function undoOptOut() {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({confirm: true}),
   });
-  if (res && res.success) showToast('Opt-out undone. They’re marked as replied; Harvey sends nothing on its own.', 'success');
-  else showToast(failMsg(res, 'Could not undo the opt-out. Try again.'), 'error');
+  if (res && res.success) showToast(t('optout.undone'), 'success');
+  else showToast(failMsg(res, t('optout.undo_failed')), 'error');
   if (_optOut.id !== id) return;
   _optOut.armed = false;
   _optOut.busy = false;
@@ -2307,9 +2981,11 @@ async function undoOptOut() {
 // From a conversation: the contact, with the opt-out record open.
 async function showOptOut(prospectId, email) {
   goTab('prospects');
-  _contactQuery = email || '';
+  _ct.q = email || '';
+  _ct.filter = 'all';
+  _ct.offset = 0;
   const search = document.getElementById('contact-search');
-  if (search) search.value = _contactQuery;
+  if (search) search.value = _ct.q;
   await loadProspects();
   const i = _prospects.findIndex(p => p.id === prospectId);
   if (i >= 0 && _optOut.id !== prospectId) toggleOptOut(i);
@@ -2356,7 +3032,7 @@ async function openInGmail(ci, si, ri) {
   // only gets the draft once the send is recorded.
   const w = window.open('', '_blank');
   if (!w) {
-    showToast('Your browser blocked the Gmail tab. Allow pop-ups for this page and click again.', 'error');
+    showToast(t('camp.popup_blocked'), 'error');
     return;
   }
   w.opener = null;
@@ -2367,7 +3043,7 @@ async function openInGmail(ci, si, ri) {
   try { if (!claimed) claimed = await markSent(ci, ri, true); } finally { _gmailBusy = false; }
   if (!claimed) { w.close(); return; }
   w.location.href = url;
-  if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
+  if (left) showToast(t('camp.placeholder_left'), 'error');
 }
 
 async function markSent(ci, ri, sent) {
@@ -2383,9 +3059,9 @@ async function markSent(ci, ri, sent) {
     res = await resp.json();
   } catch {}
   const ok = !!(res && res.success);
-  if (!ok) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
-  else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
-  else showToast(sent ? 'Marked as sent by you.' : 'Unmarked.', 'success');
+  if (!ok) showToast((res && res.message) || t('camp.save_failed'), 'error');
+  else if (!sent && res.sent) showToast(t('camp.already_replied'));
+  else showToast(sent ? t('camp.marked') : t('camp.unmarked'), 'success');
   loadCampaigns();
   // True only when this call changed it: a status means they replied or
   // opted out, 'already' means another click or tab got there first.
@@ -2398,18 +3074,18 @@ function campaignProgress(c) {
   if (!rs.length) return '';
   const count = st => rs.filter(r => st.includes(r.status)).length;
   const parts = [
-    ['Contacted', count(['contacted']), 'c-accent'],
-    ['Replied', count(['replied']), 'c-active'],
-    ['Interested', count(['interested', 'meeting']), 'c-good'],
-    ['Waiting', count(['new', 'queued']), 'c-accent-soft'],
+    [t('stage.contacted'), count(['contacted']), 'c-accent'],
+    [t('stage.replied'), count(['replied']), 'c-active'],
+    [t('stage.interested'), count(['interested', 'meeting']), 'c-good'],
+    [t('stage.waiting'), count(['new', 'queued']), 'c-accent-soft'],
   ];
   const closed = rs.length - parts.reduce((x, p) => x + p[1], 0);
-  if (closed > 0) parts.push(['Closed out', closed, 'c-idle']);
-  return '<div class="campaign-progress"><div class="bar" role="img" aria-label="Where this campaign\'s people stand">' +
+  if (closed > 0) parts.push([t('stage.closed'), closed, 'c-idle']);
+  return '<div class="campaign-progress"><div class="bar" role="img" aria-label="' + escHtml(t('camp.progress')) + '">' +
     parts.filter(p => p[1]).map(p => '<span class="' + p[2] + '" style="width:' + (100 * p[1] / rs.length) +
-      '%" title="' + p[0] + ': ' + p[1] + '"></span>').join('') + '</div>' +
+      '%" title="' + escHtml(p[0]) + ': ' + p[1] + '"></span>').join('') + '</div>' +
     '<div class="campaign-legend">' + parts.filter(p => p[1]).map(p =>
-      '<span><i class="' + p[2] + '"></i>' + p[0] + ' <b>' + p[1] + '</b></span>').join('') + '</div></div>';
+      '<span><i class="' + p[2] + '"></i>' + escHtml(p[0]) + ' <b>' + p[1] + '</b></span>').join('') + '</div></div>';
 }
 
 async function loadCampaigns() {
@@ -2418,8 +3094,7 @@ async function loadCampaigns() {
   if (!data) { el.innerHTML = offlineState(); return; }
   _campaigns = data;
   if (!data.length) {
-    el.innerHTML = emptyState(icon('campaigns'), 'No campaigns yet',
-      'The Writer agent hasn\'t drafted any sequences. It kicks in automatically once Harvey has scored prospects to write for.');
+    el.innerHTML = emptyState(icon('campaigns'), escHtml(t('camp.empty')), escHtml(t('camp.empty_copy')));
     return;
   }
   let html = '';
@@ -2430,35 +3105,35 @@ async function loadCampaigns() {
         // Only offered when Harvey can't send itself and this person can
         // still be emailed (the server decides: can_send_by_hand).
         if (r.sent_by_hand) {
-          const tick = '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+          const tick = '<label class="check-line small">' +
             '<input type="checkbox" checked onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
-            '&#10003; Sent by you</label>';
+            '&#10003; ' + escHtml(t('camp.sent_by_you')) + '</label>';
           if (s === 0) return '<span class="rcpt-who">' + escHtml(r.email) + '</span>' + tick;
           // Follow-ups are the user's too: Harvey never emails someone they emailed.
           return '<span class="rcpt-who">' + escHtml(r.email) + '</span>' +
             '<button class="btn btn-secondary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
-            'Open in Gmail</button>' +
-            '<span class="muted" style="font-size:12px">Harvey won\'t send follow-ups to people you emailed yourself.</span>';
+            escHtml(t('camp.open_gmail')) + '</button>' +
+            '<span class="muted small">' + escHtml(t('camp.no_followups')) + '</span>';
         }
         if (s !== 0) return '';
         if (!r.can_send_by_hand) {
           // Harvey sends here; this only records an email the user already sent.
           return r.can_mark_sent
-            ? '<label class="muted" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer">' +
+            ? '<label class="check-line small muted">' +
               '<input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
-              'I already emailed ' + escHtml(r.email) + ' myself</label>'
+              escHtml(t('camp.already_emailed', {email: r.email})) + '</label>'
             : '';
         }
         const risky = r.email_status === 'risky'
-          ? ' <span class="mini t-waiting">Catch-all, may bounce</span>' : '';
+          ? ' <span class="mini t-waiting">' + escHtml(t('camp.catch_all')) + '</span>' : '';
         return '<span class="rcpt-who">' + escHtml(r.email) + risky + '</span>' +
           '<button class="btn btn-secondary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
-          'Open in Gmail</button>' +
-          '<label><input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> Mark as sent</label>'
+          escHtml(t('camp.open_gmail')) + '</button>' +
+          '<label><input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' + escHtml(t('camp.mark_sent')) + '</label>';
       }).filter(Boolean).map(x => '<div class="rcpt">' + x + '</div>').join('');
       stepsHtml += '<div class="email-step"><span class="step-dot">' + escHtml(String(step.step || '?')) + '</span>' +
-        '<div><div class="step-num">' + (s === 0 ? 'First email' : 'Follow-up') +
-        (step.delay_days ? ' &middot; ' + escHtml(String(step.delay_days)) + ' days after the last' : '') + '</div>' +
+        '<div><div class="step-num">' + escHtml(s === 0 ? t('camp.first') : t('camp.followup')) +
+        (step.delay_days ? ' &middot; ' + escHtml(t('camp.delay', {n: step.delay_days})) : '') + '</div>' +
         '<div class="subject">' + escHtml(step.subject) + '</div>' +
         '<div class="body">' + escHtml(step.body) + '</div>' +
         (sendBtns ? '<div class="step-actions">' + sendBtns + '</div>' : '') +
@@ -2466,13 +3141,14 @@ async function loadCampaigns() {
     });
     const pc = (c.prospect_ids || []).length;
     html += '<div class="campaign-card"><div class="campaign-top">' +
-      '<div class="campaign-title"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
-        '<button class="btn btn-ghost btn-sm" onclick="fbCampaign(' + i + ')">Feedback</button></div>' +
-      '<div class="meta">' + badge(c.status) + '<span>' + pc + ' prospect' + (pc !== 1 ? 's' : '') + '</span>' +
-        '<span>' + (c.sequence || []).length + ' emails</span><span>Created ' + relTime(c.created_at) + '</span></div>' +
+      '<div class="campaign-title"><h3>' + escHtml(c.name || t('camp.untitled')) + '</h3>' +
+        '<button class="btn btn-ghost btn-sm" onclick="fbCampaign(' + i + ')">' + escHtml(t('ct.feedback')) + '</button></div>' +
+      '<div class="meta">' + badge(c.status) + '<span>' + escHtml(t('camp.prospects', {n: pc})) + '</span>' +
+        '<span>' + escHtml(t('camp.emails', {n: (c.sequence || []).length})) + '</span><span>' +
+        escHtml(t('camp.created')) + ' ' + relTime(c.created_at) + '</span></div>' +
       campaignProgress(c) + '</div>' +
       '<div class="sequence">' +
-      (stepsHtml || '<p class="muted" style="font-size:13px;padding-top:16px">No email steps in this campaign.</p>') + '</div></div>';
+      (stepsHtml || '<p class="muted small" style="padding-top:16px">' + escHtml(t('camp.no_steps')) + '</p>') + '</div></div>';
   });
   el.innerHTML = html;
 }
@@ -2480,15 +3156,11 @@ async function loadCampaigns() {
 // The whole exchange in order: Harvey's cold emails (from the Outbox), the
 // replies, Harvey's answers, and any answer still waiting for approval.
 let _convos = [], _convoFilter = 'needs';
-const STAGE_LABELS = {
-  initial_outreach: 'Outreach', engaged: 'Engaged', qualifying: 'Qualifying', presenting: 'Presenting',
-  negotiating: 'Negotiating', closing: 'Closing', closed_won: 'Won', closed_lost: 'Lost',
-};
 const CONVO_FILTERS = [
-  ['needs', 'Needs you', c => !!c.draft || c.status === 'needs_human'],
-  ['open', 'Open', c => c.status !== 'closed'],
-  ['closed', 'Closed', c => c.status === 'closed'],
-  ['all', 'All', () => true],
+  ['needs', c => !!c.draft || c.status === 'needs_human'],
+  ['open', c => c.status !== 'closed'],
+  ['closed', c => c.status === 'closed'],
+  ['all', () => true],
 ];
 
 async function loadConversations() {
@@ -2497,12 +3169,11 @@ async function loadConversations() {
   if (!data) { el.innerHTML = offlineState(); return; }
   _convos = data;
   if (!data.length) {
-    el.innerHTML = emptyState(icon('conversations'), 'No conversations yet',
-      'No prospects have replied so far. When they do, the Handler agent classifies each reply and responds — every thread shows up here.');
+    el.innerHTML = emptyState(icon('conversations'), escHtml(t('cv.empty')), escHtml(t('cv.empty_copy')));
     return;
   }
   // Open on "Needs you" only when something needs you.
-  if (_convoFilter === 'needs' && !data.some(CONVO_FILTERS[0][2])) _convoFilter = 'open';
+  if (_convoFilter === 'needs' && !data.some(CONVO_FILTERS[0][1])) _convoFilter = 'open';
   renderConversations();
 }
 
@@ -2511,17 +3182,16 @@ function setConvoFilter(f) { _convoFilter = f; renderConversations(); }
 function renderConversations() {
   const el = document.getElementById('conversations-list');
   const filter = CONVO_FILTERS.find(f => f[0] === _convoFilter) || CONVO_FILTERS[3];
-  const bar = '<div class="toolbar"><div class="segmented" role="group" aria-label="Filter conversations">' +
+  const bar = '<div class="toolbar"><div class="segmented" role="group" aria-label="' + escHtml(t('cv.filter_label')) + '">' +
     CONVO_FILTERS.map(f => '<button class="' + (f[0] === filter[0] ? 'on' : '') + '" aria-pressed="' + (f[0] === filter[0]) +
-      '" onclick="setConvoFilter(\'' + f[0] + '\')">' + f[1] + ' <span class="n">' +
-      _convos.filter(f[2]).length + '</span></button>').join('') + '</div></div>';
+      '" onclick="setConvoFilter(\'' + f[0] + '\')">' + escHtml(t('cv.filter.' + f[0])) + ' <span class="n">' +
+      _convos.filter(f[1]).length + '</span></button>').join('') + '</div></div>';
   // Handed-to-you first, then drafts waiting; otherwise newest first (as served).
   const rank = c => c.status === 'needs_human' ? 0 : c.draft ? 1 : 2;
-  const shown = _convos.filter(filter[2]).map((c, i) => [c, i])
+  const shown = _convos.filter(filter[1]).map((c, i) => [c, i])
     .sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]);
   if (!shown.length) {
-    el.innerHTML = bar + '<div class="card">' + emptyState(icon('check'), 'Nothing here',
-      'No conversation matches this filter.') + '</div>';
+    el.innerHTML = bar + '<div class="card">' + emptyState(icon('check'), escHtml(t('cv.none')), escHtml(t('cv.none_copy'))) + '</div>';
     return;
   }
   el.innerHTML = bar + shown.map(convoCard).join('');
@@ -2533,11 +3203,11 @@ function convoCard(c) {
     .map(it => ({...it, key: +parseTs(it.ts)}))
     // An item with no time goes last instead of scrambling the order.
     .sort((a, b) => (isNaN(a.key) ? Infinity : a.key) - (isNaN(b.key) ? Infinity : b.key) || 0);
-  const first = c.first_name || 'Them';
+  const first = c.first_name || t('cv.them');
   const thread = items.map(it => {
     if (it.email) {
       return '<div class="thread-email"><div class="te-head">' + icon('campaigns') +
-        '<b>Email ' + escHtml(String(it.email.step)) + '</b><span>' + escHtml(it.email.subject) + '</span>' +
+        '<b>' + escHtml(t('desk.email_n', {n: it.email.step})) + '</b><span>' + escHtml(it.email.subject) + '</span>' +
         '<span class="te-when">' + relTime(it.email.sent_at) + '</span></div>' +
         '<div class="te-body">' + escHtml(it.email.body) + '</div></div>';
     }
@@ -2547,12 +3217,13 @@ function convoCard(c) {
       escHtml(m.content) + '</div>';
   }).join('');
   const draft = c.draft
-    ? '<div class="thread-draft"><div class="sender">' + icon('pen') + 'Harvey drafted a reply · waiting for you</div>' +
+    ? '<div class="thread-draft"><div class="sender">' + icon('pen') + escHtml(t('cv.drafted')) + '</div>' +
       '<div class="td-body">' + escHtml(c.draft.body) + '</div>' +
-      '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">Review in Outbox' + icon('arrow') + '</button></div>'
+      '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">' + escHtml(t('cv.review')) + icon('arrow') + '</button></div>'
     : '';
-  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
-  const stage = own(STAGE_LABELS, c.stage) ? '<span class="tag">' + STAGE_LABELS[c.stage] + '</span>' : '';
+  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || t('cv.unknown');
+  const stageKey = 'cv.stage.' + c.stage;
+  const stage = c.stage && t(stageKey) !== stageKey ? '<span class="tag">' + escHtml(t(stageKey)) + '</span>' : '';
   return '<div class="convo-card"><div class="convo-head">' +
     '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
     '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
@@ -2560,7 +3231,7 @@ function convoCard(c) {
     // An escalation's intent badge says the same as its status: show one.
     '<div class="tags">' + (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
       stage + badge(c.status) + '</div></div>' +
-    '<div class="thread">' + (thread || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
+    '<div class="thread">' + (thread || '<p class="muted small">' + escHtml(t('cv.no_messages')) + '</p>') +
     draft + '</div>' + convoActions(c) + '</div>';
 }
 
@@ -2568,24 +3239,23 @@ function convoCard(c) {
 // waits for you to reply yourself, then close it or hand it back.
 function convoActions(c) {
   if (c.status === 'needs_human') {
-    return '<div class="convo-actions"><span class="muted">' + icon('alert') +
-      'Harvey handed this to you. Reply from your inbox, then:</span>' +
-      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'open\')">Hand back to Harvey</button>' +
-      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'closed\')">Close</button></div>';
+    return '<div class="convo-actions"><span class="muted">' + icon('alert') + escHtml(t('cv.handed')) + '</span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'open\')">' + escHtml(t('cv.hand_back')) + '</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'closed\')">' + escHtml(t('common.close')) + '</button></div>';
   }
   if (c.status === 'open') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
-      jsq(c.id) + ',\'closed\')">Close conversation</button></div>';
+      jsq(c.id) + ',\'closed\')">' + escHtml(t('cv.close')) + '</button></div>';
   }
   if (c.status === 'closed' && c.prospect_status === 'opted_out') {
     // Reopening wouldn't help: Harvey never answers someone who opted out.
-    return '<div class="convo-actions"><span class="muted">' + icon('alert') + 'Opted out. Harvey won’t write to them.</span>' +
+    return '<div class="convo-actions"><span class="muted">' + icon('alert') + escHtml(t('cv.opted_out')) + '</span>' +
       '<button class="btn btn-secondary btn-sm" onclick="showOptOut(' + jsq(c.prospect_id) + ',' + jsq(c.prospect_email) +
-      ')">Why opted out?</button></div>';
+      ')">' + escHtml(t('cv.why_opted_out')) + '</button></div>';
   }
   if (c.status === 'closed') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
-      jsq(c.id) + ',\'open\')">Reopen</button></div>';
+      jsq(c.id) + ',\'open\')">' + escHtml(t('cv.reopen')) + '</button></div>';
   }
   return '';
 }
@@ -2595,19 +3265,19 @@ async function setConvoStatus(id, status) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({status: status}),
   });
-  if (data && data.success) showToast(status === 'open' ? 'Open again. Harvey will answer the next reply.' : 'Closed. A new reply starts a new conversation.', 'success');
-  else showToast(failMsg(data, 'Could not update that conversation.'), 'error');
+  if (data && data.success) showToast(status === 'open' ? t('cv.reopened') : t('cv.closed'), 'success');
+  else showToast(failMsg(data, t('cv.update_failed')), 'error');
   loadConversations();
   loadToday();
 }
 
 async function loadActivity() {
   const el = document.getElementById('activity-list');
-  const data = await api('/api/activity');
+  const [data, runs] = await Promise.all([api('/api/activity'), api('/api/runs')]);
+  renderRunsTable(document.getElementById('activity-runs'), runs, 25);
   if (!data) { el.innerHTML = offlineState(); return; }
   if (!data.length) {
-    el.innerHTML = emptyState(icon('activity'), 'No activity yet',
-      'Harvey hasn\'t taken any actions. Every prospect found, email written, and reply handled will appear here the moment it happens.');
+    el.innerHTML = emptyState(icon('activity'), escHtml(t('act.empty')), escHtml(t('act.empty_copy')));
     return;
   }
   let html = '<div class="card"><div class="timeline">';
@@ -2615,25 +3285,37 @@ async function loadActivity() {
   for (const a of data) {
     const label = dayLabel(a.created_at);
     if (label !== day) { day = label; html += '<div class="tl-day">' + escHtml(label) + '</div>'; }
-    html += '<div class="tl-item' + (a.agent === 'main' ? ' quiet' : '') + '"><span class="tl-time">' + timeOfDay(a.created_at) + '</span>' +
+    html += '<div class="tl-item' + (a.agent === 'main' ? ' quiet' : '') + '"><span class="tl-time">' + escHtml(timeOfDay(a.created_at)) + '</span>' +
       '<span class="tl-icon">' + icon(own(AGENT_ICONS, a.agent) || 'activity') + '</span>' +
       '<span class="tl-text">' + actionText(a) + '</span>' +
-      '<span class="tl-agent">' + escHtml(a.agent) + '</span></div>';
+      '<span class="tl-agent">' + escHtml(agentName(a.agent)) + '</span></div>';
   }
   el.innerHTML = html + '</div></div>';
 }
 
 // ── Init & live refresh ──
 
-loadToday();
-loadTrend();
-loadFunnel();
-loadSetupStatus();
-loadRuns();
-loadTodayActivity();
-loadHarveyStatus();
+async function init() {
+  applyI18n();
+  switchLangButtons();
+  applyTheme(currentTheme());
+  _co.limit = _ct.limit = loadPageSize();
+  await loadModules();
+  let tab = 'overview';
+  try { tab = sessionStorage.getItem('harvey-tab') || 'overview'; } catch { /* ignore */ }
+  goTab(tab);
+  loadHarveyStatus();
+}
 
-loadLiveStatus();
+function switchLangButtons() {
+  document.querySelectorAll('.lang-switch button').forEach(b => {
+    const on = b.dataset.lang === getLang();
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+
+init();
 
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
@@ -2643,10 +3325,10 @@ setInterval(() => {
   if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
 }, 10000);
 
-// Nav counts stay live wherever you are, so "something needs me" is visible
-// from any tab without polling that tab's contents.
+// Email-module nav counts stay live wherever you are, so "something needs
+// me" is visible from any tab without polling that tab's contents.
 setInterval(async () => {
-  if (document.hidden || _locked || currentTab === 'today') return;
+  if (document.hidden || _locked || !_modules.email || currentTab === 'today') return;
   const data = await api('/api/today');
   if (!data) return;
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
@@ -2657,15 +3339,16 @@ setInterval(async () => {
 // Outbox, settings and help are deliberately excluded — re-rendering the desk
 // under someone mid-decision loses their place, and settings may be mid-edit.
 setInterval(() => {
-  if (document.hidden || _locked) return;
+  if (document.hidden || _locked || document.querySelector('.menu.open')) return;
   switch (currentTab) {
+    case 'overview': loadOverview(); break;
     case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;
-    case 'companies': if (!companyDrill) loadCompanies(); break;
-    case 'prospects': loadProspects(); break;
+    case 'companies': loadCompanies(); break;
+    case 'prospects': if (!_optOut.id) loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'controls': loadLogs(); break;
+    case 'controls': loadLogs(); loadControlSending(); break;
   }
 }, 15000);

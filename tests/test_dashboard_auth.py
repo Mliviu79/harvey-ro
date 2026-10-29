@@ -870,5 +870,5 @@ def test_app_js_only_talks_to_the_api_through_authfetch():
     assert re.findall(r"(?<![A-Za-z])fetch\(", app) == []
     assert "authFetch(" in app
     assert "localStorage.setItem('harvey-dashboard" not in app
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert "downloadCsv('/api/export/prospects.csv'" in html
+    # The contact CSVs download through downloadCsv (authFetch + a blob).
+    assert "downloadCsv('/api/export/prospects.csv" in app
