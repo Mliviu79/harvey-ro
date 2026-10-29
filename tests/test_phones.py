@@ -468,3 +468,23 @@ def test_trailing_fax_note_does_not_label_the_next_number():
 def test_country_tld_beats_a_county_code_location():
     assert phone_region("Sibiu, SB", None, "clinica-exemplu.ro") == "RO"
     assert phone_region("Constanța, CT", None, "clinica-exemplu.ro") == "RO"
+
+
+def test_hostile_markup_is_read_in_linear_time():
+    import time
+    from harvey.collectors.phones import MAX_PAGE_CHARS
+    pages = ["<div itemprop='telephone' " * (MAX_PAGE_CHARS // 26),
+             "<script type=application/ld+json>" * (MAX_PAGE_CHARS // 33),
+             "<a" * (MAX_PAGE_CHARS // 2 - 1) + ">",
+             "a" * MAX_PAGE_CHARS]
+    for html in pages:
+        t = time.perf_counter()
+        assert phones_from_html(html, "RO") == []
+        assert time.perf_counter() - t < 5
+
+
+def test_unclosed_comment_or_tag_hides_the_rest_like_a_browser():
+    assert phones_from_html("<!-- 0740 000 135", "RO") == []
+    assert phones_from_html("<a title='x 0740 000 135", "RO") == []
+    assert [h.number for h in phones_from_html("1 < 2, sunați 0740 000 135", "RO")] \
+        == ["+40740000135"]

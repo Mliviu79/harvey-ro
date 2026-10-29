@@ -112,7 +112,7 @@ def phone_hit(raw: str, region: str | None = None, source: str = "") -> PhoneHit
 # Text that holds digits but is never a phone number. Masked (not deleted)
 # before matching, so the digits either side of it can't join up.
 _NOT_PHONES = [
-    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                       # emails
+    re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),             # emails
     re.compile(r"(?i)\b(?:https?://|www\.)\S+"),                       # URLs
     re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,4})?\b"),  # IBAN
     re.compile(r"\b[JFC]\s?\d{1,2}\s?/\s?\d+\s?/\s?\d{2,4}\b"),        # J08/1234/2010
@@ -174,6 +174,58 @@ _ITEMPROP = re.compile(
     r"""(?is)<(\w+)\b([^>]*\bitemprop\s*=\s*["']telephone["'][^>]*)>""")
 _CONTENT = re.compile(r"""(?is)\bcontent\s*=\s*["']([^"']*)["']""")
 _TEL_HREF = re.compile(r'(?i)href\s*=\s*["\']\s*tel:([^"\'>]+)["\']')
+
+
+_CODE_CLOSE = {"script": re.compile(r"(?i)</script\s*>"),
+               "style": re.compile(r"(?i)</style\s*>")}
+_TAG_NAME = re.compile(r"<([A-Za-z][\w:-]*)")
+
+
+def _tidy(html: str) -> str:
+    """The page with comments dropped and every ``<`` that isn't a tag
+    start escaped, in one linear pass.
+
+    The tag patterns here scan from a ``<`` to its ``>`` or ``</script>``;
+    on a page of unclosed tags each would rescan to the end of the page
+    from every ``<``, and any site Harvey visits can serve that. After this
+    every ``<`` is a tag with its own end, so each scan stops there. An
+    unclosed tag, comment, script or style ends the page, as in a browser."""
+    out: list[str] = []
+    i, n = 0, len(html)
+    while i < n:
+        lt = html.find("<", i)
+        if lt < 0:
+            out.append(html[i:])
+            break
+        out.append(html[i:lt])
+        if html.startswith("<!--", lt):
+            end = html.find("-->", lt + 4)
+            if end < 0:
+                break
+            out.append(" ")
+            i = end + 3
+            continue
+        nxt = html[lt + 1:lt + 2]
+        if not (nxt.isascii() and (nxt.isalpha() or nxt in "/!?")):
+            out.append("&lt;")
+            i = lt + 1
+            continue
+        gt = html.find(">", lt + 1)
+        if gt < 0:
+            break
+        tag = html[lt:gt + 1]
+        out.append("<" + tag[1:].replace("<", "&lt;"))
+        i = gt + 1
+        name = _TAG_NAME.match(tag)
+        close = _CODE_CLOSE.get(name.group(1).lower()) if name else None
+        if close is not None:
+            end = close.search(html, i)
+            if end is None:
+                break
+            out.append(html[i:end.start()].replace("<", "&lt;"))
+            out.append(end.group(0))
+            i = end.end()
+    return "".join(out)
 
 
 def _strip_code(html: str) -> str:
@@ -289,7 +341,9 @@ def _is_reference(text: str, start: int) -> bool:
     """An order, invoice or reference number: its label right before the
     digits on the same line, and no phone label with it ("Tel. nr. 0268..."
     is a phone)."""
-    line = text[:start].rsplit("\n", 1)[-1]
+    # A bounded look back: slicing all of text[:start] per match is
+    # quadratic on a page of digits. 200 chars reach past any label.
+    line = text[max(0, start - 200):start].rsplit("\n", 1)[-1]
     before = re.split(r"\d", line)[-1][-REF_LABEL_CHARS:]
     return bool(_REF_LABEL.search(before)) and not _PHONE_LABEL.search(before)
 
@@ -312,7 +366,7 @@ def phones_from_html(html: str, region: str | None = None,
 
     # A commented-out number (an old footer, a JSON-LD block switched off)
     # is not one the site publishes.
-    html = re.sub(r"(?s)<!--.*?-->", " ", html)
+    html = _tidy(html)
     schema = _schema_phones(html)
     html = _strip_code(html)
 
@@ -345,6 +399,8 @@ def phones_from_html(html: str, region: str | None = None,
         if region is not None and not _written_whole(m.raw_string, m.number):
             continue
         add(m.number, "page_text")
+        if len(hits) >= limit:
+            break
     return hits[:limit]
 
 
