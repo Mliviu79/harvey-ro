@@ -223,7 +223,9 @@ def _tidy(html: str) -> str:
             if end is None:
                 break
             out.append(html[i:end.start()].replace("<", "&lt;"))
-            out.append(end.group(0))
+            # Exactly the close the later patterns look for: "</script >"
+            # left as written would send each of them to the end of the page.
+            out.append(f"</{name.group(1).lower()}>")
             i = end.end()
     return "".join(out)
 

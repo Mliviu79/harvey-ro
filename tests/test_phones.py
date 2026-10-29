@@ -476,7 +476,10 @@ def test_hostile_markup_is_read_in_linear_time():
     pages = ["<div itemprop='telephone' " * (MAX_PAGE_CHARS // 26),
              "<script type=application/ld+json>" * (MAX_PAGE_CHARS // 33),
              "<a" * (MAX_PAGE_CHARS // 2 - 1) + ">",
-             "a" * MAX_PAGE_CHARS]
+             "a" * MAX_PAGE_CHARS,
+             "<script></script >" * (MAX_PAGE_CHARS // 18),
+             "<STYLE></Style\n>" * (MAX_PAGE_CHARS // 17),
+             "<script type=application/ld+json></script >" * (MAX_PAGE_CHARS // 43)]
     for html in pages:
         t = time.perf_counter()
         assert phones_from_html(html, "RO") == []
@@ -488,3 +491,9 @@ def test_unclosed_comment_or_tag_hides_the_rest_like_a_browser():
     assert phones_from_html("<a title='x 0740 000 135", "RO") == []
     assert [h.number for h in phones_from_html("1 < 2, sunați 0740 000 135", "RO")] \
         == ["+40740000135"]
+
+
+def test_a_spaced_script_close_still_ends_the_script():
+    html = ('<script type="application/ld+json">{"telephone": "+40 268 000 134"}</script >'
+            "<p>0740 000 135</p>")
+    assert [h.number for h in phones_from_html(html, "RO")] == ["+40268000134", "+40740000135"]
