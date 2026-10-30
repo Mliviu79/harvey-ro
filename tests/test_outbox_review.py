@@ -19,7 +19,7 @@ from harvey.config import DEFAULT_OPT_OUT_LINE as LINE
 from harvey.models import Company
 from harvey.models.campaign import Campaign
 from harvey.models.prospect import Prospect
-from harvey.signals import seed_signal_catalog
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 
@@ -40,7 +40,7 @@ def client(monkeypatch):
 async def _seed(db_path, status="pending_review", kind="sequence"):
     state = StateManager(str(db_path))
     await state.init_db()
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     company_id = await state.add_company(Company(
         name="Brightline Portals", domain="brightline.example",
         website="https://brightline.example", description="Client portal for law firms",

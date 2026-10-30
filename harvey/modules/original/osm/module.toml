@@ -1,0 +1,27 @@
+# OpenStreetMap through the Overpass API: businesses mapped around a point.
+id = "osm"
+name = "OpenStreetMap"
+description = "Businesses mapped around a point, free."
+set = "original"
+kind = "search"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["nominatim"]
+default_enabled = true
+entry = "harvey.collectors.discover.OpenStreetMap"
+secrets = []
+terms_note = "OpenStreetMap data is ODbL (credit OpenStreetMap contributors). Overpass is a shared community server: keep requests few and small."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+free_tier = "unlimited, within community rate etiquette"
+
+[[capabilities]]
+id = "osm_listings"
+op = "query"
+provider = "osm"
+inputs = [["query", "area"]]
+outputs = { records = "companies", ids = ["domain", "phone"], facts = ["FOUND_IN_SERP", "NO_WEBSITE"] }
+cost = { usd = 0.0, per = "query" }

@@ -16,7 +16,7 @@ import pytest_asyncio
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
 from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
 ENV = {"dataforseo_login": "u", "dataforseo_password": "p"}
@@ -28,7 +28,7 @@ async def state():
     with tempfile.TemporaryDirectory() as tmp:
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
-        await seed_signal_catalog(sm)
+        await sync_vocabulary(sm)
         for sig in SIGNAL_CATALOG:
             await sm.set_signal_status(sig["code"], "confirmed")
         yield sm

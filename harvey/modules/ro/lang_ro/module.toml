@@ -1,0 +1,12 @@
+# Dashboard strings in Romanian, the default language. They live in the
+# "ro" block of harvey/web/i18n.js until languages become one data file each.
+id = "lang_ro"
+name = "Română"
+description = "Dashboard text in Romanian, the default."
+set = "ro"
+kind = "language"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true

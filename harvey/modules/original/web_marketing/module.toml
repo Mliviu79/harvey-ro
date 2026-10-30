@@ -1,0 +1,101 @@
+# What a website says about the business's marketing: ad pixels, the tools
+# it runs, structured data, online booking, the agency credited in the
+# footer, robots.txt rules for AI crawlers, and the sitemap's size and age.
+id = "web_marketing"
+name = "Website marketing"
+description = "What a site says about the business's marketing: ad pixels, tools, booking, agency."
+set = "original"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["website"]
+default_enabled = false
+entry = "harvey.integrations.tech_detect.detect_tech"
+secrets = []
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free: the homepage, sitemap.xml and robots.txt"
+
+[[signals]]
+code = "INCUMBENT_AGENCY"
+label = "Has a marketing/web agency"
+category = "profile"
+value_type = "text"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+confidence_floor = 0.75
+
+[[signals]]
+code = "RUNNING_GOOGLE_ADS"
+label = "Running Google Ads"
+category = "profile"
+value_type = "bool"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+
+[[signals]]
+code = "RUNNING_META_ADS"
+label = "Running Meta/Facebook Ads"
+category = "profile"
+value_type = "bool"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+
+[[signals]]
+code = "TECH_STACK"
+label = "Website platform / tools"
+category = "profile"
+value_type = "text"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+cardinality = "many"
+
+[[signals]]
+code = "NO_SCHEMA_MARKUP"
+label = "Missing structured data"
+category = "profile"
+value_type = "bool"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+
+[[signals]]
+code = "NO_ONLINE_BOOKING"
+label = "No online booking/scheduling"
+category = "profile"
+value_type = "bool"
+collector = "profile"
+cost_note = "free (homepage HTML)"
+
+[[signals]]
+code = "SITE_PAGE_COUNT"
+label = "Site size"
+category = "profile"
+value_type = "num"
+collector = "profile"
+cost_note = "free (sitemap.xml)"
+
+[[signals]]
+code = "BLOG_STALE"
+label = "Content gone stale"
+category = "profile"
+value_type = "num"
+collector = "profile"
+cost_note = "free (sitemap.xml)"
+
+[[signals]]
+code = "BLOCKS_AI_CRAWLERS"
+label = "Blocks AI crawlers"
+category = "profile"
+value_type = "bool"
+collector = "profile"
+cost_note = "free (robots.txt)"
+
+[[capabilities]]
+id = "marketing_profile"
+op = "read"
+inputs = [["pages"], ["domain"]]
+outputs = { facts = ["INCUMBENT_AGENCY", "RUNNING_GOOGLE_ADS", "RUNNING_META_ADS", "TECH_STACK", "NO_SCHEMA_MARKUP", "NO_ONLINE_BOOKING", "SITE_PAGE_COUNT", "BLOG_STALE", "BLOCKS_AI_CRAWLERS"] }
+cost = { usd = 0.0, per = "company" }

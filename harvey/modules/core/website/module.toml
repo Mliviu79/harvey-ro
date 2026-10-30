@@ -1,0 +1,35 @@
+# Reads a company's own website: the homepage, then the pages its menu links
+# to (team, about, contact), over plain HTTP or through the browser service
+# for JavaScript-only sites. The other website modules read what it fetched.
+id = "website"
+name = "Website reader"
+description = "Reads a company's own site: the homepage and the pages its menu links to."
+set = "core"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.collectors.profile.ProfileCollector"
+secrets = []
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free: the company's own pages"
+
+[[signals]]
+code = "CONTACT_FORM_URL"
+label = "Contact form available"
+category = "verification"
+value_type = "text"
+collector = "profile"
+cost_note = "free (site HTML)"
+
+[[capabilities]]
+id = "read_site"
+op = "read"
+inputs = [["domain"]]
+outputs = { records = "pages", facts = ["CONTACT_FORM_URL"] }
+cost = { usd = 0.0, per = "company" }

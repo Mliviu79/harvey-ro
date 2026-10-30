@@ -15,7 +15,7 @@ from harvey import pipeline as P
 from harvey.collectors import discover as D
 from harvey.config import load_config
 from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
 
@@ -24,7 +24,7 @@ async def state():
     with tempfile.TemporaryDirectory() as tmp:
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
-        await seed_signal_catalog(sm)
+        await sync_vocabulary(sm)
         for sig in SIGNAL_CATALOG:
             await sm.set_signal_status(sig["code"], "confirmed")
         yield sm

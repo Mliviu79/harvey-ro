@@ -1,0 +1,31 @@
+# TinyFish: free web search with a key. Its own ordering, so no rank.
+id = "tinyfish"
+name = "TinyFish"
+description = "Free web search with a key."
+set = "original"
+kind = "search"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.collectors.discover.TinyFish"
+secrets = ["TINYFISH_API_KEY"]
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+free_tier = "free with a key, no card"
+
+[[lanes]]
+id = "tinyfish"
+max_per_minute = 30
+max_per_hour = 500
+
+[[capabilities]]
+id = "web_search"
+op = "query"
+provider = "tinyfish"
+inputs = [["query", "area"], ["query"]]
+outputs = { records = "companies", ids = ["domain"], facts = ["FOUND_IN_SERP"] }
+cost = { usd = 0.0, per = "search" }

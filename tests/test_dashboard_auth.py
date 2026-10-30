@@ -30,6 +30,10 @@ from starlette.routing import Route
 import harvey.dashboard as dash
 from harvey import dashboard_auth as auth
 
+# The settings tests save the email campaign keys, which Settings offers
+# only while that module (the Email switch) is on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 POSIX = pytest.mark.skipif(os.name == "nt", reason="POSIX file modes (Windows uses ACLs)")
 ORIGIN = "http://127.0.0.1:5555"
 CROSS_SITE = {"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site",
@@ -763,7 +767,8 @@ def test_real_server_started_like_the_cli(tmp_path):
             r = c.post("/api/settings/env", content='{"SMTP_HOST":"x.example.test"}',
                        headers={**CROSS_SITE, "Content-Type": "text/plain"})
             assert r.status_code == 403
-            r = c.post("/api/settings/env", json={"SMTP_HOST": "ok.example.test"}, headers=ok)
+            # A key of a module that is on in a new install (email_verify).
+            r = c.post("/api/settings/env", json={"REOON_API_KEY": "fictional-key"}, headers=ok)
             assert r.json()["success"]
             assert "server" not in r.headers
     finally:

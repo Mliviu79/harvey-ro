@@ -910,6 +910,8 @@ def cmd_registry(args):
         else:
             _print_registry_status(meta, path)
         return
+    # Before the download (load fetches ~1.5 GB) or any read of it.
+    _require_module("onrc", f"harvey registry {action}")
 
     if action == "load":
         async def _load():
@@ -1042,6 +1044,7 @@ def cmd_import_onrc(args):
         else:
             print("  Next: harvey contacts (reads the sites of those with one)\n")
 
+    _require_module("onrc", "harvey import-onrc")
     asyncio.run(_import())
 
 
@@ -1053,12 +1056,17 @@ def cmd_discover(args):
         PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
     )
 
+    from harvey.modules import switches
+
     async def _discover():
+        enabled = await _modules_on()
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu(load_env().model_dump()):
+            for m in provider_menu(load_env().model_dump(), enabled):
                 mark = "ready" if m["configured"] else "needs setup"
+                if not m["enabled"]:
+                    mark = f"off: harvey modules enable {m['module']}"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
                 print(f"    Cost: {m['cost_note']}")
@@ -1074,6 +1082,11 @@ def cmd_discover(args):
             print(f"\n  Unknown provider {args.provider!r}. "
                   f"See: harvey discover --providers\n")
             return
+        off = switches.discovery_problem(enabled, args.provider,
+                                         getattr(args, "preset", "") or "")
+        if off:
+            print(f"\n  {off}\n")
+            raise SystemExit(2)
 
         # Fail before collection; estimates need no credentials.
         # An unconfigured provider used to end in one quiet "stopped
@@ -1177,32 +1190,40 @@ def cmd_signals(args):
     prospects against nothing until someone makes these decisions.
     """
     from harvey.state import StateManager
-    from harvey.signals import seed_signal_catalog
+    from harvey.signals import sync_vocabulary
 
     async def _signals():
         state = StateManager()
         await state.init_db()
-        await seed_signal_catalog(state)
+        await sync_vocabulary(state)
 
         codes = [a.strip().upper() for a in (args.confirm or args.reject or "").split(",")
                  if a.strip()]
+        # Signals of a module that is off are hidden: not listed, not decided on.
+        visible = await state.get_signal_codes(available_only=True)
         if codes:
             status = "confirmed" if args.confirm else "rejected"
             if codes == ["ALL"]:
-                codes = [c["code"] for c in await state.get_signal_codes()]
+                codes = [c["code"] for c in visible]
             elif codes == ["FREE"]:
                 # Only signals whose cost note STARTS with free/included. A
                 # substring match would sweep in "1 credit (free tiers
                 # available)", which is not free.
-                codes = [c["code"] for c in await state.get_signal_codes()
+                codes = [c["code"] for c in visible
                          if (c["cost_note"] or "").lower().startswith(("free", "included"))]
+            hidden = {c["code"]: c["module"] for c in await state.get_signal_codes()
+                      if not c["available"]}
+            for c in codes:
+                if c in hidden:
+                    print(f"\n  {c}: its module {hidden[c]} is off "
+                          f"(harvey modules enable {hidden[c]}).")
             changed = sum(
-                [1 for c in codes if await state.set_signal_status(c, status)]
+                [1 for c in codes if c not in hidden and await state.set_signal_status(c, status)]
             )
             print(f"\n  {changed} signal(s) {status}.\n")
             return
 
-        rows = await state.get_signal_codes()
+        rows = visible
         states = await state.signal_states([r["code"] for r in rows])
         by_status = {"confirmed": 0, "proposed": 0, "rejected": 0}
         for r in rows:
@@ -1260,6 +1281,99 @@ _MERGE_REFUSED = {
 def _match_reasons(reasons) -> str:
     return "; ".join(_MATCH_REASONS.get(r.get("code"), r.get("code", ""))
                      .format(value=r.get("value", "")) for r in reasons or [])
+
+
+def cmd_modules(args):
+    """What Harvey is made of: every module's manifest, read and checked
+    without importing any of them, and whether each is on in this install.
+    ``enable``/``disable <id>`` turns one on or off."""
+    import json
+
+    from harvey.modules.loader import ManifestError, load_manifests
+
+    try:
+        manifests = load_manifests()
+    except ManifestError as e:
+        print("\n  Some module manifests are wrong:")
+        for line in e.problems:
+            print(f"    {line}")
+        print()
+        sys.exit(1)
+
+    if args.modules_action in ("enable", "disable"):
+        if not args.module_id:
+            print(f"\n  Which module? harvey modules {args.modules_action} <id> "
+                  "(see: harvey modules list)\n")
+            sys.exit(2)
+        _switch_module(args.module_id, args.modules_action == "enable")
+        return
+
+    on = asyncio.run(_modules_on())
+    rows = [{**m.summary(), "enabled": m.id in on} for m in manifests]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print(f"\n  {'id':<18} {'set':<9} {'kind':<10} {'version':<8} {'signals':>7}  "
+          f"{'default':<8} now")
+    for r in rows:
+        default = "on" if r["default_enabled"] else "off"
+        now = "on" if r["enabled"] else "off"
+        pack = "  (data pack)" if r["data_only"] else ""
+        print(f"  {r['id']:<18} {r['set']:<9} {r['kind']:<10} {r['version']:<8} "
+              f"{r['signals']:>7}  {default:<8} {now}{pack}")
+    print(f"\n  {len(rows)} modules, {sum(r['signals'] for r in rows)} signals."
+          "\n  Turn one on or off: harvey modules enable|disable <id>\n")
+
+
+async def _modules_on() -> set[str]:
+    """What is on; a fresh install (no database yet) has the defaults, and
+    reading them creates nothing."""
+    from pathlib import Path
+
+    from harvey import state as state_module
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    if not Path(state_module.DB_PATH).exists():
+        return switches.resolve({})
+    state = StateManager()
+    await state.init_db()
+    return await switches.enabled_ids(state)
+
+
+def _require_module(module_id: str, what: str) -> None:
+    """Stop before any work (a download, a database write) when the module
+    a command belongs to is off; main() prints the reason, exit code 2."""
+    from harvey.modules import switches
+
+    if module_id not in asyncio.run(_modules_on()):
+        raise switches.ModuleOff(module_id, what)
+
+
+def _switch_module(module_id: str, on: bool):
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    async def _switch():
+        state = StateManager()
+        await state.init_db()
+        try:
+            await switches.set_enabled(state, module_id, on)
+        except switches.SwitchRefused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        m = switches.by_id()[module_id]
+        if on:
+            print(f"\n  {m.name or m.id} is on.")
+            if m.signals:
+                print(f"  Its signals are back in the vocabulary, as you left them: "
+                      f"{', '.join(s['code'] for s in m.signals)}")
+        else:
+            print(f"\n  {m.name or m.id} is off. Nothing was deleted: its data stays, "
+                  "hidden, and comes back when you turn it on.")
+        print()
+
+    asyncio.run(_switch())
 
 
 def cmd_duplicates(args):
@@ -1802,6 +1916,14 @@ def main():
     sub.set_defaults(func=cmd_signals)
 
     sub = subparsers.add_parser(
+        "modules", help="The modules Harvey is made of, from their manifests")
+    sub.add_argument("modules_action", nargs="?", default="list",
+                     choices=["list", "enable", "disable"])
+    sub.add_argument("module_id", nargs="?", default="", help="The module to turn on or off")
+    sub.add_argument("--json", action="store_true", help="Print JSON")
+    sub.set_defaults(func=cmd_modules)
+
+    sub = subparsers.add_parser(
         "duplicates", help="Companies that may be on file twice: merge, keep apart, undo")
     group = sub.add_mutually_exclusive_group()
     group.add_argument("--merge", nargs=2, metavar=("KEEP", "MERGED"),
@@ -1863,7 +1985,11 @@ def main():
         # ConfigError and friends carry actionable messages — show them
         # cleanly instead of a raw traceback.
         from harvey.config import ConfigError
+        from harvey.modules.switches import ModuleOff
 
+        if isinstance(e, ModuleOff):
+            print(f"\n  {e}\n")
+            sys.exit(2)
         if isinstance(e, ConfigError):
             print(f"\n  Configuration problem:\n  {e}\n")
         else:

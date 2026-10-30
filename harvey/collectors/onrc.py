@@ -820,11 +820,13 @@ async def save_firms(
     """
     from harvey.caen import describe
     from harvey.gate import do_not_contact_domain_match
-    from harvey.signals import seed_signal_catalog
+    from harvey.modules import switches
+    from harvey.signals import sync_vocabulary
 
+    await switches.require(state, "onrc", "Saving firms from the ONRC registry")
     classes = list(classes or [])
     people = people or {}
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     confirmed = await state.confirmed_signal_codes()
     wanted_codes = ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE") \
         if with_administrators else ("ACTIVITY_CODE",)
@@ -990,7 +992,7 @@ async def import_registry(
     (``harvey search``). ``with_administrators`` False leaves the
     representatives file unread.
     """
-    from harvey.signals import seed_signal_catalog
+    from harvey.signals import sync_vocabulary
 
     classes = list(classes or [])
     report = ImportReport(dataset=dataset.name, dry_run=dry_run)
@@ -1000,7 +1002,7 @@ async def import_registry(
         raise ValueError("every activity needs an area: give a county or a locality "
                          "(or words or CAEN codes to search the whole country)")
 
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     confirmed = await state.confirmed_signal_codes()
     people_codes = {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed \
         if with_administrators else set()

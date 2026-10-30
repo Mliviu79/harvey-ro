@@ -1,0 +1,45 @@
+# Romania's trade registry (ONRC) open data: every firm, its authorised CAEN
+# classes, status and administrators, loaded once per dataset into
+# data/registry.db and searched there.
+id = "onrc"
+name = "ONRC trade registry"
+description = "Every Romanian firm from the ONRC open data, searched locally."
+set = "ro"
+kind = "source"
+version = "0.3.0"
+api = 1
+markets = ["RO"]
+requires = ["market_ro"]
+default_enabled = true
+entry = "harvey.registry"
+secrets = []
+terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a natural person's name and role are kept from the representatives file; sole traders get no street address."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free (open data download)"
+
+[[signals]]
+code = "ACTIVITY_CODE"
+label = "Registered activity (CAEN)"
+category = "profile"
+value_type = "text"
+collector = "registry"
+cost_note = "free (ONRC open data, data.gov.ro)"
+cardinality = "many"
+when_known = "source"
+
+[[capabilities]]
+id = "registry_sync"
+op = "sync"
+inputs = []
+outputs = { records = "registry" }
+cost = { usd = 0.0, per = "dataset" }
+
+[[capabilities]]
+id = "registry_search"
+op = "query"
+inputs = [["query", "area"], ["query"], ["area"]]
+outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"] }
+cost = { usd = 0.0, per = "query" }

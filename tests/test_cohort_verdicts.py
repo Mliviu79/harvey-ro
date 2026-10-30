@@ -19,15 +19,18 @@ from fastapi.testclient import TestClient
 import harvey.dashboard as dash
 import harvey.signals as signals
 from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("web_marketing")
 
 
 @pytest_asyncio.fixture
 async def state(tmp_path):
     sm = StateManager(str(tmp_path / "v.db"))
     await sm.init_db()
-    await seed_signal_catalog(sm)
+    await sync_vocabulary(sm)
     return sm
 
 
@@ -146,9 +149,9 @@ async def test_a_rank_search_that_no_longer_finds_it_is_a_checked_no(state):
 async def test_absence_false_reads_a_missing_row_as_no(state, monkeypatch):
     """For a collector that looks at every company and writes only positives."""
     await _seed(state)
-    catalog = [dict(s, absence="false") if s["code"] == "RUNNING_GOOGLE_ADS" else s
-               for s in SIGNAL_CATALOG]
-    monkeypatch.setattr(signals, "SIGNAL_CATALOG", catalog)
+    real = signals.absence
+    monkeypatch.setattr(signals, "absence",
+                        lambda code: "false" if code == "RUNNING_GOOGLE_ADS" else real(code))
     counts, rows = await state.cohort_verdicts([], ["RUNNING_GOOGLE_ADS"],
                                                verdicts=("match",))
     assert counts == {"match": 2, "possible": 0, "no_match": 2}
@@ -201,7 +204,7 @@ def _seed_client(client):
     async def go():
         sm = StateManager(str(client.db_path))
         await sm.init_db()
-        await seed_signal_catalog(sm)
+        await sync_vocabulary(sm)
         await _seed(sm)
     asyncio.run(go())
 

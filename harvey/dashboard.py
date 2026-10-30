@@ -119,6 +119,18 @@ def _read_env_file() -> dict[str, str]:
     return env_vars
 
 
+def _error_body(error: Exception, key: str = "error", **extra) -> dict:
+    """A refusal's JSON body. A module-off refusal also carries the
+    module's id (``off_module``), so the page says it in the viewer's
+    language; the English text stays for the API and the CLI."""
+    from harvey.modules.switches import ModuleOff
+
+    body = {**extra, key: str(error)}
+    if isinstance(error, ModuleOff):
+        body["off_module"] = error.module_id
+    return body
+
+
 def _env_key(line: str) -> str:
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -399,20 +411,41 @@ def _current_provider() -> str:
         return "instantly"
 
 
+# Keys a module reads that Settings never writes: TrulyInbox's are saved by
+# its own connect flow, which checks the key against the mailbox first.
+ENV_OWN_FLOW = ("TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID")
+
+
+def _present_env_keys() -> set[str]:
+    """Names of the keys that hold a value, in .env or the environment."""
+    present = {k for k, v in _read_env_file().items() if (v or "").strip()}
+    return present | {k for k, v in os.environ.items() if (v or "").strip()}
+
+
+async def _env_allowlist() -> list[str]:
+    """The .env keys Settings shows and saves: those the enabled modules'
+    manifests list, plus any module's key that already holds a value. A
+    key that is set can always be changed or cleared, so a password still
+    in use (the heartbeat sends whatever the Email switch says) can be
+    rotated with its module off."""
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    keys = switches.env_keys(await switches.enabled_ids(state))
+    present = _present_env_keys()
+    keys += [k for k in switches.env_keys({m.id for m in switches.manifests()})
+             if k in present and k not in keys]
+    return [k for k in keys if k not in ENV_OWN_FLOW]
+
+
 @app.get("/api/settings")
 async def get_settings():
-    """Get current settings — presence flags only for secrets, never raw values."""
-    env_vars = _read_env_file()
-    all_keys = [
-        "INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
-        "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
-        "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
-        "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
-        "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
-        "M365_CLIENT_ID", "M365_TENANT_ID",
-        "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
-    ]
-    for key in all_keys:
+    """Get current settings — presence flags only for secrets, never raw
+    values, and only for the keys of modules that are on."""
+    allowed = await _env_allowlist()
+    env_vars = {k: v for k, v in _read_env_file().items() if k in allowed}
+    for key in allowed:
         if key not in env_vars:
             env_vars[key] = os.getenv(key, "")
 
@@ -450,6 +483,7 @@ async def get_settings():
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
+        "env_keys": allowed,
     }
 
 
@@ -462,15 +496,18 @@ async def save_env_settings(request: Request):
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     if not isinstance(data, dict):
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    from harvey.modules import switches
+
+    allowed = await _env_allowlist()
+    # A key of a module that is off is refused by name, not dropped.
+    for key in data:
+        owners = switches.env_key_owners(key) if key not in allowed else []
+        if owners and key not in ENV_OWN_FLOW:
+            return JSONResponse(_error_body(switches.ModuleOff(owners[0], f"Saving {key}"),
+                                            "message", success=False), status_code=409)
     async with _env_lock:
         updates = {}
-        for key in ["INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
-                     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
-                     "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
-                     "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
-                     "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
-                     "M365_CLIENT_ID", "M365_TENANT_ID",
-                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
+        for key in allowed:
             if key in data and data[key] is not None:
                 value = data[key]
                 if isinstance(value, bool) or not isinstance(value, (str, int, float)):
@@ -2031,19 +2068,22 @@ async def export_selected_prospects(request: Request):
     return _csv_download(to_csv(rows, CSV_COLUMNS), "contacts.csv")
 
 
-# ── Dashboard modules and overview ──
+# ── Modules: what Harvey is made of, and which parts are on ──
 #
-# Modules only change what the dashboard SHOWS. Nothing the heartbeat reads
-# looks at them: sending, approval, autopilot and the kill switch work the
-# same whether the Email module is on or off.
+# The Email switch is the email_outreach module's. It only changes what the
+# dashboard SHOWS (and which .env keys Settings offers): sending, approval,
+# autopilot and the kill switch work the same whether it is on or off.
 
-UI_MODULES = {"email": "ui.module.email"}
+UI_MODULES = {"email": "email_outreach"}
 
 
 async def _modules() -> dict:
+    from harvey.modules import switches
+
     state = _state()
     await state.init_db()
-    return {name: (await state.get_setting(key)) == "on" for name, key in UI_MODULES.items()}
+    on = await switches.enabled_ids(state)
+    return {name: module_id in on for name, module_id in UI_MODULES.items()}
 
 
 @app.get("/api/ui/modules")
@@ -2059,6 +2099,8 @@ async def get_ui_modules():
 @app.post("/api/ui/modules")
 async def set_ui_modules(request: Request):
     """{"email": true|false}: show or hide a module's tabs. Visibility only."""
+    from harvey.modules import switches
+
     try:
         body = await request.json()
     except Exception:
@@ -2070,9 +2112,84 @@ async def set_ui_modules(request: Request):
                             status_code=400)
     state = _state()
     await state.init_db()
-    for name, on in body.items():
-        await state.set_setting(UI_MODULES[name], "on" if on else "")
+    try:
+        for name, on in body.items():
+            await switches.set_enabled(state, UI_MODULES[name], on)
+    except switches.SwitchRefused as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=409)
     return {"success": True, "modules": await _modules()}
+
+
+def _module_row(m, on: set[str], present: set[str], labels: dict[str, str],
+                names: dict[str, str]) -> dict:
+    cost = m.cost or {}
+    return {
+        "id": m.id, "name": m.name or m.id, "description": m.description,
+        "set": m.set, "kind": m.kind, "version": m.version,
+        "enabled": m.id in on, "locked": m.set == "core", "data_only": m.data_only,
+        "requires": [{"id": r, "name": names.get(r, r)} for r in m.requires],
+        "signals": [{"code": sig["code"], "label": labels.get(sig["code"], sig.get("label", ""))}
+                    for sig in m.signals],
+        # Presence only: a value never leaves the box.
+        "secrets": [{"key": k, "present": k in present} for k in m.secrets],
+        "cost": {"note": str(cost.get("note", "")), "free_tier": str(cost.get("free_tier", "")),
+                 "as_of": str(cost.get("as_of", ""))},
+        "terms_note": m.terms_note,
+    }
+
+
+async def _modules_page() -> dict:
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    on = await switches.enabled_ids(state)
+    present = _present_env_keys()
+    labels = {r["code"]: r["label"] for r in await state.get_signal_codes()}
+    names = {m.id: m.name or m.id for m in switches.manifests()}
+    sets: dict[str, list] = {}
+    for m in switches.manifests():
+        sets.setdefault(m.set, []).append(_module_row(m, on, present, labels, names))
+    return {"sets": [{"key": k, "modules": v} for k, v in sets.items()],
+            # Packs in data/modules left out, one line each saying why.
+            "pack_problems": switches.pack_problems()}
+
+
+@app.get("/api/modules")
+async def get_modules():
+    """Every module, grouped by set: what it is, the signals it adds, the
+    .env keys it needs (present or not, never the values), its cost and
+    terms notes, and whether it is on."""
+    try:
+        return await _modules_page()
+    except Exception as e:
+        logger.exception("modules page failed")
+        return {"sets": [], "error": str(e)}
+
+
+@app.post("/api/modules/{module_id}")
+async def set_module(module_id: str, request: Request):
+    """{"enabled": true|false}. Refused, with the reason, for a core module,
+    for one whose requirements are off, and for one another module needs."""
+    from harvey.modules import switches
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return JSONResponse({"success": False, "message": 'expected {"enabled": true|false}'},
+                            status_code=400)
+    if module_id not in switches.by_id():
+        return JSONResponse({"success": False, "message": f"no module {module_id!r}"},
+                            status_code=404)
+    state = _state()
+    await state.init_db()
+    try:
+        await switches.set_enabled(state, module_id, body["enabled"])
+    except switches.SwitchRefused as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=409)
+    return {"success": True, **await _modules_page()}
 
 
 @app.get("/api/overview")
@@ -2114,9 +2231,9 @@ async def get_overview():
         "with_activity": await _scalar(
             "SELECT COUNT(DISTINCT company_id) AS n FROM company_activities"),
         "signals_proposed": await _scalar(
-            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'proposed'"),
+            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'proposed' AND available = 1"),
         "signals_confirmed": await _scalar(
-            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'confirmed'"),
+            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'confirmed' AND available = 1"),
         "sending": await _sending_summary(config),
     }
 
@@ -2363,6 +2480,18 @@ _discovery_report: dict | None = None
 _discovery_kind = "discover"   # or "profile": reading sites has no stop switch
 
 
+async def _discovery_refusal(body: dict):
+    """Why the source or preset asked for can't run (a ModuleOff: its
+    module is off), or None."""
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    return switches.discovery_problem(await switches.enabled_ids(state),
+                                      str(body.get("provider") or ""),
+                                      str(body.get("preset") or ""))
+
+
 def _discovery_queries(body: dict, config):
     from harvey.collectors.discover import build_queries, preset_problem
 
@@ -2383,13 +2512,19 @@ def _discovery_queries(body: dict, config):
 async def get_discovery_providers():
     """What each source does, what it costs, and whether it's ready to use."""
     try:
-        from harvey.collectors.discover import DEFAULT_PROVIDER, provider_menu
+        from harvey.collectors.discover import DEFAULT_PROVIDER, PRESETS, provider_menu
         from harvey.config import load_env
+
+        from harvey.modules import switches
 
         state = _state()
         await state.init_db()
+        enabled = await switches.enabled_ids(state)
         return {
-            "providers": provider_menu(load_env().model_dump()),
+            "providers": provider_menu(load_env().model_dump(), enabled),
+            # Presets whose module is off are hidden from the picker.
+            "presets": {key: switches.capability_owner("preset", key) in enabled
+                        for key in PRESETS},
             "default": DEFAULT_PROVIDER,
             "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
             "paused": await state.get_setting("discovery_paused"),
@@ -2415,6 +2550,9 @@ async def estimate_discovery(request: Request):
         if provider not in PROVIDERS:
             return JSONResponse({"error": f"unknown provider {provider!r}"},
                                 status_code=400)
+        refusal = await _discovery_refusal(body)
+        if refusal:
+            return JSONResponse(_error_body(refusal), status_code=409)
 
         try:
             queries = _discovery_queries(body, load_config())
@@ -2454,6 +2592,10 @@ async def start_discovery(request: Request):
             return JSONResponse({"success": False,
                                  "message": f"unknown provider {provider!r}"},
                                 status_code=400)
+        refusal = await _discovery_refusal(body)
+        if refusal:
+            return JSONResponse(_error_body(refusal, "message", success=False),
+                                status_code=409)
 
         config = load_config()
         try:
@@ -2790,13 +2932,13 @@ async def get_today():
     items: list[dict] = []
     stats: dict = {}
     try:
-        from harvey.signals import seed_signal_catalog
+        from harvey.signals import sync_vocabulary
 
         state = _state()
         await state.init_db()
-        await seed_signal_catalog(state)
+        await sync_vocabulary(state)
 
-        codes = await state.get_signal_codes()
+        codes = await state.get_signal_codes(available_only=True)
         proposed = [c for c in codes if c.get("status") == "proposed"]
         confirmed = [c for c in codes if c.get("status") == "confirmed"]
         pending = await state.get_outbox(status="pending_review", limit=200)
@@ -2989,54 +3131,33 @@ async def search_caen(q: str = "", limit: int = 50):
 # whole prospecting pipeline hangs off: collectors ask `state.confirmed_signal_codes()`
 # and skip anything that isn't in the set.
 
-CATEGORY_META = {
-    "discovery": {
-        "label": "Discovery — who exists",
-        "blurb": "How Harvey finds businesses at all, and how visible they are. "
-                 "This is the only stage that costs money.",
-    },
-    "profile": {
-        "label": "Profile — what they are",
-        "blurb": "Read from the pages a business already publishes. Free, no AI "
-                 "tokens, three HTTP requests per company. These are the signals "
-                 "that make an email specific.",
-    },
-    "people": {
-        "label": "People — who decides",
-        "blurb": "Named humans and whether they're the one who can say yes.",
-    },
-    "verification": {
-        "label": "Contactability — can you reach them",
-        "blurb": "Whether the address will actually deliver, and what to do when "
-                 "it won't.",
-    },
-}
-CATEGORY_ORDER = ["discovery", "profile", "people", "verification"]
-
-
 @app.get("/api/signals")
 async def get_signals():
-    """The signal vocabulary, grouped for review, with live cohort sizes."""
+    """The signal vocabulary, one group per module that declares signals,
+    with live cohort sizes. Signals of a module that is off are left out
+    (their observations stay); ``hidden`` counts them."""
     try:
-        from harvey.signals import absence, seed_signal_catalog
+        from harvey.modules import switches
+        from harvey.signals import absence, sync_vocabulary
 
         state = _state()
         await state.init_db()
-        # Seeding is idempotent and never overrides a decision the user made,
+        # Syncing is idempotent and never overrides a decision the user made,
         # so it is safe to run on every load — new signals shipped in an
         # upgrade show up as `proposed` without any migration step.
-        await seed_signal_catalog(state)
+        await sync_vocabulary(state)
 
-        codes = await state.get_signal_codes()
+        every = await state.get_signal_codes()
+        codes = [c for c in every if c.get("available", 1)]
         counts = {c["signal_code"]: c for c in await state.signal_counts()}
         # True / false / unknown per company: "unknown" is not checked yet.
         states = await state.signal_states([sig["code"] for sig in codes])
 
         groups, summary = [], {"proposed": 0, "confirmed": 0, "rejected": 0}
-        for cat in CATEGORY_ORDER:
+        for m in switches.manifests():
             rows = []
             for sig in codes:
-                if sig.get("category") != cat:
+                if sig.get("module") != m.id:
                     continue
                 seen = counts.get(sig["code"], {})
                 rows.append({
@@ -3047,19 +3168,15 @@ async def get_signals():
                     "absence": absence(sig["code"]),
                 })
             if rows:
-                meta = CATEGORY_META.get(cat, {})
-                groups.append({
-                    "key": cat,
-                    "label": meta.get("label", cat.title()),
-                    "blurb": meta.get("blurb", ""),
-                    "signals": rows,
-                })
+                groups.append({"key": m.id, "label": m.name or m.id,
+                               "blurb": m.description, "signals": rows})
         for sig in codes:
             summary[sig.get("status", "proposed")] = (
                 summary.get(sig.get("status", "proposed"), 0) + 1
             )
 
-        return {"summary": summary, "groups": groups, "total": len(codes)}
+        return {"summary": summary, "groups": groups, "total": len(codes),
+                "hidden": len(every) - len(codes)}
     except Exception as e:
         logger.exception("signals load failed")
         return {"error": str(e), "groups": [], "summary": {}}
@@ -3082,23 +3199,27 @@ async def set_signals_status(request: Request):
                 {"success": False, "message": "no signal codes given"}, status_code=400
             )
 
-        from harvey.signals import seed_signal_catalog
+        from harvey.signals import sync_vocabulary
 
         state = _state()
         await state.init_db()
         # Seed first: a confirm that arrives before anything has loaded the
         # catalog would otherwise report success while changing nothing.
-        await seed_signal_catalog(state)
+        await sync_vocabulary(state)
 
-        changed, unknown = 0, []
+        # A hidden signal (its module is off) is not decided on here.
+        hidden = {r["code"] for r in await state.get_signal_codes() if not r.get("available", 1)}
+        changed, unknown, off = 0, [], []
         for code in codes:
-            if await state.set_signal_status(code, status):
+            if code in hidden:
+                off.append(code)
+            elif await state.set_signal_status(code, status):
                 changed += 1
             else:
                 unknown.append(code)
         return {
             "success": True, "changed": changed,
-            "status": status, "unknown": unknown,
+            "status": status, "unknown": unknown, "module_off": off,
         }
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -3115,8 +3236,19 @@ async def _cohort_companies(require: list[str], exclude: list[str],
     """(counts per verdict, the page of companies in ``verdicts``)."""
     state = _state()
     await state.init_db()
+    await _refuse_hidden_signals(state, [*require, *exclude, *(r["code"] for r in ranges or [])])
     return await state.cohort_verdicts(require, exclude, ranges, verdicts=verdicts,
                                        offset=offset, limit=limit)
+
+
+async def _refuse_hidden_signals(state, codes) -> None:
+    """A signal of a module that is off can't be filtered on: it is hidden,
+    and its data stops at the day the module went off."""
+    hidden = {r["code"]: r for r in await state.get_signal_codes() if not r.get("available", 1)}
+    for code in codes:
+        if code in hidden:
+            from harvey.modules.switches import ModuleOff
+            raise ModuleOff(hidden[code].get("module") or "", f"The signal {code}")
 
 
 COHORT_VERDICTS = ("match", "possible", "no_match")
@@ -3249,7 +3381,7 @@ async def preview_cohort(request: Request):
                 "total": sum(counts[v] for v in verdicts),
                 "offset": offset, "limit": limit, "companies": rows}
     except (ValueError, TypeError) as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse(_error_body(e), status_code=400)
     except Exception as e:
         return JSONResponse({"size": 0, "companies": [], "error": str(e)}, status_code=500)
 
@@ -3282,7 +3414,7 @@ async def export_cohort(require: str = "", exclude: str = "", ranges: str = "",
             for r in rows:
                 writer.writerow([_csv_cell(r.get(k)) for k in columns])
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse(_error_body(e), status_code=400)
     except Exception as e:
         logger.warning("Cohort export failed: %s", e)
         return JSONResponse({"error": "Cohort export failed"}, status_code=500)

@@ -106,6 +106,9 @@ class PatternState:
     async def get_setting(self, key, default=None):
         return "0"
 
+    async def settings_with_prefix(self, prefix):
+        return {}
+
     async def increment_setting(self, key):
         pass
 

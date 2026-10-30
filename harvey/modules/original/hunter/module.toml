@@ -1,0 +1,30 @@
+# Hunter.io: a domain's address pattern and the people it knows there, plus
+# a verification fallback. Searches are counted against a monthly cap.
+id = "hunter"
+name = "Hunter"
+description = "A domain's address pattern and the people Hunter knows there."
+set = "original"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.integrations.email_finder.hunter_domain_people"
+secrets = ["HUNTER_API_KEY", "HUNTER_MONTHLY_SEARCHES"]
+
+[cost]
+as_of = 2026-10-30
+free_tier = "50 verifications and 25 domain searches a month"
+
+[settings.monthly_searches]
+type = "int"
+default = 25
+env = "HUNTER_MONTHLY_SEARCHES"
+
+[[capabilities]]
+id = "domain_search"
+op = "lookup"
+inputs = [["domain"]]
+outputs = { records = "people", facts = ["EMAIL_PATTERN"] }
+cost = { usd = 0.0, per = "search", note = "1 of the monthly domain searches" }

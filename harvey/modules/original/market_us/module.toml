@@ -1,0 +1,12 @@
+# United States vocabulary. Its lists (titles, states, legal forms) are
+# still in the code that uses them; they move here as data files later.
+id = "market_us"
+name = "United States"
+description = "US vocabulary: titles, states and legal forms."
+set = "original"
+kind = "market"
+version = "0.3.0"
+api = 1
+markets = ["US"]
+requires = []
+default_enabled = true

@@ -25,8 +25,11 @@ from harvey.collectors.discover import (
 )
 from harvey.collectors.profile import ProfileCollector, profile_companies
 from harvey.models.company import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("hiring")
 
 
 @pytest_asyncio.fixture
@@ -357,7 +360,7 @@ async def test_no_feed_request_unless_a_hiring_signal_is_confirmed():
 
 @pytest.mark.asyncio
 async def test_profile_companies_takes_keywords_from_the_config(state, monkeypatch):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("HIRING_ROLE", "confirmed")
     seen = {}
 
@@ -443,7 +446,7 @@ async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeyp
     monkeypatch.setitem(D.PROVIDERS, "fake", _OneHit("careers.acme.com"))
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("FOUND_IN_SERP", "confirmed")
     q = build_queries(_config(), preset="hiring")[0]
     report = await run_discovery(state, _config(), "fake", [q])
@@ -488,7 +491,7 @@ async def test_a_board_with_no_matching_role_says_not_hiring():
 
 @pytest.mark.asyncio
 async def test_a_closed_role_stops_being_current(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     cid = await state.add_company(Company(name="Acme", domain="acme.com"))
     await state.add_observations([{
         "company_id": cid, "signal_code": "HIRING_ROLE", "collector": "profile",
@@ -600,7 +603,7 @@ async def test_hiring_preset_hits_on_ats_hosts_are_never_prospects(state, monkey
     monkeypatch.setitem(D.PROVIDERS, "fake", _OneHit(domain))
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("FOUND_IN_SERP", "confirmed")
     report = await run_discovery(state, _config(), "fake", build_queries(_config(), preset="hiring")[:1])
     assert report.new_companies == 0 and report.junk == 1

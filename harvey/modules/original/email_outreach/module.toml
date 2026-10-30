@@ -1,0 +1,55 @@
+# The email loop: the heartbeat, Writer, Sender, Handler and Analyst, the
+# send gate, the mail providers, Precleared, TrulyInbox and the trainer.
+id = "email_outreach"
+name = "Email campaigns"
+description = "Writes, queues and sends cold email, and handles the replies."
+set = "original"
+kind = "action"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["email_verify"]
+default_enabled = false
+entry = "harvey.main"
+secrets = [
+    "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+    "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+    "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
+    "M365_CLIENT_ID", "M365_TENANT_ID",
+    "INSTANTLY_API_KEY",
+    "PRECLEARED_API_KEY",
+    "TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID",
+    "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+]
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "model calls use your Claude or ChatGPT plan; Instantly, TrulyInbox and Precleared bill you directly"
+
+[settings.max_daily_sends]
+type = "int"
+default = 50
+config = "channels.email.max_daily_sends"
+
+[settings.require_approval]
+type = "bool"
+default = true
+config = "channels.email.require_approval"
+
+[settings.send_to_risky]
+type = "bool"
+default = false
+config = "channels.email.send_to_risky"
+
+[settings.max_bounce_rate]
+type = "float"
+default = 0.05
+config = "channels.email.max_bounce_rate"
+
+[[capabilities]]
+id = "send_sequence"
+op = "action"
+inputs = [["fact:EMAIL_STATUS"]]
+outputs = { records = "outbox" }
+cost = { usd = 0.0, per = "email" }

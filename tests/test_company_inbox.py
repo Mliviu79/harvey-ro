@@ -62,7 +62,7 @@ async def test_published_address_grading(monkeypatch, graded, expected):
     async def mx(domain):
         return "smtp.google.com"
 
-    async def check(email, mx_type, env):
+    async def check(email, mx_type, env, state=None):
         return graded, graded == "risky"
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
@@ -117,6 +117,7 @@ PAGES = {
 def make_scout(pages, verdict="verified"):
     scout = Scout.__new__(Scout)
     scout.env = None
+    scout.state = None
     scout._seen_prospect_keys = set()
 
     async def resolve(domain, retries=1):
@@ -149,7 +150,7 @@ async def test_no_usable_address_means_no_inbox():
 
 @pytest.mark.asyncio
 async def test_inbox_prospect_carries_its_verification(monkeypatch):
-    async def graded(email, env=None):
+    async def graded(email, env=None, state=None):
         return "verified"
 
     monkeypatch.setattr(scout_mod, "verify_published_address", graded)

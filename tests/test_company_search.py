@@ -24,7 +24,7 @@ import harvey.dashboard as dash
 import harvey.state as state_mod
 from harvey import caen, cli
 from harvey.models import Company
-from harvey.signals import seed_signal_catalog
+from harvey.signals import sync_vocabulary
 from harvey.state import MIGRATIONS, StateManager, search_terms
 
 
@@ -197,7 +197,7 @@ async def test_a_minus_word_excludes(state):
 
 @pytest.mark.asyncio
 async def test_index_follows_renames_industry_and_new_activities(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     cid = await state.add_company(Company(name="Vechi Nume SRL", location="Exampleville"))
     await state.rename_company(cid, "Nou Nume SRL")
     assert await _names(state, "nou") == ["Nou Nume SRL"]

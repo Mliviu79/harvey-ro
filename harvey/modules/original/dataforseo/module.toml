@@ -1,0 +1,121 @@
+# DataForSEO: business listings around a point, Google organic rank and
+# Google Maps rank, each searched from the city centre.
+id = "dataforseo"
+name = "DataForSEO"
+description = "Business listings, Google rank and Google Maps rank around a city."
+set = "original"
+kind = "search"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["nominatim"]
+default_enabled = true
+entry = "harvey.collectors.discover.DataForSEOListings"
+secrets = ["DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "DATAFORSEO_SANDBOX"]
+
+[cost]
+as_of = 2026-10-30
+free_tier = "$1 signup credit; free sandbox (DATAFORSEO_SANDBOX); $50 minimum deposit to go live"
+
+[[signals]]
+code = "SERP_RANK"
+label = "Search rank position"
+category = "discovery"
+value_type = "num"
+collector = "discover"
+cost_note = "~$0.006 per search at depth 30 (paid SERP API, Live endpoint)"
+keyed_by = "phrase"
+cardinality = "many"
+when_known = "search"
+
+[[signals]]
+code = "IN_LOCAL_PACK"
+label = "In the Google local 3-pack"
+category = "discovery"
+value_type = "num"
+collector = "discover"
+cost_note = "included in the organic rank search above"
+keyed_by = "phrase"
+cardinality = "many"
+when_known = "search"
+
+[[signals]]
+code = "MAPS_RANK"
+label = "Google Maps rank position"
+category = "discovery"
+value_type = "num"
+collector = "discover"
+cost_note = "~$0.002 per Maps search of up to 100 results (paid SERP API)"
+keyed_by = "phrase"
+cardinality = "many"
+when_known = "search"
+
+[[signals]]
+code = "FOUND_IN_SERP"
+label = "Discovered via search"
+category = "discovery"
+value_type = "text"
+collector = "discover"
+cost_note = "included in the search above"
+cardinality = "many"
+when_known = "search"
+
+[[signals]]
+code = "NO_WEBSITE"
+label = "No website at all"
+category = "discovery"
+value_type = "bool"
+collector = "discover"
+cost_note = "included in the business listing lookup"
+when_known = "search"
+
+[[signals]]
+code = "UNCLAIMED_LISTING"
+label = "Unclaimed Google listing"
+category = "discovery"
+value_type = "bool"
+collector = "discover"
+cost_note = "included in the business listing lookup"
+when_known = "search"
+
+[[signals]]
+code = "REVIEW_RATING"
+label = "Review rating"
+category = "discovery"
+value_type = "num"
+collector = "discover"
+cost_note = "included in the business listing lookup"
+when_known = "search"
+
+[[signals]]
+code = "REVIEW_COUNT"
+label = "Number of reviews"
+category = "discovery"
+value_type = "num"
+collector = "discover"
+cost_note = "included in the business listing lookup"
+when_known = "search"
+
+[[capabilities]]
+id = "business_listings"
+op = "query"
+provider = "dataforseo_listings"
+inputs = [["query", "area"]]
+outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
+cost = { usd = 0.012, per = "query", plus_usd = 0.00036, plus_per = "business" }
+
+[[capabilities]]
+id = "organic_rank"
+op = "query"
+provider = "dataforseo_serp"
+inputs = [["query", "area"]]
+outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "IN_LOCAL_PACK", "FOUND_IN_SERP"] }
+cost = { usd = 0.006, per = "search", note = "depth 30, Live endpoint" }
+
+[[capabilities]]
+id = "maps_rank"
+op = "query"
+provider = "dataforseo_maps"
+inputs = [["query", "area"]]
+outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["MAPS_RANK", "FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
+cost = { usd = 0.002, per = "search", note = "up to 100 results, Live endpoint" }

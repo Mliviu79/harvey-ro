@@ -18,7 +18,7 @@ import pytest_asyncio
 
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
 
@@ -27,7 +27,7 @@ async def state():
     with tempfile.TemporaryDirectory() as tmp:
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
-        await seed_signal_catalog(sm)
+        await sync_vocabulary(sm)
         for sig in SIGNAL_CATALOG:
             await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
@@ -1135,7 +1135,7 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
         scavio_api_key='dummy'))
     state = StateManager(str(tmp_path / 'test.db'))
     await state.init_db()
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     for signal in SIGNAL_CATALOG:
         await state.set_signal_status(signal['code'], 'confirmed')
     report = await D.run_discovery(state, load_config(), provider_key=provider,

@@ -1,0 +1,62 @@
+# Finds the named people on pages already read: team cards, sentences like
+# "owned and operated by", schema.org Person and founder markup.
+id = "people"
+name = "People on the site"
+description = "Named people from team pages, sentences and schema.org markup."
+set = "core"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["website"]
+default_enabled = true
+entry = "harvey.collectors.people.find_people"
+secrets = []
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free: pages the website module already fetched"
+
+[[signals]]
+code = "CONTACT_FOUND"
+label = "Named contact found"
+category = "people"
+value_type = "text"
+collector = "people"
+cost_note = "free (team page)"
+cardinality = "many"
+
+[[signals]]
+code = "DECISION_MAKER_TITLE"
+label = "Decision-maker title"
+category = "people"
+value_type = "text"
+collector = "people"
+cost_note = "free (team page)"
+cardinality = "many"
+
+[[signals]]
+code = "REGISTRY_VERIFIED"
+label = "Confirmed in a public registry"
+category = "people"
+value_type = "text"
+collector = "people"
+cost_note = "free (public registry API)"
+cardinality = "many"
+
+[[signals]]
+code = "LIKELY_OWNER"
+label = "Likely the owner"
+category = "people"
+value_type = "bool"
+collector = "people"
+cost_note = "free (company website)"
+cardinality = "many"
+
+[[capabilities]]
+id = "find_people"
+op = "read"
+inputs = [["pages"]]
+outputs = { records = "people", facts = ["CONTACT_FOUND", "DECISION_MAKER_TITLE", "LIKELY_OWNER"] }
+cost = { usd = 0.0, per = "company" }

@@ -60,7 +60,8 @@ async function api(path) {
 """
 
 APP_FUNCS = ("escHtml", "jsq", "own", "icon", "emptyState", "failedOnServer", "offlineState",
-             "offlineLine", "markLoadFailed", "loadSettings", "saveEnv", "loadHarveyStatus",
+             "offlineLine", "markLoadFailed", "loadSettings", "applyEnvKeys", "saveEnv",
+             "loadHarveyStatus",
              "loadLiveStatus", "loadActivity", "loadTodayActivity", "renderRunsTable", "runName",
              "loadOverview", "agentName")
 

@@ -1,0 +1,21 @@
+# Sequencer-ready CSV of contacts or companies (harvey export, and the
+# dashboard's Export buttons).
+id = "export"
+name = "Export"
+description = "Sequencer-ready CSV files of contacts or companies."
+set = "core"
+kind = "action"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.export"
+secrets = []
+
+[[capabilities]]
+id = "export_csv"
+op = "action"
+inputs = []
+outputs = { files = ["csv"] }
+cost = { usd = 0.0, per = "export" }

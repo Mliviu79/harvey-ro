@@ -162,6 +162,29 @@ class Scout:
         self._site_evidence: dict[str, dict] = {}
         self._own_domains: dict[str, bool] = {}
         self._challenged: set[str] = set()
+        self._modules: set[str] | None = None
+        # What this cycle left out because its module is off: {what: module}.
+        self._skipped: dict[str, str] = {}
+
+    async def _module_on(self, module_id: str) -> bool:
+        """Whether a module is on, read once per cycle: a strategy or search
+        backend whose module is off doesn't run."""
+        if self._modules is None:
+            from harvey.modules import switches
+            self._modules = await switches.enabled_ids(self.state)
+        return module_id in self._modules
+
+    async def _uses(self, module_id: str, what: str) -> bool:
+        """``_module_on``, saying once per cycle what is left out when the
+        module is off (a warning, and the cycle's Activity entry): nothing
+        is skipped in silence."""
+        if await self._module_on(module_id):
+            return True
+        if what not in self._skipped:
+            self._skipped[what] = module_id
+            logger.warning(f"Scout: {what} skipped: the {module_id} module is off "
+                           f"(harvey modules enable {module_id}).")
+        return False
 
     async def run(self):
         """Main prospecting flow: find leads matching ICP."""
@@ -173,32 +196,39 @@ class Scout:
         self._seen_domains = set()
         self._site_reads, self._site_evidence, self._own_domains = {}, {}, {}
         self._challenged = set()
+        self._modules = None
+        self._skipped = {}
 
         prospects_found = 0
 
         # Each strategy is isolated so one failing does not abort the cycle.
+        # A strategy belongs to a module, and runs only while it is on.
         strategies = []
         # Hunter first, if configured: real named people with a real
         # verification verdict beats a scrape guess, but the free tier's
         # monthly budget (HUNTER_MONTHLY_SEARCHES, 25 by default) is small —
         # self-skips once it's spent.
-        strategies.append(("hunter", self._prospect_via_hunter))
+        if await self._uses("hunter", "Hunter contacts"):
+            strategies.append(("hunter", self._prospect_via_hunter))
         # Backfill next: companies already on file (e.g. from `harvey
         # discover`) but with zero prospects. Scrapes each company's own
         # site directly, so it costs no search-query budget and isn't at
         # the mercy of Serper/Bing flakiness — cheapest, most reliable win
         # available before spending any queries.
         strategies.append(("known_companies", self._prospect_via_known_companies))
-        if self.config.channels.linkedin.enabled and self.env.linkedin_email:
+        linkedin = (self.config.channels.linkedin.enabled and self.env.linkedin_email
+                    and await self._uses("linkedin", "LinkedIn prospecting"))
+        if linkedin:
             strategies.append(("linkedin", self._prospect_via_linkedin))
         # Job boards first: hiring is the strongest intent signal, and the
         # strategy self-skips when python-jobspy isn't installed.
-        strategies.append(("hiring_boards", self._prospect_via_hiring_boards))
+        if await self._uses("hiring", "Job-board search"):
+            strategies.append(("hiring_boards", self._prospect_via_hiring_boards))
         # Web search for LinkedIn profiles yields names without a company or
         # email, which Harvey can't verify; it rides the same switch as the
         # LinkedIn channel (and its login) so it is off unless LinkedIn
         # prospecting is wanted, and doesn't spend the cycle's query budget.
-        if self.config.channels.linkedin.enabled and self.env.linkedin_email:
+        if linkedin:
             strategies.append(("profile_search", self._prospect_via_profile_search))
         strategies.append(("company_discovery", self._prospect_via_company_discovery))
 
@@ -211,10 +241,14 @@ class Scout:
         finally:
             await self.close_browser()
 
+        details = {"prospects_found": prospects_found}
+        if self._skipped:
+            details["skipped"] = [{"what": what, "module": module}
+                                  for what, module in self._skipped.items()]
         await self.state.log_action(
             action_type="prospect",
             agent="scout",
-            details={"prospects_found": prospects_found},
+            details=details,
         )
         logger.info(f"Scout: Found {prospects_found} new prospects this cycle.")
 
@@ -370,7 +404,8 @@ class Scout:
         """Search the web using the best available backend.
 
         Returns list of (url, snippet) tuples.
-        Tries backends in order: Serper API → TinyFish Search API → DuckDuckGo → Bing → Google.
+        Tries backends in order: Serper API → TinyFish Search API → DuckDuckGo → Bing → Google,
+        each only while its module (serper, tinyfish, web_search_scrape) is on.
         """
         if self._queries_this_cycle >= MAX_QUERIES_PER_CYCLE:
             logger.info("Scout: Query limit reached for this cycle. Will continue next cycle.")
@@ -385,15 +420,24 @@ class Scout:
         serper_key = getattr(self.env, "serper_api_key", "") or ""
         tinyfish_key = getattr(self.env, "tinyfish_api_key", "") or ""
         backends = []
-        if serper_key:
+        if serper_key and await self._module_on("serper"):
             backends.append(lambda: self._search_serper(query, serper_key))
-        if tinyfish_key:
+        if tinyfish_key and await self._module_on("tinyfish"):
             backends.append(lambda: self._search_tinyfish(query, tinyfish_key))
-        backends.extend([
-            lambda: self._search_duckduckgo(query),
-            lambda: self._search_bing(query),
-            lambda: self._search_google(query),
-        ])
+        # Search engines' result pages, read without an API: their own
+        # module, off unless turned on (their terms forbid it).
+        if await self._module_on("web_search_scrape"):
+            backends.extend([
+                lambda: self._search_duckduckgo(query),
+                lambda: self._search_bing(query),
+                lambda: self._search_google(query),
+            ])
+        if not backends:
+            if "Web search" not in self._skipped:
+                self._skipped["Web search"] = "web_search_scrape"
+                logger.warning("Scout: Web search skipped: no search module is on with what "
+                               "it needs (serper or tinyfish with its key, or web_search_scrape).")
+            return []
 
         for backend in backends:
             try:
@@ -1024,7 +1068,7 @@ class Scout:
         companies = []
 
         industries = self.config.icp.industries or []
-        if not industries:
+        if not industries or not await self._uses("web_search_scrape", "G2/Clutch directories"):
             return []
 
         directory_queries = []
@@ -1843,7 +1887,7 @@ Respond ONLY with the JSON array."""
         if not email:
             return None
         try:
-            status = await verify_published_address(email, env=self.env)
+            status = await verify_published_address(email, env=self.env, state=self.state)
         except Exception as e:
             logger.debug(f"Inbox verification failed for {email}: {e}")
             status = "guess"
@@ -2020,7 +2064,8 @@ Respond ONLY with the JSON array."""
 
             signal_note = f"Signal: hiring {job_title} (posted on job board)"
             from harvey.integrations.tech_detect import detect_tech
-            tech = detect_tech(info.get("_homepage_html", ""))
+            tech = (detect_tech(info.get("_homepage_html", ""))
+                    if await self._uses("web_marketing", "Tech detection") else [])
             if tech:
                 await self.state.update_company_signals(company_id, tech_stack=tech)
                 signal_note += ". Tech on site: " + ", ".join(tech[:5])
@@ -2073,11 +2118,12 @@ Respond ONLY with the JSON array."""
             )
             homepage_html = resp.text if resp is not None else ""
 
-        tech = detect_tech(homepage_html)
+        tech = detect_tech(homepage_html) if await self._uses("web_marketing", "Tech detection") else []
 
         signals: list[dict] = []
         try:
-            hiring_roles = await self._scrape_hiring_signals(domain)
+            hiring_roles = (await self._scrape_hiring_signals(domain)
+                            if await self._uses("hiring", "Careers-page scan") else [])
         except Exception as e:
             logger.debug(f"Hiring scan failed for {domain}: {e}")
             hiring_roles = []

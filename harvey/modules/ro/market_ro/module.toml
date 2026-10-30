@@ -1,0 +1,12 @@
+# Romanian vocabulary. Today: the CAEN nomenclature, legal forms and ONRC
+# status names in harvey/reference/*.csv, and lists still in code.
+id = "market_ro"
+name = "Romania"
+description = "Romanian vocabulary: CAEN codes, legal forms, registry status names."
+set = "ro"
+kind = "market"
+version = "0.3.0"
+api = 1
+markets = ["RO"]
+requires = []
+default_enabled = true

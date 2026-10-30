@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import harvey.dashboard as dash
-from harvey.signals import seed_signal_catalog
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 ORIGIN = "http://127.0.0.1:5555"
@@ -36,7 +36,7 @@ def env(tmp_path, monkeypatch):
     async def _init():
         state = StateManager(db_path=str(db))
         await state.init_db()
-        await seed_signal_catalog(state)  # observations only accept known codes
+        await sync_vocabulary(state)  # observations only accept known codes
     asyncio.run(_init())
     return {"db": db, "token": dash.token_store.get()}
 

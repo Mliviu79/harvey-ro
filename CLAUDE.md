@@ -40,7 +40,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does Harvey do?"** → It's like having a tireless sales assistant. Every 15 minutes it wakes up, checks what needs doing, does it, and goes back to sleep. It finds prospects, writes emails, sends campaigns, and responds to replies.
 
-- **"How does it find people?"** → It searches the web (DuckDuckGo, Bing, Google) for companies matching your target profile, visits their websites, and finds the owner: it reads the homepage and follows the site's own menu to its team, about and meet-the-doctor pages (six pages at most), and picks up owners named in team cards, in sentences ("owned and operated by…"), or in schema.org. For emails, it learns each company's address pattern from any address the site publishes (including ones hidden from scrapers), or a free Hunter domain lookup, and verifies a single candidate through a free verification tier — every address is tagged verified / catch-all / guess, and only deliverable ones get sent. No expensive tools needed.
+- **"How does it find people?"** → It searches the web for companies matching your target profile (Serper or TinyFish with a key; reading DuckDuckGo, Bing and Google result pages is its own module, `web_search_scrape`, off on new installs because those engines' terms forbid it), visits their websites, and finds the owner: it reads the homepage and follows the site's own menu to its team, about and meet-the-doctor pages (six pages at most), and picks up owners named in team cards, in sentences ("owned and operated by…"), or in schema.org. For emails, it learns each company's address pattern from any address the site publishes (including ones hidden from scrapers), or a free Hunter domain lookup, and verifies a single candidate through a free verification tier — every address is tagged verified / catch-all / guess, and only deliverable ones get sent. No expensive tools needed.
 
 - **"How does it write emails?"** → It uses proven cold email frameworks (like AIDA and PAS) with strict rules — short, personal, no AI-sounding language. Each email is tailored to the specific person and their company.
 
@@ -182,7 +182,10 @@ Ask the user these questions and build `harvey.yaml` and `skills/product_knowled
 ### Step 4: Confirm Signals
 
 Harvey ships a catalog of 31 signals it knows how to collect, all **proposed** and
-none active. Nothing is prospected against until the user confirms them.
+none active. Nothing is prospected against until the user confirms them. Each
+signal belongs to a module, and only the signals of modules that are on are
+shown (startup, hiring and website-marketing signals ship off: turn the module
+on first on the dashboard's **Surse** page, or `harvey modules enable <id>`).
 
 Send them to `harvey dashboard` → **Signals**, where each one shows a
 plain-language description, what it costs, and how many companies already carry
@@ -213,7 +216,7 @@ harvey discover --estimate                         # projected spend, then exits
 harvey discover                                    # free OpenStreetMap source
 harvey discover --provider dataforseo_listings --max-spend 2.00
 harvey discover --preset yc --provider serper   # startups that say they're YC-backed
-harvey discover --preset hiring --provider serper   # companies whose careers pages list your roles
+harvey discover --preset hiring --provider serper   # companies whose careers pages list your roles (the hiring module must be on)
 harvey discover --preset accelerator --provider serper   # ...Techstars, Antler, EF and others
 harvey discover --preset funding --provider serper       # companies announcing a raise
 ```
@@ -239,7 +242,9 @@ Add more search phrases per industry with `icp.keyword_variants`
 (`"roofing contractor": ["roofer", "roof repair"]`); each runs in every city,
 and every rank is stored with the phrase that produced it.
 
-**Selling to startups:** three presets (above, or *Look for* on Discover):
+**Selling to startups:** three presets (above, or *Look for* on Discover), once
+the `startups` module is on (`harvey modules enable startups`; `hiring` for the
+hiring preset):
 `yc` finds companies whose own site says they're backed by Y Combinator,
 `accelerator` the same for Techstars, 500 Global, Antler, Entrepreneur First,
 South Park Commons, Neo, AI Grant, a16z speedrun, Pioneer and Plug and Play,
@@ -317,7 +322,7 @@ Users will come back with questions and tasks. Common ones:
 - **DISCOVER** (`collectors/discover.py`): the only stage that spends money, so cost discipline lives in the collector, not the database — every run estimates first, checks a spend cap between batches, reads a kill switch, and flushes observations per batch. Providers are adapters behind one interface (`DiscoveryProvider`); adding one is a small class. Junk filtering matches *patterns*, not a literal blocklist. Entity resolution is the normalised domain, falling back to the provider's `external_id` for businesses with no website.
 
 ### Sub-Agents
-- **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. Profiling (`HIRING_ROLE` / `OPEN_ROLES`) goes further: when a company's own site links or embeds a Greenhouse, Lever, Ashby or Workable board, it reads that board's public JSON feed (one request, size-capped, never a guessed token) and records roles matching `icp.hiring_signals` (falls back to `icp.titles`) with department, location, posting date and URL, plus the open-roles count (`harvey/collectors/ats.py`). A board with no matching role records `HIRING_ROLE` = 0, so closed roles stop being current. The `titles` fallback is weak (it lists who you email, not roles that signal buying), so suggest users set `hiring_signals`. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
+- **Scout**: Python does all web searching (Serper → TinyFish → DuckDuckGo → Bing → Google, each only while its module is on; the last three are `web_search_scrape`) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. Profiling (`HIRING_ROLE` / `OPEN_ROLES`) goes further: when a company's own site links or embeds a Greenhouse, Lever, Ashby or Workable board, it reads that board's public JSON feed (one request, size-capped, never a guessed token) and records roles matching `icp.hiring_signals` (falls back to `icp.titles`) with department, location, posting date and URL, plus the open-roles count (`harvey/collectors/ats.py`). A board with no matching role records `HIRING_ROLE` = 0, so closed roles stop being current. The `titles` fallback is weak (it lists who you email, not roles that signal buying), so suggest users set `hiring_signals`. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
 - **Writer**: Generates 3-email sequences (Email 1 < 75 words, Email 2 < 75, Email 3 < 40). Strict ban list on AI patterns.
 - **Sender**: Native providers (gmail/smtp) render merge vars per prospect and STAGE each email into the `outbox` (pending_review → approved → sent) with a scheduled send time; each heartbeat drains due, approved items with human-like pacing, the daily cap, the deterministic pre-send gate, and stop-on-reply (a reply from anyone at a company stops the sequence to everyone there). Legacy Instantly path deploys campaigns via API. Enforces daily send limits either way.
 - **Handler**: Polls the provider (or Instantly) for replies, dedups them, classifies intent, advances conversation stage, and queues auto-responses through the same outbox approval ladder. On native providers it also detects bounces → marks the address invalid, cancels the prospect's queued sends, and trips a global kill switch past a bounce-rate threshold.
@@ -350,6 +355,8 @@ harvey registry search dentist BV  # Every firm in Romania: name, activity words
 harvey import-onrc dentist --county BV  # Shortcut: loads the latest dataset if needed, then pulls by area + activity (--dry-run counts). No activity = every operating company in the area (county or --locality required); --administrators all|none. Every authorised CAEN class is saved per company
 harvey search <words|code>   # Search companies on file locally: CAEN code (8623), activity in RO/EN words (stomatologie, dentist), name, town — all words must match, -word excludes; --json
 harvey caen <code|words>     # CAEN reference: a code's name in every revision, or the codes for some words (not a filter)
+harvey modules list          # Every module's manifest (harvey/modules/<set>/<id>/module.toml): id, set, kind, version, signals, default and current on/off; --json. Imports no module code
+harvey modules enable|disable <id>  # Turn a module on or off for this install (modules.<id>.enabled; dashboard: Surse). Core can't go off; enabling needs its requires on, disabling is refused while an enabled module requires it. Off hides its signals, refuses its sources/presets/strategies (Scout logs each skip once per cycle) and drops its unset .env keys from Settings (a key that holds a value stays editable); nothing is deleted
 harvey duplicates            # Companies that may be on file twice (resolver.py): --merge KEEP MERGED / --separate A B / --undo MERGED. Merges at >= 0.85 are automatic, 0.6-0.85 wait for review, two CUIs never merge, every merge can be undone
 harvey sending pause|resume  # Kill switch for all outbound
 harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
@@ -365,4 +372,5 @@ harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or reco
 - **Codex calls fail** (`brain.provider: codex`): the log line says why — `codex login` with ChatGPT (also when the login "has expired or is due for renewal": Harvey never renews it), install the supported Codex version (`harvey status --check` shows what's wrong without a model call; while Codex is unusable Harvey pauses whole cycles on purpose), pick a `brain.model` without code mode, or remove whatever Codex config layer is forcing tools/hooks/MCP back on. Never weaken Harvey's isolation checks to get past it.
 - **LinkedIn login stopped / "on hold"**: any login that sent the password and didn't reach the feed (a checkpoint, a refused password, a stall) writes `data/linkedin_login_hold.json` and Harvey never logs in again on its own. Have the user sign in by hand in a normal browser, then delete that file. "Login form not found (HTTP 403)" means the browser was refused: set `BROWSER_CDP_FALLBACK_URL` to the Chromium service.
 - **Instantly API 401**: Wrong API key or needs the Growth plan for API access
-- **Google search rate limiting**: Harvey automatically falls back to DuckDuckGo and Bing. For reliable search, add a Serper API key ($5/mo).
+- **Google search rate limiting**: with the `web_search_scrape` module on, Harvey falls back to DuckDuckGo and Bing. For reliable search, add a Serper API key ($5/mo).
+- **"Scout: … skipped: the <id> module is off"** in the log or Activity: that part of Scout belongs to a module that is off. Turn it on (Surse, or `harvey modules enable <id>`) if the user wants it. An install that already used it before modules existed keeps it on.

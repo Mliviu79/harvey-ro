@@ -1,0 +1,43 @@
+# Learns a company's address pattern from what its site publishes, builds
+# one candidate and checks it with a verification service. Without a key
+# every address stays a guess and is never sent.
+id = "email_verify"
+name = "Email verification"
+description = "Learns each company's address pattern and checks one address with Reoon or ZeroBounce."
+set = "original"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.integrations.email_finder.find_email"
+secrets = ["REOON_API_KEY", "ZEROBOUNCE_API_KEY"]
+
+[cost]
+as_of = 2026-10-30
+free_tier = "Reoon 600 checks a month; ZeroBounce 100 a month"
+note = "1 verification credit per address"
+
+[[signals]]
+code = "EMAIL_PATTERN"
+label = "Company email pattern"
+category = "verification"
+value_type = "text"
+collector = "verify"
+cost_note = "free, or ~1 lookup credit"
+
+[[signals]]
+code = "EMAIL_STATUS"
+label = "Email deliverability"
+category = "verification"
+value_type = "text"
+collector = "verify"
+cost_note = "1 verification credit (free tiers available)"
+
+[[capabilities]]
+id = "find_email"
+op = "lookup"
+inputs = [["name", "domain"]]
+outputs = { facts = ["EMAIL_PATTERN", "EMAIL_STATUS"] }
+cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier" }

@@ -1,0 +1,35 @@
+# Phone numbers a business publishes on its own pages: tap-to-call links,
+# schema.org markup, numbers written out. Faxes are left out.
+id = "phones"
+name = "Phone numbers"
+description = "Phone numbers a business publishes on its own pages."
+set = "core"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["website"]
+default_enabled = true
+entry = "harvey.collectors.phones.phones_from_html"
+secrets = []
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free: pages the website module already fetched"
+
+[[signals]]
+code = "PHONE_NUMBER"
+label = "Phone number on the site"
+category = "verification"
+value_type = "text"
+collector = "profile"
+cost_note = "free (site HTML)"
+cardinality = "many"
+
+[[capabilities]]
+id = "site_phones"
+op = "read"
+inputs = [["pages"]]
+outputs = { ids = ["phone"], facts = ["PHONE_NUMBER"] }
+cost = { usd = 0.0, per = "company" }

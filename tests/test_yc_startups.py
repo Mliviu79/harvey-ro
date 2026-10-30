@@ -18,8 +18,11 @@ import pytest_asyncio
 from harvey.collectors.discover import build_queries, is_junk, preset_problem
 from harvey.collectors.profile import ProfileCollector, yc_backed
 from harvey.models.company import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("startups")
 
 
 @pytest_asyncio.fixture
@@ -71,7 +74,7 @@ def test_the_signal_is_in_the_catalog_and_starts_proposed():
 
 @pytest.mark.asyncio
 async def test_the_profile_collector_records_it(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.state = await state.confirmed_signal_codes(), {}, state
@@ -203,7 +206,7 @@ async def _yc_company(state, backed: bool):
 @pytest.mark.parametrize("backed", [True, False])
 async def test_the_writer_uses_the_skill_for_yc_startups_only(state, backed):
     from harvey.agents.writer import Writer
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     prospect = await _yc_company(state, backed)
     brain = RecordingBrain()
     cfg = SimpleNamespace(
@@ -227,7 +230,7 @@ async def test_the_reply_handler_uses_it_too(state, backed):
     from harvey.agents.handler import Handler
     from harvey.models.conversation import Conversation, Message
     from tests.test_outbox_native import Cfg, Env
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     prospect = await _yc_company(state, backed)
     brain = RecordingBrain()
     handler = Handler(brain=brain, state=state, config=Cfg(), env=Env())
@@ -277,7 +280,7 @@ def test_real_ways_sites_mention_yc_without_being_backed(html):
 
 @pytest.mark.asyncio
 async def test_the_about_page_is_checked_when_the_homepage_is_silent(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.state = await state.confirmed_signal_codes(), {}, state
@@ -325,7 +328,7 @@ def test_a_preset_hit_records_that_the_search_matched():
 
 @pytest.mark.asyncio
 async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.com"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="discover",
@@ -408,7 +411,7 @@ def test_the_preset_excludes_ycs_own_sites():
 
 @pytest.mark.asyncio
 async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
     cid = await state.add_company(Company(name="Vendor", domain="vendor.com"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="profile",
@@ -447,7 +450,7 @@ async def test_ycs_own_domains_are_never_profiled(state):
 @pytest.mark.asyncio
 async def test_a_mixed_batch_doesnt_get_founder_framing(state):
     from harvey.agents.writer import Writer
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     yc = await _yc_company(state, True)
     plain = await _yc_company(state, False)
     brain = RecordingBrain()

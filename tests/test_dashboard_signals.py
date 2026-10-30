@@ -15,6 +15,9 @@ import harvey.dashboard as dash
 from harvey.signals import SIGNAL_CATALOG
 from harvey.state import StateManager
 
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
+
 
 @pytest.fixture
 def client(monkeypatch):
@@ -44,12 +47,13 @@ def test_signals_seed_as_proposed_not_confirmed(client):
     assert data["summary"]["confirmed"] == 0
 
 
-def test_signals_grouped_with_plain_language(client):
+def test_signals_grouped_by_module_with_plain_language(client):
     data = client.get("/api/signals").json()
     keys = [g["key"] for g in data["groups"]]
-    assert keys == ["discovery", "profile", "people", "verification"]
+    assert keys == ["people", "phones", "website", "dataforseo", "email_verify", "hiring",
+                    "startups", "web_marketing", "onrc"]
     for group in data["groups"]:
-        assert group["blurb"]  # every category explains itself
+        assert group["label"] and group["blurb"]  # every module explains itself
         for sig in group["signals"]:
             assert sig["description"] and sig["cost_note"]
 
@@ -111,8 +115,8 @@ def test_invalid_status_is_rejected(client):
 async def _seed_observations(db_path):
     state = StateManager(str(db_path))
     await state.init_db()
-    from harvey.signals import seed_signal_catalog
-    await seed_signal_catalog(state)
+    from harvey.signals import sync_vocabulary
+    await sync_vocabulary(state)
     from harvey.models import Company
 
     ids = []
@@ -157,8 +161,8 @@ def test_cohort_is_a_set_intersection(client):
 async def _seed_large_cohort(db_path, n):
     state = StateManager(str(db_path))
     await state.init_db()
-    from harvey.signals import seed_signal_catalog
-    await seed_signal_catalog(state)
+    from harvey.signals import sync_vocabulary
+    await sync_vocabulary(state)
     from harvey.models import Company
 
     ids = [await state.add_company(Company(name=f"Co {i:03d}", domain=f"co{i:03d}.com"))
@@ -316,12 +320,13 @@ def test_cost_notes_are_machine_classifiable():
     assert not email["cost_note"].lower().startswith("free")
 
 
-def test_every_signal_has_a_category_the_ui_renders():
-    from harvey.dashboard import CATEGORY_ORDER
-    for sig in SIGNAL_CATALOG:
-        assert sig["category"] in CATEGORY_ORDER, (
-            f"{sig['code']} is in category {sig['category']!r}, which the "
-            "dashboard would silently drop")
+def test_every_signal_shows_under_its_module_with_when_it_is_known(client):
+    data = client.get("/api/signals").json()
+    shown = {s["code"]: (g["key"], s["when_known"]) for g in data["groups"] for s in g["signals"]}
+    assert set(shown) == {s["code"] for s in SIGNAL_CATALOG}
+    assert shown["SERP_RANK"] == ("dataforseo", "search")
+    assert shown["ACTIVITY_CODE"] == ("onrc", "source")
+    assert shown["TECH_STACK"] == ("web_marketing", "enrich")
 
 
 @pytest.mark.parametrize('body', [[], None, {'require': [7]}, {'require': {}},
@@ -356,8 +361,8 @@ def test_cohort_over_previous_cap_and_stable_ties(client):
     async def initialize():
         state = StateManager(str(client.db_path))
         await state.init_db()
-        from harvey.signals import seed_signal_catalog
-        await seed_signal_catalog(state)
+        from harvey.signals import sync_vocabulary
+        await sync_vocabulary(state)
     asyncio.run(initialize())
     # Bulk seed rather than opening 10,001 individual connections.
     with closing(sqlite3.connect(client.db_path)) as db, db:
@@ -526,8 +531,8 @@ const page = (name, offset) => ({size: 100, offset, companies: [{name}]});
 async def _seed_ranks(db_path):
     state = StateManager(str(db_path))
     await state.init_db()
-    from harvey.signals import seed_signal_catalog
-    await seed_signal_catalog(state)
+    from harvey.signals import sync_vocabulary
+    await sync_vocabulary(state)
     from harvey.models import Company
     for name, rank in (("Top", 3), ("Mid", 14), ("Deep", 45)):
         cid = await state.add_company(Company(name=name, domain=f"{name.lower()}.com"))

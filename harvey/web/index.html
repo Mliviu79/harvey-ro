@@ -103,6 +103,7 @@
       <button data-tab="prospects" onclick="showTab('prospects', this)"><svg class="icon" aria-hidden="true"><use href="#i-contacts"/></svg><span class="label" data-i18n="nav.contacts">Contacte</span></button>
       <button data-tab="discover" onclick="showTab('discover', this)"><svg class="icon" aria-hidden="true"><use href="#i-discover"/></svg><span class="label" data-i18n="nav.discover">Descoperă</span></button>
       <button data-tab="signals" onclick="showTab('signals', this)"><svg class="icon" aria-hidden="true"><use href="#i-signals"/></svg><span class="label" data-i18n="nav.signals">Semnale</span><span class="nav-count" id="nav-signals"></span></button>
+      <button data-tab="modules" onclick="showTab('modules', this)"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span class="label" data-i18n="nav.modules">Surse</span></button>
     </div>
     <div class="nav-group" data-module="email" hidden>
       <div class="nav-label" data-i18n="nav.group.email">Email</div>
@@ -211,6 +212,16 @@
 </div>
 
 <!-- Signals: the confirmation gate -->
+<div id="modules" class="section">
+  <div class="section-head">
+    <div>
+      <h2 data-i18n="modp.title">Surse</h2>
+      <p data-i18n="modp.lede">Din ce e făcut Harvey: surse de date, căutări, citiri de site, limbi și acțiuni. Pornește doar ce folosești. Când oprești un modul nu se șterge nimic: datele lui rămân, doar ascunse.</p>
+    </div>
+  </div>
+  <div id="modules-list"></div>
+</div>
+
 <div id="signals" class="section">
   <div class="section-head">
     <div>
@@ -363,6 +374,7 @@
     </div>
   </div>
 
+  <div data-env="REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY">
   <div class="subhead"><span data-i18n="set.verify">Verificarea adreselor de email</span> <span class="hint" data-i18n="set.verify_hint">Recomandat</span></div>
   <div class="card">
     <div class="settings-row">
@@ -371,16 +383,17 @@
         <p class="desc" data-i18n-html="set.verifiers_desc"></p>
       </div>
       <div class="fields">
-        <div class="form-group"><label class="form-label" for="reoon-key"><span data-i18n="set.reoon">Cheie API Reoon</span> <span id="reoon-status" class="email-tag"></span></label>
+        <div class="form-group" data-env="REOON_API_KEY"><label class="form-label" for="reoon-key"><span data-i18n="set.reoon">Cheie API Reoon</span> <span id="reoon-status" class="email-tag"></span></label>
           <div class="with-btn"><input type="password" class="form-input" id="reoon-key" autocomplete="off">
             <button class="btn btn-secondary" onclick="toggleVisibility('reoon-key')" data-i18n="common.show">Arată</button></div></div>
-        <div class="form-group"><label class="form-label" for="zerobounce-key"><span data-i18n="set.zerobounce">Cheie API ZeroBounce</span> <span id="zerobounce-status" class="email-tag"></span></label>
+        <div class="form-group" data-env="ZEROBOUNCE_API_KEY"><label class="form-label" for="zerobounce-key"><span data-i18n="set.zerobounce">Cheie API ZeroBounce</span> <span id="zerobounce-status" class="email-tag"></span></label>
           <input type="password" class="form-input" id="zerobounce-key" autocomplete="off"></div>
-        <div class="form-group"><label class="form-label" for="hunter-key"><span data-i18n="set.hunter">Cheie API Hunter</span> <span id="hunter-status" class="email-tag"></span></label>
+        <div class="form-group" data-env="HUNTER_API_KEY"><label class="form-label" for="hunter-key"><span data-i18n="set.hunter">Cheie API Hunter</span> <span id="hunter-status" class="email-tag"></span></label>
           <input type="password" class="form-input" id="hunter-key" autocomplete="off"></div>
         <button class="btn btn-primary btn-sm" onclick="saveVerifiers()" data-i18n="set.save_verifiers">Salvează cheile</button>
       </div>
     </div>
+  </div>
   </div>
 
   <div data-module="email" hidden>
@@ -473,7 +486,7 @@
 
   <div class="subhead" data-i18n="set.optional">Opțional</div>
   <div class="card">
-    <div class="settings-row">
+    <div class="settings-row" data-env="LINKEDIN_EMAIL">
       <div>
         <h3>LinkedIn</h3>
         <p class="desc" data-i18n="set.linkedin_desc">Pentru căutarea de persoane pe LinkedIn. Harvey se autentifică și caută ca un om.</p>
@@ -490,7 +503,7 @@
         <button class="btn btn-primary btn-sm" onclick="saveLinkedIn()" data-i18n="set.save_linkedin">Salvează LinkedIn</button>
       </div>
     </div>
-    <div class="settings-row">
+    <div class="settings-row" data-env="CLOUDFLARE_ACCOUNT_ID">
       <div>
         <h3>Cloudflare</h3>
         <p class="desc" data-i18n="set.cf_desc">Citire în profunzime a site-urilor cu JavaScript, la antrenarea pe produs. Cam 5 $ pe lună.</p>

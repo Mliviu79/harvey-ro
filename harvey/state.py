@@ -10,6 +10,7 @@ upgrade cleanly in place.
 """
 
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -29,6 +30,8 @@ from harvey.models.conversation import Conversation, Message  # noqa: F401
 from harvey import resolver
 from harvey.paths import PROJECT_ROOT
 from harvey.startups import parse_funding
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 
@@ -847,6 +850,26 @@ MIGRATIONS: list[str] = [
                 COALESCE(NEW.collector, ''), COALESCE(NEW.confidence, 1.0));
     END;
     """,
+    # ── v18: the vocabulary comes from module manifests ──
+    """
+    -- Filled from each signal's manifest declaration by
+    -- signals.sync_vocabulary(). `available` is 0 while the declaring
+    -- module is off: the signal is hidden and never collected, and its
+    -- observations stay (the insert trigger still knows the code).
+    ALTER TABLE signal_codes ADD COLUMN module TEXT DEFAULT '';
+    ALTER TABLE signal_codes ADD COLUMN subject TEXT DEFAULT 'company';
+    ALTER TABLE signal_codes ADD COLUMN unit TEXT DEFAULT '';
+    ALTER TABLE signal_codes ADD COLUMN cardinality TEXT DEFAULT 'one';
+    ALTER TABLE signal_codes ADD COLUMN keyed_by TEXT DEFAULT '';
+    ALTER TABLE signal_codes ADD COLUMN absence TEXT DEFAULT 'unknown';
+    ALTER TABLE signal_codes ADD COLUMN when_known TEXT DEFAULT 'enrich';
+    ALTER TABLE signal_codes ADD COLUMN available INTEGER DEFAULT 1;
+
+    -- Rank reads key on keyed_by from here on; the next sync writes the
+    -- same from the manifests.
+    UPDATE signal_codes SET keyed_by = 'phrase'
+        WHERE code IN ('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK');
+    """,
 ]
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
@@ -1228,8 +1251,103 @@ def _statements(script: str):
         yield pending
 
 
+# What an install that predates modules has on file from the parts of Scout
+# that ran with no switch: each module listed here stays on through the
+# upgrade when its query finds a row (switches.upgrade_enabled).
+_MODULE_TRACES = {
+    # Companies found by Scout's search-engine reading, or its G2/Clutch scan.
+    "web_search_scrape": "SELECT 1 FROM companies WHERE source IN ('web_search', 'directory')",
+    # Tools detected on a site (Scout's tech note in email personalization).
+    "web_marketing": "SELECT 1 FROM companies WHERE COALESCE(tech_stack_json, '[]') "
+                     "NOT IN ('', '[]')",
+    # Open roles from a careers page, or contacts from the job-board sweep.
+    "hiring": "SELECT 1 FROM companies WHERE signals_json LIKE '%\"hiring\"%' "
+              "UNION ALL SELECT 1 FROM prospects WHERE source = 'job_board'",
+}
+
+
+async def _modules_first_seen(db) -> None:
+    """v18's Python step: the install meets modules. The old dashboard Email
+    switch becomes the email_outreach module's (the old key stays, so an
+    older Harvey started on this database still reads it). On an install
+    that already ran (it has a vocabulary or companies), modules that ship
+    off but were working stay on (switches.upgrade_enabled); a new install
+    takes the manifests' defaults. Only the shipped manifests count here: a
+    pack in data/modules can't stop the database from opening."""
+    from harvey.modules import switches
+
+    async with db.execute("SELECT value FROM settings WHERE key = ?",
+                          (switches.LEGACY_EMAIL_KEY,)) as cur:
+        row = await cur.fetchone()
+    if row is not None and row[0] == "on":
+        await db.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (switches.KEY.format(switches.EMAIL_MODULE), switches.ON))
+
+    async with db.execute("SELECT (SELECT COUNT(*) FROM signal_codes) "
+                          "+ (SELECT COUNT(*) FROM companies)") as cur:
+        (existing,) = await cur.fetchone()
+    if not existing:
+        return
+    async with db.execute("SELECT code FROM signal_codes WHERE status = 'confirmed'") as cur:
+        confirmed = {r[0] for r in await cur.fetchall()}
+    used = set()
+    for module_id, sql in _MODULE_TRACES.items():
+        async with db.execute(f"SELECT EXISTS ({sql})") as cur:
+            if (await cur.fetchone())[0]:
+                used.add(module_id)
+    kept = switches.upgrade_enabled(switches.shipped(), switches.present_env_keys(),
+                                    confirmed, used)
+    for module_id in kept:
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                         (switches.KEY.format(module_id), switches.ON))
+    if kept:
+        logger.info("Modules kept on from before the upgrade: %s", ", ".join(kept))
+
+
 # Python steps run right after a migration, in its transaction.
-_AFTER_MIGRATION = {17: _resolve_on_file}
+_AFTER_MIGRATION = {17: _resolve_on_file, 18: _modules_first_seen}
+
+
+_UPSERT_SIGNAL_CODE = """INSERT INTO signal_codes
+       (code, label, description, category, value_type,
+        collector, cost_note, confidence_floor, status,
+        module, subject, unit, cardinality, keyed_by, absence,
+        when_known, available)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'proposed'),
+           ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(code) DO UPDATE SET
+       label = excluded.label,
+       description = excluded.description,
+       category = excluded.category,
+       value_type = excluded.value_type,
+       collector = excluded.collector,
+       cost_note = excluded.cost_note,
+       confidence_floor = excluded.confidence_floor,
+       status = COALESCE(?, signal_codes.status),
+       module = excluded.module,
+       subject = excluded.subject,
+       unit = excluded.unit,
+       cardinality = excluded.cardinality,
+       keyed_by = excluded.keyed_by,
+       absence = excluded.absence,
+       when_known = excluded.when_known,
+       available = excluded.available,
+       updated_at = CURRENT_TIMESTAMP"""
+
+
+def _signal_code_params(code: str, *, label: str = "", description: str = "",
+                        category: str = "", value_type: str = "text",
+                        collector: str = "", cost_note: str = "",
+                        confidence_floor: float = 0.0, status: str | None = None,
+                        module: str = "", subject: str = "company", unit: str = "",
+                        cardinality: str = "one", keyed_by: str = "",
+                        absence: str = "unknown", when_known: str = "enrich",
+                        available: bool = True) -> tuple:
+    return (code, label, description, category, value_type, collector,
+            cost_note, float(confidence_floor), status,
+            module, subject, unit, cardinality, keyed_by, absence, when_known,
+            1 if available else 0, status)
 
 
 class StateManager:
@@ -2508,37 +2626,66 @@ class StateManager:
         cost_note: str = "",
         confidence_floor: float = 0.0,
         status: str | None = None,
+        module: str = "",
+        subject: str = "company",
+        unit: str = "",
+        cardinality: str = "one",
+        keyed_by: str = "",
+        absence: str = "unknown",
+        when_known: str = "enrich",
+        available: bool = True,
     ):
         """Register a signal in the vocabulary. Never downgrades a user's
         decision: an existing row's ``status`` is preserved unless explicitly
         passed, so re-seeding can't silently re-enable a rejected signal."""
         async with self._connect() as db:
-            await db.execute(
-                """INSERT INTO signal_codes
-                       (code, label, description, category, value_type,
-                        collector, cost_note, confidence_floor, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'proposed'))
-                   ON CONFLICT(code) DO UPDATE SET
-                       label = excluded.label,
-                       description = excluded.description,
-                       category = excluded.category,
-                       value_type = excluded.value_type,
-                       collector = excluded.collector,
-                       cost_note = excluded.cost_note,
-                       confidence_floor = excluded.confidence_floor,
-                       status = COALESCE(?, signal_codes.status),
-                       updated_at = CURRENT_TIMESTAMP""",
-                (code, label, description, category, value_type, collector,
-                 cost_note, float(confidence_floor), status, status),
-            )
+            await db.execute(_UPSERT_SIGNAL_CODE, _signal_code_params(
+                code, label=label, description=description, category=category,
+                value_type=value_type, collector=collector, cost_note=cost_note,
+                confidence_floor=confidence_floor, status=status, module=module,
+                subject=subject, unit=unit, cardinality=cardinality, keyed_by=keyed_by,
+                absence=absence, when_known=when_known, available=available))
             await db.commit()
 
-    async def get_signal_codes(self, status: str | None = None) -> list[dict]:
+    async def write_vocabulary(self, rows_for, settings_prefix: str) -> int:
+        """Upsert the whole vocabulary in one write transaction.
+
+        ``rows_for(settings)`` gets the settings under ``settings_prefix``
+        (the module switches), read inside the transaction, and returns one
+        dict of upsert_signal_code arguments per signal. A switch flipped by
+        another process lands before this reads or after it commits, never
+        in between, so the availability written always matches the
+        switches. Returns how many rows were written."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
+                    (len(settings_prefix), settings_prefix),
+                ) as cursor:
+                    settings = {k: v for k, v in await cursor.fetchall()}
+                rows = rows_for(settings)
+                for row in rows:
+                    await db.execute(_UPSERT_SIGNAL_CODE, _signal_code_params(**row))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return len(rows)
+
+    async def get_signal_codes(self, status: str | None = None,
+                               available_only: bool = False) -> list[dict]:
+        """The vocabulary. ``available_only`` leaves out the signals of
+        modules that are off (hidden, never collected)."""
         sql = "SELECT * FROM signal_codes"
-        params: list = []
+        where, params = [], []
         if status:
-            sql += " WHERE status = ?"
+            where.append("status = ?")
             params.append(status)
+        if available_only:
+            where.append("available = 1")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY category, code"
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -2560,7 +2707,10 @@ class StateManager:
             return cursor.rowcount > 0
 
     async def confirmed_signal_codes(self) -> set[str]:
-        return {r["code"] for r in await self.get_signal_codes(status="confirmed")}
+        """What collectors may collect: confirmed by a person, and declared
+        by a module that is on."""
+        return {r["code"] for r in await self.get_signal_codes(status="confirmed",
+                                                                available_only=True)}
 
     # ── Observations (every fact is a row, never a column) ──
 
@@ -2704,7 +2854,8 @@ class StateManager:
     # written last. A search that no longer finds the company writes 0 for
     # that phrase: checked, not ranked. Rows from before phrases were
     # stored (empty value_text) stop counting once a phrased row exists.
-    _RANK_CODES = "('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK')"
+    # Which signals are rank signals is the manifests' keyed_by = "phrase".
+    _RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
     _CURRENT_CTE = f"""
     WITH latest AS (
         SELECT o.* FROM observations o
@@ -3175,6 +3326,15 @@ class StateManager:
             )
             await db.commit()
             return cursor.rowcount
+
+    async def settings_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Every setting whose key starts with ``prefix``."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
+                (len(prefix), prefix),
+            ) as cursor:
+                return {k: v for k, v in await cursor.fetchall()}
 
     async def delete_setting(self, key: str):
         async with self._connect() as db:

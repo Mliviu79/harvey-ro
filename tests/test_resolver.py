@@ -19,8 +19,8 @@ from harvey import resolver
 from harvey.collectors import discover as D
 from harvey.collectors import onrc
 from harvey.models import Company, Prospect
-from harvey.signals import seed_signal_catalog
-from harvey.state import StateManager
+from harvey.signals import sync_vocabulary
+from harvey.state import MIGRATIONS, StateManager
 
 DATASET = onrc.Dataset("firme-01-01-2026", "2026-01-01", {})
 
@@ -29,7 +29,7 @@ DATASET = onrc.Dataset("firme-01-01-2026", "2026-01-01", {})
 async def state(tmp_path):
     sm = StateManager(str(tmp_path / "r.db"))
     await sm.init_db()
-    await seed_signal_catalog(sm)
+    await sync_vocabulary(sm)
     for code in ("ACTIVITY_CODE", "PHONE_NUMBER", "FOUND_IN_SERP", "CONTACT_FOUND"):
         await sm.set_signal_status(code, "confirmed")
     return sm
@@ -521,7 +521,7 @@ async def test_an_upgrade_stopped_halfway_starts_again(tmp_path, monkeypatch):
     assert "merged_into" not in {r[1] for r in _rows(path, "PRAGMA table_info(companies)")}
     monkeypatch.setitem(S._AFTER_MIGRATION, 17, S._resolve_on_file)
     await StateManager(path).init_db()
-    assert _rows(path, "PRAGMA user_version") == [(17,)]
+    assert _rows(path, "PRAGMA user_version") == [(len(S.MIGRATIONS),)]
 
 
 @pytest.mark.asyncio
@@ -532,7 +532,7 @@ async def test_two_processes_upgrading_at_once_both_start(tmp_path):
     done = await asyncio.gather(StateManager(path).init_db(), StateManager(path).init_db(),
                                 return_exceptions=True)
     assert not [r for r in done if isinstance(r, Exception)], done
-    assert _rows(path, "PRAGMA user_version") == [(17,)]
+    assert _rows(path, "PRAGMA user_version") == [(len(MIGRATIONS),)]
 
 
 @pytest.mark.asyncio

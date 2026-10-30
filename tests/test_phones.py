@@ -20,7 +20,7 @@ from harvey.collectors.phones import (
 from harvey.collectors.profile import ProfileCollector
 from harvey.export import COMPANY_CSV_COLUMNS, collect_companies, export_companies_csv
 from harvey.models.company import Company
-from harvey.signals import seed_signal_catalog
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 
@@ -277,7 +277,7 @@ def test_stored_listing_phone_formats():
 async def state(tmp_path):
     sm = StateManager(str(tmp_path / "phones.db"))
     await sm.init_db()
-    await seed_signal_catalog(sm)
+    await sync_vocabulary(sm)
     return sm
 
 

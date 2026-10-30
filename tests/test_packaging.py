@@ -101,6 +101,8 @@ CHECK = textwrap.dedent('''
     web = os.path.join(os.path.dirname(harvey.__file__), "web")
     assert os.path.exists(os.path.join(web, "app.js"))
     assert os.path.exists(os.path.join(web, "auth.js"))
+    from harvey.modules.loader import load_manifests
+    assert {m.id for m in load_manifests(data_dir=None)} >= {"website", "osm", "onrc"}
     # The installed dashboard is locked: the token lives under WORK here.
     from fastapi.testclient import TestClient
     dash.token_store.configure(os.path.join(WORK, "data", "dashboard-token"))

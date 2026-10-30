@@ -1,0 +1,12 @@
+# Dashboard strings in English. They live in the "en" block of
+# harvey/web/i18n.js until languages become one data file each.
+id = "lang_en"
+name = "English"
+description = "Dashboard text in English."
+set = "core"
+kind = "language"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true

@@ -12,7 +12,7 @@ from harvey.collectors.profile import (
     BOOKING_HINTS, RO_TEAM_PATHS, TEAM_PATHS, ProfileCollector, _reads_like_title, title_looks_like_role,
 )
 from harvey.models.company import Company
-from harvey.signals import seed_signal_catalog
+from harvey.signals import sync_vocabulary
 from tests.test_collectors_profile import state  # noqa: F401  (fixture)
 from tests.test_company_inbox import make_scout
 
@@ -230,7 +230,7 @@ async def test_romanian_site_tries_romanian_pages_first():
 
 
 async def team_requests(state, domain):  # noqa: F811
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.state = {"CONTACT_FOUND"}, {}, state
@@ -259,7 +259,7 @@ async def test_romanian_team_paths_go_first(state):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_romanian_team_page_is_read_before_contact(state):  # noqa: F811
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.state = {"CONTACT_FOUND"}, {}, state

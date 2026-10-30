@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 import harvey.dashboard as dash
 from harvey.models import Company
 from harvey.models.prospect import Prospect
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
 WEB = Path(dash.__file__).resolve().parent / "web"
@@ -42,7 +42,7 @@ def _seed(db_path) -> dict:
     async def go():
         s = StateManager(str(db_path))
         await s.init_db()
-        await seed_signal_catalog(s)
+        await sync_vocabulary(s)
         for code in ("PHONE_NUMBER", "CONTACT_FOUND"):
             await s.set_signal_status(code, "confirmed")
         ids = {}
@@ -288,7 +288,8 @@ def test_email_module_is_off_by_default_and_switches(client):
 
     async def setting():
         s = StateManager(str(client.db_path))
-        return await s.get_setting("ui.module.email"), await s.get_setting("sending_paused")
+        return (await s.get_setting("modules.email_outreach.enabled"),
+                await s.get_setting("sending_paused"))
     assert asyncio.run(setting()) == ("on", "")          # visibility only: no kill switch
     client.post("/api/ui/modules", json={"email": False})
     assert client.get("/api/ui/modules").json()["modules"]["email"] is False
@@ -300,11 +301,16 @@ def test_module_switch_refuses_anything_else(client, body):
 
 
 def test_module_switch_is_not_read_by_sending():
-    """The heartbeat must never look at a dashboard-only setting."""
+    """The heartbeat must never look at the Email switch: it only changes
+    what the dashboard shows. The old key is read once, to move it."""
     root = Path(dash.__file__).resolve().parent
+    movers = {root / "dashboard.py", root / "state.py", root / "modules" / "switches.py"}
     for path in root.rglob("*.py"):
-        if path.name != "dashboard.py":
+        if path not in movers:
             assert "ui.module" not in path.read_text(encoding="utf-8"), path
+    for name in ("main.py", "gate.py", "agents/sender.py", "agents/handler.py",
+                 "agents/writer.py", "agents/analyst.py"):
+        assert "email_outreach" not in (root / name).read_text(encoding="utf-8"), name
 
 
 # ── Overview and live status ──

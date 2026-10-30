@@ -1,0 +1,31 @@
+# Turns a place name ("Denver, CO") into the point the map and rank searches
+# start from. Each place is looked up once and cached for good.
+id = "nominatim"
+name = "Nominatim"
+description = "Turns a place name into the point searches start from."
+set = "core"
+kind = "gazetteer"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.collectors.discover.geocode_city"
+secrets = []
+terms_note = "OpenStreetMap's Nominatim usage policy: at most one request a second, an identifying User-Agent, and results cached rather than asked again."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free, within the usage policy"
+
+[[lanes]]
+id = "nominatim"
+max_per_second = 1
+
+[[capabilities]]
+id = "geocode"
+op = "lookup"
+inputs = [["locality"], ["region"]]
+outputs = { values = ["point"] }
+cost = { usd = 0.0, per = "place" }

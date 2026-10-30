@@ -23,8 +23,11 @@ RECENT = date.fromordinal(date.today().toordinal() - 120).strftime("%Y-%m")   # 
 from harvey.collectors.discover import build_queries, is_junk, preset_problem
 from harvey.collectors.profile import ProfileCollector, accelerators, funding_round
 from harvey.models.company import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("startups")
 
 
 @pytest_asyncio.fixture
@@ -254,7 +257,7 @@ def test_the_new_signals_are_free_profile_signals(code):
 
 @pytest.mark.asyncio
 async def test_they_start_proposed(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     assert not {"ACCELERATOR", "FUNDING_ROUND"} & await state.confirmed_signal_codes()
 
 
@@ -372,7 +375,7 @@ _PAD = "<p>We build billing for teams that ship fast.</p>" * 12
 
 @pytest.mark.asyncio
 async def test_profiling_records_the_program(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("ACCELERATOR", "confirmed")
     c, _ = _collector(state, "<h1>Acme</h1><p>Acme (Techstars '24) builds billing.</p>")
     c.confirmed = await state.confirmed_signal_codes()
@@ -391,7 +394,7 @@ async def test_profiling_records_the_program(state):
 
 @pytest.mark.asyncio
 async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.com",
                                           source_url="https://acme.com/blog/series-a"))
@@ -409,7 +412,7 @@ async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
 
 @pytest.mark.asyncio
 async def test_a_hit_on_someone_elses_site_isnt_read(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.com",
                                           source_url="https://news.example.com/acme-raises"))
@@ -422,7 +425,7 @@ async def test_a_hit_on_someone_elses_site_isnt_read(state):
 
 @pytest.mark.asyncio
 async def test_the_press_page_is_checked(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.com"))
     press = "<h2>Acme raises $6M seed round (February 2026)</h2>" + _PAD
@@ -490,7 +493,7 @@ def _writer(state, brain):
     ("", None, "", False, None),
 ])
 async def test_the_writer_uses_the_playbook_for_these_startups(state, code, num, text, playbook, fact):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     prospect = await _prospect(state, code, num, text, 1)
     brain = RecordingBrain()
     await _writer(state, brain)._write_personal_email(prospect)
@@ -503,7 +506,7 @@ async def test_the_writer_uses_the_playbook_for_these_startups(state, code, num,
 async def test_an_old_raise_is_marked_old(state):
     """For a startup known some other way (here an accelerator): an old or
     undated raise is a fact, marked so it isn't written to as news."""
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     for n, text, note in ((1, "Seed · $2M · 2022-03", "not recent"), (2, "Seed", "no date")):
         prospect = await _prospect(state, "ACCELERATOR", 1, "Antler", n)
         await state.add_observation(company_id=prospect.company_id, signal_code="FUNDING_ROUND",
@@ -518,7 +521,7 @@ async def test_the_reply_handler_uses_it_for_an_accelerator_startup(state):
     from harvey.agents.handler import Handler
     from harvey.models.conversation import Conversation, Message
     from tests.test_outbox_native import Cfg, Env
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     prospect = await _prospect(state, "ACCELERATOR", 1, "Antler", 1)
     brain = RecordingBrain()
     handler = Handler(brain=brain, state=state, config=Cfg(), env=Env())
@@ -530,7 +533,7 @@ async def test_the_reply_handler_uses_it_for_an_accelerator_startup(state):
 
 @pytest.mark.asyncio
 async def test_a_mixed_sequence_batch_gets_no_founder_framing(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     funded = await _prospect(state, "FUNDING_ROUND", 1, f"Seed · {RECENT}", 1)
     plain = await _prospect(state, "", None, "", 2)
     brain = RecordingBrain()
@@ -649,7 +652,7 @@ def test_the_junk_list_has_neo_and_the_search_skips_pioneer():
     ("$100M", False),                          # undated
 ])
 async def test_only_a_recent_raise_brings_the_playbook(state, text, playbook):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     prospect = await _prospect(state, "FUNDING_ROUND", 1, text, 1)
     brain = RecordingBrain()
     await _writer(state, brain)._write_personal_email(prospect)
@@ -658,7 +661,7 @@ async def test_only_a_recent_raise_brings_the_playbook(state, text, playbook):
 
 @pytest.mark.asyncio
 async def test_a_profile_that_finds_nothing_supersedes_an_accelerator_search_hit(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("ACCELERATOR", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.com"))
     await state.add_observation(company_id=cid, signal_code="ACCELERATOR", collector="discover",

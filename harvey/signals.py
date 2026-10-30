@@ -455,28 +455,58 @@ ABSENCE_VALUES = ("unknown", "false")
 
 
 def absence(code: str) -> str:
-    """How a company with no current observation of ``code`` reads."""
-    for sig in SIGNAL_CATALOG:
-        if sig["code"] == code:
-            return sig.get("absence", "unknown")
+    """How a company with no current observation of ``code`` reads, as the
+    manifest that declares it says."""
+    from harvey.modules import switches
+
+    for m in switches.manifests():
+        for sig in m.signals:
+            if sig["code"] == code:
+                return sig["absence"]
     return "unknown"
 
 
-async def seed_signal_catalog(state) -> int:
-    """Register the catalog as PROPOSED signals awaiting user confirmation.
+async def sync_vocabulary(state) -> int:
+    """Bring signal_codes in line with the module manifests.
 
-    Idempotent, and never overrides a decision the user already made: an
-    existing signal keeps its confirmed/rejected status.
+    Every signal a manifest declares is registered (new ones as PROPOSED,
+    awaiting user confirmation), with its declaring module and how it reads.
+    It is ``available`` while a module that is on declares it or lists it
+    among a capability's outputs (FOUND_IN_SERP stays while any search
+    module is on); otherwise it is hidden and never collected, and its
+    observations stay. Idempotent, and never overrides a decision the user
+    already made: an existing signal keeps its confirmed/rejected status.
+    The descriptions live here, in SIGNAL_CATALOG. The switches are read
+    and every row written in one transaction, so a module turned on or off
+    in another process at the same moment can't leave its signals hidden
+    or shown the wrong way. Returns how many signals are declared.
     """
-    for sig in SIGNAL_CATALOG:
-        await state.upsert_signal_code(
-            sig["code"],
-            label=sig["label"],
-            description=sig["description"],
-            category=sig["category"],
-            value_type=sig["value_type"],
-            collector=sig["collector"],
-            cost_note=sig["cost_note"],
+    from harvey.modules import switches
+
+    manifests = switches.manifests()
+    descriptions = {sig["code"]: sig["description"] for sig in SIGNAL_CATALOG}
+
+    def rows(stored: dict[str, str]) -> list[dict]:
+        on = switches.resolve(stored, manifests)
+        produced = {fact for m in manifests if m.id in on for cap in m.capabilities
+                    for fact in (cap.get("outputs") or {}).get("facts", [])}
+        return [dict(
+            code=sig["code"],
+            label=sig.get("label", sig["code"]),
+            description=descriptions.get(sig["code"], sig.get("description", "")),
+            category=sig.get("category", ""),
+            value_type=sig.get("value_type", "text"),
+            collector=sig.get("collector", ""),
+            cost_note=sig.get("cost_note", ""),
             confidence_floor=sig.get("confidence_floor", 0.0),
-        )
-    return len(SIGNAL_CATALOG)
+            module=m.id,
+            subject=sig["subject"],
+            unit=sig["unit"],
+            cardinality=sig["cardinality"],
+            keyed_by=sig["keyed_by"],
+            absence=sig["absence"],
+            when_known=sig["when_known"],
+            available=m.id in on or sig["code"] in produced,
+        ) for m in manifests for sig in m.signals]
+
+    return await state.write_vocabulary(rows, switches.PREFIX)

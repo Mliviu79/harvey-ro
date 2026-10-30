@@ -1726,11 +1726,16 @@ async def run_discovery(
     """
     from harvey.config import live_do_not_contact, load_env
     from harvey.gate import do_not_contact_domain_match
-    from harvey.signals import seed_signal_catalog
+    from harvey.modules import switches
+    from harvey.signals import sync_vocabulary
 
     provider = PROVIDERS.get(provider_key)
     if provider is None:
         raise ValueError(f"unknown discovery provider: {provider_key!r}")
+    # A source or preset whose module is off is refused (ModuleOff), never
+    # run or skipped quietly.
+    for preset in sorted({q.preset for q in queries or []} - {""}) or [""]:
+        await switches.require_discovery(state, provider_key, preset)
 
     queries = queries or build_queries(config)
     if provider.needs_coordinates:
@@ -1758,7 +1763,7 @@ async def run_discovery(
         report.stopped = "over budget"
         return report
 
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     confirmed = await state.confirmed_signal_codes()
     if not confirmed:
         report.errors.append(
@@ -2011,12 +2016,16 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
     return rows
 
 
-def provider_menu(env: dict | None = None) -> list[dict]:
-    """The menu the dashboard renders: what each provider does, and its cost.
+def provider_menu(env: dict | None = None, enabled: set[str] | None = None) -> list[dict]:
+    """The menu the dashboard renders: what each provider does, and its cost,
+    with the module it belongs to and whether that module is on (all on
+    when ``enabled`` is None).
 
     The CLI calls this bare; without a load, every keyed provider would show
     "needs setup" even with a working key in .env.
     """
+    from harvey.modules.switches import capability_owner
+
     if env is None:
         from harvey.config import load_env
         env = load_env().model_dump()
@@ -2028,6 +2037,8 @@ def provider_menu(env: dict | None = None) -> list[dict]:
             "env_keys": [k.upper() for k in p.env_keys],
             "configured": p.configured(env),
             "needs_key": bool(p.env_keys),
+            "module": capability_owner("provider", p.key) or "",
+            "enabled": enabled is None or capability_owner("provider", p.key) in enabled,
         }
         for p in PROVIDERS.values()
     ]

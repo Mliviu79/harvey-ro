@@ -1430,8 +1430,8 @@ async def profile_companies(state, companies: list[dict], config=None) -> tuple[
     (``icp.hiring_signals``, else ``icp.titles``); without it a job board
     still gives OPEN_ROLES, but no role is singled out.
     """
-    from harvey.signals import seed_signal_catalog
-    await seed_signal_catalog(state)
+    from harvey.signals import sync_vocabulary
+    await sync_vocabulary(state)
     confirmed = await state.confirmed_signal_codes()
     if not confirmed:
         logger.warning(

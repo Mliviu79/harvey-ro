@@ -1,0 +1,65 @@
+# Who is hiring for the roles that signal a purchase: the Greenhouse, Lever,
+# Ashby or Workable board a company's own site links to, its careers page,
+# and (with python-jobspy installed) a job-board search.
+id = "hiring"
+name = "Hiring"
+description = "Who is hiring for your roles: the job boards a company's site links to, careers pages, job-board search."
+set = "original"
+kind = "enricher"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["website"]
+default_enabled = false
+entry = "harvey.collectors.ats"
+secrets = []
+terms_note = "Job boards are read through their public JSON feeds, only when the company's own site links to one. The optional python-jobspy search reads Indeed, whose terms forbid automated access."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free: one request per job board"
+
+[settings.hiring_signals]
+type = "list"
+default = []
+config = "icp.hiring_signals"
+
+[[signals]]
+code = "HIRING_ROLE"
+label = "Hiring for a relevant role"
+category = "profile"
+value_type = "text"
+collector = "profile"
+cost_note = "free (careers page or public job-board feed)"
+cardinality = "many"
+
+[[signals]]
+code = "OPEN_ROLES"
+label = "Open roles on their job board"
+category = "profile"
+value_type = "num"
+collector = "profile"
+cost_note = "free (public job-board feed, one request)"
+
+[[capabilities]]
+id = "job_board"
+op = "read"
+inputs = [["pages"]]
+outputs = { facts = ["HIRING_ROLE", "OPEN_ROLES"] }
+cost = { usd = 0.0, per = "company" }
+
+[[capabilities]]
+id = "hiring_search"
+op = "query"
+preset = "hiring"
+inputs = [["query"]]
+outputs = { records = "companies", ids = ["domain"] }
+cost = { usd = 0.0, per = "search", note = "runs through a search module" }
+
+[[capabilities]]
+id = "job_board_search"
+op = "query"
+inputs = [["query", "area"]]
+outputs = { records = "companies" }
+cost = { usd = 0.0, per = "search", note = "needs pip install python-jobspy" }

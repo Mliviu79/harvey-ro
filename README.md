@@ -699,6 +699,8 @@ harvey import-onrc --county BV [dentist]  # load + pull in one step (free);
 harvey search 8623 brasov    # search companies on file by CAEN code, activity in words
                              # (dentist, stomatologie), name or town; --json
 harvey caen 8623             # what a CAEN code means (every revision), or the codes for words
+harvey modules list          # the modules Harvey is made of, on or off (--json)
+harvey modules enable <id>   # turn one on (disable <id> turns it off; nothing is deleted)
 harvey duplicates            # possible duplicates and merges; --merge KEEP MERGED,
                              # --separate A B, --undo MERGED
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
@@ -720,6 +722,44 @@ raw-data export for inspection: it includes opted-out and unverified contacts
 and should not be imported as an outreach list. The dashboard's prospect CSV
 download follows the same policy; `?all=true` selects its raw export.
 
+
+### Modules
+
+Everything beyond the core is a module with a `module.toml` manifest under
+`harvey/modules/<set>/<id>/`: the core set (website reader, people, phones,
+export, geocoding, English), the original set (US market, the discovery
+sources, web-marketing, startup and hiring signals, email verification,
+Hunter, LinkedIn, the email loop) and the Romanian set (market, language,
+ONRC). A manifest names the code it describes, the `.env` keys it reads, what
+it costs, its terms, and the signals it declares; each signal in the catalog
+is declared by exactly one module. `harvey modules list` reads them all
+without importing any code. `data/modules/<id>/` can hold a data-only market
+or language pack: words and signals only. A pack that names code, holds a
+code file or a link, carries `.env` keys, capabilities or patterns, or calls
+itself core is left out with a warning on Surse, and the rest of Harvey runs
+on. A new set of modules (a country) is one new folder under
+`harvey/modules/`.
+
+Each install turns modules on and off on the dashboard's **Surse** page or
+with `harvey modules enable|disable <id>`. Core modules are always on. A new
+install starts with the Romanian set, OpenStreetMap, DataForSEO, Serper,
+TinyFish, Scavio, Hunter and the email verifiers on; startups, hiring,
+website-marketing signals, keyless web search, LinkedIn and email campaigns
+start off. Turning a module on never turns on another: one whose `requires`
+are off is refused, naming them, and one that an enabled module requires
+can't be turned off. Off means hidden, never deleted: its signals leave
+Semnale, the signal pickers and collection (their observations stay), its
+discovery sources and presets are refused with an error that names the
+module, Scout skips its strategies (saying so once per cycle in the log and
+Activity), Hunter and the verifiers aren't called, and Settings stops offering
+its `.env` keys that are empty (one that holds a value stays editable). The signal vocabulary itself comes from the manifests of the modules
+that are on. On an install that predates modules, a module that ships off
+stays on if one of its `.env` keys is set (a search or enrichment provider
+that was set up), if you had confirmed one of its signals, or if the install
+has data from it (companies found through keyless web search or G2/Clutch,
+tools detected on sites, open roles or job-board contacts). The Email
+switch in Settings is the email campaigns module: it changes what the
+dashboard shows, never how sending works.
 
 ## Using a ChatGPT plan instead (Codex)
 
@@ -858,6 +898,7 @@ harvey/
 │   ├── discover.py      # provider adapters, junk filtering, entity resolution
 │   └── profile.py       # the free HTTP profiler
 ├── agents/              # scout, writer, sender, handler, analyst
+├── modules/             # module manifests (module.toml) and their loader
 ├── integrations/        # mail providers, email finder, quota
 └── web/                 # dashboard HTML/CSS/JS — no build step
 

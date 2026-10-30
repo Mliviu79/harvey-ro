@@ -52,7 +52,14 @@ function jsq(v) {
 
 // The reason a failed action gave, or a fallback when it gave none.
 function failMsg(data, fallback) {
+  // A module that is off: said in the viewer's language, naming the module
+  // (the server's English sentence is for the API and the CLI).
+  if (data && data.off_module) return t('modp.off_refused', {name: moduleName(data.off_module)});
   return (data && (data.message || data.error || data.detail)) || fallback;
+}
+
+function moduleName(id) {
+  return hasKey('en', 'module.' + id + '.name') ? t('module.' + id + '.name') : String(id);
 }
 
 // Lookup tables keyed by stored strings: "constructor" must not hit Object's.
@@ -483,6 +490,7 @@ function loadCurrentTab() {
     case 'overview': loadOverview(); break;
     case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
+    case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': loadCompanies(); break;
     case 'prospects': loadProspects(); break;
@@ -538,6 +546,93 @@ async function setModule(name, on) {
     showToast(failMsg(res, t('mod.failed')), 'error');
   }
   loadModulesCard();
+}
+
+// ── Surse: the modules Harvey is made of, each on or off ──
+
+const MODULE_SETS = ['core', 'original', 'ro', 'shared'];
+const MODULE_KINDS = ['source', 'search', 'enricher', 'market', 'gazetteer', 'language', 'action', 'ui'];
+
+async function loadModulesPage() {
+  const el = document.getElementById('modules-list');
+  const data = await api('/api/modules');
+  markLoadFailed('modules', !data || data.error);
+  if (!data || data.error) { el.innerHTML = offlineState(); return; }
+  renderModulesPage(data);
+}
+
+function renderModulesPage(data) {
+  const el = document.getElementById('modules-list');
+  const sets = (data.sets || []).filter(s => (s.modules || []).length);
+  // Packs in data/modules that were left out, and why (the server's lines
+  // name the file and the problem).
+  const problems = (data.pack_problems || []).length
+    ? '<div class="test-result error module-problems"><strong>' + escHtml(t('modp.pack_problems')) +
+      '</strong><ul>' + data.pack_problems.map(p => '<li>' + escHtml(p) + '</li>').join('') + '</ul></div>'
+    : '';
+  if (!sets.length) {
+    el.innerHTML = problems + emptyState(icon('layers'), escHtml(t('modp.empty')), escHtml(t('modp.empty_copy')), true);
+    return;
+  }
+  el.innerHTML = problems + sets.map(s =>
+    '<div class="subhead">' + escHtml(MODULE_SETS.includes(s.key) ? t('modp.set.' + s.key) : s.key) + '</div>' +
+    '<div class="card module-list">' + s.modules.map(moduleRow).join('') + '</div>'
+  ).join('');
+}
+
+function moduleRow(m) {
+  const name = tServer('module.' + m.id + '.name', m.name);
+  const cost = m.cost || {};
+  const meta = [];
+  const line = (key, html) => meta.push('<span class="k">' + escHtml(t(key)) + '</span><span class="v">' + html + '</span>');
+  if ((m.signals || []).length) {
+    line('modp.signals', m.signals.map(s =>
+      '<span class="cost-chip">' + escHtml(tServer('sigc.' + s.code + '.label', s.label) || s.code) + '</span>').join(''));
+  }
+  // Presence only: the server never sends a value.
+  if ((m.secrets || []).length) {
+    line('modp.keys', m.secrets.map(k =>
+      '<span class="email-tag ' + (k.present ? 'verified' : 'guess') + '" title="' +
+        escHtml(t(k.present ? 'modp.key_set' : 'modp.key_missing')) + '">' + escHtml(k.key) +
+        ' · ' + escHtml(t(k.present ? 'modp.key_set' : 'modp.key_missing')) + '</span>').join(''));
+  }
+  const price = [cost.free_tier && tServer('module.' + m.id + '.free', cost.free_tier),
+                 cost.note && tServer('module.' + m.id + '.cost', cost.note)].filter(Boolean);
+  if (price.length) line('modp.cost', escHtml(price.join(' · ')));
+  if ((m.requires || []).length) {
+    line('modp.requires', escHtml(m.requires.map(r => tServer('module.' + r.id + '.name', r.name || r.id)).join(', ')));
+  }
+  const kind = MODULE_KINDS.includes(m.kind) ? t('modp.kind.' + m.kind) : m.kind;
+  return '<div class="module-row">' +
+    '<div class="module-text">' +
+      '<h3>' + escHtml(name) + ' <span class="tag">' + escHtml(kind) + '</span>' +
+        (m.locked ? ' <span class="tag accent">' + escHtml(t('modp.core')) + '</span>' : '') + '</h3>' +
+      '<p class="desc">' + escHtml(tServer('module.' + m.id + '.about', m.description)) + '</p>' +
+      (meta.length ? '<div class="module-meta">' + meta.join('') + '</div>' : '') +
+      (m.terms_note ? '<div class="module-terms">' + escHtml(tServer('module.' + m.id + '.terms', m.terms_note)) + '</div>' : '') +
+    '</div>' +
+    '<label class="switch"' + (m.locked ? ' title="' + escHtml(t('modp.locked')) + '"' : '') + '>' +
+      '<input type="checkbox" ' + (m.enabled ? 'checked ' : '') + (m.locked ? 'disabled ' : '') +
+        'aria-label="' + escHtml(name) + '" onchange="setModuleOn(' + jsq(m.id) + ', this.checked)">' +
+      '<span class="track" aria-hidden="true"><span class="thumb"></span></span>' +
+      '<span class="switch-label">' + escHtml(t(m.enabled ? 'mod.on' : 'mod.off')) + '</span>' +
+    '</label>' +
+  '</div>';
+}
+
+async function setModuleOn(id, on) {
+  const res = await api('/api/modules/' + encodeURIComponent(id), {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: !!on}),
+  });
+  if (res && res.success) {
+    showToast(t(on ? 'modp.toast_on' : 'modp.toast_off'), 'success');
+    renderModulesPage(res);
+    loadModules();
+  } else {
+    showToast(failMsg(res, t('mod.failed')), 'error');
+    loadModulesPage();
+  }
 }
 
 // ── Language ──
@@ -1112,8 +1207,8 @@ async function loadSignals() {
     const undecided = g.signals.filter(x => x.status === 'proposed').length;
     return '<div class="sig-group">' +
       '<div class="sig-group-head"><div>' +
-        '<h3>' + escHtml(tServer('sig.group.' + g.key + '.label', g.label)) + '</h3><p>' +
-        escHtml(tServer('sig.group.' + g.key + '.blurb', g.blurb)) + '</p>' +
+        '<h3>' + escHtml(tServer('module.' + g.key + '.name', g.label)) + '</h3><p>' +
+        escHtml(tServer('module.' + g.key + '.about', g.blurb)) + '</p>' +
       '</div>' +
       (undecided
         ? '<div class="btn-row">' +
@@ -1135,6 +1230,8 @@ function sigLabel(sig) {
   return tServer('sigc.' + sig.code + '.label', sig.label || sig.code);
 }
 
+const WHEN_KNOWN = ['source', 'search', 'enrich', 'judged'];
+
 function sigRow(sig) {
   const free = /free|included/i.test(sig.cost_note || '');
   const costCls = free ? 'free' : (/\$/.test(sig.cost_note || '') ? 'paid' : '');
@@ -1145,6 +1242,11 @@ function sigRow(sig) {
         escHtml(t('sig.states', {yes: st.true || 0, no: st.false || 0, unk: st.unknown || 0})) + '</span>'
     : sig.companies
       ? '<span class="cost-chip">' + escHtml(t('sig.seen', {n: sig.companies})) + '</span>' : '';
+  // When in a search the fact can be known: from the source itself, from a
+  // search, by reading the company, or by a model's judgement.
+  const when = WHEN_KNOWN.includes(sig.when_known)
+    ? '<span class="cost-chip" title="' + escHtml(t('sig.when_hint')) + '">' +
+        escHtml(t('sig.when.' + sig.when_known)) + '</span>' : '';
   const floor = sig.confidence_floor > 0
     ? '<span class="cost-chip">' + escHtml(t('sig.floor', {p: Math.round(sig.confidence_floor * 100)})) + '</span>' : '';
 
@@ -1166,7 +1268,7 @@ function sigRow(sig) {
       '<div class="sig-desc">' + escHtml(tServer('sigc.' + sig.code + '.desc', sig.description)) + '</div>' +
       '<div class="sig-meta">' +
         '<span class="cost-chip ' + costCls + '">' + escHtml(tServer('sigc.' + sig.code + '.cost', sig.cost_note) || t('sig.cost_unknown')) + '</span>' +
-        floor + seen + badge(sig.status) +
+        when + floor + seen + badge(sig.status) +
       '</div>' +
     '</div>' +
     '<div class="sig-decide">' + decide + '</div>' +
@@ -1200,9 +1302,24 @@ async function loadDiscoverProviders() {
   markLoadFailed('discover', !data || !data.providers);
   if (!data || !data.providers) { el.innerHTML = offlineState(); return; }
 
-  _provider = _provider || data.selected || data.default;
+  // A source or preset whose module is off isn't offered (Surse turns it on).
+  const providers = data.providers.filter(p => p.enabled !== false);
+  if (!providers.some(p => p.key === _provider)) _provider = null;
+  _provider = _provider || [data.selected, data.default].find(k => providers.some(p => p.key === k)) ||
+    (providers[0] || {}).key || null;
+  const presetSel = document.getElementById('disc-preset');
+  if (presetSel && data.presets) {
+    Array.from(presetSel.options || []).forEach(o => {
+      if (o.value) o.hidden = o.disabled = data.presets[o.value] === false;
+    });
+    if (presetSel.value && data.presets[presetSel.value] === false) presetSel.value = '';
+  }
   const pv = (p, field) => tServer('prov.' + p.key + '.' + field, p[field]);
-  el.innerHTML = '<div class="prov-grid">' + data.providers.map(p => {
+  el.innerHTML = (providers.length ? '' : emptyState(icon('layers'), escHtml(t('disc.none_on')),
+      escHtml(t('disc.none_on_copy')), true,
+      '<button type="button" class="btn btn-secondary btn-sm" onclick="goTab(\'modules\')">' +
+        escHtml(t('disc.open_modules')) + '</button>')) +
+    '<div class="prov-grid">' + providers.map(p => {
     const ready = p.configured
       ? '<span class="badge t-good">' + escHtml(t('disc.ready')) + '</span>'
       : '<span class="badge t-waiting">' + escHtml(t('disc.needs_key')) + '</span>';
@@ -1272,7 +1389,8 @@ async function estimateDiscovery() {
   });
   if (!data || data.error) {
     el.innerHTML = '<div class="test-result error">' +
-      escHtml((data && data.error) || t('disc.estimate_failed')) + '</div>';
+      escHtml(failMsg(data && {off_module: data.off_module, error: data.error},
+                      t('disc.estimate_failed'))) + '</div>';
     return;
   }
 
@@ -1481,7 +1599,8 @@ async function runCohort() {
   });
   if (generation !== _cohortGeneration) return;
   if (!data || data.error) {
-    el.innerHTML = data ? '<div class="test-result error">' + escHtml(data.error) + '</div>' : '';
+    el.innerHTML = data ? '<div class="test-result error">' +
+      escHtml(failMsg({off_module: data.off_module, error: data.error}, '')) + '</div>' : '';
     return;
   }
 
@@ -1598,6 +1717,8 @@ async function loadSettings() {
   if (!data) { if (errEl) errEl.innerHTML = offlineState(); return; }
   if (errEl) errEl.innerHTML = '';
 
+  applyEnvKeys(data.env_keys);
+
   const prov = data.provider || 'instantly';
   const provEl = document.getElementById('active-provider');
   if (provEl) provEl.textContent = prov;
@@ -1651,6 +1772,16 @@ async function loadSettings() {
   tag('reoon-status', data.reoon_api_key_set);
   tag('zerobounce-status', data.zerobounce_api_key_set);
   tag('hunter-status', data.hunter_api_key_set);
+}
+
+// Settings offers the .env keys of the modules that are on: a field (or a
+// card) marked data-env="KEY ..." shows while any of its keys is offered.
+function applyEnvKeys(keys) {
+  if (!Array.isArray(keys)) return;
+  const on = new Set(keys);
+  document.querySelectorAll('[data-env]').forEach(el => {
+    el.hidden = !el.dataset.env.split(/\s+/).some(k => on.has(k));
+  });
 }
 
 function saveGmail() {

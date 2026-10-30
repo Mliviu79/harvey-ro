@@ -18,6 +18,33 @@ FAKE_HELP = "\n".join(f"  {flag} <value>   test" for flag in claude_runtime.REQU
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "real_claude_cli: runs the installed Claude CLI (no stand-in)")
+    config.addinivalue_line(
+        "markers", "modules_on(*ids): these modules count as switched on")
+
+
+@pytest.fixture(autouse=True)
+def _modules_on(request, monkeypatch):
+    """``@pytest.mark.modules_on("hiring", ...)``: the test runs as if the
+    user had switched those modules on (several of the original Harvey's,
+    such as hiring, startups and web_marketing, ship off)."""
+    marker = request.node.get_closest_marker("modules_on")
+    if marker is None:
+        return
+    from harvey.modules import switches
+
+    real = switches.resolve
+    forced = {switches.KEY.format(m): switches.ON for m in marker.args}
+    monkeypatch.setattr(switches, "resolve",
+                        lambda stored, mans=None: real({**stored, **forced}, mans))
+
+
+@pytest.fixture(autouse=True)
+def _no_checkout_env_file(monkeypatch, tmp_path_factory):
+    """Upgrading a database looks for .env key names: never the checkout's
+    real .env, so no test depends on (or reads) the developer's keys."""
+    from harvey.modules import switches
+
+    monkeypatch.setattr(switches, "ENV_FILE", tmp_path_factory.mktemp("env") / ".env")
 
 
 @pytest.fixture(autouse=True)

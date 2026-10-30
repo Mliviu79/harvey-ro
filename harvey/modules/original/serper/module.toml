@@ -1,0 +1,27 @@
+# Serper: Google search with rank positions, for discovery and for Scout's
+# own searches.
+id = "serper"
+name = "Serper"
+description = "Google search with rank positions."
+set = "original"
+kind = "search"
+version = "0.3.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.collectors.discover.Serper"
+secrets = ["SERPER_API_KEY"]
+
+[cost]
+as_of = 2026-10-30
+free_tier = "2,500 queries free, no card"
+note = "about $0.30-$1.00 per 1,000 searches depending on plan"
+
+[[capabilities]]
+id = "google_search"
+op = "query"
+provider = "serper"
+inputs = [["query", "area"], ["query"]]
+outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP"] }
+cost = { usd = 0.001, per = "search" }

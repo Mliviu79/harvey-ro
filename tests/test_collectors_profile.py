@@ -10,8 +10,11 @@ import pytest_asyncio
 from harvey.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
+from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# These modules ship off; here they are on, as a user who wants them has them.
+pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
 
 
 @pytest_asyncio.fixture
@@ -156,7 +159,7 @@ def test_clean_page_has_no_false_tech():
 
 @pytest.mark.asyncio
 async def test_only_confirmed_signals_are_collected(state, monkeypatch):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("TECH_STACK", "confirmed")
     confirmed = await state.confirmed_signal_codes()
     c = collector(confirmed)
@@ -177,7 +180,7 @@ async def test_only_confirmed_signals_are_collected(state, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_seeded_catalog_starts_unconfirmed(state):
-    n = await seed_signal_catalog(state)
+    n = await sync_vocabulary(state)
     assert n == len(SIGNAL_CATALOG)
     assert await state.confirmed_signal_codes() == set()
     proposed = await state.get_signal_codes(status="proposed")
@@ -189,9 +192,9 @@ async def test_seeded_catalog_starts_unconfirmed(state):
 
 @pytest.mark.asyncio
 async def test_user_decision_survives_reseeding(state):
-    await seed_signal_catalog(state)
+    await sync_vocabulary(state)
     await state.set_signal_status("SERP_RANK", "rejected")
-    await seed_signal_catalog(state)          # e.g. after an upgrade
+    await sync_vocabulary(state)          # e.g. after an upgrade
     codes = {c["code"]: c["status"] for c in await state.get_signal_codes()}
     assert codes["SERP_RANK"] == "rejected", "re-seeding must not undo a user's choice"
 

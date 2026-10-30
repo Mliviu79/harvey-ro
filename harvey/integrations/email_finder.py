@@ -362,6 +362,17 @@ def _hunter_api_key() -> str:
     return os.getenv("HUNTER_API_KEY", "").strip()
 
 
+async def _module_on(state, module_id: str) -> bool:
+    """Whether Hunter's or the verifiers' module is on. Without a state
+    there are no switches to read (a one-off check outside an install), so
+    it counts as on."""
+    if state is None:
+        return True
+    from harvey.modules import switches
+
+    return await switches.is_enabled(state, module_id)
+
+
 # Hunter's free tier is 25 domain-searches/month for the whole account, and
 # every call spends one no matter how many people it returns. Paid plans set
 # HUNTER_MONTHLY_SEARCHES to their own allowance. Every domain-search call in
@@ -480,6 +491,8 @@ async def derive_pattern(
     site_guess = cached if cached and cached.get("pattern") and source.startswith("site_address_guess") else None
     hunter_tried = source.endswith("_after_hunter")
     key = _hunter_api_key()
+    if key and not await _module_on(state, "hunter"):
+        key = ""
     if key and not hunter_tried and await hunter_searches_remaining(state) > 0:
         await record_hunter_search(state)
         try:
@@ -643,15 +656,19 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
     return None  # unknown / risky-unknown — inconclusive
 
 
-async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str], bool]:
+async def _verify_candidate(email: str, mx_type: str, env,
+                            state=None) -> tuple[Optional[str], bool]:
     """Run the best available verifier for this domain type.
 
     Returns (status_or_None, catch_all_seen). Order is chosen so scarce
     paid-ish credits are spent only where they actually resolve the domain.
+    Reoon, ZeroBounce and the SMTP check run only while the email_verify
+    module is on, Hunter's check only while hunter is.
     """
-    reoon_key = getattr(env, "reoon_api_key", "") if env else ""
-    zerobounce_key = getattr(env, "zerobounce_api_key", "") if env else ""
-    hunter_key = _hunter_api_key()
+    verifiers = await _module_on(state, "email_verify")
+    reoon_key = getattr(env, "reoon_api_key", "") if env and verifiers else ""
+    zerobounce_key = getattr(env, "zerobounce_api_key", "") if env and verifiers else ""
+    hunter_key = _hunter_api_key() if await _module_on(state, "hunter") else ""
 
     catch_all_seen = False
 
@@ -686,7 +703,7 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
             if status is not None:
                 return status, catch_all_seen
 
-    smtp = await verify_email_smtp(email)
+    smtp = await verify_email_smtp(email) if verifiers else None
     if smtp is True:
         # Confirm it's not just a catch-all before trusting "verified".
         if await detect_catch_all(email.split("@")[1]) is True:
@@ -707,7 +724,7 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
     return None, catch_all_seen
 
 
-async def verify_published_address(email: str, env=None) -> str:
+async def verify_published_address(email: str, env=None, state=None) -> str:
     """Grade an address the company publishes on its own website.
 
     Graded like any other address: a catch-all verdict stays "risky", so
@@ -722,7 +739,7 @@ async def verify_published_address(email: str, env=None) -> str:
     mx_host = await get_mx_host(domain)
     if not mx_host:
         return "invalid"
-    status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
+    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, state)
     return status or "guess"
 
 
@@ -809,7 +826,7 @@ async def find_email(
     if not verify:
         return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type)
 
-    status, catch_all = await _verify_candidate(candidate, mx_type, env)
+    status, catch_all = await _verify_candidate(candidate, mx_type, env, state)
 
     if catch_all and state is not None:
         try:

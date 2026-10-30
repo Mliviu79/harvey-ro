@@ -1,0 +1,34 @@
+# Scavio: Google Maps listings and Google search from one key.
+id = "scavio"
+name = "Scavio"
+description = "Google Maps listings and Google search from one key."
+set = "original"
+kind = "search"
+version = "0.3.0"
+api = 1
+markets = []
+requires = ["nominatim"]
+default_enabled = true
+entry = "harvey.collectors.discover.ScavioProvider"
+secrets = ["SCAVIO_API_KEY"]
+
+[cost]
+as_of = 2026-10-30
+free_tier = "50 credits on signup, no card"
+note = "1 credit per page; estimates use the $0.01 pay-as-you-go price"
+
+[[capabilities]]
+id = "maps_listings"
+op = "query"
+provider = "scavio_maps"
+inputs = [["query", "area"]]
+outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
+cost = { usd = 0.01, per = "page", note = "up to 20 listings a page" }
+
+[[capabilities]]
+id = "google_search"
+op = "query"
+provider = "scavio_search"
+inputs = [["query", "area"], ["query"]]
+outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP"] }
+cost = { usd = 0.01, per = "page", note = "up to 10 results a page" }

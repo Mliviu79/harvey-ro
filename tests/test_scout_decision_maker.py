@@ -34,6 +34,9 @@ class FakeState:
     async def get_setting(self, key, default=None):
         return "0"
 
+    async def settings_with_prefix(self, prefix):
+        return {}
+
     async def increment_setting(self, key):
         pass
 
@@ -430,3 +433,26 @@ async def test_scout_search_web_uses_tinyfish_backend():
     assert called == [("tinyfish", "Denver roofers", "tf_key")]
     assert len(results) == 1
     assert results[0][0] == "https://summit.example"
+
+
+@pytest.mark.asyncio
+async def test_scout_search_web_skips_backends_whose_module_is_off():
+    """TinyFish is off here, and the keyless engines (web_search_scrape)
+    ship off: nothing is searched, and nothing is scraped behind its back."""
+    scout = site_scout({})
+    scout.env.tinyfish_api_key = "tf_key"
+    scout.state.settings_with_prefix = lambda prefix: _async({"modules.tinyfish.enabled": "off"})
+    called = []
+
+    async def fake(query, key=""):
+        called.append(query)
+        return [("https://summit.example", "")]
+
+    scout._search_tinyfish = scout._search_duckduckgo = scout._search_bing = fake
+    scout._search_google = fake
+    assert await scout._web_search("Denver roofers") == []
+    assert called == []
+
+
+async def _async(value):
+    return value
