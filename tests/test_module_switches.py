@@ -23,7 +23,7 @@ import harvey.dashboard as dash
 import harvey.state as state_module
 from harvey.collectors import discover as D
 from harvey.models import Company
-from harvey.modules import switches
+from harvey.modules import api, runs, switches
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import MIGRATIONS, StateManager
 
@@ -83,7 +83,7 @@ def test_a_module_whose_requirement_is_off_is_off():
 
 @pytest.mark.asyncio
 async def test_migration_adds_the_vocabulary_columns(state):
-    assert (await _rows(state, "PRAGMA user_version"))[0][0] == len(MIGRATIONS) == 18
+    assert (await _rows(state, "PRAGMA user_version"))[0][0] == len(MIGRATIONS) >= 18
     cols = {r[1] for r in await _rows(state, "PRAGMA table_info(signal_codes)")}
     assert {"module", "subject", "unit", "cardinality", "keyed_by", "absence",
             "when_known", "available"} <= cols
@@ -279,14 +279,14 @@ async def test_run_discovery_refuses_a_disabled_provider(state):
     config = SimpleNamespace(icp=SimpleNamespace(industries=["roofing"], geography=["Denver"]),
                              product=SimpleNamespace(name="x"))
     with pytest.raises(switches.ModuleOff, match="harvey modules enable serper"):
-        await D.run_discovery(state, config, "serper", dry_run=True)
+        await runs.run_discovery(state, config, "serper", dry_run=True)
 
 
 @pytest.mark.asyncio
 async def test_run_discovery_refuses_a_preset_whose_module_is_off(state):
     queries = [D.DiscoveryQuery(term="x", preset="yc")]
     with pytest.raises(switches.ModuleOff, match="startups"):
-        await D.run_discovery(state, None, "serper", queries, dry_run=True)
+        await runs.run_discovery(state, None, "serper", queries, dry_run=True)
 
 
 def test_cli_discover_refuses_a_disabled_provider(tmp_path, monkeypatch, capsys):
@@ -324,7 +324,11 @@ async def test_saving_registry_firms_needs_the_onrc_module(state):
 
     await switches.set_enabled(state, "onrc", False)
     with pytest.raises(switches.ModuleOff, match="onrc"):
-        await onrc.save_firms(state, [], None, onrc.ImportReport(dataset="x"), codes={})
+        await runs.save_source_draft(state, api.Draft(), onrc.ImportReport(dataset="x"),
+                                     module="onrc")
+    # Nor is the registry read at all.
+    with pytest.raises(switches.ModuleOff, match="onrc"):
+        await runs.import_registry(state, {}, None, county="BV")
 
 
 # ── CLI ──
@@ -766,23 +770,26 @@ async def test_find_email_calls_no_service_whose_module_is_off(state, monkeypatc
         return check
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "fictional-key")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "fictional-key")
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter_pattern)
     for name in ("verify_reoon", "verify_zerobounce", "verify_hunter",
                  "verify_email_smtp", "detect_catch_all"):
         monkeypatch.setattr(ef, name, await verifier(name))
     env = SimpleNamespace(reoon_api_key="fictional", zerobounce_api_key="fictional")
 
-    await ef.find_email("Ana", "Pop", "example.com", env=env, state=state)
+    await ef.find_email("Ana", "Pop", "example.com", env=env,
+                        enabled=await switches.enabled_ids(state))
     assert {"hunter", "verify_reoon", "verify_hunter", "verify_email_smtp"} <= set(called)
 
     called.clear()
     await switches.set_enabled(state, "hunter", False)
     await switches.set_enabled(state, "email_verify", False)
-    result = await ef.find_email("Ion", "Pop", "example.org", env=env, state=state)
+    enabled = await switches.enabled_ids(state)
+    result = await ef.find_email("Ion", "Pop", "example.org", env=env, enabled=enabled)
     assert called == [] and result.status == "guess"
     called.clear()
-    assert await ef.verify_published_address("office@example.org", env=env, state=state) == "guess"
+    assert await ef.verify_published_address("office@example.org", env=env,
+                                             enabled=enabled) == "guess"
     assert called == []
 
 

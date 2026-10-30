@@ -15,6 +15,7 @@ import pytest_asyncio
 
 from harvey.collectors import onrc
 from harvey.models import Company
+from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -137,7 +138,7 @@ async def state():
 async def run(state, files, **kw):
     kw.setdefault("county", "BV")
     kw.setdefault("classes", onrc.parse_classes("dentist"))
-    return await onrc.import_registry(state, files, DATASET, **kw)
+    return await runs.import_registry(state, files, DATASET, **kw)
 
 
 def obs(state, code):
@@ -621,8 +622,18 @@ async def test_no_activity_imports_everything_operating_in_the_area(state, files
 
 
 @pytest.mark.asyncio
+async def test_an_import_is_the_registry_modules_and_says_so(state, files):
+    report = await run(state, files)
+    assert report.observations and not report.errors
+    with sqlite3.connect(state.db_path) as db:
+        assert db.execute("SELECT DISTINCT module, capability FROM observations").fetchall() \
+            == [("onrc", "registry_import")]
+        assert db.execute("SELECT params_json FROM runs WHERE provider = 'onrc'").fetchone()
+
+
+@pytest.mark.asyncio
 async def test_progress_is_reported_while_saving(state, files, monkeypatch):
-    monkeypatch.setattr(onrc, "PROGRESS_EVERY", 3)
+    monkeypatch.setattr(runs, "SOURCE_PROGRESS_EVERY", 3)
     seen = []
     await run(state, files, classes=[], progress=lambda done, total: seen.append((done, total)))
     assert seen == [(3, 8), (6, 8)]

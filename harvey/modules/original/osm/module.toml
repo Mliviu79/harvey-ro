@@ -9,7 +9,8 @@ api = 1
 markets = []
 requires = ["nominatim"]
 default_enabled = true
-entry = "harvey.collectors.discover.OpenStreetMap"
+entry = "harvey.modules.original.osm.capabilities"
+wraps = ["harvey.collectors.discover"]
 secrets = []
 terms_note = "OpenStreetMap data is ODbL (credit OpenStreetMap contributors). Overpass is a shared community server: keep requests few and small."
 

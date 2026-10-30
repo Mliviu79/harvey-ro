@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = false
-entry = "harvey.integrations.linkedin.LinkedInAutomation"
+entry = "harvey.modules.original.linkedin.capabilities"
+wraps = ["harvey.integrations.linkedin"]
 secrets = ["LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"]
 terms_note = "Automating LinkedIn breaks its terms of service and can get the account restricted or banned. Use an account you can afford to lose."
 

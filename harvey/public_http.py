@@ -152,7 +152,15 @@ def public_http_client(
     *, timeout: float | httpx.Timeout = 15.0, headers: dict[str, str] | None = None,
 ) -> httpx.AsyncClient:
     """A client whose every connection, redirect and TLS identity is checked."""
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         transport=PublicHTTPTransport(), trust_env=False,
         timeout=timeout, headers=headers, follow_redirects=True, max_redirects=10,
     )
+    client.public_only = True
+    return client
+
+
+def is_public_client(client) -> bool:
+    """Whether ``client`` is one public_http_client made (every connection
+    checked), not a plain httpx client."""
+    return getattr(client, "public_only", False) is True

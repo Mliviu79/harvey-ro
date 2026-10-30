@@ -21,10 +21,11 @@ from harvey.collectors.ats import (
 )
 from harvey.collectors.discover import (
     Business, DiscoveryProvider, DiscoveryQuery, PRESETS, _observations, build_queries, is_junk,
-    preset_problem, run_discovery,
+    preset_problem,
 )
-from harvey.collectors.profile import ProfileCollector, profile_companies
+from harvey.collectors.profile import ProfileCollector
 from harvey.models.company import Company
+from harvey.modules.runs import profile_companies, run_discovery
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -364,11 +365,12 @@ async def test_profile_companies_takes_keywords_from_the_config(state, monkeypat
     await state.set_signal_status("HIRING_ROLE", "confirmed")
     seen = {}
 
-    async def fake_run(self, companies, run_id=""):
-        seen["keywords"] = self.role_keywords
+    async def fake_profile(state, companies, confirmed, run_id="", config=None,
+                           role_keywords=None):
+        seen["keywords"] = role_keywords
         return 0
 
-    monkeypatch.setattr(ProfileCollector, "run", fake_run)
+    monkeypatch.setattr("harvey.modules.runs.profile", fake_profile)
     config = SimpleNamespace(icp=SimpleNamespace(hiring_signals=["Head of Growth"], titles=["CEO"]))
     await profile_companies(state, [], config=config)
     assert seen["keywords"] == ["head of growth"]

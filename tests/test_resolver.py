@@ -19,6 +19,7 @@ from harvey import resolver
 from harvey.collectors import discover as D
 from harvey.collectors import onrc
 from harvey.models import Company, Prospect
+from harvey.modules import ingest, runs
 from harvey.signals import sync_vocabulary
 from harvey.state import MIGRATIONS, StateManager
 
@@ -43,10 +44,18 @@ def _firm(n=1, name="EXEMPLU SRL", locality="Brașov", cui=None, website="", dom
 
 async def _pull(state, *firms):
     report = onrc.ImportReport(dataset=DATASET.name)
-    await onrc.save_firms(state, list(firms), DATASET, report,
-                          codes={f.reg: [("8623", 3)] for f in firms}, classes=[("8623", None)])
+    draft = onrc.firms_draft(list(firms), DATASET, codes={f.reg: [("8623", 3)] for f in firms},
+                             classes=[("8623", None)]).stamp("onrc", "registry_search")
+    draft.values.update(codes=("ACTIVITY_CODE",), collector=onrc.COLLECTOR)
+    await runs.save_source_draft(state, draft, report, module="onrc")
     assert not report.errors, report.errors
     return report
+
+
+async def _upsert(state, biz, query):
+    """A listing saved as discovery saves it: (company id, was it new)."""
+    saved = await ingest.listing(state, D.business_record(biz, query))
+    return saved.company_id, saved.created
 
 
 def _maps_hit(name="Exemplu", phone="", location="Brașov, Romania", n=1, domain=""):
@@ -125,8 +134,8 @@ def test_a_phone_key_is_a_valid_number():
 
 @pytest.mark.asyncio
 async def test_a_shared_booking_site_is_not_one_company(state):
-    one = await D._upsert(state, _maps_hit(name="Exemplu Unu", n=1, domain="clicksanitas.ro"), QUERY)
-    two = await D._upsert(state, _maps_hit(name="Exemplu Doi", n=2, domain="clicksanitas.ro"), QUERY)
+    one = await _upsert(state, _maps_hit(name="Exemplu Unu", n=1, domain="clicksanitas.ro"), QUERY)
+    two = await _upsert(state, _maps_hit(name="Exemplu Doi", n=2, domain="clicksanitas.ro"), QUERY)
     assert one[0] != two[0] and two[1]
 
 
@@ -150,7 +159,7 @@ async def test_map_hit_with_same_name_and_town_goes_to_review(state):
     await _pull(state, _firm())
     firm = await state.get_company_by_cui("90000001")
 
-    company_id, is_new = await D._upsert(state, _maps_hit(), QUERY)
+    company_id, is_new = await _upsert(state, _maps_hit(), QUERY)
 
     assert is_new and company_id != firm.id         # kept, not merged on a name alone
     [pair] = await state.duplicates()
@@ -168,7 +177,7 @@ async def test_map_hit_with_same_name_town_and_phone_merges(state):
     await state.add_observation(company_id=firm.id, signal_code="PHONE_NUMBER",
                                 collector="profile", value_text="+40700000001")
 
-    company_id, is_new = await D._upsert(state, _maps_hit(phone="0700 000 001"), QUERY)
+    company_id, is_new = await _upsert(state, _maps_hit(phone="0700 000 001"), QUERY)
 
     assert company_id == firm.id and not is_new
     [merge] = await state.merges()
@@ -186,16 +195,16 @@ async def test_map_hit_with_same_name_town_and_phone_merges(state):
 
 @pytest.mark.asyncio
 async def test_the_same_listing_again_is_the_same_record(state):
-    first, new = await D._upsert(state, _maps_hit(phone="0700 000 002"), QUERY)
-    again, new_again = await D._upsert(state, _maps_hit(phone="0700 000 002"), QUERY)
+    first, new = await _upsert(state, _maps_hit(phone="0700 000 002"), QUERY)
+    again, new_again = await _upsert(state, _maps_hit(phone="0700 000 002"), QUERY)
     assert new and not new_again and again == first
     assert await state.merges() == [] and await state.duplicates() == []
 
 
 @pytest.mark.asyncio
 async def test_a_phone_alone_is_a_question_not_an_answer(state):
-    a, _ = await D._upsert(state, _maps_hit(name="Exemplu Unu", phone="0700 000 003", n=1), QUERY)
-    b, new = await D._upsert(state, _maps_hit(name="Altceva Doi", phone="0700 000 003", n=2), QUERY)
+    a, _ = await _upsert(state, _maps_hit(name="Exemplu Unu", phone="0700 000 003", n=1), QUERY)
+    b, new = await _upsert(state, _maps_hit(name="Altceva Doi", phone="0700 000 003", n=2), QUERY)
     assert new and a != b
     [pair] = await state.duplicates()
     assert pair["score"] == 0.8 and pair["reasons"][0]["code"] == "phone"
@@ -204,7 +213,7 @@ async def test_a_phone_alone_is_a_question_not_an_answer(state):
 @pytest.mark.asyncio
 async def test_a_phone_many_companies_share_says_nothing(state):
     for n in range(1, 4):
-        await D._upsert(state, _maps_hit(name=f"Firma {n} Exemplu", phone="0700 000 004", n=n), QUERY)
+        await _upsert(state, _maps_hit(name=f"Firma {n} Exemplu", phone="0700 000 004", n=n), QUERY)
     match = await state.match_company(Company(name="Alta Exemplu", phone="+40700000004",
                                               location="Brașov"))
     assert match.company_id is None and match.score == 0
@@ -212,8 +221,8 @@ async def test_a_phone_many_companies_share_says_nothing(state):
 
 @pytest.mark.asyncio
 async def test_same_name_with_different_websites_is_not_evidence(state):
-    await D._upsert(state, _maps_hit(domain="exemplu-unu.example.com", n=1), QUERY)
-    _, new = await D._upsert(state, _maps_hit(domain="exemplu-doi.example.com", n=2), QUERY)
+    await _upsert(state, _maps_hit(domain="exemplu-unu.example.com", n=1), QUERY)
+    _, new = await _upsert(state, _maps_hit(domain="exemplu-doi.example.com", n=2), QUERY)
     assert new and await state.duplicates() == []
 
 
@@ -328,7 +337,7 @@ async def test_an_automatic_merge_can_be_undone(state):
     firm = await state.get_company_by_cui("90000001")
     await state.add_observation(company_id=firm.id, signal_code="PHONE_NUMBER",
                                 value_text="+40700000007")
-    await D._upsert(state, _maps_hit(phone="+40700000007", n=7), QUERY)
+    await _upsert(state, _maps_hit(phone="+40700000007", n=7), QUERY)
     [merge] = await state.merges()
 
     await state.undo_merge(merge["merged"])
@@ -346,7 +355,7 @@ async def test_undo_takes_back_what_the_listing_brought_after_the_merge(state):
                                 value_text="+40700000007")
     hit = _maps_hit(phone="+40700000007", n=7)
     hit.source_url = "https://maps.example.com/?cid=7"
-    survivor, created = await D._upsert(state, hit, QUERY)
+    survivor, created = await _upsert(state, hit, QUERY)
     assert survivor == firm.id and not created
     # The run goes on to write the listing's facts to the company it joined.
     await state.add_observation(company_id=survivor, signal_code="REVIEW_RATING",
@@ -433,7 +442,7 @@ async def test_merge_pair_keeps_the_registry_record(state):
 @pytest.mark.asyncio
 async def test_separate_takes_the_pair_off_the_list(state):
     await _pull(state, _firm())
-    await D._upsert(state, _maps_hit(), QUERY)
+    await _upsert(state, _maps_hit(), QUERY)
     [pair] = await state.duplicates()
     await state.separate_companies(pair["company_a"], pair["company_b"])
     assert await state.duplicates() == [] and await state.count_duplicates() == 0

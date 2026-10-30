@@ -701,6 +701,7 @@ harvey search 8623 brasov    # search companies on file by CAEN code, activity i
 harvey caen 8623             # what a CAEN code means (every revision), or the codes for words
 harvey modules list          # the modules Harvey is made of, on or off (--json)
 harvey modules enable <id>   # turn one on (disable <id> turns it off; nothing is deleted)
+harvey caps list             # every module's capabilities: inputs, outputs, cost, on/off (--json)
 harvey duplicates            # possible duplicates and merges; --merge KEEP MERGED,
                              # --separate A B, --undo MERGED
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
@@ -761,6 +762,21 @@ tools detected on sites, open roles or job-board contacts). The Email
 switch in Settings is the email campaigns module. Off, the dashboard hides
 its tabs and `harvey run` writes, sends and reads no email at all; it only
 looks for companies and contacts. On, sending works as `harvey.yaml` says.
+
+What a module can do is a list of capabilities in its manifest: a search
+over an area, a lookup by name and town, a read of a company's site. Each
+says what it takes, what it gives (records, identifiers, signals), what it
+costs and whether its module is on: `harvey caps list` (`--json`) prints
+them all. A capability returns what it found and writes nothing; one core
+step saves it, so every module goes through the same rules: the same
+company found twice is one company, only confirmed signals are recorded
+(and only ones the capability declares), a module that is off does
+nothing whoever asks it, phones and people accumulate instead of being
+overwritten, and a sole trader's address is never kept. Each recorded
+fact says which module and
+capability found it and for which company, so undoing a merge sends back
+exactly the facts found for the merged company, including ones found
+after the merge.
 
 ## Using a ChatGPT plan instead (Codex)
 
@@ -899,7 +915,7 @@ harvey/
 │   ├── discover.py      # provider adapters, junk filtering, entity resolution
 │   └── profile.py       # the free HTTP profiler
 ├── agents/              # scout, writer, sender, handler, analyst
-├── modules/             # module manifests (module.toml) and their loader
+├── modules/             # module manifests and capabilities, the loader, core ingest and runs
 ├── integrations/        # mail providers, email finder, quota
 └── web/                 # dashboard HTML/CSS/JS — no build step
 

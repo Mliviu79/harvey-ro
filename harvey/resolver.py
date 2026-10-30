@@ -94,6 +94,9 @@ class Match:
     same_record: bool = False
     # The incoming record's keys the matched company doesn't hold yet.
     new_ids: list[tuple[str, str]] = field(default_factory=list)
+    # A same-record match through a merged company: that company, the one
+    # the record really is before the merge ("" otherwise).
+    origin: str = ""
 
     @property
     def attach(self) -> bool:
@@ -347,6 +350,8 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
     holders: dict[tuple[str, str], set[str]] = {}
     theirs_all: dict[str, dict[str, set[str]]] = {}
     via_merged: set[str] = set()
+    # live company -> the merged rows holding one of the record's own keys
+    merged_owner: dict[str, set[str]] = {}
     for cid, kind, value, merged_into in rows:
         live = await live_id(db, cid) if merged_into else cid
         if not live:
@@ -355,6 +360,8 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
             via_merged.add(live)
         if (kind, value) in wanted:
             holders.setdefault((kind, value), set()).add(live)
+            if live != cid and kind in SAME_RECORD:
+                merged_owner.setdefault(live, set()).add(cid)
         if live == cid:
             theirs_all.setdefault(cid, {}).setdefault(kind, set()).add(value)
     evidence: dict[str, dict[str, tuple[float, str]]] = {}
@@ -382,9 +389,30 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
         score, reasons, found = scored
         if score > best.score:
             held = {pair for pair, live in holders.items() if cid in live}
-            best = Match(cid, score, reasons, any(k in SAME_RECORD for k in found),
-                         [pair for pair in ids if pair not in held])
+            same = any(k in SAME_RECORD for k in found)
+            best = Match(cid, score, reasons, same,
+                         [pair for pair in ids if pair not in held],
+                         min(merged_owner.get(cid, ())) if same and merged_owner.get(cid) else "")
+    if best.same_record and not best.origin:
+        best.origin = await _moved_from(db, [pair for pair in ids if pair[0] in SAME_RECORD])
     return best
+
+
+async def _moved_from(db, keys) -> str:
+    """The company one of ``keys`` belonged to before a merge (still in
+    force) moved it onto the survivor, or "": a record matched by such a
+    key is that company, merged. Through a chain of merges (A into S, S
+    into T) the earliest merge names the key's first owner, A."""
+    for kind, value in keys:
+        async with db.execute(
+            "SELECT m.merged FROM company_merge_moves mm JOIN company_merges m ON m.id = mm.merge_id "
+            "WHERE mm.tbl = 'company_ids' AND mm.key1 = ? AND mm.key2 = ? AND m.undone_at IS NULL "
+            "ORDER BY m.id ASC LIMIT 1", (kind, value)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            return row[0]
+    return ""
 
 
 async def scan(db) -> dict:
@@ -561,8 +589,8 @@ _MOVE_MATCH = {table: cond.format(t=table) for table, cond in _MOVE_MATCH.items(
 
 async def undo(db, merged: str) -> dict:
     """Undo the merge that took ``merged``: every row it moved goes back,
-    and so does every fact its own listing brought since (observations
-    citing its source URL, written to the survivor after the merge); the
+    and so does every fact found for it since (observations whose
+    origin_company_id is it, written to the survivor after the merge); the
     columns it filled on the survivor are emptied again, and the pair goes
     back on the review list for a person to answer. Never commits. Refused
     when ``merged`` isn't merged, or when its survivor has since been
@@ -579,14 +607,23 @@ async def undo(db, merged: str) -> dict:
     keep, gone = await _company_row(db, survivor), await _company_row(db, merged)
     if keep is not None and keep.get("merged_into"):
         raise MergeRefused("survivor_merged")
-    # Facts the merged record's own listing gave after the merge landed on
-    # the survivor (the run that merged it, or a re-run that finds the
-    # listing again, writes to the company it stands for). Its source URL
-    # says whose they are.
+    # Facts found for the merged record after the merge landed on the
+    # survivor (the run that merged it, or a re-run that finds its listing
+    # again, writes to the company it stands for). Each says which record
+    # it was found for (origin_company_id): the merged one, or one merged
+    # into it before, goes back.
+    await db.execute(
+        "UPDATE observations SET company_id = ? WHERE company_id = ? AND (origin_company_id = ? "
+        "OR origin_company_id IN (SELECT key1 FROM company_merge_moves "
+        "WHERE merge_id = ? AND tbl = 'companies'))",
+        (merged, survivor, merged, merge_id))
+    # Rows from before facts carried their origin: the merged record's own
+    # listing is told by its source URL.
     source_url = ((gone or {}).get("source_url") or "").strip()
     if source_url and source_url != ((keep or {}).get("source_url") or "").strip():
         await db.execute(
-            "UPDATE observations SET company_id = ? WHERE company_id = ? AND evidence_url = ?",
+            "UPDATE observations SET company_id = ? WHERE company_id = ? AND evidence_url = ? "
+            "AND COALESCE(origin_company_id, '') = ''",
             (merged, survivor, source_url))
 
     for table in ("observations", "prospects", "company_ids", "company_activities"):

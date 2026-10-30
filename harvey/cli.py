@@ -742,6 +742,7 @@ async def _ensure_registry(path: Path, data_dir: Path, name: str = "latest",
 
     from harvey import registry
     from harvey.collectors import onrc
+    from harvey.modules import api
 
     roles = [r for r in onrc.FILES if r != "people" or with_people]
     have = registry.status(path)
@@ -785,7 +786,10 @@ async def _ensure_registry(path: Path, data_dir: Path, name: str = "latest",
     print(f"  Loading {dataset.name} (registry as of {dataset.date}) into {path.name}; "
           "a few minutes, once per dataset...", flush=True)
     try:
-        return registry.build(files, dataset, path, progress=_print_load_progress)
+        loaded = await api.capability("onrc", "registry_sync")(
+            api.Input(extra={"files": files, "dataset": dataset, "path": path,
+                             "progress": _print_load_progress}), api.Context())
+        return loaded.values["registry"]
     except registry.RegistryBusy as e:
         if have and offline_ok:
             print(f"  Another load is running; using the registry already loaded "
@@ -945,6 +949,7 @@ def cmd_registry(args):
 
     if action == "pull":
         from harvey.config import live_do_not_contact, load_config
+        from harvey.modules.runs import registry_pull
         from harvey.state import StateManager
 
         q = registry.resolve(con, words, all_statuses=args.all_statuses)
@@ -966,7 +971,7 @@ def cmd_registry(args):
             if with_admins and meta.get("with_administrators") != "1":
                 print("  (this registry was loaded without administrators: "
                       "harvey registry load --force)")
-            report = await registry.pull(
+            report = await registry_pull(
                 state, con, q, limit=args.limit, with_administrators=with_admins,
                 dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
                 progress=_pull_progress(args.dry_run))
@@ -992,6 +997,7 @@ def cmd_import_onrc(args):
     from harvey import registry
     from harvey.collectors import onrc
     from harvey.config import live_do_not_contact, load_config
+    from harvey.modules.runs import registry_pull
     from harvey.state import StateManager
 
     async def _import():
@@ -1030,7 +1036,7 @@ def cmd_import_onrc(args):
         what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
         print(f"  Looking for {what} in {where}"
               f"{'' if args.include_inactive else ' (operating companies only)'}...")
-        report = await registry.pull(
+        report = await registry_pull(
             state, con, q, with_administrators=with_admins, dry_run=args.dry_run,
             do_not_contact=live_do_not_contact(load_config()), area=where,
             progress=_pull_progress(args.dry_run))
@@ -1052,11 +1058,9 @@ def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
     from harvey.config import load_config, load_env
-    from harvey.collectors.discover import (
-        PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
-    )
-
+    from harvey.collectors.discover import PROVIDERS, build_queries, preset_problem, provider_menu
     from harvey.modules import switches
+    from harvey.modules.runs import run_discovery
 
     async def _discover():
         enabled = await _modules_on()
@@ -1323,6 +1327,68 @@ def cmd_modules(args):
               f"{r['signals']:>7}  {default:<8} {now}{pack}")
     print(f"\n  {len(rows)} modules, {sum(r['signals'] for r in rows)} signals."
           "\n  Turn one on or off: harvey modules enable|disable <id>\n")
+
+
+def _cost_text(cost: dict) -> str:
+    """A capability's [cost] as people read it: "free", "$0.002/search"."""
+    usd, per = cost.get("usd", 0.0), cost.get("per", "call")
+    text = f"${usd:g}/{per}" if usd else "free"
+    if cost.get("plus_usd"):
+        text += f" + ${cost['plus_usd']:g}/{cost.get('plus_per', 'item')}"
+    return text
+
+
+def cmd_caps(args):
+    """Every capability the module manifests declare: which module, what it
+    takes and gives, what it costs, the lane it runs in, and whether its
+    module is on."""
+    import json
+
+    from harvey.modules.loader import ManifestError, load_manifests
+
+    try:
+        manifests = load_manifests()
+    except ManifestError as e:
+        print("\n  Some module manifests are wrong:")
+        for line in e.problems:
+            print(f"    {line}")
+        print()
+        sys.exit(1)
+    on = asyncio.run(_modules_on())
+    rows = []
+    for m in manifests:
+        for cap in m.capabilities:
+            lanes = [lane["id"] for lane in m.lanes]
+            rows.append({
+                "module": m.id, "capability": cap["id"], "op": cap.get("op", ""),
+                "inputs": [list(alt) for alt in cap.get("inputs") or []],
+                "outputs": dict(cap.get("outputs") or {}),
+                "cost": dict(cap.get("cost") or {}), "cost_text": _cost_text(cap.get("cost") or {}),
+                "lane": cap.get("lane") or (lanes[0] if lanes else ""),
+                "enabled": m.id in on,
+            })
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return
+
+    def inputs(row):
+        return " | ".join("+".join(alt) for alt in row["inputs"]) or "-"
+
+    def outputs(row):
+        out = row["outputs"]
+        parts = [out["records"]] if out.get("records") else []
+        parts += [f"{k}:{','.join(v)}" for k, v in out.items() if k != "records" and v]
+        return " ".join(parts) or "-"
+
+    print(f"\n  {'module':<18} {'capability':<20} {'op':<7} {'inputs':<22} {'cost':<34} "
+          f"{'lane':<10} now")
+    for r in rows:
+        print(f"  {r['module']:<18} {r['capability']:<20} {r['op']:<7} {inputs(r):<22} "
+              f"{r['cost_text']:<34} {r['lane'] or '-':<10} {'on' if r['enabled'] else 'off'}")
+        print(f"  {'':<18} {'':<20} gives {outputs(r)}")
+    print(f"\n  {len(rows)} capabilities in {len({r['module'] for r in rows})} modules."
+          "\n  A module's switch turns all of its capabilities on or off: "
+          "harvey modules enable|disable <id>\n")
 
 
 async def _modules_on() -> set[str]:
@@ -1922,6 +1988,12 @@ def main():
     sub.add_argument("module_id", nargs="?", default="", help="The module to turn on or off")
     sub.add_argument("--json", action="store_true", help="Print JSON")
     sub.set_defaults(func=cmd_modules)
+
+    sub = subparsers.add_parser(
+        "caps", help="Every capability the modules declare: inputs, outputs, cost, on/off")
+    sub.add_argument("caps_action", nargs="?", default="list", choices=["list"])
+    sub.add_argument("--json", action="store_true", help="Print JSON")
+    sub.set_defaults(func=cmd_caps)
 
     sub = subparsers.add_parser(
         "duplicates", help="Companies that may be on file twice: merge, keep apart, undo")

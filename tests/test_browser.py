@@ -413,7 +413,7 @@ class FakeReader(PageReader):
 @pytest.mark.asyncio
 async def test_profile_collector_renders_js_shells_and_records_the_method():
     from harvey.collectors.profile import ProfileCollector
-    c = ProfileCollector(state=None, confirmed={"NO_ONLINE_BOOKING"})
+    c = ProfileCollector(confirmed={"NO_ONLINE_BOOKING"})
     c._client = FakeHTTP({"https://clinica.test": (200, SHELL)})
     c._pages = FakeReader()
     obs = await c.profile_company("c1", "clinica.test")
@@ -424,7 +424,7 @@ async def test_profile_collector_renders_js_shells_and_records_the_method():
 @pytest.mark.asyncio
 async def test_profile_collector_keeps_static_pages_on_http():
     from harvey.collectors.profile import ProfileCollector
-    c = ProfileCollector(state=None, confirmed={"NO_ONLINE_BOOKING"})
+    c = ProfileCollector(confirmed={"NO_ONLINE_BOOKING"})
     c._client = FakeHTTP({"https://clinica.test": (200, STATIC)})
     c._pages = FakeReader()
     obs = await c.profile_company("c1", "clinica.test")
@@ -434,7 +434,7 @@ async def test_profile_collector_keeps_static_pages_on_http():
 @pytest.mark.asyncio
 async def test_profile_collector_renders_a_challenged_site_and_clears_the_challenge():
     from harvey.collectors.profile import ProfileCollector
-    c = ProfileCollector(state=None, confirmed=set())
+    c = ProfileCollector(confirmed=set())
     c._client = FakeHTTP({"https://clinica.test": (403, CHALLENGE)})
     c._pages = FakeReader()
     assert await c._get("https://clinica.test") == RENDERED

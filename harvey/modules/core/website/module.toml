@@ -11,7 +11,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.collectors.profile.ProfileCollector"
+entry = "harvey.modules.core.website.capabilities"
+wraps = ["harvey.collectors.profile"]
 secrets = []
 
 [cost]
@@ -31,5 +32,5 @@ cost_note = "free (site HTML)"
 id = "read_site"
 op = "read"
 inputs = [["domain"]]
-outputs = { records = "pages", facts = ["CONTACT_FORM_URL"] }
+outputs = { records = "pages", facts = ["CONTACT_FORM_URL"], values = ["name"] }
 cost = { usd = 0.0, per = "company" }

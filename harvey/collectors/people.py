@@ -735,7 +735,7 @@ def find_people(pages: list[tuple[str, str]], domain: str, site_name: str = "") 
     """
     from harvey.collectors.profile import ProfileCollector
 
-    detect = ProfileCollector(state=None).detect_people
+    detect = ProfileCollector().detect_people
     merged: dict[tuple[str, str], dict] = {}
     order = []
     for url, html in pages:

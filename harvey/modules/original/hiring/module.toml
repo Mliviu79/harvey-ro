@@ -11,7 +11,8 @@ api = 1
 markets = []
 requires = ["website"]
 default_enabled = false
-entry = "harvey.collectors.ats"
+entry = "harvey.modules.original.hiring.capabilities"
+wraps = ["harvey.collectors.discover", "harvey.collectors.profile", "harvey.collectors.ats"]
 secrets = []
 terms_note = "Job boards are read through their public JSON feeds, only when the company's own site links to one. The optional python-jobspy search reads Indeed, whose terms forbid automated access."
 

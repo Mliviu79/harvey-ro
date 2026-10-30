@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.collectors.discover.geocode_city"
+entry = "harvey.modules.core.nominatim.capabilities"
+wraps = ["harvey.collectors.discover"]
 secrets = []
 terms_note = "OpenStreetMap's Nominatim usage policy: at most one request a second, an identifying User-Agent, and results cached rather than asked again."
 

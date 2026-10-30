@@ -21,17 +21,18 @@ Only ``verified`` (and optionally ``risky``) should ever be emailed.
 
 import asyncio
 import logging
-import os
 import random
 import re
 import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Optional
 
 import dns.resolver
 import aiosmtplib
 import httpx
+
+from harvey.modules.api import Budget
 
 logger = logging.getLogger("harvey.email_finder")
 
@@ -74,11 +75,15 @@ class HunterUnavailable(Exception):
 
 @dataclass
 class EmailResult:
-    """Outcome of an email lookup. status is the source of truth."""
+    """Outcome of an email lookup. status is the source of truth.
+    ``learned`` is what the lookup learned about the domain's addresses, to
+    keep (pattern, source, confidence, mx_type; is_catch_all when a
+    verifier saw a catch-all), or {} when it learned nothing."""
     email: str
     status: str          # verified / risky / guess / invalid
     pattern: str = ""
     mx_type: str = ""
+    learned: dict = field(default_factory=dict)
 
     @property
     def verified(self) -> bool:
@@ -97,6 +102,10 @@ def _clean_domain(domain: str) -> str:
     if domain.startswith("www."):
         domain = domain[4:]
     return domain
+
+
+# A domain as the pattern cache keys it.
+clean_domain = _clean_domain
 
 
 def _clean_name_part(value: str) -> str:
@@ -358,68 +367,31 @@ def _translate_hunter_pattern(hunter_pattern: str) -> Optional[str]:
     return mapping.get(p)
 
 
-def _hunter_api_key() -> str:
-    return os.getenv("HUNTER_API_KEY", "").strip()
+def _secret(env, name: str) -> str:
+    """A .env key's value (``name`` as EnvConfig spells it) from ``env``: a
+    dict, or an object holding it as an attribute; "" without one."""
+    if env is None:
+        return ""
+    value = env.get(name, "") if isinstance(env, Mapping) else getattr(env, name, "")
+    return (value or "").strip()
 
 
-async def _module_on(state, module_id: str) -> bool:
-    """Whether Hunter's or the verifiers' module is on. Without a state
-    there are no switches to read (a one-off check outside an install), so
-    it counts as on."""
-    if state is None:
-        return True
-    from harvey.modules import switches
+def _hunter_api_key(env) -> str:
+    return _secret(env, "hunter_api_key")
 
-    return await switches.is_enabled(state, module_id)
+
+def _module_on(enabled, module_id: str) -> bool:
+    """Whether Hunter's or the verifiers' module is on. ``enabled`` None
+    (a one-off check outside an install) counts every module as on."""
+    return enabled is None or module_id in enabled
 
 
 # Hunter's free tier is 25 domain-searches/month for the whole account, and
-# every call spends one no matter how many people it returns. Paid plans set
-# HUNTER_MONTHLY_SEARCHES to their own allowance. Every domain-search call in
-# Harvey draws from this one counter, so the pattern lookup and Scout's
-# named-contact strategy can't each assume they have the full quota.
-HUNTER_FREE_MONTHLY_SEARCHES = 25
-
-
-def _hunter_monthly_cap() -> int:
-    raw = os.getenv("HUNTER_MONTHLY_SEARCHES", "").strip()
-    if not raw:
-        return HUNTER_FREE_MONTHLY_SEARCHES
-    try:
-        return max(int(raw), 0)
-    except ValueError:
-        return HUNTER_FREE_MONTHLY_SEARCHES
-
-
-def _hunter_usage_key() -> str:
-    return f"hunter_domain_search_count:{datetime.now(timezone.utc):%Y-%m}"
-
-
-async def hunter_searches_remaining(state) -> int:
-    """Domain-searches left this calendar month (UTC). Without a state
-    store there is nothing to count against, so the full cap is reported."""
-    cap = _hunter_monthly_cap()
-    if state is None:
-        return cap
-    try:
-        used = int(await state.get_setting(_hunter_usage_key(), "0") or "0")
-    except (ValueError, TypeError):
-        used = 0
-    except Exception as e:
-        logger.debug(f"Hunter usage read failed: {e}")
-        return 0
-    return max(cap - used, 0)
-
-
-async def record_hunter_search(state) -> None:
-    """Count one domain-search against this month's budget. Called before
-    the request, so a call that fails mid-flight is still counted."""
-    if state is None:
-        return
-    try:
-        await state.increment_setting(_hunter_usage_key())
-    except Exception as e:
-        logger.debug(f"Hunter usage write failed: {e}")
+# every call spends one no matter how many people it returns. Every
+# domain-search call in Harvey draws from one counter that core keeps (the
+# Budget passed in; the cap is the hunter manifest's monthly_searches,
+# HUNTER_MONTHLY_SEARCHES), so the pattern lookup and Scout's named-contact
+# strategy can't each assume they have the full quota.
 
 
 async def hunter_domain_people(
@@ -431,8 +403,8 @@ async def hunter_domain_people(
     None on any failure (network, non-200, bad JSON, or no data).
 
     Costs one domain-search credit per call regardless of ``limit``, so
-    callers must check hunter_searches_remaining() and record_hunter_search()
-    first rather than rely on this failing gracefully to protect the quota.
+    callers must draw one from the month's allowance first (Budget.take)
+    rather than rely on this failing gracefully to protect the quota.
     """
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -456,17 +428,22 @@ async def hunter_domain_people(
 async def derive_pattern(
     domain: str,
     known_emails: Optional[list[tuple[str, str, str]]] = None,
-    state=None,
+    cached: Optional[dict] = None,
     default_pattern: str = DEFAULT_PATTERN,
+    budget=None,
+    enabled=None,
+    env=None,
 ) -> tuple[str, str, float]:
     """Determine a domain's email pattern. Returns (pattern, source, confidence).
 
     Order: a known address for this domain (a named person's address on
-    the site) → the DB cache, unless all it holds is a default → Hunter
-    domain-search (once per domain) → ``default_pattern``. This is the step
-    that collapses six guesses to one and is where free tiers stretch
-    furthest. A cached default is a fallback, not evidence: it never blocks
-    a real address or Hunter (it used to, forever).
+    the site) → ``cached`` (what Harvey learned before), unless all it
+    holds is a default → Hunter domain-search (once per domain, one of the
+    month's allowance drawn from ``budget``, the key from ``env``) →
+    ``default_pattern``. This is
+    the step that collapses six guesses to one and is where free tiers
+    stretch furthest. A cached default is a fallback, not evidence: it
+    never blocks a real address or Hunter (it used to, forever).
     """
     domain = _clean_domain(domain)
 
@@ -477,12 +454,7 @@ async def derive_pattern(
             if inferred:
                 return inferred, "known_email", 0.9
 
-    cached = None
-    if state is not None:
-        try:
-            cached = await state.get_email_pattern(domain)
-        except Exception as e:
-            logger.debug(f"Pattern cache read failed for {domain}: {e}")
+    budget = budget if budget is not None else Budget()
     source = (cached or {}).get("source") or ""
     if cached and cached.get("pattern") and source not in WEAK_SOURCES:
         return cached["pattern"], source or "cache", cached.get("confidence", 0.6)
@@ -490,11 +462,11 @@ async def derive_pattern(
     # A site guess is better than nothing, but Hunter gets one look first.
     site_guess = cached if cached and cached.get("pattern") and source.startswith("site_address_guess") else None
     hunter_tried = source.endswith("_after_hunter")
-    key = _hunter_api_key()
-    if key and not await _module_on(state, "hunter"):
+    key = _hunter_api_key(env)
+    if key and not _module_on(enabled, "hunter"):
         key = ""
-    if key and not hunter_tried and await hunter_searches_remaining(state) > 0:
-        await record_hunter_search(state)
+    if key and not hunter_tried and await budget.left("hunter") > 0:
+        await budget.take("hunter")
         try:
             result = await _hunter_domain_pattern(domain, key)
             answered = True
@@ -657,7 +629,7 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
 
 
 async def _verify_candidate(email: str, mx_type: str, env,
-                            state=None) -> tuple[Optional[str], bool]:
+                            enabled=None) -> tuple[Optional[str], bool]:
     """Run the best available verifier for this domain type.
 
     Returns (status_or_None, catch_all_seen). Order is chosen so scarce
@@ -665,10 +637,10 @@ async def _verify_candidate(email: str, mx_type: str, env,
     Reoon, ZeroBounce and the SMTP check run only while the email_verify
     module is on, Hunter's check only while hunter is.
     """
-    verifiers = await _module_on(state, "email_verify")
-    reoon_key = getattr(env, "reoon_api_key", "") if env and verifiers else ""
-    zerobounce_key = getattr(env, "zerobounce_api_key", "") if env and verifiers else ""
-    hunter_key = _hunter_api_key() if await _module_on(state, "hunter") else ""
+    verifiers = _module_on(enabled, "email_verify")
+    reoon_key = _secret(env, "reoon_api_key") if verifiers else ""
+    zerobounce_key = _secret(env, "zerobounce_api_key") if verifiers else ""
+    hunter_key = _hunter_api_key(env) if _module_on(enabled, "hunter") else ""
 
     catch_all_seen = False
 
@@ -724,7 +696,7 @@ async def _verify_candidate(email: str, mx_type: str, env,
     return None, catch_all_seen
 
 
-async def verify_published_address(email: str, env=None, state=None) -> str:
+async def verify_published_address(email: str, env=None, enabled=None) -> str:
     """Grade an address the company publishes on its own website.
 
     Graded like any other address: a catch-all verdict stays "risky", so
@@ -739,7 +711,7 @@ async def verify_published_address(email: str, env=None, state=None) -> str:
     mx_host = await get_mx_host(domain)
     if not mx_host:
         return "invalid"
-    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, state)
+    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, enabled)
     return status or "guess"
 
 
@@ -764,10 +736,13 @@ async def find_email(
     domain: str,
     verify: bool = True,
     env=None,
-    state=None,
     known_emails: Optional[list[tuple[str, str, str]]] = None,
     default_pattern: str = DEFAULT_PATTERN,
     other_people: Optional[list[tuple[str, str]]] = None,
+    cached: Optional[dict] = None,
+    budget=None,
+    enabled=None,
+    learned: Optional[dict] = None,
 ) -> EmailResult:
     """Find and honestly grade one email for a person at a company.
 
@@ -781,7 +756,15 @@ async def find_email(
     one of them could own (jsmith@ for Jane when John Smith works there too,
     or an address published as theirs) is never guessed or verified for
     this person: a verifier would confirm the other person's mailbox.
+
+    ``cached`` is what Harvey learned about the domain before (its
+    email_patterns row), ``budget`` what Hunter lookups it may spend,
+    ``enabled`` the modules that are on (None: all). Nothing is written:
+    what the lookup learned comes back in ``learned`` (also filled into
+    the ``learned`` dict passed in as it is learned, so a caller keeps it
+    even when verification fails), for core to keep.
     """
+    learned = learned if learned is not None else {}
     domain = _clean_domain(domain)
     if not (first_name and last_name and domain):
         return EmailResult(email="", status="invalid")
@@ -795,7 +778,8 @@ async def find_email(
     mx_type = classify_mx(mx_host)
 
     pattern, source, confidence = await derive_pattern(
-        domain, known_emails=known_emails, state=state, default_pattern=default_pattern,
+        domain, known_emails=known_emails, cached=cached, default_pattern=default_pattern,
+        budget=budget, enabled=enabled, env=env,
     )
     candidate = build_email(pattern, first_name, last_name, domain)
     own = _clean_name_part(first_name), _clean_name_part(last_name)
@@ -814,29 +798,21 @@ async def find_email(
         candidate = build_email(DEFAULT_PATTERN, first_name, last_name, domain)
         pattern = DEFAULT_PATTERN
 
-    if state is not None:
-        try:
-            await state.save_email_pattern(
-                domain, pattern=pattern, source=source,
-                confidence=confidence, mx_type=mx_type,
-            )
-        except Exception as e:
-            logger.debug(f"Pattern cache write failed for {domain}: {e}")
+    learned.update(pattern=pattern, source=source, confidence=confidence, mx_type=mx_type)
 
     if not verify:
-        return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type)
+        return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type,
+                           learned=learned)
 
-    status, catch_all = await _verify_candidate(candidate, mx_type, env, state)
+    status, catch_all = await _verify_candidate(candidate, mx_type, env, enabled)
 
-    if catch_all and state is not None:
-        try:
-            await state.save_email_pattern(domain, mx_type=mx_type, is_catch_all=1)
-        except Exception:
-            pass
+    if catch_all:
+        learned["is_catch_all"] = 1
 
     if status is None:
         # Verification couldn't decide — an honest guess, never "verified".
         status = "guess"
 
     logger.info(f"Email for {first_name} {last_name}@{domain}: {candidate} [{status}]")
-    return EmailResult(email=candidate, status=status, pattern=pattern, mx_type=mx_type)
+    return EmailResult(email=candidate, status=status, pattern=pattern, mx_type=mx_type,
+                       learned=learned)

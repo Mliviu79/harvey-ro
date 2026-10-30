@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.integrations.email_finder.hunter_domain_people"
+entry = "harvey.modules.original.hunter.capabilities"
+wraps = ["harvey.integrations.email_finder"]
 secrets = ["HUNTER_API_KEY", "HUNTER_MONTHLY_SEARCHES"]
 
 [cost]

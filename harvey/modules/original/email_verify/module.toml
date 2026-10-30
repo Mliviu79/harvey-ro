@@ -11,7 +11,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.integrations.email_finder.find_email"
+entry = "harvey.modules.original.email_verify.capabilities"
+wraps = ["harvey.integrations.email_finder"]
 secrets = ["REOON_API_KEY", "ZEROBOUNCE_API_KEY"]
 
 [cost]
@@ -39,5 +40,12 @@ cost_note = "1 verification credit (free tiers available)"
 id = "find_email"
 op = "lookup"
 inputs = [["name", "domain"]]
-outputs = { facts = ["EMAIL_PATTERN", "EMAIL_STATUS"] }
+outputs = { facts = ["EMAIL_PATTERN", "EMAIL_STATUS"], values = ["email_pattern"] }
+cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier" }
+
+[[capabilities]]
+id = "verify_address"
+op = "lookup"
+inputs = [["domain"]]
+outputs = { facts = ["EMAIL_STATUS"] }
 cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier" }

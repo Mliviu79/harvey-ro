@@ -1,0 +1,36 @@
+{
+ "companies": [],
+ "company_activities": [],
+ "company_ids": [],
+ "company_merge_moves": [],
+ "company_merges": [],
+ "email_patterns": [],
+ "match_candidates": [],
+ "observations": [],
+ "prospects": [],
+ "runs": [],
+ "settings": [
+  {
+   "key": "geo:denver, co",
+   "updated_at": true,
+   "value": "39.7392,-104.9903"
+  },
+  {
+   "key": "geo:nowhere, zz",
+   "updated_at": true,
+   "value": "-"
+  },
+  {
+   "coordinate": "39.7392,-104.9903,40",
+   "query": "Denver, CO"
+  },
+  {
+   "coordinate": "",
+   "query": "Nowhere, ZZ"
+  },
+  {
+   "coordinate": "39.7392,-104.9903,40",
+   "query": "Denver, CO"
+  }
+ ]
+}

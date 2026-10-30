@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = ["website"]
 default_enabled = true
-entry = "harvey.collectors.phones.phones_from_html"
+entry = "harvey.modules.core.phones.capabilities"
+wraps = ["harvey.collectors.phones"]
 secrets = []
 
 [cost]

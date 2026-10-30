@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
+from harvey.modules import runs
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
@@ -170,7 +171,7 @@ async def test_only_confirmed_signals_are_collected(state, monkeypatch):
     async def fake_get(url):
         return '<html><link href="/wp-content/x.css"><footer>Powered by <a href="https://ag.com">Agency</a></footer></html>'
     c._get = fake_get
-    c.state = state
+    c.known = state
 
     cid = await state.add_company(Company(name="Acme", domain="acme.com"))
     obs = await c.profile_company(cid, "acme.com")
@@ -219,11 +220,11 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
 
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
     monkeypatch.setattr(ProfileCollector, "_first_present", fake_first)
-    async with ProfileCollector(state, {"TECH_STACK"}) as c:
-        await c.run([{"id": cid, "name": "Denver, CO | HOA Management Firm",
+    await runs.profile(state, [{"id": cid, "name": "Denver, CO | HOA Management Firm",
                       "domain": "managementharbor.com"},
                      {"id": keep, "name": "Birch Management", "domain": "birchmgt.com"},
-                     {"id": derived, "name": "Grow With Us", "domain": "growwithus.us"}])
+                     {"id": derived, "name": "Grow With Us", "domain": "growwithus.us"}],
+                       {"TECH_STACK"})
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         names = dict(db.execute("SELECT domain, name FROM companies"))
@@ -257,9 +258,8 @@ async def test_profile_repairs_weak_names_and_retains_brands(
         return None
 
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
-    monkeypatch.setattr("harvey.collectors.profile.asyncio.sleep", no_sleep)
-    async with ProfileCollector(state, set()) as c:
-        await c.run([{"id": cid, "name": current, "domain": domain}])
+    monkeypatch.setattr("harvey.modules.runs.asyncio.sleep", no_sleep)
+    await runs.profile(state, [{"id": cid, "name": current, "domain": domain}], set())
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         assert db.execute("SELECT name FROM companies WHERE id = ?", (cid,)).fetchone() == (expected,)
@@ -287,8 +287,7 @@ async def test_profile_uses_homepage_brand_over_service_location_title(
         return None
 
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
-    monkeypatch.setattr("harvey.collectors.profile.asyncio.sleep", no_sleep)
-    async with ProfileCollector(state, set()) as c:
-        await c.run([{"id": cid, "name": current, "domain": domain}])
+    monkeypatch.setattr("harvey.modules.runs.asyncio.sleep", no_sleep)
+    await runs.profile(state, [{"id": cid, "name": current, "domain": domain}], set())
     assert (await state.get_company_by_domain(domain)).name == brand
     assert (await state.get_prospect(pid)).company == brand

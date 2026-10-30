@@ -8,6 +8,7 @@ import pytest_asyncio
 
 from harvey.state import StateManager
 from harvey.integrations import email_finder as ef
+from harvey.modules import ingest
 from harvey.integrations.email_finder import (
     EmailResult,
     build_email,
@@ -97,7 +98,6 @@ async def test_derive_pattern_from_known_email(state):
     pattern, source, conf = await derive_pattern(
         "acme.com",
         known_emails=[("john.smith@acme.com", "John", "Smith")],
-        state=state,
     )
     assert pattern == "{f}.{l}"
     assert source == "known_email"
@@ -109,15 +109,16 @@ async def test_derive_pattern_uses_cache(state):
     await state.save_email_pattern(
         "acme.com", pattern="{fi}{l}", source="scraped_mailto", confidence=0.85
     )
-    pattern, source, conf = await derive_pattern("acme.com", state=state)
+    pattern, source, conf = await derive_pattern(
+        "acme.com", cached=await state.get_email_pattern("acme.com"))
     assert pattern == "{fi}{l}"
     assert source == "scraped_mailto"
 
 
 @pytest.mark.asyncio
 async def test_derive_pattern_default_no_signal(state, monkeypatch):
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
-    pattern, source, conf = await derive_pattern("unknown-co.com", state=state)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
+    pattern, source, conf = await derive_pattern("unknown-co.com")
     assert pattern == "{f}.{l}"
     assert source == "default"
     assert conf < 0.5
@@ -131,7 +132,7 @@ async def test_find_email_no_mx_is_invalid(state, monkeypatch):
     async def no_mx(domain):
         return None
     monkeypatch.setattr(ef, "get_mx_host", no_mx)
-    result = await find_email("Jane", "Doe", "acme.com", state=state)
+    result = await find_email("Jane", "Doe", "acme.com")
     assert result.status == "invalid"
     assert result.mx_type == "none"
 
@@ -141,13 +142,14 @@ async def test_find_email_verify_false_is_guess(state, monkeypatch):
     async def google_mx(domain):
         return "aspmx.l.google.com"
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
 
-    result = await find_email("Jane", "Doe", "acme.com", verify=False, state=state)
+    result = await find_email("Jane", "Doe", "acme.com", verify=False)
     assert result.status == "guess"
     assert result.email == "jane.doe@acme.com"
     assert result.mx_type == "google"
-    # Pattern still cached even without verification
+    # Pattern still learned (and kept) even without verification
+    await ingest.learned_pattern(state, "acme.com", result.learned)
     cached = await state.get_email_pattern("acme.com")
     assert cached["mx_type"] == "google"
 
@@ -157,14 +159,14 @@ async def test_find_email_verified_via_reoon(state, monkeypatch):
     async def google_mx(domain):
         return "aspmx.l.google.com"
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
 
     async def fake_reoon(email, key):
         return {"status": "valid", "catch_all": False}
     monkeypatch.setattr(ef, "verify_reoon", fake_reoon)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state
+        "Jane", "Doe", "acme.com", env=Env(reoon="k")
     )
     assert result.status == "verified"
     assert result.verified and result.sendable
@@ -175,18 +177,19 @@ async def test_find_email_catch_all_is_risky(state, monkeypatch):
     async def ms_mx(domain):
         return "acme.mail.protection.outlook.com"
     monkeypatch.setattr(ef, "get_mx_host", ms_mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
 
     async def fake_zb(email, key):
         return {"status": "valid", "catch_all": True}
     monkeypatch.setattr(ef, "verify_zerobounce", fake_zb)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(zerobounce="k"), state=state
+        "Jane", "Doe", "acme.com", env=Env(zerobounce="k")
     )
     assert result.status == "risky"
     assert not result.sendable   # verified-only by default
-    # catch-all flag persisted
+    # catch-all flag learned, and kept
+    await ingest.learned_pattern(state, "acme.com", result.learned)
     cached = await state.get_email_pattern("acme.com")
     assert cached["is_catch_all"] == 1
 
@@ -196,14 +199,14 @@ async def test_find_email_invalid_from_provider(state, monkeypatch):
     async def google_mx(domain):
         return "aspmx.l.google.com"
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
 
     async def fake_reoon(email, key):
         return {"status": "invalid", "catch_all": False}
     monkeypatch.setattr(ef, "verify_reoon", fake_reoon)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state
+        "Jane", "Doe", "acme.com", env=Env(reoon="k")
     )
     assert result.status == "invalid"
 
@@ -214,9 +217,9 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
     async def google_mx(domain):
         return "aspmx.l.google.com"
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
     # No verifier keys configured at all → nothing can confirm.
-    result = await find_email("Jane", "Doe", "acme.com", env=Env(), state=state)
+    result = await find_email("Jane", "Doe", "acme.com", env=Env())
     assert result.status == "guess"
     assert not result.verified
 
@@ -227,20 +230,21 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
 @pytest.mark.asyncio
 async def test_hunter_budget_defaults_to_free_tier(state, monkeypatch):
     monkeypatch.delenv("HUNTER_MONTHLY_SEARCHES", raising=False)
-    assert await ef.hunter_searches_remaining(state) == 25
-    await ef.record_hunter_search(state)
-    assert await ef.hunter_searches_remaining(state) == 24
+    allowance = ingest.Allowance(state)
+    assert await allowance.left("hunter") == 25
+    await allowance.take("hunter")
+    assert await allowance.left("hunter") == 24
 
 
 @pytest.mark.asyncio
 async def test_hunter_budget_follows_paid_plan_setting(state, monkeypatch):
     monkeypatch.setenv("HUNTER_MONTHLY_SEARCHES", "500")
-    assert await ef.hunter_searches_remaining(state) == 500
+    assert await ingest.Allowance(state).left("hunter") == 500
 
 
 @pytest.mark.asyncio
 async def test_derive_pattern_spends_and_respects_hunter_budget(state, monkeypatch):
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
     monkeypatch.setenv("HUNTER_MONTHLY_SEARCHES", "1")
     calls = []
 
@@ -249,8 +253,9 @@ async def test_derive_pattern_spends_and_respects_hunter_budget(state, monkeypat
         return "{f}.{l}", 0.8
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", fake_hunter)
-    _, source, _ = await derive_pattern("first-co.com", state=state)
+    allowance = ingest.Allowance(state)
+    _, source, _ = await derive_pattern("first-co.com", budget=allowance)
     assert source == "hunter_domain_search"
-    _, source, _ = await derive_pattern("second-co.com", state=state)
+    _, source, _ = await derive_pattern("second-co.com", budget=allowance)
     assert source == "default"
     assert calls == ["first-co.com"]

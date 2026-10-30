@@ -11,7 +11,8 @@ api = 1
 markets = ["RO"]
 requires = ["market_ro"]
 default_enabled = true
-entry = "harvey.registry"
+entry = "harvey.modules.ro.onrc.capabilities"
+wraps = ["harvey.registry", "harvey.collectors.onrc"]
 secrets = []
 terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a natural person's name and role are kept from the representatives file; sole traders get no street address."
 
@@ -34,12 +35,21 @@ when_known = "source"
 id = "registry_sync"
 op = "sync"
 inputs = []
-outputs = { records = "registry" }
+outputs = { records = "registry", values = ["registry"] }
 cost = { usd = 0.0, per = "dataset" }
 
 [[capabilities]]
 id = "registry_search"
 op = "query"
 inputs = [["query", "area"], ["query"], ["area"]]
-outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"] }
+outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"], values = ["dataset", "report", "codes", "collector", "run_params"] }
+cost = { usd = 0.0, per = "query" }
+
+# The same firms read straight from the downloaded files, without the
+# local registry database.
+[[capabilities]]
+id = "registry_import"
+op = "query"
+inputs = [["area"], ["query", "area"]]
+outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"], values = ["dataset", "report", "codes", "collector", "run_params"] }
 cost = { usd = 0.0, per = "query" }

@@ -84,15 +84,15 @@ def no_network(monkeypatch):
         raise AssertionError("no paid or verification call in tests")
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
     for name in ("verify_reoon", "verify_zerobounce", "verify_hunter", "verify_email_smtp",
                  "_hunter_domain_pattern"):
         monkeypatch.setattr(ef, name, boom)
 
-    async def unverified(email, env=None):
+    async def unverified(email, env=None, enabled=None):
         return "guess"
 
-    monkeypatch.setattr(scout_mod, "verify_published_address", unverified)
+    monkeypatch.setattr(ef, "verify_published_address", unverified)
 
 
 @pytest.mark.asyncio
@@ -313,7 +313,7 @@ async def test_profile_collector_reports_a_challenge_without_trying_every_varian
             calls.append(url)
             return SimpleNamespace(status_code=202, text=SG_CHALLENGE, headers={"content-type": "text/html"})
 
-    collector = ProfileCollector(state=None)
+    collector = ProfileCollector()
     collector._client = Client()
     assert await collector._resolve_site("challengedlaw.test") == ("", "")
     assert calls == ["https://challengedlaw.test"]

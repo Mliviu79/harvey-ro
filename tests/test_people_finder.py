@@ -13,7 +13,7 @@ import pytest
 from harvey.collectors import people
 from harvey.collectors.profile import ProfileCollector
 
-detect_people = ProfileCollector(state=None).detect_people
+detect_people = ProfileCollector().detect_people
 
 
 def names(found):

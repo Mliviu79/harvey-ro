@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = ["nominatim"]
 default_enabled = true
-entry = "harvey.collectors.discover.DataForSEOListings"
+entry = "harvey.modules.original.dataforseo.capabilities"
+wraps = ["harvey.collectors.discover"]
 secrets = ["DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "DATAFORSEO_SANDBOX"]
 
 [cost]
@@ -109,7 +110,7 @@ id = "organic_rank"
 op = "query"
 provider = "dataforseo_serp"
 inputs = [["query", "area"]]
-outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "IN_LOCAL_PACK", "FOUND_IN_SERP"] }
+outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "IN_LOCAL_PACK", "FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
 cost = { usd = 0.006, per = "search", note = "depth 30, Live endpoint" }
 
 [[capabilities]]

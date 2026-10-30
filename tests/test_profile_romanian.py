@@ -233,7 +233,7 @@ async def team_requests(state, domain):  # noqa: F811
     await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.state = {"CONTACT_FOUND"}, {}, state
+    c.confirmed, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
     requested = []
 
     async def fake_get(url):
@@ -262,7 +262,7 @@ async def test_romanian_team_page_is_read_before_contact(state):  # noqa: F811
     await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.state = {"CONTACT_FOUND"}, {}, state
+    c.confirmed, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
     pad = "<p>" + "Bine ați venit. " * 40 + "</p>"
     pages = {"": "<html>home</html>",
              "/contact": f"<html>{pad}<p>Telefon 0712 000 000</p></html>",

@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.collectors.discover.Serper"
+entry = "harvey.modules.original.serper.capabilities"
+wraps = ["harvey.collectors.discover"]
 secrets = ["SERPER_API_KEY"]
 
 [cost]
@@ -23,5 +24,5 @@ id = "google_search"
 op = "query"
 provider = "serper"
 inputs = [["query", "area"], ["query"]]
-outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP"] }
+outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP", "NO_WEBSITE"] }
 cost = { usd = 0.001, per = "search" }

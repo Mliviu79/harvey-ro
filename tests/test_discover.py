@@ -18,6 +18,7 @@ import pytest_asyncio
 
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
+from harvey.modules import runs as R
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -40,8 +41,8 @@ def config():
 
 # The real implementations, captured before the autouse fixture stubs them,
 # so the geocoding tests can exercise them directly.
-REAL_GEOCODE = D.geocode_city
-REAL_RESOLVE = D.resolve_coordinates
+REAL_GEOCODE = R.geocode_city
+REAL_RESOLVE = R.resolve_coordinates
 REAL_SLEEP = asyncio.sleep
 
 
@@ -58,7 +59,7 @@ def offline(monkeypatch):
     async def no_sleep(_seconds):
         return None
 
-    monkeypatch.setattr(D, "geocode_city", no_geocode)
+    monkeypatch.setattr(R, "geocode_city", no_geocode)
     monkeypatch.setattr(D.asyncio, "sleep", no_sleep)
 
 
@@ -160,7 +161,7 @@ def test_estimates_match_published_pricing():
 async def test_dry_run_estimates_without_calling_anything(state, config, register):
     fake = register(FakeProvider([[biz(domain="a.com")]], per_query_cost=0.5))
     q = [D.DiscoveryQuery(term="roofer", location="Denver")]
-    report = await D.run_discovery(state, config, "fake", q, dry_run=True)
+    report = await R.run_discovery(state, config, "fake", q, dry_run=True)
     assert report.estimated_cost == 0.5
     assert fake.calls == 0
     assert report.found == 0
@@ -171,7 +172,7 @@ async def test_dry_run_estimates_without_calling_anything(state, config, registe
 async def test_budget_cap_refuses_before_spending(state, config, register):
     fake = register(FakeProvider([[biz(domain="a.com")]] * 10, per_query_cost=1.0))
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in "abcdefghij"]
-    report = await D.run_discovery(state, config, "fake", q, max_spend=2.0)
+    report = await R.run_discovery(state, config, "fake", q, max_spend=2.0)
     assert report.stopped == "over budget"
     assert fake.calls == 0, "the cap must be checked before the first call, not after"
     assert report.actual_cost == 0.0
@@ -185,7 +186,7 @@ async def test_budget_stops_mid_run_when_actual_exceeds_estimate(state, config, 
     fake.estimate = lambda queries: 0.0
     register(fake)
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in "abcdefghij"]
-    report = await D.run_discovery(state, config, "fake", q, max_spend=3.0)
+    report = await R.run_discovery(state, config, "fake", q, max_spend=3.0)
     assert report.stopped == "budget reached"
     assert fake.calls < 10
 
@@ -195,7 +196,7 @@ async def test_kill_switch_stops_between_batches(state, config, register):
     await state.set_setting("discovery_paused", "stopped by hand")
     fake = register(FakeProvider([[biz(domain="a.com")]], per_query_cost=0.0))
     q = [D.DiscoveryQuery(term="roofer", location="Denver")]
-    report = await D.run_discovery(state, config, "fake", q)
+    report = await R.run_discovery(state, config, "fake", q)
     assert report.stopped == "paused"
     assert fake.calls == 0
 
@@ -205,7 +206,7 @@ async def test_nothing_runs_until_signals_are_confirmed(state, config, register)
     for sig in SIGNAL_CATALOG:
         await state.set_signal_status(sig["code"], "proposed")
     fake = register(FakeProvider([[biz(domain="a.com")]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "no confirmed signals"
     assert fake.calls == 0
@@ -224,10 +225,10 @@ async def test_rerun_finds_everyone_already_known(state, config, register):
     register(FakeProvider([list(batch), list(batch)]))
     q = [D.DiscoveryQuery(term="roofer", location="Denver")]
 
-    first = await D.run_discovery(state, config, "fake", q)
+    first = await R.run_discovery(state, config, "fake", q)
     assert (first.new_companies, first.known_companies) == (2, 0)
 
-    second = await D.run_discovery(state, config, "fake", q)
+    second = await R.run_discovery(state, config, "fake", q)
     assert (second.new_companies, second.known_companies) == (0, 2), (
         "a re-run must recognise both the domain-keyed and the "
         "external-id-keyed record")
@@ -242,7 +243,7 @@ async def test_websiteless_businesses_are_kept_and_deduped(state, config, regist
          biz(name="B", external_id="osm:node/2", has_website=False),
          biz(name="A again", external_id="osm:node/1", has_website=False)],
     ]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.new_companies == 2
     assert len(await state.cohort(["NO_WEBSITE"])) == 2
@@ -253,7 +254,7 @@ async def test_duplicates_within_one_run_are_collapsed(state, config, register):
     register(FakeProvider([[
         biz(domain="northvale.com"), biz(domain="northvale.com"), biz(domain="other.com"),
     ]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.found == 3
     assert report.new_companies == 2
@@ -264,7 +265,7 @@ async def test_junk_is_counted_not_silently_dropped(state, config, register):
     register(FakeProvider([[
         biz(domain="yelp.com"), biz(domain="angi.com"), biz(domain="real.com"),
     ]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.junk == 2
     assert report.new_companies == 1
@@ -279,7 +280,7 @@ async def test_every_fact_becomes_an_observation(state, config, register):
         name="Northvale", domain="northvale.com", rank=14, rating=4.6,
         review_count=88, is_claimed=False, has_website=True,
     )]]))
-    await D.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
+    await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
     rows = {o["signal_code"]: o for o in await state.get_observations()}
     assert rows["SERP_RANK"]["value_num"] == 14
@@ -298,7 +299,7 @@ async def test_unconfirmed_signals_are_not_recorded(state, config, register):
     the UI that sets it."""
     await state.set_signal_status("REVIEW_RATING", "rejected")
     register(FakeProvider([[biz(domain="northvale.com", rating=4.6, review_count=88)]]))
-    await D.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
+    await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
     codes = {o["signal_code"] for o in await state.get_observations()}
     assert "REVIEW_RATING" not in codes
@@ -316,7 +317,7 @@ async def test_a_failed_query_does_not_lose_the_successful_ones(state, config, r
 
     register(Flaky([], per_query_cost=0.0))
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in ("a", "b", "c")]
-    report = await D.run_discovery(state, config, "fake", q)
+    report = await R.run_discovery(state, config, "fake", q)
 
     assert report.new_companies == 2
     assert len(report.errors) == 1 and "boom" in report.errors[0]
@@ -329,7 +330,7 @@ async def test_run_is_logged_with_what_it_actually_cost(state, config, register)
     register(FakeProvider([[biz(domain="a.com")], [biz(domain="b.com")]],
                           per_query_cost=0.25))
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in ("a", "b")]
-    report = await D.run_discovery(state, config, "fake", q, max_spend=5.0)
+    report = await R.run_discovery(state, config, "fake", q, max_spend=5.0)
 
     runs = await state.get_runs()
     assert runs[0]["stage"] == "discover"
@@ -812,12 +813,12 @@ def test_the_default_provider_needs_no_account():
 async def test_unconfigured_provider_says_which_key_is_missing(state, config, monkeypatch):
     from harvey.config import EnvConfig
     monkeypatch.setattr("harvey.config.load_env", lambda: EnvConfig())
-    report = await D.run_discovery(state, config, "dataforseo_listings",
+    report = await R.run_discovery(state, config, "dataforseo_listings",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "not configured"
     assert "DATAFORSEO_LOGIN" in report.errors[0]
 
-    tf_report = await D.run_discovery(state, config, "tinyfish",
+    tf_report = await R.run_discovery(state, config, "tinyfish",
                                       [D.DiscoveryQuery(term="roofer")])
     assert tf_report.stopped == "not configured"
     assert "TINYFISH_API_KEY" in tf_report.errors[0]
@@ -836,7 +837,7 @@ async def test_empty_api_key_runs_nothing_and_says_so(state, config,
         raise AssertionError("an unconfigured provider must not be called")
     fake.fetch = must_not_fetch
 
-    report = await D.run_discovery(state, config, "serper",
+    report = await R.run_discovery(state, config, "serper",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "not configured"
     assert report.queries_ran == 0
@@ -855,7 +856,7 @@ async def test_template_placeholder_key_is_treated_as_missing(state, config,
         raise AssertionError("a placeholder key must not be sent to the API")
     fake.fetch = must_not_fetch
 
-    report = await D.run_discovery(state, config, "serper",
+    report = await R.run_discovery(state, config, "serper",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "not configured"
     assert report.queries_ran == 0
@@ -880,7 +881,7 @@ async def test_queries_ran_reports_what_actually_executed(state, config,
                                                           register):
     fake = register(FakeProvider([[biz(domain="a.com")],
                                   [biz(domain="b.com")]]))
-    report = await D.run_discovery(state, config, "fake", [
+    report = await R.run_discovery(state, config, "fake", [
         D.DiscoveryQuery(term="roofer", location="Denver"),
         D.DiscoveryQuery(term="roofer", location="Aurora"),
     ])
@@ -894,7 +895,7 @@ async def test_queries_ran_is_zero_when_stopped_before_any_fetch(state, config,
                                                                  register):
     await state.set_setting("discovery_paused", "stopped by hand")
     fake = register(FakeProvider([[biz(domain="a.com")]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "paused"
     assert report.queries_ran == 0
@@ -905,7 +906,7 @@ async def test_queries_ran_is_zero_when_stopped_before_any_fetch(state, config,
 def test_unknown_provider_fails_loudly():
     with pytest.raises(ValueError, match="unknown discovery provider"):
         import asyncio
-        asyncio.run(D.run_discovery(None, None, "nope"))
+        asyncio.run(R.run_discovery(None, None, "nope"))
 
 
 @pytest.mark.asyncio
@@ -1008,7 +1009,7 @@ async def test_a_geocode_miss_is_cached_too(state):
 async def test_configured_coordinates_win_over_geocoding(state, monkeypatch):
     async def boom(*a, **kw):
         raise AssertionError("should not geocode a query that already has a point")
-    monkeypatch.setattr(D, "geocode_city", boom)
+    monkeypatch.setattr(R, "geocode_city", boom)
 
     queries = [D.DiscoveryQuery(term="roofer", location="Denver, CO",
                                 coordinate="1.0,2.0,25")]
@@ -1019,7 +1020,7 @@ async def test_configured_coordinates_win_over_geocoding(state, monkeypatch):
 @pytest.mark.asyncio
 async def test_one_geocode_per_city_not_per_query(state, monkeypatch):
     """Twelve queries across four cities is four lookups, not twelve."""
-    monkeypatch.setattr(D, "geocode_city", REAL_GEOCODE)
+    monkeypatch.setattr(R, "geocode_city", REAL_GEOCODE)
     calls = {"n": 0}
 
     def handler(request):
@@ -1067,7 +1068,7 @@ async def test_an_unmappable_term_is_reported_not_silently_skipped(
         raise RuntimeError("OpenStreetMap has no category for 'widgets'")
     monkeypatch.setattr(D.OpenStreetMap, "fetch", fake_fetch)
 
-    report = await D.run_discovery(state, config, "osm",
+    report = await R.run_discovery(state, config, "osm",
                                    [D.DiscoveryQuery(term="widgets",
                                                      coordinate="1,2,40")])
     assert report.found == 0
@@ -1138,7 +1139,7 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     await sync_vocabulary(state)
     for signal in SIGNAL_CATALOG:
         await state.set_signal_status(signal['code'], 'confirmed')
-    report = await D.run_discovery(state, load_config(), provider_key=provider,
+    report = await R.run_discovery(state, load_config(), provider_key=provider,
         queries=[D.DiscoveryQuery(term='roofer', location='Denver')])
     assert report.errors == []
     assert report.junk == 1, report.as_dict()
@@ -1305,7 +1306,7 @@ class _Exhausted(FakeProvider):
 async def test_a_provider_out_of_allowance_stops_the_run(state, config, register):
     provider = register(_Exhausted([]))
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in ("a", "b", "c")]
-    report = await D.run_discovery(state, config, "fake", q, max_spend=5.0)
+    report = await R.run_discovery(state, config, "fake", q, max_spend=5.0)
     assert provider.calls == 1
     assert "500 searches an hour" in report.stopped
 
@@ -1395,7 +1396,7 @@ async def test_a_forbidden_company_never_becomes_a_row(state, config, register):
         biz(domain="notrival.example"),      # lookalike, a different company
         biz(domain="real.example"),
     ]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.excluded == 2
     assert report.junk == 0
@@ -1414,7 +1415,7 @@ async def test_an_empty_list_changes_discovery_not_at_all(state, config, registe
     config._source_path = None
     config.compliance.do_not_contact = []
     register(FakeProvider([[biz(domain="rival.example"), biz(domain="real.example")]]))
-    report = await D.run_discovery(state, config, "fake",
+    report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.excluded == 0
     assert report.new_companies == 2
@@ -1466,7 +1467,7 @@ async def test_failed_attempt_is_not_a_successful_query(state, config, register)
     async def fail(*args):
         raise RuntimeError("fixture failure")
     fake.fetch = fail
-    report = await D.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
+    report = await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
     assert report.queries_ran == 1
     assert report.queries_succeeded == 0
     assert report.errors
@@ -1485,7 +1486,7 @@ def test_cli_exit_tracks_successful_queries(monkeypatch, config, attempted, succ
         return SimpleNamespace(discover={"queries": 2, "queries_ran": attempted,
                                         "queries_succeeded": succeeded}, errors=[])
     monkeypatch.setattr(StateManager, "init_db", init_db)
-    monkeypatch.setattr(D, "run_discovery", estimate)
+    monkeypatch.setattr(R, "run_discovery", estimate)
     monkeypatch.setattr(pipeline, "run_prospecting", prospect)
     if succeeded:
         cmd_discover(_cli_args())
@@ -1507,7 +1508,7 @@ async def test_scavio_stops_run_on_account_errors(state, config, register, monke
     monkeypatch.setattr(D.httpx, "AsyncClient", lambda **kw: real_client(
         transport=httpx.MockTransport(handler), **kw))
     monkeypatch.setattr("harvey.config.load_env", lambda: EnvConfig(scavio_api_key="fixture"))
-    report = await D.run_discovery(state, config, provider.key,
+    report = await R.run_discovery(state, config, provider.key,
         [D.DiscoveryQuery(term="roofer"), D.DiscoveryQuery(term="plumber")])
     assert len(calls) == 1
     assert str(status) in report.stopped
@@ -1533,10 +1534,10 @@ async def test_scavio_partial_search_preserves_prior_ranks_and_cost(state, confi
         transport=httpx.MockTransport(handler), **kw))
     monkeypatch.setattr("harvey.config.load_env", lambda: EnvConfig(scavio_api_key="fixture"))
     query = D.DiscoveryQuery(term="roofer", depth=20)
-    await D.run_discovery(state, config, provider.key, [query])
+    await R.run_discovery(state, config, provider.key, [query])
     previous = await state.get_company_by_domain("roofer10.example")
     phase[0] = "partial"
-    report = await D.run_discovery(state, config, provider.key, [query])
+    report = await R.run_discovery(state, config, provider.key, [query])
     assert report.actual_cost == pytest.approx(0.01)
     assert report.found == 10 and report.errors
     assert bool(report.stopped) is (failure == 402)
@@ -1582,8 +1583,8 @@ async def test_scavio_maps_resolves_coordinates_in_run(state, config, register, 
     async def resolve(state, queries):
         resolved.extend(queries)
         return queries
-    monkeypatch.setattr(D, "resolve_coordinates", resolve)
-    await D.run_discovery(state, config, provider.key, [D.DiscoveryQuery(term="roofer")], dry_run=True)
+    monkeypatch.setattr(R, "resolve_coordinates", resolve)
+    await R.run_discovery(state, config, provider.key, [D.DiscoveryQuery(term="roofer")], dry_run=True)
     assert len(resolved) == 1
 
 

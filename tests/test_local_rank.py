@@ -16,6 +16,7 @@ import pytest_asyncio
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
 from harvey.models import Company
+from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -42,7 +43,7 @@ def offline(monkeypatch):
     async def no_sleep(_seconds):
         return None
 
-    monkeypatch.setattr(D, "geocode_city", no_geocode)
+    monkeypatch.setattr(runs, "geocode_city", no_geocode)
     monkeypatch.setattr(D.asyncio, "sleep", no_sleep)
 
 
@@ -259,10 +260,10 @@ async def test_rank_providers_are_geocoded_before_the_run(state, monkeypatch):
         calls.append(city)
         return "39.7392,-104.9903,40"
 
-    monkeypatch.setattr(D, "geocode_city", geocode)
+    monkeypatch.setattr(runs, "geocode_city", geocode)
     for key in ("dataforseo_serp", "dataforseo_maps"):
         q = [D.DiscoveryQuery(term="roofer", location="Denver, CO")]
-        await D.run_discovery(state, load_config(), key, q, dry_run=True)
+        await runs.run_discovery(state, load_config(), key, q, dry_run=True)
         assert q[0].coordinate == "39.7392,-104.9903,40"
     assert calls == ["Denver, CO", "Denver, CO"]
 
@@ -305,7 +306,7 @@ def _install(monkeypatch, handler):
 @pytest.mark.asyncio
 async def test_rank_observations_name_the_keyword(state, monkeypatch):
     _install(monkeypatch, lambda r: httpx.Response(200, json=ORGANIC_WITH_PACK))
-    report = await D.run_discovery(state, load_config(), "dataforseo_serp", [
+    report = await runs.run_discovery(state, load_config(), "dataforseo_serp", [
         D.DiscoveryQuery(term="roofer", location="Denver, CO")], max_spend=1.0)
     assert report.errors == []
     company = await state.get_company_by_domain("kettlemanroofing.com")
@@ -335,7 +336,7 @@ async def test_each_keyword_gets_its_own_rank_and_duplicates_keep_the_best(state
     _install(monkeypatch, handler)
     queries = [D.DiscoveryQuery(term=t, location="Denver, CO")
                for t in ("roofer", "roof repair", "roofer")]
-    report = await D.run_discovery(state, load_config(), "dataforseo_serp",
+    report = await runs.run_discovery(state, load_config(), "dataforseo_serp",
                                    queries, max_spend=1.0)
     assert report.new_companies == 1
     company = await state.get_company_by_domain("kettlemanroofing.com")
@@ -352,7 +353,7 @@ async def test_each_keyword_gets_its_own_rank_and_duplicates_keep_the_best(state
 @pytest.mark.asyncio
 async def test_maps_run_records_maps_rank_and_no_website(state, monkeypatch):
     _install(monkeypatch, lambda r: httpx.Response(200, json=MAPS))
-    await D.run_discovery(state, load_config(), "dataforseo_maps", [
+    await runs.run_discovery(state, load_config(), "dataforseo_maps", [
         D.DiscoveryQuery(term="roofer", location="Denver, CO")], max_spend=1.0)
     bob = await state.get_company_by_external_id("dataforseo:cid:333")
     codes = {r["signal_code"]: r for r in await state.get_observations(company_id=bob.id)}
@@ -462,7 +463,7 @@ async def test_a_repeat_search_never_overwrites_a_better_rank(state, monkeypatch
     ]
     _install(monkeypatch, lambda r: httpx.Response(200, json=_envelope(responses.pop(0))))
     q = [D.DiscoveryQuery(term="roofer", location="Denver, CO") for _ in range(2)]
-    await D.run_discovery(state, load_config(), "dataforseo_serp", q, max_spend=1.0)
+    await runs.run_discovery(state, load_config(), "dataforseo_serp", q, max_spend=1.0)
     company = await state.get_company_by_domain("kettlemanroofing.com")
     pack = await state.get_observations(company_id=company.id, signal_code="IN_LOCAL_PACK")
     organic = await state.get_observations(company_id=company.id, signal_code="SERP_RANK")
@@ -489,7 +490,7 @@ async def _run(state, monkeypatch, pages, provider="dataforseo_serp", n=None):
     _install(monkeypatch, lambda r: httpx.Response(200, json=_envelope(pages.pop(0))))
     q = [D.DiscoveryQuery(term="roofer", location="Denver, CO")
          for _ in range(n or len(pages))]
-    report = await D.run_discovery(state, load_config(), provider, q, max_spend=1.0)
+    report = await runs.run_discovery(state, load_config(), provider, q, max_spend=1.0)
     assert report.errors == []
     return report
 
@@ -564,7 +565,7 @@ async def test_pack_and_maps_resolve_to_one_websiteless_company(state, monkeypat
     for payload, key in ((first, "dataforseo_serp" if first is pack else "dataforseo_maps"),
                          (second, "dataforseo_serp" if second is pack else "dataforseo_maps")):
         _install(monkeypatch, lambda r, p=payload: httpx.Response(200, json=p))
-        report = await D.run_discovery(state, load_config(), key, [
+        report = await runs.run_discovery(state, load_config(), key, [
             D.DiscoveryQuery(term="roofer", location="Denver, CO")], max_spend=1.0)
         assert report.errors == [], report.errors
     import sqlite3

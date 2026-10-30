@@ -62,17 +62,17 @@ async def test_never_guess_an_address_another_named_person_could_own(monkeypatch
     async def mx(domain):
         return "aspmx.l.google.com"
 
-    async def verified(email, mx_type, env):
+    async def verified(email, mx_type, env, enabled=None):
         raise AssertionError("a colliding address must never be sent to a verifier")
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
     monkeypatch.setattr(ef, "_verify_candidate", verified)
     st = PatternState({"pattern": "{fi}{l}", "source": "site_address", "confidence": 0.9})
-    result = await ef.find_email("Jane", "Smith", "acme.com", state=st,
+    result = await ef.find_email("Jane", "Smith", "acme.com", cached=st.cached,
                                  other_people=[("John", "Smith")])
     assert result.email == "" and result.status != "verified"
     st = PatternState({"pattern": "{l}", "source": "site_address", "confidence": 0.9})
-    result = await ef.find_email("Jane", "Smith", "acme.com", state=st,
+    result = await ef.find_email("Jane", "Smith", "acme.com", cached=st.cached,
                                  other_people=[("John", "Smith")])
     assert result.email == ""
 
@@ -85,7 +85,7 @@ async def test_another_persons_published_address_is_never_this_persons_guess(mon
     monkeypatch.setattr(ef, "get_mx_host", mx)
     st = PatternState({"pattern": "{f}", "source": "site_address", "confidence": 0.9})
     result = await ef.find_email(
-        "Nora", "Quist", "acme.com", verify=False, state=st, other_people=[("Nora", "Vale")],
+        "Nora", "Quist", "acme.com", verify=False, cached=st.cached, other_people=[("Nora", "Vale")],
         known_emails=[("nora@acme.com", "Nora", "Vale")])
     assert result.email == ""
 
@@ -117,7 +117,7 @@ class PatternState:
 async def test_a_cached_default_does_not_block_a_known_address():
     st = PatternState({"pattern": "{f}.{l}", "source": "default", "confidence": 0.3})
     pattern, source, _ = await ef.derive_pattern(
-        "acme.com", known_emails=[("nvale@acme.com", "Nora", "Vale")], state=st)
+        "acme.com", known_emails=[("nvale@acme.com", "Nora", "Vale")], cached=st.cached)
     assert (pattern, source) == ("{fi}{l}", "known_email")
 
 
@@ -130,9 +130,9 @@ async def test_a_cached_default_does_not_block_hunter(monkeypatch):
         return "{fi}{l}", 0.8
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
     st = PatternState({"pattern": "{f}.{l}", "source": "default", "confidence": 0.3})
-    assert (await ef.derive_pattern("acme.com", state=st))[0] == "{fi}{l}"
+    assert (await ef.derive_pattern("acme.com", cached=st.cached))[0] == "{fi}{l}"
     assert calls == ["acme.com"]
 
 
@@ -145,11 +145,11 @@ async def test_hunter_is_not_asked_twice_about_a_domain_it_had_no_pattern_for(mo
         return None
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
-    first = await ef.derive_pattern("acme.com", state=PatternState())
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
+    first = await ef.derive_pattern("acme.com", cached=None)
     assert first[1] == "default_after_hunter" and calls == ["acme.com"]
     st = PatternState({"pattern": first[0], "source": first[1], "confidence": first[2]})
-    await ef.derive_pattern("acme.com", state=st)
+    await ef.derive_pattern("acme.com", cached=st.cached)
     assert calls == ["acme.com"]
 
 
@@ -162,11 +162,11 @@ async def test_a_low_confidence_site_guess_still_gets_one_hunter_lookup(monkeypa
         return None
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
     cached = {"pattern": "{fi}{l}", "source": "site_address_guess", "confidence": 0.6}
-    pattern, source, conf = await ef.derive_pattern("acme.com", state=PatternState(cached))
+    pattern, source, conf = await ef.derive_pattern("acme.com", cached=cached)
     assert calls == ["acme.com"] and pattern == "{fi}{l}" and source.endswith("_after_hunter")
-    await ef.derive_pattern("acme.com", state=PatternState(
+    await ef.derive_pattern("acme.com", cached=(
         {"pattern": pattern, "source": source, "confidence": conf}))
     assert calls == ["acme.com"]
 
@@ -177,8 +177,8 @@ async def test_a_hunter_outage_is_not_remembered_as_no_pattern(monkeypatch):
         raise ef.HunterUnavailable("429")
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", down)
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
-    _, source, _ = await ef.derive_pattern("acme.com", state=PatternState())
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
+    _, source, _ = await ef.derive_pattern("acme.com", cached=None)
     assert source == "default"      # asked again next time
 
 
@@ -208,9 +208,9 @@ async def test_hunter_errors_are_transient(monkeypatch, status):
 
 @pytest.mark.asyncio
 async def test_a_small_business_with_no_evidence_defaults_to_first_name(monkeypatch):
-    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
     pattern, source, conf = await ef.derive_pattern(
-        "acme.com", state=PatternState(), default_pattern=ef.SMALL_BUSINESS_PATTERN)
+        "acme.com", cached=None, default_pattern=ef.SMALL_BUSINESS_PATTERN)
     assert (pattern, source) == ("{f}", "default") and conf < 0.5
 
 
@@ -221,7 +221,7 @@ async def test_a_persons_own_published_address_is_used_as_is(monkeypatch):
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
     result = await ef.find_email(
-        "Tess", "Marlowe", "marlowemarketingco.test", verify=False, state=PatternState(),
+        "Tess", "Marlowe", "marlowemarketingco.test", verify=False, cached=None,
         known_emails=[("tess@marlowemarketingco.test", "Tess", "Marlowe")])
     assert result.email == "tess@marlowemarketingco.test"
     assert result.status == "guess"   # unverified stays a guess: never sent

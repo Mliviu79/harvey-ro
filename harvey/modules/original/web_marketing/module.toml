@@ -11,7 +11,8 @@ api = 1
 markets = []
 requires = ["website"]
 default_enabled = false
-entry = "harvey.integrations.tech_detect.detect_tech"
+entry = "harvey.modules.original.web_marketing.capabilities"
+wraps = ["harvey.collectors.profile", "harvey.integrations.tech_detect"]
 secrets = []
 
 [cost]

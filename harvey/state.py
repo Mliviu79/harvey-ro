@@ -13,7 +13,6 @@ import json
 import logging
 import re
 import sqlite3
-import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -30,6 +29,7 @@ from harvey.models.conversation import Conversation, Message  # noqa: F401
 from harvey import resolver
 from harvey.paths import PROJECT_ROOT
 from harvey.startups import parse_funding
+from harvey.words import SEARCH_STOPWORDS, fold_words
 
 logger = logging.getLogger(__name__)
 
@@ -151,15 +151,9 @@ def _norm(value: str | None) -> str:
 
 # ── Company search: words typed -> an FTS5 query ──
 
-# Joining words that would otherwise have to appear in the company's text.
-_SEARCH_STOPWORDS = frozenset({"de", "si", "la", "in", "pe", "cu", "din", "a",
-                               "of", "and", "the", "for"})
-
-
-def _fold_words(text: str) -> list[str]:
-    decomposed = unicodedata.normalize("NFKD", (text or "").lower())
-    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return re.findall(r"[a-z0-9]+", plain)
+# (harvey/words.py, shared with the registry's search)
+_SEARCH_STOPWORDS = SEARCH_STOPWORDS
+_fold_words = fold_words
 
 
 def _search_term(word: str) -> str:
@@ -870,6 +864,18 @@ MIGRATIONS: list[str] = [
     UPDATE signal_codes SET keyed_by = 'phrase'
         WHERE code IN ('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK');
     """,
+    # ── v19: where each fact came from (harvey/modules/ingest.py) ──
+    """
+    -- The module and capability that found the fact, and the company it was
+    -- found for before any merge (a listing's own record, the company a site
+    -- was read for). Undoing a merge sends back every fact whose origin is
+    -- the merged company. Empty on rows from before.
+    ALTER TABLE observations ADD COLUMN module TEXT DEFAULT '';
+    ALTER TABLE observations ADD COLUMN capability TEXT DEFAULT '';
+    ALTER TABLE observations ADD COLUMN origin_company_id TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_obs_origin ON observations(origin_company_id)
+        WHERE origin_company_id != '';
+    """,
 ]
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
@@ -1059,7 +1065,8 @@ async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
             r["signal_code"], r.get("collector", ""), r.get("value_num"),
             r.get("value_text", ""), float(r.get("confidence", 1.0)),
             r.get("evidence_url", ""), r.get("observed_at"),
-            r.get("run_id", run_id),
+            r.get("run_id", run_id), r.get("module", ""), r.get("capability", ""),
+            r.get("origin_company_id", ""),
         )
         for r in rows
     ]
@@ -1067,9 +1074,9 @@ async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
         """INSERT INTO observations
                (id, company_id, prospect_id, signal_code, collector,
                 value_num, value_text, confidence, evidence_url,
-                observed_at, run_id)
+                observed_at, run_id, module, capability, origin_company_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                   COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)""",
         payload,
     )
     return len(payload)
@@ -1078,7 +1085,8 @@ async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
 class Resolution:
     """What saving a company did: ``company_id`` is the record to write its
     facts to; ``created`` whether that is a new company; ``match`` how it
-    was matched; ``merged_from`` the row an automatic merge folded in."""
+    was matched; ``merged_from`` the row an automatic merge folded in;
+    ``origin`` the record before any merge."""
 
     __slots__ = ("company_id", "created", "match", "merged_from")
 
@@ -1086,6 +1094,14 @@ class Resolution:
                  merged_from: str = ""):
         self.company_id, self.created, self.match = company_id, created, match
         self.merged_from = merged_from
+
+    @property
+    def origin(self) -> str:
+        """The record this one is before any merge: the row an automatic
+        merge folded in, the merged record whose own key matched, or the
+        company itself. Facts found for it carry it, so undoing that merge
+        takes them back (resolver.undo)."""
+        return self.merged_from or self.match.origin or self.company_id
 
 
 def _own_keys(company: Company, match: "resolver.Match") -> list[tuple[str, str]]:
@@ -2727,21 +2743,26 @@ class StateManager:
         evidence_url: str = "",
         run_id: str = "",
         observed_at: str | None = None,
+        module: str = "",
+        capability: str = "",
+        origin_company_id: str = "",
     ) -> str:
         """Record one fact. Raises if signal_code isn't in the vocabulary —
-        a typo must fail loudly rather than create a junk signal."""
+        a typo must fail loudly rather than create a junk signal.
+        ``module``, ``capability`` and ``origin_company_id`` say who found
+        it and for which record, as ingest's rows do."""
         obs_id = _new_id()
         async with self._connect() as db:
             await db.execute(
                 """INSERT INTO observations
                        (id, company_id, prospect_id, signal_code, collector,
                         value_num, value_text, confidence, evidence_url,
-                        observed_at, run_id)
+                        observed_at, run_id, module, capability, origin_company_id)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                           COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)""",
                 (obs_id, company_id, prospect_id, signal_code, collector,
                  value_num, value_text, float(confidence), evidence_url,
-                 observed_at, run_id),
+                 observed_at, run_id, module, capability, origin_company_id),
             )
             await self._flush_company_search(db)
             await db.commit()
@@ -3118,7 +3139,7 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                f"""SELECT c.id, c.name, c.domain, c.location
+                f"""SELECT c.id, c.name, c.domain, c.location, c.source_url
                    FROM companies c
                    {_LAST_PROFILED_JOIN}
                    WHERE c.domain != '' AND {LIVE_COMPANY}

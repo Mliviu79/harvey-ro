@@ -16,6 +16,7 @@ import pytest_asyncio
 from harvey import registry
 from harvey.collectors import onrc
 from harvey.models import Company
+from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 from tests.test_onrc import BIRTH, CAEN, CNP, DATASET, FIRMS, PEOPLE, STATUS, firm, write
@@ -231,7 +232,7 @@ def test_explicit_filters_as_import_onrc_gives_them(con):
 @pytest.mark.asyncio
 async def test_pull_saves_like_import_onrc(state, con):
     q = registry.resolve(con, "dentist BV")
-    report = await registry.pull(state, con, q)
+    report = await runs.registry_pull(state, con, q)
     assert not report.errors
     assert (report.new_companies, report.known_companies) == (4, 0)
     a = await state.get_company_by_cui("90000017")
@@ -246,7 +247,7 @@ async def test_pull_saves_like_import_onrc(state, con):
     total, rows = await state.search_companies("8622")
     assert [r["cui"] for r in rows] == ["90000017"]
 
-    again = await registry.pull(state, con, q)
+    again = await runs.registry_pull(state, con, q)
     assert (again.new_companies, again.known_companies) == (0, 4)
     assert again.observations == 0
 
@@ -257,7 +258,7 @@ async def test_pull_merges_on_legal_identity_only(state, con):
                                             source="discover:osm"))
     other = await state.add_company(Company(name="Alt Zâmbet",
                                             domain="zambet-exemplu.example.ro"))
-    report = await registry.pull(state, con, registry.resolve(con, "8623 BV"))
+    report = await runs.registry_pull(state, con, registry.resolve(con, "8623 BV"))
     assert report.known_companies == 1 and report.new_companies == 2
     merged = await state.get_company_by_cui("90000017")
     assert merged.id == known and merged.name == "Clinica Zâmbet"
@@ -269,13 +270,13 @@ async def test_pull_merges_on_legal_identity_only(state, con):
 @pytest.mark.asyncio
 async def test_pull_limit_dry_run_and_gate(state, con):
     q = registry.resolve(con, "dentist BV")
-    dry = await registry.pull(state, con, q, dry_run=True)
+    dry = await runs.registry_pull(state, con, q, dry_run=True)
     assert dry.new_companies == 4
     with sqlite3.connect(state.db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
     for code in ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"):
         await state.set_signal_status(code, "proposed")
-    report = await registry.pull(state, con, q, limit=2, with_administrators=False)
+    report = await runs.registry_pull(state, con, q, limit=2, with_administrators=False)
     assert report.new_companies == 2 and report.observations == 0
     assert report.unconfirmed == ["ACTIVITY_CODE"]
 
@@ -284,7 +285,7 @@ async def test_pull_limit_dry_run_and_gate(state, con):
 async def test_catch_all_through_the_registry(state, con):
     q = registry.resolve(con, classes=onrc.parse_classes("kinetoterapeut"),
                          counties=["Brașov"])
-    report = await registry.pull(state, con, q)
+    report = await runs.registry_pull(state, con, q)
     assert report.catch_all_only == 1
     assert (await state.get_company_by_cui("90000104")).industry == "Physiotherapy"
 
@@ -305,7 +306,7 @@ async def test_pull_is_quick_per_company(state, tmp_path):
     registry.build(raw, DATASET, path)
     con = registry.connect(path)
     started = time.monotonic()
-    report = await registry.pull(state, con, registry.resolve(con, "8623"))
+    report = await runs.registry_pull(state, con, registry.resolve(con, "8623"))
     per_company = (time.monotonic() - started) / 600
     assert report.new_companies == 600
     assert per_company < 0.010, per_company
@@ -461,7 +462,7 @@ async def test_a_failed_batch_takes_its_counts_with_it(state, con, monkeypatch):
     async def broken(self, *a, **k):
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(CompanyBatch, "set_company_activities", broken)
-    report = await registry.pull(state, con, registry.resolve(con, "dentist BV"))
+    report = await runs.registry_pull(state, con, registry.resolve(con, "dentist BV"))
     assert report.errors
     assert (report.new_companies, report.administrators, report.observations) == (0, 0, 0)
     with sqlite3.connect(state.db_path) as db:

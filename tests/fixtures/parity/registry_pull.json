@@ -1,0 +1,586 @@
+{
+ "companies": [
+  {
+   "address": "Str. Exemplului 12, 500123",
+   "company_size": "",
+   "created_at": true,
+   "cui": "90000017",
+   "description": "",
+   "domain": "",
+   "external_id": "",
+   "id": "C1",
+   "industry": "Dental practice",
+   "location": "Brașov, Romania",
+   "merged_into": "",
+   "name": "Clinica Zâmbet",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "discover:osm",
+   "source_url": "",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": "https://zambet-exemplu.example.ro"
+  },
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "",
+   "description": "",
+   "domain": "zambet-exemplu.example.ro",
+   "external_id": "",
+   "id": "C2",
+   "industry": "",
+   "location": "",
+   "merged_into": "",
+   "name": "Alt Zâmbet",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "",
+   "source_url": "",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  },
+  {
+   "address": "Str. Morii 3",
+   "company_size": "",
+   "created_at": true,
+   "cui": "90000025",
+   "description": "",
+   "domain": "",
+   "external_id": "onrc:J2025000200088",
+   "id": "C3",
+   "industry": "Dental practice",
+   "location": "Cristian, Brașov, Romania",
+   "merged_into": "",
+   "name": "DINTE TEST SRL",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "registry:onrc",
+   "source_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  },
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "",
+   "description": "",
+   "domain": "",
+   "external_id": "onrc:F08/800/2018",
+   "id": "C4",
+   "industry": "Dental practice",
+   "location": "Brașov, Romania",
+   "merged_into": "",
+   "name": "TESTESCU ANA PERSOANĂ FIZICĂ AUTORIZATĂ",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "registry:onrc",
+   "source_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  },
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "90000112",
+   "description": "",
+   "domain": "",
+   "external_id": "onrc:J08/990/2019",
+   "id": "C5",
+   "industry": "Other specialised retail (incl. opticians)",
+   "location": "Brașov, Romania",
+   "merged_into": "",
+   "name": "DENTIST DOAR NUME SRL",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "registry:onrc",
+   "source_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  },
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "90000104",
+   "description": "",
+   "domain": "",
+   "external_id": "onrc:J08/920/2012",
+   "id": "C6",
+   "industry": "Other human health activities (labs, imaging, physio, psychologists)",
+   "location": "Brașov, Romania",
+   "merged_into": "",
+   "name": "RECUPERARE EXEMPLU SRL",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "registry:onrc",
+   "source_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  },
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "90000082",
+   "description": "",
+   "domain": "",
+   "external_id": "onrc:J08/900/2011",
+   "id": "C7",
+   "industry": "Other human health activities (labs, imaging, physio, psychologists)",
+   "location": "Brașov, Romania",
+   "merged_into": "",
+   "name": "SANATATE GENERALA EXEMPLU SRL",
+   "notes": "",
+   "phone": "",
+   "profile_checked_at": false,
+   "prospects_checked_at": false,
+   "signals_json": "[]",
+   "source": "registry:onrc",
+   "source_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  }
+ ],
+ "company_activities": [
+  {
+   "code": "8623",
+   "company_id": "C3",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 3
+  },
+  {
+   "code": "8623",
+   "company_id": "C4",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  },
+  {
+   "code": "8622",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  },
+  {
+   "code": "8623",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  },
+  {
+   "code": "4778",
+   "company_id": "C5",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  },
+  {
+   "code": "8690",
+   "company_id": "C6",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  },
+  {
+   "code": "8695",
+   "company_id": "C6",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 3
+  },
+  {
+   "code": "8690",
+   "company_id": "C7",
+   "confidence": 1.0,
+   "source": "registry",
+   "version": 2
+  }
+ ],
+ "company_ids": [
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "cui",
+   "source": "discover:osm",
+   "value": "90000017"
+  },
+  {
+   "company_id": "C2",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "domain",
+   "source": "",
+   "value": "zambet-exemplu.example.ro"
+  },
+  {
+   "company_id": "C3",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "cui",
+   "source": "registry:onrc",
+   "value": "90000025"
+  },
+  {
+   "company_id": "C3",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:J2025000200088"
+  },
+  {
+   "company_id": "C3",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "J2025000200088"
+  },
+  {
+   "company_id": "C3",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "dinte test@cristian"
+  },
+  {
+   "company_id": "C4",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:F08/800/2018"
+  },
+  {
+   "company_id": "C4",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "F08/800/2018"
+  },
+  {
+   "company_id": "C4",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "testescu ana persoana fizica autorizata@brasov"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "discover:osm",
+   "value": "clinica zambet@brasov"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:J08/100/2010"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "J08/100/2010"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "zambet exemplu@brasov"
+  },
+  {
+   "company_id": "C5",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "cui",
+   "source": "registry:onrc",
+   "value": "90000112"
+  },
+  {
+   "company_id": "C5",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:J08/990/2019"
+  },
+  {
+   "company_id": "C5",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "J08/990/2019"
+  },
+  {
+   "company_id": "C5",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "dentist doar nume@brasov"
+  },
+  {
+   "company_id": "C6",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "cui",
+   "source": "registry:onrc",
+   "value": "90000104"
+  },
+  {
+   "company_id": "C6",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:J08/920/2012"
+  },
+  {
+   "company_id": "C6",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "J08/920/2012"
+  },
+  {
+   "company_id": "C6",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "recuperare exemplu@brasov"
+  },
+  {
+   "company_id": "C7",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "cui",
+   "source": "registry:onrc",
+   "value": "90000082"
+  },
+  {
+   "company_id": "C7",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "external",
+   "source": "registry:onrc",
+   "value": "onrc:J08/900/2011"
+  },
+  {
+   "company_id": "C7",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "reg",
+   "source": "registry:onrc",
+   "value": "J08/900/2011"
+  },
+  {
+   "company_id": "C7",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "registry:onrc",
+   "value": "sanatate generala exemplu@brasov"
+  }
+ ],
+ "company_merge_moves": [],
+ "company_merges": [],
+ "email_patterns": [],
+ "match_candidates": [],
+ "observations": [
+  {
+   "collector": "registry",
+   "company_id": "C3",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "ACTIVITY_CODE",
+   "value_num": null,
+   "value_text": "8623/3"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C4",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "ACTIVITY_CODE",
+   "value_num": null,
+   "value_text": "8623/2"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "ACTIVITY_CODE",
+   "value_num": null,
+   "value_text": "8623/2"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "CONTACT_FOUND",
+   "value_num": null,
+   "value_text": "Maria Testescu — Administrator"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "DECISION_MAKER_TITLE",
+   "value_num": null,
+   "value_text": "Maria Testescu — Administrator"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "CONTACT_FOUND",
+   "value_num": null,
+   "value_text": "Andrei-Mihai Doi — Administrator"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "DECISION_MAKER_TITLE",
+   "value_num": null,
+   "value_text": "Andrei-Mihai Doi — Administrator"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C6",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R3",
+   "signal_code": "ACTIVITY_CODE",
+   "value_num": null,
+   "value_text": "8690/2"
+  },
+  {
+   "collector": "registry",
+   "company_id": "C7",
+   "confidence": 1.0,
+   "evidence_url": "https://data.gov.ro/dataset/firme-01-10-2026",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R3",
+   "signal_code": "ACTIVITY_CODE",
+   "value_num": null,
+   "value_text": "8690/2"
+  }
+ ],
+ "prospects": [],
+ "runs": [
+  {
+   "cost_usd": 0.0,
+   "ended_at": true,
+   "error": "",
+   "id": "R1",
+   "params_json": "{\"dataset\": \"firme-01-10-2026\", \"source\": \"registry\", \"match\": \"({name locality county} : \\\"dentist\\\"* OR tags : (\\\"c8623r2\\\" OR \\\"c8623r3\\\")) AND tags : (\\\"jbv\\\") AND tags : activ\", \"area\": \"\", \"classes\": [\"8623 Rev.2/3\"], \"limit\": null, \"administrators\": true}",
+   "provider": "onrc",
+   "records": 4,
+   "stage": "import",
+   "started_at": true,
+   "status": "completed"
+  },
+  {
+   "cost_usd": 0.0,
+   "ended_at": true,
+   "error": "",
+   "id": "R2",
+   "params_json": "{\"dataset\": \"firme-01-10-2026\", \"source\": \"registry\", \"match\": \"tags : (\\\"c8623r3\\\" OR \\\"c8623r2\\\") AND tags : (\\\"jbv\\\") AND tags : activ\", \"area\": \"\", \"classes\": [\"8623 Rev.2/3\"], \"limit\": null, \"administrators\": true}",
+   "provider": "onrc",
+   "records": 3,
+   "stage": "import",
+   "started_at": true,
+   "status": "completed"
+  },
+  {
+   "cost_usd": 0.0,
+   "ended_at": true,
+   "error": "",
+   "id": "R3",
+   "params_json": "{\"dataset\": \"firme-01-10-2026\", \"source\": \"registry\", \"match\": \"tags : (\\\"c8690r2\\\") AND tags : activ\", \"area\": \"\", \"classes\": [\"8690 Rev.2\"], \"limit\": null, \"administrators\": false}",
+   "provider": "onrc",
+   "records": 2,
+   "stage": "import",
+   "started_at": true,
+   "status": "completed"
+  }
+ ],
+ "settings": []
+}

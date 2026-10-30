@@ -1,0 +1,171 @@
+{
+ "companies": [
+  {
+   "address": "",
+   "company_size": "",
+   "created_at": true,
+   "cui": "",
+   "description": "",
+   "domain": "brightpathdental.example",
+   "external_id": "",
+   "id": "C1",
+   "industry": "",
+   "location": "Denver, CO",
+   "merged_into": "",
+   "name": "Brightpath Dental",
+   "notes": "",
+   "phone": "+1 303-555-0142",
+   "profile_checked_at": false,
+   "prospects_checked_at": true,
+   "signals_json": "[]",
+   "source": "discover:osm",
+   "source_url": "",
+   "tech_stack_json": "[]",
+   "updated_at": true,
+   "website": ""
+  }
+ ],
+ "company_activities": [],
+ "company_ids": [
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "domain",
+   "source": "discover:osm",
+   "value": "brightpathdental.example"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "name",
+   "source": "discover:osm",
+   "value": "brightpath dental@denver"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "phone",
+   "source": "discover:osm",
+   "value": "+13035550142"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 0.9,
+   "created_at": true,
+   "kind": "phone",
+   "source": "people",
+   "value": "+13035550177"
+  }
+ ],
+ "company_merge_moves": [],
+ "company_merges": [],
+ "email_patterns": [
+  {
+   "confidence": 0.9,
+   "domain": "brightpathdental.example",
+   "is_catch_all": -1,
+   "mx_type": "other",
+   "pattern": "{fi}{l}",
+   "source": "known_email",
+   "updated_at": true
+  }
+ ],
+ "match_candidates": [],
+ "observations": [
+  {
+   "collector": "people",
+   "company_id": "C1",
+   "confidence": 0.9,
+   "evidence_url": "https://brightpathdental.example/team",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "",
+   "signal_code": "LIKELY_OWNER",
+   "value_num": 1.0,
+   "value_text": "Nora Ellison — Owner & President: Nora Ellison — Owner & President"
+  },
+  {
+   "collector": "people",
+   "company_id": "C1",
+   "confidence": 1.0,
+   "evidence_url": "https://brightpathdental.example",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "",
+   "signal_code": "PHONE_NUMBER",
+   "value_num": null,
+   "value_text": "+13035550142"
+  },
+  {
+   "collector": "people",
+   "company_id": "C1",
+   "confidence": 0.9,
+   "evidence_url": "https://brightpathdental.example/contact",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "",
+   "signal_code": "PHONE_NUMBER",
+   "value_num": null,
+   "value_text": "+13035550177"
+  }
+ ],
+ "prospects": [
+  {
+   "company": "Brightpath Dental",
+   "company_id": "C1",
+   "company_size": "",
+   "created_at": true,
+   "department": "",
+   "email": "nellison@brightpathdental.example",
+   "email_status": "verified",
+   "email_verified": 1,
+   "first_name": "Nora",
+   "id": "P1",
+   "industry": "SaaS",
+   "last_name": "Ellison",
+   "linkedin_url": "",
+   "personalization_notes": "",
+   "phone": "",
+   "phone_verified": 0,
+   "score": 0,
+   "seniority": "c_suite",
+   "source": "known_company_backfill",
+   "source_url": "https://brightpathdental.example/team",
+   "status": "new",
+   "timezone": "",
+   "title": "Owner & President",
+   "updated_at": true
+  },
+  {
+   "company": "Brightpath Dental",
+   "company_id": "C1",
+   "company_size": "",
+   "created_at": true,
+   "department": "",
+   "email": "iquist@brightpathdental.example",
+   "email_status": "invalid",
+   "email_verified": 0,
+   "first_name": "Ivo",
+   "id": "P2",
+   "industry": "SaaS",
+   "last_name": "Quist",
+   "linkedin_url": "",
+   "personalization_notes": "",
+   "phone": "",
+   "phone_verified": 0,
+   "score": 0,
+   "seniority": "manager",
+   "source": "known_company_backfill",
+   "source_url": "https://brightpathdental.example/team",
+   "status": "new",
+   "timezone": "",
+   "title": "Practice Manager",
+   "updated_at": true
+  }
+ ],
+ "runs": [],
+ "settings": []
+}

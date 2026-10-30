@@ -27,9 +27,10 @@ over the old one, so a reader never sees a half-loaded registry.
 ``search()`` answers words the way harvey search does (every word must
 match, accent-insensitive, prefixes, a 4-digit code exact, -word excludes),
 with activity words resolved to CAEN classes first: "dentist" finds firms
-authorised for dental practice, whatever they are called. ``pull()`` copies
-chosen firms into the working database, under the same identity, fill-gaps
-and confirmation rules as import-onrc (onrc.save_firms).
+authorised for dental practice, whatever they are called. ``search_draft()``
+reads the firms a query matches as the onrc module's draft; core copies
+them into the working database (harvey/modules/runs.py, registry_pull),
+under the same identity, fill-gaps and confirmation rules as any source.
 """
 
 from __future__ import annotations
@@ -517,7 +518,7 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
     ``classes`` (code, version or None), ``counties`` (registry spelling)
     and ``localities`` are filters on top, as import-onrc gives them.
     Operating firms only, unless ``all_statuses``."""
-    from harvey.state import _SEARCH_STOPWORDS, _fold_words
+    from harvey.words import SEARCH_STOPWORDS as _SEARCH_STOPWORDS, fold_words as _fold_words
 
     q = Query(explicit_classes=list(classes or []))
     text = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", words or "")
@@ -796,11 +797,11 @@ def _status_names() -> dict[str, str]:
     return _STATUS_NAMES
 
 
-# ── Pulling chosen firms into the working database ──
+# ── Reading chosen firms for the working database ──
 
 def firms_for_pull(con, ids: list[int], with_administrators: bool = True):
     """(Firms, reg -> classes, reg -> administrators) for these ids, in the
-    shapes onrc.save_firms takes."""
+    shapes onrc.firms_draft takes."""
     firms, codes, people = [], {}, {}
     for start in range(0, len(ids), 900):
         chunk = ids[start:start + 900]
@@ -831,25 +832,16 @@ def dataset_of(con) -> onrc.Dataset:
     return onrc.Dataset(meta.get("dataset", ""), meta.get("date", ""), {})
 
 
-async def pull(state, con, q: Query, *, limit: int | None = None,
-               with_administrators: bool = True, dry_run: bool = False,
-               do_not_contact: list[str] | None = None, progress=None,
-               area: str = "") -> onrc.ImportReport:
-    """Copy the firms a resolved query matches (the first ``limit``, best
-    first) into the working database with onrc.save_firms: same identity,
-    fill-gaps and confirmation rules as import-onrc. ACTIVITY_CODE is
-    recorded only for the classes the query named."""
-    dataset = dataset_of(con)
-    report = onrc.ImportReport(dataset=dataset.name, dry_run=dry_run)
-    report.classes = onrc.class_labels(q.classes)
+def search_draft(con, q: Query, *, limit: int | None = None,
+                 with_administrators: bool = True):
+    """The firms a resolved query matches (the first ``limit``, best first)
+    as a Draft (onrc.firms_draft): ``counts["matched"]`` how many,
+    ``values["dataset"]`` the registry's dataset."""
     ids = matching_ids(con, q, limit) if q.match else []
-    report.authorised = report.active = report.in_area = len(ids)
     firms, codes, people = firms_for_pull(con, ids, with_administrators)
-    return await onrc.save_firms(
-        state, firms, dataset, report, codes=codes, people=people, classes=q.classes,
-        with_administrators=with_administrators, dry_run=dry_run,
-        do_not_contact=do_not_contact, progress=progress,
-        run_params={"dataset": dataset.name, "source": "registry",
-                    "match": q.match[:500], "area": area,
-                    "classes": report.classes or ["any"], "limit": limit,
-                    "administrators": with_administrators})
+    dataset = dataset_of(con)
+    draft = onrc.firms_draft(firms, dataset, codes=codes, people=people, classes=q.classes,
+                             with_administrators=with_administrators)
+    draft.counts["matched"] = len(ids)
+    draft.values["dataset"] = dataset
+    return draft

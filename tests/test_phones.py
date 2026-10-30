@@ -20,6 +20,7 @@ from harvey.collectors.phones import (
 from harvey.collectors.profile import ProfileCollector
 from harvey.export import COMPANY_CSV_COLUMNS, collect_companies, export_companies_csv
 from harvey.models.company import Company
+from harvey.modules import runs
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
@@ -302,9 +303,8 @@ async def _profile(state, confirmed, companies, monkeypatch):
 
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
     monkeypatch.setattr(ProfileCollector, "_first_present", fake_first)
-    monkeypatch.setattr("harvey.collectors.profile.asyncio.sleep", no_sleep)
-    async with ProfileCollector(state, confirmed) as c:
-        return await c.run(companies)
+    monkeypatch.setattr("harvey.modules.runs.asyncio.sleep", no_sleep)
+    return await runs.profile(state, companies, confirmed)
 
 
 @pytest.mark.asyncio

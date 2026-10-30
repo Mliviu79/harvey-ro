@@ -91,6 +91,9 @@ class Manifest:
     requires: tuple[str, ...] = ()
     default_enabled: bool = False
     entry: str = ""
+    # The existing files the module's capabilities run (dotted paths): what
+    # the contract tests hold to the module rules.
+    wraps: tuple[str, ...] = ()
     secrets: tuple[str, ...] = ()
     terms_note: str = ""
     cost: dict = field(default_factory=dict)
@@ -315,6 +318,11 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
     elif entry and (not isinstance(entry, str) or not _ENTRY.match(entry)):
         problems.append(f"{where}: entry {entry!r} must be a dotted path inside "
                         f"the harvey package (harvey.something)")
+    wraps = _str_list(raw.get("wraps"), "wraps", where, problems)
+    for path in wraps:
+        if not _ENTRY.match(path):
+            problems.append(f"{where}: wraps {path!r} must be a dotted path inside "
+                            f"the harvey package (harvey.something)")
     if data_only:
         code = _code_files(path.parent)
         if code:
@@ -348,6 +356,7 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         requires=_str_list(raw.get("requires"), "requires", where, problems),
         default_enabled=default is True,
         entry=entry if isinstance(entry, str) else "",
+        wraps=wraps,
         secrets=_str_list(raw.get("secrets"), "secrets", where, problems),
         terms_note=terms if isinstance(terms, str) else "",
         cost=_check_cost(raw.get("cost"), where, problems),

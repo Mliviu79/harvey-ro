@@ -15,6 +15,7 @@ from harvey import pipeline as P
 from harvey.collectors import discover as D
 from harvey.config import load_config
 from harvey.models import Company
+from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -126,13 +127,13 @@ def chain(monkeypatch):
                     collector="profile", value_text="wordpress")
             return len(companies), "run-x"
 
-        monkeypatch.setattr("harvey.collectors.profile.profile_companies",
+        monkeypatch.setattr("harvey.modules.runs.profile_companies",
                             fake_profile)
         return seen
 
     async def offline(state, city, radius_km=40, client=None):
         return ""
-    monkeypatch.setattr(D, "geocode_city", offline)
+    monkeypatch.setattr(runs, "geocode_city", offline)
     return install
 
 
@@ -202,7 +203,7 @@ async def test_a_failing_profile_stage_does_not_lose_the_discovery(
 
     async def boom(state, companies, **_):
         raise RuntimeError("network gone")
-    monkeypatch.setattr("harvey.collectors.profile.profile_companies", boom)
+    monkeypatch.setattr("harvey.modules.runs.profile_companies", boom)
 
     report = await P.run_prospecting(state, config, "fake",
                                      [D.DiscoveryQuery(term="roofer")])

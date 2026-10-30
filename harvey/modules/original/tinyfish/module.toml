@@ -9,7 +9,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = true
-entry = "harvey.collectors.discover.TinyFish"
+entry = "harvey.modules.original.tinyfish.capabilities"
+wraps = ["harvey.collectors.discover"]
 secrets = ["TINYFISH_API_KEY"]
 
 [cost]
@@ -27,5 +28,5 @@ id = "web_search"
 op = "query"
 provider = "tinyfish"
 inputs = [["query", "area"], ["query"]]
-outputs = { records = "companies", ids = ["domain"], facts = ["FOUND_IN_SERP"] }
+outputs = { records = "companies", ids = ["domain"], facts = ["FOUND_IN_SERP", "NO_WEBSITE"] }
 cost = { usd = 0.0, per = "search" }

@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import harvey.agents.scout as scout_mod
 import harvey.integrations.email_finder as ef
 from harvey.agents.scout import Scout
 from harvey.agents.sender import Sender
@@ -62,7 +61,7 @@ async def test_published_address_grading(monkeypatch, graded, expected):
     async def mx(domain):
         return "smtp.google.com"
 
-    async def check(email, mx_type, env, state=None):
+    async def check(email, mx_type, env, enabled=None):
         return graded, graded == "risky"
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
@@ -150,10 +149,10 @@ async def test_no_usable_address_means_no_inbox():
 
 @pytest.mark.asyncio
 async def test_inbox_prospect_carries_its_verification(monkeypatch):
-    async def graded(email, env=None, state=None):
+    async def graded(email, env=None, enabled=None):
         return "verified"
 
-    monkeypatch.setattr(scout_mod, "verify_published_address", graded)
+    monkeypatch.setattr(ef, "verify_published_address", graded)
     p = await make_scout(PAGES)._company_inbox_prospect("c1", "acme.com", "Acme Roofing", "Roofing")
     assert p.email == "office@acme.com" and p.email_status == "verified"
     assert p.is_company_inbox and p.company_id == "c1"

@@ -10,7 +10,8 @@ api = 1
 markets = []
 requires = []
 default_enabled = false
-entry = "harvey.agents.scout.Scout"
+entry = "harvey.modules.original.web_search_scrape.capabilities"
+wraps = ["harvey.collectors.web_search"]
 secrets = []
 terms_note = "Reads search engines' and directories' result pages without an API. DuckDuckGo, Bing, Google, G2 and Clutch forbid automated access in their terms."
 

@@ -13,11 +13,12 @@ Two shapes of discovery, and the difference matters:
   businesses visible enough to be trying and not winning, which is the most
   useful prospecting signal there is.
 
-Cost discipline lives here, not in the database. A table can only record spend
-after the fact; only the collector can decline to spend it. Every run
-estimates first, checks a budget between batches, reads the kill switch, and
-flushes observations per batch — a long run that dies must not lose what it
-already learned.
+Cost discipline lives in the run (harvey/modules/runs.py), not the database.
+A table can only record spend after the fact; only the run can decline to
+spend it. Every run estimates first, checks a budget between batches, reads
+the kill switch, and flushes observations per batch — a long run that dies
+must not lose what it already learned. This file is the search modules'
+code: each provider answers one search as a Draft, and writes nothing.
 """
 
 import asyncio
@@ -28,14 +29,13 @@ import math
 import re
 import unicodedata
 from html import unescape
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from urllib.parse import urlparse
 
 import httpx
 
-from harvey import resolver
-from harvey.models import Company
+from harvey.modules.api import Draft, Fact, Record
 
 logger = logging.getLogger("harvey.collectors.discover")
 
@@ -282,19 +282,10 @@ NOMINATIM = "https://nominatim.openstreetmap.org/search"
 GEOCODE_UA = "Harvey/0.1 (open-source sales agent; github.com/ethanplusai/harvey)"
 
 
-async def geocode_city(state, city: str, radius_km: int = 40,
-                       client: httpx.AsyncClient | None = None) -> str:
-    """"Denver, CO" -> "39.7392,-104.9903,40". Cached permanently."""
-    if not city:
-        return ""
-    cache_key = f"geo:{city.strip().lower()}"
-    cached = await state.get_setting(cache_key)
-    if cached:
-        # A previous miss is cached as "-" so we don't re-ask every run.
-        return "" if cached == "-" else f"{cached},{radius_km}"
-
-    owned = client is None
-    client = client or httpx.AsyncClient(timeout=TIMEOUT)
+async def nominatim_point(city: str, client: httpx.AsyncClient) -> str | None:
+    """"Denver, CO" -> "39.7392,-104.9903"; "" when Nominatim knows no such
+    place, None when it couldn't be asked. Caching the answer is the
+    caller's (it is kept for good: harvey/modules/runs.py)."""
     try:
         r = await client.get(
             NOMINATIM,
@@ -305,42 +296,11 @@ async def geocode_city(state, city: str, radius_km: int = 40,
         hits = r.json()
     except Exception as e:
         logger.warning("geocode failed for %r: %s", city, e)
-        return ""
-    finally:
-        if owned:
-            await client.aclose()
-
+        return None
     if not hits:
-        await state.set_setting(cache_key, "-")
         logger.warning("geocode: no match for %r", city)
         return ""
-
-    point = f"{float(hits[0]['lat']):.4f},{float(hits[0]['lon']):.4f}"
-    await state.set_setting(cache_key, point)
-    return f"{point},{radius_km}"
-
-
-async def resolve_coordinates(state, queries: list["DiscoveryQuery"],
-                              radius_km: int = 40,
-                              client: httpx.AsyncClient | None = None
-                              ) -> list["DiscoveryQuery"]:
-    """Fill in coordinates for any query that lacks them.
-
-    Configured ``icp.geo_coordinates`` always wins; this only covers what the
-    user did not spell out. Distinct cities are geocoded once each, however
-    many queries share them.
-    """
-    needed = {q.location for q in queries if q.location and not q.coordinate}
-    points: dict[str, str] = {}
-    for i, city in enumerate(sorted(needed)):
-        if i:
-            await asyncio.sleep(1.1)     # Nominatim: max 1 request/second
-        points[city] = await geocode_city(state, city, radius_km, client)
-
-    for query in queries:
-        if not query.coordinate:
-            query.coordinate = points.get(query.location, "")
-    return queries
+    return f"{float(hits[0]['lat']):.4f},{float(hits[0]['lon']):.4f}"
 
 
 # ── The record every provider returns ─────────────────────────────────
@@ -1710,250 +1670,6 @@ def estimate_cost(provider_key: str, queries: list[DiscoveryQuery]) -> float:
     return provider.estimate(queries) if provider else 0.0
 
 
-async def run_discovery(
-    state,
-    config,
-    provider_key: str = DEFAULT_PROVIDER,
-    queries: list[DiscoveryQuery] | None = None,
-    max_spend: float = 1.0,
-    dry_run: bool = False,
-) -> DiscoveryReport:
-    """Discover businesses and record what was learned about them.
-
-    ``dry_run`` estimates and returns without calling anything. Run it first,
-    every time: the first small trial is what exposes the data-quality
-    problems that would otherwise poison every market you scale to.
-    """
-    from harvey.config import live_do_not_contact, load_env
-    from harvey.gate import do_not_contact_domain_match
-    from harvey.modules import switches
-    from harvey.signals import sync_vocabulary
-
-    provider = PROVIDERS.get(provider_key)
-    if provider is None:
-        raise ValueError(f"unknown discovery provider: {provider_key!r}")
-    # A source or preset whose module is off is refused (ModuleOff), never
-    # run or skipped quietly.
-    for preset in sorted({q.preset for q in queries or []} - {""}) or [""]:
-        await switches.require_discovery(state, provider_key, preset)
-
-    queries = queries or build_queries(config)
-    if provider.needs_coordinates:
-        queries = await resolve_coordinates(state, queries)
-    report = DiscoveryReport(provider=provider_key, queries=len(queries))
-    report.estimated_cost = provider.estimate(queries)
-
-    if dry_run:
-        return report
-
-    env = load_env().model_dump()
-    missing = provider.missing_keys(env)
-    if missing:
-        names = ", ".join(k.upper() for k in missing)
-        report.errors.append(
-            f"{provider.label} is not ready: {names} is empty or still the "
-            f"template placeholder in .env")
-        report.stopped = "not configured"
-        return report
-
-    if report.estimated_cost > max_spend:
-        report.errors.append(
-            f"estimated ${report.estimated_cost:.2f} exceeds the ${max_spend:.2f} "
-            f"cap — raise the cap or run fewer queries")
-        report.stopped = "over budget"
-        return report
-
-    await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    if not confirmed:
-        report.errors.append(
-            "no signals confirmed — confirm signals first (dashboard → Signals, "
-            "or `harvey signals --confirm free`) or discovery has nothing to record")
-        report.stopped = "no confirmed signals"
-        return report
-
-    report.run_id = await state.start_run(
-        "discover", provider=provider_key,
-        params={"queries": len(queries), "estimate": report.estimated_cost},
-    )
-
-    # Resolved once per run, not per result: the list may live in a file, and
-    # re-reading it a few hundred times would turn a config lookup into I/O
-    # inside the hot loop.
-    do_not_contact = live_do_not_contact(config)
-
-    # Each business's base facts are written once per run; its ranks once per
-    # (business, keyword), and again only if a repeat search ranks it better.
-    seen: set[str] = set()
-    best_ranks: dict[tuple[str, str], tuple] = {}
-    company_ids: dict[str, str] = {}
-    ranked_in_run: dict[tuple[str, str], set[str]] = {}
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-            for i, query in enumerate(queries):
-                # The kill switch is read between batches, not once at the
-                # top: a long run has to be stoppable while it is running.
-                if await state.get_setting("discovery_paused"):
-                    report.stopped = "paused"
-                    break
-                if report.actual_cost > max_spend:
-                    report.stopped = "budget reached"
-                    break
-                if i and provider.key == "osm":
-                    await asyncio.sleep(OpenStreetMap.MIN_INTERVAL)
-
-                try:
-                    report.queries_ran += 1
-                    provider.last_cost = 0.0
-                    provider.last_error = provider.stop_reason = ""
-                    provider.complete = True
-                    provider.remaining_budget = max(0.0, max_spend - report.actual_cost)
-                    found = await provider.fetch(client, env, query)
-                    report.queries_succeeded += 1
-                except ProviderExhausted as e:
-                    logger.warning("discover: %s stopped: %s", provider_key, e)
-                    report.stopped = str(e)
-                    break
-                except Exception as e:
-                    # A failure is an observation about the run, not a reason
-                    # to lose the queries that already succeeded.
-                    logger.warning("discover: %s failed on %r: %s",
-                                   provider_key, query.keyword(), e)
-                    report.errors.append(f"{query.keyword()}: {e}")
-                    continue
-                finally:
-                    report.actual_cost += provider.last_cost
-
-                if provider.last_error:
-                    report.errors.append(f"{query.keyword()}: {provider.last_error}")
-                report.found += len(found)
-                batch = []
-                for biz in found:
-                    if query.preset == "hiring" and biz.domain and not is_junk(biz.domain):
-                        # Judged on the host as found first: jobs.lever.co
-                        # stripped would be lever.co, a vendor, not junk.
-                        biz.domain = company_host(biz.domain)
-                    if is_junk(biz.domain, biz.raw_title or biz.name):
-                        report.junk += 1
-                        continue
-                    # Before the upsert, so a forbidden company never becomes a
-                    # row and never reaches profiling. Checking it at send time
-                    # alone still lets one through discovery, where it costs
-                    # credits to enrich and sits in every cohort until somebody
-                    # notices it by eye.
-                    if do_not_contact_domain_match(biz.domain, do_not_contact):
-                        report.excluded += 1
-                        continue
-                    ident = biz.identity()
-                    if not ident:
-                        continue
-                    first = ident not in seen
-                    if first:
-                        seen.add(ident)
-                        company_id, is_new = await _upsert(state, biz, query)
-                        if is_new:
-                            report.new_companies += 1
-                        else:
-                            report.known_companies += 1
-                        company_ids[ident] = company_id
-                    company_id = company_ids[ident]
-                    phrase = biz.keyword or query.keyword()
-                    for code, value in zip(RANK_CODES, _rank_tuple(biz)):
-                        if value is not None:
-                            ranked_in_run.setdefault((code, phrase), set()).add(company_id)
-
-                    rank_key = (ident, phrase.lower())
-                    ranks = _rank_tuple(biz)
-                    previous = best_ranks.get(rank_key)
-                    improved = previous is None or any(
-                        new is not None and (old is None or new < old)
-                        for new, old in zip(ranks, previous))
-                    if not first and not improved:
-                        continue
-                    if previous is not None:
-                        # A repeat of the same search: record only the ranks
-                        # it improved, so a worse one never becomes "latest".
-                        biz = replace(biz, **{
-                            name: (new if new is not None and (old is None or new < old)
-                                   else None)
-                            for name, new, old in zip(RANK_FIELDS, ranks, previous)})
-                    if improved:
-                        best_ranks[rank_key] = tuple(
-                            _best(old, new) for new, old in
-                            zip(ranks, previous or (None,) * len(ranks)))
-                    batch.extend(_observations(biz, company_id, confirmed,
-                                               report.run_id, query=query,
-                                               ranks_only=not first))
-
-                # A business this phrase ranked before, and that no search for
-                # it this run has found, is no longer ranked (within depth) or
-                # no longer in the pack. Say so, so the latest reading is true.
-                phrase = query.keyword()
-                for code in provider.rank_codes if provider.complete else ():
-                    if code not in confirmed:
-                        continue
-                    found_now = ranked_in_run.setdefault((code, phrase), set())
-                    for gone in await state.ranked_company_ids(code, phrase) - found_now:
-                        batch.append({
-                            "company_id": gone, "signal_code": code,
-                            "collector": "discover", "value_num": 0.0,
-                            "value_text": phrase, "confidence": 1.0,
-                            "evidence_url": "", "run_id": report.run_id,
-                        })
-
-                # Flush every batch. The observations are the asset; buffering
-                # them until some threshold means a run that dies loses them.
-                if batch:
-                    report.observations += await state.add_observations(
-                        batch, run_id=report.run_id)
-                if provider.stop_reason:
-                    report.stopped = provider.stop_reason
-                    break
-
-        await state.finish_run(report.run_id, status="completed",
-                               records=report.new_companies + report.known_companies,
-                               cost_usd=report.actual_cost)
-    except Exception as e:
-        logger.exception("discover run failed")
-        report.errors.append(str(e))
-        await state.finish_run(report.run_id, status="failed",
-                               records=report.new_companies,
-                               cost_usd=report.actual_cost, error=str(e))
-    return report
-
-
-async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, bool]:
-    """Record the business, returning (id, was_new). The resolver decides
-    whether it is a company on file: by its listing id or domain as
-    before, and now also by phone and by name in the same town, so a map
-    hit for a registry firm without a website joins that firm (or, when
-    less sure, waits on the review list) instead of becoming a second one.
-    A known company gets the gaps in its record filled; nothing it holds
-    is replaced."""
-    # A booking platform, link shortener or directory the listing gives as
-    # its website is many businesses' domain, not this one's: the website
-    # is kept, the domain (an identity) isn't.
-    domain = biz.domain if not biz.domain or resolver.usable_domain(biz.domain) else ""
-    company = Company(
-        name=biz.name,
-        domain=domain,
-        website=biz.website,
-        phone=biz.phone,
-        industry=biz.category or query.term,
-        location=biz.location or query.location,
-        source=f"discover:{biz.provider}",
-        source_url=biz.source_url,
-        external_id=biz.external_id,
-    )
-    result = await state.save_company(company, extra_ids=tuple(x for x in biz.alt_ids if x))
-    if not result.created and not result.merged_from:
-        # (An automatic merge has filled the gaps already, and logged them
-        # so an undo can take them back.)
-        await state.fill_company_fields(
-            result.company_id, phone=biz.phone, website=biz.website, domain=domain)
-    return result.company_id, result.created
-
-
 RANK_FIELDS = ("rank", "local_pack_rank", "maps_rank")
 RANK_CODES = ("SERP_RANK", "IN_LOCAL_PACK", "MAPS_RANK")      # same order
 
@@ -1962,25 +1678,30 @@ def _rank_tuple(biz: Business) -> tuple:
     return tuple(getattr(biz, name) for name in RANK_FIELDS)
 
 
-def _observations(biz: Business, company_id: str, confirmed: set[str],
-                  run_id: str, query: DiscoveryQuery | None = None,
-                  ranks_only: bool = False) -> list[dict]:
-    """Every fact this business gave us, as rows — and only the confirmed ones.
+def business_record(biz: Business, query: DiscoveryQuery | None, key: str = "") -> Record:
+    """The company a result describes. The listing's street address isn't
+    kept (a search result's is often the map pin's, not the office's)."""
+    return Record(
+        key=key or biz.identity(), name=biz.name, domain=biz.domain, website=biz.website,
+        phone=biz.phone, industry=biz.category or (query.term if query else ""),
+        location=biz.location or (query.location if query else ""),
+        source=f"discover:{biz.provider}", source_url=biz.source_url,
+        external_id=biz.external_id, alt_ids=tuple(biz.alt_ids),
+    )
 
-    Rank rows carry the search phrase in ``value_text``: "#14 for 'roofer
-    Denver, CO'" is a fact; "#14" on its own isn't. ``ranks_only`` is for a
-    business already recorded this run, found again by another search.
-    """
-    rows: list[dict] = []
+
+def business_facts(biz: Business, query: DiscoveryQuery | None = None,
+                   ranks_only: bool = False, record: str = "") -> list[Fact]:
+    """Every fact a result gives about the business, in the order they are
+    recorded. Rank facts carry the search phrase in ``value_text``: "#14
+    for 'roofer Denver, CO'" is a fact; "#14" on its own isn't.
+    ``ranks_only`` is for a business already recorded this run, found again
+    by another search."""
+    facts: list[Fact] = []
 
     def add(code, *, num=None, text="", conf=1.0):
-        if code in confirmed:
-            rows.append({
-                "company_id": company_id, "signal_code": code,
-                "collector": "discover", "value_num": num, "value_text": text,
-                "confidence": conf, "evidence_url": biz.source_url,
-                "run_id": run_id,
-            })
+        facts.append(Fact(code, value_num=num, value_text=text, confidence=conf,
+                          source_url=biz.source_url, record=record, collector="discover"))
 
     keyword = biz.keyword or (query.keyword() if query is not None else "")
     if biz.rank is not None:
@@ -1990,7 +1711,7 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
     if biz.maps_rank is not None:
         add("MAPS_RANK", num=float(biz.maps_rank), text=keyword)
     if ranks_only:
-        return rows
+        return facts
 
     add("FOUND_IN_SERP", text=biz.provider)
     # Both ways when the listing says: a cohort that excludes "no website"
@@ -2003,17 +1724,149 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
         add("REVIEW_RATING", num=float(biz.rating))
     if biz.review_count is not None:
         add("REVIEW_COUNT", num=float(biz.review_count))
-    if query is not None and query.preset == "yc":
+    return facts
+
+
+def preset_facts(query: DiscoveryQuery | None, source_url: str, record: str = "") -> list[Fact]:
+    """What a preset search's hit (found at ``source_url``) says beyond the
+    search itself."""
+    facts: list[Fact] = []
+    preset = query.preset if query is not None else ""
+    if preset == "yc":
         # The search matched "backed by Y Combinator" on a page of their own
         # site (third-party sites are filtered out above). Short of reading
         # that page ourselves, so below the homepage's own claim.
-        add("YC_BACKED", num=1.0, conf=0.7)
-    if query is not None and query.preset == "accelerator":
+        facts.append(Fact("YC_BACKED", value_num=1.0, confidence=0.7,
+                          source_url=source_url, record=record, collector="discover"))
+    if preset == "accelerator":
         # Same, for the other programs; which one isn't known until the
         # profile reads their pages. A funding hit isn't recorded: the
         # raise's date matters, so the profile reads the hit page itself.
-        add("ACCELERATOR", num=1.0, conf=0.6)
-    return rows
+        facts.append(Fact("ACCELERATOR", value_num=1.0, confidence=0.6,
+                          source_url=source_url, record=record, collector="discover"))
+    return facts
+
+
+def _observations(biz: Business, company_id: str, confirmed: set[str],
+                  run_id: str, query: DiscoveryQuery | None = None,
+                  ranks_only: bool = False) -> list[dict]:
+    """Every fact this business gave us, as observation rows, and only the
+    confirmed ones (what a run writes for its first sighting)."""
+    facts = business_facts(biz, query, ranks_only)
+    if not ranks_only:
+        facts += preset_facts(query, biz.source_url)
+    return [{"company_id": company_id, "signal_code": f.code, "collector": f.collector,
+             "value_num": f.value_num, "value_text": f.value_text, "confidence": f.confidence,
+             "evidence_url": f.source_url, "run_id": run_id}
+            for f in facts if f.code in confirmed]
+
+
+async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.AsyncClient,
+                       env: dict, remaining: float = math.inf, host=None) -> Draft:
+    """One search through one provider, as a Draft: a record per result
+    (junk dropped and counted in ``counts``, each keyed by its position),
+    the facts each result gives, and what the search really cost.
+    ``host`` rewrites a result's domain before the junk check (a preset's
+    careers.acme.com is acme.com). A failure is the draft's ``failed``,
+    with ``stop`` set when the provider can take no more this run."""
+    provider = PROVIDERS[provider_key]
+    draft = Draft()
+    provider.last_cost = 0.0
+    provider.last_error = provider.stop_reason = ""
+    provider.complete = True
+    provider.remaining_budget = remaining
+    try:
+        found = await provider.fetch(client, env, query)
+    except ProviderExhausted as e:
+        logger.warning("discover: %s stopped: %s", provider_key, e)
+        draft.failed = draft.stop = str(e)
+        draft.cost = provider.last_cost
+        return draft
+    except Exception as e:
+        # A failure is an observation about the run, not a reason to lose
+        # the queries that already succeeded.
+        logger.warning("discover: %s failed on %r: %s", provider_key, query.keyword(), e)
+        draft.failed = str(e)
+        draft.cost = provider.last_cost
+        return draft
+    draft.cost = provider.last_cost
+    if provider.last_error:
+        draft.errors.append(provider.last_error)
+    draft.stop = provider.stop_reason
+    draft.complete_codes = tuple(provider.rank_codes) if provider.complete else ()
+    draft.counts["found"] = len(found)
+    for i, biz in enumerate(found):
+        if host is not None and biz.domain and not is_junk(biz.domain):
+            # Judged on the host as found first: jobs.lever.co stripped
+            # would be lever.co, a vendor, not junk.
+            biz.domain = host(biz.domain)
+        if is_junk(biz.domain, biz.raw_title or biz.name):
+            draft.counts["junk"] = draft.counts.get("junk", 0) + 1
+            continue
+        key = str(i)
+        record = business_record(biz, query, key)
+        record.found_by = biz.keyword or query.keyword()
+        draft.records.append(record)
+        draft.facts += business_facts(biz, query, record=key)
+    return draft
+
+
+# ── Capabilities (the search modules' and the presets' code) ──
+
+
+def provider_capabilities(module_id: str, caps: dict[str, str]) -> dict:
+    """A search module's capabilities: capability id -> provider key. Each
+    takes a DiscoveryQuery (``input.query``) and searches once."""
+    from harvey.modules.api import Capability
+
+    def make(cap_id: str, key: str) -> Capability:
+        async def run(inp, ctx) -> Draft:
+            draft = await search_draft(key, inp.query, ctx.http, ctx.env,
+                                       remaining=ctx.budget.remaining)
+            return draft.stamp(module_id, cap_id)
+
+        return Capability(module_id, cap_id, run,
+                          estimate=lambda inp: PROVIDERS[key].estimate([inp.query]))
+
+    return {cap_id: make(cap_id, key) for cap_id, key in caps.items()}
+
+
+def preset_capabilities(module_id: str, caps: dict[str, str]) -> dict:
+    """A preset's capabilities: capability id -> preset key. Each runs the
+    preset's search through the search module the run chose
+    (``settings["provider"]``, its capability ``settings["searcher"]`` as
+    (module, capability)), and adds what a hit says beyond the search."""
+    from harvey.modules.api import Capability
+
+    def make(cap_id: str, preset: str) -> Capability:
+        async def run(inp, ctx) -> Draft:
+            key = ctx.settings["provider"]
+            draft = await search_draft(key, inp.query, ctx.http, ctx.env,
+                                       remaining=ctx.budget.remaining,
+                                       host=company_host if preset == "hiring" else None)
+            draft.stamp(*ctx.settings["searcher"])
+            extra = [(r.key, f) for r in draft.records
+                     for f in preset_facts(inp.query, r.source_url, r.key)]
+            # Each hit's own facts stay together, the preset's after the search's.
+            order = {r.key: i for i, r in enumerate(draft.records)}
+            facts = [(f.record, f) for f in draft.facts] + extra
+            facts.sort(key=lambda kf: order.get(kf[0], -1))
+            draft.facts = [f for _, f in facts]
+            return draft.stamp(module_id, cap_id)
+
+        return Capability(module_id, cap_id, run, estimate=preset_estimate)
+
+    return {cap_id: make(cap_id, preset) for cap_id, preset in caps.items()}
+
+
+def preset_estimate(inp) -> float:
+    """A preset search costs what the search module it runs through charges
+    (``inp.extra["provider"]``); not told which, the dearest one, so an
+    estimate never understates."""
+    provider = PROVIDERS.get(inp.extra.get("provider", ""))
+    if provider is not None:
+        return provider.estimate([inp.query])
+    return max((p.estimate([inp.query]) for p in PROVIDERS.values()), default=0.0)
 
 
 def provider_menu(env: dict | None = None, enabled: set[str] | None = None) -> list[dict]:

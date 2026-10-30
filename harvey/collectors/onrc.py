@@ -55,7 +55,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from harvey.models import Company
+from harvey.modules.api import Draft, Fact, Record
 
 logger = logging.getLogger(__name__)
 
@@ -679,8 +679,6 @@ def administrators(path: Path, regs) -> dict[str, list[tuple[str, str, str]]]:
 
 # ── The import ──
 
-PROGRESS_EVERY = 500
-
 
 @dataclass
 class ImportReport:
@@ -768,15 +766,6 @@ def _location(firm: Firm) -> str:
     return ", ".join(parts + ["Romania"])
 
 
-# Companies saved per transaction. Big enough that committing is noise,
-# small enough that an interrupted import keeps most of what it saved.
-SAVE_BATCH = 500
-# The ImportReport counts save_firms adds to as it saves.
-_REPORT_COUNTS = ("catch_all_only", "shared_domain", "excluded", "new_companies",
-                  "known_companies", "updated_companies", "administrators",
-                  "activities", "observations")
-
-
 def _class_matcher(classes):
     """A test for whether (code, version) is one of ``classes``; a class
     with version None stands for Rev.2 and Rev.3 alike."""
@@ -785,55 +774,32 @@ def _class_matcher(classes):
     return lambda pair: pair in exact or (pair[0] in either and pair[1] in (2, 3))
 
 
-async def save_firms(
-    state,
+def firms_draft(
     firms: list[Firm],
     dataset: Dataset,
-    report: ImportReport,
     *,
     codes: dict[str, list[tuple[str, int]]],
     people: dict[str, list[tuple[str, str, str]]] | None = None,
     classes: list[tuple[str, int | None]] | None = None,
-    run_params: dict | None = None,
     with_administrators: bool = True,
-    dry_run: bool = False,
-    do_not_contact: list[str] | None = None,
-    progress=None,
-) -> ImportReport:
-    """Save registry firms into the working database, SAVE_BATCH per
-    transaction. Shared by the streaming import and harvey registry pull.
+) -> Draft:
+    """Registry firms as a Draft: a record per firm (keyed by its position)
+    and the facts the registry states about it.
 
     ``codes`` holds every class each firm (by registration number) is
-    authorised for; ``classes`` the ones the request named, in its order:
-    those a firm holds are its ACTIVITY_CODE observations, and the first
-    names its industry (otherwise its first Rev.3 class does). ``people``
-    are its administrators. Companies are matched to what is on file by
-    CUI, then by registration number, never by website domain alone (a
-    domain another business holds is counted in ``shared_domain`` and left
-    off); a known one has its gaps filled, never its existing values
-    replaced, except the registered-office address, which is always
-    refreshed: the registry is the authority on it, and a re-import is how
-    a moved office reaches the record. ``dry_run`` reads everything and
-    writes nothing. Observations are written once per dataset: re-importing
-    the same dataset adds nothing, a newer one adds its readings beside the
-    old. ``progress(done, total)`` is called every PROGRESS_EVERY companies.
+    authorised for, all of them the record's activities; ``classes`` the
+    ones the request named, in its order: those a firm holds are its
+    ACTIVITY_CODE facts, and the first names its industry (otherwise its
+    first Rev.3 class does). ``people`` are its administrators (their name
+    and role, as CONTACT_FOUND and, for a decision maker,
+    DECISION_MAKER_TITLE). The website the registry gives is the firm's own
+    declaration (``declared_domain``). Each record counts its
+    ``administrators`` and whether it matched only on the catch-all class.
     """
     from harvey.caen import describe
-    from harvey.gate import do_not_contact_domain_match
-    from harvey.modules import switches
-    from harvey.signals import sync_vocabulary
 
-    await switches.require(state, "onrc", "Saving firms from the ONRC registry")
     classes = list(classes or [])
-    people = people or {}
-    await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    wanted_codes = ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE") \
-        if with_administrators else ("ACTIVITY_CODE",)
-    report.unconfirmed = [c for c in wanted_codes if c not in confirmed]
-    if not with_administrators:
-        people = {}
-
+    people = (people or {}) if with_administrators else {}
     named = _class_matcher(classes)
     order = {pair: i for i, pair in enumerate(classes)}
     vague = CATCH_ALL if _catch_all_is_vague(classes) else None
@@ -842,131 +808,47 @@ async def save_firms(
         return (pair == vague,
                 min(order.get(pair, len(order)), order.get((pair[0], None), len(order))))
 
-    if not dry_run:
-        report.run_id = await state.start_run("import", provider="onrc",
-                                              params=run_params or {})
-    evidence = dataset.page
-
-    async def save(batch, firm: Firm):
-        if firm.domain and do_not_contact_domain_match(firm.domain, do_not_contact or []):
-            report.excluded += 1
-            return
+    evidence = getattr(dataset, "page", "")
+    draft = Draft()
+    for i, firm in enumerate(firms):
+        key = str(i)
         firm_codes = list(codes.get(firm.reg, []))
         matched = sorted({pair for pair in firm_codes if named(pair)}, key=rank) \
             if classes else []
-        if matched and matched[0] == vague:
-            report.catch_all_only += 1
         # Nothing asked for (or matched by name only): ACTIVITY_CODE records
         # only classes someone asked for (a whole county would be ~600k
         # observations), and the company's first current class names it.
         first = matched[0] if matched else _industry_class(firm_codes)
         industry = (describe(*first) or "") if first else ""
-        external = f"onrc:{firm.reg}"
-        draft = Company(
-            name=firm.name, cui=firm.cui, external_id=external,
-            website=firm.website, domain=firm.domain, industry=industry,
-            location=_location(firm), address=firm.address,
-            source=SOURCE, source_url=evidence,
-        )
-        # The resolver matches the legal identity (CUI, registration
-        # number) as before, and now also a company found elsewhere by the
-        # same name in the same town. The registry's website field is
-        # self-declared: a domain another business already holds may be a
-        # shared group site or simply wrong, so on its own it is a possible
-        # match for review, never a reason to hang these administrators and
-        # this address on that business.
-        match = await batch.match_company(draft, declared_domain=True)
-        existing = match.company_id if match.attach else None
-        domain = firm.domain
-        holder = await batch.get_company_by_domain(domain) if domain else None
-        if holder and (existing is None or holder.id != existing):
-            report.shared_domain += 1
-            domain = draft.domain = ""
-        elif holder and not match.same_record:
-            # Joining the holder by a merge: the merge brings the domain.
-            draft.domain = ""
-        if existing:
-            report.known_companies += 1
-        else:
-            report.new_companies += 1
         admins = people.get(firm.reg, [])
-        report.administrators += len(admins)
-        if dry_run:
-            return
-
-        if existing and match.same_record:
-            company_id = existing
-            changed = await batch.fill_company_fields(
-                company_id, cui=firm.cui, name=firm.name, website=firm.website,
-                domain=domain, industry=industry, location=_location(firm),
-                address=firm.address)
-            await batch.register_ids(company_id, draft, match)
-            if changed:
-                report.updated_companies += 1
-        else:
-            # New, or the same company by other evidence (saved, then merged
-            # into it, which can be undone), or a possible one for review.
-            company_id = (await batch.save_company(draft, match)).company_id
-
-        # What the company does, all of it: describes the record (like
-        # its industry), so it isn't held behind the signal gate.
-        report.activities += await batch.set_company_activities(
-            company_id, firm_codes, source=COLLECTOR)
+        record = Record(
+            key=key, name=firm.name, ids={"cui": firm.cui} if firm.cui else {},
+            external_id=f"onrc:{firm.reg}",
+            website=firm.website, domain=firm.domain, industry=industry,
+            location=_location(firm), address=firm.address, legal_form=firm.form,
+            source=SOURCE, source_url=evidence, declared_domain=True,
+            activities=firm_codes,
+            counts={"administrators": len(admins),
+                    "catch_all_only": int(bool(matched) and matched[0] == vague)},
+        )
+        draft.records.append(record)
 
         rows: dict[tuple[str, str], float] = {}     # (signal, value) -> confidence
-        if "ACTIVITY_CODE" in confirmed:
-            for pair in matched:
-                rows[("ACTIVITY_CODE", activity_value(*pair))] = \
-                    CATCH_ALL_CONFIDENCE if pair == vague else 1.0
+        for pair in matched:
+            rows[("ACTIVITY_CODE", activity_value(*pair))] = \
+                CATCH_ALL_CONFIDENCE if pair == vague else 1.0
         for first_name, last, title in admins:
             text = f"{first_name} {last} — {title}"
-            if "CONTACT_FOUND" in confirmed:
-                rows.setdefault(("CONTACT_FOUND", text), 1.0)
-            if "DECISION_MAKER_TITLE" in confirmed and \
-                    _fold(title).startswith(_DECISION_MAKERS):
+            rows.setdefault(("CONTACT_FOUND", text), 1.0)
+            if _fold(title).startswith(_DECISION_MAKERS):
                 rows.setdefault(("DECISION_MAKER_TITLE", text), 1.0)
-        if rows:
-            seen = await batch.observed(company_id, evidence)
-            fresh = [{"company_id": company_id, "signal_code": code_,
-                      "collector": COLLECTOR, "value_text": text,
-                      "confidence": confidence, "evidence_url": evidence,
-                      "run_id": report.run_id}
-                     for (code_, text), confidence in rows.items()
-                     if (code_, text) not in seen]
-            if fresh:
-                report.observations += await batch.add_observations(
-                    fresh, run_id=report.run_id)
-
-    try:
-        done = 0
-        for start in range(0, len(firms), SAVE_BATCH):
-            # A batch that fails is rolled back, so are its counts.
-            counts = {k: getattr(report, k) for k in _REPORT_COUNTS}
-            try:
-                async with state.batch() as batch:
-                    for firm in firms[start:start + SAVE_BATCH]:
-                        done += 1
-                        if progress and done % PROGRESS_EVERY == 0:
-                            progress(done, len(firms))
-                        await save(batch, firm)
-            except Exception:
-                for k, v in counts.items():
-                    setattr(report, k, v)
-                raise
-        if not dry_run:
-            await state.finish_run(report.run_id, status="completed",
-                                   records=report.new_companies + report.known_companies)
-    except Exception as e:
-        logger.exception("onrc import failed")
-        report.errors.append(str(e))
-        if not dry_run:
-            await state.finish_run(report.run_id, status="failed",
-                                   records=report.new_companies, error=str(e))
-    return report
+        draft.facts += [Fact(code_, value_text=text, confidence=confidence,
+                             source_url=evidence, record=key, collector=COLLECTOR)
+                        for (code_, text), confidence in rows.items()]
+    return draft
 
 
-async def import_registry(
-    state,
+def read_import(
     files: dict[str, Path],
     dataset: Dataset,
     *,
@@ -974,38 +856,24 @@ async def import_registry(
     classes: list[tuple[str, int | None]] | None = None,
     locality: str = "",
     active_only: bool = True,
-    dry_run: bool = False,
-    do_not_contact: list[str] | None = None,
-    with_administrators: bool = True,
-    progress=None,
-) -> ImportReport:
-    """Read the registry files and save what matches (save_firms).
+    with_people: bool = True,
+) -> tuple[list[Firm], dict, dict, ImportReport]:
+    """Read the registry files for what an import asks for: (firms, every
+    class each is authorised for, their administrators, the report so far).
 
     ``county`` and ``locality`` take comma-separated lists; no county is the
-    whole country. ``classes`` are (code, version) pairs, version None for "Rev.2 or
-    Rev.3"; their order picks which class names the company's industry
-    (Rev.2's catch-all 8690 last, when it stands in for a narrower class).
-    No classes imports every activity in the area, which then needs a
-    county or a locality (the whole country would be millions of rows).
-    Either way every class a kept company is authorised for is saved as
-    its activities, so it can be searched by any of them later
-    (``harvey search``). ``with_administrators`` False leaves the
-    representatives file unread.
+    whole country. ``classes`` are (code, version) pairs, version None for
+    "Rev.2 or Rev.3". No classes reads every activity in the area, which
+    then needs a county or a locality (the whole country would be millions
+    of rows). ``with_people`` False leaves the representatives file unread.
     """
-    from harvey.signals import sync_vocabulary
-
     classes = list(classes or [])
-    report = ImportReport(dataset=dataset.name, dry_run=dry_run)
+    report = ImportReport(dataset=dataset.name)
     report.classes = class_labels(classes)
     names = counties(county)
     if not classes and not names and not _localities(locality):
         raise ValueError("every activity needs an area: give a county or a locality "
                          "(or words or CAEN codes to search the whole country)")
-
-    await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    people_codes = {"CONTACT_FOUND", "DECISION_MAKER_TITLE"} & confirmed \
-        if with_administrators else set()
 
     # Streamed in the order that keeps the working set smallest. With an
     # activity filter: the wanted classes nationwide, their status, the
@@ -1034,17 +902,8 @@ async def import_registry(
                 have = all_codes.setdefault(reg, [])
                 have += [pair for pair in hits if pair not in have]
     people = administrators(files["people"], kept_regs) \
-        if people_codes and "people" in files else {}
-
-    return await save_firms(
-        state, firms, dataset, report, codes=all_codes, people=people,
-        classes=classes, with_administrators=with_administrators,
-        dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
-        run_params={
-            "dataset": dataset.name, "county": ", ".join(names or []) or "Romania",
-            "locality": locality,
-            "classes": report.classes or ["all activities"], "active_only": active_only,
-            "administrators": with_administrators})
+        if with_people and "people" in files else {}
+    return firms, all_codes, people, report
 
 
 def parse_classes(words: str | list[str] = "", codes: str = "") -> list[tuple[str, int | None]]:

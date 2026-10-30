@@ -11,7 +11,8 @@ api = 1
 markets = []
 requires = ["website"]
 default_enabled = false
-entry = "harvey.startups"
+entry = "harvey.modules.original.startups.capabilities"
+wraps = ["harvey.collectors.discover", "harvey.collectors.profile", "harvey.startups"]
 secrets = []
 terms_note = "Reads only the company's own site. Never ycombinator.com, accelerator directories, Crunchbase, PitchBook or LinkedIn, whose terms forbid scraping."
 
@@ -47,7 +48,8 @@ cost_note = "free (homepage, About, press page)"
 [[capabilities]]
 id = "startup_claims"
 op = "read"
-inputs = [["pages"]]
+# With the YC preset's hit on file, a page saying nothing doesn't undo it.
+inputs = [["pages", "fact:YC_BACKED"], ["pages"]]
 outputs = { facts = ["YC_BACKED", "ACCELERATOR", "FUNDING_ROUND"] }
 cost = { usd = 0.0, per = "company" }
 
@@ -56,7 +58,7 @@ id = "yc_search"
 op = "query"
 preset = "yc"
 inputs = [["query"]]
-outputs = { records = "companies", ids = ["domain"] }
+outputs = { records = "companies", ids = ["domain"], facts = ["YC_BACKED"] }
 cost = { usd = 0.0, per = "search", note = "runs through a search module" }
 
 [[capabilities]]
@@ -64,7 +66,7 @@ id = "accelerator_search"
 op = "query"
 preset = "accelerator"
 inputs = [["query"]]
-outputs = { records = "companies", ids = ["domain"] }
+outputs = { records = "companies", ids = ["domain"], facts = ["ACCELERATOR"] }
 cost = { usd = 0.0, per = "search", note = "runs through a search module" }
 
 [[capabilities]]

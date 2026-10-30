@@ -28,10 +28,11 @@ Hardening notes:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -39,17 +40,16 @@ from bs4 import BeautifulSoup
 from harvey.brain import Brain
 from harvey.collectors import people as people_mod
 from harvey.collectors.discover import site_name_from_html
-from harvey.collectors.phones import MAX_PHONES, phone_region, phones_from_html
 from harvey.collectors.profile import _reads_like_title, looks_like_challenge
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.integrations import email_finder as ef
 from harvey.integrations.email_finder import (
-    DEFAULT_PATTERN, SMALL_BUSINESS_PATTERN, find_email, site_email_evidence,
-    verify_published_address,
+    DEFAULT_PATTERN, SMALL_BUSINESS_PATTERN, site_email_evidence,
 )
 from harvey.integrations.linkedin import LinkedInAutomation
-from harvey.models.company import Company
 from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.browser import HTTP, PageReader
+from harvey.modules import api, ingest
 from harvey.public_http import public_http_client
 from harvey.state import StateManager
 from harvey.untrusted import UNTRUSTED_RULE, fence
@@ -111,9 +111,10 @@ INBOX_PREFERRED = ("owner", "office", "cabinet", "clinica", "farmacia", "farmaci
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
-# with email-pattern lookups and set by HUNTER_MONTHLY_SEARCHES (see
-# integrations/email_finder.py); this just paces it, since a heartbeat every
-# 15 minutes would spend a free-tier month in a few hours otherwise.
+# with email-pattern lookups and set by HUNTER_MONTHLY_SEARCHES (the hunter
+# module's monthly_searches, counted by ingest.Allowance); this just paces
+# it, since a heartbeat every 15 minutes would spend a free-tier month in a
+# few hours otherwise.
 HUNTER_DOMAINS_PER_CYCLE = 1
 
 # Rotate a small pool of realistic desktop user-agents. Scrapers that always
@@ -185,6 +186,24 @@ class Scout:
             logger.warning(f"Scout: {what} skipped: the {module_id} module is off "
                            f"(harvey modules enable {module_id}).")
         return False
+
+    async def _context(self, **kw) -> api.Context:
+        """What a module's capability Scout calls may use: the .env keys,
+        the ICP, the modules that are on (read now), and the month's Hunter
+        allowance."""
+        enabled = None
+        if getattr(self, "state", None) is not None:
+            from harvey.modules import switches
+            enabled = frozenset(await switches.enabled_ids(self.state))
+        env = getattr(self, "env", None)
+        # One shape for every capability: a dict of the .env keys.
+        if hasattr(env, "model_dump"):
+            env = env.model_dump()
+        elif not isinstance(env, dict):
+            env = dict(vars(env)) if env is not None else {}
+        return api.Context(env=env, config=getattr(self, "config", None),
+                           enabled=enabled, budget=ingest.Allowance(getattr(self, "state", None)),
+                           **kw)
 
     async def run(self):
         """Main prospecting flow: find leads matching ICP."""
@@ -427,11 +446,7 @@ class Scout:
         # Search engines' result pages, read without an API: their own
         # module, off unless turned on (their terms forbid it).
         if await self._module_on("web_search_scrape"):
-            backends.extend([
-                lambda: self._search_duckduckgo(query),
-                lambda: self._search_bing(query),
-                lambda: self._search_google(query),
-            ])
+            backends.append(lambda: self._html_search(query))
         if not backends:
             if "Web search" not in self._skipped:
                 self._skipped["Web search"] = "web_search_scrape"
@@ -522,93 +537,12 @@ class Scout:
                 results.append((url, snippet))
         return results[:MAX_RESULTS_PER_QUERY]
 
-    async def _search_duckduckgo(self, query: str) -> list[tuple[str, str]]:
-        """Search via DuckDuckGo HTML — free, no rate limiting."""
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        resp = await self._fetch(url)
-        if resp is None:
-            return []
-
-        soup = self._safe_soup(resp.text)
-        if soup is None:
-            return []
-
-        results = []
-        for result in soup.select(".result"):
-            link = result.select_one(".result__a")
-            snippet_el = result.select_one(".result__snippet")
-            if not (link and link.get("href")):
-                continue
-            href = self._attr_str(link.get("href"))
-            # DDG wraps URLs in a redirect — extract the real URL.
-            if "uddg=" in href:
-                try:
-                    params = parse_qs(urlparse(href).query)
-                    real = params.get("uddg", [])
-                    if real:
-                        href = real[0]
-                except Exception:
-                    pass
-            snippet = snippet_el.get_text().strip() if snippet_el else ""
-            if href.startswith("http"):
-                results.append((href, snippet))
-
-        if results:
-            logger.debug(f"DuckDuckGo returned {len(results)} results")
-        return results[:MAX_RESULTS_PER_QUERY]
-
-    async def _search_bing(self, query: str) -> list[tuple[str, str]]:
-        """Search via Bing HTML scraping — less aggressive than Google."""
-        url = f"https://www.bing.com/search?q={quote_plus(query)}&count={MAX_RESULTS_PER_QUERY}"
-        resp = await self._fetch(url)
-        if resp is None:
-            return []
-
-        soup = self._safe_soup(resp.text)
-        if soup is None:
-            return []
-
-        results = []
-        for item in soup.select("li.b_algo"):
-            link = item.select_one("h2 a")
-            snippet_el = item.select_one(".b_caption p")
-            if not (link and link.get("href")):
-                continue
-            href = self._attr_str(link.get("href"))
-            snippet = snippet_el.get_text().strip() if snippet_el else ""
-            if href.startswith("http"):
-                results.append((href, snippet))
-
-        if results:
-            logger.debug(f"Bing returned {len(results)} results")
-        return results[:MAX_RESULTS_PER_QUERY]
-
-    async def _search_google(self, query: str) -> list[tuple[str, str]]:
-        """Search via Google HTML scraping — aggressive rate limiting, last resort."""
-        url = f"https://www.google.com/search?q={quote_plus(query)}&num={MAX_RESULTS_PER_QUERY}"
-        # Google throttles hard; a single quick try avoids burning the cycle.
-        resp = await self._fetch(url, retries=1)
-        if resp is None:
-            return []
-
-        soup = self._safe_soup(resp.text)
-        if soup is None:
-            return []
-
-        results = []
-        for div in soup.select("div.g"):
-            link = div.select_one("a")
-            snippet_el = div.select_one("div.VwiC3b")
-            if not (link and link.get("href")):
-                continue
-            href = self._attr_str(link.get("href"))
-            snippet = snippet_el.get_text() if snippet_el else ""
-            if href.startswith("http"):
-                results.append((href, snippet))
-
-        if results:
-            logger.debug(f"Google returned {len(results)} results")
-        return results[:MAX_RESULTS_PER_QUERY]
+    async def _html_search(self, query: str) -> list[tuple[str, str]]:
+        """DuckDuckGo, then Bing, then Google result pages (the
+        web_search_scrape module), read through Scout's own fetch."""
+        found = await api.capability("web_search_scrape", "html_search")(
+            api.Input(query=query), await self._context(http=self._fetch))
+        return [(r.source_url, r.description) for r in found.records]
 
     # ── Strategy -1: Hunter named contacts (quota-gated) ──
 
@@ -630,11 +564,8 @@ class Scout:
         if not api_key:
             return 0
 
-        from harvey.integrations.email_finder import (
-            hunter_domain_people, hunter_searches_remaining, record_hunter_search,
-        )
-
-        remaining = await hunter_searches_remaining(self.state)
+        allowance = ingest.Allowance(self.state)
+        remaining = await allowance.left("hunter")
         if remaining <= 0:
             return 0
 
@@ -651,15 +582,17 @@ class Scout:
             self.config.icp.industries[0] if self.config.icp.industries else ""
         )
         count = 0
+        search = api.capability("hunter", "domain_search")
+        ctx = await self._context()
         for company in companies:
             domain = (company.get("domain") or "").strip()
             if not domain:
                 continue
 
-            if await hunter_searches_remaining(self.state) <= 0:
+            found = await search(api.Input(company_id=company["id"], domain=domain), ctx)
+            if found.stop:
                 break
-            await record_hunter_search(self.state)
-            people = await hunter_domain_people(domain, api_key)
+            people = [p.fields for p in found.people]
             try:
                 await self.state.mark_prospects_checked(company["id"])
             except Exception as e:
@@ -697,7 +630,7 @@ class Scout:
                 if await self._is_duplicate_prospect(prospect):
                     continue
 
-                await self.state.add_prospect(prospect)
+                await ingest.prospect(self.state, prospect)
                 self._remember_prospect(prospect)
                 count += 1
                 logger.info(
@@ -764,7 +697,7 @@ class Scout:
                 logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
 
             for prospect in contacts:
-                await self.state.add_prospect(prospect)
+                await ingest.prospect(self.state, prospect)
                 count += 1
                 logger.info(
                     f"Scout: Added {prospect.full_name()} ({prospect.title}) "
@@ -782,7 +715,7 @@ class Scout:
         """Search LinkedIn for ICP-matching profiles."""
         logger.info("Scout: Searching LinkedIn...")
         linkedin = LinkedInAutomation(
-            self.env.linkedin_email, self.env.linkedin_password
+            self.env.linkedin_email, self.env.linkedin_password, browser_env=os.environ
         )
 
         try:
@@ -792,13 +725,15 @@ class Scout:
                 return 0
 
             count = 0
+            search = api.capability("linkedin", "people_search")
+            ctx = await self._context(browser=linkedin)
             for title in self.config.icp.titles:
                 for industry in self.config.icp.industries:
                     keywords = f"{title} {industry}"
                     try:
-                        profiles = await linkedin.search_people(
-                            keywords=keywords, max_results=10
-                        )
+                        found = await search(api.Input(query=keywords,
+                                                       extra={"max_results": 10}), ctx)
+                        profiles = [p.fields for p in found.people]
                     except Exception as e:
                         logger.debug(f"LinkedIn search failed for '{keywords}': {e}")
                         continue
@@ -856,7 +791,7 @@ class Scout:
                         if await self._is_duplicate_prospect(prospect):
                             continue
 
-                        await self.state.add_prospect(prospect)
+                        await ingest.prospect(self.state, prospect)
                         self._remember_prospect(prospect)
                         count += 1
                         logger.info(
@@ -922,7 +857,7 @@ class Scout:
                 if await self._is_duplicate_prospect(prospect):
                     continue
 
-                await self.state.add_prospect(prospect)
+                await ingest.prospect(self.state, prospect)
                 self._remember_prospect(prospect)
                 count += 1
 
@@ -1017,7 +952,7 @@ class Scout:
         # were already read, so stopping at the cycle cap would only lose them.
         count = 0
         for prospect in scored_contacts:
-            await self.state.add_prospect(prospect)
+            await ingest.prospect(self.state, prospect)
             count += 1
             logger.info(
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
@@ -1132,48 +1067,14 @@ class Scout:
         return True
 
     async def _scrape_directory_page(self, url: str) -> list[dict]:
-        """Scrape a directory/list page for company links."""
-        companies = []
-        resp = await self._fetch(url, timeout=SCRAPE_TIMEOUT, retries=2)
-        if resp is None:
-            return []
-
-        soup = self._safe_soup(resp.text)
-        if soup is None:
-            return []
-
-        page_domain = self._extract_domain(url)
-        seen_here = set()
-
-        try:
-            for link in soup.find_all("a", href=True):
-                href = self._attr_str(link.get("href"))
-                if not href.startswith("http"):
-                    continue
-
-                domain = self._extract_domain(href)
-                if not domain or self._is_noise_domain(domain):
-                    continue
-                if domain == page_domain or domain in seen_here:
-                    continue
-
-                link_text = link.get_text().strip()
-                if 3 < len(link_text) < 60:
-                    seen_here.add(domain)
-                    companies.append({
-                        "name": link_text,
-                        "domain": domain,
-                        "website": f"https://{domain}",
-                        "source": "directory",
-                        "source_url": url,
-                    })
-
-                if len(companies) >= 10:
-                    break
-        except Exception as e:
-            logger.debug(f"Failed to parse directory page {url}: {e}")
-
-        return companies
+        """Scrape a directory/list page for company links (the
+        web_search_scrape module)."""
+        found = await api.capability("web_search_scrape", "directories")(
+            api.Input(extra={"url": url, "domain_of": self._extract_domain,
+                             "noise": self._is_noise_domain}),
+            await self._context(http=self._fetch))
+        return [{"name": r.name, "domain": r.domain, "website": r.website,
+                 "source": r.source, "source_url": r.source_url} for r in found.records]
 
     def _extract_company_domains_from_snippet(self, snippet: str, source_url: str) -> list[str]:
         """Extract potential company domains mentioned in a search snippet."""
@@ -1242,18 +1143,30 @@ class Scout:
         # What the company's own site published: this person's exact address
         # if it's there, and the default to guess with when nothing is.
         evidence = getattr(self, "_site_evidence", {}).get(self._host(domain), {})
+        key = ef.clean_domain(domain)
+        cached = None
+        if self.state is not None:
+            try:
+                cached = await self.state.get_email_pattern(key)
+            except Exception as e:
+                logger.debug(f"Pattern cache read failed for {key}: {e}")
         try:
-            result = await find_email(
-                first_name, last_name, domain,
-                verify=True, env=self.env, state=self.state,
-                known_emails=evidence.get("known") or None,
-                default_pattern=evidence.get("default", DEFAULT_PATTERN),
-                other_people=evidence.get("people") or None,
-            )
+            draft = await api.capability("email_verify", "find_email")(api.Input(
+                domain=domain, facts={"EMAIL_PATTERN": cached}, extra={
+                    "first_name": first_name, "last_name": last_name, "verify": True,
+                    "known_emails": evidence.get("known") or None,
+                    "default_pattern": evidence.get("default", DEFAULT_PATTERN),
+                    "other_people": evidence.get("people") or None,
+                }), await self._context())
         except Exception as e:
             logger.debug(f"find_email failed for {domain}: {e}")
             return "", "invalid"
-        return result.email, result.status
+        if self.state is not None:
+            await ingest.learned_pattern(self.state, key, draft.values.get("email_pattern"))
+        if draft.failed is not None or not draft.contacts:
+            logger.debug(f"find_email failed for {domain}: {draft.failed}")
+            return "", "invalid"
+        return draft.contacts[0].value, draft.contacts[0].status
 
     async def _score_contacts(self, contacts: list[Prospect]) -> list[Prospect]:
         """Use Claude to score and add personalization notes to found contacts.
@@ -1393,7 +1306,7 @@ Respond ONLY with the JSON array."""
         except Exception as e:
             logger.debug(f"get_company_by_domain failed for {domain}: {e}")
 
-        company = Company(
+        record = api.Record(
             name=name,
             domain=domain,
             website=website or f"https://{domain}",
@@ -1405,8 +1318,12 @@ Respond ONLY with the JSON array."""
             source_url=source_url,
         )
         # Through the resolver: a site whose business is already on file
-        # under another key (a registry firm, a map listing) joins it.
-        return (await self.state.save_company(company)).company_id
+        # under another key (a registry firm, a map listing) joins it, and
+        # what Scout finds for it later says it was found for this record.
+        saved = await ingest.found_company(self.state, record)
+        if saved.origin != saved.company_id:
+            self.__dict__.setdefault("_origins", {})[saved.company_id] = saved.origin
+        return saved.company_id
 
     async def _resolve_base_url(
         self, domain: str, retries: int = 1
@@ -1604,7 +1521,11 @@ Respond ONLY with the JSON array."""
         home_url, home = site["pages"][0]
         site_name = site_name_from_html(home, domain)
         try:
-            found = people_mod.find_people(site["pages"], domain, site_name)
+            people = await api.capability("people", "find_people")(api.Input(
+                domain=domain, name=site_name,
+                pages=[api.Page(url, html, self._page_method(url)) for url, html in site["pages"]]),
+                await self._context())
+            found = [p.fields for p in people.people]
         except Exception as e:
             logger.debug(f"People detection failed for {domain}: {e}")
             found = []
@@ -1634,8 +1555,8 @@ Respond ONLY with the JSON array."""
         }
         if pattern:
             try:
-                await self.state.save_email_pattern(
-                    key, pattern=pattern, confidence=confidence,
+                await ingest.email_pattern(
+                    self.state, key, pattern=pattern, confidence=confidence,
                     source="site_address" if known else "site_address_guess",
                 )
                 logger.debug(f"Scout: learned pattern {pattern} for {key} ({confidence:.2f})")
@@ -1793,6 +1714,11 @@ Respond ONLY with the JSON array."""
         await self._observe_phones(company_id, domain)
         return contacts
 
+    def _origin(self, company_id: str) -> str:
+        """The record Scout found ``company_id`` as, when saving it merged
+        that record into this one ("" otherwise: the company itself)."""
+        return self.__dict__.get("_origins", {}).get(company_id, "")
+
     async def _observe_phones(self, company_id: str, domain: str):
         """The phone numbers on the pages already read for people and the
         inbox. The first fills the company's phone when it has none (a
@@ -1811,29 +1737,21 @@ Respond ONLY with the JSON array."""
         except Exception:
             company = None
         location = (getattr(company, "location", "") or "") if company else ""
-        region = phone_region(location, getattr(self, "config", None), self._host(domain))
-        hits, seen = [], set()
-        for url, html in pages:
-            for hit in phones_from_html(html, region):
-                if hit.number not in seen and len(hits) < MAX_PHONES:
-                    seen.add(hit.number)
-                    hits.append((url, hit))
-        if not hits:
+        # Labelled "people", not "profile": a profile-collector row would
+        # count as the company being profiled and hold back its profile run.
+        found = await api.capability("phones", "site_phones")(
+            api.Input(company_id=company_id, domain=self._host(domain), locality=location,
+                      pages=[api.Page(url, html, self._page_method(url)) for url, html in pages]),
+            await self._context(settings={"collector": "people"}))
+        if not found.contacts:
             return
         try:
-            await self.state.fill_company_phone(company_id, hits[0][1].display)
+            await ingest.company_phone(self.state, company_id, found.contacts[0].display)
             confirmed = await self.state.confirmed_signal_codes()
             if "PHONE_NUMBER" in (confirmed or set()):
-                await self.state.add_observations([{
-                    "signal_code": "PHONE_NUMBER", "company_id": company_id,
-                    # Not "profile": a profile-collector row would count as the
-                    # company being profiled and hold back its profile run.
-                    "collector": ("people" if self._page_method(url) == HTTP
-                                  else f"people:{self._page_method(url)}"),
-                    "value_text": hit.number,
-                    "confidence": hit.confidence,
-                    "evidence_url": url,
-                } for url, hit in hits])
+                await ingest.facts(self.state, found.facts, company_id=company_id,
+                                   origin=self._origin(company_id),
+                                   confirmed=confirmed or set())
         except Exception as e:
             logger.debug(f"Phone numbers not stored for {domain}: {e}")
 
@@ -1852,13 +1770,14 @@ Respond ONLY with the JSON array."""
         explicit = people_mod.is_owner_title(member.get("title", ""))
         evidence = member.get("evidence") or ""
         try:
-            await self.state.add_observations([{
-                "signal_code": "LIKELY_OWNER", "company_id": company_id,
-                "collector": "people", "value_num": 1,
-                "value_text": f"{name} — {member.get('title') or 'owner'}: {evidence}"[:300],
-                "confidence": 0.9 if explicit else 0.7,
-                "evidence_url": member.get("evidence_url", ""),
-            }])
+            await ingest.facts(self.state, [api.Fact(
+                "LIKELY_OWNER", value_num=1, collector="people",
+                value_text=f"{name} — {member.get('title') or 'owner'}: {evidence}"[:300],
+                confidence=0.9 if explicit else 0.7,
+                source_url=member.get("evidence_url", ""),
+                module="people", capability="find_people")],
+                company_id=company_id, origin=self._origin(company_id),
+                confirmed=confirmed or set())
         except Exception as e:
             logger.debug(f"LIKELY_OWNER observation failed for {company_id}: {e}")
 
@@ -1887,7 +1806,9 @@ Respond ONLY with the JSON array."""
         if not email:
             return None
         try:
-            status = await verify_published_address(email, env=self.env, state=self.state)
+            graded = await api.capability("email_verify", "verify_address")(
+                api.Input(domain=domain, extra={"email": email}), await self._context())
+            status = graded.contacts[0].status
         except Exception as e:
             logger.debug(f"Inbox verification failed for {email}: {e}")
             status = "guess"
@@ -1976,7 +1897,7 @@ Respond ONLY with the JSON array."""
         `pip install python-jobspy`); silently skipped otherwise.
         """
         try:
-            from jobspy import scrape_jobs
+            import jobspy  # noqa: F401
         except ImportError:
             logger.debug("Scout: python-jobspy not installed; skipping job boards.")
             return 0
@@ -1988,25 +1909,12 @@ Respond ONLY with the JSON array."""
         geo = self.config.icp.geography[0] if self.config.icp.geography else ""
 
         logger.info(f"Scout: Searching job boards for '{search_term}' roles...")
-        loop = asyncio.get_event_loop()
-
-        def _search():
-            return scrape_jobs(
-                site_name=["indeed"],
-                search_term=search_term,
-                location=geo,
-                results_wanted=15,
-                hours_old=24 * 14,  # fresh signal only: last two weeks
-            )
-
-        try:
-            df = await asyncio.wait_for(
-                loop.run_in_executor(None, _search), timeout=120
-            )
-        except Exception as e:
-            logger.warning(f"Scout: job-board search failed: {e}")
+        found = await api.capability("hiring", "job_board_search")(
+            api.Input(query=search_term, area=geo), await self._context())
+        if found.failed is not None:
+            logger.warning(f"Scout: job-board search failed: {found.failed}")
             return 0
-        if df is None or getattr(df, "empty", True):
+        if not found.records:
             return 0
 
         default_industry = (
@@ -2016,17 +1924,12 @@ Respond ONLY with the JSON array."""
         all_contacts: list[Prospect] = []
         companies_used = 0
 
-        try:
-            rows = df.to_dict("records")
-        except Exception:
-            return 0
-
         seen_names: set[str] = set()
-        for row in rows:
+        for post in found.records:
             if companies_used >= 5:
                 break
-            company_name = str(row.get("company") or "").strip()
-            job_title = str(row.get("title") or "").strip()[:80]
+            company_name = post.name
+            job_title = post.found_by
             if not company_name or company_name.lower() in seen_names:
                 continue
             seen_names.add(company_name.lower())
@@ -2051,13 +1954,13 @@ Respond ONLY with the JSON array."""
                 description=info.get("description", ""),
                 industry=default_industry,
                 source="job_board",
-                source_url=str(row.get("job_url") or ""),
+                source_url=post.source_url,
             )
 
             signal = {"type": "hiring", "detail": job_title, "found_at": today}
             try:
-                await self.state.update_company_signals(
-                    company_id, new_signals=[signal]
+                await ingest.company_notes(
+                    self.state, company_id, new_signals=[signal]
                 )
             except Exception as e:
                 logger.debug(f"update_company_signals failed: {e}")
@@ -2067,7 +1970,7 @@ Respond ONLY with the JSON array."""
             tech = (detect_tech(info.get("_homepage_html", ""))
                     if await self._uses("web_marketing", "Tech detection") else [])
             if tech:
-                await self.state.update_company_signals(company_id, tech_stack=tech)
+                await ingest.company_notes(self.state, company_id, tech_stack=tech)
                 signal_note += ". Tech on site: " + ", ".join(tech[:5])
 
             contacts = await self._contacts_from_company(
@@ -2087,7 +1990,7 @@ Respond ONLY with the JSON array."""
         scored = await self._score_contacts(all_contacts)
         count = 0
         for prospect in scored:
-            await self.state.add_prospect(prospect)
+            await ingest.prospect(self.state, prospect)
             count += 1
             logger.info(
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
@@ -2133,8 +2036,8 @@ Respond ONLY with the JSON array."""
 
         if tech or signals:
             try:
-                await self.state.update_company_signals(
-                    company_id, tech_stack=tech, new_signals=signals
+                await ingest.company_notes(
+                    self.state, company_id, tech_stack=tech, new_signals=signals
                 )
             except Exception as e:
                 logger.debug(f"update_company_signals failed for {domain}: {e}")

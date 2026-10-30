@@ -9,7 +9,6 @@ signals that actually make an email specific — who their incumbent agency is,
 whether they're spending on ads today, what's missing from their site.
 """
 
-import asyncio
 import logging
 from html import unescape as html_unescape
 import random
@@ -20,7 +19,8 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from harvey.browser import HTTP, PageReader
-from harvey.public_http import public_http_client
+from harvey.modules.api import Contact, Draft, Fact, Page
+from harvey.public_http import is_public_client, public_http_client
 from harvey.startups import funding_text
 
 from harvey.collectors.ats import detect_board, matching_roles, read_board, role_keywords
@@ -829,16 +829,43 @@ def _page_title(html: str) -> str:
     return html_unescape(re.sub(r"(?s)<[^>]+>", " ", " ".join(parts))).lower()
 
 
+def open_http() -> httpx.AsyncClient:
+    """The client a profile pass reads sites with (one per run)."""
+    return public_http_client(
+        timeout=TIMEOUT,
+        headers={"User-Agent": random.choice(USER_AGENTS),
+                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+    )
+
+
+class Known:
+    """What core already knows about the company being read, handed in as
+    values (no database): whether a preset search found it (by signal
+    code), and the page that search found it on. The collector asks it
+    the way it would ask the database."""
+
+    def __init__(self, search_hits: dict[str, bool] | None = None, source_url: str = ""):
+        self.search_hits = dict(search_hits or {})
+        self.source_url = source_url
+
+    async def search_hit(self, company_id: str, code: str) -> bool:
+        return bool(self.search_hits.get(code))
+
+    async def get_company(self, company_id: str):
+        return self
+
+
 class ProfileCollector:
     """Fetches a business's public pages and emits observations.
 
     Only signals the user CONFIRMED are collected; everything else is skipped
-    even if the data is sitting right there in the HTML.
+    even if the data is sitting right there in the HTML. ``known`` is what
+    core knows about the company already (Known); it is only read.
     """
 
-    def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 12.0,
+    def __init__(self, known=None, confirmed: set[str] | None = None, timeout: float = 12.0,
                  role_keywords: list[str] | None = None, config=None):
-        self.state = state
+        self.known = known
         # Where a business's national phone numbers are read when its
         # location doesn't name a country (prospect_country, icp.geography).
         self.config = config
@@ -848,7 +875,8 @@ class ProfileCollector:
         self.role_keywords = list(role_keywords or [])
         self._client: httpx.AsyncClient | None = None
         self.site_names: dict[str, str] = {}
-        # The first phone each company's pages publish, for _fill_phone.
+        # The first phone each company's pages publish: the company's own
+        # phone, when it has none (site_draft returns it as a contact).
         self.phones: dict[str, str] = {}
         # Hosts that answered with a bot challenge (SiteGround's 202,
         # Cloudflare's "Just a moment...") rather than a page.
@@ -858,11 +886,7 @@ class ProfileCollector:
         return code in self.confirmed
 
     async def __aenter__(self):
-        self._client = public_http_client(
-            timeout=TIMEOUT,
-            headers={"User-Agent": random.choice(USER_AGENTS),
-                     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
-        )
+        self._client = open_http()
         self._pages = PageReader()
         return self
 
@@ -997,10 +1021,10 @@ class ProfileCollector:
                 add("HIRING_ROLE", text=r, url=curl)
     async def _search_hit(self, company_id: str, code: str) -> bool:
         """Is the latest reading a preset search's hit? (see state.search_hit)"""
-        if getattr(self, "state", None) is None:
+        if getattr(self, "known", None) is None:
             return False
         try:
-            return await self.state.search_hit(company_id, code)
+            return await self.known.search_hit(company_id, code)
         except Exception:
             return False
 
@@ -1008,7 +1032,7 @@ class ProfileCollector:
         """The page a search found the company on, when it's on their own
         site and isn't the homepage; "" otherwise. Never someone else's site."""
         try:
-            company = await self.state.get_company(company_id)
+            company = await self.known.get_company(company_id)
         except Exception:
             return ""
         url = (getattr(company, "source_url", "") or "").strip()
@@ -1187,6 +1211,7 @@ class ProfileCollector:
             return obs
         self.site_names[company_id] = site_name_from_html(home, domain)
         pages.append((site, home))
+        self.__dict__.setdefault("pages_read", {})[company_id] = pages
 
         # Ads (they are spending TODAY — the strongest budget signal here)
         add("RUNNING_GOOGLE_ADS", num=1 if self._any(home, GOOGLE_ADS) else 0)
@@ -1346,7 +1371,7 @@ class ProfileCollector:
     def _phones(self, company_id: str, pages: list[tuple[str, str]], region, add) -> None:
         """PHONE_NUMBER for each number the fetched pages publish (a tel:
         link or schema.org markup at full confidence), and the first one
-        kept for _fill_phone."""
+        kept as the company's phone (returned by site_draft)."""
         seen: set[str] = set()
         for url, html in pages:
             for hit in phones_from_html(html, region):
@@ -1354,100 +1379,89 @@ class ProfileCollector:
                     continue
                 seen.add(hit.number)
                 self.__dict__.setdefault("phones", {}).setdefault(company_id, hit.display)
+                self.__dict__.setdefault("phone_hits", {}).setdefault(company_id, []).append(
+                    (url, hit))
                 add("PHONE_NUMBER", text=hit.number, conf=hit.confidence, url=url)
 
-    async def _improve_name(self, company: dict, domain: str):
-        """Replace a name the domain doesn't back up ("Denver, CO | HOA
+    def better_name(self, company_id: str, current: str, domain: str) -> str:
+        """The name the homepage gives itself, when it should replace
+        ``current``: one the domain doesn't back up ("Denver, CO | HOA
         Management Firm") or one merely derived from the domain ("Grow With
-        Us") with the one the homepage gives itself. Only a distinctive brand match
-        is kept; generic industry and navigation text does not establish identity."""
-        better = self.site_names.pop(company["id"], "")
-        current = company.get("name") or ""
+        Us"); "" to keep it. Only a distinctive brand match is kept; generic
+        industry and navigation text does not establish identity."""
+        better = self.site_names.pop(company_id, "")
+        current = current or ""
         fallback = current == name_from_domain(domain)
         if not better or better == current or (
                 name_matches_domain(current, domain) and not fallback):
-            return
-        try:
-            await self.state.rename_company(company["id"], better)
-            logger.info(f"profile: {domain} named '{better}' (was '{current}')")
-        except Exception as e:
-            logger.debug(f"rename_company failed for {domain}: {e}")
-
-    async def _fill_phone(self, company: dict):
-        """The site's first number as the company's phone, only when it has
-        none — a listing's number is kept. Contact data like a published
-        email, so it doesn't wait for PHONE_NUMBER to be confirmed."""
-        phone = self.phones.pop(company["id"], "")
-        if not phone:
-            return
-        try:
-            if await self.state.fill_company_phone(company["id"], phone):
-                logger.info(f"profile: {company.get('domain')} phone {phone} from its site")
-        except Exception as e:
-            logger.debug(f"fill_company_phone failed for {company.get('domain')}: {e}")
-
-    async def _mark_checked(self, company_id: str):
-        try:
-            await self.state.mark_company_profiled(company_id)
-        except Exception as e:
-            logger.debug(f"mark_company_profiled failed for {company_id}: {e}")
-
-    async def run(self, companies: list[dict], run_id: str = "") -> int:
-        """Profile many businesses, flushing observations after each one.
-
-        Flush-per-item is deliberate: the observations are the asset, and a
-        long run that dies must not take them with it.
-        """
-        total = 0
-        for company in companies:
-            domain = (company.get("domain") or "").strip()
-            if not domain:
-                continue
-            try:
-                obs = await self.profile_company(company["id"], domain,
-                                                 company.get("location") or "")
-            except Exception as e:
-                logger.warning(f"profile failed for {domain}: {e}")
-                await self._mark_checked(company["id"])
-                continue
-            # Marked regardless of outcome — an unreachable site still counts
-            # as checked, or the same handful gets retried every cycle
-            # forever instead of rotating through the rest of the backlog.
-            await self._mark_checked(company["id"])
-            await self._improve_name(company, domain)
-            await self._fill_phone(company)
-            if obs:
-                total += await self.state.add_observations(obs, run_id=run_id)
-                logger.info(f"profile: {domain} → {len(obs)} observation(s)")
-            await asyncio.sleep(random.uniform(0.4, 1.2))
-        return total
+            return ""
+        return better
 
 
-async def profile_companies(state, companies: list[dict], config=None) -> tuple[int, str]:
-    """Convenience entry point: opens a run, profiles, closes the run.
+# Which module's capability each fact a profile pass reads belongs to: one
+# pass over a site serves them all (the pages are fetched once).
+READ_BY = {
+    "CONTACT_FORM_URL": ("website", "read_site"),
+    **{code: ("web_marketing", "marketing_profile") for code in (
+        "RUNNING_GOOGLE_ADS", "RUNNING_META_ADS", "TECH_STACK", "NO_SCHEMA_MARKUP",
+        "NO_ONLINE_BOOKING", "INCUMBENT_AGENCY", "BLOCKS_AI_CRAWLERS", "SITE_PAGE_COUNT",
+        "BLOG_STALE")},
+    **{code: ("startups", "startup_claims") for code in (
+        "YC_BACKED", "ACCELERATOR", "FUNDING_ROUND")},
+    **{code: ("hiring", "job_board") for code in ("HIRING_ROLE", "OPEN_ROLES")},
+    **{code: ("people", "find_people") for code in ("CONTACT_FOUND", "DECISION_MAKER_TITLE")},
+    "PHONE_NUMBER": ("phones", "site_phones"),
+}
 
-    ``config`` supplies the roles that count as hiring intent
-    (``icp.hiring_signals``, else ``icp.titles``); without it a job board
-    still gives OPEN_ROLES, but no role is singled out.
-    """
-    from harvey.signals import sync_vocabulary
-    await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    if not confirmed:
-        logger.warning(
-            "profile: no signals confirmed yet — confirm signals first "
-            "(nothing is collected until you choose what matters)."
-        )
-        return 0, ""
-    run_id = await state.start_run("profile", provider="http")
-    try:
+
+async def site_draft(inp, ctx, only: set[str] | None = None) -> Draft:
+    """Read one company's site (``inp.domain``, located at ``inp.locality``)
+    as a Draft: the facts every confirmed signal (``ctx.wanted``, narrowed
+    to ``only``) asks for, each stamped with the capability it belongs to
+    (READ_BY); the pages read; the phones they publish, the first of which
+    is the company's when it has none; and in ``values["name"]`` the name
+    the homepage gives itself when it should replace ``inp.name``.
+
+    ``inp.facts["search_hits"]`` says which signals a preset search found
+    it by, ``inp.extra["source_url"]`` the page; ``ctx.http`` and
+    ``ctx.browser`` are the run's client and page reader. A site is read
+    only through a client that refuses private addresses: given any other
+    (or none), the read opens its own. A fact of a module that is off
+    isn't read for."""
+    wanted = set(ctx.wanted if ctx.wanted is not None else READ_BY)
+    if only is not None:
+        wanted &= only
+    wanted = {code for code in wanted if ctx.on(READ_BY.get(code, ("website",))[0])}
+    config = ctx.config
+    keywords = ctx.settings.get("role_keywords")
+    if keywords is None:
         keywords = role_keywords(getattr(config, "icp", None))
-        async with ProfileCollector(state, confirmed, role_keywords=keywords,
-                                    config=config) as collector:
-            n = await collector.run(companies, run_id=run_id)
-        await state.finish_run(run_id, records=n, cost_usd=0.0)
-        return n, run_id
-    except Exception as e:
-        await state.finish_run(run_id, status="failed", error=str(e))
-        raise
-
+    c = ProfileCollector(Known(inp.facts.get("search_hits"), inp.extra.get("source_url", "")),
+                         wanted, role_keywords=keywords, config=config)
+    own_http = None if is_public_client(ctx.http) else open_http()
+    own_pages = PageReader() if ctx.browser is None else None
+    c._client, c._pages = own_http or ctx.http, own_pages or ctx.browser
+    try:
+        obs = await c.profile_company(inp.company_id, inp.domain, inp.locality)
+    finally:
+        if own_http is not None:
+            await own_http.aclose()
+        if own_pages is not None:
+            await own_pages.aclose()
+    draft = Draft()
+    for row in obs:
+        module, cap = READ_BY.get(row["signal_code"], ("website", "read_site"))
+        draft.facts.append(Fact(
+            row["signal_code"], value_num=row["value_num"], value_text=row["value_text"],
+            confidence=row["confidence"], source_url=row["evidence_url"],
+            collector=row["collector"], module=module, capability=cap))
+    draft.pages = [Page(url, html, c._method(url))
+                   for url, html in c.__dict__.get("pages_read", {}).get(inp.company_id, [])]
+    draft.contacts = [Contact("phone", hit.number, display=hit.display,
+                              confidence=hit.confidence, source_url=url,
+                              module="phones", capability="site_phones")
+                      for url, hit in c.__dict__.get("phone_hits", {}).get(inp.company_id, [])]
+    better = c.better_name(inp.company_id, inp.name, inp.domain)
+    if better:
+        draft.values["name"] = better
+    return draft

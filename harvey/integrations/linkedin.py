@@ -8,7 +8,6 @@ protect the user's LinkedIn account from restriction.
 import asyncio
 import json
 import logging
-import os
 import random
 import re
 from datetime import date, datetime
@@ -61,9 +60,10 @@ def browser_endpoint(env=None) -> tuple[str, str]:
     """(cdp_url, token) of the browser LinkedIn should use: the fallback
     (Chromium) first, since LinkedIn refuses Obscura; then the primary;
     ("", "") to launch a local Chromium (a pip install with
-    `playwright install chromium`)."""
+    `playwright install chromium`). ``env`` is the process environment as
+    core hands it over (LinkedInAutomation's ``browser_env``)."""
     from harvey.browser import primary_url
-    env = os.environ if env is None else env
+    env = env or {}
     fallback = (env.get("BROWSER_CDP_FALLBACK_URL") or "").strip()
     if fallback:
         return fallback, ""
@@ -86,9 +86,11 @@ MAX_SEARCH_PAGES_PER_QUERY = 5
 
 
 class LinkedInAutomation:
-    def __init__(self, email: str, password: str):
+    def __init__(self, email: str, password: str, browser_env=None):
         self.email = email
         self.password = password
+        # Where the browser runs (BROWSER_CDP_*), from whoever opens the session.
+        self.browser_env = browser_env
         self.browser = None
         self.context = None
         self.page = None
@@ -179,7 +181,7 @@ class LinkedInAutomation:
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
-        cdp_url, token = browser_endpoint()
+        cdp_url, token = browser_endpoint(self.browser_env)
         if cdp_url:
             headers = {"Authorization": f"Bearer {token}"} if token else None
             self.browser = await self._pw.chromium.connect_over_cdp(
