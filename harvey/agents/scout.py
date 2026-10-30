@@ -166,6 +166,9 @@ class Scout:
         self._modules: set[str] | None = None
         # What this cycle left out because its module is off: {what: module}.
         self._skipped: dict[str, str] = {}
+        # A forced run's start (contacts.now()): companies already searched
+        # are searched again, unless this run already did.
+        self.search_since: str | None = None
 
     async def _module_on(self, module_id: str) -> bool:
         """Whether a module is on, read once per cycle: a strategy or search
@@ -571,7 +574,9 @@ class Scout:
 
         batch_size = min(remaining, HUNTER_DOMAINS_PER_CYCLE)
         try:
-            companies = await self.state.companies_needing_prospects(limit=batch_size)
+            companies = await self.state.companies_needing_prospects(
+                limit=batch_size, module="hunter", capability="domain_search",
+                since=self.search_since)
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")
             return 0
@@ -593,10 +598,7 @@ class Scout:
             if found.stop:
                 break
             people = [p.fields for p in found.people]
-            try:
-                await self.state.mark_prospects_checked(company["id"])
-            except Exception as e:
-                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+            await self._searched(company["id"], "hunter", "domain_search", len(people))
 
             for person in people or []:
                 if not isinstance(person, dict):
@@ -663,7 +665,7 @@ class Scout:
 
         try:
             companies = await self.state.companies_needing_prospects(
-                limit=MAX_COMPANIES_PER_CYCLE
+                limit=MAX_COMPANIES_PER_CYCLE, since=self.search_since
             )
         except Exception as e:
             logger.debug(f"companies_needing_prospects failed: {e}")
@@ -688,13 +690,9 @@ class Scout:
                 source="known_company_backfill",
             )
 
-            # Mark it checked regardless of outcome, so a company with no
-            # scrapable team page rotates out instead of being retried
-            # every cycle forever.
-            try:
-                await self.state.mark_prospects_checked(company["id"])
-            except Exception as e:
-                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+            # Searched whatever it found, so a company with no scrapable
+            # team page isn't searched by this capability again.
+            await self._searched(company["id"], "people", "find_people", len(contacts))
 
             for prospect in contacts:
                 await ingest.prospect(self.state, prospect)
@@ -708,6 +706,18 @@ class Scout:
                 return count
 
         return count
+
+    async def _searched(self, company_id: str, module: str, capability: str,
+                        found: int) -> None:
+        """The company was searched for people and emails by a module's
+        capability (the searches table), and when (its rotation mark)."""
+        try:
+            await self.state.record_search(
+                "company", company_id, module, capability, looked_for="people,email",
+                outcome="found" if found else "nothing", found=found)
+            await self.state.mark_prospects_checked(company_id)
+        except Exception as e:
+            logger.debug(f"recording the search of {company_id} failed: {e}")
 
     # ── Strategy 1: LinkedIn ──
 
@@ -1752,6 +1762,8 @@ Respond ONLY with the JSON array."""
                 await ingest.facts(self.state, found.facts, company_id=company_id,
                                    origin=self._origin(company_id),
                                    confirmed=confirmed or set())
+            await ingest.add_contacts(self.state, company_id, found.contacts,
+                                      origin=self._origin(company_id))
         except Exception as e:
             logger.debug(f"Phone numbers not stored for {domain}: {e}")
 

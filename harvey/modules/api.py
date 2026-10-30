@@ -187,8 +187,11 @@ class Person:
 @dataclass
 class Contact:
     """A way to reach a company or a person: ``kind`` "phone" (``value`` in
-    E.164, ``display`` as written for people) or "email" (``status``
-    verified, risky, guess or invalid)."""
+    E.164, ``display`` as written for people), "email" (``status``
+    verified, risky, guess or invalid), or any other kind a manifest
+    declares (``[[contact_kinds]]``: a contact form's URL, a social
+    profile's). A capability lists the kinds it returns in its
+    ``outputs.contacts``."""
 
     kind: str
     value: str
@@ -325,8 +328,9 @@ def undeclared(draft: Draft, manifests=None) -> list[str]:
             problems.append(f"{person.module}.{person.capability} returned a person")
     for contact in draft.contacts:
         o = out(contact.module, contact.capability) or {}
-        ok = "phone" in (o.get("ids") or ()) if contact.kind == "phone" else (
-            "EMAIL_STATUS" in (o.get("facts") or ()) or o.get("records") == "people")
+        ok = contact.kind in (o.get("contacts") or ()) or (
+            "phone" in (o.get("ids") or ()) if contact.kind == "phone" else (
+                "EMAIL_STATUS" in (o.get("facts") or ()) or o.get("records") == "people"))
         if not ok:
             problems.append(f"{contact.module}.{contact.capability} returned a "
                             f"{contact.kind} contact")

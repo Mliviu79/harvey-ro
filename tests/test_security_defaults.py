@@ -128,7 +128,7 @@ async def test_held_instantly_reply_spends_no_model_call(state):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("new, expected", [(30, "write_campaign"), (0, "prospect")])
+@pytest.mark.parametrize("new, expected", [(30, "write_campaign"), (0, "idle")])
 async def test_held_drafts_do_not_block_writing_or_prospecting(new, expected):
     # A held Instantly draft must not win "send_campaign" every cycle and
     # starve the writer and scout forever.

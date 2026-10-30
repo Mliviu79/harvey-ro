@@ -678,13 +678,16 @@ def _split_person(text: str) -> dict:
     return {"name": name.strip(), "title": title.strip() if sep else ""}
 
 
-def _blocked_entries(config) -> list[str]:
+def _blocked_entries(config, strict: bool = False) -> list[str]:
     """compliance.do_not_contact, as the exports read it. Unreadable: logged
-    and treated as empty here (the exports themselves refuse to run then)."""
+    and treated as empty here, or with ``strict`` (an export) the
+    ConfigError is raised: an export never goes out without the list."""
     from harvey.export import _do_not_contact
     try:
         return _do_not_contact(config)
     except Exception as e:
+        if strict:
+            raise
         logger.warning("do_not_contact couldn't be read: %s", e)
         return []
 
@@ -884,6 +887,13 @@ async def get_company(company_id: str):
     except Exception as e:
         logger.warning("company findings failed: %s", e)
         row["findings"] = {"phones": [], "addresses": [], "facts": []}
+    try:
+        from harvey import contacts
+        async with _contacts_db() as db:
+            row["reach"] = await contacts.of_company(db, company_id)
+    except Exception as e:
+        logger.warning("company contacts failed: %s", e)
+        row["reach"] = {"contacts": [], "people": [], "locations": [], "sources": []}
     return row
 
 
@@ -1558,6 +1568,361 @@ async def get_prospects(limit: int | None = None, offset: int | None = None,
 def _state():
     from harvey.state import StateManager
     return StateManager(db_path=str(DB_PATH))
+
+
+# ── Contacts: every way to reach a company (harvey/contacts.py) ──
+
+CONTACT_KINDS_EXTRA = ("mobile",)
+CONTACT_PAGE_MAX = 200
+CONTACT_EXPORT_MAX = 500_000
+
+
+def _number_arg(raw):
+    """A bound typed in a filter box: a number, or None when empty."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    return _range_bound(str(raw).strip())
+
+
+async def _contact_filter(state, args) -> tuple[object, bool]:
+    """The ContactFilter the query string asks for, and whether the
+    financials database must be attached. Raises ValueError (or ModuleOff
+    for a hidden signal) on a bad argument."""
+    from harvey import contacts
+
+    get = lambda k: (args.get(k) or "").strip()[:200]  # noqa: E731
+    f = contacts.ContactFilter(
+        kind=get("kind"), status=get("status"), trust=get("trust"),
+        has_person=get("person"), source=get("source"), county=get("county"),
+        locality=get("locality"), website=get("website"), q=get("q"))
+    require, exclude = _codes(args.get("require") or ""), _codes(args.get("exclude") or "")
+    if require or exclude:
+        await _refuse_hidden_signals(state, [*require, *exclude])
+        f.cohort = state._verdict_sql(require, exclude, [], 0.0)
+    bounds = {k: _number_arg(args.get(k)) for k in
+              ("min_turnover", "max_turnover", "min_employees", "max_employees")}
+    attach = False
+    if any(v is not None for v in bounds.values()):
+        from harvey.modules.ro.mf_financials import store as fin_store
+
+        figures = fin_store.Filter(**bounds, unknown="include" if get("unknown") == "include"
+                                   else "exclude")
+        if Path(fin_store.FINANCIALS_PATH).is_file():
+            f.figures = figures.sql("c.cui")
+            attach = True
+        elif figures.unknown != "include":
+            # No statements on file: no company has a known figure.
+            f.figures = ("0", [])
+    return f, attach
+
+
+@asynccontextmanager
+async def _contacts_db(attach_figures: bool = False):
+    db = await aiosqlite.connect(str(DB_PATH))
+    try:
+        if attach_figures:
+            from harvey.modules.ro.mf_financials import store as fin_store
+
+            await db.execute("ATTACH DATABASE ? AS fin",
+                             (f"file:{fin_store.FINANCIALS_PATH}?mode=ro",))
+        yield db
+    finally:
+        await db.close()
+
+
+async def _capped_count(db, with_sql: str, body: str, params: list) -> tuple[int, bool]:
+    from harvey.contacts import COUNT_CAP
+
+    async with db.execute(f"{with_sql}SELECT COUNT(*) FROM (SELECT 1 {body} LIMIT ?)",
+                          (*params, COUNT_CAP + 1)) as cur:
+        (n,) = await cur.fetchone()
+    return min(n, COUNT_CAP), n > COUNT_CAP
+
+
+@app.get("/api/contacts")
+async def get_contacts(request: Request, view: str = "contacts", limit: int = 50,
+                       offset: int = 0, sort: str = "", dir: str = "desc"):
+    """One page of contacts, one row per distinct contact (a chain's shared
+    phone is one row reaching many companies), or with ``view=people`` the
+    people still to search (named, with no contact of their own). Filters
+    (query string): kind (email, phone, mobile, or any kind), status,
+    trust, person (yes/no), source, county, locality, website (yes/no),
+    require/exclude (signal codes, the cohort rules), min/max_turnover,
+    min/max_employees and unknown (include/exclude), q. ``total`` stops at
+    contacts.COUNT_CAP (``more`` says there are more)."""
+    from harvey import contacts
+
+    limit = max(1, min(int(limit or 50), CONTACT_PAGE_MAX))
+    offset = max(0, int(offset or 0))
+    people = view == "people"
+    empty = {"view": "people" if people else "contacts", "total": 0, "more": False,
+             "offset": offset, "limit": limit, "rows": [], "sources": [], "kinds": [],
+             "financials": False}
+    if not DB_PATH.exists():
+        return empty
+    state = _state()
+    await state.init_db()
+    try:
+        f, attach = await _contact_filter(state, request.query_params)
+    except ValueError as e:
+        return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    from harvey.modules.ro.mf_financials import store as fin_store
+    empty["financials"] = Path(fin_store.FINANCIALS_PATH).is_file()
+    if people:
+        with_sql, body, params = contacts.people_query(f)
+        order = contacts.order_by(contacts.PEOPLE_SORTS, sort, dir, "first_seen", "p.id")
+        select = ("SELECT p.id, p.name, p.role, p.source, p.first_seen, "
+                  f"{contacts.PERSON_SEARCHED} AS searched_at, "
+                  "c.id AS company_id, c.name AS company_name, c.location, c.cui, c.domain ")
+    else:
+        with_sql, body, params = contacts.contact_query(f)
+        order = contacts.order_by(contacts.CONTACT_SORTS, sort, dir, "first_seen", "ct.id")
+        select = ("SELECT ct.id, ct.kind, ct.value, ct.display, ct.line_type, ct.status, "
+                  "ct.do_not_contact, ct.first_seen, ct.last_seen ")
+    async with _contacts_db(attach) as db:
+        db.row_factory = aiosqlite.Row
+        total, more = await _capped_count(db, with_sql, body, params)
+        async with db.execute(f"{with_sql}{select}{body}{order} LIMIT ? OFFSET ?",
+                              (*params, limit, offset)) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        if not people:
+            found = await contacts.summaries(db, [r["id"] for r in rows])
+            for r in rows:
+                r.update(found.get(r["id"], {}))
+                r["do_not_contact"] = bool(r["do_not_contact"])
+        async with db.execute(
+                "SELECT DISTINCT source FROM people WHERE source != '' ORDER BY source" if people
+                else "SELECT DISTINCT source FROM company_contacts WHERE source != '' "
+                     "ORDER BY source") as cur:
+            sources = [r[0] for r in await cur.fetchall()]
+        async with db.execute("SELECT kind, label, channel FROM contact_kinds "
+                              "WHERE available = 1 OR kind IN (SELECT DISTINCT kind FROM contacts) "
+                              "ORDER BY rowid") as cur:
+            kinds = [dict(r) for r in await cur.fetchall()]
+    blocked = _blocked_entries(_load_config_quietly()) if not people else []
+    if blocked:
+        from harvey.gate import do_not_contact_match
+        for r in rows:
+            if r["kind"] == "email" and do_not_contact_match(r["value"], blocked):
+                r["do_not_contact"] = True
+    return {**empty, "total": total, "more": more, "rows": rows, "sources": sources,
+            "kinds": kinds}
+
+
+# A Find-contacts run takes at most this many companies (the newest first);
+# a wider filter is taken in more runs.
+FIND_MAX = 50_000
+
+
+async def _find_selection(body: dict):
+    """(state, the companies a Find-contacts request selects, its filter's
+    error or "") from {"filter": {the Contacts page's filters}, "company_ids",
+    "force", "limit"}."""
+    from harvey import finder
+
+    state = _state()
+    await state.init_db()
+    raw = body.get("filter") if isinstance(body.get("filter"), dict) else {}
+    try:
+        f, attach = await _contact_filter(state, {k: str(v) for k, v in raw.items()
+                                                  if v is not None})
+    except ValueError as e:
+        return state, [], str(e)
+    try:
+        limit = max(1, min(int(body.get("limit") or FIND_MAX), FIND_MAX))
+    except (TypeError, ValueError):
+        return state, [], "limit must be a number"
+    ids = body.get("company_ids") if isinstance(body.get("company_ids"), list) else None
+    selected = await finder.select(state, f, ids=ids, force=bool(body.get("force")),
+                                   limit=limit, attach_figures=attach)
+    return state, selected, ""
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+@app.post("/api/contacts/find/estimate")
+async def estimate_find_contacts(request: Request):
+    """What a Find-contacts run over the current filter would do and cost:
+    how many companies (with no contact, or all with ``force``), how many
+    have a website to read (free), how many need a website search, and its
+    price through the cheapest search module that can find a company."""
+    from harvey import finder
+    from harvey.modules import switches
+
+    state, selected, error = await _find_selection(await _json_body(request))
+    if error:
+        return JSONResponse({"error": error}, status_code=400)
+    from harvey.config import load_env
+
+    out = finder.estimate(selected, await switches.enabled_ids(state), load_env().model_dump())
+    return {**out, "more": len(selected) >= FIND_MAX}
+
+
+@app.post("/api/contacts/find")
+async def find_contacts(request: Request):
+    """Queue the contact finder for the current filter ({"filter", "force",
+    "max_spend", "limit"}, or "company_ids"): one batch, one job per
+    company. ``max_spend`` caps the website searches and address checks
+    (0, the default: websites are read, nothing is paid for). A company
+    already searched by a module's capability is skipped by it, unless
+    ``force`` (searched again, once in this run)."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_contact_search
+
+    body = await _json_body(request)
+    try:
+        max_spend = _money(body.get("max_spend"), default=0.0)
+    except (TypeError, ValueError):
+        return JSONResponse({"success": False, "message": "max_spend must be a number of "
+                             "dollars, 0 or more", "code": "bad_cap"}, status_code=400)
+    state, selected, error = await _find_selection(body)
+    if error:
+        return JSONResponse({"success": False, "message": error}, status_code=400)
+    if not selected:
+        return {"success": True, "queued": 0, "companies": 0, "force": bool(body.get("force"))}
+    try:
+        batch_id, ids, dupes = await enqueue_contact_search(
+            state, [c["id"] for c in selected], max_spend=max_spend,
+            force=bool(body.get("force")))
+    except jobs.Duplicate as e:
+        return JSONResponse(_duplicate_body(e), status_code=409)
+    return {"success": True, "batch_id": batch_id, "queued": len(ids),
+            "already_waiting": len(dupes), "companies": len(selected),
+            "max_spend": max_spend, "force": bool(body.get("force"))}
+
+
+@app.get("/api/contacts/finder")
+async def contact_finder_status():
+    """The contact finder's backlog: companies with no contact, those with
+    a website still to read (worked through in the background, free), those
+    it has looked at, what it did in the last day, and its jobs waiting."""
+    from harvey import finder
+
+    if not DB_PATH.exists():
+        return {"without_contact": 0, "site_to_read": 0, "searched": 0,
+                "last_day": {"companies": 0, "found": 0, "cost": 0.0}, "jobs": {}}
+    state = _state()
+    await state.init_db()
+    out = await finder.backlog(state)
+    config = _load_config_quietly()
+    spend = getattr(config, "spend", None)
+    out["day_budget"] = getattr(spend, "per_day_usd", None)
+    return out
+
+
+@app.get("/api/contacts/{contact_id}")
+async def get_contact_reach(contact_id: int):
+    """Every live company a contact reaches, through whom and where."""
+    from harvey import contacts
+
+    if not DB_PATH.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    async with _contacts_db() as db:
+        return await contacts.reach(db, contact_id)
+
+
+async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
+    """Every contact the filters match, once each (a shared phone is called
+    once, not once per company), for an export: do-not-contact ones left
+    out (an opt-out, an address on compliance.do_not_contact, and every
+    contact of a company whose domain is on it: its phones too). ConfigError
+    when the list can't be read."""
+    from harvey import contacts
+    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
+
+    state = _state()
+    await state.init_db()
+    f, attach = await _contact_filter(state, request.query_params)
+    with_sql, body, params = contacts.contact_query(f)
+    order = contacts.order_by(contacts.CONTACT_SORTS, request.query_params.get("sort", ""),
+                              request.query_params.get("dir", "desc"), "first_seen", "ct.id")
+    blocked = _blocked_entries(_load_config_quietly(), strict=True)
+    out: list[dict] = []
+    async with _contacts_db(attach) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+                f"{with_sql}SELECT ct.id, ct.kind, ct.value, ct.display, ct.line_type, ct.status, "
+                f"ct.first_seen, ct.last_seen {body} AND ct.do_not_contact = 0{order} LIMIT ?",
+                (*params, CONTACT_EXPORT_MAX)) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        rows = [r for r in rows if not (r["kind"] == "email" and blocked
+                                        and do_not_contact_match(r["value"], blocked))]
+        for start in range(0, len(rows), 500):
+            chunk = rows[start:start + 500]
+            found = await contacts.summaries(db, [r["id"] for r in chunk])
+            marks = ",".join("?" * len(chunk))
+            names: dict[int, list[str]] = {}
+            people: dict[int, list[str]] = {}
+            barred: set[int] = set()
+            async with db.execute(
+                    "SELECT l.contact_id, c.name, COALESCE(p.name, ''), COALESCE(c.domain, '') "
+                    "FROM company_contacts l JOIN companies c ON c.id = l.company_id "
+                    "LEFT JOIN people p ON p.id = l.person_id "
+                    f"WHERE l.contact_id IN ({marks}) AND COALESCE(c.merged_into, '') = '' "
+                    "ORDER BY l.contact_id, l.id", [r["id"] for r in chunk]) as cur:
+                for cid, company, person, domain in await cur.fetchall():
+                    if blocked and domain and do_not_contact_domain_match(domain, blocked):
+                        barred.add(cid)
+                    if company and company not in names.setdefault(cid, []):
+                        names[cid].append(company)
+                    if person and person not in people.setdefault(cid, []):
+                        people[cid].append(person)
+            for r in chunk:
+                if r["id"] in barred:
+                    continue
+                info = found.get(r["id"], {})
+                out.append({
+                    "kind": r["kind"], "value": r["value"], "display": r["display"] or r["value"],
+                    "line_type": r["line_type"], "status": r["status"],
+                    "trust": info.get("trust", ""), "companies": info.get("companies", 0),
+                    "company_names": "; ".join(names.get(r["id"], [])[:10]),
+                    "people": "; ".join(people.get(r["id"], [])[:10]),
+                    "sources": "; ".join(info.get("sources", [])),
+                    "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
+    return out, len(out)
+
+
+CONTACT_EXPORT_COLUMNS = ["kind", "value", "display", "line_type", "status", "trust",
+                          "companies", "company_names", "people", "sources", "first_seen",
+                          "last_seen"]
+
+
+@app.get("/api/export/contacts.csv")
+async def export_contacts_csv(request: Request):
+    """The filtered contacts as CSV (same filters as /api/contacts)."""
+    from harvey.export import to_csv
+
+    from harvey.config import ConfigError
+
+    try:
+        rows, _ = await _contact_export_rows(request)
+    except ConfigError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return _csv_download(to_csv(rows, CONTACT_EXPORT_COLUMNS),
+                         f"contacts-{date.today().isoformat()}.csv")
+
+
+@app.get("/api/export/contacts.json")
+async def export_contacts_json(request: Request):
+    """The filtered contacts as JSON (same filters as /api/contacts)."""
+    from harvey.config import ConfigError
+
+    try:
+        rows, _ = await _contact_export_rows(request)
+    except ConfigError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse(rows, headers={
+        "Content-Disposition": f'attachment; filename="contacts-{date.today().isoformat()}.json"'})
 
 
 # What a reviewer needs next to a draft to check its claims against the facts.
@@ -2639,7 +3004,8 @@ async def get_activity():
 
 async def _batch_summary(state, batch_id: str) -> dict | None:
     """What a Descoperă run (one batch of jobs) did so far: its searches'
-    reports merged, the sites read, and how many of its jobs are where."""
+    reports merged, each source's own progress, the registry pulls, the
+    sites read and contacts found, and how many of its jobs are where."""
     from harvey.modules import jobs
     from harvey.modules.job_kinds import merge_reports
 
@@ -2648,7 +3014,9 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
         return None
     found = await jobs.list_jobs(state, batch_id=batch_id, limit=100000)
     searches = [j for j in found if j.kind == "discover"]
+    pulls = [j for j in found if j.kind == "registry_pull"]
     sites = [j for j in found if j.kind == "site_read"]
+    finder = [j for j in found if j.kind == "find_contacts"]
     report = merge_reports([j.progress.get("report") or j.result for j in searches])
     report["errors"] = (report["errors"] + [f"{j.label}: {j.error}" for j in found
                                              if j.status == jobs.FAILED and j.error])[:20]
@@ -2656,38 +3024,82 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
     for j in found:
         statuses[j.status] = statuses.get(j.status, 0) + 1
     paused = [j for j in found if j.status == jobs.PAUSED]
+    active = (jobs.QUEUED, jobs.RUNNING)
+    # Each source of the run on its own: its jobs' states and what they found.
+    sources: dict[str, dict] = {}
+    for j in searches + pulls:
+        key = j.params.get("provider") or j.params.get("source") or j.kind
+        s = sources.setdefault(key, {"key": key, "jobs": {}, "found": 0, "new_companies": 0,
+                                     "known_companies": 0, "actual_cost": 0.0, "active": 0})
+        s["jobs"][j.status] = s["jobs"].get(j.status, 0) + 1
+        s["active"] += j.status in active
+        s["actual_cost"] = round(s["actual_cost"] + float(j.actual_cost or 0.0), 4)
+        r = ((j.result or {}).get("report") or {}) if j.kind == "registry_pull" else (
+            j.progress.get("report") or j.result or {})
+        s["found"] += int(r.get("in_area" if j.kind == "registry_pull" else "found") or 0)
+        for k in ("new_companies", "known_companies"):
+            s[k] += int(r.get(k) or 0)
+            if j.kind == "registry_pull":
+                # (A search's are in the merged report already.)
+                report[k] += int(r.get(k) or 0)
     return {
         **report,
         "batch_id": batch_id, "label": batch.get("label") or "",
         "max_spend": batch.get("max_spend"),
-        "profiled_companies": sum(1 for j in sites if j.status == jobs.DONE),
+        "spent": round(sum(float(j.actual_cost or 0.0) for j in found), 4),
+        "sources": list(sources.values()),
+        "profiled_companies": sum(1 for j in sites if j.status == jobs.DONE)
+                              + sum(1 for j in finder if j.status == jobs.DONE
+                                    and "site" in (j.result.get("steps") or [])),
         "profile_observations": sum(int(j.result.get("observations") or 0) for j in sites),
-        "sites_waiting": sum(1 for j in sites if j.status in (jobs.QUEUED, jobs.RUNNING)),
+        "contacts_found": sum(int(j.result.get("contacts") or 0) for j in finder),
+        "finder_waiting": sum(1 for j in finder if j.status in active),
+        "sites_waiting": sum(1 for j in sites if j.status in active),
         "jobs": statuses,
         "spend_limited": sum(1 for j in paused if j.paused_reason == jobs.SPEND_LIMIT),
-        "running": any(j.status in (jobs.QUEUED, jobs.RUNNING) for j in found),
+        "running": any(j.status in active for j in found),
         # Searches of this run still to finish: what its Stop stops.
-        "searches_active": sum(1 for j in searches if j.status in (jobs.QUEUED, jobs.RUNNING)),
+        "searches_active": sum(1 for j in searches + pulls if j.status in active),
     }
 
 
+def _source_keys(body: dict) -> list[str]:
+    """The sources a Discover request names: ``providers`` (a list), or
+    the older single ``provider``."""
+    keys = body.get("providers")
+    if isinstance(keys, str):
+        keys = [k.strip() for k in keys.split(",")]
+    if not isinstance(keys, list) or not keys:
+        keys = [body.get("provider") or ""]
+    return list(dict.fromkeys(str(k) for k in keys if k))
+
+
 async def _discovery_refusal(body: dict):
-    """Why the source or preset asked for can't run (a ModuleOff: its
+    """Why a source or the preset asked for can't run (a ModuleOff: its
     module is off), or None."""
     from harvey.modules import switches
+    from harvey.modules.job_kinds import discover_sources
 
     state = _state()
     await state.init_db()
-    return switches.discovery_problem(await switches.enabled_ids(state),
-                                      str(body.get("provider") or ""),
-                                      str(body.get("preset") or ""))
+    enabled = await switches.enabled_ids(state)
+    jobbed = {s["key"]: s["module"] for s in discover_sources()}
+    for key in _source_keys(body) or [""]:
+        if key in jobbed:
+            if jobbed[key] not in enabled:
+                return switches.ModuleOff(jobbed[key], f"The {key} discovery source")
+            continue
+        problem = switches.discovery_problem(enabled, key, str(body.get("preset") or ""))
+        if problem:
+            return problem
+    return None
 
 
-def _discovery_queries(body: dict, config):
+def _discovery_queries(body: dict, config, provider: str = ""):
     from harvey.collectors.discover import build_queries, preset_problem
 
     preset = str(body.get("preset") or "")
-    problem = preset_problem(preset, str(body.get("provider") or ""), config=config)
+    problem = preset_problem(preset, provider or str(body.get("provider") or ""), config=config)
     if problem:
         raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
@@ -2700,13 +3112,59 @@ def _discovery_queries(body: dict, config):
     )
 
 
+def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
+    """One part per source the request ticked: a search source's queries,
+    or a registry pull's parameters from its filters. A source that can't
+    take this run (a preset it can't search with, filters that say
+    nothing) is skipped with a note, unless it is the only one: then the
+    run is refused (ValueError). Unknown sources are refused."""
+    from harvey.collectors.discover import PROVIDERS
+    from harvey.modules.job_kinds import discover_sources, registry_plan
+
+    keys = _source_keys(body)
+    if not keys:
+        raise ValueError("pick at least one source")
+    jobbed = {s["key"]: s for s in discover_sources()}
+    filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
+    plan, notes = [], []
+    for key in keys:
+        try:
+            if key in PROVIDERS:
+                plan.append({"provider": key, "label": PROVIDERS[key].label,
+                             "queries": _discovery_queries(body, config, key)})
+            elif key in jobbed:
+                src = jobbed[key]
+                if src["job"] != "registry_pull":
+                    # Only the registry's filters are read here: another
+                    # source run as a job needs its own planner first.
+                    raise ValueError(f"{key} can't be run from Discover yet")
+                params = registry_plan(filters.get(key) or {})
+                plan.append({"source": key, "job": src["job"], "label": params.pop("label"),
+                             "params": params, "name": src["label"]})
+            else:
+                raise LookupError(f"unknown provider {key!r}")
+        except LookupError:
+            raise
+        except ValueError as e:
+            if len(keys) == 1:
+                raise
+            notes.append(f"{key}: {e}")
+    if not plan:
+        raise ValueError("; ".join(notes) or "no source can take this run")
+    return plan, notes
+
+
 @app.get("/api/discover/providers")
 async def get_discovery_providers():
-    """What each source does, what it costs, and whether it's ready to use."""
+    """What each source does, what it costs, and whether it's ready to use:
+    the search modules' providers and every source Discover runs as a job
+    (the registry, with the filters its manifest declares); the runs still
+    working, and the newest one."""
     try:
         from harvey.collectors.discover import DEFAULT_PROVIDER, PRESETS, provider_menu
         from harvey.config import load_env
         from harvey.modules import switches
+        from harvey.modules.job_kinds import discover_sources
 
         state = _state()
         await state.init_db()
@@ -2715,24 +3173,34 @@ async def get_discovery_providers():
             "SELECT id FROM job_batches WHERE kind IN ('discover', 'site_read') "
             "ORDER BY rowid DESC LIMIT 1")
         last = await _batch_summary(state, batches[0]["id"]) if batches else None
+        working = await query_db(
+            "SELECT DISTINCT b.id FROM job_batches b JOIN jobs j ON j.batch_id = b.id "
+            "WHERE b.kind IN ('discover', 'site_read') AND j.status IN ('queued', 'running') "
+            "ORDER BY b.rowid DESC LIMIT 10")
+        runs = [s for s in [await _batch_summary(state, r["id"]) for r in working] if s]
         active = await query_db(
-            "SELECT kind, COUNT(*) AS n FROM jobs WHERE kind IN ('discover', 'site_read') "
-            "AND status IN ('queued', 'running') GROUP BY kind")
+            "SELECT kind, COUNT(*) AS n FROM jobs WHERE kind IN ('discover', 'site_read', "
+            "'registry_pull') AND status IN ('queued', 'running') GROUP BY kind")
         kinds = {r["kind"]: r["n"] for r in active}
+        selected = await state.get_setting("discovery_provider") or DEFAULT_PROVIDER
         return {
             "providers": provider_menu(load_env().model_dump(), enabled),
+            "sources": discover_sources(enabled),
             # Presets whose module is off are hidden from the picker.
             "presets": {key: switches.capability_owner("preset", key) in enabled
                         for key in PRESETS},
             "default": DEFAULT_PROVIDER,
-            "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
+            "selected": selected,
+            "selected_all": [k for k in selected.split(",") if k],
             "paused": await state.get_setting("discovery_paused"),
             "running": bool(kinds),
-            "running_kind": "discover" if kinds.get("discover") else "profile",
-            "searches_waiting": kinds.get("discover", 0),
+            "running_kind": "discover" if kinds.get("discover") or kinds.get("registry_pull")
+                            else "profile",
+            "searches_waiting": kinds.get("discover", 0) + kinds.get("registry_pull", 0),
             "sites_waiting": kinds.get("site_read", 0),
             "unprofiled": await state.count_companies_needing_profile(),
             "last_report": last,
+            "active_runs": runs,
         }
     except Exception as e:
         logger.exception("discovery providers failed")
@@ -2742,44 +3210,75 @@ async def get_discovery_providers():
 @app.post("/api/discover/estimate")
 async def estimate_discovery(request: Request):
     """Projected spend and the exact query list, before anything is
-    collected. A source that can count (DataForSEO Business Listings) is
-    asked how many results each search has first, a small paid request
-    each, so the price is exact; the answer says what counting cost."""
+    collected, for every source ticked (``providers``; ``provider`` for
+    one): the sum, and each source's own. A source that can count
+    (DataForSEO Business Listings) is asked how many results each search
+    has first, a small paid request each, so the price is exact; the
+    answer says what counting cost. The registry's estimate is its free
+    count of the firms that match."""
     try:
+        import asyncio
+
         from harvey.collectors.discover import PROVIDERS, estimate_cost
         from harvey.config import load_config
+        from harvey.modules.job_kinds import registry_count
         from harvey.modules.runs import run_discovery
 
         body = await request.json()
-        provider = body.get("provider") or ""
-        if provider not in PROVIDERS:
-            return JSONResponse({"error": f"unknown provider {provider!r}"},
-                                status_code=400)
         refusal = await _discovery_refusal(body)
         if refusal:
             return JSONResponse(_error_body(refusal), status_code=409)
-
         config = load_config()
         try:
-            queries = _discovery_queries(body, config)
+            plan, notes = _discovery_plan(body, config)
+        except LookupError as e:
+            return JSONResponse({"error": str(e).strip("'\"")}, status_code=400)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
-        if PROVIDERS[provider].can_count:
-            state = _state()
-            await state.init_db()
-            report = await run_discovery(state, config, provider, queries,
-                                         dry_run=True, count=True)
-            counted = {"counted": report.counted, "available": report.available,
-                       "count_cost": round(report.count_cost, 4),
-                       "errors": report.errors}
+        state = _state()
+        await state.init_db()
+        parts = []
+        for part in plan:
+            if part.get("provider"):
+                key, queries = part["provider"], part["queries"]
+                counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
+                if PROVIDERS[key].can_count:
+                    report = await run_discovery(state, config, key, queries,
+                                                 dry_run=True, count=True)
+                    counted = {"counted": report.counted, "available": report.available,
+                               "count_cost": round(report.count_cost, 4),
+                               "errors": report.errors}
+                parts.append({"key": key, "label": part["label"],
+                              "queries": [q.keyword() for q in queries],
+                              "query_count": len(queries),
+                              "estimated_cost": round(estimate_cost(key, queries), 4),
+                              "free": PROVIDERS[key].estimate(queries) == 0, **counted})
+            else:
+                try:
+                    n = await asyncio.to_thread(registry_count, part["params"])
+                    errors = []
+                except FileNotFoundError as e:
+                    n, errors = None, [f"{e} (the filter needs it)"]
+                parts.append({"key": part["source"], "label": part["label"],
+                              "queries": [part["label"]], "query_count": 1,
+                              "estimated_cost": 0.0, "free": True, "counted": n is not None,
+                              "available": n, "count_cost": 0.0,
+                              "errors": errors or ([] if n is not None else [
+                                  "no registry loaded yet: the run loads it first (about "
+                                  "1.5 GB, once per dataset)"])})
+        queries = [q for p_ in parts for q in p_["queries"]]
+        counted_all = all(p_["counted"] for p_ in parts)
         return {
-            "provider": provider,
-            "queries": [q.keyword() for q in queries],
-            "query_count": len(queries),
-            "estimated_cost": round(estimate_cost(provider, queries), 4),
-            "free": PROVIDERS[provider].estimate(queries) == 0,
-            **counted,
+            "provider": parts[0]["key"],
+            "sources": parts, "notes": notes,
+            "queries": queries, "query_count": len(queries),
+            "estimated_cost": round(sum(p_["estimated_cost"] for p_ in parts), 4),
+            "free": all(p_["free"] for p_ in parts),
+            "counted": counted_all if len(parts) > 1 else parts[0]["counted"],
+            "available": (sum(p_["available"] or 0 for p_ in parts)
+                          if any(p_["available"] is not None for p_ in parts) else None),
+            "count_cost": round(sum(p_["count_cost"] for p_ in parts), 4),
+            "errors": [e for p_ in parts for e in p_["errors"]],
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -2808,22 +3307,18 @@ def _money(value, default: float | None = None) -> float:
 
 @app.post("/api/discover/run")
 async def start_discovery(request: Request):
-    """Queue the run and hand back at once: one job per search, on the
-    source's own lane. Another run, of this source or any other, queues
-    behind or beside it; the same search asked again while it still waits
-    is refused, naming the job already there."""
+    """Queue the run and hand back at once: every source ticked in one
+    batch under one spend cap, a job per search on the source's own lane
+    and a registry pull on the registry's. Another run, of these sources or
+    any other, queues behind or beside it; the same search asked again
+    while it still waits is refused, naming the job already there. What
+    every source saves feeds the contact finder."""
     try:
-        from harvey.collectors.discover import PROVIDERS
         from harvey.config import load_config
         from harvey.modules import jobs
-        from harvey.modules.job_kinds import enqueue_discovery
+        from harvey.modules.job_kinds import enqueue_sources
 
         body = await request.json()
-        provider = body.get("provider") or ""
-        if provider not in PROVIDERS:
-            return JSONResponse({"success": False,
-                                 "message": f"unknown provider {provider!r}"},
-                                status_code=400)
         refusal = await _discovery_refusal(body)
         if refusal:
             return JSONResponse(_error_body(refusal, "message", success=False),
@@ -2831,26 +3326,31 @@ async def start_discovery(request: Request):
 
         config = load_config()
         try:
-            queries = _discovery_queries(body, config)
+            plan, notes = _discovery_plan(body, config)
+        except LookupError as e:
+            return JSONResponse({"success": False, "message": str(e).strip("'\"")},
+                                status_code=400)
         except ValueError as e:
             return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         try:
-            max_spend = _money(body.get("max_spend") or None, default=1.0)
+            # 0 is a cap of nothing (free sources only); blank, the default.
+            max_spend = _money(body.get("max_spend"), default=1.0)
         except (TypeError, ValueError):
             return JSONResponse({"success": False, "message": "max_spend must be a number "
                                  "of dollars, 0 or more", "code": "bad_cap"}, status_code=400)
 
         state = _state()
         await state.init_db()
-        await state.set_setting("discovery_provider", provider)
+        await state.set_setting("discovery_provider",
+                                ",".join(p_.get("provider") or p_["source"] for p_ in plan))
         await state.set_setting("discovery_paused", "")
         try:
-            batch_id, ids, dupes = await enqueue_discovery(
-                state, provider, queries, max_spend=max_spend,
-                label=PROVIDERS[provider].label)
+            batch_id, ids, dupes = await enqueue_sources(
+                state, plan, max_spend=max_spend,
+                label=" + ".join(p_.get("name") or p_["label"] for p_ in plan))
         except jobs.Duplicate as e:
             return JSONResponse(_duplicate_body(e), status_code=409)
-        return {"success": True, "queries": len(ids), "batch_id": batch_id,
+        return {"success": True, "queries": len(ids), "batch_id": batch_id, "notes": notes,
                 "duplicates": [d.as_dict() for d in dupes]}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -2882,14 +3382,15 @@ async def start_profile():
 
 @app.post("/api/discover/stop")
 async def stop_discovery(request: Request):
-    """Cancel the searches of one run ({"batch_id"}; or, without one, of
-    one source, {"provider"}) still to finish. A running one stops after
-    its page, keeping what it found; sites already queued are still read.
-    Other runs (another source's, a command's) and searches paused at a
-    spend limit or by hand are left alone."""
+    """Cancel what is still to finish of one run ({"batch_id"}), of one
+    source within it ({"batch_id", "provider"}), or of one source in every
+    run ({"provider"}): its searches and registry pulls. A running search
+    stops after its page, keeping what it found; sites and contacts already
+    queued are still looked at. Other runs (another source's, a command's)
+    and searches paused at a spend limit or by hand are left alone."""
     try:
         from harvey.modules import jobs
-        from harvey.modules.job_kinds import discovery_lane
+        from harvey.modules.job_kinds import discover_sources, discovery_lane
 
         try:
             body = await request.json()
@@ -2901,18 +3402,25 @@ async def stop_discovery(request: Request):
         if not batch_id and not provider:
             return JSONResponse({"success": False, "message": "say which run to stop "
                                  "(batch_id) or which source (provider)"}, status_code=400)
+        jobbed = {s["key"]: s["module"] for s in discover_sources()}
         lane = None
         if not batch_id:
-            try:
-                lane = discovery_lane(provider)[0]
-            except ValueError as e:
-                return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+            if provider in jobbed:
+                lane = jobbed[provider]
+            else:
+                try:
+                    lane = discovery_lane(provider)[0]
+                except ValueError as e:
+                    return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         state = _state()
         await state.init_db()
         stopped = 0
         for job in await jobs.list_jobs(state, statuses=(jobs.QUEUED, jobs.RUNNING),
                                         batch_id=batch_id or None, lane=lane, limit=100000):
-            if job.kind != "discover" or (provider and job.params.get("provider") != provider):
+            if job.kind not in ("discover", "registry_pull"):
+                continue
+            key = job.params.get("provider") or job.params.get("source") or ""
+            if provider and key != provider:
                 continue
             try:
                 await jobs.cancel(state, job.id)

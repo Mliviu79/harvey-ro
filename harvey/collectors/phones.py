@@ -53,6 +53,21 @@ def phone_type(number) -> str:
     return _TYPES.get(phonenumbers.number_type(number), "other")
 
 
+# What a number can take: an SMS audience is the mobiles. Numbers whose kind
+# the numbering plan doesn't say (US and Canadian ones) are "unknown".
+_LINE_TYPES = {
+    PhoneNumberType.MOBILE: "mobile",
+    PhoneNumberType.FIXED_LINE: "fixed",
+    PhoneNumberType.VOIP: "voip",
+    PhoneNumberType.TOLL_FREE: "toll_free",
+}
+
+
+def line_type(number) -> str:
+    """mobile / fixed / voip / toll_free / unknown, for a parsed number."""
+    return _LINE_TYPES.get(phonenumbers.number_type(number), "unknown")
+
+
 def _hit(number, source: str) -> PhoneHit:
     return PhoneHit(
         number=phonenumbers.format_number(number, PhoneNumberFormat.E164),

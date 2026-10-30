@@ -111,7 +111,7 @@ handle replies  >  send campaigns  >  write campaigns  >  prospect  >  idle (ana
 
 Outbox draining rides along on **every** cycle regardless, because it has to happen on schedule.
 
-The heartbeat is the Email module's: it reads replies, writes and sends, and with the Email module off it does nothing. Finding companies, reading their sites and loading public data are **jobs** the worker runs (see [The queue](#the-queue-background-jobs)); when there is nobody left to write to, the heartbeat queues a contact search as one.
+The heartbeat is the Email module's: it reads replies, writes and sends, and with the Email module off it does nothing. Finding companies, reading their sites, finding contacts and loading public data are **jobs** the worker runs (see [The queue](#the-queue-background-jobs)), whatever the Email switch says. The heartbeat never looks for people: the [contact finder](#the-contact-finder) does, on its own.
 
 ### The queue (background jobs)
 
@@ -308,7 +308,10 @@ The only stage that spends money, so it always estimates first and never calls a
 harvey discover --providers   # the menu, with real prices
 harvey discover --estimate    # projected spend, then exits
 harvey discover               # go
+harvey discover --provider serper,tinyfish --max-spend 2.00   # several sources, one run, one cap
 ```
+
+On the dashboard's **Descoperă** tab the sources are checkboxes: tick several and they run as one batch under one spend cap, the estimate is their sum, and a preset a source can't search with leaves that source out with a note instead of refusing the run. The ONRC trade registry is one of the sources (every query capability that records companies and says in its manifest how Discover runs it, `discover = "registry_pull"`): ticked, it shows the filters its manifest declares (activity or CAEN code, county, town, turnover, employees, employer, VAT, micro-enterprise tax), its estimate is the free count of matching firms, and it queues a registry pull in the same batch. Each run still working shows each source's progress, with a Stop for the run and for each source. What every source saves feeds the [contact finder](#the-contact-finder).
 
 Every search takes every result the source has, page by page: "dentist
 București" is not a page of 100, it is all of them. The one stop is your spend
@@ -672,7 +675,8 @@ The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeli
 **Pipeline**
 - **Signals** — the confirmation gate and the cohort builder
 - **Discover** — the provider menu with prices side by side, an estimate, then a run; plus reading the sites of companies found but not yet looked at
-- **Companies / Contacts** — everything found, searchable, with CSV export
+- **Companies** — everything found, searchable, with CSV export
+- **Contacts** — every way to reach a company, one row per distinct email or phone (a chain's shared number is one row reaching all its companies; expand it to see them), with its kind, phone line type (mobile, fixed, VoIP), status, trust and sources. Filters: kind (email, phone, mobile), status, trust, has a person, source, county or town, company has a website, signals the company has or lacks (the cohort rules), turnover and employees when the financial statements are loaded, and text. Paged on the server; past 100,000 the count says "over N". **People to search** lists everyone named at a company (a registry's administrators, a team page) with no email or phone of their own yet. **Find contacts** runs the [contact finder](#the-contact-finder) over the current filters, priced first and under the cap you type; tick **Search again** to also search those already searched. Above the list, the finder's backlog. CSV and JSON exports list each contact once and leave do-not-contact ones out. The Email module's outreach list is a third view while that module is on.
 - **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
 
 **System**
@@ -712,6 +716,48 @@ Four things fall out of that, none of which you get from columns:
 The vocabulary is governed: a database trigger rejects any `signal_code` not in the `signal_codes` table, so a typo fails loudly instead of quietly inventing a junk signal.
 
 Other tables: `companies`, `prospects`, `campaigns`, `conversations`, `outbox`, `actions`, `runs`, `usage_events`, `email_patterns`, `settings`, `feedback`.
+
+### Contacts, people, places, sources and searches
+
+Harvey's job is finding ways to reach companies, so contacts have tables of their own (`harvey/contacts.py`):
+
+| Table | One row per |
+|---|---|
+| `contacts` | distinct contact: `(kind, value)` is unique, an email lowercased, a phone in E.164 with its `line_type` (mobile, fixed, voip, toll_free, unknown, from the numbering plan: an SMS audience is the mobiles), its `status` (an email's verified / risky / guess / invalid / unchecked, a phone's valid / invalid) and `do_not_contact` (an opt-out) |
+| `company_contacts` | link between a company and a contact, optionally through a person and at a place, one per source that gave it (a phone a site published and ANAF confirmed is two links), with the source and capability that found it, the page it was on, and `trust`: confirmed, likely or unconfirmed. Many to many: a pharmacy chain's hundred companies can share one phone and one email, and that is one contact linked a hundred times, not a duplicate and not a merge. A contact is never thrown away because its match is unproven: it is kept with its trust and source, and you filter on them. |
+| `people` | person named at a company (an administrator from the registry, a team page's member), with their role |
+| `locations` | place of a company: a listing that matched a company on file (by its website or phone) is one of its branches, with its own address and phone |
+| `company_sources` | source a company was found in (one company, many sources; `companies.source` stays the first) |
+| `searches` | search of a record (a company, a person) by a module's capability: what it looked for, when, what it found, what it cost |
+
+The kinds of contact are an open list: modules declare them in their manifests (`[[contact_kinds]]`; core declares email, phone, contact_form, linkedin, facebook, instagram and whatsapp) and a trigger refuses any kind nobody declared, so a new channel is a new module. A social profile is only kept when the company's own website links to it: Harvey never reads LinkedIn, Facebook or Instagram.
+
+**A record searched once isn't searched there again.** A company searched by one source (a site read, Serper, TinyFish, the address check) is skipped by that source on the next run, whatever it found, and can still be searched by any other: a search module you set up later goes back over the companies the others found nothing for. A plain **Read sites** read looks for phones and a contact form only, so it doesn't count as the finder's read of the site for its emails. A capability can declare `refresh_days` in its manifest to search again after that long (by default, never). An error isn't a search done: it is tried again. To search again anyway, tick **Search again** next to **Find contacts**, or `harvey contacts --force`. The company panel shows where and when it was searched and with what result.
+
+### The contact finder
+
+Every company with no contact is a record to search, whichever source brought it in (the registry, a listing, a search). The finder (`harvey/finder.py`, the core `contact_finder` module) works on one company per job, on the **contacts** lane, and has nothing to do with the email loop: it runs whatever the Email switch says.
+
+1. **What is on file, free.** Phones from ANAF and the taxpayer file are contacts already. A website the company's key or its registry entry gives is read: its phones (each marked mobile or fixed), the addresses it publishes (one on the company's own domain is trusted, another only maybe), its contact form, the social profiles and WhatsApp links its pages point to (never read on those networks), and the people its team page names.
+2. **A website search, only inside a cap.** A company with no website and no contact is looked up by its name and town through each search module whose capability says `lookup = "website"` in its manifest (TinyFish, Serper, Scavio, DataForSEO; not OpenStreetMap, which only searches by trade), cheapest first, until one gives a candidate. The results are read once, in memory, and never stored; directories and booking platforms are never taken for the company's site. The candidate is read like any website and tagged **confirmed** (a page carries the company's CUI, or a phone or email already on file), **likely** (the name matches and a page names its town) or **unconfirmed**. Nothing is thrown away: every contact read off it carries no more than that trust, and you filter on it. Below confirmed, the site says nothing else about the company (no facts, no new name) and its domain doesn't become the company's key.
+3. **One checked address per person.** For each person named at a company with a website (a registry administrator, a team page's member) and no contact of their own, one address built from the domain's pattern is checked with your verifier tier (Reoon, ZeroBounce, Hunter). The registry writes the family name first, so "POPESCU ION" is Ion Popescu.
+
+Paid steps (searches and address checks) run only inside a spend cap you set: a Find-contacts run's cap, or for background work `spend.per_day_usd` in harvey.yaml (off by default, and then the background never pays for anything). Without one they are skipped, the job says so, and the company stays on the backlog for a run with a cap. A search that costs nothing (a free tier priced at $0) needs no cap. Address checks also count against the month's checks, `EMAIL_VERIFY_MONTHLY_CHECKS` in `.env` (600 by default, Reoon's free tier): a cap in dollars can't see free-tier credits.
+
+**When it runs.** For every company with a website a Discover run saves or matches, in that run's batch, free: its site is read (a registry pull hands it to the ANAF checks first). A Discover run's cap is for its own searches; looking up the companies it saved with no website is a Find-contacts run of its own, priced and capped. On demand: **Find contacts** on the Contacts page (the current filters) and in the Companies menu (the selection or the search's results) price the run first (websites to read are free; companies with no website cost one search each through the cheapest module), then run it under the cap you type. In the background, the worker feeds the backlog a little at a time: companies with a website not read yet, newest first, free; with `spend.per_day_usd` set, also companies with no website that a search module you set up hasn't searched yet. When nothing is left it rests for 15 minutes before looking again. The Contacts page shows the backlog (companies with no contact, those with a website still to read, what the finder did in the last day), and so does `harvey contacts status`.
+
+```bash
+harvey contacts status                         # the backlog
+harvey contacts find --county Brașov           # companies in Brașov with no contact: websites only (free)
+harvey contacts find --website no --max-spend 2.00   # look up companies with no website, up to $2
+harvey contacts find --force --limit 50        # search again, even what was searched before
+```
+
+**From contacts to the Email module.** The finder knows nothing about email campaigns. While the Email module is on, each heartbeat takes the email contacts it could write to (not do-not-contact, trust confirmed or likely) that aren't prospects yet and makes them prospects for the Writer; an address a site published and nobody checked is checked first (a credit from the same monthly checks), and one that comes back a guess or invalid stays a contact only.
+
+Every row says which company it was found for before any merge, so a merge moves them to the survivor (a link the survivor already has stays parked with its provenance) and undoing it sends back exactly what was found for the other record.
+
+Upgrading builds these tables from what is on file (phones, the registry's administrators, prospects and their emails, contact forms, sources, the contact searches already done), in set-based SQL: on a synthetic database the size of a whole-country install (1.78 million companies, 1.5 million administrators, 137,000 phones) it took about a minute.
 
 ---
 
@@ -826,8 +872,9 @@ harvey worker                # run queued jobs without the dashboard (one worker
 harvey jobs                  # the queue per lane; cancel|retry|resume ID, pause|resume-lane LANE
                              # (resume ID --max-spend N raises a paused run's cap)
 harvey signals               # review/confirm what to prospect against
-harvey discover              # find businesses; --providers / --estimate; one job per search
+harvey discover              # find businesses; --providers / --estimate; --provider a,b runs several in one batch
 harvey profile               # read discovered companies' sites (free); one job per company
+harvey contacts [find|status]  # the contact finder: find (filters, --max-spend, --force, --background) or the backlog
                              # (these and the loads and checks below wait for their jobs;
                              #  --background queues them and returns)
 harvey registry load         # the whole trade registry into data/registry.db, once per dataset

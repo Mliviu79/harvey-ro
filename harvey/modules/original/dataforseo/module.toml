@@ -101,6 +101,8 @@ when_known = "search"
 id = "business_listings"
 op = "query"
 provider = "dataforseo_listings"
+# Finds a company by its name and town (the contact finder's website lookup).
+lookup = "website"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
 cost = { usd = 0.012, per = "page", plus_usd = 0.00036, plus_per = "business", note = "every business the search matches, 1,000 a page; the estimate counts them first" }
@@ -109,6 +111,8 @@ cost = { usd = 0.012, per = "page", plus_usd = 0.00036, plus_per = "business", n
 id = "organic_rank"
 op = "query"
 provider = "dataforseo_serp"
+# Finds a company by its name and town (the contact finder's website lookup).
+lookup = "website"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "IN_LOCAL_PACK", "FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
 cost = { usd = 0.002, per = "page", note = "10 results a page, up to 200 (DataForSEO's maximum), Live endpoint" }
@@ -117,6 +121,8 @@ cost = { usd = 0.002, per = "page", note = "10 results a page, up to 200 (DataFo
 id = "maps_rank"
 op = "query"
 provider = "dataforseo_maps"
+# Finds a company by its name and town (the contact finder's website lookup).
+lookup = "website"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["MAPS_RANK", "FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
 cost = { usd = 0.002, per = "page", note = "100 results a page, up to 700 (DataForSEO's maximum), Live endpoint" }

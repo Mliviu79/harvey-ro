@@ -32,5 +32,38 @@ cost_note = "free (site HTML)"
 id = "read_site"
 op = "read"
 inputs = [["domain"]]
-outputs = { records = "pages", facts = ["CONTACT_FORM_URL"], values = ["name"] }
+outputs = { records = "pages", facts = ["CONTACT_FORM_URL"], values = ["name"], contacts = ["email", "contact_form", "linkedin", "facebook", "instagram", "whatsapp"] }
 cost = { usd = 0.0, per = "company" }
+
+# The ways a company's own site says it can be reached. A social profile is
+# kept only when the company's own pages link to it: Harvey never reads the
+# social networks themselves (their terms forbid it).
+[[contact_kinds]]
+kind = "email"
+label = "Email"
+channel = "email"
+
+[[contact_kinds]]
+kind = "contact_form"
+label = "Contact form"
+channel = "web"
+
+[[contact_kinds]]
+kind = "linkedin"
+label = "LinkedIn"
+channel = "social"
+
+[[contact_kinds]]
+kind = "facebook"
+label = "Facebook"
+channel = "social"
+
+[[contact_kinds]]
+kind = "instagram"
+label = "Instagram"
+channel = "social"
+
+[[contact_kinds]]
+kind = "whatsapp"
+label = "WhatsApp"
+channel = "message"

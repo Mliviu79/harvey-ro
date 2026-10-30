@@ -943,6 +943,14 @@ details[open] > summary::before { rotate: 45deg; }
 .prov-card .row .k { color: var(--text-3); min-width: 52px; flex: none; }
 .prov-card .row .v { color: var(--text-2); }
 .prov-card .row a { color: var(--accent); }
+.prov-head input[type="checkbox"] { flex: none; width: 16px; height: 16px; accent-color: var(--accent); }
+.prov-head h3 { flex: 1; }
+.source-filters { margin-bottom: var(--sp-4); }
+.source-filters h3, .finder-card h2 { font-size: var(--fs-ui); font-weight: 600; margin-bottom: var(--sp-2); }
+.run-card { margin-bottom: var(--sp-3); }
+.run-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: var(--sp-2); }
+.finder-card { margin-bottom: var(--sp-3); }
+.finder-status { margin: 0 0 var(--sp-2); }
 .prov-card .caveat { font-size: var(--fs-caption); color: var(--wait); background: var(--wait-bg); padding: 8px 10px; border-radius: var(--r-sm); text-wrap: pretty; }
 .estimate-box { border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-3); background: var(--surface-2); }
 .estimate-box .amount { font: 500 var(--fs-kpi)/1.1 var(--num); letter-spacing: -0.04em; }

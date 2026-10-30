@@ -47,6 +47,8 @@ LEASE_TTL_SECONDS = 30.0
 POLL_SECONDS = 2.0
 # How often a source set to update on its own is checked for being due.
 DUE_SOURCES_EVERY_SECONDS = 900
+# How often the contact finder's backlog is topped up (job_kinds.enqueue_backlog).
+BACKLOG_EVERY_SECONDS = 60
 # How long a stopping worker lets running jobs reach the end of their page:
 # well inside the 10 s "docker stop" gives before it kills the process, so
 # a restart usually takes the clean path (the page kept, the cursor saved).
@@ -303,6 +305,9 @@ class Worker:
         self._tasks: dict[str, asyncio.Task] = {}
         self._wake = asyncio.Event()
         self._next_due = 0.0
+        # The first top-up a minute in: a worker started for a moment (a
+        # command's) never feeds the backlog.
+        self._next_backlog = time.monotonic() + BACKLOG_EVERY_SECONDS
         self._renewer: _Renewer | None = None
 
     def lost_leases(self) -> set[str]:
@@ -344,6 +349,9 @@ class Worker:
                 if self.due_sources and time.monotonic() >= self._next_due:
                     self._next_due = time.monotonic() + DUE_SOURCES_EVERY_SECONDS
                     await _enqueue_due_sources(self.state)
+                if self.due_sources and time.monotonic() >= self._next_backlog:
+                    self._next_backlog = time.monotonic() + BACKLOG_EVERY_SECONDS
+                    await _enqueue_backlog(self.state)
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(_first(stop, self._wake), timeout=self.poll)
@@ -521,6 +529,14 @@ async def _first(*events: asyncio.Event) -> None:
     finally:
         for w in waits:
             w.cancel()
+
+
+async def _enqueue_backlog(state) -> None:
+    try:
+        from harvey.modules.job_kinds import enqueue_backlog
+        await enqueue_backlog(state)
+    except Exception as e:
+        logger.warning("worker: feeding the contact finder's backlog failed: %s", e)
 
 
 async def _enqueue_due_sources(state) -> None:

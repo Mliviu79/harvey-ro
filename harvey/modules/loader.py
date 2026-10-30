@@ -58,6 +58,8 @@ SIGNAL_DEFAULTS = {"subject": "company", "unit": "", "cardinality": "one",
                    "keyed_by": "", "absence": "unknown", "when_known": "enrich"}
 SIGNAL_TEXT = ("label", "category", "collector", "cost_note", "description", "unit")
 VALUE_TYPES = ("num", "text", "bool")
+# How a contact kind reaches a company: what a campaign over it would use.
+CONTACT_CHANNELS = ("email", "phone", "web", "social", "message")
 # Discovery keys a capability claims: one module each, so a switch always
 # names the module that really runs the source or preset.
 OWNED_KEYS = ("provider", "preset")
@@ -110,6 +112,9 @@ class Manifest:
     settings: dict = field(default_factory=dict)
     signals: tuple[dict, ...] = ()
     capabilities: tuple[dict, ...] = ()
+    # Kinds of contact the module finds ([[contact_kinds]]): kind, label,
+    # channel. The contacts table takes only declared kinds.
+    contact_kinds: tuple[dict, ...] = ()
 
     def summary(self) -> dict:
         """The row ``harvey modules list`` prints."""
@@ -170,6 +175,32 @@ def _check_signals(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
     return tuple(out)
 
 
+def _check_contact_kinds(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        problems.append(f"{where}: [[contact_kinds]] must be an array of tables")
+        return ()
+    out, seen = [], set()
+    for i, item in enumerate(raw):
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if not isinstance(kind, str) or not _ID.match(kind):
+            problems.append(f"{where}: contact kind #{i + 1} needs a kind in lower case "
+                            f"letters, digits and _, got {kind!r}")
+            continue
+        if kind in seen:
+            problems.append(f"{where}: contact kind {kind} is declared twice")
+            continue
+        seen.add(kind)
+        if item.get("channel") not in CONTACT_CHANNELS:
+            problems.append(f"{where}: contact kind {kind} has channel {item.get('channel')!r}; "
+                            f"it must be one of {', '.join(CONTACT_CHANNELS)}")
+        if not isinstance(item.get("label", ""), str):
+            problems.append(f"{where}: contact kind {kind} label must be a string")
+        out.append({"label": kind, **item})
+    return tuple(out)
+
+
 def _check_capabilities(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
     if raw is None:
         return ()
@@ -190,6 +221,12 @@ def _check_capabilities(raw, where: str, problems: list[str]) -> tuple[dict, ...
         if cap.get("op") not in CAPABILITY_OPS:
             problems.append(f"{where}: capability {cid} has op {cap.get('op')!r}; "
                             f"it must be one of {', '.join(CAPABILITY_OPS)}")
+        # How long a search it did holds before the record is searched
+        # again (contacts.refresh_days); left out, never.
+        refresh = cap.get("refresh_days", 0)
+        if not isinstance(refresh, int) or isinstance(refresh, bool) or refresh < 0:
+            problems.append(f"{where}: capability {cid} refresh_days must be a whole "
+                            f"number of days (0 for never), got {refresh!r}")
         out.append(dict(cap))
     return tuple(out)
 
@@ -388,6 +425,7 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         settings=_check_settings(raw.get("settings"), where, problems),
         signals=_check_signals(raw.get("signals"), where, problems),
         capabilities=_check_capabilities(raw.get("capabilities"), where, problems),
+        contact_kinds=_check_contact_kinds(raw.get("contact_kinds"), where, problems),
     )
 
 
@@ -448,6 +486,13 @@ def cross_check(manifests) -> list[str]:
                                 f"{owner[code].id} ({owner[code].path})")
             else:
                 owner[code] = m
+    kinds: dict[str, Manifest] = {}
+    for m in manifests:
+        for item in m.contact_kinds:
+            first = kinds.setdefault(item["kind"], m)
+            if first is not m:
+                problems.append(f"{m.path}: contact kind {item['kind']!r} is already declared "
+                                f"by {first.id} ({first.path})")
     claimed: dict[tuple[str, str], Manifest] = {}
     for m in manifests:
         for cap in m.capabilities:

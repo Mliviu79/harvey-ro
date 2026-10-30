@@ -13,7 +13,15 @@ requires = []
 default_enabled = true
 entry = "harvey.modules.original.email_verify.capabilities"
 wraps = ["harvey.integrations.email_finder"]
-secrets = ["REOON_API_KEY", "ZEROBOUNCE_API_KEY"]
+secrets = ["REOON_API_KEY", "ZEROBOUNCE_API_KEY", "EMAIL_VERIFY_MONTHLY_CHECKS"]
+
+# The address checks the contact finder and the Email module's audience may
+# make a month (a verification credit each). The default is Reoon's free
+# tier; set it to what your verifier plan allows.
+[settings.monthly_searches]
+type = "int"
+default = 600
+env = "EMAIL_VERIFY_MONTHLY_CHECKS"
 
 [cost]
 as_of = 2026-10-30

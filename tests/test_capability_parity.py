@@ -36,8 +36,11 @@ from harvey.state import StateManager
 pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring", "web_search_scrape")
 
 GOLDEN = Path(__file__).parent / "fixtures" / "parity"
-# Columns added with the wrappers: provenance, not what was found.
-NEW_COLUMNS = {"observations": {"module", "capability", "origin_company_id"}}
+# Columns added with the wrappers: provenance, not what was found. (A
+# company's website_trust and website_source are the contact finder's, and
+# no run recorded here finds a website that way.)
+NEW_COLUMNS = {"observations": {"module", "capability", "origin_company_id"},
+               "companies": {"website_trust", "website_source"}}
 TABLES = ("companies", "company_ids", "company_activities", "observations", "prospects",
           "match_candidates", "company_merges", "company_merge_moves", "email_patterns",
           "runs", "settings")

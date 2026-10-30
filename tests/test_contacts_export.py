@@ -1,4 +1,4 @@
-"""`harvey contacts` loop and the phone/location and per-company exports."""
+"""The phone/location and per-company exports."""
 
 import csv
 import io
@@ -6,7 +6,6 @@ import io
 import pytest
 import pytest_asyncio
 
-from harvey.cli import backfill_contacts
 from harvey.export import (
     COMPANY_CSV_COLUMNS, CSV_COLUMNS, collect_companies, collect_prospects,
     export_companies_csv,
@@ -14,68 +13,6 @@ from harvey.export import (
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
 from harvey.state import StateManager
-
-
-# ── contacts loop ──
-
-class FakeState:
-    """companies_needing_prospects over an in-memory backlog."""
-
-    def __init__(self, ids, stuck=()):
-        self.pending = list(ids)
-        self.stuck = set(stuck)   # never marked checked, like a skipped row
-        self.calls = 0
-
-    async def companies_needing_prospects(self, limit=10):
-        self.calls += 1
-        return [{"id": i} for i in self.pending[:limit]]
-
-
-class FakeScout:
-    def __init__(self, state, per_batch=1):
-        self.state = state
-        self.per_batch = per_batch
-
-    async def _prospect_via_known_companies(self):
-        batch = self.state.pending[:10]
-        self.state.pending = [i for i in self.state.pending
-                              if i not in batch or i in self.state.stuck]
-        return self.per_batch
-
-
-@pytest.mark.asyncio
-async def test_contacts_loop_drains_backlog():
-    state = FakeState([f"c{i}" for i in range(25)])
-    checked, found = await backfill_contacts(lambda: FakeScout(state), state, 200)
-    assert (checked, found) == (25, 3)
-    assert state.pending == []
-
-
-@pytest.mark.asyncio
-async def test_contacts_loop_stops_at_limit():
-    state = FakeState([f"c{i}" for i in range(50)])
-    checked, _ = await backfill_contacts(lambda: FakeScout(state), state, 20)
-    assert checked == 20
-    assert len(state.pending) == 30
-
-
-@pytest.mark.asyncio
-async def test_contacts_loop_stops_when_nothing_is_marked_checked():
-    ids = [f"c{i}" for i in range(10)]
-    state = FakeState(ids, stuck=ids)
-    checked, found = await backfill_contacts(
-        lambda: FakeScout(state, per_batch=0), state, 200)
-    assert (checked, found) == (10, 0)
-    assert state.calls == 2
-
-
-@pytest.mark.asyncio
-async def test_contacts_loop_with_empty_backlog():
-    state = FakeState([])
-    made = []
-    checked, found = await backfill_contacts(
-        lambda: made.append(1) or FakeScout(state), state, 200)
-    assert (checked, found, made) == (0, 0, [])
 
 
 # ── exports ──

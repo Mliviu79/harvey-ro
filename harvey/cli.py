@@ -228,7 +228,7 @@ def cmd_status(args):
         from harvey.main import unusable_backlog_notice
         backlog = unusable_backlog_notice(summary)
         if backlog:
-            print("  Prospecting:          PAUSED")
+            print("  Writing:              NOTHING USABLE")
             print(textwrap.fill(backlog, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
         if notice:
@@ -571,57 +571,78 @@ def cmd_profile(args):
     asyncio.run(_profile())
 
 
-async def backfill_contacts(make_scout, state, limit: int) -> tuple[int, int]:
-    """Run Scout's known-companies backfill until the backlog or ``limit`` runs out.
+async def _print_finder_status(state) -> None:
+    from harvey import finder
 
-    Returns (companies checked, contacts found). A fresh Scout per batch, as a
-    heartbeat cycle would have, so per-cycle caches don't pile up. Stops when
-    a batch holds only companies this run already handed to Scout: those
-    weren't marked checked, and asking again would loop forever.
-    """
-    from harvey.agents.scout import MAX_COMPANIES_PER_CYCLE
-
-    seen: set[str] = set()
-    found = 0
-    while len(seen) < limit:
-        batch = await state.companies_needing_prospects(limit=MAX_COMPANIES_PER_CYCLE)
-        new = {c["id"] for c in batch} - seen
-        if not new:
-            break
-        seen |= new
-        scout = make_scout()
-        try:
-            found += await scout._prospect_via_known_companies()
-        finally:
-            close = getattr(scout, "close_browser", None)
-            if close is not None:
-                await close()
-    return len(seen), found
+    b = await finder.backlog(state)
+    waiting = b["jobs"].get("queued", 0) + b["jobs"].get("running", 0)
+    print(f"\n  Companies with no contact:    {b['without_contact']:,}")
+    print(f"    with a website to read:     {b['site_to_read']:,}  (read in the background, free)")
+    print(f"    looked at by the finder:    {b['searched']:,}")
+    day = b["last_day"]
+    print(f"  Last 24 hours:                {day['companies']:,} companies, "
+          f"{day['found']:,} contacts found, ${day['cost']:.4f}")
+    print(f"  Finder jobs waiting:          {waiting:,}\n")
 
 
 def cmd_contacts(args):
-    """Find contacts at companies already on file. Writes and sends nothing."""
-    from harvey.brain import Brain
-    from harvey.config import load_config, load_env
+    """The contact finder: every company with no contact is a record to
+    search (harvey/finder.py). Writes and sends nothing but contacts."""
     from harvey.state import StateManager
-    from harvey.agents.scout import Scout
 
     async def _contacts():
-        config = load_config()
-        env = load_env()
-        state = StateManager()
-        brain = Brain(state, config.brain)
-        await state.init_db()
+        from harvey import finder
+        from harvey.config import load_env
+        from harvey.modules import jobs, switches
+        from harvey.modules.job_kinds import enqueue_contact_search
 
-        print(f"\n  Looking for contacts at up to {args.limit} companies on file...\n")
-        checked, found = await backfill_contacts(
-            lambda: Scout(brain, state, config, env), state, args.limit)
-        if not checked:
-            print("  Nothing to check. Every company with a website has been "
-                  "looked at recently.\n")
+        state = StateManager()
+        await state.init_db()
+        if args.action == "status":
+            await _print_finder_status(state)
             return
-        print(f"  Checked {checked} companies → {found} contacts found")
-        print("  Get the list: harvey export --companies  (or --all for every contact)\n")
+        from harvey.contacts import ContactFilter
+
+        f = ContactFilter(county=args.county, locality=args.locality, website=args.website,
+                          q=args.q)
+        require = [c.strip().upper() for c in args.require.split(",") if c.strip()]
+        exclude = [c.strip().upper() for c in args.exclude.split(",") if c.strip()]
+        if require or exclude:
+            f.cohort = state._verdict_sql(require, exclude, [], 0.0)
+        selected = await finder.select(state, f, force=args.force, limit=args.limit)
+        if not selected:
+            print("\n  Nothing to search: every company that matches has a contact "
+                  "already (--force searches them again).\n")
+            return
+        est = finder.estimate(selected, await switches.enabled_ids(state),
+                              load_env().model_dump())
+        print(f"\n  {est['companies']:,} companies: {est['with_site']:,} with a website to "
+              f"read (free), {est['to_look_up']:,} to look up by name and town")
+        if est["to_look_up"] and not args.max_spend:
+            print("  No --max-spend: the website searches are skipped (nothing is paid for).")
+        elif est["to_look_up"]:
+            print(f"  Website searches: about ${est['estimated_cost']:.4f} "
+                  f"(cap: ${args.max_spend:.2f}; at most ${est['most']:.4f} when the "
+                  "cheapest finds nothing and the next is tried)")
+        try:
+            batch_id, ids, dupes = await enqueue_contact_search(
+                state, [c["id"] for c in selected], max_spend=args.max_spend, force=args.force)
+        except jobs.Duplicate as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        if dupes:
+            print(f"  {len(dupes):,} already waiting, not queued twice")
+        if args.background:
+            await _queued_note(state, batch_id, len(ids))
+            return
+        found = await _wait_for(state, batch_id)
+        done = [j for j in found if j.kind == "find_contacts" and j.status == jobs.DONE]
+        contacts_found = sum(int(j.result.get("contacts") or 0) for j in done)
+        cost = sum(float(j.result.get("cost") or 0.0) for j in done)
+        print(f"\n  Looked at {len(done):,} companies → {contacts_found:,} contacts found"
+              f" (${cost:.4f})")
+        _job_failures(found)
+        print("  See them: the dashboard's Contacts page, or harvey export --all\n")
 
     asyncio.run(_contacts())
 
@@ -1615,33 +1636,33 @@ def cmd_discover(args):
             print("\n  Run one with: harvey discover --provider <key> --estimate\n")
             return
 
-        if args.provider not in PROVIDERS:
-            print(f"\n  Unknown provider {args.provider!r}. "
-                  f"See: harvey discover --providers\n")
-            return
-        off = switches.discovery_problem(enabled, args.provider,
-                                         getattr(args, "preset", "") or "")
-        if off:
-            print(f"\n  {off}\n")
-            raise SystemExit(2)
+        keys = list(dict.fromkeys(k.strip() for k in args.provider.split(",") if k.strip()))
+        for key in keys:
+            if key not in PROVIDERS:
+                print(f"\n  Unknown provider {key!r}. See: harvey discover --providers\n")
+                return
+            off = switches.discovery_problem(enabled, key, getattr(args, "preset", "") or "")
+            if off:
+                print(f"\n  {off}\n")
+                raise SystemExit(2)
 
-        # Fail before collection; estimates need no credentials.
-        # An unconfigured provider used to end in one quiet "stopped
-        # early" line and exit code 0: a silent no-op that reads as
-        # success.
-        provider = PROVIDERS[args.provider]
-        missing = provider.missing_keys(load_env().model_dump())
-        if missing and not args.estimate:
-            names = ", ".join(k.upper() for k in missing)
-            print("\n  " + "!" * 68)
-            print(f"  ERROR: provider skipped: missing key - "
-                  f"{provider.label} is not configured, 0 queries can run.")
-            print(f"  Missing or empty: {names}")
-            print("  Put a real value in .env (template placeholders don't"
-                  " count), then retry.")
-            print("  All providers and their keys: harvey discover --providers")
-            print("  " + "!" * 68 + "\n")
-            raise SystemExit(1)
+            # Fail before collection; estimates need no credentials.
+            # An unconfigured provider used to end in one quiet "stopped
+            # early" line and exit code 0: a silent no-op that reads as
+            # success.
+            provider = PROVIDERS[key]
+            missing = provider.missing_keys(load_env().model_dump())
+            if missing and not args.estimate:
+                names = ", ".join(k.upper() for k in missing)
+                print("\n  " + "!" * 68)
+                print(f"  ERROR: provider skipped: missing key - "
+                      f"{provider.label} is not configured, 0 queries can run.")
+                print(f"  Missing or empty: {names}")
+                print("  Put a real value in .env (template placeholders don't"
+                      " count), then retry.")
+                print("  All providers and their keys: harvey discover --providers")
+                print("  " + "!" * 68 + "\n")
+                raise SystemExit(1)
 
         config = load_config()
         state = StateManager()
@@ -1650,49 +1671,62 @@ def cmd_discover(args):
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
         preset = getattr(args, "preset", "") or ""
-        problem = preset_problem(preset, args.provider, config=config)
-        if problem:
-            print(f"\n  {problem}\n")
-            sys.exit(2)
-        queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit, preset=preset)
+        plan, total = [], 0.0
+        for key in keys:
+            problem = preset_problem(preset, key, config=config)
+            if problem:
+                if len(keys) == 1:
+                    print(f"\n  {problem}\n")
+                    sys.exit(2)
+                # One source of several that can't run this preset is left
+                # out, saying so; the others run.
+                print(f"\n  {PROVIDERS[key].label} left out: {problem}")
+                continue
+            provider = PROVIDERS[key]
+            queries = build_queries(config, cities=cities,
+                                    depth=args.depth, limit=args.limit, preset=preset)
 
-        # --estimate asks a source that can count how many results each
-        # search has (a small paid request each), so the price is exact.
-        report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend, dry_run=True,
-                                     count=args.estimate)
-        print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
-        for q in queries[:8]:
-            print(f"    - {q.keyword()}" + ("" if q.coordinate else
-                  "   (no coordinates — add icp.geo_coordinates for radius search)"))
-        if len(queries) > 8:
-            print(f"    ... and {len(queries) - 8} more")
-        if report.counted:
-            print(f"\n  {report.available:,} results in all"
-                  f"   (counting them cost ${report.count_cost:.4f})")
-        elif provider.can_count:
-            print("\n  Not counted yet: each search is priced at one full page."
-                  "\n  harvey discover --estimate counts them for the exact price.")
-        print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
-              f"   (cap: ${args.max_spend:.2f})")
-        if report.estimated_cost > args.max_spend:
+            # --estimate asks a source that can count how many results each
+            # search has (a small paid request each), so the price is exact.
+            report = await run_discovery(state, config, key, queries,
+                                         max_spend=args.max_spend, dry_run=True,
+                                         count=args.estimate)
+            print(f"\n  {len(queries)} queries via {provider.label}")
+            for q in queries[:8]:
+                print(f"    - {q.keyword()}" + ("" if q.coordinate else
+                      "   (no coordinates — add icp.geo_coordinates for radius search)"))
+            if len(queries) > 8:
+                print(f"    ... and {len(queries) - 8} more")
+            if report.counted:
+                print(f"\n  {report.available:,} results in all"
+                      f"   (counting them cost ${report.count_cost:.4f})")
+            elif provider.can_count:
+                print("\n  Not counted yet: each search is priced at one full page."
+                      "\n  harvey discover --estimate counts them for the exact price.")
+            for err in report.errors[:3]:
+                print(f"    ! {err}")
+            total += report.estimated_cost
+            plan.append({"provider": key, "queries": queries})
+        if not plan:
+            print("\n  No source can run this preset.\n")
+            sys.exit(2)
+        print(f"\n  Estimated cost: ${total:.4f}   (cap: ${args.max_spend:.2f}"
+              f"{', shared by every source' if len(plan) > 1 else ''})")
+        if total > args.max_spend:
             print(f"  More than the cap: the run stops when ${args.max_spend:.2f} is "
                   "spent and says what was left.")
-        for err in report.errors[:3]:
-            print(f"    ! {err}")
 
         if args.estimate:
             print("\n  Estimate only. Re-run without --estimate to collect.\n")
             return
 
         from harvey.modules import jobs
-        from harvey.modules.job_kinds import enqueue_discovery, merge_reports
+        from harvey.modules.job_kinds import enqueue_sources, merge_reports
 
         try:
-            batch_id, ids, dupes = await enqueue_discovery(
-                state, args.provider, queries, max_spend=args.max_spend,
-                read_sites=not args.no_profile, label=provider.label)
+            batch_id, ids, dupes = await enqueue_sources(
+                state, plan, max_spend=args.max_spend, read_sites=not args.no_profile,
+                label=" + ".join(PROVIDERS[part["provider"]].label for part in plan))
         except jobs.Duplicate as e:
             print(f"\n  {e}\n")
             raise SystemExit(2)
@@ -1731,12 +1765,13 @@ def cmd_discover(args):
                   f"harvey jobs resume {limited[0].id} --max-spend N")
 
         if args.no_profile:
-            print("\n  PROFILE — skipped (--no-profile)")
+            print("\n  CONTACTS — skipped (--no-profile)")
         else:
+            looked = [j for j in found if j.kind == "find_contacts" and j.status == jobs.DONE]
             read = [j for j in sites if j.status == jobs.DONE]
-            print(f"\n  PROFILE — {len(read)} sites read, "
-                  f"{sum(int(j.result.get('observations') or 0) for j in read)} "
-                  "observations  (free)")
+            print(f"\n  CONTACTS — {len(looked) + len(read)} companies looked at, "
+                  f"{sum(int(j.result.get('contacts') or 0) for j in looked)} "
+                  "contacts found")
 
         for err in r.get("errors", [])[:5]:
             print(f"    ! {err}")
@@ -2538,7 +2573,8 @@ def main():
     # harvey sending pause|resume|status
     sub = subparsers.add_parser("discover", help="Find businesses matching your ICP")
     sub.add_argument("--provider", default="osm",
-                     help="Discovery provider (default: osm — free, no account)")
+                     help="Discovery provider, or several separated by commas in one run "
+                          "under one cap: serper,tinyfish (default: osm — free, no account)")
     sub.add_argument("--providers", action="store_true",
                      help="List every provider with cost and setup, then exit")
     sub.add_argument("--estimate", action="store_true",
@@ -2564,7 +2600,7 @@ def main():
                           "Neo, AI Grant, a16z speedrun or Plug and Play; "
                           "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
-                     help="Don't profile what was found (profiling is free)")
+                     help="Don't look for contacts at what was found (reading sites is free)")
     _background_arg(sub)
     sub.set_defaults(func=cmd_discover)
 
@@ -2579,14 +2615,32 @@ def main():
 
     sub = subparsers.add_parser(
         "contacts",
-        help="Find contacts at companies already on file (reads their sites; "
-             "no Claude calls, writes and sends nothing)",
-        description="Reads each company's own website for its owner or team and "
-                    "resolves their email. No Claude calls and nothing is written "
-                    "or sent, but email verification uses your Reoon/ZeroBounce/"
-                    "Hunter credits when those keys are set.")
+        help="Find a way to reach companies on file with none (the contact finder; "
+             "no Claude calls, sends nothing)",
+        description="The contact finder. 'find' (the default) searches the companies "
+                    "that match the filters and have no contact: their own website "
+                    "first (free), then, within --max-spend, a search by name and town "
+                    "for those with no website and one checked address per person "
+                    "named there. 'status' shows the backlog.")
+    sub.add_argument("action", nargs="?", default="find", choices=["find", "status"],
+                     help="find (default) or status")
+    sub.add_argument("--county", default="", help="Only companies in this county")
+    sub.add_argument("--locality", default="", help="Only companies in this town")
+    sub.add_argument("--website", default="", choices=["", "yes", "no"],
+                     help="Only companies with (yes) or without (no) a website")
+    sub.add_argument("--q", default="", help="Words in the company's name")
+    sub.add_argument("--require", default="",
+                     help="Signal codes a company must hold (a code not checked yet counts)")
+    sub.add_argument("--exclude", default="", help="Signal codes a company must not hold")
     sub.add_argument("--limit", type=int, default=200,
-                     help="Max companies to check, in batches of 10 (default: 200)")
+                     help="Most companies to search, newest first (default: 200)")
+    sub.add_argument("--max-spend", type=_dollars, default=0.0,
+                     help="Cap in dollars for website searches and address checks "
+                          "(default: 0, nothing paid: websites are read only)")
+    sub.add_argument("--force", action="store_true",
+                     help="Search again companies already searched (each search is "
+                          "kept; the company drawer shows where and when)")
+    _background_arg(sub)
     sub.set_defaults(func=cmd_contacts)
 
     sub = subparsers.add_parser(

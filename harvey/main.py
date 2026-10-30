@@ -108,12 +108,11 @@ def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     return max(int(delta.total_seconds()), 60)
 
 
-# When nothing is writable, prospecting pauses for the rest of the day once
-# this many unusable prospects (a guessed, invalid or missing email) were
-# found in the last 24 hours. Without a working verifier every address is a
-# guess, and prospecting every cycle would spend search and verifier credits
-# on people Harvey can never email. Nothing re-checks a guess, so the window
-# is a day, never all time: an all-time count would stop Scout for good.
+# When nothing is writable, status says why once this many unusable
+# prospects (a guessed, invalid or missing email) were found in the last 24
+# hours: without a working verifier every address is a guess, and the
+# Writer never drafts for one. Nothing re-checks a guess, so the window is
+# a day, never all time.
 PROSPECT_BACKLOG = 20
 
 
@@ -127,17 +126,17 @@ def _new_counts(summary: dict) -> tuple[int, int]:
 
 
 def unusable_backlog_notice(summary: dict) -> str:
-    """Why Harvey paused prospecting for the day, or ""."""
+    """Why the Writer has had nothing to write for about a day, or ""."""
     _, writable = _new_counts(summary)
     recent = summary.get("recent_unusable_prospects", 0) or 0
     if writable or recent < PROSPECT_BACKLOG:
         return ""
     return (
         f"Harvey found {recent} prospects in the last day, but none has a verified "
-        "or catch-all email, so it paused prospecting for about a day to save search "
-        "and verifier credits. Add an email verifier key (REOON_API_KEY, "
-        "ZEROBOUNCE_API_KEY or HUNTER_API_KEY in .env) or check it still has credits. "
-        "`harvey export --all` exports the list as it is."
+        "or catch-all email, so for about a day there was nothing to write for. Add "
+        "an email verifier key (REOON_API_KEY, ZEROBOUNCE_API_KEY or HUNTER_API_KEY "
+        "in .env) or check it still has credits. `harvey export --all` exports the "
+        "list as it is."
     )
 
 
@@ -154,15 +153,17 @@ async def decide_next_action(
     heartbeat doesn't run its cycle at all).
 
     Uses deterministic priority rules (handle_replies > send_campaign >
-    write_campaign > prospect > idle) instead of burning a Claude call on a
-    decision that is fully derivable from pipeline counts. This saves budget
-    every cycle and removes a fragile LLM string-parsing step.
+    write_campaign > idle) instead of burning a Claude call on a decision
+    that is fully derivable from pipeline counts. This saves budget every
+    cycle and removes a fragile LLM string-parsing step. Finding people to
+    write to isn't the heartbeat's: the contact finder (harvey/finder.py)
+    runs on its own, whatever the Email switch says.
     """
     if summary is None:
         summary = await state.get_state_summary()
 
     # Only prospects the Writer can draft for trigger writing: one with a
-    # guessed email stays 'new' for good, and counting it starved Scout.
+    # guessed email stays 'new' for good, and counting it starved the cycle.
     new_prospects, writable = _new_counts(summary)
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
@@ -179,11 +180,10 @@ async def decide_next_action(
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
     elif writable > 0:
         action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
-    elif unusable_backlog_notice(summary):
-        action, reason = "idle", "a day's worth of prospects with no usable email"
-        logger.warning(unusable_backlog_notice(summary))
     else:
-        action, reason = "prospect", f"{new_prospects} new prospect(s), none ready to write for"
+        action, reason = "idle", f"{new_prospects} new prospect(s), none ready to write for"
+        if unusable_backlog_notice(summary):
+            logger.warning(unusable_backlog_notice(summary))
 
     logger.info(f"Decision: {action} ({reason})")
     return action
@@ -296,7 +296,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.sender import Sender
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
+    from harvey.agents.audience import Audience
 
+    audience = Audience(state, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
@@ -397,6 +399,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 summary = {}
                 action = "quiet_hours_send"
             else:
+                # The email contacts the finder found, as prospects to write
+                # to (the finder itself never depends on email).
+                try:
+                    await audience.run()
+                except Exception as e:
+                    logger.warning(f"Audience: couldn't pick prospects from the contacts: {e}")
                 logger.info("Checking pipeline state...")
                 summary = await state.get_state_summary()
                 action = await decide_next_action(brain, state, config, summary=summary,
@@ -409,21 +417,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
             if action == "handle_replies":
                 tasks.append(("handle_replies", handler.run()))
-            elif action == "prospect":
-                # Finding contacts is a job (its own lane, the worker runs
-                # it): queued once, never twice while it waits.
-                from harvey.modules.job_kinds import enqueue_find_contacts
-                tasks.append(("prospect", enqueue_find_contacts(state)))
-                # Also handle replies in parallel if needed
-                if has_open_convos and email_on:
-                    tasks.append(("handle_replies", handler.run()))
-                # Analyst is cheap (no Claude calls) — keep analytics fresh
-                tasks.append(("analyze", analyst.run()))
             elif action == "write_campaign":
                 tasks.append(("write_campaign", writer.run()))
                 if has_open_convos:
                     tasks.append(("handle_replies", handler.run()))
             elif action == "idle":
+                # Analyst is cheap (no Claude calls) — keep analytics fresh
                 tasks.append(("analyze", analyst.run()))
 
             # Sending happens in a second phase, after every agent above has

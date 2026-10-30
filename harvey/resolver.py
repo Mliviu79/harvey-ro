@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import resources
 
+from harvey import contacts
+
 ATTACH = 0.85
 REVIEW = 0.6
 # What each kind of evidence is worth on its own.
@@ -543,6 +545,9 @@ async def merge(db, survivor: str, merged: str, *, score: float | None = None,
     await move("company_activities", "t.code, CAST(t.version AS TEXT), t.source",
                " AND NOT EXISTS (SELECT 1 FROM company_activities s WHERE s.company_id = ? "
                "AND s.code = t.code AND s.version = t.version AND s.source = t.source)")
+    # People, contact links, places and sources (harvey/contacts.py): each
+    # row says whom it was found for, so these need no log of their own.
+    await contacts.merge(db, survivor, merged, merge_id)
     # Companies merged into this one earlier now stand for the survivor.
     await db.execute(
         "INSERT INTO company_merge_moves (merge_id, tbl, key1, key2, key3) "
@@ -626,6 +631,7 @@ async def undo(db, merged: str) -> dict:
             "AND COALESCE(origin_company_id, '') = ''",
             (merged, survivor, source_url))
 
+    await contacts.undo(db, survivor, merged, merge_id)
     for table in ("observations", "prospects", "company_ids", "company_activities"):
         await db.execute(
             f"UPDATE OR IGNORE {table} SET company_id = ? WHERE company_id = ? AND EXISTS ("

@@ -39,7 +39,7 @@ OLD_COLUMNS = ("code", "label", "description", "category", "value_type", "collec
 # (they serve Romania too); its US-startup, hiring, website-marketing,
 # keyless-scraping, LinkedIn and email-campaign modules are off.
 DEFAULT_ON = {
-    "export", "lang_en", "nominatim", "people", "phones", "website",
+    "contact_finder", "export", "lang_en", "nominatim", "people", "phones", "website",
     "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper", "tinyfish",
     "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
 }

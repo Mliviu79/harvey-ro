@@ -881,6 +881,12 @@ class ProfileCollector:
         # Hosts that answered with a bot challenge (SiteGround's 202,
         # Cloudflare's "Just a moment...") rather than a page.
         self.challenged: set[str] = set()
+        # Read for the ways a company can be reached whatever is confirmed
+        # (the contact finder's site read): the contact page and the team
+        # page are fetched for them, and kept here per company.
+        self.contacts = False
+        self.forms: dict[str, str] = {}
+        self.team: dict[str, list[dict]] = {}
 
     def wants(self, code: str) -> bool:
         return code in self.confirmed
@@ -1327,15 +1333,18 @@ class ProfileCollector:
                             pass
 
         # contact form — reaches the business without needing an email at all
-        if self.wants("CONTACT_FORM_URL"):
+        reach = getattr(self, "contacts", False)
+        if self.wants("CONTACT_FORM_URL") or reach:
             if re.search(r"(?is)<form\b", _strip_code(home)):
                 add("CONTACT_FORM_URL", text=site, url=site)
+                self.__dict__.setdefault("forms", {})[company_id] = site
             else:
                 curl, chtml = await self._first_present(site, CONTACT_PATHS)
                 if chtml:
                     pages.append((curl, chtml))
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
                     add("CONTACT_FORM_URL", text=curl, url=curl)
+                    self.__dict__.setdefault("forms", {})[company_id] = curl
 
         # open roles → hiring intent. The job-board feed when their site
         # links one (titles, departments and dates for every role), else
@@ -1348,7 +1357,7 @@ class ProfileCollector:
                 logger.info(f"profile: {domain} open roles unread: {type(e).__name__}: {e}")
 
         # team page → people
-        if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE"):
+        if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE") or reach:
             paths = TEAM_PATHS
             if domain.lower().rstrip(".").endswith(".ro"):
                 paths = RO_TEAM_PATHS + TEAM_PATHS + ("/contact",)
@@ -1357,6 +1366,8 @@ class ProfileCollector:
                 pages.append((turl, thtml))
                 for person in self.detect_people(thtml, domain=domain,
                                                  site_name=self.site_names.get(company_id, "")):
+                    self.__dict__.setdefault("team", {}).setdefault(company_id, []).append(
+                        {**person, "url": turl})
                     label = f"{person['first_name']} {person['last_name']}"
                     add("CONTACT_FOUND",
                         text=f"{label} — {person['title']}" if person["title"] else label,
@@ -1438,6 +1449,7 @@ async def site_draft(inp, ctx, only: set[str] | None = None) -> Draft:
         keywords = role_keywords(getattr(config, "icp", None))
     c = ProfileCollector(Known(inp.facts.get("search_hits"), inp.extra.get("source_url", "")),
                          wanted, role_keywords=keywords, config=config)
+    c.contacts = bool(ctx.settings.get("contacts"))
     own_http = None if is_public_client(ctx.http) else open_http()
     own_pages = PageReader() if ctx.browser is None else None
     c._client, c._pages = own_http or ctx.http, own_pages or ctx.browser
@@ -1461,7 +1473,89 @@ async def site_draft(inp, ctx, only: set[str] | None = None) -> Draft:
                               confidence=hit.confidence, source_url=url,
                               module="phones", capability="site_phones")
                       for url, hit in c.__dict__.get("phone_hits", {}).get(inp.company_id, [])]
+    if c.contacts:
+        _reach(draft, c, inp)
     better = c.better_name(inp.company_id, inp.name, inp.domain)
     if better:
         draft.values["name"] = better
     return draft
+
+
+# Social profiles and messaging links a company's own pages point to, as
+# (kind, pattern over an href). Harvey never reads these networks: a link on
+# the company's own site is the only evidence it keeps.
+SOCIAL_LINKS = (
+    ("linkedin", re.compile(r"(?i)^https?://(?:[a-z]{2,3}\.)?linkedin\.com/(company|school|in)/([^/?#\s]+)")),
+    ("facebook", re.compile(r"(?i)^https?://(?:www\.|m\.|web\.)?(?:facebook|fb)\.com/([^?#\s]+)")),
+    ("instagram", re.compile(r"(?i)^https?://(?:www\.)?instagram\.com/([^/?#\s]+)")),
+    ("whatsapp", re.compile(r"(?i)^https?://(?:wa\.me/|(?:api|web)\.whatsapp\.com/send/?\?(?:[^#\s]*&)?phone=)\+?(\d{6,15})")),
+)
+# Paths of those networks that are a share button, a login or a post, not
+# the company's own profile.
+_NOT_A_PROFILE = frozenset({
+    "sharer", "sharer.php", "share", "share.php", "dialog", "plugins", "tr", "login",
+    "l.php", "events", "watch", "groups", "hashtag", "p", "reel", "reels", "explore",
+    "accounts", "stories", "people", "pages", "profile.php", "home.php", "intent",
+})
+_HREF = re.compile(r"""(?i)href\s*=\s*["']([^"'>\s]+)["']""")
+
+
+def social_links(html: str) -> list[tuple[str, str]]:
+    """(kind, profile URL) for each social profile or messaging link a page
+    links to, once each, normalised (no query, no trailing slash)."""
+    out: list[tuple[str, str]] = []
+    for href in _HREF.findall(html or ""):
+        href = html_unescape(href).strip()
+        for kind, pattern in SOCIAL_LINKS:
+            m = pattern.match(href)
+            if not m:
+                continue
+            if kind == "linkedin":
+                url = f"https://www.linkedin.com/{m.group(1).lower()}/{m.group(2).strip('/')}"
+            elif kind == "whatsapp":
+                url = f"https://wa.me/{m.group(1)}"
+            else:
+                path = m.group(1).strip("/")
+                if not path or path.split("/")[0].lower() in _NOT_A_PROFILE:
+                    break
+                host = "www.facebook.com" if kind == "facebook" else "www.instagram.com"
+                url = f"https://{host}/{path.split('/')[0] if kind == 'instagram' else path}"
+            if (kind, url) not in out:
+                out.append((kind, url))
+            break
+    return out
+
+
+def _reach(draft: Draft, c: "ProfileCollector", inp) -> None:
+    """The ways the pages just read say to reach the company, beside the
+    phones: the addresses they publish (an address on the company's own
+    domain is surely its own, any other only maybe), its contact form, the
+    social profiles it links to, and the people its team page names."""
+    from harvey.collectors.people import emails_on_page
+    from harvey.modules.api import Person
+
+    own = (inp.domain or "").lower().removeprefix("www.")
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind, value, url, confidence=1.0, display=""):
+        if (kind, value) in seen:
+            return
+        seen.add((kind, value))
+        draft.contacts.append(Contact(kind, value, display=display, confidence=confidence,
+                                      source_url=url, module="website", capability="read_site"))
+
+    for page in draft.pages:
+        for addr in emails_on_page(page.html):
+            host = addr.rpartition("@")[2].lower()
+            mine = bool(own) and (host == own or host.endswith("." + own))
+            add("email", addr.lower(), page.url, 1.0 if mine else 0.5)
+        for kind, url in social_links(page.html):
+            add(kind, url, page.url)
+    form = c.__dict__.get("forms", {}).get(inp.company_id)
+    if form:
+        add("contact_form", form, form)
+    for person in c.__dict__.get("team", {}).get(inp.company_id, []):
+        draft.people.append(Person(
+            first_name=person["first_name"], last_name=person["last_name"],
+            title=person.get("title") or "", source_url=person.get("url") or "",
+            module="people", capability="find_people"))

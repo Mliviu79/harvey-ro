@@ -1,0 +1,35 @@
+# Finds a way to reach every company on file with none: what is on file
+# first (a website a registry declares, phones from official sources), then
+# the company's own site, and for a company with no website a search by its
+# name and town through whichever search modules are on. Searches run only
+# inside a spend cap the user set. Core's finder (harvey/finder.py) runs it,
+# one company per job on the contacts lane, whatever the Email switch says.
+id = "contact_finder"
+name = "Contact finder"
+description = "Finds an email, a phone or another way to reach every company with none: its own site first, then a search by name and town."
+set = "core"
+kind = "enricher"
+version = "0.1.0"
+api = 1
+markets = []
+requires = ["website"]
+default_enabled = true
+entry = "harvey.modules.core.contact_finder.capabilities"
+wraps = ["harvey.collectors.discover"]
+secrets = []
+terms_note = "A search's results are read once, in memory, to pick the company's website, and never stored (some search providers' terms forbid keeping results). Only the website and what the company's own site publishes are saved."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free on file and on the company's own site; a website search costs what the search module charges"
+
+# Looks a company up by its name and town through a search module
+# (settings.provider: a provider key whose capability says lookup =
+# "website"), and returns the results as candidates for core to pick from.
+[[capabilities]]
+id = "find_website"
+op = "lookup"
+inputs = [["name", "locality"], ["name"]]
+outputs = { records = "links", ids = ["domain"] }
+cost = { usd = 0.0, per = "company", note = "runs through a search module" }

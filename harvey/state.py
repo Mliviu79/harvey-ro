@@ -26,7 +26,7 @@ from harvey.models.prospect import Prospect
 from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
-from harvey import resolver
+from harvey import contacts, resolver
 from harvey.paths import PROJECT_ROOT
 from harvey.startups import parse_funding
 from harvey.words import SEARCH_STOPWORDS, fold_words
@@ -37,6 +37,9 @@ DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 
 # How long (seconds) a connection waits on a locked database before failing.
 BUSY_TIMEOUT_SECONDS = 30.0
+# How long a start waits for another process's upgrade of the schema: a
+# migration over a full registry holds the database for a minute or more.
+MIGRATION_TIMEOUT_SECONDS = 900.0
 
 # Email statuses the Writer drafts for. Shared with the heartbeat so it only
 # chooses write_campaign when there is something the Writer will act on.
@@ -207,6 +210,387 @@ def _activity_matches(activity: dict, words: list[str]) -> bool:
 # Each entry is an idempotent SQL script. The index into this list + 1 is
 # the schema version stored in PRAGMA user_version. Never edit or reorder
 # released migrations — append new ones.
+
+
+# ── v21: contacts, people, places and sources (harvey/contacts.py) ──
+# Built from parts: a person's name_norm is the same expression everywhere.
+_PROSPECT_NAME = "TRIM(COALESCE(NEW.first_name, '') || ' ' || COALESCE(NEW.last_name, ''))"
+# The trade registry writes the family name first ("POPESCU ION"): a
+# prospect made from such a person is the same person, not a new one.
+_PROSPECT_NAME_REVERSED = ("TRIM(COALESCE(NEW.last_name, '') || ' ' || "
+                           "COALESCE(NEW.first_name, ''))")
+_EMAIL_STATUS = ("CASE WHEN {s} IN ('verified', 'risky', 'guess', 'invalid') "
+                 "THEN {s} ELSE 'unchecked' END")
+# A prospect becomes an email contact of its company, through its person
+# when it has a name. (The prospect triggers below, run for every insert
+# and every change of address, status or opt-out.)
+_PROSPECT_LINK = f"""
+        INSERT INTO people (company_id, name, name_norm, role, source, origin_company_id)
+        SELECT NEW.company_id, {_PROSPECT_NAME}, {contacts.sql_name_norm(_PROSPECT_NAME)},
+               COALESCE(NEW.title, ''), COALESCE(NEW.source, ''), NEW.company_id
+        WHERE COALESCE(NEW.company_id, '') != '' AND {contacts.sql_name_norm(_PROSPECT_NAME)} != ''
+          AND NOT EXISTS (SELECT 1 FROM people pr WHERE pr.company_id = NEW.company_id
+                          AND pr.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME_REVERSED)})
+        ON CONFLICT(company_id, name_norm) DO UPDATE SET last_seen = CURRENT_TIMESTAMP;
+        INSERT INTO company_contacts (company_id, contact_id, person_id, source, evidence_url,
+                                      trust, origin_company_id)
+        SELECT NEW.company_id, ct.id,
+               COALESCE((SELECT pe.id FROM people pe WHERE pe.company_id = NEW.company_id
+                         AND pe.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME)}
+                         AND pe.name_norm != ''),
+                        (SELECT pe.id FROM people pe WHERE pe.company_id = NEW.company_id
+                         AND pe.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME_REVERSED)}
+                         AND pe.name_norm != ''), 0),
+               COALESCE(NEW.source, ''), COALESCE(NEW.source_url, ''),
+               CASE WHEN substr(NEW.email, instr(NEW.email, '@') + 1) =
+                         (SELECT c.domain FROM companies c WHERE c.id = NEW.company_id
+                          AND c.domain != '') THEN 'confirmed' ELSE 'likely' END,
+               NEW.company_id
+        FROM contacts ct
+        WHERE ct.kind = 'email' AND ct.value = NEW.email AND COALESCE(NEW.company_id, '') != ''
+        ON CONFLICT(company_id, contact_id, person_id, source) DO UPDATE SET last_seen = CURRENT_TIMESTAMP;"""
+_P_NAME = "TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))"
+_P_ORIGIN = ("COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'prospects' "
+             "AND mv.key1 = p.id), p.company_id)")
+
+_V21_CONTACTS = f"""
+    -- The kinds of contact, declared by modules ([[contact_kinds]] in their
+    -- manifests, synced by signals.sync_vocabulary). A contact's kind must
+    -- be one of them (trigger below): an open vocabulary, not a fixed list.
+    CREATE TABLE IF NOT EXISTS contact_kinds (
+        kind TEXT PRIMARY KEY,
+        label TEXT DEFAULT '',
+        channel TEXT DEFAULT '',
+        module TEXT DEFAULT '',
+        available INTEGER DEFAULT 1
+    );
+    INSERT OR IGNORE INTO contact_kinds (kind, label, channel, module) VALUES
+        ('email', 'Email', 'email', 'website'),
+        ('phone', 'Phone', 'phone', 'phones'),
+        ('contact_form', 'Contact form', 'web', 'website'),
+        ('linkedin', 'LinkedIn', 'social', 'website');
+
+    -- One row per distinct contact: an email lowercased, a phone in E.164
+    -- (line_type from the numbering plan: an SMS audience is the mobiles),
+    -- a URL. status: an email's verified | risky | guess | invalid |
+    -- unchecked, a phone's valid | invalid. Integer ids: there are millions
+    -- of rows between these tables.
+    CREATE TABLE IF NOT EXISTS contacts (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        display TEXT DEFAULT '',
+        line_type TEXT DEFAULT '',
+        status TEXT DEFAULT '',
+        do_not_contact INTEGER DEFAULT 0,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (kind, value)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_kind ON contacts(kind, line_type, status);
+    CREATE INDEX IF NOT EXISTS idx_contacts_first_seen ON contacts(first_seen);
+    CREATE TRIGGER IF NOT EXISTS trg_contacts_kind_known
+    BEFORE INSERT ON contacts
+    FOR EACH ROW
+    WHEN NEW.kind NOT IN (SELECT kind FROM contact_kinds)
+    BEGIN
+        SELECT RAISE(ABORT, 'unknown contact kind: not in contact_kinds');
+    END;
+
+    -- Someone named at a company (a registry's administrator, a team
+    -- page's member): searched for an email or phone of their own.
+    CREATE TABLE IF NOT EXISTS people (
+        id INTEGER PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        name_norm TEXT NOT NULL,
+        role TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        origin_company_id TEXT DEFAULT '',
+        UNIQUE (company_id, name_norm)
+    );
+    CREATE INDEX IF NOT EXISTS idx_people_first_seen ON people(first_seen);
+
+    -- A company's places: a branch keeps its own address and phone.
+    CREATE TABLE IF NOT EXISTS locations (
+        id INTEGER PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        name TEXT DEFAULT '',
+        address TEXT DEFAULT '',
+        locality TEXT DEFAULT '',
+        county TEXT DEFAULT '',
+        country TEXT DEFAULT '',
+        point TEXT DEFAULT '',
+        external_id TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        origin_company_id TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_locations_company ON locations(company_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_listing
+        ON locations(company_id, external_id) WHERE external_id != '';
+
+    -- Which companies a contact reaches: many to many (a chain's units can
+    -- share one phone). One link per source that gave it: a phone a site
+    -- published and ANAF confirmed is two links, each with its own source
+    -- and evidence. person_id and location_id are 0 for none, so the
+    -- unique key holds for a link without a person (NULLs never collide).
+    CREATE TABLE IF NOT EXISTS company_contacts (
+        id INTEGER PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        contact_id INTEGER NOT NULL,
+        person_id INTEGER NOT NULL DEFAULT 0,
+        location_id INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT '',
+        capability TEXT DEFAULT '',
+        evidence_url TEXT DEFAULT '',
+        trust TEXT DEFAULT 'unconfirmed',
+        confidence REAL DEFAULT 1.0,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        origin_company_id TEXT DEFAULT '',
+        UNIQUE (company_id, contact_id, person_id, source)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_contacts_contact ON company_contacts(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_company_contacts_person ON company_contacts(person_id)
+        WHERE person_id != 0;
+    CREATE INDEX IF NOT EXISTS idx_company_contacts_source ON company_contacts(source);
+
+    -- Every source a company was found in. companies.source stays the first.
+    CREATE TABLE IF NOT EXISTS company_sources (
+        company_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        ref TEXT NOT NULL DEFAULT '',
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        origin_company_id TEXT DEFAULT '',
+        PRIMARY KEY (company_id, source, ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_sources_source ON company_sources(source);
+
+    -- Where each record was already searched: one row per search, so a
+    -- record searched by one module's capability isn't searched by it again
+    -- (unless forced, or older than the capability's refresh_days), and is
+    -- still searched by any other. target_id is a company's id or a
+    -- person's (as text). looked_for: website, people, email, phone (comma
+    -- separated). outcome: found | nothing | error (an error isn't a search
+    -- done: it is tried again).
+    CREATE TABLE IF NOT EXISTS searches (
+        id INTEGER PRIMARY KEY,
+        target TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        module TEXT NOT NULL,
+        capability TEXT NOT NULL DEFAULT '',
+        looked_for TEXT DEFAULT '',
+        searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        outcome TEXT DEFAULT '',
+        found INTEGER DEFAULT 0,
+        cost REAL DEFAULT 0,
+        batch_id TEXT DEFAULT '',
+        detail TEXT DEFAULT '',
+        origin_company_id TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_searches_target
+        ON searches(target, target_id, module, capability, searched_at);
+
+    -- Backfill from what is on file. A row a past merge moved keeps the
+    -- company it was found for, so undoing that merge still sends it back.
+    CREATE TEMP TABLE v21_moved AS
+        SELECT mm.tbl, mm.key1, mm.key2, m.survivor, m.merged
+        FROM company_merge_moves mm JOIN company_merges m ON m.id = mm.merge_id
+        WHERE m.undone_at IS NULL
+          AND (mm.tbl = 'prospects' OR (mm.tbl = 'company_ids' AND mm.key1 IN ('phone', 'external')));
+    CREATE INDEX temp.v21_moved_ids ON v21_moved(tbl, key1, key2, survivor);
+
+    -- People: each CONTACT_FOUND ("Ana Pop — administrator"), once per company.
+    INSERT OR IGNORE INTO people (company_id, name, name_norm, role, source, first_seen,
+                                  last_seen, origin_company_id)
+    SELECT company_id, name, norm, role, src, MIN(seen), MAX(seen), origin FROM (
+        SELECT company_id, name, {contacts.sql_name_norm("name")} AS norm, role, src, seen, origin
+        FROM (
+            SELECT o.company_id,
+                   TRIM(CASE WHEN instr(o.value_text, ' — ') > 0
+                             THEN substr(o.value_text, 1, instr(o.value_text, ' — ') - 1)
+                             ELSE o.value_text END) AS name,
+                   CASE WHEN instr(o.value_text, ' — ') > 0
+                        THEN TRIM(substr(o.value_text, instr(o.value_text, ' — ') + 3))
+                        ELSE '' END AS role,
+                   COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')) AS src,
+                   o.observed_at AS seen,
+                   COALESCE(NULLIF(o.origin_company_id, ''), o.company_id) AS origin
+            FROM observations o
+            WHERE o.signal_code = 'CONTACT_FOUND' AND COALESCE(o.company_id, '') != ''
+              AND COALESCE(o.value_text, '') != ''))
+    WHERE norm != '' GROUP BY company_id, norm;
+
+    -- Phones: every PHONE_NUMBER and every phone key (a listing's, the
+    -- company's own column). Display and line type follow in Python.
+    INSERT OR IGNORE INTO contacts (kind, value, status, first_seen, last_seen)
+    SELECT 'phone', value, 'valid', MIN(seen), MAX(seen) FROM (
+        SELECT value_text AS value, observed_at AS seen FROM observations
+        WHERE signal_code = 'PHONE_NUMBER' AND COALESCE(company_id, '') != ''
+          AND value_text LIKE '+%'
+        UNION ALL
+        SELECT value, created_at FROM company_ids WHERE kind = 'phone')
+    GROUP BY value;
+    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, capability,
+        evidence_url, trust, confidence, first_seen, last_seen, origin_company_id)
+    SELECT o.company_id, ct.id, COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')),
+           COALESCE(o.capability, ''), COALESCE(o.evidence_url, ''),
+           CASE WHEN MAX(COALESCE(o.confidence, 1.0)) >= 0.9 THEN 'confirmed'
+                WHEN MAX(COALESCE(o.confidence, 1.0)) >= 0.6 THEN 'likely'
+                ELSE 'unconfirmed' END,
+           MAX(COALESCE(o.confidence, 1.0)), MIN(o.observed_at), MAX(o.observed_at),
+           COALESCE(NULLIF(o.origin_company_id, ''), o.company_id)
+    FROM observations o JOIN contacts ct ON ct.kind = 'phone' AND ct.value = o.value_text
+    WHERE o.signal_code = 'PHONE_NUMBER' AND COALESCE(o.company_id, '') != ''
+      AND o.value_text LIKE '+%'
+    GROUP BY o.company_id, ct.id, 3;
+    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, trust, confidence,
+        first_seen, last_seen, origin_company_id)
+    SELECT i.company_id, ct.id, COALESCE(i.source, ''), 'confirmed', COALESCE(i.confidence, 1.0),
+           i.created_at, i.created_at,
+           COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'company_ids'
+                     AND mv.key1 = 'phone' AND mv.key2 = i.value AND mv.survivor = i.company_id),
+                    i.company_id)
+    FROM company_ids i JOIN contacts ct ON ct.kind = 'phone' AND ct.value = i.value
+    WHERE i.kind = 'phone';
+
+    -- Contact forms a site has.
+    INSERT OR IGNORE INTO contacts (kind, value, display, first_seen, last_seen)
+    SELECT 'contact_form', TRIM(value_text), TRIM(value_text), MIN(observed_at), MAX(observed_at)
+    FROM observations
+    WHERE signal_code = 'CONTACT_FORM_URL' AND COALESCE(company_id, '') != ''
+      AND TRIM(COALESCE(value_text, '')) != ''
+    GROUP BY TRIM(value_text);
+    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, capability,
+        evidence_url, trust, confidence, first_seen, last_seen, origin_company_id)
+    SELECT o.company_id, ct.id, COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')),
+           COALESCE(o.capability, ''), COALESCE(o.evidence_url, ''), 'confirmed',
+           MAX(COALESCE(o.confidence, 1.0)), MIN(o.observed_at), MAX(o.observed_at),
+           COALESCE(NULLIF(o.origin_company_id, ''), o.company_id)
+    FROM observations o
+    JOIN contacts ct ON ct.kind = 'contact_form' AND ct.value = TRIM(o.value_text)
+    WHERE o.signal_code = 'CONTACT_FORM_URL' AND COALESCE(o.company_id, '') != ''
+    GROUP BY o.company_id, ct.id, 3;
+
+    -- Emails (and LinkedIn addresses) of the prospects, through their person.
+    -- An opted-out address is do-not-contact.
+    INSERT OR IGNORE INTO contacts (kind, value, display, status, do_not_contact, first_seen,
+                                    last_seen)
+    SELECT 'email', email, email, {_EMAIL_STATUS.format(s="MAX(email_status)")},
+           MAX(status = 'opted_out'), MIN(created_at), MAX(updated_at)
+    FROM prospects WHERE email != '' AND instr(email, '@') > 1 GROUP BY email;
+    INSERT OR IGNORE INTO contacts (kind, value, display, first_seen, last_seen)
+    SELECT 'linkedin', TRIM(linkedin_url), TRIM(linkedin_url), MIN(created_at), MAX(updated_at)
+    FROM prospects WHERE TRIM(COALESCE(linkedin_url, '')) != '' GROUP BY TRIM(linkedin_url);
+    INSERT OR IGNORE INTO people (company_id, name, name_norm, role, source, first_seen,
+                                  last_seen, origin_company_id)
+    SELECT p.company_id, {_P_NAME}, {contacts.sql_name_norm(_P_NAME)}, COALESCE(p.title, ''),
+           COALESCE(p.source, ''), p.created_at, p.updated_at, {_P_ORIGIN}
+    FROM prospects p
+    WHERE COALESCE(p.company_id, '') != '' AND {contacts.sql_name_norm(_P_NAME)} != '';
+    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, person_id, source,
+        evidence_url, trust, first_seen, last_seen, origin_company_id)
+    SELECT p.company_id, ct.id, COALESCE(pe.id, 0), COALESCE(p.source, ''),
+           COALESCE(p.source_url, ''),
+           CASE WHEN ct.kind = 'linkedin' OR (COALESCE(c.domain, '') != ''
+                     AND substr(p.email, instr(p.email, '@') + 1) = c.domain)
+                THEN 'confirmed' ELSE 'likely' END,
+           p.created_at, p.updated_at, {_P_ORIGIN}
+    FROM prospects p
+    JOIN contacts ct ON (ct.kind = 'email' AND ct.value = p.email AND p.email != '')
+                     OR (ct.kind = 'linkedin' AND ct.value = TRIM(p.linkedin_url)
+                         AND TRIM(COALESCE(p.linkedin_url, '')) != '')
+    LEFT JOIN companies c ON c.id = p.company_id
+    LEFT JOIN people pe ON pe.company_id = p.company_id
+         AND pe.name_norm = {contacts.sql_name_norm(_P_NAME)} AND pe.name_norm != ''
+    WHERE COALESCE(p.company_id, '') != '';
+
+    -- Sources: the company's own, every listing id it holds, and every
+    -- module that wrote a fact about it.
+    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
+                                           origin_company_id)
+    SELECT id, source, COALESCE(external_id, ''), created_at, updated_at, id
+    FROM companies WHERE COALESCE(source, '') != '';
+    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
+                                           origin_company_id)
+    SELECT i.company_id,
+           COALESCE(NULLIF(i.source, ''), substr(i.value, 1, instr(i.value, ':') - 1)),
+           i.value, i.created_at, i.created_at,
+           COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'company_ids'
+                     AND mv.key1 = 'external' AND mv.key2 = i.value
+                     AND mv.survivor = i.company_id), i.company_id)
+    FROM company_ids i
+    WHERE i.kind = 'external' AND (i.source != '' OR instr(i.value, ':') > 1);
+    -- (Not again for the source the company came from: a registry record's
+    -- "registry:onrc" is its onrc module.)
+    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
+                                           origin_company_id)
+    SELECT company_id, module, '', first_seen, last_seen, origin FROM (
+        SELECT company_id, module, MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen,
+               CASE WHEN MIN(COALESCE(NULLIF(origin_company_id, ''), company_id))
+                       = MAX(COALESCE(NULLIF(origin_company_id, ''), company_id))
+                    THEN MIN(COALESCE(NULLIF(origin_company_id, ''), company_id))
+                    ELSE company_id END AS origin
+        FROM observations
+        WHERE COALESCE(module, '') != '' AND COALESCE(company_id, '') != ''
+        GROUP BY company_id, module) found
+    WHERE NOT EXISTS (SELECT 1 FROM company_sources s WHERE s.company_id = found.company_id
+                      AND (s.source = found.module OR s.source LIKE '%:' || found.module));
+    -- Searches already done: the contact backfill's and the site reads'
+    -- rotation marks, one search each (a site read looks for phones and a
+    -- contact form; the backfill for people and their emails).
+    INSERT INTO searches (target, target_id, module, capability, looked_for, searched_at,
+                          outcome, found, origin_company_id)
+    SELECT 'company', c.id, 'people', 'find_people', 'people,email', c.prospects_checked_at,
+           CASE WHEN EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
+                THEN 'found' ELSE 'nothing' END,
+           (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id), c.id
+    FROM companies c WHERE c.prospects_checked_at IS NOT NULL;
+    INSERT INTO searches (target, target_id, module, capability, looked_for, searched_at,
+                          outcome, origin_company_id)
+    SELECT 'company', c.id, 'website', 'read_site', 'phone,contact_form', c.profile_checked_at,
+           'nothing', c.id
+    FROM companies c WHERE c.profile_checked_at IS NOT NULL;
+    DROP TABLE temp.v21_moved;
+
+    -- From here on every prospect write keeps its contact in step: a new
+    -- address, a verifier's status, an opt-out (do-not-contact) and its undo.
+    CREATE TRIGGER IF NOT EXISTS trg_prospects_contact_insert
+    AFTER INSERT ON prospects
+    WHEN NEW.email != '' AND instr(NEW.email, '@') > 1
+    BEGIN
+        INSERT INTO contacts (kind, value, display, status, do_not_contact)
+        VALUES ('email', NEW.email, NEW.email, {_EMAIL_STATUS.format(s="NEW.email_status")},
+                NEW.status = 'opted_out')
+        ON CONFLICT(kind, value) DO UPDATE SET
+            status = CASE WHEN excluded.status != 'unchecked' THEN excluded.status
+                          ELSE contacts.status END,
+            do_not_contact = MAX(contacts.do_not_contact, excluded.do_not_contact),
+            last_seen = CURRENT_TIMESTAMP;{_PROSPECT_LINK}
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_prospects_contact_update
+    AFTER UPDATE OF email, email_status, status ON prospects
+    WHEN NEW.email != '' AND instr(NEW.email, '@') > 1
+    BEGIN
+        INSERT INTO contacts (kind, value, display, status, do_not_contact)
+        VALUES ('email', NEW.email, NEW.email, {_EMAIL_STATUS.format(s="NEW.email_status")},
+                NEW.status = 'opted_out')
+        ON CONFLICT(kind, value) DO UPDATE SET
+            status = CASE WHEN excluded.status != 'unchecked' THEN excluded.status
+                          ELSE contacts.status END,
+            do_not_contact = CASE WHEN NEW.status = 'opted_out' THEN 1
+                                  WHEN OLD.status = 'opted_out' THEN 0
+                                  ELSE contacts.do_not_contact END,
+            last_seen = CURRENT_TIMESTAMP;{_PROSPECT_LINK}
+    END;
+"""
 
 MIGRATIONS: list[str] = [
     # ── v1: base schema (idempotent, so pre-migration DBs adopt cleanly) ──
@@ -938,6 +1322,24 @@ MIGRATIONS: list[str] = [
         started_at REAL NOT NULL
     );
     """,
+    # ── v21: contacts, people, places and sources ──
+    _V21_CONTACTS,
+    # ── v22: the website the contact finder found, and how sure it is ──
+    """
+    -- A website the contact finder found by searching the company's name and
+    -- town: confirmed (its pages name the company's CUI, or a phone or email
+    -- already on file), likely (name and town match) or unconfirmed.
+    -- website_source is the search module it came from. '' for a website a
+    -- source gave with the company itself.
+    ALTER TABLE companies ADD COLUMN website_trust TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN website_source TEXT DEFAULT '';
+    -- The finder's free backlog: companies with a website to read.
+    CREATE INDEX IF NOT EXISTS idx_companies_website ON companies(website)
+        WHERE website != '';
+    -- The finder takes the newest companies first.
+    CREATE INDEX IF NOT EXISTS idx_companies_created ON companies(created_at);
+    CREATE INDEX IF NOT EXISTS idx_searches_batch ON searches(batch_id) WHERE batch_id != '';
+    """,
 ]
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
@@ -1040,6 +1442,9 @@ async def _insert_company(db, company: Company) -> str:
     )
     if cursor.rowcount:
         await resolver.register(db, company.id, resolver.identifiers(company), company.source)
+        await contacts.add_source(db, company.id, company.source, company.external_id)
+        await _company_phone_contact(db, company.id, company.phone, company.source,
+                                     company.location, company.domain)
     else:
         # Uniqueness conflict: hand back the existing record's id.
         for column, value in (("cui", company.cui),
@@ -1092,7 +1497,29 @@ async def _fill_company_fields(db, company_id: str, fields: dict) -> list[str]:
             changed.append(column)
     if changed:
         await resolver.register_company(db, company_id)
+    if "phone" in changed:
+        await _company_phone_contact(db, company_id, fields["phone"])
     return changed
+
+
+async def _company_phone_contact(db, company_id: str, phone: str, source: str = "",
+                                 location: str | None = None, domain: str | None = None) -> None:
+    """The company's own phone column is also a phone contact of it (read
+    in its country); one that doesn't parse stays in the column only."""
+    if not phone:
+        return
+    from harvey.collectors.phones import phone_region
+
+    if location is None or not source:
+        async with db.execute("SELECT location, domain, source FROM companies WHERE id = ?",
+                              (company_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return
+        location, domain, source = location or row[0], domain or row[1], source or row[2]
+    await contacts.add(db, company_id, contacts.Found(
+        "phone", phone, source=source or "", trust="confirmed",
+        region=phone_region(location or "", None, domain or "")))
 
 
 async def _set_company_activities(db, company_id: str, classes, source: str,
@@ -1141,7 +1568,18 @@ async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
                    COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)""",
         payload,
     )
+    # A phone, a named person or a contact form is also a contact record.
+    await contacts.from_observations(db, rows)
     return len(payload)
+
+
+async def _add_contacts(db, company_id: str, found: list, origin: str = "") -> int:
+    """Save each contact (contacts.Found) and link it to the company; how
+    many were kept (a phone that doesn't parse isn't)."""
+    kept = 0
+    for item in found:
+        kept += await contacts.add(db, company_id, item, origin) is not None
+    return kept
 
 
 class Resolution:
@@ -1268,6 +1706,21 @@ class CompanyBatch:
 
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         return await _insert_observations(self.db, rows, run_id)
+
+    async def add_contacts(self, company_id: str, found: list, origin: str = "") -> int:
+        return await _add_contacts(self.db, company_id, found, origin)
+
+    async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
+                         source: str = "", origin: str = "") -> None:
+        for name, role in people:
+            await contacts.add_person(self.db, company_id, name, role, source, origin)
+
+    async def add_location(self, company_id: str, **place) -> int:
+        return await contacts.add_location(self.db, company_id, **place)
+
+    async def add_company_source(self, company_id: str, source: str, ref: str = "",
+                                 origin: str = "") -> None:
+        await contacts.add_source(self.db, company_id, source, ref, origin)
 
     async def module_readings(self, company_id: str, module: str
                               ) -> tuple[dict[str, tuple], set[tuple[str, str]]]:
@@ -1400,8 +1853,16 @@ async def _modules_first_seen(db) -> None:
         logger.info("Modules kept on from before the upgrade: %s", ", ".join(kept))
 
 
+async def _contacts_first_seen(db) -> None:
+    """v21's Python step: the phones its SQL backfilled get their display
+    form and line type, and a prospect's own phone (as typed) becomes a
+    contact of its person (parsing a number needs phonenumbers)."""
+    await contacts.backfill_phones(db)
+    await contacts.backfill_prospect_phones(db)
+
+
 # Python steps run right after a migration, in its transaction.
-_AFTER_MIGRATION = {17: _resolve_on_file, 18: _modules_first_seen}
+_AFTER_MIGRATION = {17: _resolve_on_file, 18: _modules_first_seen, 21: _contacts_first_seen}
 
 
 _UPSERT_SIGNAL_CODE = """INSERT INTO signal_codes
@@ -1450,13 +1911,13 @@ class StateManager:
         self.db_path = db_path or str(DB_PATH)
 
     @asynccontextmanager
-    async def _connect(self):
+    async def _connect(self, timeout: float = BUSY_TIMEOUT_SECONDS):
         """Open a connection with sane concurrency settings.
 
         `timeout` maps to SQLite's busy handler, so writers wait for locks
         (e.g. while the dashboard holds a read) instead of erroring.
         """
-        db = await aiosqlite.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
+        db = await aiosqlite.connect(self.db_path, timeout=timeout)
         try:
             yield db
         finally:
@@ -1481,7 +1942,8 @@ class StateManager:
     async def init_db(self):
         """Create/upgrade the schema. Safe to call on every startup."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with self._connect() as db:
+        # (A second process starting during an upgrade waits for it.)
+        async with self._connect(timeout=MIGRATION_TIMEOUT_SECONDS) as db:
             # WAL is persistent in the DB file: readers (dashboard) never
             # block the writer (agent) and vice versa.
             try:
@@ -2768,6 +3230,23 @@ class StateManager:
                 raise
         return len(rows)
 
+    async def write_contact_kinds(self, rows_for, settings_prefix: str) -> None:
+        """The contact kinds the manifests declare (contacts.sync_kinds), with
+        the switches read in the same transaction (see write_vocabulary)."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
+                    (len(settings_prefix), settings_prefix),
+                ) as cursor:
+                    settings = {k: v for k, v in await cursor.fetchall()}
+                await contacts.sync_kinds(db, rows_for(settings))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
     async def get_signal_codes(self, status: str | None = None,
                                available_only: bool = False) -> list[dict]:
         """The vocabulary. ``available_only`` leaves out the signals of
@@ -2843,9 +3322,36 @@ class StateManager:
                  value_num, value_text, float(confidence), evidence_url,
                  observed_at, run_id, module, capability, origin_company_id),
             )
+            await contacts.from_observations(db, [{
+                "company_id": company_id, "signal_code": signal_code, "value_text": value_text,
+                "confidence": confidence, "evidence_url": evidence_url, "observed_at": observed_at,
+                "module": module, "collector": collector, "capability": capability,
+                "origin_company_id": origin_company_id}])
             await self._flush_company_search(db)
             await db.commit()
         return obs_id
+
+    async def add_contacts(self, company_id: str, found: list, origin: str = "") -> int:
+        """Save contacts (contacts.Found) found for a company, linked to it."""
+        if not found:
+            return 0
+        async with self._connect() as db:
+            kept = await _add_contacts(db, company_id, found, origin)
+            await db.commit()
+        return kept
+
+    async def add_location(self, company_id: str, **place) -> int:
+        """One of a company's places (contacts.add_location)."""
+        async with self._connect() as db:
+            location_id = await contacts.add_location(db, company_id, **place)
+            await db.commit()
+        return location_id
+
+    async def add_company_source(self, company_id: str, source: str, ref: str = "",
+                                 origin: str = "") -> None:
+        async with self._connect() as db:
+            await contacts.add_source(db, company_id, source, ref, origin)
+            await db.commit()
 
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         """Batch insert. Flushed per batch by callers — a long run that dies
@@ -3367,41 +3873,124 @@ class StateManager:
             )
             if cursor.rowcount:
                 await resolver.register_company(db, company_id)
+                await _company_phone_contact(db, company_id, phone)
             await db.commit()
             return cursor.rowcount > 0
 
     async def companies_needing_prospects(
-        self, limit: int = 10, stale_days: int = 14
+        self, limit: int = 10, module: str = "people", capability: str = "find_people",
+        since: str | None = None,
     ) -> list[dict]:
-        """Companies with a domain, zero prospects, and no recent check.
+        """Companies with a domain, zero prospects, and not yet searched by
+        ``module``'s ``capability`` (the searches table).
 
         `harvey discover` (and other company-only sources) can add companies
         without ever finding a named contact at them. This is what lets a
         prospecting pass go back and fill that in, instead of only ever
         looking at companies it stumbles into fresh in the same cycle.
 
-        Ordered by ``prospects_checked_at`` (nulls first) rather than
-        recency, so a backfill pass rotates through the whole backlog
-        instead of retrying the same top-N-by-created_at companies every
-        cycle — a company a team page didn't exist for last time is worth
-        another look after ``stale_days``, not a permanent skip.
+        A company searched once isn't searched by the same capability
+        again: not until the capability's ``refresh_days`` (its manifest)
+        have passed, never when it declares none. It can still be searched
+        by any other. ``since`` (a forced run's start) searches again every
+        company not searched since then. Never-searched companies first,
+        then the longest ago, so the whole backlog rotates.
         """
+        cutoff = contacts.search_cutoff(module, capability, since)
+        last = ("(SELECT MAX(s.searched_at) FROM searches s WHERE s.target = 'company' "
+                "AND s.target_id = c.id AND s.module = ? AND s.capability = ?)")
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 f"""SELECT c.id, c.name, c.domain, c.industry
                    FROM companies c
-                   LEFT JOIN prospects p ON p.company_id = c.id
                    WHERE c.domain != '' AND {LIVE_COMPANY}
-                     AND (c.prospects_checked_at IS NULL
-                          OR c.prospects_checked_at < datetime('now', ?))
-                   GROUP BY c.id
-                   HAVING COUNT(p.id) = 0
-                   ORDER BY c.prospects_checked_at IS NOT NULL, c.prospects_checked_at
+                     AND NOT EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
+                     AND {contacts.not_searched("c.id")}
+                   ORDER BY {last} IS NOT NULL, {last}
                    LIMIT ?""",
-                (f"-{int(stale_days)} days", int(limit)),
+                (module, capability, cutoff, module, capability, module, capability,
+                 int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def email_audience(self, limit: int = 200) -> list[dict]:
+        """Email contacts the Email module can write to and has no prospect
+        for yet: a verified, catch-all or not yet checked address, not
+        do-not-contact, reaching a live company with trust confirmed or
+        likely. Each comes with one link (through a person first, then the
+        best trust): its company, person and source. Oldest first."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT ct.id AS contact_id, ct.value AS email, ct.status, l.company_id,
+                          l.source, l.evidence_url, l.trust, COALESCE(p.name, '') AS person,
+                          COALESCE(p.role, '') AS role, COALESCE(p.source, '') AS person_source,
+                          c.name AS company, COALESCE(c.industry, '') AS industry,
+                          COALESCE(c.domain, '') AS domain
+                   FROM contacts ct
+                   JOIN company_contacts l ON l.id = (
+                       SELECT l2.id FROM company_contacts l2
+                       JOIN companies c2 ON c2.id = l2.company_id
+                       WHERE l2.contact_id = ct.id AND l2.trust IN ('confirmed', 'likely')
+                         AND COALESCE(c2.merged_into, '') = ''
+                       ORDER BY l2.person_id = 0, l2.trust != 'confirmed', l2.id LIMIT 1)
+                   JOIN companies c ON c.id = l.company_id
+                   LEFT JOIN people p ON p.id = l.person_id AND l.person_id != 0
+                   WHERE ct.kind = 'email' AND ct.do_not_contact = 0
+                     AND ct.status IN ('verified', 'risky', 'unchecked')
+                     AND NOT EXISTS (SELECT 1 FROM prospects pr WHERE pr.email = ct.value)
+                   ORDER BY ct.status = 'unchecked', ct.id LIMIT ?""", (int(limit),)) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def record_search(self, target: str, target_id, module: str, capability: str,
+                            **done) -> None:
+        """A search done for a record (contacts.record_search), whatever it
+        found."""
+        async with self._connect() as db:
+            await contacts.record_search(db, target, target_id, module, capability, **done)
+            await db.commit()
+
+    async def set_found_website(self, company_id: str, website: str, *, domain: str = "",
+                                trust: str = "unconfirmed", source: str = "") -> bool:
+        """A website the contact finder found for a company with none, and
+        how sure it is (companies.website_trust). Its domain is the
+        company's key only when ``domain`` is given (a confirmed match) and
+        no other company holds it. False when the company has a website
+        already: a found one never replaces it."""
+        async with self._connect() as db:
+            if domain:
+                async with db.execute("SELECT 1 FROM companies WHERE domain = ? AND id != ? "
+                                      "LIMIT 1", (domain, company_id)) as cur:
+                    if await cur.fetchone():
+                        domain = ""
+            cur = await db.execute(
+                "UPDATE companies SET website = ?, website_trust = ?, website_source = ?, "
+                "domain = CASE WHEN ? != '' AND COALESCE(domain, '') = '' THEN ? ELSE domain END, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND COALESCE(website, '') = '' AND COALESCE(domain, '') = ''",
+                (website, trust, source, domain, domain, company_id))
+            changed = cur.rowcount > 0
+            if changed and domain:
+                await resolver.register(db, company_id, [("domain", domain)], source=source)
+            await db.commit()
+        return changed
+
+    async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
+                         source: str = "", origin: str = "") -> int:
+        """People named at a company ((name, role) pairs), each kept once
+        by name; a second mention fills a missing role. How many were new."""
+        async with self._connect() as db:
+            async with db.execute("SELECT COUNT(*) FROM people WHERE company_id = ?",
+                                  (company_id,)) as cur:
+                (before,) = await cur.fetchone()
+            for name, role in people:
+                await contacts.add_person(db, company_id, name, role, source, origin)
+            async with db.execute("SELECT COUNT(*) FROM people WHERE company_id = ?",
+                                  (company_id,)) as cur:
+                (after,) = await cur.fetchone()
+            await db.commit()
+        return after - before
 
     async def mark_prospects_checked(self, company_id: str):
         """Record that a prospect-backfill pass looked at this company,

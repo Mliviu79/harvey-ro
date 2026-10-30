@@ -57,12 +57,18 @@ def offline(monkeypatch):
     env = EnvConfig(serper_api_key="k", tinyfish_api_key="k")
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: env)
     monkeypatch.setattr(job_kinds, "_config", lambda: None)
-    # Site reads aren't what these tests are about.
+    # Site reads and the contact finder aren't what these tests are about.
     monkeypatch.setattr(job_kinds, "enqueue_site_reads", _no_site_reads)
+    monkeypatch.setattr(job_kinds, "enqueue_finder_follow_ups", _no_finder)
+    monkeypatch.setattr(job_kinds, "enqueue_backlog", _no_finder)
 
 
 async def _no_site_reads(*a, **k):
     return [], []
+
+
+async def _no_finder(*a, **k):
+    return 0
 
 
 def rows(state, sql, *args):
@@ -781,12 +787,29 @@ async def test_a_site_read_job_reads_one_company(state, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_heartbeat_queues_contact_finding_instead_of_running_it(state):
+async def test_the_contact_finder_is_one_job_per_company_on_its_own_lane(state):
+    from harvey.models.company import Company
     from harvey.modules.job_kinds import enqueue_find_contacts
 
-    first = await enqueue_find_contacts(state)
-    assert first and await enqueue_find_contacts(state) is None     # one at a time
-    assert rows(state, "SELECT kind, lane FROM jobs") == [("find_contacts", "contacts")]
+    a = await state.add_company(Company(name="Alfa Example", domain="alfa.example.com"))
+    b = await state.add_company(Company(name="Beta Example", domain="beta.example.com"))
+    ids, dupes = await enqueue_find_contacts(state, [a, b, a])
+    assert len(ids) == 2 and not dupes
+    again, dupes = await enqueue_find_contacts(state, [a])
+    assert again == [] and len(dupes) == 1                         # once per company
+    assert rows(state, "SELECT DISTINCT kind, lane, module FROM jobs") == [
+        ("find_contacts", "contacts", "contact_finder")]
+    assert sorted(r[0] for r in rows(state, "SELECT label FROM jobs")) == [
+        "Alfa Example", "Beta Example"]
+
+
+def test_the_heartbeat_no_longer_finds_contacts():
+    import inspect
+
+    import harvey.main as main_mod
+
+    source = inspect.getsource(main_mod)
+    assert "find_contacts" not in source and "Scout" not in source
 
 
 @pytest.mark.asyncio

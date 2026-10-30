@@ -15,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from dataclasses import replace
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -452,6 +453,12 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
                            run_id=report.run_id, confirmed=confirmed)
         fresh = await ingest.unseen(batch, saved.company_id, record.source_url, rows)
         report.observations += await ingest.write(batch, fresh, report.run_id)
+        if "CONTACT_FOUND" not in confirmed:
+            # The people the source names (a registry's administrators) are
+            # people to search for a contact whatever is confirmed; only the
+            # reading waits for CONTACT_FOUND.
+            await ingest.named_people(batch, saved.company_id, found, origin=saved.origin,
+                                      source=module)
 
     records = draft.records
     try:
@@ -1174,70 +1181,139 @@ async def profile(state, companies: list[dict], confirmed: set[str], run_id: str
     write what each read found before the next: the observations are the
     asset, and a long run that dies must not take them with it. Returns
     the observations written."""
+    total = 0
+    async with site_reader(state, confirmed, config=config,
+                           role_keywords=role_keywords) as read:
+        for company in companies:
+            if not (company.get("domain") or "").strip():
+                continue
+            done = await read(company, run_id=run_id)
+            total += done.observations if done else 0
+            await asyncio.sleep(random.uniform(0.4, 1.2))
+    return total
+
+
+@dataclass
+class SiteRead:
+    """What one read of a company's site found and wrote."""
+
+    draft: api.Draft
+    observations: int = 0
+    contacts: int = 0
+    people: int = 0
+
+
+@asynccontextmanager
+async def site_reader(state, confirmed: set[str], *, config=None,
+                      role_keywords: list[str] | None = None, contacts: bool = False):
+    """``read(company, run_id=, trust=, judge=)`` for one company's site at
+    a time, on one HTTP client and page reader. ``contacts`` reads the
+    contact and team pages for the ways to reach the company whatever is
+    confirmed (the contact finder's read)."""
     from harvey.browser import PageReader
     from harvey.collectors import profile as P
 
     cap = api.capability("website", "read_site")
-    total = 0
     enabled = await _enabled(state)
     hit_codes = _hit_codes(enabled, confirmed)
     client, pages = P.open_http(), PageReader()
+    ctx = api.Context(http=client, browser=pages, config=config,
+                      wanted=frozenset(confirmed), enabled=enabled,
+                      settings={"role_keywords": list(role_keywords or []),
+                                "contacts": contacts})
+
+    async def read(company: dict, *, run_id: str = "", domain: str = "", judge=None):
+        return await _read_site(state, cap, ctx, company, confirmed, hit_codes,
+                                run_id=run_id, domain=domain, judge=judge)
+
     try:
-        ctx = api.Context(http=client, browser=pages, config=config,
-                          wanted=frozenset(confirmed), enabled=enabled,
-                          settings={"role_keywords": list(role_keywords or [])})
-        for company in companies:
-            domain = (company.get("domain") or "").strip()
-            if not domain:
-                continue
-            company_id = company["id"]
-            hits, source_url = await _known(state, company, hit_codes)
-            inp = api.Input(company_id=company_id, name=company.get("name") or "",
-                            domain=domain, locality=company.get("location") or "",
-                            facts={"search_hits": hits}, extra={"source_url": source_url})
-            try:
-                draft = await cap(inp, ctx)
-            except Exception as e:
-                _profile_log.warning(f"profile failed for {domain}: {e}")
-                await _mark_profiled(state, company_id)
-                continue
-            # Marked regardless of outcome — an unreachable site still counts
-            # as checked, or the same handful gets retried every cycle
-            # forever instead of rotating through the rest of the backlog.
-            await _mark_profiled(state, company_id)
-            better = draft.values.get("name")
-            if better:
-                try:
-                    await ingest.company_name(state, company_id, better)
-                    _profile_log.info(f"profile: {domain} named '{better}' "
-                                      f"(was '{company.get('name') or ''}')")
-                except Exception as e:
-                    _profile_log.debug(f"rename_company failed for {domain}: {e}")
-            phones = [c for c in draft.contacts if c.kind == "phone"]
-            if phones:
-                # Contact data like a published email: it doesn't wait for
-                # PHONE_NUMBER to be confirmed.
-                try:
-                    if await ingest.company_phone(state, company_id, phones[0].display):
-                        _profile_log.info(f"profile: {company.get('domain')} phone "
-                                          f"{phones[0].display} from its site")
-                except Exception as e:
-                    _profile_log.debug(f"fill_company_phone failed for {company.get('domain')}: {e}")
-            if draft.facts:
-                total += await ingest.write(state, ingest.rows(
-                    draft.facts, company_id=company_id, run_id=run_id,
-                    confirmed=confirmed), run_id)
-                _profile_log.info(f"profile: {domain} → {len(draft.facts)} observation(s)")
-            await asyncio.sleep(random.uniform(0.4, 1.2))
+        yield read
     finally:
         await client.aclose()
         await pages.aclose()
-    return total
 
 
-async def _mark_profiled(state, company_id: str):
+async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, run_id: str = "",
+                     domain: str = "", judge=None) -> SiteRead | None:
+    """One company's site read and written. ``domain`` reads a site other
+    than the company's own key (a website it declares, or one the contact
+    finder found); ``judge(draft)`` then says how sure it is that the site
+    is the company's ("confirmed", "likely", "unconfirmed"): below
+    confirmed, only the ways to reach it are kept, marked with that trust,
+    and nothing about the site is said of the company (no facts, no new
+    name, no phone of record). None when the read failed."""
+    domain = (domain or company.get("domain") or "").strip()
+    company_id = company["id"]
+    hits, source_url = await _known(state, company, hit_codes)
+    inp = api.Input(company_id=company_id, name=company.get("name") or "",
+                    domain=domain, locality=company.get("location") or "",
+                    facts={"search_hits": hits}, extra={"source_url": source_url})
+    try:
+        draft = await cap(inp, ctx)
+    except Exception as e:
+        _profile_log.warning(f"profile failed for {domain}: {e}")
+        await _mark_profiled(state, company_id, "error", detail=str(e))
+        return None
+    # Marked regardless of outcome — an unreachable site still counts
+    # as checked, or the same handful gets retried every cycle
+    # forever instead of rotating through the rest of the backlog.
+    await _mark_profiled(state, company_id, found=len(draft.contacts),
+                         contacts=bool(ctx.settings.get("contacts")))
+    trust = judge(draft) if judge is not None else ""
+    own = trust in ("", "confirmed")
+    done = SiteRead(draft)
+    better = draft.values.get("name")
+    if better and own:
+        try:
+            await ingest.company_name(state, company_id, better)
+            _profile_log.info(f"profile: {domain} named '{better}' "
+                              f"(was '{company.get('name') or ''}')")
+        except Exception as e:
+            _profile_log.debug(f"rename_company failed for {domain}: {e}")
+    phones = [c for c in draft.contacts if c.kind == "phone"]
+    if phones and own:
+        # Contact data like a published email: it doesn't wait for
+        # PHONE_NUMBER to be confirmed.
+        try:
+            if await ingest.company_phone(state, company_id, phones[0].display):
+                _profile_log.info(f"profile: {domain} phone {phones[0].display} from its site")
+        except Exception as e:
+            _profile_log.debug(f"fill_company_phone failed for {domain}: {e}")
+    try:
+        if draft.contacts:
+            # Every way the site says to reach the company: phones,
+            # emails, its contact form, the social profiles it links to.
+            done.contacts = await ingest.add_contacts(state, company_id, draft.contacts,
+                                                      trust=trust)
+        if draft.people:
+            done.people = await ingest.people(state, company_id, draft.people)
+    except Exception as e:
+        _profile_log.debug(f"contacts not stored for {domain}: {e}")
+    if draft.facts and own:
+        done.observations = await ingest.write(state, ingest.rows(
+            draft.facts, company_id=company_id, run_id=run_id,
+            confirmed=confirmed), run_id)
+        _profile_log.info(f"profile: {domain} → {len(draft.facts)} observation(s)")
+    return done
+
+
+# What a site read looks for: a plain read its phones and contact form; the
+# contact finder's (``contacts``) its emails, social profiles and people too.
+# Only the second closes the finder's read (finder.SITE_WANTS).
+PLAIN_READ = "phone,contact_form"
+CONTACT_READ = "phone,email,contact_form,social,people"
+
+
+async def _mark_profiled(state, company_id: str, outcome: str = "", found: int = 0,
+                         detail: str = "", contacts: bool = False):
+    """The site was read (its rotation mark), and searched for the ways it
+    says to reach the company (the searches table), whatever it found."""
     try:
         await state.mark_company_profiled(company_id)
+        await state.record_search("company", company_id, "website", "read_site",
+                                  looked_for=CONTACT_READ if contacts else PLAIN_READ,
+                                  outcome=outcome or ("found" if found else "nothing"),
+                                  found=found, detail=detail)
     except Exception as e:
         _profile_log.debug(f"mark_company_profiled failed for {company_id}: {e}")
 

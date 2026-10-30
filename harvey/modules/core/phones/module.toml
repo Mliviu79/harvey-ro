@@ -34,3 +34,8 @@ op = "read"
 inputs = [["pages"]]
 outputs = { ids = ["phone"], facts = ["PHONE_NUMBER"] }
 cost = { usd = 0.0, per = "company" }
+
+[[contact_kinds]]
+kind = "phone"
+label = "Phone"
+channel = "phone"

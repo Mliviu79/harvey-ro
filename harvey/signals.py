@@ -511,4 +511,12 @@ async def sync_vocabulary(state) -> int:
             available=m.id in on or sig["code"] in produced,
         ) for m in manifests for sig in m.signals]
 
-    return await state.write_vocabulary(rows, switches.PREFIX)
+    declared = await state.write_vocabulary(rows, switches.PREFIX)
+
+    def kinds(stored: dict[str, str]) -> list[dict]:
+        on = switches.resolve(stored, manifests)
+        return [{**item, "module": m.id, "available": m.id in on}
+                for m in manifests for item in m.contact_kinds]
+
+    await state.write_contact_kinds(kinds, switches.PREFIX)
+    return declared

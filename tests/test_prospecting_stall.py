@@ -46,11 +46,12 @@ async def test_summary_counts_only_prospects_the_writer_can_use(state):
 
 
 @pytest.mark.asyncio
-async def test_guessed_emails_alone_lead_back_to_prospecting(state):
+async def test_guessed_emails_alone_leave_nothing_to_write(state):
     for n in range(3):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
+    # Finding people isn't the heartbeat's (the contact finder runs on its own).
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
 
 
 async def age_all(state, days):
@@ -64,10 +65,9 @@ async def age_all(state, days):
 
 
 @pytest.mark.asyncio
-async def test_a_day_of_unusable_prospects_pauses_spending_and_says_why(state):
-    # With no usable email at all (say, no verifier key), prospecting every
-    # cycle would burn search and verifier credits on people Harvey can
-    # never email. A day's worth pauses it, and status explains why.
+async def test_a_day_of_unusable_prospects_says_why_nothing_is_written(state):
+    # With no usable email at all (say, no verifier key), the Writer has
+    # nothing to draft for. A day's worth of them, and status says why.
     from harvey.main import PROSPECT_BACKLOG, unusable_backlog_notice
     for n in range(PROSPECT_BACKLOG):
         await add(state, n, f"p{n}@co{n}.test", "guess")
@@ -75,23 +75,24 @@ async def test_a_day_of_unusable_prospects_pauses_spending_and_says_why(state):
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     notice = unusable_backlog_notice(summary)
     assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice and "about a day" in notice
+    assert "paused prospecting" not in notice
 
 
 @pytest.mark.asyncio
-async def test_the_pause_never_becomes_permanent(state):
-    # Nothing re-checks a guessed address, so an all-time count would stop
-    # Scout for good. Once the guesses are a day old, prospecting resumes.
+async def test_the_notice_never_becomes_permanent(state):
+    # Nothing re-checks a guessed address, so an all-time count would say
+    # it for good. Once the guesses are a day old, it stops.
     from harvey.main import PROSPECT_BACKLOG, unusable_backlog_notice
     for n in range(PROSPECT_BACKLOG + 10):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     await age_all(state, days=2)
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     assert unusable_backlog_notice(summary) == ""
 
 
 @pytest.mark.asyncio
-async def test_old_guesses_do_not_stop_a_mixed_setup_returning_to_prospecting(state):
+async def test_old_guesses_do_not_stop_a_mixed_setup_writing(state):
     for n in range(25):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     await age_all(state, days=3)
@@ -104,7 +105,7 @@ async def test_old_guesses_do_not_stop_a_mixed_setup_returning_to_prospecting(st
     [verified] = [p for p in await state.get_prospects_by_status("new") if p.email_status == "verified"]
     await state.update_prospect_status(verified.id, "queued")  # what the Writer does
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
 
 
 @pytest.mark.asyncio

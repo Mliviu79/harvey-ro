@@ -117,6 +117,7 @@ const STATUS = {
   proposed: 'waiting', confirmed: 'good',
   verified: 'good', risky: 'waiting', guess: 'idle', invalid: 'bad',
   running: 'active', stale: 'bad', stalled: 'bad',
+  unchecked: 'idle', valid: 'good', likely: 'waiting', unconfirmed: 'idle',
 };
 
 function statusMeta(status) {
@@ -236,10 +237,14 @@ const SOURCE_LABELS = {
   scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search', 'registry:onrc': 'src.onrc', onrc: 'src.onrc',
 };
 function sourceLabel(s) {
+  return escHtml(sourceText(s));
+}
+
+function sourceText(s) {
   if (!s) return '';
   const hit = own(SOURCE_LABELS, s);
-  if (hit) return escHtml(hit.startsWith('src.') ? t(hit) : hit);
-  return escHtml(String(s).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()));
+  if (hit) return hit.startsWith('src.') ? t(hit) : hit;
+  return String(s).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
 }
 
 const AGENT_ICONS = {scout: 'discover', writer: 'pen', sender: 'campaigns', handler: 'message',
@@ -1543,10 +1548,41 @@ async function setSignals(codes, status) {
   loadSignals();
 }
 
-// ── Discover: pick a source, price it, then run it ──
+// ── Discover: tick sources, price them, then run them as one batch ──
 
-let _provider = null;
+// The sources ticked (search providers' keys and "<module>.<capability>"
+// for a source run as a job, the registry), and each one's filters.
+let _sources = null;
+let _sourceFilters = {};
 let _discoverPoll = null;
+let _discData = null;
+
+function sourceCard(p, kind) {
+  const pv = (field) => kind === 'job' ? tServer('src.' + p.key + '.' + field, p[field] || '')
+                                       : tServer('prov.' + p.key + '.' + field, p[field]);
+  const on = _sources.has(p.key);
+  const ready = p.configured
+    ? '<span class="badge t-good">' + escHtml(t('disc.ready')) + '</span>'
+    : '<span class="badge t-waiting">' + escHtml(t('disc.needs_key')) + '</span>';
+  return '<label class="prov-card ' + (on ? 'selected' : '') + '">' +
+    '<div class="prov-head"><input type="checkbox"' + (on ? ' checked' : '') +
+      ' onchange="toggleSource(' + jsq(p.key) + ', this.checked)" aria-label="' + escHtml(pv('label')) + '">' +
+      '<h3>' + escHtml(pv('label')) + '</h3>' + ready + '</div>' +
+    '<div class="blurb">' + escHtml(pv('blurb')) + '</div>' +
+    (kind === 'job'
+      ? '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' + escHtml(t('disc.free_count')) + '</span></div>' +
+        (p.attribution ? '<div class="caveat">' + escHtml(p.attribution) + '</div>' : '')
+      : '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' + escHtml(pv('cost_note')) + '</span></div>' +
+        '<div class="row"><span class="k">' + escHtml(t('disc.free')) + '</span><span class="v">' + escHtml(pv('free_tier')) + '</span></div>' +
+        (p.needs_key
+          ? '<div class="row"><span class="k">' + escHtml(t('disc.setup')) + '</span><span class="v">' +
+            escHtml(t('disc.env_keys', {keys: p.env_keys.join(', ')})) + ' &middot; ' +
+            '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
+            escHtml(t('disc.get_key')) + '</a></span></div>'
+          : '') +
+        (p.caveat ? '<div class="caveat">' + escHtml(pv('caveat')) + '</div>' : '')) +
+  '</label>';
+}
 
 async function loadDiscoverProviders() {
   const el = document.getElementById('discover-providers');
@@ -1554,12 +1590,17 @@ async function loadDiscoverProviders() {
   // Without the providers there is nothing to estimate or run against.
   markLoadFailed('discover', !data || !data.providers);
   if (!data || !data.providers) { el.innerHTML = offlineState(); return; }
+  _discData = data;
 
   // A source or preset whose module is off isn't offered (Surse turns it on).
   const providers = data.providers.filter(p => p.enabled !== false);
-  if (!providers.some(p => p.key === _provider)) _provider = null;
-  _provider = _provider || [data.selected, data.default].find(k => providers.some(p => p.key === k)) ||
-    (providers[0] || {}).key || null;
+  const jobbed = (data.sources || []).filter(s => s.enabled !== false);
+  const known = new Set(providers.map(p => p.key).concat(jobbed.map(s => s.key)));
+  if (_sources === null) {
+    const last = (data.selected_all || []).filter(k => known.has(k));
+    _sources = new Set(last.length ? last : [data.default].filter(k => known.has(k)));
+  }
+  _sources.forEach(k => { if (!known.has(k)) _sources.delete(k); });
   const presetSel = document.getElementById('disc-preset');
   if (presetSel && data.presets) {
     Array.from(presetSel.options || []).forEach(o => {
@@ -1567,39 +1608,15 @@ async function loadDiscoverProviders() {
     });
     if (presetSel.value && data.presets[presetSel.value] === false) presetSel.value = '';
   }
-  const pv = (p, field) => tServer('prov.' + p.key + '.' + field, p[field]);
-  el.innerHTML = (providers.length ? '' : emptyState(icon('layers'), escHtml(t('disc.none_on')),
+  el.innerHTML = (providers.length || jobbed.length ? '' : emptyState(icon('layers'), escHtml(t('disc.none_on')),
       escHtml(t('disc.none_on_copy')), true,
       '<button type="button" class="btn btn-secondary btn-sm" onclick="goTab(\'modules\')">' +
         escHtml(t('disc.open_modules')) + '</button>')) +
-    '<div class="prov-grid">' + providers.map(p => {
-    const ready = p.configured
-      ? '<span class="badge t-good">' + escHtml(t('disc.ready')) + '</span>'
-      : '<span class="badge t-waiting">' + escHtml(t('disc.needs_key')) + '</span>';
-    return '<button type="button" class="prov-card ' + (p.key === _provider ? 'selected' : '') +
-      '" aria-pressed="' + (p.key === _provider) + '" onclick="pickProvider(' + jsq(p.key) + ')">' +
-      '<div class="prov-head"><h3>' + escHtml(pv(p, 'label')) + '</h3>' + ready + '</div>' +
-      '<div class="blurb">' + escHtml(pv(p, 'blurb')) + '</div>' +
-      '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' +
-        escHtml(pv(p, 'cost_note')) + '</span></div>' +
-      '<div class="row"><span class="k">' + escHtml(t('disc.free')) + '</span><span class="v">' +
-        escHtml(pv(p, 'free_tier')) + '</span></div>' +
-      (p.needs_key
-        ? '<div class="row"><span class="k">' + escHtml(t('disc.setup')) + '</span><span class="v">' +
-          escHtml(t('disc.env_keys', {keys: p.env_keys.join(', ')})) + ' &middot; ' +
-          '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' +
-          escHtml(t('disc.get_key')) + '</a></span></div>'
-        : '') +
-      (p.caveat ? '<div class="caveat">' + escHtml(pv(p, 'caveat')) + '</div>' : '') +
-    '</button>';
-  }).join('') + '</div>';
+    '<div class="prov-grid">' + jobbed.map(s => sourceCard(s, 'job')).join('') +
+      providers.map(p => sourceCard(p, 'provider')).join('') + '</div>';
+  renderSourceFilters(jobbed);
 
   const running = data.running;
-  // Stop stops the searches of the run shown below; reading sites can't be
-  // stopped part-way, and another run (a command's) isn't this page's.
-  _discBatch = (data.last_report && data.last_report.batch_id) || '';
-  document.getElementById('disc-stop').style.display =
-    data.last_report && data.last_report.searches_active ? '' : 'none';
   renderProfileCard(data.unprofiled || 0, running);
   if (running && !_discoverPoll) {
     _discoverPoll = setInterval(loadDiscoverProviders, 4000);
@@ -1612,33 +1629,87 @@ async function loadDiscoverProviders() {
     btn.textContent = t('disc.estimate_first');
     showToast(data.running_kind === 'profile' ? t('disc.profile_done') : t('disc.done'), 'success');
   }
-  renderDiscoverResult(data.last_report, running);
+  renderActiveRuns(data.active_runs || []);
+  const shown = (data.active_runs || []).some(r => data.last_report && r.batch_id === data.last_report.batch_id);
+  renderDiscoverResult(shown ? null : data.last_report, running && !(data.active_runs || []).length);
 }
 
-function pickProvider(key) {
-  _provider = key;
+function toggleSource(key, on) {
+  if (on) _sources.add(key); else _sources.delete(key);
   document.getElementById('disc-run').disabled = true;
   document.getElementById('disc-run').textContent = t('disc.estimate_first');
   document.getElementById('discover-estimate').innerHTML = '';
   loadDiscoverProviders();
 }
 
+// The filters a ticked source declares in its manifest (the registry's
+// activity, county, town, turnover...), one panel per source.
+function renderSourceFilters(jobbed) {
+  const el = document.getElementById('discover-filters');
+  if (!el) return;
+  const ticked = (jobbed || []).filter(s => _sources.has(s.key) && (s.filters || []).length);
+  el.innerHTML = ticked.map(s => {
+    const f = _sourceFilters[s.key] = _sourceFilters[s.key] || {};
+    const label = (x) => tServer('src.' + s.key + '.filter.' + x.key, x.label || x.key);
+    const id = (x) => 'sf-' + s.key.replace(/\W/g, '-') + '-' + x.key;
+    const set = (x) => 'setSourceFilter(' + jsq(s.key) + ',' + jsq(x.key) + ',this.value)';
+    const field = (x) => {
+      let input;
+      if (x.type === 'yesno' || x.type === 'choice') {
+        const options = x.type === 'yesno' ? [['', t('cl.f.any')], ['yes', t('cl.f.yes')], ['no', t('cl.f.no')]]
+          : (x.options || []).map(o => [o, tServer('src.option.' + o, o)]);
+        input = '<select class="form-input" id="' + id(x) + '" onchange="' + set(x) + '">' + options.map(o =>
+          '<option value="' + escHtml(o[0]) + '"' + (String(f[x.key] || '') === o[0] ? ' selected' : '') + '>' +
+          escHtml(o[1]) + '</option>').join('') + '</select>';
+      } else {
+        input = '<input class="form-input" id="' + id(x) + '" type="' + (x.type === 'number' ? 'number' : 'text') +
+          '" value="' + escHtml(f[x.key] || '') + '" oninput="' + set(x) + '">';
+      }
+      return '<div class="form-group"><label class="form-label" for="' + id(x) + '">' + escHtml(label(x)) + '</label>' + input + '</div>';
+    };
+    return '<div class="card source-filters"><h3>' + escHtml(tServer('src.' + s.key + '.label', s.label)) + '</h3>' +
+      '<div class="form-row">' + s.filters.map(field).join('') + '</div></div>';
+  }).join('');
+}
+
+function setSourceFilter(source, key, value) {
+  const f = _sourceFilters[source] = _sourceFilters[source] || {};
+  if (value === '' || value === null) delete f[key]; else f[key] = value;
+  document.getElementById('disc-run').disabled = true;
+  document.getElementById('disc-run').textContent = t('disc.estimate_first');
+}
+
+function discoverCap(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  const cap = Number(text);
+  return text === '' || !isFinite(cap) || cap < 0 ? 1 : cap;
+}
+
 function discoverBody() {
   const raw = document.getElementById('disc-cities').value.trim();
+  const providers = [..._sources];
+  const filters = {};
+  providers.forEach(k => { if (_sourceFilters[k]) filters[k] = _sourceFilters[k]; });
   return {
-    provider: _provider,
+    providers: providers,
+    filters: filters,
     // Semicolons or newlines, never commas: "Denver, CO" is one city.
     cities: raw ? raw.split(/[;\n]/).map(c => c.trim()).filter(Boolean) : [],
     // Blank: every result the source has; the cap is what stops a run.
     depth: Number(document.getElementById('disc-depth').value) || null,
     limit: Number(document.getElementById('disc-limit').value) || null,
-    max_spend: Number(document.getElementById('disc-cap').value) || 1,
+    // 0 is a cap of nothing (free sources only); blank, the $1 default.
+    max_spend: discoverCap(document.getElementById('disc-cap').value),
     preset: (document.getElementById('disc-preset') || {}).value || '',
   };
 }
 
 async function estimateDiscovery() {
   const el = document.getElementById('discover-estimate');
+  if (!_sources || !_sources.size) {
+    el.innerHTML = '<div class="test-result error">' + escHtml(t('disc.pick_one')) + '</div>';
+    return;
+  }
   el.innerHTML = '<p class="muted small">' + escHtml(t('disc.pricing')) + '</p>';
   const data = await api('/api/discover/estimate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1653,17 +1724,25 @@ async function estimateDiscovery() {
 
   const cap = discoverBody().max_spend;
   const over = data.estimated_cost > cap;
+  const sources = data.sources || [];
+  const perSource = sources.length > 1 ? '<div class="query-list">' + sources.map(s =>
+    escHtml(s.label) + ': ' + (s.free ? escHtml(t('disc.free_amount')) : escHtml(fmtUsd(s.estimated_cost, 4))) +
+    (s.available !== null && s.available !== undefined ? ' &middot; ' + escHtml(t('disc.found_n', {n: fmtN(s.available)})) : '')
+  ).join('<br>') + '</div>' : '';
   el.innerHTML = '<div class="estimate-box">' +
     '<div class="amount ' + (data.free ? 'free' : 'paid') + '">' +
       (data.free ? escHtml(t('disc.free_amount')) : escHtml(fmtUsd(data.estimated_cost, 4))) + '</div>' +
     '<div class="muted small" style="margin-top:2px">' +
       escHtml(t('disc.queries', {n: data.query_count})) +
-      (data.free ? '' : ' &middot; ' + escHtml(t('disc.cap_is', {cap: fmtUsd(cap, 2)}))) + '</div>' +
+      (data.free ? '' : ' &middot; ' + escHtml(t(sources.length > 1 ? 'disc.cap_shared' : 'disc.cap_is', {cap: fmtUsd(cap, 2)}))) + '</div>' +
     (data.counted ? '<div class="muted small" style="margin-top:2px">' +
       escHtml(t('disc.counted', {n: fmtN(data.available || 0), cost: fmtUsd(data.count_cost || 0, 4)})) + '</div>' : '') +
     (data.counted === false && (data.errors || []).length ? '<div class="muted small" style="margin-top:2px">' +
       escHtml(t('disc.uncounted')) + ' ' + (data.errors || []).map(escHtml).join(' ') + '</div>' : '') +
+    ((data.notes || []).length ? '<div class="test-result" style="margin-top:8px">' +
+      (data.notes || []).map(n => escHtml(t('disc.left_out', {why: n}))).join('<br>') + '</div>' : '') +
     (over ? '<div class="test-result error" style="margin-top:12px">' + escHtml(t('disc.over_cap')) + '</div>' : '') +
+    perSource +
     '<div class="query-list">' +
       data.queries.slice(0, 40).map(escHtml).join('<br>') +
       (data.queries.length > 40 ? '<br>' + escHtml(t('disc.more_queries', {n: data.queries.length - 40})) : '') +
@@ -1695,17 +1774,54 @@ async function runDiscovery() {
   loadDiscoverProviders();
 }
 
-// The run the "last run" card shows: Stop stops its searches, no other run's.
-let _discBatch = '';
-
-async function stopDiscovery() {
+// Stop a run, or one source within it.
+async function stopDiscovery(batchId, source) {
+  const body = {batch_id: batchId || ''};
+  if (source) body.provider = source;
   const data = await api('/api/discover/stop', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(_discBatch ? {batch_id: _discBatch} : {provider: _provider}),
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
   showToast(data && data.success ? t('disc.stopping')
                                  : failMsg(data, t('disc.stop_failed')), data && data.success ? 'success' : 'error');
   loadDiscoverProviders();
+}
+
+function sourceName(key) {
+  const d = _discData || {};
+  const job = (d.sources || []).find(s => s.key === key);
+  if (job) return tServer('src.' + key + '.label', job.label);
+  const p = (d.providers || []).find(x => x.key === key);
+  return p ? tServer('prov.' + key + '.label', p.label) : key;
+}
+
+// Every run still working: each source's progress within it, and a Stop
+// for the run and for each source.
+function renderActiveRuns(runs) {
+  const el = document.getElementById('discover-runs');
+  if (!el) return;
+  if (!runs.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="subhead">' + escHtml(t('disc.active_runs')) + '</div>' + runs.map(r => {
+    const jobs = r.jobs || {};
+    const head = '<div class="run-head"><strong>' + escHtml(r.label || r.batch_id) + '</strong> ' +
+      '<span class="muted small">' + escHtml(t('disc.still_working', {n: jobs.running || 0, w: jobs.queued || 0})) +
+      (r.max_spend !== null && r.max_spend !== undefined ? ' &middot; ' + escHtml(t('disc.spent_of', {spent: fmtUsd(r.spent || 0, 4), cap: fmtUsd(r.max_spend, 2)})) : '') +
+      '</span> <button type="button" class="btn btn-secondary btn-sm" onclick="openQueue(' + jsq(r.batch_id) + ')">' +
+        icon('queue') + escHtml(t('disc.see_jobs')) + '</button>' +
+      (r.searches_active ? ' <button type="button" class="btn btn-danger btn-sm" onclick="stopDiscovery(' + jsq(r.batch_id) + ')">' +
+        escHtml(t('disc.stop')) + '</button>' : '') + '</div>';
+    const rows = (r.sources || []).map(s => {
+      const sj = s.jobs || {};
+      return '<tr><td>' + escHtml(sourceName(s.key)) + '</td>' +
+        '<td class="muted small">' + escHtml(t('disc.source_jobs', {done: sj.done || 0, run: sj.running || 0, wait: sj.queued || 0})) + '</td>' +
+        '<td>' + escHtml(t('disc.source_found', {n: fmtN(s.new_companies || 0), k: fmtN(s.known_companies || 0)})) + '</td>' +
+        '<td class="muted">' + (s.actual_cost ? escHtml(fmtUsd(s.actual_cost, 4)) : escHtml(t('runs.free'))) + '</td>' +
+        '<td>' + (s.active ? '<button type="button" class="btn btn-ghost btn-sm" onclick="stopDiscovery(' + jsq(r.batch_id) + ',' + jsq(s.key) + ')">' +
+          escHtml(t('disc.stop_source')) + '</button>' : '') + '</td></tr>';
+    }).join('');
+    const finder = (r.contacts_found || r.finder_waiting)
+      ? '<p class="muted small">' + escHtml(t('disc.finder_progress', {n: fmtN(r.contacts_found || 0), w: fmtN(r.finder_waiting || 0)})) + '</p>' : '';
+    return '<div class="card run-card">' + head + (rows ? '<table class="data"><tbody>' + rows + '</tbody></table>' : '') + finder + '</div>';
+  }).join('');
 }
 
 // Companies found but not looked at: reading their sites is free and
@@ -1771,6 +1887,7 @@ function renderDiscoverResult(report, running) {
       stat(t('disc.observations'), fmtN(report.observations || 0)) +
       stat(t('disc.junk'), fmtN(report.junk || 0)) +
       (report.profiled_companies ? stat(t('disc.sites_read'), fmtN(report.profiled_companies)) : '') +
+      (report.contacts_found ? stat(t('disc.contacts_found'), fmtN(report.contacts_found), 'accent') : '') +
       stat(t('disc.actual_cost'), report.actual_cost ? escHtml(fmtUsd(report.actual_cost, 4)) : escHtml(t('runs.free'))) +
     '</div>' +
     (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
@@ -2843,11 +2960,19 @@ function searchPh(prefix) {
 
 const PAGE_SIZES = [25, 50, 100];
 
-function pagerHtml(state, total, fn) {
+// opts.more: the total is a floor (counting stopped there); opts.jump: a
+// page-number box.
+function pagerHtml(state, total, fn, opts) {
+  const o = opts || {};
   const from = total ? state.offset + 1 : 0;
   const to = Math.min(total, state.offset + state.limit);
+  const pages = Math.max(1, Math.ceil(total / state.limit));
   return '<div class="pager">' +
-    '<span class="pager-range">' + escHtml(t('page.range', {from: from, to: to, total: total})) + '</span>' +
+    '<span class="pager-range">' + escHtml(t(o.more ? 'page.range_more' : 'page.range', {from: from, to: to, total: total})) + '</span>' +
+    (o.jump ? '<label class="pager-size"><span>' + escHtml(t('page.page')) + '</span>' +
+      '<input class="form-input" type="number" min="1"' + (o.more ? '' : ' max="' + pages + '"') +
+      ' value="' + (Math.floor(state.offset / state.limit) + 1) + '" onchange="' + fn + '(\'page\', this.value)" ' +
+      'aria-label="' + escHtml(t('page.page')) + '" style="width:6em"></label>' : '') +
     '<label class="pager-size"><span>' + escHtml(t('page.per_page')) + '</span>' +
       '<select class="form-input" onchange="' + fn + '(\'size\', this.value)" aria-label="' + escHtml(t('page.per_page')) + '">' +
       PAGE_SIZES.map(n => '<option value="' + n + '"' + (n === state.limit ? ' selected' : '') + '>' + n + '</option>').join('') +
@@ -2855,7 +2980,7 @@ function pagerHtml(state, total, fn) {
     '<span class="pager-btns">' +
       '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'prev\')"' + (state.offset > 0 ? '' : ' disabled') +
         ' aria-label="' + escHtml(t('page.prev')) + '" title="' + escHtml(t('page.prev')) + '">' + icon('chev-left') + '</button>' +
-      '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'next\')"' + (to < total ? '' : ' disabled') +
+      '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'next\')"' + (to < total || (o.more && to === total) ? '' : ' disabled') +
         ' aria-label="' + escHtml(t('page.next')) + '" title="' + escHtml(t('page.next')) + '">' + icon('chev-right') + '</button>' +
     '</span></div>';
 }
@@ -2864,6 +2989,7 @@ function pageMove(state, how, value) {
   if (how === 'size') { state.limit = Number(value) || 50; state.offset = 0; savePageSize(state.limit); }
   else if (how === 'prev') state.offset = Math.max(0, state.offset - state.limit);
   else if (how === 'next') state.offset += state.limit;
+  else if (how === 'page') state.offset = Math.max(0, (Math.floor(Number(value)) || 1) - 1) * state.limit;
 }
 
 function savePageSize(n) { try { localStorage.setItem('harvey-page-size', String(n)); } catch { /* ignore */ } }
@@ -3216,11 +3342,21 @@ function renderCompanyActions() {
     {label: t('actions.csv'), action: 'exportCompanies(\'csv\', true)', disabled: !n},
     {label: t('actions.json'), action: 'exportCompanies(\'json\', true)', disabled: !n},
     {label: t('actions.anaf'), action: 'anafCompanies(true)', disabled: !n},
+    {label: t('actions.find'), action: 'findForCompanies(true)', disabled: !n},
     {sep: true, label: all},
     {label: t('actions.csv'), action: 'exportCompanies(\'csv\', false)', disabled: !_co.total},
     {label: t('actions.json'), action: 'exportCompanies(\'json\', false)', disabled: !_co.total},
     {label: t('actions.anaf'), action: 'anafCompanies(false)', disabled: !_co.total},
+    {label: t('actions.find'), action: 'findForCompanies(false)', disabled: !_co.total},
   ]);
+}
+
+// The contact finder for the selection, or the search's results (every
+// company when nothing is searched): priced first, then run under a cap.
+function findForCompanies(selection) {
+  const body = selection ? {company_ids: [..._co.selected], force: true}
+                         : {filter: _co.q.trim() ? {q: _co.q.trim()} : {}};
+  openFinder('dupes-panel', body);
 }
 
 // Check the selection, the search's results or every company at ANAF.
@@ -3342,10 +3478,31 @@ function renderDrawer() {
       '<button class="copy" onclick="copyText(' + jsq(e.email) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>';
   }).join('');
 
-  const people = (c.people || []).map(p =>
+  // Contacts, people, places and sources from the contacts model; the
+  // people list falls back to the named contacts on older data.
+  const reach = c.reach || {};
+  const peopleList = (reach.people || []).length ? reach.people.map(p => ({name: p.name, title: p.role, reached: p.reached, own: true}))
+    : (c.people || []);
+  const people = peopleList.map(p =>
     '<div class="person"><span class="avatar">' + initials(...String(p.name).split(' ')) + '</span>' +
     '<div class="cell-stack"><span class="cell-main">' + escHtml(p.name) + '</span>' +
-    (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') + '</div></div>').join('');
+    (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') + '</div>' +
+    (p.own && !p.reached ? '<span class="tag">' + escHtml(t('drawer.to_search')) + '</span>' : '') + '</div>').join('');
+  const reachRows = (reach.contacts || []).map(r =>
+    '<div class="drow">' + contactValue(r) +
+    '<span class="drow-meta">' + [r.status ? escHtml(statusMeta(r.status).label) : '', escHtml(statusMeta(r.trust).label),
+      escHtml(r.person), r.shared_with ? escHtml(t('drawer.shared_with', {n: r.shared_with})) : '', (r.sources || [r.source]).map(sourceLabel).join(', ')]
+      .filter(Boolean).join(' · ') + '</span></div>').join('');
+  const placeRows = (reach.locations || []).map(l =>
+    '<div class="drow addr"><span class="drow-text">' + escHtml([l.name, l.address].filter(Boolean).join(' — ')) + '</span>' +
+    '<span class="drow-meta">' + [escHtml(l.phone), sourceLabel(l.source)].filter(Boolean).join(' · ') + '</span></div>').join('');
+  const searchRows = (reach.searches || []).map(x =>
+    '<div class="drow"><span class="drow-text">' + sourceLabel(x.module) + (x.person ? ' · ' + escHtml(x.person) : '') + '</span>' +
+    '<span class="drow-meta">' + [x.searched_at ? escHtml(String(x.searched_at).slice(0, 16)) : '',
+      escHtml(t('drawer.search.' + (x.outcome || 'nothing'), {n: x.found || 0}))].filter(Boolean).join(' · ') + '</span></div>').join('');
+  const sourceRows = (reach.sources || []).map(x =>
+    '<div class="drow"><span class="drow-text">' + sourceLabel(x.source) + '</span>' +
+    '<span class="drow-meta">' + [escHtml(x.ref), x.first_seen ? escHtml(String(x.first_seen).slice(0, 10)) : ''].filter(Boolean).join(' · ') + '</span></div>').join('');
 
   const contacts = (_drawer.contacts || []).map(p => {
     const name = [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email || '—';
@@ -3384,7 +3541,11 @@ function renderDrawer() {
     (addressRows ? section(t('drawer.addresses'), 'pin', addressRows, (findings.addresses || []).length) : '') +
     (factRows ? section(t('drawer.official'), 'layers', '<dl class="facts-list">' + factRows + '</dl>') : '') +
     section(t('drawer.emails'), 'mail', emailRows || none(t('drawer.no_emails')), (c.emails || []).length) +
-    section(t('drawer.people'), 'contacts', people || none(t('drawer.no_people')), (c.people || []).length) +
+    (reachRows ? section(t('drawer.reach'), 'layers', reachRows, (reach.contacts || []).length) : '') +
+    section(t('drawer.people'), 'contacts', people || none(t('drawer.no_people')), peopleList.length) +
+    (placeRows ? section(t('drawer.locations'), 'pin', placeRows, (reach.locations || []).length) : '') +
+    (sourceRows ? section(t('drawer.sources'), 'discover', sourceRows, (reach.sources || []).length) : '') +
+    (searchRows ? section(t('drawer.searches'), 'discover', searchRows, (reach.searches || []).length) : '') +
     (contacts ? section(t('drawer.contacts'), 'layers', contacts, (_drawer.contacts || []).length) : '') +
     section(t('drawer.activities'), 'companies', companyActivities(c, true)) +
     section(t('drawer.details'), 'pin', '<dl class="facts-list">' + facts.map(f => '<dt>' + escHtml(f[0]) + '</dt><dd>' + f[1] + '</dd>').join('') + '</dl>') +
@@ -3453,13 +3614,389 @@ function fbCampaign(i) {
   if (c) submitFeedback('campaign', c.id, t('fb.campaign_prompt'));
 }
 
+// ── Contacts: every way to reach a company, one row per contact ──
+//
+// A chain's shared phone is one row reaching many companies (expand it to
+// see them). "People to search" lists who is named at a company but has no
+// email or phone of their own yet. The count is a capped query, so this
+// list is fetched when asked for, never on the 15-second refresh.
+
+let _cv = { view: 'contacts', q: '', f: {}, sort: '', dir: 'desc', offset: 0, limit: loadPageSize(),
+            total: 0, more: false, rows: [], open: null, reach: {}, gen: 0, timer: null, force: false,
+            sources: [], kinds: [], financials: false, signals: null, error: '' };
+const CONTACT_STATUSES = ['verified', 'risky', 'guess', 'unchecked', 'invalid', 'valid'];
+const CONTACT_TRUST = ['confirmed', 'likely', 'unconfirmed'];
+const CONTACT_LINES = ['mobile', 'fixed', 'voip', 'toll_free'];
+const CONTACT_COLUMNS = [['value', 'cl.col.contact'], ['status', 'cl.col.status'], ['trust', 'cl.col.trust'],
+                         ['companies', 'cl.col.companies'], [null, 'cl.col.person'], [null, 'cl.col.sources'],
+                         ['first_seen', 'cl.col.first_seen']];
+const PEOPLE_COLUMNS = [['name', 'cl.col.name'], ['company', 'cl.col.company'], [null, 'cl.col.place'],
+                        [null, 'cl.col.sources'], ['first_seen', 'cl.col.first_seen'], ['searched_at', 'cl.col.searched']];
+
+// The Contacts tab: the contacts list, the people still to search, and
+// (Email module) the outreach list.
+function loadProspects() {
+  const el = document.getElementById('prospects-table');
+  if (!_modules.email && _cv.view === 'outreach') _cv.view = 'contacts';
+  if (!document.getElementById('ct-views')) {
+    el.innerHTML = '<div class="toolbar"><div class="segmented" id="ct-views" role="group" data-i18n-aria="cl.views_label" ' +
+      'aria-label="' + escHtml(t('cl.views_label')) + '"></div></div><div id="ct-body"></div>';
+  }
+  const views = ['contacts', 'people'].concat(_modules.email ? ['outreach'] : []);
+  document.getElementById('ct-views').innerHTML = views.map(v =>
+    '<button class="' + (v === _cv.view ? 'on' : '') + '" aria-pressed="' + (v === _cv.view) + '" onclick="setContactView(\'' + v + '\')">' +
+      escHtml(t('cl.view.' + v)) + '</button>').join('');
+  return _cv.view === 'outreach' ? loadOutreach() : loadContactList();
+}
+
+function setContactView(v) {
+  if (v === _cv.view) return;
+  _cv.view = v;
+  _cv.offset = 0;
+  _cv.sort = '';
+  _cv.open = null;
+  const body = document.getElementById('ct-body');
+  if (body) body.innerHTML = '';
+  loadProspects();
+}
+
+function contactParams(paged) {
+  const p = new URLSearchParams();
+  if (_cv.view === 'people') p.set('view', 'people');
+  if (_cv.q.trim()) p.set('q', _cv.q.trim());
+  Object.keys(_cv.f).forEach(k => { if (_cv.f[k] !== '' && _cv.f[k] !== undefined) p.set(k, _cv.f[k]); });
+  if (_cv.sort) { p.set('sort', _cv.sort); p.set('dir', _cv.dir); }
+  if (paged) { p.set('limit', _cv.limit); p.set('offset', _cv.offset); }
+  return p.toString();
+}
+
+async function loadContactList() {
+  const body = document.getElementById('ct-body');
+  if (!body) return;
+  if (!document.getElementById('cl-rows')) {
+    const ph = _cv.view === 'people' ? 'cl.people_search_ph' : searchPh('cl');
+    body.innerHTML = '<div class="toolbar">' +
+      '<label class="search grow">' + icon('discover') +
+        '<input class="form-input" id="cl-search" type="search" autocomplete="off" data-i18n-placeholder="' + ph + '" ' +
+        'data-i18n-aria="cl.search_label" placeholder="' + escHtml(t(ph)) + '" aria-label="' + escHtml(t('cl.search_label')) + '" ' +
+        'oninput="contactListSearch(this.value)"></label><div id="cl-actions"></div></div>' +
+      '<details class="more-fields" id="cl-more"><summary>' + escHtml(t('cl.filters')) + '</summary><div id="cl-filters"></div></details>' +
+      '<div id="cl-finder"></div><div id="cl-rows"></div>';
+    loadFinderStatus();
+    document.getElementById('cl-search').value = _cv.q;
+    renderContactFilters();
+  }
+  if (_cv.signals === null) {
+    _cv.signals = [];
+    api('/api/signals').then(res => {
+      _cv.signals = [];
+      ((res && res.groups) || []).forEach(g => (g.signals || []).forEach(sig => {
+        if (sig.status === 'confirmed') _cv.signals.push({code: sig.code, label: sig.label || sig.code});
+      }));
+      renderContactFilters();
+    });
+  }
+  const gen = ++_cv.gen;
+  const res = await api('/api/contacts?' + contactParams(true));
+  if (gen !== _cv.gen) return;
+  const rowsEl = document.getElementById('cl-rows');
+  if (!rowsEl) return;
+  if (!res) { rowsEl.innerHTML = offlineState(); return; }
+  const facets = JSON.stringify([res.sources, res.kinds, res.financials]);
+  const changed = facets !== JSON.stringify([_cv.sources, _cv.kinds, _cv.financials]);
+  Object.assign(_cv, {total: res.total || 0, more: !!res.more, rows: res.rows || [], error: res.error || '',
+                      sources: res.sources || [], kinds: res.kinds || [], financials: !!res.financials});
+  if (!_cv.rows.length && _cv.offset > 0 && _cv.total > 0) { _cv.offset = 0; return loadContactList(); }
+  if (changed) renderContactFilters();
+  renderContactList();
+}
+
+function contactListSearch(value) {
+  _cv.q = value;
+  _cv.offset = 0;
+  clearTimeout(_cv.timer);
+  _cv.timer = setTimeout(loadContactList, 250);
+}
+
+function setContactListFilter(key, value) {
+  if (value === '' || value === null || value === undefined) delete _cv.f[key]; else _cv.f[key] = String(value);
+  _cv.offset = 0;
+  clearTimeout(_cv.timer);
+  _cv.timer = setTimeout(loadContactList, 250);
+}
+
+function clearContactFilters() {
+  _cv.f = {};
+  _cv.offset = 0;
+  renderContactFilters();
+  loadContactList();
+}
+
+function sortContacts(col) {
+  if (_cv.sort === col) _cv.dir = _cv.dir === 'asc' ? 'desc' : 'asc';
+  else { _cv.sort = col; _cv.dir = col === 'first_seen' || col === 'companies' ? 'desc' : 'asc'; }
+  _cv.offset = 0;
+  loadContactList();
+}
+
+function pageContactList(how, value) {
+  pageMove(_cv, how, value);
+  loadContactList().then(() => {
+    const top = document.getElementById('prospects');
+    if (top && how !== 'size') top.scrollIntoView({block: 'start'});
+  });
+}
+
+function renderContactFilters() {
+  const el = document.getElementById('cl-filters');
+  if (!el) return;
+  const f = _cv.f;
+  const opt = (value, label, current) => '<option value="' + escHtml(value) + '"' + (String(current || '') === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  const select = (key, label, options) => '<div class="form-group"><label class="form-label" for="cl-f-' + key + '">' + escHtml(t(label)) + '</label>' +
+    '<select class="form-input" id="cl-f-' + key + '" onchange="setContactListFilter(\'' + key + '\', this.value)">' +
+    opt('', t('cl.f.any'), f[key]) + options.map(o => opt(o[0], o[1], f[key])).join('') + '</select></div>';
+  const input = (key, label, type) => '<div class="form-group"><label class="form-label" for="cl-f-' + key + '">' + escHtml(t(label)) + '</label>' +
+    '<input class="form-input" id="cl-f-' + key + '" type="' + (type || 'text') + '" value="' + escHtml(f[key] || '') + '" ' +
+    'oninput="setContactListFilter(\'' + key + '\', this.value)"></div>';
+  const yesNo = [['yes', t('cl.f.yes')], ['no', t('cl.f.no')]];
+  const signals = (_cv.signals || []).map(s => [s.code, tServer('sigc.' + s.code + '.label', s.label)]);
+  const people = _cv.view === 'people';
+  let html = '<div class="form-row">';
+  if (!people) {
+    const kinds = [];
+    (_cv.kinds || []).forEach(k => {
+      kinds.push([k.kind, kindLabel(k.kind)]);
+      if (k.kind === 'phone') kinds.push(['mobile', t('cl.f.mobile')]);
+    });
+    html += select('kind', 'cl.f.kind', kinds) +
+      select('status', 'cl.f.status', CONTACT_STATUSES.map(v => [v, statusMeta(v).label])) +
+      select('trust', 'cl.f.trust', CONTACT_TRUST.map(v => [v, statusMeta(v).label])) +
+      select('person', 'cl.f.person', yesNo);
+  }
+  html += select('source', 'cl.f.source', (_cv.sources || []).map(v => [v, sourceText(v)])) +
+    select('website', 'cl.f.website', yesNo) + '</div><div class="form-row">' +
+    input('county', 'cl.f.county') + input('locality', 'cl.f.locality') +
+    select('require', 'cl.f.require', signals) + select('exclude', 'cl.f.exclude', signals) + '</div>';
+  if (_cv.financials) {
+    html += '<div class="form-row">' + input('min_turnover', 'cl.f.min_turnover', 'number') + input('max_turnover', 'cl.f.max_turnover', 'number') +
+      input('min_employees', 'cl.f.min_employees', 'number') + input('max_employees', 'cl.f.max_employees', 'number') +
+      '<div class="form-group"><label class="form-label"><input type="checkbox"' + (f.unknown === 'include' ? ' checked' : '') +
+      ' onchange="setContactListFilter(\'unknown\', this.checked ? \'include\' : \'\')"> ' + escHtml(t('cl.f.unknown')) + '</label></div></div>';
+  }
+  el.innerHTML = html + '<div class="btn-row"><button class="btn btn-ghost btn-sm" onclick="clearContactFilters()">' +
+    escHtml(t('cl.f.clear')) + '</button></div>';
+}
+
+function contactHeader(cols) {
+  return '<thead><tr>' + cols.map(c => {
+    if (!c[0]) return '<th>' + escHtml(t(c[1])) + '</th>';
+    const on = _cv.sort === c[0];
+    return '<th aria-sort="' + (on ? (_cv.dir === 'asc' ? 'ascending' : 'descending') : 'none') + '">' +
+      '<button type="button" class="link-btn" onclick="sortContacts(\'' + c[0] + '\')" title="' + escHtml(t('cl.sort_by', {col: t(c[1])})) + '">' +
+      escHtml(t(c[1])) + (on ? (_cv.dir === 'asc' ? ' &#9650;' : ' &#9660;') : '') + '</button></th>';
+  }).join('') + '</tr></thead>';
+}
+
+// A contact kind in words: the label its module declares, translated.
+function kindLabel(kind) {
+  const k = (_cv.kinds || []).find(x => x.kind === kind);
+  return tServer('ck.' + kind, k ? k.label : kind);
+}
+
+function contactValue(r) {
+  const shown = r.display || r.value;
+  let link = '';
+  if (r.kind === 'phone') link = telHref(r.value);
+  else if (r.kind === 'email') link = mailHref(r.value);
+  else link = safeHref(r.value);
+  const ext = r.kind !== 'phone' && r.kind !== 'email';
+  const main = link ? '<a class="' + (r.kind === 'phone' ? 'mono tel' : 'email') + '" href="' + link + '"' +
+    (ext ? ' target="_blank" rel="noopener noreferrer"' : '') + '>' + escHtml(shown) + '</a>' : '<span class="mono">' + escHtml(shown) + '</span>';
+  const kind = r.kind === 'phone' && r.line_type && r.line_type !== 'unknown' ? t('cl.line.' + r.line_type) : kindLabel(r.kind);
+  return '<div class="contact-line">' + main + '<button class="copy" onclick="copyText(' + jsq(r.value) + ', this)" aria-label="' +
+    escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div><div class="cell-sub"><span class="tag">' + escHtml(kind) + '</span>' +
+    (r.do_not_contact ? ' <span class="tag t-bad">' + escHtml(t('cl.do_not_contact')) + '</span>' : '') + '</div>';
+}
+
+function renderContactList() {
+  const rowsEl = document.getElementById('cl-rows');
+  if (!rowsEl) return;
+  renderContactListActions();
+  const people = _cv.view === 'people';
+  if (_cv.error) { rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), escHtml(t('cl.bad_filter')), escHtml(_cv.error)) + '</div>'; return; }
+  if (!_cv.rows.length) {
+    const filtered = _cv.q.trim() || Object.keys(_cv.f).length;
+    rowsEl.innerHTML = '<div class="table-card">' + (filtered
+      ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t('cl.no_match_copy')))
+      : emptyState(icon('contacts'), escHtml(t(people ? 'cl.people_empty' : 'ct.empty')), escHtml(t(people ? 'cl.people_empty_copy' : 'ct.empty_copy')))) + '</div>';
+    return;
+  }
+  let html = '<div class="table-card"><table class="data ct-table">' + contactHeader(people ? PEOPLE_COLUMNS : CONTACT_COLUMNS) + '<tbody>';
+  _cv.rows.forEach((r, i) => {
+    if (people) {
+      html += '<tr><td class="ct-name"><div class="cell-row"><span class="avatar">' + initials(...String(r.name).split(' ')) + '</span>' +
+        '<div class="cell-stack"><span class="cell-main">' + escHtml(r.name) + '</span><span class="cell-sub">' + escHtml(roleText(r.role)) + '</span></div></div></td>' +
+        '<td data-label="' + escHtml(t('cl.col.company')) + '"><a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(r.company_id) + ');return false">' +
+          escHtml(r.company_name) + '</a>' + (r.cui ? '<div class="cell-sub mono">' + escHtml(r.cui) + '</div>' : '') + '</td>' +
+        '<td class="muted" data-label="' + escHtml(t('cl.col.place')) + '">' + escHtml(String(r.location || '').replace(/,\s*Romania$/i, '')) + '</td>' +
+        '<td class="muted" data-label="' + escHtml(t('cl.col.sources')) + '">' + sourceLabel(r.source) + '</td>' +
+        '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.first_seen')) + '">' + relTime(r.first_seen) + '</td>' +
+        '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.searched')) + '">' + (r.searched_at ? relTime(r.searched_at) : escHtml(t('cl.never'))) + '</td></tr>';
+      return;
+    }
+    const open = _cv.open === r.id;
+    const co = r.company || {};
+    const reach = r.companies > 1
+      ? '<button type="button" class="link-btn" aria-expanded="' + open + '" onclick="toggleContactReach(' + i + ')">' + escHtml(t('kpi.fact_companies', {n: r.companies})) + '</button>'
+      : '';
+    html += '<tr class="' + (open ? 'selected' : '') + '"><td data-label="' + escHtml(t('cl.col.contact')) + '">' + contactValue(r) + '</td>' +
+      '<td data-label="' + escHtml(t('cl.col.status')) + '">' + (r.status ? badge(r.status) : '') + '</td>' +
+      '<td data-label="' + escHtml(t('cl.col.trust')) + '">' + badge(r.trust) + '</td>' +
+      '<td data-label="' + escHtml(t('cl.col.companies')) + '"><div class="cell-stack">' +
+        (co.id ? '<a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(co.id) + ');return false">' + escHtml(co.name) + '</a>' : '') +
+        '<span class="cell-sub">' + (reach || escHtml(String(co.location || '').replace(/,\s*Romania$/i, ''))) + '</span></div></td>' +
+      '<td data-label="' + escHtml(t('cl.col.person')) + '">' + escHtml(co.person || '') +
+        (r.people > 1 ? '<div class="cell-sub">' + escHtml(t('cl.people_n', {n: r.people})) + '</div>' : '') + '</td>' +
+      '<td class="muted" data-label="' + escHtml(t('cl.col.sources')) + '">' + (r.sources || []).map(sourceLabel).join(', ') + '</td>' +
+      '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.first_seen')) + '">' + relTime(r.first_seen) + '</td></tr>';
+    if (open) html += '<tr class="detail-row"><td colspan="7">' + contactReachHtml(_cv.reach[r.id]) + '</td></tr>';
+  });
+  rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_cv, _cv.total, 'pageContactList', {more: _cv.more, jump: true});
+}
+
+async function toggleContactReach(i) {
+  const r = _cv.rows[i];
+  if (!r) return;
+  _cv.open = _cv.open === r.id ? null : r.id;
+  renderContactList();
+  if (_cv.open === null || _cv.reach[r.id]) return;
+  const data = await api('/api/contacts/' + encodeURIComponent(r.id));
+  _cv.reach[r.id] = data || {error: true};
+  if (_cv.open === r.id) renderContactList();
+}
+
+function contactReachHtml(data) {
+  if (!data) return '<div class="skeleton"></div>';
+  if (data.error) return '<p class="none">' + escHtml(t('drawer.error')) + '</p>';
+  return '<table class="data"><tbody>' + (data.links || []).map(l =>
+    '<tr><td><a href="#" class="co-link" onclick="openCompany(' + jsq(l.company_id) + ');return false">' + escHtml(l.company) + '</a>' +
+      (l.cui ? ' <span class="muted mono">' + escHtml(l.cui) + '</span>' : '') + '</td>' +
+    '<td class="muted">' + escHtml(l.address || String(l.location || '').replace(/,\s*Romania$/i, '')) + '</td>' +
+    '<td>' + escHtml(l.person) + (l.role ? ' <span class="muted">' + escHtml(roleText(l.role)) + '</span>' : '') + '</td>' +
+    '<td>' + badge(l.trust) + '</td><td class="muted">' + sourceLabel(l.source) + '</td></tr>').join('') + '</tbody></table>';
+}
+
+function renderContactListActions() {
+  const el = document.getElementById('cl-actions');
+  if (!el) return;
+  // Find contacts: the companies on file not yet searched; "search again"
+  // also those already searched (each search is kept, see the company panel).
+  const find = '<div class="btn-row"><label class="small" title="' + escHtml(t('cl.find_force_title')) + '">' +
+    '<input type="checkbox" id="cl-force"' + (_cv.force ? ' checked' : '') + ' onchange="_cv.force = this.checked"> ' +
+    escHtml(t('cl.find_force')) + '</label>' +
+    '<button class="btn btn-secondary btn-sm" onclick="findContacts()">' + escHtml(t('cl.find')) + '</button>';
+  el.innerHTML = find + (_cv.view === 'people' ? '' : menuHtml('cl-menu', [
+    {sep: true, label: t('cl.export_label')},
+    {label: t('actions.csv'), note: t('cl.export_note'), action: 'exportContactList(\'csv\')', disabled: !_cv.total},
+    {label: t('cl.export_json'), action: 'exportContactList(\'json\')', disabled: !_cv.total},
+  ])) + '</div>';
+}
+
+// Find contacts for the page's filter: priced first (websites to read are
+// free, a company with no website is a paid search), then run under a cap.
+function findContacts() {
+  const filter = Object.assign({}, _cv.f);
+  if (_cv.q.trim()) filter.q = _cv.q.trim();
+  openFinder('cl-finder', {filter: filter, force: !!_cv.force});
+}
+
+// The contact finder's backlog, above the Contacts list.
+async function loadFinderStatus() {
+  const el = document.getElementById('cl-finder');
+  const s = await api('/api/contacts/finder');
+  if (!el || !s || el.dataset.open) return;
+  const waiting = ((s.jobs || {}).queued || 0) + ((s.jobs || {}).running || 0);
+  el.innerHTML = '<p class="muted small finder-status">' + escHtml(t('finder.backlog', {
+    n: fmtN(s.without_contact || 0), site: fmtN(s.site_to_read || 0), done: fmtN(s.searched || 0)})) +
+    ' &middot; ' + escHtml(t('finder.last_day', {n: fmtN((s.last_day || {}).companies || 0),
+                                                 found: fmtN((s.last_day || {}).found || 0)})) +
+    (waiting ? ' &middot; ' + escHtml(t('finder.waiting', {n: fmtN(waiting)})) : '') +
+    (s.day_budget ? '' : ' &middot; ' + escHtml(t('finder.no_budget'))) + '</p>';
+}
+
+let _finder = null;
+
+async function openFinder(target, body) {
+  const el = document.getElementById(target);
+  if (!el) return;
+  el.dataset.open = '1';
+  el.innerHTML = '<div class="card"><p class="muted small">' + escHtml(t('disc.pricing')) + '</p></div>';
+  const est = await api('/api/contacts/find/estimate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  if (!est || est.error) {
+    el.innerHTML = '<div class="test-result error">' + escHtml(failMsg(est, t('cl.find_failed'))) + '</div>';
+    return;
+  }
+  _finder = {target: target, body: body, est: est};
+  const paid = est.to_look_up > 0;
+  const cap = paid ? Math.min(1, Math.max(0.01, Math.ceil(est.estimated_cost * 100) / 100)) : 0;
+  el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t('finder.title')) + '</h2>' +
+    '<p>' + escHtml(t('finder.summary', {n: fmtN(est.companies), site: fmtN(est.with_site),
+                                         look: fmtN(est.to_look_up)})) +
+      (est.more ? ' ' + escHtml(t('finder.more')) : '') + '</p>' +
+    (paid ? (est.searchers.length
+      ? '<p class="muted small">' + escHtml(t('finder.cost', {cost: fmtUsd(est.estimated_cost, 4),
+                                                            most: fmtUsd(est.most, 4)})) + '</p>'
+      : '<p class="muted small">' + escHtml(t('finder.no_search')) + '</p>') : '') +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="finder-cap">' +
+      escHtml(t('finder.cap')) + '</label><input class="form-input" id="finder-cap" type="number" min="0" step="0.01" value="' + cap + '">' +
+      '<div class="muted small">' + escHtml(t('finder.cap_help')) + '</div></div></div>' +
+    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runFinder(this)"' + (est.companies ? '' : ' disabled') + '>' +
+      escHtml(t('finder.run', {n: fmtN(est.companies)})) + '</button>' +
+    '<button class="btn btn-ghost btn-sm" onclick="closeFinder()">' + escHtml(t('common.cancel')) + '</button></div></div>';
+}
+
+function closeFinder() {
+  if (!_finder) return;
+  const el = document.getElementById(_finder.target);
+  if (el) { delete el.dataset.open; el.innerHTML = ''; }
+  if (_finder.target === 'cl-finder') loadFinderStatus();
+  _finder = null;
+}
+
+async function runFinder(btn) {
+  if (!_finder) return;
+  btn.disabled = true;
+  const cap = Number((document.getElementById('finder-cap') || {}).value) || 0;
+  const data = await api('/api/contacts/find', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(Object.assign({}, _finder.body, {max_spend: cap})),
+  });
+  if (data && data.success) {
+    showToast(t(data.force ? 'cl.find_queued_force' : 'cl.find_queued') + ' ' +
+              t('finder.queued', {n: fmtN(data.queued || 0)}), 'success');
+    closeFinder();
+  } else {
+    btn.disabled = false;
+    showToast(failMsg(data, t('cl.find_failed')), 'error');
+  }
+}
+
+function exportContactList(format) {
+  downloadCsv('/api/export/contacts.' + format + '?' + contactParams(false), 'contacte-' + stamp() + '.' + format);
+}
+
 // ── Contacts: same pattern as Companies ──
 
 let _ct = { q: '', filter: 'all', offset: 0, limit: 50, total: 0, counts: {}, selected: new Set(), timer: null, gen: 0 };
 const CONTACT_FILTERS = ['all', 'todo', 'contacted', 'replied', 'closed'];
 
-async function loadProspects() {
-  const el = document.getElementById('prospects-table');
+// The Email module's outreach list (the prospects): reachable from the
+// Contacts tab while that module is on.
+async function loadOutreach() {
+  const el = document.getElementById('ct-body');
+  if (!el) return;
   if (!document.getElementById('contact-rows')) {
     el.innerHTML = '<div class="toolbar">' +
       '<label class="search grow">' + icon('discover') +
@@ -3480,7 +4017,7 @@ async function loadProspects() {
   if (!res || !rowsEl) { if (rowsEl) rowsEl.innerHTML = offlineState(); return; }
   _ct.total = res.total || 0;
   _ct.counts = res.counts || {};
-  if (!(res.prospects || []).length && _ct.offset > 0 && _ct.total > 0) { _ct.offset = 0; return loadProspects(); }
+  if (!(res.prospects || []).length && _ct.offset > 0 && _ct.total > 0) { _ct.offset = 0; return loadOutreach(); }
   _prospects = res.prospects || [];
   renderContacts();
 }
@@ -3489,14 +4026,14 @@ function contactSearchInput(value) {
   _ct.q = value;
   _ct.offset = 0;
   clearTimeout(_ct.timer);
-  _ct.timer = setTimeout(loadProspects, 250);
+  _ct.timer = setTimeout(loadOutreach, 250);
 }
 
-function setContactFilter(f) { _ct.filter = f; _ct.offset = 0; loadProspects(); }
+function setContactFilter(f) { _ct.filter = f; _ct.offset = 0; loadOutreach(); }
 
 function pageContacts(how, value) {
   pageMove(_ct, how, value);
-  loadProspects().then(() => {
+  loadOutreach().then(() => {
     const top = document.getElementById('prospects');
     if (top && how !== 'size') top.scrollIntoView({block: 'start'});
   });
@@ -3691,11 +4228,12 @@ async function undoOptOut() {
   _optOut.armed = false;
   _optOut.busy = false;
   _optOut.data = await api('/api/prospects/' + encodeURIComponent(id) + '/opt-out') || {error: true};
-  loadProspects();
+  loadOutreach();
 }
 
 // From a conversation: the contact, with the opt-out record open.
 async function showOptOut(prospectId, email) {
+  _cv.view = 'outreach';
   goTab('prospects');
   _ct.q = email || '';
   _ct.filter = 'all';
@@ -4205,7 +4743,9 @@ setInterval(() => {
     case 'overview': loadOverview(); break;
     case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;
     case 'companies': loadCompanies(); break;
-    case 'prospects': if (!_optOut.id) loadProspects(); break;
+    // The contacts list isn't refetched (its count is a big query): only
+    // the outreach list, which the Email loop changes as it goes.
+    case 'prospects': if (_cv.view === 'outreach' && !_optOut.id) loadOutreach(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;

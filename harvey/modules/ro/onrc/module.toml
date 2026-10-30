@@ -44,6 +44,24 @@ cost = { usd = 0.0, per = "dataset" }
 id = "registry_search"
 op = "query"
 inputs = [["query", "area"], ["query"], ["area"]]
+# A Discover source: ticked on the Descoperă page it queues this job in the
+# run's batch, with the filters below as its panel. The estimate is the
+# free count of the firms that match.
+discover = "registry_pull"
+label = "ONRC trade registry"
+filters = [
+    { key = "words", type = "text", label = "Activity or CAEN code (words, or 8623)" },
+    { key = "county", type = "text", label = "County (BV, Brașov; B is Bucharest)" },
+    { key = "locality", type = "text", label = "Town" },
+    { key = "min_turnover", type = "number", label = "Turnover from (lei)", module = "mf_financials" },
+    { key = "max_turnover", type = "number", label = "Turnover up to (lei)", module = "mf_financials" },
+    { key = "min_employees", type = "number", label = "Employees from", module = "mf_financials" },
+    { key = "max_employees", type = "number", label = "Employees up to", module = "mf_financials" },
+    { key = "unknown", type = "choice", options = ["exclude", "include"], label = "Firms with no figures on file", module = "mf_financials" },
+    { key = "employer", type = "yesno", label = "Employer (pays wage tax)", module = "mf_taxpayers" },
+    { key = "vat", type = "yesno", label = "VAT registered", module = "mf_taxpayers" },
+    { key = "micro", type = "yesno", label = "Micro-enterprise tax", module = "mf_taxpayers" },
+]
 outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"], values = ["dataset", "report", "codes", "collector", "run_params"] }
 cost = { usd = 0.0, per = "query" }
 

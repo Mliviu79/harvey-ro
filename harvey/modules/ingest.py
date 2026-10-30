@@ -84,7 +84,35 @@ async def listing(store, record: Record) -> Saved:
         # so an undo can take them back.)
         await store.fill_company_fields(
             result.company_id, phone=record.phone, website=record.website, domain=domain)
+    await place_of(store, result.company_id, record, result.origin,
+                   sure=result.created or result.match.same_record)
     return Saved(result.company_id, result.origin, result.created)
+
+
+async def place_of(store, company_id: str, record: Record, origin: str = "",
+                   sure: bool = True) -> int:
+    """A listing as one of its company's places, and as one of the sources
+    it was found in: a branch that matched a company on file keeps its own
+    address and phone there, and its phone is a contact of the company
+    through that place (``sure`` False: matched by other evidence than its
+    own record, so the phone is only likely the company's). Returns the
+    place's id (0 when the listing can't tell one place from another)."""
+    from harvey import contacts
+    from harvey.collectors.phones import phone_region
+
+    source = record.module or record.source
+    await store.add_company_source(company_id, record.source or source, record.external_id,
+                                   origin)
+    location_id = await store.add_location(
+        company_id, name=record.name, address=record.address, location=record.location,
+        external_id=record.external_id, phone=record.phone, source=source, origin=origin)
+    if record.phone:
+        await store.add_contacts(company_id, [contacts.Found(
+            "phone", record.phone, source=source, capability=record.capability,
+            evidence_url=record.source_url, trust="confirmed" if sure else "likely",
+            location_id=location_id,
+            region=phone_region(record.location, None, record.domain))], origin)
+    return location_id
 
 
 async def source_record(batch, record: Record, *, collector: str,
@@ -130,6 +158,7 @@ async def source_record(batch, record: Record, *, collector: str,
     # industry), so it isn't held behind the signal gate.
     out.activities = await batch.set_company_activities(
         out.company_id, record.activities, source=collector)
+    await batch.add_company_source(out.company_id, record.source, record.external_id, out.origin)
     return out
 
 
@@ -272,13 +301,67 @@ async def changed(batch, company_id: str, module: str, found: list[dict],
 
 async def company_phones(batch, company_id: str, contacts) -> bool:
     """An official record's phone as the company's phone when it has none
-    (on a batch); every number is also kept as a reading when PHONE_NUMBER
-    is confirmed. True when the company's phone was set."""
+    (on a batch); every number is a contact of the company, and is also
+    kept as a reading when PHONE_NUMBER is confirmed. True when the
+    company's phone was set."""
+    await add_contacts(batch, company_id, contacts)
     phones = [c for c in contacts if c.kind == "phone" and (c.display or c.value)]
     if not phones:
         return False
     changed_ = await batch.fill_company_fields(company_id, phone=phones[0].display or phones[0].value)
     return "phone" in (changed_ or [])
+
+
+async def add_contacts(store, company_id: str, found, origin: str = "",
+                       trust: str = "", region: str | None = None) -> int:
+    """Every contact a capability found for a company (api.Contact), linked
+    to it with its source and evidence. Contact data, like a published
+    email: it doesn't wait for a signal to be confirmed. ``trust`` is the
+    most a contact can be trusted (found on a website whose match to the
+    company is only likely, or unconfirmed): never thrown away, only marked.
+    How many were kept (a number that doesn't parse isn't)."""
+    from harvey import contacts
+
+    def capped(c) -> str:
+        own = contacts.trust_for(c.confidence)
+        if trust not in contacts.TRUST_LEVELS:
+            return own
+        return max(own, trust, key=contacts.TRUST_LEVELS.index)
+
+    items = [contacts.Found(c.kind, c.value, display=c.display, status=c.status,
+                            source=c.module, capability=c.capability,
+                            evidence_url=c.source_url, confidence=c.confidence,
+                            trust=capped(c), region=region)
+             for c in found or () if c.value]
+    if not items or not company_id:
+        return 0
+    return await store.add_contacts(company_id, items, origin)
+
+
+async def people(store, company_id: str, found, origin: str = "") -> int:
+    """The people a capability named at a company (api.Person): kept once
+    each by name, to be searched for a contact of their own. How many were
+    new."""
+    named = [(f"{p.first_name} {p.last_name}".strip(), p.title or "") for p in found or ()]
+    named = [(name, role) for name, role in named if name]
+    if not named or not company_id:
+        return 0
+    source = next((p.module for p in found if p.module), "")
+    return await store.add_people(company_id, named, source=source, origin=origin)
+
+
+async def named_people(batch, company_id: str, found: list[Fact], *, origin: str = "",
+                       source: str = "") -> None:
+    """The people a source's CONTACT_FOUND facts name ("Ana Pop —
+    administrator"), as people of the company (on a batch): records to
+    search for a contact, kept whether or not the signal is confirmed."""
+    from harvey import contacts
+
+    named = [contacts.split_person(f.value_text or "") for f in found
+             if f.code == "CONTACT_FOUND"]
+    named = [(name, role) for name, role in named if name]
+    if named and company_id:
+        await batch.add_people(company_id, named, source=source, origin=origin)
 
 
 # ── People, contacts and what a company is called ──
@@ -299,8 +382,26 @@ async def company_name(store, company_id: str, name: str) -> None:
 async def prospect(store, person) -> str:
     """A person at a company, as a contact. A contact already on file (same
     email or LinkedIn address) is kept as it is: a second source adds
-    people, it doesn't rewrite them."""
-    return await store.add_prospect(person)
+    people, it doesn't rewrite them. Its email and its person are mirrored
+    into the contacts by the prospect triggers (migration v21); its own
+    phone, which needs parsing, here."""
+    prospect_id = await store.add_prospect(person)
+    phone = (getattr(person, "phone", "") or "").strip()
+    if phone and person.company_id:
+        from harvey import contacts
+        from harvey.collectors.phones import phone_region
+
+        try:
+            company = await store.get_company(person.company_id)
+            await store.add_contacts(person.company_id, [contacts.Found(
+                "phone", phone, person=person.full_name(), role=person.title or "",
+                source=person.source or "", evidence_url=person.source_url or "",
+                trust="likely", region=phone_region(
+                    getattr(company, "location", "") or "", None,
+                    getattr(company, "domain", "") or (person.email or "").rpartition("@")[2]))])
+        except Exception as e:
+            logger.debug(f"prospect phone not kept as a contact: {e}")
+    return prospect_id
 
 
 async def email_pattern(store, domain: str, **found) -> None:
@@ -417,3 +518,19 @@ async def found_company(store, record: Record) -> Saved:
     record before any merge, so undoing the merge takes that back too."""
     result = await store.save_company(company_from(record))
     return Saved(result.company_id, result.origin or result.company_id, result.created)
+
+
+async def person_contacts(store, company_id: str, person: str, role: str, found,
+                          trust: str = "likely", origin: str = "") -> int:
+    """A contact a lookup found for one person at a company (an address a
+    verifier graded), linked to that person. How many were kept."""
+    from harvey import contacts
+
+    items = [contacts.Found(c.kind, c.value, display=c.display, status=c.status,
+                            person=person, role=role, source=c.module,
+                            capability=c.capability, evidence_url=c.source_url,
+                            confidence=c.confidence, trust=trust)
+             for c in found or () if c.value]
+    if not items or not company_id:
+        return 0
+    return await store.add_contacts(company_id, items, origin)
