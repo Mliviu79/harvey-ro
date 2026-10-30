@@ -413,11 +413,13 @@ def _load_caen(con):
 # ── Reading ──
 
 def connect(path: Path = REGISTRY_PATH) -> sqlite3.Connection:
-    """The registry, read-only. FileNotFoundError when it isn't loaded."""
+    """The registry, read-only. FileNotFoundError when it isn't loaded.
+    The connection may be handed to a worker thread (a long search runs
+    in one, off the event loop), one thread at a time."""
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"no registry at {path}: run harvey registry load")
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 

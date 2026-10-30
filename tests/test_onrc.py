@@ -677,7 +677,7 @@ def test_registrations_in_area(files):
     assert onrc.registrations_in_area(files["firms"], None, "Cristian") == {"J2025000200088"}
 
 
-def test_cli_every_activity_needs_an_area(monkeypatch, capsys):
+def test_cli_every_firm_in_the_country_takes_a_flag(monkeypatch, capsys):
     import sys
 
     from harvey import cli
@@ -686,4 +686,4 @@ def test_cli_every_activity_needs_an_area(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exit_:
         cli.main()
     assert exit_.value.code == 2
-    assert "give a --county or a --locality" in capsys.readouterr().out
+    assert "--whole-country" in capsys.readouterr().out

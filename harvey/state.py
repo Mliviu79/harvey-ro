@@ -876,6 +876,68 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_obs_origin ON observations(origin_company_id)
         WHERE origin_company_id != '';
     """,
+    # ── v20: background jobs (harvey/modules/jobs.py, harvey/modules/worker.py) ──
+    """
+    -- What one click (or one command) asked for: the jobs it became share
+    -- its id, and a paid batch's cap is what its jobs reserve from.
+    CREATE TABLE IF NOT EXISTS job_batches (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        params_json TEXT DEFAULT '{}',
+        max_spend REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- One unit of work on one lane. A lane runs its jobs in order; lanes
+    -- run side by side. progress_json keeps what a stopped job resumes
+    -- from (a search's page cursor); result_json what it did.
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        lane TEXT NOT NULL,
+        module TEXT DEFAULT '',
+        capability TEXT DEFAULT '',
+        label TEXT DEFAULT '',
+        params_json TEXT DEFAULT '{}',
+        dedupe_key TEXT,
+        status TEXT NOT NULL DEFAULT 'queued',
+        progress_json TEXT DEFAULT '{}',
+        result_json TEXT DEFAULT '{}',
+        est_cost REAL DEFAULT 0.0,
+        reserved REAL DEFAULT 0.0,
+        actual_cost REAL DEFAULT 0.0,
+        attempts INTEGER DEFAULT 0,
+        not_before TIMESTAMP,
+        error TEXT DEFAULT '',
+        paused_reason TEXT DEFAULT '',
+        stop_requested TEXT DEFAULT '',
+        batch_id TEXT DEFAULT '',
+        parent_id TEXT DEFAULT '',
+        worker TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- The same work can't wait twice: unique while it is still to finish.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key)
+        WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'paused');
+    CREATE INDEX IF NOT EXISTS idx_jobs_lane ON jobs(lane, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+    -- The one worker allowed to run jobs on this database: whoever holds a
+    -- lease whose heartbeat is fresh.
+    CREATE TABLE IF NOT EXISTS worker_lease (
+        name TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        pid INTEGER DEFAULT 0,
+        host TEXT DEFAULT '',
+        heartbeat_at REAL NOT NULL,
+        started_at REAL NOT NULL
+    );
+    """,
 ]
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
@@ -3214,7 +3276,7 @@ class StateManager:
                 return counts, [dict(row) for row in await cursor.fetchall()]
 
     async def companies_needing_profile(
-        self, limit: int = 100, stale_days: int = 90
+        self, limit: int = 100, stale_days: int = 90, ids=None
     ) -> list[dict]:
         """Companies a profile run should visit next.
 
@@ -3228,21 +3290,30 @@ class StateManager:
 
         Businesses with no domain are excluded — there is no site to read.
         They are not a failure, they are the NO_WEBSITE cohort.
+
+        ``ids`` looks only at those companies (a search's results), so a
+        run's handful isn't found by reading the whole backlog.
         """
+        out: list[dict] = []
+        chunks = [None] if ids is None else [
+            list(ids)[i:i + 500] for i in range(0, len(list(ids)), 500)]
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute(
-                f"""SELECT c.id, c.name, c.domain, c.location, c.source_url
-                   FROM companies c
-                   {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != '' AND {LIVE_COMPANY}
-                     AND ({_LAST_PROFILED} IS NULL
-                          OR {_LAST_PROFILED} < datetime('now', ?))
-                   ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
-                   LIMIT ?""",
-                (f"-{int(stale_days)} days", int(limit)),
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
+            for chunk in chunks:
+                only = "" if chunk is None else f"AND c.id IN ({', '.join('?' * len(chunk))})"
+                async with db.execute(
+                    f"""SELECT c.id, c.name, c.domain, c.location, c.source_url
+                       FROM companies c
+                       {_LAST_PROFILED_JOIN}
+                       WHERE c.domain != '' AND {LIVE_COMPANY} {only}
+                         AND ({_LAST_PROFILED} IS NULL
+                              OR {_LAST_PROFILED} < datetime('now', ?))
+                       ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
+                       LIMIT ?""",
+                    (*(chunk or ()), f"-{int(stale_days)} days", int(limit)),
+                ) as cursor:
+                    out += [dict(r) for r in await cursor.fetchall()]
+        return out
 
     async def count_companies_needing_profile(self, stale_days: int = 90) -> int:
         async with self._connect() as db:

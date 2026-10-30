@@ -559,7 +559,8 @@ class Listing(D.DiscoveryProvider):
 
 
 @pytest.mark.asyncio
-async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monkeypatch):
+async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monkeypatch,
+                                                                   claim_provider):
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: EnvConfig())
     survivor = (await state.save_company(Company(
         name="Northvale Roofing Company", phone="+13035550199", location="Denver, Colorado",
@@ -567,19 +568,20 @@ async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monke
     await state.add_observation("REVIEW_COUNT", company_id=survivor, value_num=3)
     query = [D.DiscoveryQuery(term="roofer", location="Denver, CO")]
 
-    monkeypatch.setitem(D.PROVIDERS, "fake_maps", Listing(4.1))
+    claim_provider(Listing(4.1))
     await runs.run_discovery(state, None, "fake_maps", query)
     [(merged, into)] = _rows(state, "SELECT id, merged_into FROM companies WHERE merged_into != ''")
     assert into == survivor
     # Found again later: the listing's own id is the merged record's, and
     # its facts land on the company it stands for, saying whose they are.
-    monkeypatch.setitem(D.PROVIDERS, "fake_maps", Listing(4.6))
+    claim_provider(Listing(4.6))
     await runs.run_discovery(state, None, "fake_maps", query)
     found = _rows(state, "SELECT signal_code, value_num, company_id, origin_company_id, module, "
                          "capability FROM observations WHERE signal_code = 'REVIEW_RATING' "
                          "ORDER BY rowid")
-    assert found == [("REVIEW_RATING", 4.1, survivor, merged, "", "fake_maps"),
-                     ("REVIEW_RATING", 4.6, survivor, merged, "", "fake_maps")]
+    # Said to be the stand-in module's: a source no module claims doesn't run.
+    assert found == [("REVIEW_RATING", 4.1, survivor, merged, "stub_fake_maps", "web_search"),
+                     ("REVIEW_RATING", 4.6, survivor, merged, "stub_fake_maps", "web_search")]
 
     await state.undo_merge(merged)
     back = _rows(state, "SELECT company_id, COUNT(*) FROM observations WHERE origin_company_id = ? "
@@ -591,7 +593,8 @@ async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monke
 
 
 @pytest.mark.asyncio
-async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(state, monkeypatch):
+async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(
+        state, monkeypatch, claim_provider):
     """The listing merged into a company, that company merged by hand into
     another, then the listing found again: its facts are the listing's."""
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: EnvConfig())
@@ -602,13 +605,13 @@ async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(st
         name="Westridge Holdings", domain="westridge.example", location="Boulder, Colorado",
         source="manual"))).company_id
     query = [D.DiscoveryQuery(term="roofer", location="Denver, CO")]
-    monkeypatch.setitem(D.PROVIDERS, "fake_maps", Listing(4.1))
+    claim_provider(Listing(4.1))
     await runs.run_discovery(state, None, "fake_maps", query)
     [(listing, into)] = _rows(state, "SELECT id, merged_into FROM companies WHERE merged_into != ''")
     assert into == middle
     await state.merge_companies(top, middle)
 
-    monkeypatch.setitem(D.PROVIDERS, "fake_maps", Listing(4.6))
+    claim_provider(Listing(4.6))
     await runs.run_discovery(state, None, "fake_maps", query)
     assert _rows(state, "SELECT DISTINCT company_id, origin_company_id FROM observations "
                         "WHERE value_num = 4.6") == [(top, listing)]

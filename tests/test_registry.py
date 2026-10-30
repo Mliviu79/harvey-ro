@@ -347,7 +347,11 @@ def test_cli_without_a_registry(monkeypatch, capsys, tmp_path):
 
 
 def test_cli_load_uses_files_already_downloaded(monkeypatch, capsys, raw, tmp_path):
-    # A named dataset whose files are on disk loads without data.gov.ro.
+    import harvey.state as state_mod
+
+    # A named dataset whose files are on disk loads without data.gov.ro
+    # (as a job, which the command runs itself when no worker is running).
+    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
     folder = tmp_path / "onrc" / DATASET.date
     folder.mkdir(parents=True)
     for role, path in raw.items():
@@ -371,6 +375,19 @@ def test_cli_import_onrc_is_a_shortcut(monkeypatch, capsys, raw, db_path, tmp_pa
     out = run_cli(monkeypatch, capsys, "import-onrc", "dentist", "--county", "BV",
                   "--dry-run", "--registry", str(db_path))
     assert "3 match" in out and "3 would be new" in out
+
+
+@pytest.mark.parametrize("narrowing", [["--dry-run"], ["--whole-country", "--dry-run"]])
+def test_cli_import_onrc_counts_the_whole_country(monkeypatch, capsys, raw, db_path,
+                                                  tmp_path, narrowing):
+    import harvey.state as state_mod
+
+    async def latest(client):
+        return DATASET
+    monkeypatch.setattr(onrc, "latest_dataset", latest)
+    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
+    out = run_cli(monkeypatch, capsys, "import-onrc", *narrowing, "--registry", str(db_path))
+    assert "every activity in all of Romania" in out and " match" in out
 
 
 def test_counting_stops_at_the_cap(con, monkeypatch):

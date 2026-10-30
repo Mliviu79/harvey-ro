@@ -98,8 +98,9 @@ async def test_old_guesses_do_not_stop_a_mixed_setup_returning_to_prospecting(st
     await add(state, 100, "v@verified.test", "verified")
     summary = await state.get_state_summary()
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "write_campaign"
+    # Email off: nothing for the heartbeat to decide (it doesn't run a cycle).
     assert await decide_next_action(None, state, CONFIG, summary=summary,
-                                    email_on=False) == "prospect"
+                                    email_on=False) == "idle"
     [verified] = [p for p in await state.get_prospects_by_status("new") if p.email_status == "verified"]
     await state.update_prospect_status(verified.id, "queued")  # what the Writer does
     summary = await state.get_state_summary()
@@ -123,8 +124,9 @@ async def test_a_deliverable_prospect_is_still_written_for(state):
     await add(state, 2, "p2@co2.test", "verified")
     summary = await state.get_state_summary()
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "write_campaign"
+    # Email off: nothing for the heartbeat to decide (it doesn't run a cycle).
     assert await decide_next_action(None, state, CONFIG, summary=summary,
-                                    email_on=False) == "prospect"
+                                    email_on=False) == "idle"
 
 
 @pytest.mark.asyncio

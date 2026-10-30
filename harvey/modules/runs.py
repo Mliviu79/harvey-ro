@@ -101,7 +101,8 @@ async def resolve_coordinates(state, queries, radius_km: int = 40,
 # ── Discovery (the search modules and the presets) ──
 
 async def run_discovery(state, config, provider_key: str | None = None, queries=None,
-                        max_spend: float = 1.0, dry_run: bool = False, count: bool = False):
+                        max_spend: float = 1.0, dry_run: bool = False, count: bool = False,
+                        stop=None, cursor: dict | None = None, on_page=None):
     """Discover businesses and record what was learned about them: every
     result each search has, page by page, until the spend cap or the kill
     switch stops it (read between pages); a stop says what was left.
@@ -112,6 +113,12 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     search, so the estimate is exact; nothing else is called. Run it first,
     every time: the first small trial is what exposes the data-quality
     problems that would otherwise poison every market you scale to.
+
+    A job runs one search through here: ``stop()`` (async) says why it must
+    stop at the next page (a cancel, a pause), ``cursor`` resumes a search
+    from the page a stop left it at, and ``on_page(pages, results, cost)``
+    is told after each page (cost: what the search has spent so far). ``report.cursor`` is where the last search
+    stopped (None when it ran to the end).
     """
     from harvey.collectors import discover as D
     from harvey.config import live_do_not_contact, load_env
@@ -121,7 +128,10 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     provider_key = provider_key or D.DEFAULT_PROVIDER
     provider = D.PROVIDERS.get(provider_key)
     if provider is None:
-        raise ValueError(f"unknown discovery provider: {provider_key!r}")
+        # Only a source a module claims runs: one that no module does is
+        # refused, never run with its facts attributed to nobody.
+        raise ValueError(f"unknown discovery provider: {provider_key!r} "
+                         "(no module claims it; see harvey modules list)")
     # A source or preset whose module is off is refused (ModuleOff), never
     # run or skipped quietly.
     for preset in sorted({q.preset for q in queries or []} - {""}) or [""]:
@@ -132,6 +142,8 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
         queries = await resolve_coordinates(state, queries)
     report = D.DiscoveryReport(provider=provider_key, queries=len(queries))
     report.estimated_cost = provider.estimate(queries)
+    # Not started yet: a stop before the first search leaves it where it was.
+    report.cursor = cursor
 
     if dry_run:
         if count and provider.can_count:
@@ -167,12 +179,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     # inside the hot loop.
     do_not_contact = live_do_not_contact(config)
     enabled = await _enabled(state)
-    try:
-        searcher = _capability_for("provider", provider_key)
-    except api.CapabilityMissing:
-        # A provider no module claims (one added in code only): it runs as
-        # it is, its facts attributed to no module.
-        searcher = D.provider_capabilities("", {provider_key: provider_key})[provider_key]
+    searcher = _capability_for("provider", provider_key)
     presets = {}
 
     # Each business's base facts are written once per run; its ranks once per
@@ -182,8 +189,12 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     saved: dict[str, ingest.Saved] = {}
     ranked_in_run: dict[tuple[str, str], set[str]] = {}
 
-    async def paused() -> bool:
-        return bool(await state.get_setting("discovery_paused"))
+    async def paused() -> str:
+        if stop is not None:
+            why = await stop()
+            if why:
+                return why
+        return "paused" if await state.get_setting("discovery_paused") else ""
 
     next_query = 0
     try:
@@ -193,8 +204,9 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                 # The kill switch is read between searches and between a
                 # search's pages, not once at the top: a long run has to be
                 # stoppable while it is running.
-                if await paused():
-                    report.stopped = "paused"
+                why = await paused()
+                if why:
+                    report.stopped = why
                     break
                 # The cap is checked before spending: a search starts only
                 # if its first request fits in what is left.
@@ -215,11 +227,17 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                                   wanted=frozenset(confirmed), enabled=enabled,
                                   settings={"provider": provider_key,
                                             "searcher": (searcher.module, searcher.id),
-                                            "paused": paused})
+                                            "paused": paused, "on_page": on_page,
+                                            "cursor": cursor if i == 0 else None})
                 report.queries_ran += 1
                 draft = await cap(api.Input(query=query, area=query.location,
                                             extra={"provider": provider_key}), ctx)
                 report.actual_cost += draft.cost
+                report.pages += draft.counts.get("pages", 0)
+                report.cursor = (draft.values.get("cursor") if draft.failed is None
+                                 else (cursor if i == 0 else None))
+                report.transient = bool(draft.values.get("transient"))
+                report.retry_after = draft.values.get("retry_after")
                 if "available" in draft.counts:
                     report.available = (report.available or 0) + draft.counts["available"]
                 report.unfetched += draft.counts.get("unfetched", 0)
@@ -257,6 +275,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                     if first:
                         seen.add(ident)
                         saved[ident] = await ingest.listing(state, record)
+                        report.company_ids.append(saved[ident].company_id)
                         if saved[ident].created:
                             report.new_companies += 1
                         else:
@@ -315,7 +334,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                     report.stopped = draft.stop
                     break
 
-        if report.stopped in ("budget reached", "paused"):
+        if report.stopped in ("budget reached", "paused", "cancelled"):
             # What the stop left: the searches never started, at their
             # estimate (the results a stopped search had left are counted
             # above, from what the source said it holds).
@@ -524,6 +543,110 @@ async def import_registry(state, files, dataset, *, county: str = "", classes=No
         state, draft, draft.values["report"], module="onrc",
         run_params=draft.values.get("run_params"), dry_run=dry_run,
         do_not_contact=do_not_contact, progress=progress)
+
+
+async def ensure_registry(path, data_dir, name: str = "latest", *, with_people: bool = True,
+                          force: bool = False, offline_ok: bool = False, say=None) -> dict:
+    """The registry at ``path`` holding dataset ``name`` ("latest": the
+    newest on data.gov.ro), downloading any missing file into
+    data_dir/<date>/ and building it when it isn't loaded yet. With
+    ``offline_ok``, a registry already loaded is used as it is when
+    data.gov.ro can't be reached; without one, the newest dataset already
+    downloaded into data_dir is loaded instead. ``say(line)`` (async) is
+    told what happens. Returns its meta; JobError (code 2) when there is
+    nothing to load or another load holds the registry."""
+    from pathlib import Path
+
+    from harvey import registry
+    from harvey.collectors import onrc
+    from harvey.modules.jobs import JobError
+
+    async def tell(line: str):
+        if say is not None:
+            await say(line)
+
+    path, data_dir = Path(path), Path(data_dir)
+    roles = [r for r in onrc.FILES if r != "people" or with_people]
+    have = registry.status(path)
+    if have and have.get("schema") != registry.SCHEMA_VERSION:
+        await tell(f"  {path.name} was loaded by an older Harvey; loading it again.")
+        have, force = None, True
+    local = onrc.local_dataset(data_dir, name, roles) if name != "latest" else None
+    if local:
+        dataset, files = local
+    else:
+        timeout = httpx.Timeout(60.0, read=300.0)
+        said: list[str] = []
+
+        def progress(role, filename, size):
+            mb = f"{size / 1e6:.0f} MB" if size else "size unknown"
+            said.append(f"    downloading {filename} ({mb}), once per dataset...")
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                dataset = await (onrc.latest_dataset(client) if name == "latest"
+                                 else onrc.dataset_named(client, name))
+                if have and have.get("dataset") == dataset.name and not force:
+                    return have
+                files = await onrc.fetch_files(client, dataset, data_dir, roles=roles,
+                                               progress=progress)
+        except httpx.HTTPError as e:
+            for line in said:
+                await tell(line)
+            why = f"data.gov.ro unreachable ({e.__class__.__name__})"
+            if have and offline_ok:
+                await tell(f"  {why}; using the registry already loaded ({have.get('dataset')})")
+                return have
+            local = newest_local_dataset(data_dir, roles) if name == "latest" else None
+            if not local:
+                raise JobError(f"{why}, and no complete dataset is downloaded in {data_dir}."
+                               + (f" The registry holds {have.get('dataset')}." if have else "")
+                               + " Try again when online.", code=2)
+            dataset, files = local
+            await tell(f"  {why}; using {dataset.name}, already downloaded")
+        else:
+            for line in said:
+                await tell(line)
+    if have and have.get("dataset") == dataset.name and not force:
+        return have
+    await tell(f"  Loading {dataset.name} (registry as of {dataset.date}) into {path.name}; "
+               "a few minutes, once per dataset...")
+    loop = asyncio.get_running_loop()
+
+    def load_progress(step, rows):
+        line = f"    {step}..." if rows is None else f"    {step}: {rows:,} rows read"
+        if say is not None:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(say(line)))
+    try:
+        loaded = await api.capability("onrc", "registry_sync")(
+            api.Input(extra={"files": files, "dataset": dataset, "path": path,
+                             "progress": load_progress}), api.Context())
+        return loaded.values["registry"]
+    except registry.RegistryBusy as e:
+        if have and offline_ok:
+            await tell(f"  Another load is running; using the registry already loaded "
+                       f"({have.get('dataset')})")
+            return have
+        raise JobError(f"{e}.", code=2)
+
+
+def newest_local_dataset(data_dir, roles):
+    """The newest dataset fully downloaded under data_dir/<date>/, or None."""
+    from datetime import date
+    from pathlib import Path
+
+    from harvey.collectors import onrc
+
+    folders = sorted((p.name for p in Path(data_dir).glob("????-??-??") if p.is_dir()),
+                     reverse=True)
+    for folder in folders:
+        try:
+            when = date.fromisoformat(folder)
+        except ValueError:
+            continue
+        found = onrc.local_dataset(data_dir, f"firme-{when:%d-%m-%Y}", roles)
+        if found:
+            return found
+    return None
 
 
 # ── Free local lookups by legal identifier (a source's own database) ──

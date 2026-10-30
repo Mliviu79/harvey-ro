@@ -28,6 +28,7 @@ import logging
 import math
 import re
 import unicodedata
+from collections.abc import MutableMapping
 from html import unescape
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -36,6 +37,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harvey.modules.api import Draft, Fact, Record
+from harvey.transient import Transient
 
 logger = logging.getLogger("harvey.collectors.discover")
 
@@ -436,10 +438,22 @@ _PLACEHOLDER_RE = re.compile(
 )
 
 
+# A search whose later page failed with something worth trying again (the
+# network, a 5xx, a 429): it keeps what the earlier pages found and stops
+# where it failed, so trying again carries on from that page.
+PART_WAY = "failed part-way"
+
+
 class ProviderExhausted(RuntimeError):
     """This provider can take no more searches in this run: its allowance or
     rate limit is used up, or it refused the key. The run stops and says why,
-    rather than failing every remaining phrase the same way."""
+    rather than failing every remaining phrase the same way. ``retry_after``
+    (seconds), when known, is when it will take searches again (an hourly
+    allowance); without it a person has to act (a key, credit)."""
+
+    def __init__(self, message: str = "", retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class DiscoveryProvider:
@@ -506,22 +520,53 @@ class DiscoveryProvider:
         raise NotImplementedError
 
     async def halt(self, page_cost: float) -> str:
-        """Why the next page must not be fetched ("paused", "budget
-        reached"), or "": the kill switch and the spend cap, read between
-        pages."""
-        if self.paused is not None and await self.paused():
-            return "paused"
+        """Why the next page must not be fetched ("paused", "cancelled",
+        "budget reached"), or "": the kill switch (or the job's own stop)
+        and the spend cap, read between pages."""
+        if self.paused is not None:
+            why = await self.paused()
+            if why:
+                return why if isinstance(why, str) else "paused"
         if self.last_cost + page_cost > self.remaining_budget + 1e-9:
             return "budget reached"
         return ""
 
     def _stopped(self, why: str, unfetched: int | None = None,
-                 unfetched_cost: float = 0.0):
-        """Record that this query ended early with results left behind."""
+                 unfetched_cost: float = 0.0, cursor: dict | None = None):
+        """Record that this query ended early with results left behind,
+        and (``cursor``) where to carry on from."""
         self.stop_reason = why
         self.complete = False
         self.unfetched = unfetched
         self.unfetched_cost = unfetched_cost
+        self.next_cursor = cursor
+
+    def start_page(self, default: int = 0) -> int:
+        """The page a search resumed from a cursor starts at."""
+        try:
+            return int((self.cursor or {}).get("page", default))
+        except (TypeError, ValueError):
+            return default
+
+    async def page_done(self, results: int) -> None:
+        """Count a fetched page and tell the run (a job's progress): pages
+        so far, results so far, and what the search has cost so far, so the
+        money is recorded before the next page is paid for."""
+        self.pages += 1
+        if self.on_page is not None:
+            await self.on_page(self.pages, results, self.last_cost)
+
+    def _failed_part_way(self, error: Exception, page_label, cursor: dict) -> bool:
+        """A page after the first failed. True when it is worth trying
+        again: the search then stops there (PART_WAY), keeping what the
+        earlier pages found, to carry on from ``cursor``."""
+        from harvey.transient import is_transient
+
+        if not is_transient(error):
+            return False
+        self._stopped(PART_WAY, cursor=cursor)
+        self.last_error = f"page {page_label} failed: {error}"
+        return True
 
     async def fetch(self, client: httpx.AsyncClient, env: dict,
                     query: DiscoveryQuery) -> list[Business]:
@@ -536,6 +581,14 @@ class DiscoveryProvider:
     remaining_budget: float = math.inf
     # Set per search by search_draft: reads the kill switch.
     paused = None
+    # Set per search by search_draft: where a stopped search left off
+    # (``cursor``, None: the first page), told after each page
+    # (``on_page(pages, results, cost so far)``), and where to carry on (``next_cursor``,
+    # set when it stops part-way; None when it went to the end).
+    cursor: dict | None = None
+    next_cursor: dict | None = None
+    on_page = None
+    pages: int = 0
     # Results the source said it holds for the last query, when it says.
     available: int | None = None
     # Left behind when the cap or the kill switch stopped the last query
@@ -654,11 +707,17 @@ class DataForSEOListings(DiscoveryProvider):
         """
         self.last_cost = 0.0
         want = query.limit
+        resumed = self.cursor or {}
         page_size = min(self.PAGE_SIZE, want) if want is not None else self.PAGE_SIZE
-        # A first page the cap can't pay for in full is asked for smaller,
-        # so the cap buys what it can. Later pages keep the first one's
-        # size: an offset_token request must repeat the request it follows.
-        if math.isfinite(self.remaining_budget):
+        if resumed.get("page_size"):
+            # Resumed: the pages keep the size the search started with (a
+            # token repeats the request it follows).
+            page_size = int(resumed["page_size"])
+        elif math.isfinite(self.remaining_budget):
+            # A first page the cap can't pay for in full is asked for
+            # smaller, so the cap buys what it can. Later pages keep the
+            # first one's size: an offset_token request must repeat the
+            # request it follows.
             affordable = int((self.remaining_budget - self.TASK_COST) / self.ITEM_COST + 1e-6)
             if affordable < 1:
                 raise ProviderExhausted("budget reached")
@@ -667,7 +726,10 @@ class DataForSEOListings(DiscoveryProvider):
 
         out: list[Business] = []
         seen: set[str] = set()
-        token, offset, total = None, 0, None
+        token = resumed.get("token") or None
+        offset = int(resumed.get("offset") or 0)
+        total = resumed.get("total")
+        fetched_here = False
         while True:
             left = None if total is None else max(0, total - offset)
             if want is not None:
@@ -675,9 +737,14 @@ class DataForSEOListings(DiscoveryProvider):
             if left is not None and left <= 0:
                 break
             if offset:
-                why = await self.halt(self.TASK_COST + self.ITEM_COST * min(page_size, left or page_size))
+                page = self.TASK_COST + self.ITEM_COST * min(page_size, left or page_size)
+                if not fetched_here and page > self.remaining_budget + 1e-9:
+                    raise ProviderExhausted("budget reached")
+                why = await self.halt(page)
                 if why:
-                    self._stopped(why, left, self.cost_of(left) if left else 0.0)
+                    self._stopped(why, left, self.cost_of(left) if left else 0.0,
+                                  cursor={"offset": offset, "token": token, "total": total,
+                                          "page_size": page_size})
                     logger.info("%s: %s after %d of %s for %r", self.key, why, offset,
                                 total if total is not None else "?", query.keyword())
                     break
@@ -691,7 +758,17 @@ class DataForSEOListings(DiscoveryProvider):
                 payload["offset_token"] = token
             elif offset:
                 payload["offset"] = offset
-            data, cost = await self._search(client, env, payload)
+            try:
+                data, cost = await self._search(client, env, payload)
+            except Exception as e:
+                if fetched_here and self._failed_part_way(
+                        e, offset // max(1, page_size) + 1,
+                        {"offset": offset, "token": token, "total": total,
+                         "page_size": page_size}):
+                    logger.info("%s: page at %d of %r failed, keeping %d: %s",
+                                self.key, offset, query.keyword(), len(out), e)
+                    break
+                raise
             self.last_cost += cost
             result = _dfs_result(data)
             items = result.get("items") or []
@@ -710,6 +787,8 @@ class DataForSEOListings(DiscoveryProvider):
                 new += 1
             offset += len(items)
             token = result.get("offset_token") or None
+            fetched_here = True
+            await self.page_done(len(out))
             # The end: a short page, or one with nothing new in it (a source
             # repeating itself must never become an endless loop).
             if len(items) < page_size or not new:
@@ -1006,13 +1085,14 @@ class Serper(DiscoveryProvider):
         seen: set[str] = set()
         pages = (search_pages(query.depth, self.PAGE_SIZE) if query.depth
                  else None)
-        page = 0
+        page = first = max(1, self.start_page(1))
+        page -= 1
         while pages is None or page < pages:
             page += 1
-            if page > 1:
+            if page > first:
                 why = await self.halt(self.PAGE_COST)
                 if why:
-                    self._stopped(why)
+                    self._stopped(why, cursor={"page": page})
                     break
             body = {"q": query.keyword(),
                     # Free accounts reject num > 10 (HTTP 400 "Query pattern
@@ -1030,11 +1110,13 @@ class Serper(DiscoveryProvider):
                 r.raise_for_status()
                 data = r.json()
             except Exception as e:
-                if page == 1:
+                if page == first:
                     raise
-                # A later page that fails keeps what the earlier ones found.
-                self.complete = False
-                self.last_error = f"page {page} failed: {e}"
+                # A later page that fails keeps what the earlier ones found;
+                # one worth trying again is carried on from where it failed.
+                if not self._failed_part_way(e, page, {"page": page}):
+                    self.complete = False
+                    self.last_error = f"page {page} failed: {e}"
                 break
             self.last_cost += self.PAGE_COST
             items = data.get("organic") or []
@@ -1060,6 +1142,7 @@ class Serper(DiscoveryProvider):
                     source_url=item.get("link") or "",
                     provider=self.key,
                 ))
+            await self.page_done(len(out))
             if not items or not new:
                 break
         return out
@@ -1113,7 +1196,8 @@ class TinyFish(DiscoveryProvider):
                 minutes = int((3600 - (now - self._calls[0])) // 60) + 1
                 raise ProviderExhausted(
                     f"TinyFish allows 500 searches an hour and this hour's are used up. "
-                    f"Run again in about {minutes} minutes.")
+                    f"Run again in about {minutes} minutes.",
+                    retry_after=minutes * 60)
             wait = self._last_call + self.MIN_INTERVAL - now
             if self._last_call and wait > 0:
                 await asyncio.sleep(wait)
@@ -1139,71 +1223,27 @@ class TinyFish(DiscoveryProvider):
         pages_needed = min(self.MAX_PAGES, -(-query.depth // 10)) if query.depth else self.MAX_PAGES
         out: list[Business] = []
 
-        for page in range(pages_needed):
-            if page and await self.halt(0.0):
-                self._stopped("paused")
-                break
+        first = self.start_page(0)
+        for page in range(first, pages_needed):
+            if page > first:
+                why = await self.halt(0.0)
+                if why:
+                    self._stopped(why, cursor={"page": page})
+                    break
 
             params = {
                 "query": query.keyword(),
                 "page": page,
             }
 
-            r = None
-            for attempt in range(2):
-                await self._pace()
-                try:
-                    r = await client.get(self.ENDPOINT, headers=headers, params=params)
-                except httpx.HTTPError as e:
-                    if attempt == 0:
-                        await asyncio.sleep(1.0)
-                        continue
-                    raise RuntimeError(f"TinyFish search unreachable: {e}") from e
-
-                if r.status_code == 429:
-                    retry_after = 2.0
-                    try:
-                        retry_after = float(r.headers.get("Retry-After", "2"))
-                    except (ValueError, TypeError):
-                        pass
-                    if attempt == 0:
-                        await asyncio.sleep(min(60.0, max(1.0, retry_after)))
-                        continue
-                    raise ProviderExhausted(
-                        "TinyFish: rate limited (it allows 30 searches a minute and 500 an "
-                        "hour). Try again later, or with fewer phrases.")
-                break
-
-            if r is None:
-                raise RuntimeError("TinyFish: Request failed.")
-
-            if r.status_code == 401:
-                raise ProviderExhausted(
-                    "TinyFish: Invalid or missing API key (HTTP 401). "
-                    "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
-            if r.status_code == 402:
-                err_msg = ""
-                try:
-                    err_data = r.json()
-                    err = err_data.get("error")
-                    if isinstance(err, dict):
-                        err_msg = err.get("message", "")
-                    elif isinstance(err, str):
-                        err_msg = err
-                except Exception:
-                    pass
-                raise ProviderExhausted(
-                    f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
-            r.raise_for_status()
-
             try:
-                data = r.json()
-            except ValueError as e:
-                raise RuntimeError("TinyFish sent an unexpected answer (not JSON)") from e
-            if not isinstance(data, dict):
-                raise RuntimeError("TinyFish sent an unexpected answer (not an object)")
-            items = data.get("results") or []
-            if not isinstance(items, list) or not items:
+                r = await self._get_page(client, headers, params)
+            except Exception as e:
+                if page > first and self._failed_part_way(e, page, {"page": page}):
+                    break
+                raise
+            items = self._items(r)
+            if not items:
                 break
 
             keyword = query.keyword()
@@ -1228,11 +1268,76 @@ class TinyFish(DiscoveryProvider):
                     keyword=keyword,
                 ))
 
+            await self.page_done(len(out))
             # If this page returned fewer than 10 results, no more pages exist.
             if len(items) < 10:
                 break
 
         return out
+
+    async def _get_page(self, client: httpx.AsyncClient, headers: dict, params: dict):
+        """One page of results, once more after a moment when the network
+        or the rate limit is in the way; an answer worth no retry raises
+        what it means (a refused key pauses the source)."""
+        r = None
+        for attempt in range(2):
+            await self._pace()
+            try:
+                r = await client.get(self.ENDPOINT, headers=headers, params=params)
+            except httpx.HTTPError as e:
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise Transient(f"TinyFish search unreachable: {e}") from e
+
+            if r.status_code == 429:
+                retry_after = 2.0
+                try:
+                    retry_after = float(r.headers.get("Retry-After", "2"))
+                except (ValueError, TypeError):
+                    pass
+                if attempt == 0:
+                    await asyncio.sleep(min(60.0, max(1.0, retry_after)))
+                    continue
+                raise ProviderExhausted(
+                    "TinyFish: rate limited (it allows 30 searches a minute and 500 an "
+                    "hour). Try again later, or with fewer phrases.",
+                    retry_after=max(60.0, min(3600.0, retry_after)))
+            break
+
+        if r is None:
+            raise RuntimeError("TinyFish: Request failed.")
+
+        if r.status_code == 401:
+            raise ProviderExhausted(
+                "TinyFish: Invalid or missing API key (HTTP 401). "
+                "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
+        if r.status_code == 402:
+            err_msg = ""
+            try:
+                err_data = r.json()
+                err = err_data.get("error")
+                if isinstance(err, dict):
+                    err_msg = err.get("message", "")
+                elif isinstance(err, str):
+                    err_msg = err
+            except Exception:
+                pass
+            raise ProviderExhausted(
+                f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
+        r.raise_for_status()
+        return r
+
+    @staticmethod
+    def _items(r) -> list:
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise RuntimeError("TinyFish sent an unexpected answer (not JSON)") from e
+        if not isinstance(data, dict):
+            raise RuntimeError("TinyFish sent an unexpected answer (not an object)")
+        items = data.get("results") or []
+        return items if isinstance(items, list) else []
 
 
 class OpenStreetMap(DiscoveryProvider):
@@ -1535,14 +1640,15 @@ class ScavioProvider(DiscoveryProvider):
         self.last_error = self.stop_reason = ""
         self.complete = True
         rows: list[tuple[int, dict]] = []
-        page = -1
+        first = self.start_page(0)
+        page = first - 1
         while pages is None or page + 1 < pages:
             page += 1
             start = page * page_size
-            if rows:
+            if page > first:
                 why = await self.halt(self.CREDIT_PRICE)
                 if why:
-                    self._stopped(why)
+                    self._stopped(why, cursor={"page": page})
                     break
             try:
                 data = await self._post(client, env, path, dict(body, start=start))
@@ -1561,6 +1667,11 @@ class ScavioProvider(DiscoveryProvider):
                             raise RuntimeError("Scavio: invalid numeric result field")
                 last_page = self._last_page(data, items, page_size)
             except Exception as e:
+                if rows and self._failed_part_way(e, page + 1, {"page": page}):
+                    logger.warning("%s: page %d of %r failed, keeping %d results and "
+                                   "carrying on from it later: %s",
+                                   self.key, page + 1, query.keyword(), len(rows), e)
+                    break
                 self.complete = False
                 self.last_error = str(e)
                 if isinstance(e, ProviderExhausted):
@@ -1571,6 +1682,7 @@ class ScavioProvider(DiscoveryProvider):
                                self.key, page + 1, query.keyword(), len(rows), e)
                 break
             rows.extend((start, item) for item in items)
+            await self.page_done(len(rows))
             if last_page:
                 break
         return rows
@@ -1732,7 +1844,9 @@ class ScavioSearch(ScavioProvider):
         return out
 
 
-PROVIDERS: dict[str, DiscoveryProvider] = {
+# The providers whose code lives in this file. Which of them exist for
+# Harvey is decided by the manifests (ProviderRegistry), not by this list.
+BUILT_IN: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
         TinyFish(),
@@ -1744,6 +1858,67 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
         ScavioSearch(),
     )
 }
+
+
+class ProviderRegistry(MutableMapping):
+    """The discovery sources, built from the module manifests: a key is
+    here only when a module's capability claims it (``provider = "..."``).
+    Its code is the module's own (``PROVIDERS`` in the module's entry
+    file) or one of the built-in ones above. So a new search source is a
+    module folder, with no change here, and a source no module claims
+    doesn't exist: it is refused by name, never run unattributed.
+
+    Assigning a key installs an implementation (a test's stand-in); it is
+    used only while a module claims that key."""
+
+    def __init__(self, built_in: dict[str, DiscoveryProvider]):
+        self._code = dict(built_in)
+
+    def _claims(self) -> dict[str, DiscoveryProvider]:
+        import importlib
+
+        from harvey.modules import switches
+
+        out: dict[str, DiscoveryProvider] = {}
+        for m in switches.manifests():
+            for cap in m.capabilities:
+                key = cap.get("provider")
+                if not key or key in out:
+                    continue
+                provider = self._code.get(key)
+                if provider is None and m.entry:
+                    try:
+                        provider = (getattr(importlib.import_module(m.entry), "PROVIDERS", None)
+                                    or {}).get(key)
+                    except Exception as e:
+                        logger.warning("discover: %s's code didn't load: %s", m.id, e)
+                if provider is not None:
+                    out[key] = provider
+        # The built-in ones in their usual order, then the rest.
+        order = list(self._code)
+        return dict(sorted(out.items(), key=lambda kv: (
+            order.index(kv[0]) if kv[0] in order else len(order))))
+
+    def __getitem__(self, key):
+        return self._claims()[key]
+
+    def __setitem__(self, key, provider):
+        self._code[key] = provider
+
+    def __delitem__(self, key):
+        del self._code[key]
+
+    def __iter__(self):
+        return iter(self._claims())
+
+    def __len__(self):
+        return len(self._claims())
+
+    def __contains__(self, key):
+        return key in self._claims()
+
+
+PROVIDERS: ProviderRegistry = ProviderRegistry(BUILT_IN)
 
 DEFAULT_PROVIDER = "osm"
 
@@ -1821,6 +1996,14 @@ class DiscoveryReport:
     unfetched: int = 0
     queries_left: int = 0
     unfetched_cost: float = 0.0
+    # For a job: pages fetched, where the last search stopped (to resume
+    # from), whether its failure is worth trying again and when the source
+    # takes more, and the companies it saved (their sites are read next).
+    pages: int = 0
+    cursor: dict | None = None
+    transient: bool = False
+    retry_after: float | None = None
+    company_ids: list[str] = field(default_factory=list)
 
     def left_behind(self) -> str:
         """One line on what a stopped run left unfetched, or ""."""
@@ -1856,6 +2039,7 @@ class DiscoveryReport:
             "unfetched": self.unfetched, "queries_left": self.queries_left,
             "unfetched_cost": round(self.unfetched_cost, 4),
             "left_behind": self.left_behind(),
+            "pages": self.pages,
         }
 
 
@@ -2119,7 +2303,7 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
 
 async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.AsyncClient,
                        env: dict, remaining: float = math.inf, host=None,
-                       paused=None) -> Draft:
+                       paused=None, cursor: dict | None = None, on_page=None) -> Draft:
     """One search through one provider, as a Draft: a record per result
     (junk dropped and counted in ``counts``, each keyed by its position),
     the facts each result gives, and what the search really cost.
@@ -2129,7 +2313,15 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     ``paused`` (async, true when the kill switch is on) is read between
     pages; ``counts["available"]`` is what the source said it holds, and
     ``counts["unfetched"]`` / ``values["unfetched_cost"]`` what a stop
-    left behind."""
+    left behind. ``cursor`` resumes a search a stop left part-way (from
+    the page it reached); ``values["cursor"]`` is where this one stopped
+    (None when it went to the end), ``counts["pages"]`` how many pages it
+    fetched, and ``on_page(pages, results, cost)`` is awaited after each
+    page. A failure worth trying again (the network, a 5xx, a 429) sets
+    ``values["transient"]``: on the first page the draft fails, on a later
+    one it keeps the earlier pages and stops PART_WAY with its cursor. A
+    provider that can take more later says when (``values["retry_after"]``,
+    seconds)."""
     provider = PROVIDERS[provider_key]
     draft = Draft()
     provider.last_cost = 0.0
@@ -2139,12 +2331,19 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     provider.paused = paused
     provider.available = provider.unfetched = None
     provider.unfetched_cost = 0.0
+    provider.cursor = dict(cursor) if cursor else None
+    provider.next_cursor = None
+    provider.on_page = on_page
+    provider.pages = 0
     try:
         found = await provider.fetch(client, env, query)
     except ProviderExhausted as e:
         logger.warning("discover: %s stopped: %s", provider_key, e)
         draft.failed = draft.stop = str(e)
         draft.cost = provider.last_cost
+        draft.counts["pages"] = provider.pages
+        if e.retry_after:
+            draft.values["retry_after"] = e.retry_after
         return draft
     except Exception as e:
         # A failure is an observation about the run, not a reason to lose
@@ -2152,18 +2351,32 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
         logger.warning("discover: %s failed on %r: %s", provider_key, query.keyword(), e)
         draft.failed = str(e)
         draft.cost = provider.last_cost
+        draft.counts["pages"] = provider.pages
+        from harvey.transient import is_transient
+        if is_transient(e):
+            draft.values["transient"] = True
         return draft
+    finally:
+        provider.cursor = provider.on_page = None
     draft.cost = provider.last_cost
+    draft.counts["pages"] = provider.pages
     if provider.last_error:
         draft.errors.append(provider.last_error)
     draft.stop = provider.stop_reason
+    if draft.stop == PART_WAY:
+        draft.values["transient"] = True
+    if provider.next_cursor:
+        draft.values["cursor"] = provider.next_cursor
     if provider.available is not None:
         draft.counts["available"] = provider.available
     if provider.unfetched:
         draft.counts["unfetched"] = provider.unfetched
     if provider.unfetched_cost:
         draft.values["unfetched_cost"] = provider.unfetched_cost
-    draft.complete_codes = tuple(provider.rank_codes) if provider.complete else ()
+    # A search resumed part-way didn't see its first pages this time, so it
+    # can't say a business is no longer ranked.
+    draft.complete_codes = (tuple(provider.rank_codes)
+                            if provider.complete and not cursor else ())
     draft.counts["found"] = len(found)
     for i, biz in enumerate(found):
         if host is not None and biz.domain and not is_junk(biz.domain):
@@ -2193,7 +2406,9 @@ def provider_capabilities(module_id: str, caps: dict[str, str]) -> dict:
         async def run(inp, ctx) -> Draft:
             draft = await search_draft(key, inp.query, ctx.http, ctx.env,
                                        remaining=ctx.budget.remaining,
-                                       paused=ctx.settings.get("paused"))
+                                       paused=ctx.settings.get("paused"),
+                                       cursor=ctx.settings.get("cursor"),
+                                       on_page=ctx.settings.get("on_page"))
             return draft.stamp(module_id, cap_id)
 
         return Capability(module_id, cap_id, run,
@@ -2215,7 +2430,9 @@ def preset_capabilities(module_id: str, caps: dict[str, str]) -> dict:
             draft = await search_draft(key, inp.query, ctx.http, ctx.env,
                                        remaining=ctx.budget.remaining,
                                        host=company_host if preset == "hiring" else None,
-                                       paused=ctx.settings.get("paused"))
+                                       paused=ctx.settings.get("paused"),
+                                       cursor=ctx.settings.get("cursor"),
+                                       on_page=ctx.settings.get("on_page"))
             draft.stamp(*ctx.settings["searcher"])
             extra = [(r.key, f) for r in draft.records
                      for f in preset_facts(inp.query, r.source_url, r.key)]

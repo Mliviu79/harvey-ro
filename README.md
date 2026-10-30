@@ -109,7 +109,22 @@ It decides deterministically, not by asking a model what to do — that would bu
 handle replies  >  send campaigns  >  write campaigns  >  prospect  >  idle (analyze)
 ```
 
-Profiling and outbox draining ride along on **every** cycle regardless, because they cost nothing and have to happen on schedule.
+Outbox draining rides along on **every** cycle regardless, because it has to happen on schedule.
+
+The heartbeat is the Email module's: it reads replies, writes and sends, and with the Email module off it does nothing. Finding companies, reading their sites and loading public data are **jobs** the worker runs (see [The queue](#the-queue-background-jobs)); when there is nobody left to write to, the heartbeat queues a contact search as one.
+
+### The queue (background jobs)
+
+Every long run is a job on the **lane** of the source it calls: a discovery search on its search module's lane (one job per search, so a run over five cities is five jobs), each company's site read on the website reader's lane, a registry load or pull on the registry's, a load or check of the financial statements or the taxpayer file on theirs, and checks at ANAF a hundred companies a job on ANAF's. A lane runs its jobs one at a time, in the order they were asked for; lanes run side by side, so a slow TinyFish search never holds up an OpenStreetMap one. The pace each service allows still holds request by request.
+
+- **Asking twice.** A second Descoperă run, of the same source or another, is queued. The same search (source, phrase, place and settings) asked again while it still waits is refused, naming the job already there.
+- **Money.** Each paid job reserves its estimate from its run's spend cap before it spends; the cap and the stop are read between pages, and each page's cost is recorded as it arrives, so the cap holds even when a worker is killed mid-search. A search the cap stops is **paused (spend limit)**: raise the cap (Coadă, or `harvey jobs resume ID --max-spend N`) and it carries on from the page it reached, without paying for the earlier pages again. `spend.per_day_usd` and `spend.per_month_usd` in harvey.yaml (UTC, none by default) limit every run together.
+- **Restarts.** A worker that is stopped (Ctrl-C, `docker stop`) lets a running search finish its page, keeps what it found and saves where it got to; the search resumes from there. A worker killed outright (no time to stop) loses the pages that search fetched since it last stopped: they are fetched again when it resumes, and paid for again, within its cap. Jobs left running on a lane nobody runs go back to the queue.
+- **Failures.** A passing problem (the network, a 5xx, a 429) is tried again later, waiting longer each time, then the job fails with the message; a search whose later page failed that way keeps the pages it had and carries on from the failed one. Only failed tries count: waiting for an allowance or a restart doesn't use them up. A source out of credit, or refusing its key, pauses its lane until you resume it; an hourly allowance used up just waits for the next hour.
+- **Who runs them.** One worker per database: the dashboard runs one inside its own process (the usual install runs only the dashboard), `harvey worker` and `harvey run` run one without it, and a lease decides which of them works. CLI commands queue their work and then wait and print its progress, running it themselves when no worker is running (and then only the lanes their own jobs are on, so a dashboard started meanwhile runs the rest); `--background` queues it and returns.
+- **Nothing re-runs on its own**, except a public-data source you set to update itself. Quiet hours are the Email module's only: the worker runs at any hour.
+
+The dashboard's **Coadă** (Queue) page shows each lane: what is running (pages, results, cost so far), waiting, paused, done and failed, with pause/resume per lane and cancel/retry/resume per job. A running search can be cancelled or paused (it stops after its page); a running load or check runs to its end. The badge beside it in the menu counts what is running and waiting, and Descoperă's result card links to its run's jobs.
 
 ---
 
@@ -661,6 +676,7 @@ The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeli
 - **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
 
 **System**
+- **Queue** — every background job per lane: running (with progress), waiting, paused, done, failed; pause a lane, cancel, retry or resume a job.
 - **Activity**, **Usage**, **Controls**, **Settings**, **Help**. Usage shows Claude or Codex quota gauges and per-agent token counts, with no dollar figures: you're on a subscription and aren't billed per token, so showing costs would be made up.
 
 | Outbox | Conversations |
@@ -804,11 +820,16 @@ If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real
 ### Commands
 
 ```bash
-harvey run                   # the heartbeat loop
-harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock link)
+harvey run                   # the heartbeat loop (the Email module's: reply, write, send)
+harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock link); runs the job worker
+harvey worker                # run queued jobs without the dashboard (one worker per database)
+harvey jobs                  # the queue per lane; cancel|retry|resume ID, pause|resume-lane LANE
+                             # (resume ID --max-spend N raises a paused run's cap)
 harvey signals               # review/confirm what to prospect against
-harvey discover              # find businesses; --providers / --estimate
-harvey profile               # read discovered companies' sites (free)
+harvey discover              # find businesses; --providers / --estimate; one job per search
+harvey profile               # read discovered companies' sites (free); one job per company
+                             # (these and the loads and checks below wait for their jobs;
+                             #  --background queues them and returns)
 harvey registry load         # the whole trade registry into data/registry.db, once per dataset
 harvey registry search dentist BV  # every firm in Romania: words, CAEN code, county, town
                              # (--min-turnover 1M, --max-employees 49 ... once statements are loaded;
@@ -1029,7 +1050,7 @@ another service* on the dashboard) and Harvey stops suggesting it.
 
 ```
 harvey/
-├── main.py              # heartbeat loop
+├── main.py              # heartbeat loop (email only)
 ├── brain.py             # Claude/Codex provider selection + skills + usage
 ├── claude_runtime.py    # Isolated Claude CLI calls (safe mode, no tools, clean dir)
 ├── codex.py             # Isolated Codex subscription runtime
@@ -1043,7 +1064,8 @@ harvey/
 │   ├── discover.py      # provider adapters, junk filtering, entity resolution
 │   └── profile.py       # the free HTTP profiler
 ├── agents/              # scout, writer, sender, handler, analyst
-├── modules/             # module manifests and capabilities, the loader, core ingest and runs
+├── modules/             # module manifests and capabilities, the loader, core ingest and runs,
+│                        #   jobs (the queue), worker (lanes, lease), job_kinds
 ├── integrations/        # mail providers, email finder, quota
 └── web/                 # dashboard HTML/CSS/JS — no build step
 

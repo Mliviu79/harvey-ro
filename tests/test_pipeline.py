@@ -112,12 +112,12 @@ class FakeDiscovery(D.DiscoveryProvider):
 
 
 @pytest.fixture
-def chain(monkeypatch):
+def chain(monkeypatch, claim_provider):
     """A fake discovery provider and a profile stage that records its input."""
     seen = {"profiled": []}
 
     def install(businesses):
-        monkeypatch.setitem(D.PROVIDERS, "fake", FakeDiscovery(businesses))
+        claim_provider(FakeDiscovery(businesses))
 
         async def fake_profile(state, companies, **_):
             seen["profiled"] = [c["domain"] for c in companies]

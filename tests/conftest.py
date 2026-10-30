@@ -111,3 +111,43 @@ def _no_live_anaf(monkeypatch, tmp_path_factory, request):
         raise service.AnafError("ANAF is not asked in tests")
 
     monkeypatch.setattr(service, "ask", refuse)
+
+
+# Every fact a discovery result can give (discover.business_facts).
+_SEARCH_FACTS = ["FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING",
+                 "REVIEW_COUNT", "SERP_RANK", "IN_LOCAL_PACK", "MAPS_RANK"]
+
+
+@pytest.fixture
+def claim_provider(monkeypatch):
+    """``claim_provider(provider)``: a test's stand-in discovery source,
+    claimed by a module of its own (``stub_<key>``), as a real one is. A
+    source no module claims is refused, so a stand-in needs one too."""
+    import sys
+    import types
+    from pathlib import Path
+
+    from harvey.collectors import discover as D
+    from harvey.modules import switches
+    from harvey.modules.loader import Manifest
+
+    def install(provider, module_id: str | None = None):
+        key = provider.key
+        module_id = module_id or f"stub_{key}"
+        monkeypatch.setitem(D.PROVIDERS, key, provider)
+        entry = f"harvey.modules._stub_{module_id}"
+        code = types.ModuleType(entry)
+        code.CAPABILITIES = D.provider_capabilities(module_id, {"web_search": key})
+        monkeypatch.setitem(sys.modules, entry, code)
+        manifest = Manifest(
+            id=module_id, set="original", kind="search", version="0.0.1",
+            path=Path("tests") / module_id / "module.toml", name=f"Stub {key}",
+            default_enabled=True, entry=entry,
+            capabilities=({"id": "web_search", "op": "query", "provider": key,
+                           "outputs": {"records": "companies", "ids": ["domain"],
+                                       "facts": list(_SEARCH_FACTS)}},))
+        mans = tuple(m for m in switches.manifests() if m.id != module_id) + (manifest,)
+        monkeypatch.setattr(switches, "manifests", lambda: mans)
+        return provider
+
+    return install

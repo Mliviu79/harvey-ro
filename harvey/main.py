@@ -1,4 +1,11 @@
-"""Harvey's main heartbeat loop. Always Be Closing."""
+"""Harvey's main heartbeat loop. Always Be Closing.
+
+The heartbeat is the Email module's: it reads replies, writes, and sends.
+Finding companies, reading their sites and loading public data are jobs
+the worker runs (harvey/modules/worker.py); when there is nobody left to
+write to, the heartbeat queues a contact search as one. With the Email
+module off it does nothing at all.
+"""
 
 import asyncio
 import logging
@@ -19,7 +26,6 @@ from harvey.modules import switches
 from harvey.pidfile import (
     LOCK_FILE, hold_loop_lock, read_pid, release_loop_lock, remove_pid_file, write_pid_file,
 )
-from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
 logging.basicConfig(
@@ -144,8 +150,8 @@ async def decide_next_action(
 ) -> str:
     """Decide what Harvey should do next based on current state.
 
-    With the Email module off, Harvey only looks for companies and
-    contacts: nothing is written, sent or read from the mailbox.
+    With the Email module off there is nothing to decide: "idle" (the
+    heartbeat doesn't run its cycle at all).
 
     Uses deterministic priority rules (handle_replies > send_campaign >
     write_campaign > prospect > idle) instead of burning a Claude call on a
@@ -166,7 +172,7 @@ async def decide_next_action(
     deployable = 0 if legacy_sending_held(config) else draft_campaigns
 
     if not email_on:
-        action, reason = "prospect", "the Email module is off: finding contacts only"
+        action, reason = "idle", "the Email module is off"
     elif open_conversations > 0:
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
     elif deployable > 0:
@@ -286,13 +292,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     logger.info("Database initialized.")
 
     # Import agents here to avoid circular imports
-    from harvey.agents.scout import Scout
     from harvey.agents.writer import Writer
     from harvey.agents.sender import Sender
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
 
-    scout = Scout(brain, state, config, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
@@ -305,8 +309,16 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     while not stop_event.is_set():
         try:
             # The Email module's switch is read every cycle: off means no
-            # writing, sending or reading mail, whatever harvey.yaml says.
+            # writing, sending or reading mail, whatever harvey.yaml says,
+            # and so nothing for the heartbeat to do (finding companies and
+            # reading sites are jobs; the worker runs them).
             email_on = await switches.is_enabled(state, switches.EMAIL_MODULE)
+            if not email_on:
+                logger.info("The Email module is off: nothing to do. Checking again in "
+                            f"{config.usage.heartbeat_interval_minutes} minutes.")
+                if await _interruptible_sleep(interval, stop_event):
+                    break
+                continue
 
             # 0. Approval or autopilot, as the config file says now: the
             # dashboard can switch it while Harvey runs.
@@ -398,7 +410,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if action == "handle_replies":
                 tasks.append(("handle_replies", handler.run()))
             elif action == "prospect":
-                tasks.append(("prospect", scout.run()))
+                # Finding contacts is a job (its own lane, the worker runs
+                # it): queued once, never twice while it waits.
+                from harvey.modules.job_kinds import enqueue_find_contacts
+                tasks.append(("prospect", enqueue_find_contacts(state)))
                 # Also handle replies in parallel if needed
                 if has_open_convos and email_on:
                     tasks.append(("handle_replies", handler.run()))
@@ -426,19 +441,6 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 send_tasks.append(("send_outbox", sender.run))
             if email_on and sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
                 tasks.append(("read_replies", handler.run()))
-
-            # Profiling rides along every cycle. It is three HTTP requests per
-            # business with no model call, so it costs nothing against the
-            # Claude budget the rest of this loop is rationing — and it is what
-            # turns a name and a domain into something worth writing about.
-            if summary.get("unprofiled", 0):
-                tasks.append(("profile", run_profile_stage(state, limit=25, config=config)))
-            # A free local source the user set to update on its own (the
-            # financial statements) checks for a new year when it is due.
-            # Off by default: then this only reads two settings.
-            if not send_only:
-                from harvey.modules.runs import sync_due_sources
-                tasks.append(("sources", sync_due_sources(state)))
 
             outcomes = await _run_agents(tasks)
 
@@ -550,7 +552,31 @@ async def _run_with_signals():
             # Windows / non-main-thread fallback
             signal.signal(sig, lambda s, f: _request_shutdown(signal.Signals(s).name))
 
-    await heartbeat(stop_event)
+    # The jobs the heartbeat queues (finding contacts) need a worker. With
+    # the dashboard up, its worker runs them and this one waits; without
+    # it, this one runs every job, at any hour (quiet hours are email's).
+    worker = asyncio.create_task(_run_worker(stop_event))
+    try:
+        await heartbeat(stop_event)
+    finally:
+        stop_event.set()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+async def _run_worker(stop_event: asyncio.Event):
+    from harvey.modules.worker import Worker, lease_holder
+
+    try:
+        state = StateManager()
+        await state.init_db()
+        holder = await lease_holder(state)
+        if holder:
+            logger.info("Jobs run in the worker on %s (pid %s); this one stands by.",
+                        holder.get("host"), holder.get("pid"))
+        await Worker(state).run(stop_event)
+    except Exception as e:
+        logger.warning(f"The job worker stopped: {e}. Jobs wait until the dashboard "
+                       "or harvey worker runs them.")
 
 
 def main():

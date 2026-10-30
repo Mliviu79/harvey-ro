@@ -88,12 +88,9 @@ class FakeProvider(D.DiscoveryProvider):
 
 
 @pytest.fixture
-def register(monkeypatch):
-    """Install a fake provider into the registry for one test."""
-    def _install(provider):
-        monkeypatch.setitem(D.PROVIDERS, provider.key, provider)
-        return provider
-    return _install
+def register(claim_provider):
+    """Install a fake provider, claimed by a stand-in module, for one test."""
+    return claim_provider
 
 
 def biz(**kw):
@@ -1525,25 +1522,29 @@ async def test_failed_attempt_is_not_a_successful_query(state, config, register)
 
 
 @pytest.mark.parametrize("attempted,succeeded", [(0, 0), (2, 0), (2, 1), (1, 1)])
-def test_cli_exit_tracks_successful_queries(monkeypatch, config, attempted, succeeded):
-    from harvey import config as cfg, pipeline
+def test_cli_exit_tracks_successful_queries(monkeypatch, config, tmp_path, attempted, succeeded):
+    import harvey.state as state_mod
+    from harvey import config as cfg
+    from harvey.modules import job_kinds
+
     _fake_env(monkeypatch, serper_api_key="fixture")
     monkeypatch.setattr(cfg, "load_config", lambda: config)
-    async def init_db(self):
-        pass
-    async def estimate(*args, **kwargs):
-        return D.DiscoveryReport()
-    async def prospect(*args, **kwargs):
-        return SimpleNamespace(discover={"queries": 2, "queries_ran": attempted,
-                                        "queries_succeeded": succeeded}, errors=[])
-    monkeypatch.setattr(StateManager, "init_db", init_db)
-    monkeypatch.setattr(R, "run_discovery", estimate)
-    monkeypatch.setattr(pipeline, "run_prospecting", prospect)
+    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
+
+    async def run(*args, dry_run=False, **kwargs):
+        if dry_run:
+            return D.DiscoveryReport()
+        # The run's searches as the job ran them.
+        return D.DiscoveryReport(queries=1, queries_ran=attempted,
+                                 queries_succeeded=succeeded)
+    monkeypatch.setattr(R, "run_discovery", run)
+    monkeypatch.setattr(job_kinds, "_config", lambda: config)
+    args = _cli_args(city="Denver, CO")
     if succeeded:
-        cmd_discover(_cli_args())
+        cmd_discover(args)
     else:
         with pytest.raises(SystemExit) as exc:
-            cmd_discover(_cli_args())
+            cmd_discover(args)
         assert exc.value.code == 1
 
 

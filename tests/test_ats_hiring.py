@@ -443,9 +443,9 @@ class _OneHit(DiscoveryProvider):
 
 
 @pytest.mark.asyncio
-async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeypatch):
-    from harvey.collectors import discover as D
-    monkeypatch.setitem(D.PROVIDERS, "fake", _OneHit("careers.acme.com"))
+async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeypatch,
+                                                                  claim_provider):
+    claim_provider(_OneHit("careers.acme.com"))
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
     await sync_vocabulary(state)
@@ -600,9 +600,9 @@ def test_the_hiring_preset_needs_roles():
     "acme.applytojob.com", "ats.rippling.com", "acme.wd5.myworkdayjobs.com",
 ])
 @pytest.mark.asyncio
-async def test_hiring_preset_hits_on_ats_hosts_are_never_prospects(state, monkeypatch, domain):
-    from harvey.collectors import discover as D
-    monkeypatch.setitem(D.PROVIDERS, "fake", _OneHit(domain))
+async def test_hiring_preset_hits_on_ats_hosts_are_never_prospects(state, monkeypatch, domain,
+                                                                  claim_provider):
+    claim_provider(_OneHit(domain))
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
     await sync_vocabulary(state)

@@ -64,7 +64,44 @@ async def _lifespan(_app):
             await StateManager(str(DB_PATH)).init_db()
         except Exception:
             logger.exception("could not upgrade %s", DB_PATH)
-    yield
+    # The job worker runs inside the dashboard: the usual install runs only
+    # this process. It waits for the database to exist, and stands aside
+    # while another worker (harvey worker, a command) holds the lease.
+    stop = asyncio.Event()
+    task = None
+    if os.environ.get("HARVEY_DASHBOARD_WORKER", "on").strip().lower() not in ("off", "0", "no"):
+        task = asyncio.create_task(_run_worker(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        if task is not None:
+            try:
+                await asyncio.wait_for(task, timeout=30)
+            except Exception:
+                logger.exception("the job worker didn't stop cleanly")
+
+
+async def _run_worker(stop: asyncio.Event):
+    from harvey.modules.worker import Worker
+
+    while not stop.is_set():
+        if DB_PATH.exists():
+            try:
+                state = _state()
+                await state.init_db()
+                await Worker(state).run(stop)
+            except Exception:
+                logger.exception("the job worker stopped; starting it again in a minute")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass
 
 
 app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_url=None,
@@ -2599,9 +2636,39 @@ async def get_activity():
 # This is the only stage that spends money, so the UI never starts one without
 # showing what it will cost first.
 
-_discovery_task: asyncio.Task | None = None
-_discovery_report: dict | None = None
-_discovery_kind = "discover"   # or "profile": reading sites has no stop switch
+
+async def _batch_summary(state, batch_id: str) -> dict | None:
+    """What a Descoperă run (one batch of jobs) did so far: its searches'
+    reports merged, the sites read, and how many of its jobs are where."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import merge_reports
+
+    batch = await jobs.get_batch(state, batch_id)
+    if batch is None:
+        return None
+    found = await jobs.list_jobs(state, batch_id=batch_id, limit=100000)
+    searches = [j for j in found if j.kind == "discover"]
+    sites = [j for j in found if j.kind == "site_read"]
+    report = merge_reports([j.progress.get("report") or j.result for j in searches])
+    report["errors"] = (report["errors"] + [f"{j.label}: {j.error}" for j in found
+                                             if j.status == jobs.FAILED and j.error])[:20]
+    statuses: dict[str, int] = {}
+    for j in found:
+        statuses[j.status] = statuses.get(j.status, 0) + 1
+    paused = [j for j in found if j.status == jobs.PAUSED]
+    return {
+        **report,
+        "batch_id": batch_id, "label": batch.get("label") or "",
+        "max_spend": batch.get("max_spend"),
+        "profiled_companies": sum(1 for j in sites if j.status == jobs.DONE),
+        "profile_observations": sum(int(j.result.get("observations") or 0) for j in sites),
+        "sites_waiting": sum(1 for j in sites if j.status in (jobs.QUEUED, jobs.RUNNING)),
+        "jobs": statuses,
+        "spend_limited": sum(1 for j in paused if j.paused_reason == jobs.SPEND_LIMIT),
+        "running": any(j.status in (jobs.QUEUED, jobs.RUNNING) for j in found),
+        # Searches of this run still to finish: what its Stop stops.
+        "searches_active": sum(1 for j in searches if j.status in (jobs.QUEUED, jobs.RUNNING)),
+    }
 
 
 async def _discovery_refusal(body: dict):
@@ -2639,12 +2706,19 @@ async def get_discovery_providers():
     try:
         from harvey.collectors.discover import DEFAULT_PROVIDER, PRESETS, provider_menu
         from harvey.config import load_env
-
         from harvey.modules import switches
 
         state = _state()
         await state.init_db()
         enabled = await switches.enabled_ids(state)
+        batches = await query_db(
+            "SELECT id FROM job_batches WHERE kind IN ('discover', 'site_read') "
+            "ORDER BY rowid DESC LIMIT 1")
+        last = await _batch_summary(state, batches[0]["id"]) if batches else None
+        active = await query_db(
+            "SELECT kind, COUNT(*) AS n FROM jobs WHERE kind IN ('discover', 'site_read') "
+            "AND status IN ('queued', 'running') GROUP BY kind")
+        kinds = {r["kind"]: r["n"] for r in active}
         return {
             "providers": provider_menu(load_env().model_dump(), enabled),
             # Presets whose module is off are hidden from the picker.
@@ -2653,10 +2727,12 @@ async def get_discovery_providers():
             "default": DEFAULT_PROVIDER,
             "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
             "paused": await state.get_setting("discovery_paused"),
-            "running": bool(_discovery_task and not _discovery_task.done()),
-            "running_kind": _discovery_kind,
+            "running": bool(kinds),
+            "running_kind": "discover" if kinds.get("discover") else "profile",
+            "searches_waiting": kinds.get("discover", 0),
+            "sites_waiting": kinds.get("site_read", 0),
             "unprofiled": await state.count_companies_needing_profile(),
-            "last_report": _discovery_report,
+            "last_report": last,
         }
     except Exception as e:
         logger.exception("discovery providers failed")
@@ -2709,22 +2785,38 @@ async def estimate_discovery(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _duplicate_body(e) -> dict:
+    """A 409 for work already waiting: the message, plus the job (its kind,
+    label and status) for the page to say it in the reader's language."""
+    return {"success": False, "message": str(e), "duplicate": True, "code": "duplicate",
+            "job": e.job.as_dict()}
+
+
+def _money(value, default: float | None = None) -> float:
+    """A dollar amount from a request: finite and >= 0, else ValueError."""
+    import math
+
+    if value is None or value == "":
+        if default is None:
+            raise ValueError("expected a number of dollars")
+        return default
+    amount = float(value)
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("expected a number of dollars, 0 or more")
+    return amount
+
+
 @app.post("/api/discover/run")
 async def start_discovery(request: Request):
-    """Kick off a run in the background and hand back immediately.
-
-    Discovery takes minutes, not milliseconds — holding the request open
-    would just time out. Progress shows up in the run log.
-    """
-    global _discovery_task, _discovery_report
-
-    if _discovery_task and not _discovery_task.done():
-        return JSONResponse({"success": False, "message": "a run is already going"},
-                            status_code=409)
+    """Queue the run and hand back at once: one job per search, on the
+    source's own lane. Another run, of this source or any other, queues
+    behind or beside it; the same search asked again while it still waits
+    is refused, naming the job already there."""
     try:
         from harvey.collectors.discover import PROVIDERS
         from harvey.config import load_config
-        from harvey.pipeline import run_prospecting
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_discovery
 
         body = await request.json()
         provider = body.get("provider") or ""
@@ -2742,97 +2834,250 @@ async def start_discovery(request: Request):
             queries = _discovery_queries(body, config)
         except ValueError as e:
             return JSONResponse({"success": False, "message": str(e)}, status_code=400)
-        max_spend = float(body.get("max_spend") or 1.0)
+        try:
+            max_spend = _money(body.get("max_spend") or None, default=1.0)
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "max_spend must be a number "
+                                 "of dollars, 0 or more", "code": "bad_cap"}, status_code=400)
 
         state = _state()
         await state.init_db()
         await state.set_setting("discovery_provider", provider)
         await state.set_setting("discovery_paused", "")
-
-        global _discovery_kind
-        _discovery_kind = "discover"
-
-        async def _go():
-            global _discovery_report
-            try:
-                # Discovery chains straight into profiling: reading the sites
-                # is free, and it is what makes the results worth anything.
-                result = await run_prospecting(state, config, provider, queries,
-                                               max_spend=max_spend)
-                _discovery_report = {
-                    **(result.discover or {}),
-                    "profiled_companies": result.profiled_companies,
-                    "profile_observations": result.profile_observations,
-                    "errors": result.errors,
-                }
-            except Exception as exc:
-                logger.exception("discovery run failed")
-                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
-
-        _discovery_report = None
-        _discovery_task = asyncio.create_task(_go())
-        return {"success": True, "queries": len(queries)}
+        try:
+            batch_id, ids, dupes = await enqueue_discovery(
+                state, provider, queries, max_spend=max_spend,
+                label=PROVIDERS[provider].label)
+        except jobs.Duplicate as e:
+            return JSONResponse(_duplicate_body(e), status_code=409)
+        return {"success": True, "queries": len(ids), "batch_id": batch_id,
+                "duplicates": [d.as_dict() for d in dupes]}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.post("/api/profile/run")
 async def start_profile():
-    """Read the websites of everything discovered but not yet looked at.
+    """Queue a read of the website of everything discovered but not yet
+    looked at: one job per company on the website reader's lane.
 
     Free and model-free, so there is nothing to estimate and no cap to set.
     """
-    global _discovery_task, _discovery_report
-
-    if _discovery_task and not _discovery_task.done():
-        return JSONResponse({"success": False, "message": "a run is already going"},
-                            status_code=409)
     try:
-        from harvey.pipeline import run_profile_stage
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_site_reads
 
         state = _state()
         await state.init_db()
         pending = await state.count_companies_needing_profile()
         if not pending:
             return {"success": True, "pending": 0}
-
-        async def _go():
-            global _discovery_report
-            try:
-                try:
-                    from harvey.config import load_config
-                    config = load_config()
-                except Exception:
-                    config = None   # still profiles; no role is singled out
-                companies, observations, _ = await run_profile_stage(
-                    state, limit=200, config=config)
-                _discovery_report = {
-                    "profiled_companies": companies,
-                    "profile_observations": observations,
-                }
-            except Exception as exc:
-                logger.exception("profile run failed")
-                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
-
-        global _discovery_kind
-        _discovery_kind = "profile"
-        _discovery_report = None
-        _discovery_task = asyncio.create_task(_go())
-        return {"success": True, "pending": pending}
+        batch_id = await jobs.new_batch(state, "site_read", "Read sites")
+        ids, dupes = await enqueue_site_reads(state, batch_id=batch_id)
+        return {"success": True, "pending": len(ids), "already_queued": len(dupes),
+                "batch_id": batch_id}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.post("/api/discover/stop")
-async def stop_discovery():
-    """Kill switch. Read between batches, so an in-flight run stops cleanly."""
+async def stop_discovery(request: Request):
+    """Cancel the searches of one run ({"batch_id"}; or, without one, of
+    one source, {"provider"}) still to finish. A running one stops after
+    its page, keeping what it found; sites already queued are still read.
+    Other runs (another source's, a command's) and searches paused at a
+    spend limit or by hand are left alone."""
     try:
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import discovery_lane
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        batch_id = str(body.get("batch_id") or "")
+        provider = str(body.get("provider") or "")
+        if not batch_id and not provider:
+            return JSONResponse({"success": False, "message": "say which run to stop "
+                                 "(batch_id) or which source (provider)"}, status_code=400)
+        lane = None
+        if not batch_id:
+            try:
+                lane = discovery_lane(provider)[0]
+            except ValueError as e:
+                return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         state = _state()
         await state.init_db()
-        await state.set_setting("discovery_paused", "stopped from dashboard")
-        return {"success": True}
+        stopped = 0
+        for job in await jobs.list_jobs(state, statuses=(jobs.QUEUED, jobs.RUNNING),
+                                        batch_id=batch_id or None, lane=lane, limit=100000):
+            if job.kind != "discover" or (provider and job.params.get("provider") != provider):
+                continue
+            try:
+                await jobs.cancel(state, job.id)
+            except jobs.Refused:
+                continue        # it finished meanwhile
+            stopped += 1
+        return {"success": True, "cancelled": stopped}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+# ── The queue (Coadă): every job, per lane ──
+
+# Finished jobs shown per lane.
+QUEUE_DONE_SHOWN = 10
+
+
+def _lane_name(lane: str) -> str:
+    """The lane's name as its module's manifest gives it (English); the page
+    shows its own words for the lanes it knows (q.lane.<id>)."""
+    from harvey.modules import switches
+
+    m = switches.by_id().get(lane)
+    if m is not None:
+        return m.name or m.id
+    return {"contacts": "Contacts"}.get(lane, lane)
+
+
+@app.get("/api/jobs")
+async def get_jobs(batch: str = ""):
+    """Every lane: what is running (with its progress), waiting, paused,
+    done and failed, and whether the lane is paused; the worker running
+    them. ``batch`` narrows it to one run's jobs."""
+    try:
+        from harvey.modules import jobs
+        from harvey.modules.worker import lease_holder
+
+        state = _state()
+        await state.init_db()
+        paused = await jobs.paused_lanes(state)
+        counts = await jobs.counts(state)
+        lanes: dict[str, dict] = {}
+        for lane in sorted(set(counts["lanes"]) | set(paused)):
+            lanes[lane] = {"lane": lane, "name": _lane_name(lane), "paused": paused.get(lane, ""),
+                           "counts": counts["lanes"].get(lane, {}), "running": [],
+                           "waiting": [], "paused_jobs": [], "done": [], "failed": []}
+        shown = await jobs.list_jobs(state, statuses=(jobs.RUNNING, jobs.PAUSED),
+                                     batch_id=batch or None, limit=2000)
+        # Waiting: per lane, the first 50 in the order the worker runs them.
+        for lane_id in sorted(set(lanes) | {
+                r["lane"] for r in await query_db(
+                    "SELECT DISTINCT lane FROM jobs WHERE status = 'queued'"
+                    + (" AND batch_id = ?" if batch else ""), (batch,) if batch else ())}):
+            shown += await jobs.list_jobs(state, lane=lane_id, statuses=(jobs.QUEUED,),
+                                          batch_id=batch or None, limit=50, oldest_first=True)
+        finished = await query_db(
+            "SELECT id FROM (SELECT id, lane, status, ROW_NUMBER() OVER (PARTITION BY lane, "
+            "status ORDER BY rowid DESC) AS n FROM jobs WHERE status IN "
+            "('done', 'failed', 'cancelled')" + (" AND batch_id = ?" if batch else "") +
+            ") WHERE n <= ?", (*((batch,) if batch else ()), QUEUE_DONE_SHOWN))
+        for row in finished:
+            job = await jobs.get(state, row["id"])
+            if job is not None:
+                shown.append(job)
+        where = {jobs.RUNNING: "running", jobs.QUEUED: "waiting", jobs.PAUSED: "paused_jobs",
+                 jobs.DONE: "done", jobs.CANCELLED: "done", jobs.FAILED: "failed"}
+        for job in shown:
+            lane = lanes.setdefault(job.lane, {
+                "lane": job.lane, "name": _lane_name(job.lane), "paused": paused.get(job.lane, ""),
+                "counts": counts["lanes"].get(job.lane, {}), "running": [], "waiting": [],
+                "paused_jobs": [], "done": [], "failed": []})
+            lane[where[job.status]].append(job.as_dict())
+        for lane in lanes.values():
+            lane["waiting_more"] = max(0, lane["counts"].get(jobs.QUEUED, 0) - len(lane["waiting"]))
+            for key in ("done", "failed"):
+                lane[key].sort(key=lambda j: j["finished_at"] or j["created_at"] or "", reverse=True)
+                lane[key] = lane[key][:QUEUE_DONE_SHOWN]
+        holder = await lease_holder(state)
+        return {
+            "lanes": sorted(lanes.values(), key=lambda l: (
+                -len(l["running"]), -l["counts"].get(jobs.QUEUED, 0), l["name"].lower())),
+            "running": counts.get(jobs.RUNNING, 0), "waiting": counts.get(jobs.QUEUED, 0),
+            "paused": counts.get(jobs.PAUSED, 0), "failed": counts.get(jobs.FAILED, 0),
+            "worker": {"pid": holder.get("pid"), "host": holder.get("host")} if holder else None,
+            "batch": await jobs.get_batch(state, batch) if batch else None,
+        }
+    except Exception as e:
+        logger.exception("jobs failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/jobs/counts")
+async def get_job_counts():
+    """The nav badge: jobs running and waiting."""
+    rows = await query_db("SELECT status, COUNT(*) AS n FROM jobs "
+                          "WHERE status IN ('running', 'queued') GROUP BY status")
+    n = {r["status"]: r["n"] for r in rows}
+    return {"running": n.get("running", 0), "waiting": n.get("queued", 0)}
+
+
+@app.post("/api/jobs/{job_id}/{action}")
+async def act_on_job(job_id: str, action: str):
+    """cancel, retry, resume or pause one job."""
+    from harvey.modules import jobs
+
+    do = {"cancel": jobs.cancel, "retry": jobs.retry, "resume": jobs.resume,
+          "pause": jobs.pause}.get(action)
+    if do is None:
+        return JSONResponse({"success": False, "message": f"unknown action {action!r}"},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    try:
+        job = await do(state, job_id)
+    except jobs.Duplicate as e:
+        return JSONResponse(_duplicate_body(e), status_code=409)
+    except jobs.Refused as e:
+        return JSONResponse({"success": False, "message": str(e), "code": e.code},
+                            status_code=409)
+    return {"success": True, "job": job.as_dict()}
+
+
+@app.post("/api/lanes/{lane}/{action}")
+async def act_on_lane(lane: str, action: str):
+    """pause or resume a lane."""
+    from harvey.modules import jobs
+
+    if action not in ("pause", "resume"):
+        return JSONResponse({"success": False, "message": f"unknown action {action!r}"},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    if not await jobs.known_lane(state, lane):
+        return JSONResponse({"success": False, "message": f"no lane {lane!r}"}, status_code=404)
+    if action == "pause":
+        await jobs.pause_lane(state, lane)
+    else:
+        await jobs.resume_lane(state, lane)
+    return {"success": True, "lane": lane, "paused": action == "pause"}
+
+
+@app.post("/api/jobs/batches/{batch_id}/cap")
+async def raise_batch_cap(batch_id: str, request: Request):
+    """{"max_spend": n}: a new spend limit for a run; its jobs the old
+    limit paused go back to the queue and carry on from where they stopped."""
+    from harvey.modules import jobs
+
+    try:
+        body = await request.json()
+        cap = _money((body or {}).get("max_spend"))
+    except Exception:
+        return JSONResponse({"success": False, "message": "expected max_spend, a number >= 0"},
+                            status_code=400)
+    state = _state()
+    await state.init_db()
+    if await jobs.get_batch(state, batch_id) is None:
+        return JSONResponse({"success": False, "message": "no such run"}, status_code=404)
+    await jobs.set_batch_cap(state, batch_id, cap)
+    resumed = 0
+    for job in await jobs.list_jobs(state, statuses=(jobs.PAUSED,), batch_id=batch_id,
+                                    limit=100000):
+        if job.paused_reason == jobs.SPEND_LIMIT:
+            await jobs.resume(state, job.id)
+            resumed += 1
+    return {"success": True, "resumed": resumed}
 
 
 def _parse_ts(value) -> datetime | None:
@@ -2955,8 +3200,11 @@ async def get_live_status():
         "SELECT MAX(prospects_checked_at) AS t FROM companies"))
     finding_emails = bool(
         last_contact and (now - last_contact).total_seconds() < CONTACT_ACTIVE_SECONDS)
-    reading = any(r["stage"] == "profile" for r in running)
-    finding = any(r["stage"] == "discover" for r in running)
+    # Work is jobs now: one running on its lane counts as the step running.
+    busy = {r["kind"] for r in await query_db(
+        "SELECT DISTINCT kind FROM jobs WHERE status = 'running'")}
+    reading = any(r["stage"] == "profile" for r in running) or "site_read" in busy
+    finding = any(r["stage"] == "discover" for r in running) or "discover" in busy
 
     def step(label, done, total, active, detail, info=False, key="", vars=None):
         if active:
@@ -3252,8 +3500,46 @@ async def get_today():
 # ── Public data: the free official datasets kept locally ──
 
 FIN_MODULE = "mf_financials"
-_financials_task: asyncio.Task | None = None
-_financials_report: dict | None = None
+async def _source_jobs(state, module_id: str) -> tuple[bool, dict | None]:
+    """(whether a load or check of ``module_id``'s local copy is queued or
+    running, the last load's report: unchanged, offline, downloaded,
+    companies, observations, unconfirmed, errors)."""
+    from harvey.modules import jobs
+
+    active = await query_db(
+        "SELECT COUNT(*) AS n FROM jobs WHERE module = ? AND kind IN ('source_sync', "
+        "'source_check') AND status IN ('queued', 'running')", (module_id,))
+    last = await query_db(
+        "SELECT id FROM jobs WHERE module = ? AND kind = 'source_sync' AND status IN "
+        "('done', 'failed') ORDER BY rowid DESC LIMIT 1", (module_id,))
+    report = None
+    if last:
+        job = await jobs.get(state, last[0]["id"])
+        if job is not None and job.status == jobs.FAILED:
+            report = {"errors": [job.error or "failed"]}
+        elif job is not None:
+            r = job.result
+            report = {"unchanged": bool(r.get("unchanged")), "offline": r.get("offline") or "",
+                      "downloaded": r.get("downloaded") or [],
+                      "companies": r.get("companies", 0), "observations": r.get("observations", 0),
+                      "unconfirmed": (r.get("unconfirmed") or {}).get(module_id, []),
+                      "errors": r.get("errors") or []}
+    return bool(active and active[0]["n"]), report
+
+
+async def _queue_source(module_id: str, kind_: str, capability: str, force: bool = False):
+    """Queue a load or a check of a source's local copy: the answer, or a
+    409 naming the job already waiting."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_source
+
+    state = _state()
+    await state.init_db()
+    try:
+        batch_id, job_id = await enqueue_source(state, kind_, module_id, capability, force=force)
+    except jobs.Duplicate as e:
+        return JSONResponse(_duplicate_body(e), status_code=409)
+    return {"success": True, "job": job_id, "batch_id": batch_id, **await _public_data()}
 
 
 def _attribution(module_id: str) -> str:
@@ -3281,6 +3567,7 @@ async def _public_data() -> dict:
     loaded = await asyncio.to_thread(store.status)
     checked_at, found = source.load_catalog()
     reg = await asyncio.to_thread(registry.status)
+    fin_running, fin_report = await _source_jobs(state, FIN_MODULE)
     return {
         "registry": None if reg is None else {
             k: reg.get(k) for k in ("dataset", "date", "loaded_at", "firms", "operating")},
@@ -3297,8 +3584,8 @@ async def _public_data() -> dict:
             "published": source.published_years(found)[:8] if found else [],
             "updates": updates(found, loaded, int(settings.get("years") or 3)) if found else [],
             "settings": settings,
-            "running": bool(_financials_task and not _financials_task.done()),
-            "report": _financials_report,
+            "running": fin_running,
+            "report": fin_report,
             "attribution": _attribution(FIN_MODULE),
         },
     }
@@ -3327,30 +3614,18 @@ async def _financials_refused() -> JSONResponse | None:
 
 @app.post("/api/public-data/financials/check")
 async def check_financials():
-    """Ask data.gov.ro now whether a new or revised year is published."""
+    """Queue a check of data.gov.ro for a new or revised year."""
     refused = await _financials_refused()
     if refused:
         return refused
-    from harvey.modules.runs import sync_source
-
-    try:
-        await sync_source(_state(), FIN_MODULE, "statements_check")
-    except Exception as e:
-        logger.warning("financial statements check failed: %s", e)
-        return JSONResponse({"success": False, "message": str(e)}, status_code=502)
-    return {"success": True, **await _public_data()}
+    return await _queue_source(FIN_MODULE, "source_check", "statements_check")
 
 
 @app.post("/api/public-data/financials/load")
 async def load_financials(request: Request):
-    """Download what is missing for the years wanted and load them, in the
-    background; then the companies on file get their figures. {"force":
-    true} loads again when nothing new is published."""
-    global _financials_task, _financials_report
-
-    if _financials_task and not _financials_task.done():
-        return JSONResponse({"success": False, "message": "a load is already running"},
-                            status_code=409)
+    """Queue a download of what is missing for the years wanted and its
+    load; then the companies on file get their figures. {"force": true}
+    loads again when nothing new is published."""
     refused = await _financials_refused()
     if refused:
         return refused
@@ -3359,30 +3634,7 @@ async def load_financials(request: Request):
     except Exception:
         body = {}
     force = bool(isinstance(body, dict) and body.get("force"))
-
-    async def _go():
-        global _financials_report
-        from harvey.modules.runs import lookup_by_id, sync_source
-
-        state = _state()
-        try:
-            draft = await sync_source(state, FIN_MODULE, "statements_sync",
-                                      extra={"force": force})
-            found = await lookup_by_id(state)
-            _financials_report = {
-                "unchanged": bool(draft.values.get("unchanged")),
-                "offline": draft.values.get("offline") or "",
-                "downloaded": draft.values.get("downloaded") or [],
-                "companies": found["companies"], "observations": found["observations"],
-                "unconfirmed": found["unconfirmed"].get(FIN_MODULE, []),
-                "errors": found["errors"][:3]}
-        except Exception as exc:
-            logger.exception("financial statements load failed")
-            _financials_report = {"errors": [str(exc)]}
-
-    _financials_report = None
-    _financials_task = asyncio.create_task(_go())
-    return {"success": True}
+    return await _queue_source(FIN_MODULE, "source_sync", "statements_sync", force=force)
 
 
 @app.post("/api/public-data/financials/settings")
@@ -3410,10 +3662,6 @@ async def set_financials_settings(request: Request):
 
 TAX_MODULE = "mf_taxpayers"
 ANAF_MODULE = "anaf"
-_taxpayers_task: asyncio.Task | None = None
-_taxpayers_report: dict | None = None
-_anaf_task: asyncio.Task | None = None
-_anaf_job: dict | None = None
 
 
 async def _taxpayers_status(state, on: set[str]) -> dict:
@@ -3425,6 +3673,7 @@ async def _taxpayers_status(state, on: set[str]) -> dict:
 
     loaded = await asyncio.to_thread(store.status)
     checked_at, found = source.load_catalog()
+    running, report = await _source_jobs(state, TAX_MODULE)
     return {
         "on": TAX_MODULE in on,
         "loaded": None if loaded is None else {
@@ -3434,8 +3683,8 @@ async def _taxpayers_status(state, on: set[str]) -> dict:
         "published": found[0].year if found else None,
         "update": update(found, loaded) if found else None,
         "settings": await switches.module_settings(state, TAX_MODULE) if TAX_MODULE in on else {},
-        "running": bool(_taxpayers_task and not _taxpayers_task.done()),
-        "report": _taxpayers_report,
+        "running": running,
+        "report": report,
         "attribution": _attribution(TAX_MODULE),
     }
 
@@ -3446,14 +3695,51 @@ async def _anaf_status(state, on: set[str]) -> dict:
     from harvey.modules import switches
     from harvey.modules.ro.anaf import service
 
+    running, job = await _anaf_batch(state)
     return {
         "on": ANAF_MODULE in on,
         "kept": await asyncio.to_thread(service.status),
         "settings": await switches.module_settings(state, ANAF_MODULE) if ANAF_MODULE in on else {},
-        "running": bool(_anaf_task and not _anaf_task.done()),
-        "job": _anaf_job,
+        "running": running,
+        "job": job,
         "attribution": _attribution(ANAF_MODULE),
     }
+
+
+async def _anaf_batch(state) -> tuple[bool, dict | None]:
+    """Whether checks at ANAF are queued or running, and the latest
+    check's progress ({done, total, report, started_at}: companies, its
+    jobs' reports added up)."""
+    from harvey.modules import jobs
+    from harvey.modules.runs import _new_check_report
+
+    active = await query_db("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'id_check' AND "
+                            "module = ? AND status IN ('queued', 'running')", (ANAF_MODULE,))
+    last = await query_db("SELECT batch_id FROM jobs WHERE kind = 'id_check' AND module = ? "
+                          "ORDER BY rowid DESC LIMIT 1", (ANAF_MODULE,))
+    if not last:
+        return bool(active and active[0]["n"]), None
+    found = [j for j in await jobs.list_jobs(state, batch_id=last[0]["batch_id"], limit=100000)
+             if j.kind == "id_check" and j.module == ANAF_MODULE]
+    report = _new_check_report(ANAF_MODULE)
+    done = total = 0
+    for j in found:
+        n = len(j.params.get("company_ids") or [])
+        total += n
+        if j.status == jobs.DONE:
+            done += n
+            for key, value in j.result.items():
+                if isinstance(value, int) and not isinstance(value, bool) and key in report:
+                    report[key] += value
+            report["unconfirmed"] = j.result.get("unconfirmed") or report["unconfirmed"]
+            report["stopped"] = j.result.get("stopped") or report["stopped"]
+        elif j.status == jobs.FAILED:
+            done += n
+            report["errors"].append(j.error)
+    report["errors"] = report["errors"][:3]
+    started = min((j.created_at or "" for j in found), default="")
+    return bool(active and active[0]["n"]), {"done": done, "total": total, "report": report,
+                                             "started_at": started}
 
 
 async def _module_refused(module_id: str, what: str) -> JSONResponse | None:
@@ -3470,30 +3756,18 @@ async def _module_refused(module_id: str, what: str) -> JSONResponse | None:
 
 @app.post("/api/public-data/taxpayers/check")
 async def check_taxpayers():
-    """Ask data.gov.ro now whether a newer taxpayer file is published."""
+    """Queue a check of data.gov.ro for a newer taxpayer file."""
     refused = await _module_refused(TAX_MODULE, "Checking the taxpayer file")
     if refused:
         return refused
-    from harvey.modules.runs import sync_source
-
-    try:
-        await sync_source(_state(), TAX_MODULE, "taxpayers_check")
-    except Exception as e:
-        logger.warning("taxpayer file check failed: %s", e)
-        return JSONResponse({"success": False, "message": str(e)}, status_code=502)
-    return {"success": True, **await _public_data()}
+    return await _queue_source(TAX_MODULE, "source_check", "taxpayers_check")
 
 
 @app.post("/api/public-data/taxpayers/load")
 async def load_taxpayers(request: Request):
-    """Download the newest taxpayer file when missing and load it, in the
-    background; then the companies on file get its readings. {"force":
-    true} loads again when nothing new is published."""
-    global _taxpayers_task, _taxpayers_report
-
-    if _taxpayers_task and not _taxpayers_task.done():
-        return JSONResponse({"success": False, "message": "a load is already running"},
-                            status_code=409)
+    """Queue a download of the newest taxpayer file when missing and its
+    load; then the companies on file get its readings. {"force": true}
+    loads again when nothing new is published."""
     refused = await _module_refused(TAX_MODULE, "Loading the taxpayer file")
     if refused:
         return refused
@@ -3502,30 +3776,7 @@ async def load_taxpayers(request: Request):
     except Exception:
         body = {}
     force = bool(isinstance(body, dict) and body.get("force"))
-
-    async def _go():
-        global _taxpayers_report
-        from harvey.modules.runs import lookup_by_id, sync_source
-
-        state = _state()
-        try:
-            draft = await sync_source(state, TAX_MODULE, "taxpayers_sync",
-                                      extra={"force": force})
-            found = await lookup_by_id(state)
-            _taxpayers_report = {
-                "unchanged": bool(draft.values.get("unchanged")),
-                "offline": draft.values.get("offline") or "",
-                "downloaded": draft.values.get("downloaded") or [],
-                "companies": found["companies"], "observations": found["observations"],
-                "unconfirmed": found["unconfirmed"].get(TAX_MODULE, []),
-                "errors": found["errors"][:3]}
-        except Exception as exc:
-            logger.exception("taxpayer file load failed")
-            _taxpayers_report = {"errors": [str(exc)]}
-
-    _taxpayers_report = None
-    _taxpayers_task = asyncio.create_task(_go())
-    return {"success": True}
+    return await _queue_source(TAX_MODULE, "source_sync", "taxpayers_sync", force=force)
 
 
 @app.post("/api/public-data/taxpayers/settings")
@@ -3552,16 +3803,14 @@ async def set_taxpayers_settings(request: Request):
 
 @app.post("/api/anaf/check")
 async def check_at_anaf(request: Request):
-    """Check companies at ANAF in the background: {"ids": [...]} (a
-    selection, or one company), {"q": "..."} (every match of a search),
-    {"missing": true} (every company never checked) or {} (every company
-    with a CUI, kept answers reused). One request a second; the progress
-    is in /api/public-data's ``anaf.job``."""
-    global _anaf_task, _anaf_job
+    """Queue checks of companies at ANAF: {"ids": [...]} (a selection, or
+    one company), {"q": "..."} (every match of a search), {"missing": true}
+    (every company never checked) or {} (every company with a CUI, kept
+    answers reused). A hundred companies a job on ANAF's lane, one request
+    a second; the progress is in /api/public-data's ``anaf.job``."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_id_checks
 
-    if _anaf_task and not _anaf_task.done():
-        return JSONResponse({"success": False, "message": "an ANAF check is already running"},
-                            status_code=409)
     refused = await _module_refused(ANAF_MODULE, "Checking companies at ANAF")
     if refused:
         return refused
@@ -3578,24 +3827,16 @@ async def check_at_anaf(request: Request):
     await state.init_db()
     if ids is None and q.strip():
         ids, _ = await _search_all_ids(state, q)
-    job = {"done": 0, "total": 0, "report": None, "started_at": _now_iso()}
-
-    def progress(done, total):
-        job["done"], job["total"] = done, total
-
-    async def _go():
-        from harvey.modules.runs import check_by_id
-
-        try:
-            job["report"] = await check_by_id(state, ANAF_MODULE, "company_check", ids,
-                                              missing_only=missing, progress=progress)
-        except Exception as exc:
-            logger.exception("ANAF check failed")
-            job["report"] = {"errors": [str(exc)]}
-
-    _anaf_job = job
-    _anaf_task = asyncio.create_task(_go())
-    return {"success": True}
+    batch_id = await jobs.new_batch(state, "id_check", "ANAF", params={"missing": missing})
+    queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", ids,
+                                            missing_only=missing, batch_id=batch_id)
+    if not queued:
+        # Nothing new queued: no empty run left behind.
+        await jobs.drop_batch(state, batch_id)
+    if not queued and dupes:
+        return JSONResponse(_duplicate_body(jobs.Duplicate(dupes[0])), status_code=409)
+    return {"success": True, "batch_id": batch_id, "jobs": len(queued),
+            "already_queued": len(dupes)}
 
 
 def _now_iso() -> str:

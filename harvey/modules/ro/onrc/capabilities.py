@@ -8,6 +8,8 @@ what core needs to save and report them: the ``dataset``, the ``report``
 ``codes`` the read collects, the ``collector`` label the firms'
 activities carry, and the ``run_params`` the runs log keeps."""
 
+import asyncio
+
 from harvey import registry
 from harvey.collectors import onrc
 from harvey.modules.api import Capability, Draft
@@ -23,8 +25,10 @@ async def _sync(inp, ctx) -> Draft:
     """Load a dataset's files (``extra["files"]``, ``extra["dataset"]``)
     into the registry database (``extra["path"]``), the module's own
     storage. ``values["registry"]`` is what was loaded."""
-    meta = registry.build(inp.extra["files"], inp.extra["dataset"], inp.extra["path"],
-                          progress=inp.extra.get("progress"))
+    # In a thread: a load takes minutes, and the dashboard's own requests
+    # are served by the same event loop.
+    meta = await asyncio.to_thread(registry.build, inp.extra["files"], inp.extra["dataset"],
+                                   inp.extra["path"], progress=inp.extra.get("progress"))
     return Draft(values={"registry": meta})
 
 
@@ -35,8 +39,10 @@ async def _search(inp, ctx) -> Draft:
     q, x = inp.query, inp.extra
     limit = x.get("limit")
     with_administrators = x.get("with_administrators", True)
-    draft = registry.search_draft(x["con"], q, limit=limit,
-                                  with_administrators=with_administrators)
+    # A whole-country search reads millions of rows: in a thread, so the
+    # dashboard (whose worker may run it) never freezes meanwhile.
+    draft = await asyncio.to_thread(registry.search_draft, x["con"], q, limit=limit,
+                                    with_administrators=with_administrators)
     dataset = draft.values["dataset"]
     report = onrc.ImportReport(dataset=dataset.name)
     report.classes = onrc.class_labels(q.classes)

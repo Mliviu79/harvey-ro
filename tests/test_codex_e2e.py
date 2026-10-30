@@ -102,11 +102,7 @@ class Harness:
         async def scout_run(_self):
             self.scout_runs += 1
 
-        async def no_profile(state, limit=25, **_):
-            return None
-
         monkeypatch.setattr(scout_mod.Scout, "run", scout_run)
-        monkeypatch.setattr(main_mod, "run_profile_stage", no_profile)
         monkeypatch.setattr(main_mod, "load_config", lambda: self.config)
         monkeypatch.setattr(main_mod, "load_env", lambda: EnvConfig())
         monkeypatch.setattr(main_mod, "StateManager", lambda: self.state)

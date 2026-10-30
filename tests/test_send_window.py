@@ -1002,4 +1002,4 @@ async def test_email_module_off_writes_sends_and_reads_nothing(state, monkeypatc
     if quiet:  # no mail to wake for: the cycle sleeps out the quiet hours
         monkeypatch.setattr(main_mod, "seconds_until_quiet_hours_end", lambda c: 60)
     await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
-    assert calls == ([] if quiet else ["prospect", "analyze"])
+    assert calls == []          # the heartbeat is the Email module's: off, it does nothing

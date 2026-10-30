@@ -845,12 +845,17 @@ def test_onrc_commands_are_refused_before_any_download(tmp_path, monkeypatch, ar
     db = tmp_path / "harvey.db"
     _cli(monkeypatch, db, "modules", "disable", "onrc")
 
+    from harvey.modules import runs
+
     async def no_download(*a, **k):
         pytest.fail("the registry was fetched with the onrc module off")
-    monkeypatch.setattr(cli, "_ensure_registry", no_download)
+    monkeypatch.setattr(runs, "ensure_registry", no_download)
     monkeypatch.setattr(cli, "_registry_path", lambda args: tmp_path / "registry.db")
     code, out = _cli(monkeypatch, db, *argv)
     assert code == 2 and "harvey modules enable onrc" in out
+    # Refused before anything was queued.
+    with contextlib.closing(sqlite3.connect(db)) as con:
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
 def test_refusals_and_module_names_read_in_the_viewers_language():

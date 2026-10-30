@@ -536,30 +536,36 @@ def cmd_outbox(args):
 
 
 def cmd_profile(args):
-    """Read what companies' own websites say about them. Free, no Claude calls."""
+    """Read what companies' own websites say about them. Free, no Claude calls.
+    Each company is a job on the website reader's lane."""
     from harvey.state import StateManager
-    from harvey.pipeline import run_profile_stage
 
     async def _profile():
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_site_reads
+
         state = StateManager()
         await state.init_db()
 
-        pending = await state.count_companies_needing_profile(args.stale_days)
-        if not pending:
+        due = await state.companies_needing_profile(limit=args.limit or -1,
+                                                    stale_days=args.stale_days)
+        if not due:
             print("\n  Nothing to profile. Every company with a website has "
                   "been read recently.\n")
             return
-
-        print(f"\n  {pending} companies need profiling. Reading up to "
-              f"{args.limit}...\n")
-        try:
-            from harvey.config import load_config
-            config = load_config()
-        except Exception:
-            config = None   # still profiles; no role is singled out as hiring intent
-        companies, observations, _ = await run_profile_stage(
-            state, limit=args.limit, stale_days=args.stale_days, config=config)
-        print(f"  Read {companies} sites → {observations} observations (free)")
+        batch_id = await jobs.new_batch(state, "site_read", "Read sites")
+        ids, dupes = await enqueue_site_reads(state, [c["id"] for c in due], batch_id=batch_id,
+                                              stale_days=args.stale_days)
+        print(f"\n  {len(due)} companies need profiling: {len(ids)} queued"
+              + (f", {len(dupes)} already queued" if dupes else "") + "...\n")
+        if getattr(args, "background", False) or not ids:
+            await _queued_note(state, batch_id, len(ids))
+            return
+        found = await _wait_for(state, batch_id)
+        read = [j for j in found if j.status == jobs.DONE]
+        observations = sum(int(j.result.get("observations") or 0) for j in read)
+        print(f"  Read {len(read)} sites → {observations} observations (free)")
+        _job_failures(found)
         print("\n  See what turned up: harvey dashboard → Signals\n")
 
     asyncio.run(_profile())
@@ -725,102 +731,6 @@ def _registry_path(args) -> Path:
 def _onrc_dir(args) -> Path:
     from harvey.paths import PROJECT_ROOT
     return Path(getattr(args, "data_dir", "") or PROJECT_ROOT / "data" / "onrc")
-
-
-def _print_load_progress(step, rows):
-    if rows is None:
-        print(f"    {step}...", flush=True)
-    else:
-        print(f"    {step}: {rows:,} rows read", flush=True)
-
-
-async def _ensure_registry(path: Path, data_dir: Path, name: str = "latest",
-                           with_people: bool = True, force: bool = False,
-                           offline_ok: bool = False) -> dict:
-    """The registry at ``path`` holding dataset ``name`` ("latest": the
-    newest on data.gov.ro), downloading any missing file into
-    data_dir/<date>/ and building it when it isn't loaded yet. With
-    ``offline_ok``, a registry already loaded is used as it is when
-    data.gov.ro can't be reached; without one, the newest dataset already
-    downloaded into data_dir is loaded instead. Returns its meta."""
-    import httpx
-
-    from harvey import registry
-    from harvey.collectors import onrc
-    from harvey.modules import api
-
-    roles = [r for r in onrc.FILES if r != "people" or with_people]
-    have = registry.status(path)
-    if have and have.get("schema") != registry.SCHEMA_VERSION:
-        print(f"  {path.name} was loaded by an older Harvey; loading it again.")
-        have, force = None, True
-    local = onrc.local_dataset(data_dir, name, roles) if name != "latest" else None
-    if local:
-        dataset, files = local
-    else:
-        timeout = httpx.Timeout(60.0, read=300.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                dataset = await (onrc.latest_dataset(client) if name == "latest"
-                                 else onrc.dataset_named(client, name))
-                if have and have.get("dataset") == dataset.name and not force:
-                    return have
-
-                def progress(role, filename, size):
-                    mb = f"{size / 1e6:.0f} MB" if size else "size unknown"
-                    print(f"    downloading {filename} ({mb}), once per dataset...",
-                          flush=True)
-
-                files = await onrc.fetch_files(client, dataset, data_dir, roles=roles,
-                                               progress=progress)
-        except httpx.HTTPError as e:
-            why = f"data.gov.ro unreachable ({e.__class__.__name__})"
-            if have and offline_ok:
-                print(f"  {why}; using the registry already loaded ({have.get('dataset')})")
-                return have
-            local = _newest_local_dataset(data_dir, roles) if name == "latest" else None
-            if not local:
-                print(f"\n  {why}, and no complete dataset is downloaded in {data_dir}."
-                      + (f" The registry holds {have.get('dataset')}."
-                         if have else "") + " Try again when online.\n")
-                raise SystemExit(2)
-            dataset, files = local
-            print(f"  {why}; using {dataset.name}, already downloaded")
-    if have and have.get("dataset") == dataset.name and not force:
-        return have
-    print(f"  Loading {dataset.name} (registry as of {dataset.date}) into {path.name}; "
-          "a few minutes, once per dataset...", flush=True)
-    try:
-        loaded = await api.capability("onrc", "registry_sync")(
-            api.Input(extra={"files": files, "dataset": dataset, "path": path,
-                             "progress": _print_load_progress}), api.Context())
-        return loaded.values["registry"]
-    except registry.RegistryBusy as e:
-        if have and offline_ok:
-            print(f"  Another load is running; using the registry already loaded "
-                  f"({have.get('dataset')})")
-            return have
-        print(f"\n  {e}.\n")
-        raise SystemExit(2)
-
-
-def _newest_local_dataset(data_dir: Path, roles):
-    """The newest dataset fully downloaded under data_dir/<date>/, or None."""
-    from datetime import date
-
-    from harvey.collectors import onrc
-
-    folders = sorted((p.name for p in Path(data_dir).glob("????-??-??") if p.is_dir()),
-                     reverse=True)
-    for folder in folders:
-        try:
-            when = date.fromisoformat(folder)
-        except ValueError:
-            continue
-        found = onrc.local_dataset(data_dir, f"firme-{when:%d-%m-%Y}", roles)
-        if found:
-            return found
-    return None
 
 
 def _print_registry_status(meta: dict | None, path: Path):
@@ -1008,6 +918,74 @@ def _pull_progress(dry_run: bool):
     return lambda done, total: print(f"  {verb} {done:,} of {total:,}...", flush=True)
 
 
+def _filter_params(flt) -> dict | None:
+    from dataclasses import asdict
+
+    return asdict(flt) if flt is not None else None
+
+
+async def _run_pull(state, args, params: dict, label: str = ""):
+    """Queue a registry pull, then wait for it (and the checks it queues
+    for the firms it saved). None when it was only queued; SystemExit when
+    it failed before saving anything."""
+    from harvey.modules import jobs
+
+    batch_id = await jobs.new_batch(state, "registry_pull", label or "Registry pull")
+    try:
+        await jobs.enqueue(state, "registry_pull", "onrc", params, module="onrc",
+                           capability="registry_search", label=label or "Registry pull",
+                           batch_id=batch_id)
+    except jobs.Duplicate as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(2)
+    if getattr(args, "background", False):
+        await _queued_note(state, batch_id, 1)
+        return None
+    found = await _wait_for(state, batch_id)
+    pull = next((j for j in found if j.kind == "registry_pull"), None)
+    if pull is None or pull.status != jobs.DONE:
+        code = _job_failures(found)
+        print()
+        raise SystemExit(code or 1)
+    return found
+
+
+def _pull_report(found):
+    """The pull's report (an onrc.ImportReport) from its job's result."""
+    from harvey.collectors.onrc import ImportReport
+
+    pull = next(j for j in found if j.kind == "registry_pull")
+    data = pull.result.get("report") or {}
+    return ImportReport(**{k: v for k, v in data.items()
+                           if k in ImportReport.__dataclass_fields__})
+
+
+def _print_follow_ups(found) -> None:
+    """The checks a pull queued for the firms it saved (ANAF's), added up."""
+    from harvey.modules import jobs
+    from harvey.modules.runs import _new_check_report
+
+    checks = [j for j in found if j.kind == "id_check"]
+    for module in dict.fromkeys(j.module for j in checks):
+        total = _new_check_report(module)
+        for j in checks:
+            if j.module != module:
+                continue
+            if j.status == jobs.FAILED:
+                total["errors"].append(j.error)
+                continue
+            for key, value in j.result.items():
+                if isinstance(value, int) and not isinstance(value, bool) and key in total:
+                    total[key] += value
+            total["unconfirmed"] = j.result.get("unconfirmed") or total["unconfirmed"]
+            total["stopped"] = j.result.get("stopped") or total["stopped"]
+        waiting = sum(1 for j in checks if j.module == module and j.status not in jobs.FINISHED)
+        _print_check_report(total)
+        if waiting:
+            print(f"    {waiting} batch{'' if waiting == 1 else 'es'} still waiting: the worker "
+                  f"finishes {'it' if waiting == 1 else 'them'} (harvey jobs list)")
+
+
 def cmd_registry(args):
     """The whole trade registry in data/registry.db: load it once per
     dataset, search it, pull chosen firms into Harvey. No Claude."""
@@ -1030,10 +1008,32 @@ def cmd_registry(args):
 
     if action == "load":
         async def _load():
+            from harvey.modules import jobs
+            from harvey.state import StateManager
+
             print(f"\n  ONRC open data: {args.dataset} dataset")
-            meta = await _ensure_registry(
-                path, _onrc_dir(args), args.dataset,
-                with_people=args.administrators == "all", force=args.force)
+            state = StateManager()
+            await state.init_db()
+            batch_id = await jobs.new_batch(state, "registry_load", f"Registry {args.dataset}")
+            try:
+                await jobs.enqueue(state, "registry_load", "onrc", {
+                    "path": str(path), "data_dir": str(_onrc_dir(args)),
+                    "dataset": args.dataset, "with_people": args.administrators == "all",
+                    "force": args.force}, dedupe_key="registry_load", module="onrc",
+                    capability="registry_sync", label=f"Load {args.dataset}",
+                    batch_id=batch_id)
+            except jobs.Duplicate as e:
+                print(f"\n  {e}\n")
+                raise SystemExit(2)
+            if args.background:
+                await _queued_note(state, batch_id, 1)
+                return
+            found = await _wait_for(state, batch_id)
+            code = _job_failures(found)
+            if code:
+                print()
+                raise SystemExit(code)
+            meta = next((j.result.get("registry") for j in found if j.status == jobs.DONE), None)
             _print_registry_status(registry.status(path) or meta, path)
         asyncio.run(_load())
         return
@@ -1066,8 +1066,6 @@ def cmd_registry(args):
         return
 
     if action == "pull":
-        from harvey.config import live_do_not_contact, load_config
-        from harvey.modules.runs import registry_pull
         from harvey.state import StateManager
 
         q = registry.resolve(con, words, all_statuses=args.all_statuses, fin=fin, tax=tax)
@@ -1094,16 +1092,19 @@ def cmd_registry(args):
             if with_admins and meta.get("with_administrators") != "1":
                 print("  (this registry was loaded without administrators: "
                       "harvey registry load --force)")
-            follow = await _start_follow_up(state, args.dry_run)
-            report = await registry_pull(
-                state, con, q, limit=args.limit, with_administrators=with_admins,
-                dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
-                progress=_pull_progress(args.dry_run), follow_up=follow)
+            found = await _run_pull(state, args, {
+                "path": str(path), "words": words, "all_statuses": args.all_statuses,
+                "fin": _filter_params(fin), "tax": _filter_params(tax),
+                "limit": args.limit, "with_administrators": with_admins,
+                "dry_run": args.dry_run}, label=words)
+            if found is None:
+                return
+            report = _pull_report(found)
             print(f"\n  {report.in_area:,} firm{'' if report.in_area == 1 else 's'} "
                   f"matching \"{words}\" from {meta.get('dataset')}"
                   + (f" (first {args.limit:,})" if args.limit else ""))
             _print_pull_report(report)
-            await _finish_follow_up(follow)
+            _print_follow_ups(found)
             print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
             if report.dry_run:
                 print("  Dry run: nothing was saved.\n")
@@ -1121,8 +1122,6 @@ def cmd_import_onrc(args):
     latest dataset isn't loaded yet) and harvey registry pull."""
     from harvey import registry
     from harvey.collectors import onrc
-    from harvey.config import live_do_not_contact, load_config
-    from harvey.modules.runs import registry_pull
     from harvey.state import StateManager
 
     async def _import():
@@ -1138,43 +1137,43 @@ def cmd_import_onrc(args):
                   "or give --codes 8623.\n")
             raise SystemExit(2)
         localities = onrc._localities(args.locality)
-        if not classes and not names and not localities:
-            print("\n  Every activity in the whole country is millions of companies: "
-                  "give a --county or a --locality, or an activity.\n")
+        # Nothing narrowing it at all is every operating firm in Romania
+        # (about 1.8 million): fine on purpose, not by a forgotten flag.
+        narrowed = classes or names or localities or fin or tax
+        if not (narrowed or args.dry_run or args.whole_country):
+            print("\n  With no activity, area or filter this is every operating "
+                  "company in Romania (about 1.8 million, roughly an hour to "
+                  "import). Add --dry-run to count, or --whole-country to import "
+                  "them all.\n")
             raise SystemExit(2)
         with_admins = args.administrators == "all"
 
         path = _registry_path(args)
-        meta = await _ensure_registry(path, _onrc_dir(args), "latest",
-                                      with_people=with_admins, offline_ok=True)
+        state = StateManager()
+        await state.init_db()
+        where = f"{args.locality}, {county}" if args.locality else county
+        what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
+        print(f"\n  Looking for {what} in {where}"
+              f"{'' if args.include_inactive else ' (operating companies only)'}...")
+        found = await _run_pull(state, args, {
+            "path": str(path), "data_dir": str(_onrc_dir(args)), "ensure_latest": True,
+            "words": "", "classes": [list(c) for c in classes or []],
+            "counties": names or [], "localities": localities,
+            "all_statuses": args.include_inactive, "fin": _filter_params(fin),
+            "tax": _filter_params(tax), "with_administrators": with_admins,
+            "dry_run": args.dry_run, "area": where}, label=f"{what} in {where}")
+        if found is None:
+            return
+        pull = next((j for j in found if j.kind == "registry_pull"), None)
+        meta = (pull.result.get("meta") if pull else None) or registry.status(path) or {}
         print(f"\n  ONRC open data: {meta.get('dataset')} (registry as of {meta.get('date')})")
         if with_admins and meta.get("with_administrators") != "1":
             print("  (this registry was loaded without administrators: "
                   "harvey registry load --force)")
-
-        state = StateManager()
-        await state.init_db()
-        con = registry.connect(path)
-        q = registry.resolve(con, "", classes=classes, counties=names or [],
-                             localities=localities, all_statuses=args.include_inactive,
-                             fin=fin, tax=tax)
-        try:
-            registry.count(con, q, 1)
-        except FileNotFoundError as e:
-            print(f"\n  {e} (the filter needs it).\n")
-            raise SystemExit(2)
-        where = f"{args.locality}, {county}" if args.locality else county
-        what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
-        print(f"  Looking for {what} in {where}"
-              f"{'' if args.include_inactive else ' (operating companies only)'}...")
-        follow = await _start_follow_up(state, args.dry_run)
-        report = await registry_pull(
-            state, con, q, with_administrators=with_admins, dry_run=args.dry_run,
-            do_not_contact=live_do_not_contact(load_config()), area=where,
-            progress=_pull_progress(args.dry_run), follow_up=follow)
+        report = _pull_report(found)
         print(f"  {report.in_area:,} match\n")
         _print_pull_report(report)
-        await _finish_follow_up(follow)
+        _print_follow_ups(found)
         print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
         if report.dry_run:
             print("  Dry run: nothing was saved. Re-run without --dry-run to import.\n")
@@ -1253,19 +1252,19 @@ def cmd_financials(args):
 
     if action == "check":
         async def _check():
-            from harvey.modules.runs import sync_source
-
             state, settings = await _settings()
-            draft = await sync_source(state, FIN_MODULE, "statements_check")
+            found = await _run_source(state, args, "source_check", FIN_MODULE,
+                                      "statements_check", "Financial statements: check")
+            if found is None:
+                return
+            values = found[0].result.get("values") or {}
             checked_at, _ = source.load_catalog()
-            _print_financials_status(store.status(), draft.values.get("updates") or [],
+            _print_financials_status(store.status(), values.get("updates") or [],
                                      checked_at, settings)
         asyncio.run(_check())
         return
 
     async def _load():
-        from harvey.modules.runs import lookup_by_id, sync_source
-
         state, settings = await _settings()
         if args.years:
             years = 30 if args.years.strip().lower() == "all" else args.years
@@ -1278,42 +1277,55 @@ def cmd_financials(args):
         print(f"\n  Ministry of Finance statements: the latest {settings['years']} "
               "published years (downloads only what is missing, ~90 MB a year)...",
               flush=True)
-
-        def progress(step, rows):
-            if isinstance(rows, int) and step.startswith("downloading"):
-                print(f"    {step} ({rows / 1e6:.0f} MB)...", flush=True)
-            elif rows is None:
-                print(f"    {step}...", flush=True)
-
-        try:
-            draft = await sync_source(state, FIN_MODULE, "statements_sync",
-                                      extra={"force": args.force, "progress": progress})
-        except store.FinancialsBusy as e:
-            print(f"\n  {e}.\n")
-            raise SystemExit(2)
-        except (RuntimeError, store.FormatChanged) as e:
-            print(f"\n  {e}\n")
-            raise SystemExit(1)
-        values = draft.values
+        found = await _run_source(state, args, "source_sync", FIN_MODULE, "statements_sync",
+                                  "Financial statements: load", force=args.force)
+        if found is None:
+            return
+        result = found[0].result
+        values = result.get("values") or {}
         if values.get("offline"):
             print(f"  {values['offline']}: loaded the files already downloaded")
         if values.get("unchanged"):
             print("  Nothing new on data.gov.ro; already loaded (--force loads again).")
-        found = await lookup_by_id(state, progress=lambda done, total: print(
-            f"    companies on file: {done:,} of {total:,}...", flush=True))
         checked_at, _ = source.load_catalog()
-        _print_financials_status(values.get("financials"), [], checked_at, settings)
-        print(f"  {found['companies']:,} companies on file got figures, "
-              f"{found['observations']:,} observations recorded")
-        for module, codes in found["unconfirmed"].items():
+        _print_financials_status(values.get("financials") or store.status(), [], checked_at,
+                                 settings)
+        print(f"  {result.get('companies', 0):,} companies on file got figures, "
+              f"{result.get('observations', 0):,} observations recorded")
+        for module, codes in (result.get("unconfirmed") or {}).items():
             if module == FIN_MODULE and codes:
                 print(f"    not recorded, not confirmed: {', '.join(codes)} "
                       f"(harvey signals --confirm {','.join(codes)})")
-        for err in found["errors"][:3]:
+        for err in (result.get("errors") or [])[:3]:
             print(f"    ! {err}")
         print()
 
     asyncio.run(_load())
+
+
+async def _run_source(state, args, kind_: str, module: str, capability: str, label: str,
+                      force: bool = False):
+    """Queue a load or check of a source's local copy and wait for it. None
+    when only queued; SystemExit when it failed."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_source
+
+    try:
+        batch_id, _ = await enqueue_source(state, kind_, module, capability, force=force,
+                                           label=label)
+    except jobs.Duplicate as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(2)
+    if getattr(args, "background", False):
+        await _queued_note(state, batch_id, 1)
+        return None
+    found = await _wait_for(state, batch_id)
+    if not found or found[0].status != jobs.DONE:
+        print()
+        code = _job_failures(found)
+        print()
+        raise SystemExit(code or 1)
+    return found
 
 
 TAX_MODULE = "mf_taxpayers"
@@ -1378,54 +1390,42 @@ def cmd_taxpayers(args):
 
     if action == "check":
         async def _check():
-            from harvey.modules.runs import sync_source
-
             state, settings = await _settings()
-            draft = await sync_source(state, TAX_MODULE, "taxpayers_check")
+            found = await _run_source(state, args, "source_check", TAX_MODULE,
+                                      "taxpayers_check", "Taxpayer file: check")
+            if found is None:
+                return
+            values = found[0].result.get("values") or {}
             checked_at, _ = source.load_catalog()
-            _print_taxpayers_status(store.status(), draft.values.get("update"), checked_at,
+            _print_taxpayers_status(store.status(), values.get("update"), checked_at,
                                     settings)
         asyncio.run(_check())
         return
 
     async def _load():
-        from harvey.modules.runs import lookup_by_id, sync_source
-
         state, settings = await _settings()
         print("\n  Ministry of Finance taxpayer file: the newest year (downloads only what "
               "is missing, ~870 MB)...", flush=True)
-
-        def progress(step, rows):
-            if isinstance(rows, int) and step.startswith("downloading"):
-                print(f"    {step} ({rows / 1e6:.0f} MB)...", flush=True)
-            elif isinstance(rows, int) and rows % 500_000 == 0:
-                print(f"    {step}: {rows:,} rows...", flush=True)
-
-        try:
-            draft = await sync_source(state, TAX_MODULE, "taxpayers_sync",
-                                      extra={"force": args.force, "progress": progress})
-        except store.TaxpayersBusy as e:
-            print(f"\n  {e}.\n")
-            raise SystemExit(2)
-        except (RuntimeError, store.FormatChanged) as e:
-            print(f"\n  {e}\n")
-            raise SystemExit(1)
-        values = draft.values
+        found = await _run_source(state, args, "source_sync", TAX_MODULE, "taxpayers_sync",
+                                  "Taxpayer file: load", force=args.force)
+        if found is None:
+            return
+        result = found[0].result
+        values = result.get("values") or {}
         if values.get("offline"):
             print(f"  {values['offline']}: loaded the files already downloaded")
         if values.get("unchanged"):
             print("  Nothing new on data.gov.ro; already loaded (--force loads again).")
-        found = await lookup_by_id(state, progress=lambda done, total: print(
-            f"    companies on file: {done:,} of {total:,}...", flush=True))
         checked_at, _ = source.load_catalog()
-        _print_taxpayers_status(values.get("taxpayers"), None, checked_at, settings)
-        print(f"  {found['companies']:,} companies on file got readings, "
-              f"{found['observations']:,} observations recorded")
-        for module, codes in found["unconfirmed"].items():
+        _print_taxpayers_status(values.get("taxpayers") or store.status(), None, checked_at,
+                                settings)
+        print(f"  {result.get('companies', 0):,} companies on file got readings, "
+              f"{result.get('observations', 0):,} observations recorded")
+        for module, codes in (result.get("unconfirmed") or {}).items():
             if codes:
                 print(f"    {module}: not recorded, not confirmed: {', '.join(codes)} "
                       f"(harvey signals --confirm {','.join(codes)})")
-        for err in found["errors"][:3]:
+        for err in (result.get("errors") or [])[:3]:
             print(f"    ! {err}")
         print()
 
@@ -1492,7 +1492,9 @@ def cmd_anaf(args):
         raise SystemExit(2)
 
     async def _check():
-        from harvey.modules.runs import check_by_id
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_id_checks
+        from harvey.modules.runs import _new_check_report
 
         state = StateManager()
         await state.init_db()
@@ -1507,11 +1509,32 @@ def cmd_anaf(args):
             if not ids:
                 print()
                 raise SystemExit(2)
+        batch_id = await jobs.new_batch(state, "id_check", "ANAF",
+                                        params={"missing": args.missing})
+        queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", ids,
+                                                missing_only=args.missing, batch_id=batch_id)
+        if dupes:
+            print(f"  {len(dupes)} batch{'' if len(dupes) == 1 else 'es'} of these companies "
+                  f"already queued (job {dupes[0].id}): not asked again")
+        if args.background:
+            await _queued_note(state, batch_id, len(queued))
+            return
         print("\n  Asking ANAF (one request a second, up to 100 companies each)...", flush=True)
-        report = await check_by_id(
-            state, ANAF_MODULE, "company_check", ids, missing_only=args.missing,
-            progress=lambda done, total: done and print(f"    {done:,} of {total:,}...",
-                                                        flush=True))
+        found = await _wait_for(state, batch_id) if queued else []
+        report = _new_check_report(ANAF_MODULE)
+        report["companies"] = sum(len(j.params.get("company_ids") or []) for j in found)
+        for job in found:
+            if job.status == jobs.FAILED:
+                report["errors"].append(job.error)
+                continue
+            for key, value in job.result.items():
+                if isinstance(value, int) and not isinstance(value, bool) and key in report \
+                        and key != "companies":
+                    report[key] += value
+            report["unconfirmed"] = job.result.get("unconfirmed") or report["unconfirmed"]
+            report["stopped"] = job.result.get("stopped") or report["stopped"]
+            if job.status == jobs.QUEUED and job.error:
+                report["stopped"] = report["stopped"] or "busy"
         _print_check_report(report)
         print(f"  Source: {_attribution(ANAF_MODULE)}\n")
         if report["errors"] and not report["updated"] and not report["cached"]:
@@ -1520,35 +1543,48 @@ def cmd_anaf(args):
     asyncio.run(_check())
 
 
-async def _start_follow_up(state, dry_run: bool):
-    """The checks that run for the firms a pull saves (ANAF's), started in
-    the background of the pull; None when it is a dry run or none is on."""
-    from harvey.modules.runs import FollowUp
+# ── Jobs: a command queues its work, then waits for it ──
 
-    if dry_run:
-        return None
-
-    def progress(done, total):
-        if done % 500 < 100 or done == total:
-            print(f"    checked at ANAF: {done:,} of {total:,}...", flush=True)
-
-    follow = FollowUp(state, progress=progress)
-    if not await follow.start():
-        return None
-    names = ", ".join(_module_name(m.id) for m, _, _ in follow.checks)
-    print(f"  {names}: checking each saved firm in the background (one request a "
-          "second; Ctrl-C stops it, harvey anaf check --missing finishes later)", flush=True)
-    return follow
+def _background_arg(p):
+    p.add_argument("--background", action="store_true",
+                   help="Queue it and return at once: the dashboard's worker (or "
+                        "harvey worker) runs it; follow it with harvey jobs list")
 
 
-async def _finish_follow_up(follow) -> None:
-    if follow is None:
-        return
-    if follow.queued > follow.done:
-        print(f"  Waiting for the checks of {follow.queued - follow.done:,} more firms...",
-              flush=True)
-    for report in (await follow.finish()).values():
-        _print_check_report(report)
+async def _queued_note(state, batch_id: str, n: int) -> None:
+    from harvey.modules.worker import lease_holder
+
+    print(f"\n  Queued: {n} job{'' if n == 1 else 's'} (run {batch_id}). "
+          "Follow it on the dashboard's Queue page, or: harvey jobs list")
+    if await lease_holder(state) is None:
+        print("  No worker is running now: start the dashboard, or harvey worker.")
+    print()
+
+
+async def _wait_for(state, batch_id: str):
+    """Wait for a run's jobs, printing their progress (run here when no
+    worker is running, followed otherwise). Returns its jobs."""
+    from harvey.modules.worker import wait_for_batch
+
+    return await wait_for_batch(state, batch_id, say=lambda line: print(line, flush=True))
+
+
+def _job_failures(found) -> int:
+    """Print why jobs failed or were held; the exit status they call for."""
+    from harvey.modules import jobs
+
+    code = 0
+    for job in found:
+        if job.status == jobs.FAILED:
+            print(f"  ! {job.error}" if job.kind not in ("discover", "site_read")
+                  else f"  ! {job.label}: {job.error}")
+            code = max(code, int(job.result.get("exit_code") or 1))
+        elif job.status == jobs.PAUSED and job.paused_reason != jobs.SPEND_LIMIT:
+            print(f"  {job.label or job.kind}: paused ({job.paused_reason or job.error}). "
+                  f"harvey jobs resume {job.id}")
+        elif job.status == jobs.QUEUED and job.error:
+            print(f"  {job.label or job.kind}: waiting ({job.error})")
+    return code
 
 
 def cmd_discover(args):
@@ -1650,17 +1686,29 @@ def cmd_discover(args):
             print("\n  Estimate only. Re-run without --estimate to collect.\n")
             return
 
-        print("\n  Running...\n")
-        from harvey.pipeline import run_prospecting
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_discovery, merge_reports
 
-        result = await run_prospecting(
-            state, config, args.provider, queries,
-            max_spend=args.max_spend, profile=not args.no_profile,
-        )
-        r = result.discover or {}
+        try:
+            batch_id, ids, dupes = await enqueue_discovery(
+                state, args.provider, queries, max_spend=args.max_spend,
+                read_sites=not args.no_profile, label=provider.label)
+        except jobs.Duplicate as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        for job in dupes:
+            print(f"  Already queued, not asked again: {job.label} (job {job.id})")
+        if getattr(args, "background", False):
+            await _queued_note(state, batch_id, len(ids))
+            return
+        print("\n  Running...\n")
+        found = await _wait_for(state, batch_id)
+        searches = [j for j in found if j.kind == "discover"]
+        sites = [j for j in found if j.kind == "site_read"]
+        r = merge_reports([j.progress.get("report") or j.result for j in searches])
         ran = r.get("queries_ran", 0)
         print(f"  DISCOVER — {r.get('found', 0)} results across "
-              f"{ran} of {r.get('queries', 0)} queries")
+              f"{ran} of {len(searches)} queries")
         print(f"    {r.get('new_companies', 0)} new companies, "
               f"{r.get('known_companies', 0)} already known")
         print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
@@ -1670,21 +1718,32 @@ def cmd_discover(args):
             print(f"    {r['excluded']} skipped — on your do-not-contact list")
         print(f"    {r.get('observations', 0)} observations recorded")
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
+        limited = [j for j in searches if j.status == jobs.PAUSED
+                   and j.paused_reason == jobs.SPEND_LIMIT]
         if r.get("stopped"):
             print(f"    stopped early: {r['stopped']}")
         if r.get("left_behind"):
-            # A re-run pages from the start again, so the cap has to cover all.
             print(f"    {r['left_behind']}")
-            print("    A re-run starts from the first page: raise --max-spend to cover it all.")
+        if limited:
+            # Paused, not lost: each carries on from its page.
+            print(f"    {len(limited)} search{'' if len(limited) == 1 else 'es'} paused at the "
+                  f"spend limit; to carry on from where they stopped: "
+                  f"harvey jobs resume {limited[0].id} --max-spend N")
 
         if args.no_profile:
             print("\n  PROFILE — skipped (--no-profile)")
         else:
-            print(f"\n  PROFILE — {result.profiled_companies} sites read, "
-                  f"{result.profile_observations} observations  (free)")
+            read = [j for j in sites if j.status == jobs.DONE]
+            print(f"\n  PROFILE — {len(read)} sites read, "
+                  f"{sum(int(j.result.get('observations') or 0) for j in read)} "
+                  "observations  (free)")
 
-        for err in result.errors[:5]:
+        for err in r.get("errors", [])[:5]:
             print(f"    ! {err}")
+        _job_failures([j for j in found if j.kind != "discover"])
+        for job in searches:
+            if job.status == jobs.FAILED:
+                print(f"    ! {job.label}: {job.error}")
 
         # Empty successful searches are valid; no successful requests is not.
         # Partial success remains usable and exits zero.
@@ -1700,6 +1759,159 @@ def cmd_discover(args):
         print("\n  Next: harvey dashboard → Signals → cohort builder\n")
 
     asyncio.run(_discover())
+
+
+def _job_line(job) -> str:
+    """One job as `harvey jobs list` prints it."""
+    from harvey.modules import jobs
+
+    progress = job.progress
+    bits = []
+    if progress.get("pages"):
+        bits.append(f"{progress['pages']} page{'' if progress['pages'] == 1 else 's'}")
+    if progress.get("results"):
+        bits.append(f"{progress['results']} results")
+    if job.actual_cost:
+        bits.append(f"${job.actual_cost:.4f}")
+    if job.status == jobs.PAUSED:
+        bits.append(f"paused: {job.paused_reason or job.error}")
+    elif job.status == jobs.FAILED:
+        bits.append(f"failed: {job.error}")
+    elif job.status == jobs.QUEUED and job.error:
+        bits.append(f"tries again{f' after {job.not_before} UTC' if job.not_before else ''}: "
+                    f"{job.error}")
+    label = job.label or job.kind.replace("_", " ")
+    return f"    {job.id}  {job.status:<9} {label}" + (f"  ({'; '.join(bits)})" if bits else "")
+
+
+def cmd_jobs(args):
+    """The queue: what runs, waits, paused or failed, per lane; cancel,
+    retry or resume a job; pause or resume a lane. No Claude."""
+    from harvey.modules import jobs
+    from harvey.modules.worker import lease_holder
+    from harvey.state import StateManager
+
+    action = args.jobs_action or "list"
+    if action != "list" and not args.target:
+        what = "a lane" if action in ("pause", "resume-lane") else "a job id"
+        print(f"\n  Say which: harvey jobs {action} <{what}> (harvey jobs list shows them).\n")
+        raise SystemExit(2)
+
+    async def _go():
+        state = StateManager()
+        await state.init_db()
+        if action == "list":
+            counts = await jobs.counts(state)
+            paused = await jobs.paused_lanes(state)
+            holder = await lease_holder(state)
+            print(f"\n  Jobs: {counts.get('running', 0)} running, {counts.get('queued', 0)} "
+                  f"waiting, {counts.get('paused', 0)} paused, {counts.get('failed', 0)} failed")
+            print("  Worker: " + (f"running (pid {holder.get('pid')} on {holder.get('host')})"
+                                  if holder else "none running (start the dashboard, or "
+                                                 "harvey worker)"))
+            lanes = sorted(set(counts["lanes"]) | set(paused))
+            if args.lane:
+                lanes = [lane for lane in lanes if lane == args.lane]
+            shown = (jobs.RUNNING, jobs.QUEUED, jobs.PAUSED, jobs.FAILED) if not args.all \
+                else jobs.STATUSES
+            for lane in lanes:
+                n = counts["lanes"].get(lane, {})
+                print(f"\n  {lane}" + (f"  [paused: {paused[lane]}]" if lane in paused else "")
+                      + "  " + ", ".join(f"{v} {k}" for k, v in sorted(n.items())))
+                found = await jobs.list_jobs(state, lane=lane, statuses=shown, limit=args.limit)
+                # Running first, then in the order the worker takes them.
+                for job in sorted(reversed(found), key=lambda j: j.status != jobs.RUNNING):
+                    print(_job_line(job))
+            print()
+            return
+        if action in ("pause", "resume-lane"):
+            if not await jobs.known_lane(state, args.target):
+                print(f"\n  No lane {args.target!r} (harvey jobs list shows them).\n")
+                raise SystemExit(2)
+            if action == "pause":
+                await jobs.pause_lane(state, args.target)
+                print(f"\n  Lane {args.target} paused: nothing new starts on it, and a running "
+                      f"job stops after its page. harvey jobs resume-lane {args.target}\n")
+            else:
+                await jobs.resume_lane(state, args.target)
+                print(f"\n  Lane {args.target} resumed.\n")
+            return
+        job = await jobs.find(state, args.target)
+        if job is None:
+            print(f"\n  No job {args.target!r} (harvey jobs list shows their ids).\n")
+            raise SystemExit(2)
+        try:
+            if action == "cancel":
+                job = await jobs.cancel(state, job.id)
+                said = ("stops after the page it is on" if job.status == jobs.RUNNING
+                        else "cancelled")
+            elif action == "retry":
+                job = await jobs.retry(state, job.id)
+                said = "queued again, from where it got to"
+            else:
+                if args.max_spend is not None and job.batch_id:
+                    await jobs.set_batch_cap(state, job.batch_id, args.max_spend)
+                    for other in await jobs.list_jobs(state, statuses=(jobs.PAUSED,),
+                                                      batch_id=job.batch_id, limit=100000):
+                        if other.id != job.id and other.paused_reason == jobs.SPEND_LIMIT:
+                            await jobs.resume(state, other.id)
+                job = await jobs.resume(state, job.id)
+                said = "resumed: it carries on from where it stopped"
+        except (jobs.Refused, jobs.Duplicate) as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        print(f"\n  Job {job.id} ({job.label or job.kind}): {said}.")
+        if job.status == jobs.QUEUED:
+            if await lease_holder(state) is None:
+                print("  No worker is running, so it waits until one starts: open the "
+                      "dashboard, or run harvey worker.")
+        print()
+
+    asyncio.run(_go())
+
+
+def _dollars(text: str) -> float:
+    """A spend cap from the command line: a finite number, 0 or more."""
+    import argparse
+    import math
+
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} isn't a number of dollars (0 or more)")
+    return value
+
+
+def cmd_worker(args):
+    """Run the jobs (searches, site reads, loads, checks) on an install
+    without the dashboard. One worker per database: with the dashboard
+    running, this one waits until it stops."""
+    import logging
+    import signal
+
+    from harvey.modules.worker import serve
+    from harvey.state import StateManager
+
+    async def _go():
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+        print("\n  Harvey's worker: running queued jobs (Ctrl-C stops it; a running job "
+              "goes back to the queue and resumes from its page).\n", flush=True)
+        await serve(StateManager(), stop)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s",
+                        datefmt="%H:%M:%S")
+    try:
+        asyncio.run(_go())
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_signals(args):
@@ -2340,7 +2552,7 @@ def main():
     sub.add_argument("--limit", type=int, default=None,
                      help="Most records to take per query (default: every result; "
                           "the spend cap stops the run)")
-    sub.add_argument("--max-spend", type=float, default=1.0,
+    sub.add_argument("--max-spend", type=_dollars, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
     sub.add_argument("--preset", default="", choices=["", "yc", "hiring", "accelerator", "funding"],
                      help="A built-in search instead of your ICP's industries "
@@ -2353,14 +2565,16 @@ def main():
                           "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
+    _background_arg(sub)
     sub.set_defaults(func=cmd_discover)
 
     sub = subparsers.add_parser(
         "profile", help="Read discovered companies' websites (free, no Claude)")
-    sub.add_argument("--limit", type=int, default=200,
-                     help="Max sites to read (default: 200)")
+    sub.add_argument("--limit", type=int, default=None,
+                     help="Most sites to queue (default: every one due)")
     sub.add_argument("--stale-days", type=int, default=90,
                      help="Re-read a site after this many days (default: 90)")
+    _background_arg(sub)
     sub.set_defaults(func=cmd_profile)
 
     sub = subparsers.add_parser(
@@ -2422,6 +2636,7 @@ def main():
     r.add_argument("--data-dir", default="",
                    help="Where the dataset files are kept (default: data/onrc)")
     _registry_common(r)
+    _background_arg(r)
     r = registry_sub.add_parser("status", help="Which dataset is loaded, and its size")
     r.add_argument("--json", action="store_true", help="Print JSON")
     _registry_common(r)
@@ -2452,6 +2667,7 @@ def main():
     _fin_filter_args(r)
     _tax_filter_args(r)
     _registry_common(r)
+    _background_arg(r)
     sub.set_defaults(func=cmd_registry)
 
     sub = subparsers.add_parser(
@@ -2472,9 +2688,11 @@ def main():
                         "the module's setting; default 3, 'all' for every year)")
     r.add_argument("--force", action="store_true",
                    help="Load again even when nothing new is published")
+    _background_arg(r)
     r = fin_sub.add_parser("status", help="What is loaded, and whether data.gov.ro has newer")
     r.add_argument("--json", action="store_true", help="Print JSON")
-    fin_sub.add_parser("check", help="Ask data.gov.ro now whether a new or revised year is out")
+    r = fin_sub.add_parser("check", help="Ask data.gov.ro now whether a new or revised year is out")
+    _background_arg(r)
     sub.set_defaults(func=cmd_financials)
 
     sub = subparsers.add_parser(
@@ -2491,9 +2709,11 @@ def main():
     r = tax_sub.add_parser("load", help="Download the newest file if missing and load it")
     r.add_argument("--force", action="store_true",
                    help="Load again even when nothing new is published")
+    _background_arg(r)
     r = tax_sub.add_parser("status", help="What is loaded, and whether data.gov.ro has newer")
     r.add_argument("--json", action="store_true", help="Print JSON")
-    tax_sub.add_parser("check", help="Ask data.gov.ro now whether a newer file is out")
+    r = tax_sub.add_parser("check", help="Ask data.gov.ro now whether a newer file is out")
+    _background_arg(r)
     sub.set_defaults(func=cmd_taxpayers)
 
     sub = subparsers.add_parser(
@@ -2513,6 +2733,7 @@ def main():
                         "cache_days are reused)")
     r.add_argument("--missing", action="store_true",
                    help="Only companies ANAF was never asked about")
+    _background_arg(r)
     anaf_sub.add_parser("status", help="How many ANAF answers are kept")
     sub.set_defaults(func=cmd_anaf)
 
@@ -2546,6 +2767,9 @@ def main():
     sub.add_argument("--dry-run", action="store_true",
                      help="Count what would be imported (the registry is still "
                           "loaded); save nothing")
+    sub.add_argument("--whole-country", action="store_true",
+                     help="Import every operating company in Romania when no "
+                          "activity, area or filter is given")
     sub.add_argument("--data-dir", default="",
                      help="Where the dataset files are kept (default: data/onrc)")
     sub.add_argument("--administrators", choices=("all", "none"), default="all",
@@ -2556,6 +2780,7 @@ def main():
     sub.add_argument("--registry", default="", help=argparse.SUPPRESS)
     _fin_filter_args(sub)
     _tax_filter_args(sub)
+    _background_arg(sub)
     sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(
@@ -2595,6 +2820,26 @@ def main():
     sub = subparsers.add_parser(
         "retry-writes", help="Retry prospects the Writer couldn't write an email for")
     sub.set_defaults(func=cmd_retry_writes)
+
+    sub = subparsers.add_parser(
+        "jobs", help="The queue of background work: list, cancel, retry, resume; pause a lane",
+        description="Searches, site reads, registry and public-data loads and ANAF checks run "
+                    "as jobs, one lane per source: a lane runs its jobs in order, lanes run "
+                    "side by side. The dashboard's worker runs them (or harvey worker).")
+    sub.add_argument("jobs_action", nargs="?", default="list",
+                     choices=("list", "cancel", "retry", "resume", "pause", "resume-lane"),
+                     help="list (default); cancel/retry/resume ID; pause/resume-lane LANE")
+    sub.add_argument("target", nargs="?", default="", help="A job id (or its start), or a lane")
+    sub.add_argument("--lane", default="", help="list: only this lane")
+    sub.add_argument("--all", action="store_true", help="list: done and cancelled jobs too")
+    sub.add_argument("--limit", type=int, default=20, help="list: jobs per lane (default: 20)")
+    sub.add_argument("--max-spend", type=_dollars, default=None,
+                     help="resume: a new spend limit for the job's run (in dollars)")
+    sub.set_defaults(func=cmd_jobs)
+
+    sub = subparsers.add_parser(
+        "worker", help="Run queued jobs without the dashboard (one worker per database)")
+    sub.set_defaults(func=cmd_worker)
 
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",

@@ -55,6 +55,13 @@ function failMsg(data, fallback) {
   // A module that is off: said in the viewer's language, naming the module
   // (the server's English sentence is for the API and the CLI).
   if (data && data.off_module) return t('modp.off_refused', {name: moduleName(data.off_module)});
+  // Work already waiting, or a running job that can't stop part-way: said
+  // in the viewer's language from the job the server names.
+  if (data && data.code === 'duplicate' && data.job) {
+    return t('q.dup', {kind: jobKind(data.job.kind), label: data.job.label || '',
+                       status: t('q.st.' + data.job.status)});
+  }
+  if (data && data.code === 'not_stoppable') return t('q.not_stoppable');
   return (data && (data.message || data.error || data.detail)) || fallback;
 }
 
@@ -498,6 +505,7 @@ function loadCurrentTab() {
     case 'outbox': loadOutbox(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
+    case 'queue': loadQueue(); break;
     case 'usage': loadUsage(); break;
     case 'settings': loadSettings(); loadModulesCard(); if (_modules.email) loadSendingModeCard(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
@@ -1587,8 +1595,11 @@ async function loadDiscoverProviders() {
   }).join('') + '</div>';
 
   const running = data.running;
-  // Reading sites can't be stopped part-way; only a discovery run can.
-  document.getElementById('disc-stop').style.display = running && data.running_kind !== 'profile' ? '' : 'none';
+  // Stop stops the searches of the run shown below; reading sites can't be
+  // stopped part-way, and another run (a command's) isn't this page's.
+  _discBatch = (data.last_report && data.last_report.batch_id) || '';
+  document.getElementById('disc-stop').style.display =
+    data.last_report && data.last_report.searches_active ? '' : 'none';
   renderProfileCard(data.unprofiled || 0, running);
   if (running && !_discoverPoll) {
     _discoverPoll = setInterval(loadDiscoverProviders, 4000);
@@ -1675,15 +1686,23 @@ async function runDiscovery() {
   });
   if (data && data.success) {
     showToast(t('disc.started', {n: data.queries}), 'success');
+    // Searches asked again while the same one still waits weren't queued twice.
+    if ((data.duplicates || []).length) showToast(t('disc.dupes', {n: data.duplicates.length}), 'success');
   } else {
-    showToast((data && data.message) || t('disc.start_failed'), 'error');
+    showToast(failMsg(data, t('disc.start_failed')), 'error');
     btn.disabled = false;
   }
   loadDiscoverProviders();
 }
 
+// The run the "last run" card shows: Stop stops its searches, no other run's.
+let _discBatch = '';
+
 async function stopDiscovery() {
-  const data = await api('/api/discover/stop', {method: 'POST'});
+  const data = await api('/api/discover/stop', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(_discBatch ? {batch_id: _discBatch} : {provider: _provider}),
+  });
   showToast(data && data.success ? t('disc.stopping')
                                  : failMsg(data, t('disc.stop_failed')), data && data.success ? 'success' : 'error');
   loadDiscoverProviders();
@@ -1707,7 +1726,7 @@ async function runProfile(btn) {
   btn.textContent = t('disc.starting');
   const data = await api('/api/profile/run', {method: 'POST'});
   if (data && data.success) {
-    showToast(data.pending ? t('disc.reading', {n: Math.min(data.pending, 200)}) : t('disc.all_read'), 'success');
+    showToast(data.pending ? t('disc.reading', {n: data.pending}) : t('disc.all_read'), 'success');
     if (data.pending && !_discoverPoll) _discoverPoll = setInterval(loadDiscoverProviders, 4000);
   } else {
     showToast(failMsg(data, t('disc.start_failed')), 'error');
@@ -1717,12 +1736,20 @@ async function runProfile(btn) {
 
 function renderDiscoverResult(report, running) {
   const el = document.getElementById('discover-result');
-  if (running) {
-    el.innerHTML = '<div class="card"><h2>' + escHtml(t('disc.running')) + '</h2>' +
-      '<p class="muted small">' + escHtml(t('disc.running_detail')) + '</p></div>';
+  if (!report) {
+    el.innerHTML = running ? '<div class="card"><h2>' + escHtml(t('disc.running')) + '</h2>' +
+      '<p class="muted small">' + escHtml(t('disc.running_detail')) + '</p></div>' : '';
     return;
   }
-  if (!report) { el.innerHTML = ''; return; }
+  // The run is jobs on the Queue page: say what still waits, and link there.
+  const jobsLink = report.batch_id
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="openQueue(' + jsq(report.batch_id) + ')">' +
+        icon('queue') + escHtml(t('disc.see_jobs')) + '</button>' : '';
+  const waiting = (report.jobs || {}).queued || 0;
+  const notes = (report.running
+      ? '<p class="muted small">' + escHtml(t('disc.still_working', {n: (report.jobs || {}).running || 0, w: waiting})) + '</p>' : '') +
+    (report.spend_limited
+      ? '<div class="test-result" style="margin-top:8px">' + escHtml(t('disc.spend_limited', {n: report.spend_limited})) + '</div>' : '');
 
   const stat = (label, value, tone) =>
     '<div class="stat-card"><div class="label">' + escHtml(label) + '</div>' +
@@ -1737,7 +1764,7 @@ function renderDiscoverResult(report, running) {
       (report.stopped ? '<div class="test-result error" style="margin-top:14px">' + escHtml(t('disc.stopped_early', {why: report.stopped})) + '</div>' : '');
     return;
   }
-  el.innerHTML = '<div class="subhead">' + escHtml(t('disc.last_run')) + '</div>' +
+  el.innerHTML = '<div class="subhead">' + escHtml(t('disc.last_run')) + ' ' + jobsLink + '</div>' + notes +
     '<div class="stats-grid">' +
       stat(t('disc.new'), fmtN(report.new_companies || 0), 'accent') +
       stat(t('disc.known'), fmtN(report.known_companies || 0)) +
@@ -3985,6 +4012,140 @@ async function loadActivity() {
   el.innerHTML = html + '</div></div>';
 }
 
+// ── Queue (Coadă): the background jobs, per lane ──
+
+let _queueBatch = '';
+
+const JOB_TONE = {queued: 'waiting', running: 'active', done: 'good', failed: 'bad',
+                  cancelled: 'idle', paused: 'note'};
+
+function jobBadge(status) {
+  return '<span class="badge t-' + (JOB_TONE[status] || 'idle') + '">' +
+    escHtml(t('q.st.' + status)) + '</span>';
+}
+
+function openQueue(batch) {
+  _queueBatch = batch || '';
+  const head = document.getElementById('queue-batch');
+  if (head) head.innerHTML = '';
+  goTab('queue');
+}
+
+function jobKind(kind) {
+  const key = 'q.kind.' + kind;
+  const said = t(key);
+  return said === key ? String(kind || '').replace(/_/g, ' ') : said;
+}
+
+function jobRow(j, buttons) {
+  const p = j.progress || {};
+  const bits = [];
+  if (p.pages) bits.push(t('q.pages', {n: fmtN(p.pages)}));
+  if (p.results) bits.push(t('q.results', {n: fmtN(p.results)}));
+  if (j.actual_cost) bits.push(t('q.cost', {cost: fmtUsd(j.actual_cost, 4)}));
+  if (j.status === 'paused') bits.push(t('q.paused_why', {why: j.paused_reason === 'spend limit'
+    ? t('q.why.spend') : j.paused_reason === 'paused' ? t('q.why.hand') : (j.paused_reason || j.error || '')}));
+  if (j.status === 'queued' && j.error) bits.push(t('q.retry_at', {why: j.error}));
+  if (j.status === 'failed' && j.error) bits.push(j.error);
+  if (j.status === 'running' && j.last_line) bits.push(j.last_line.trim());
+  const act = (buttons || []).map(([action, label]) =>
+    '<button type="button" class="btn btn-secondary btn-sm" onclick="jobAction(' + jsq(j.id) + ',' +
+      jsq(action) + ')">' + escHtml(t(label)) + '</button>').join('');
+  return '<div class="job-row">' +
+    '<div class="job-main"><div class="job-title">' + jobBadge(j.status) + ' ' +
+      '<span class="job-kind">' + escHtml(jobKind(j.kind)) + '</span> ' + escHtml(j.label || '') + '</div>' +
+      (bits.length ? '<div class="job-detail">' + bits.map(escHtml).join(' &middot; ') + '</div>' : '') +
+    '</div>' + (act ? '<div class="job-actions">' + act + '</div>' : '') + '</div>';
+}
+
+// A lane is a module's (or the contact search's): its name in the viewer's
+// language when the page knows it, else the module's own.
+function laneName(l) {
+  return own({contacts: 1}, l.lane) ? tServer('q.lane.' + l.lane, l.name)
+                                    : tServer('module.' + l.lane + '.name', l.name);
+}
+
+function laneCard(l) {
+  const block = (title, list, buttons, more) => list.length
+    ? '<div class="job-group"><div class="job-group-title">' + escHtml(t(title)) + '</div>' +
+        list.map(j => jobRow(j, typeof buttons === 'function' ? buttons(j) : buttons)).join('') +
+        (more ? '<div class="muted small">' + escHtml(t('q.more', {n: fmtN(more)})) + '</div>' : '') +
+      '</div>' : '';
+  const toggle = l.paused
+    ? '<button type="button" class="btn btn-primary btn-sm" onclick="laneAction(' + jsq(l.lane) + ',\'resume\')">' + escHtml(t('q.resume_lane')) + '</button>'
+    : '<button type="button" class="btn btn-secondary btn-sm" onclick="laneAction(' + jsq(l.lane) + ',\'pause\')">' + escHtml(t('q.pause_lane')) + '</button>';
+  return '<div class="card lane-card">' +
+    '<div class="lane-head"><h3>' + escHtml(laneName(l)) + ' <span class="sig-code">' + escHtml(l.lane) + '</span></h3>' + toggle + '</div>' +
+    (l.paused ? '<div class="test-result error">' + escHtml(t('q.lane_paused', {why: l.paused === 'paused' ? t('q.why.hand') : l.paused})) + '</div>' : '') +
+    // Only a search stops part-way (after its page); a load or a check
+    // runs to its end, so it offers no Cancel or Pause while it runs.
+    block('q.running', l.running, j => j.stoppable ? [['cancel', 'q.cancel'], ['pause', 'q.pause']] : []) +
+    block('q.waiting', l.waiting, [['cancel', 'q.cancel']], l.waiting_more) +
+    block('q.paused', l.paused_jobs, [['resume', 'q.resume'], ['cancel', 'q.cancel']]) +
+    block('q.failed', l.failed, [['retry', 'q.retry']]) +
+    block('q.done', l.done, []) +
+    (!l.running.length && !l.waiting.length && !l.paused_jobs.length && !l.failed.length && !l.done.length
+      ? '<p class="muted small">' + escHtml(t('q.lane_empty')) + '</p>' : '') +
+  '</div>';
+}
+
+async function loadQueue() {
+  const el = document.getElementById('queue-list');
+  const head = document.getElementById('queue-batch');
+  if (!el) return;
+  const data = await api('/api/jobs' + (_queueBatch ? '?batch=' + encodeURIComponent(_queueBatch) : ''));
+  if (!data || data.error) { el.innerHTML = offlineState(); return; }
+  navCount('nav-queue', (data.running || 0) + (data.waiting || 0));
+  const batch = data.batch;
+  // The 5-second refresh leaves the cap field alone while someone types in it.
+  const capInput = document.getElementById('queue-cap');
+  const typing = capInput && (document.activeElement === capInput || capInput.dataset.edited === '1');
+  if (!typing) head.innerHTML = (data.worker ? '' : '<div class="test-result error">' + escHtml(t('q.worker_off')) + '</div>') +
+    (_queueBatch ? '<div class="card"><p class="desc">' + escHtml(t('q.batch', {label: (batch && batch.label) || ''})) +
+      ' <button type="button" class="btn btn-secondary btn-sm" onclick="openQueue(\'\')">' + escHtml(t('q.show_all')) + '</button></p>' +
+      (batch && batch.max_spend !== null && batch.max_spend !== undefined
+        ? '<div class="form-row"><label class="form-label" for="queue-cap">' + escHtml(t('q.cap')) + '</label>' +
+          '<input class="form-input" id="queue-cap" type="number" min="0" step="0.25" value="' + escHtml(String(batch.max_spend)) + '" oninput="this.dataset.edited=\'1\'">' +
+          '<button type="button" class="btn btn-primary btn-sm" onclick="raiseCap(' + jsq(_queueBatch) + ')">' + escHtml(t('q.raise')) + '</button></div>'
+        : '') + '</div>' : '');
+  if (!(data.lanes || []).length) {
+    el.innerHTML = emptyState(icon('queue'), escHtml(t('q.empty')), escHtml(t('q.empty_copy')), true);
+    return;
+  }
+  el.innerHTML = data.lanes.map(laneCard).join('');
+}
+
+async function jobAction(id, action) {
+  const res = await api('/api/jobs/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
+  showToast(res && res.success ? t('q.ok') : failMsg(res, t('q.failed_toast')),
+            res && res.success ? 'success' : 'error');
+  loadQueue();
+}
+
+async function laneAction(lane, action) {
+  const res = await api('/api/lanes/' + encodeURIComponent(lane) + '/' + action, {method: 'POST'});
+  showToast(res && res.success ? t('q.ok') : failMsg(res, t('q.failed_toast')),
+            res && res.success ? 'success' : 'error');
+  loadQueue();
+}
+
+async function raiseCap(batch) {
+  const input = document.getElementById('queue-cap');
+  const cap = Number((input || {}).value);
+  const res = await api('/api/jobs/batches/' + encodeURIComponent(batch) + '/cap', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({max_spend: cap}),
+  });
+  showToast(res && res.success ? t('q.raised', {n: res.resumed}) : failMsg(res, t('q.failed_toast')),
+            res && res.success ? 'success' : 'error');
+  if (input && res && res.success) { delete input.dataset.edited; input.blur(); }
+  loadQueue();
+}
+
+async function loadQueueCount() {
+  const data = await api('/api/jobs/counts');
+  if (data) navCount('nav-queue', (data.running || 0) + (data.waiting || 0));
+}
+
 // ── Init & live refresh ──
 
 async function init() {
@@ -3997,6 +4158,7 @@ async function init() {
   try { tab = sessionStorage.getItem('harvey-tab') || 'overview'; } catch { /* ignore */ }
   goTab(tab);
   loadHarveyStatus();
+  loadQueueCount();
 }
 
 function switchLangButtons() {
@@ -4011,6 +4173,13 @@ init();
 
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
+
+// The Queue badge (running + waiting) stays live from any tab; the Queue
+// page itself refreshes faster while it is open.
+setInterval(() => {
+  if (document.hidden || _locked) return;
+  if (currentTab === 'queue') loadQueue(); else loadQueueCount();
+}, 5000);
 
 // Live status panel: refreshed while the Today tab is open and visible.
 setInterval(() => {

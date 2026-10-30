@@ -1,6 +1,7 @@
 """Configuration loader for Harvey. Reads harvey.yaml + .env."""
 
 import logging
+import math
 import os
 import re
 from datetime import date as _date, time as _time
@@ -11,7 +12,8 @@ import yaml
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+    BaseModel, ConfigDict, PrivateAttr, TypeAdapter, ValidationError, field_validator,
+    model_validator,
 )
 
 from harvey.paths import PROJECT_ROOT
@@ -600,6 +602,21 @@ class WriterConfig(BaseModel):
     humanizer: bool = False
 
 
+class SpendConfig(BaseModel):
+    """Limits on what paid searches spend across every run, above each
+    run's own cap: per UTC day and per UTC month, in dollars. None (the
+    default) is no limit beyond the runs' caps."""
+    per_day_usd: float | None = None
+    per_month_usd: float | None = None
+
+    @field_validator("per_day_usd", "per_month_usd")
+    @classmethod
+    def _valid_limit(cls, v: float | None) -> float | None:
+        if v is not None and not (math.isfinite(v) and v >= 0):
+            raise ValueError("a spend limit must be a number of dollars, 0 or more")
+        return v
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -609,12 +626,17 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    spend: SpendConfig = SpendConfig()
     # The file it was loaded from, so a running Harvey can re-read the
     # sending mode from that same file (refresh_sending_mode).
     _source_path: str | None = PrivateAttr(default=None)
 
 
 class EnvConfig(BaseModel):
+    # A module's own keys beyond the ones below (its manifest's ``secrets``)
+    # come in as extra fields, lower case: a new module needs no edit here.
+    model_config = ConfigDict(extra="allow")
+
     instantly_api_key: str = ""
     # Discovery providers
     dataforseo_login: str = ""
@@ -759,8 +781,23 @@ def load_env() -> EnvConfig:
         m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
+        **_module_keys(),
     )
     return env
+
+
+def _module_keys() -> dict[str, str]:
+    """Every .env key a module's manifest names that has no field above,
+    as ``{key in lower case: value}``."""
+    try:
+        from harvey.modules.switches import manifests
+        names = {k for m in manifests() for k in m.secrets}
+    except Exception as e:
+        logger.debug("module keys unavailable: %s", e)
+        return {}
+    known = set(EnvConfig.model_fields)
+    return {k.lower(): os.getenv(k, "").strip() for k in sorted(names)
+            if k.lower() not in known}
 
 
 # ── Approval or autopilot ─────────────────────────────────────────────────
