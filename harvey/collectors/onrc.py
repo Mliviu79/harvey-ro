@@ -860,18 +860,29 @@ async def save_firms(
         first = matched[0] if matched else _industry_class(firm_codes)
         industry = (describe(*first) or "") if first else ""
         external = f"onrc:{firm.reg}"
-        # Only the legal identity merges. The registry's website field is
-        # self-declared: a domain another business already holds may be
-        # a shared group site or simply wrong, so it is a possible match
-        # for review, never a reason to hang these administrators and
+        draft = Company(
+            name=firm.name, cui=firm.cui, external_id=external,
+            website=firm.website, domain=firm.domain, industry=industry,
+            location=_location(firm), address=firm.address,
+            source=SOURCE, source_url=evidence,
+        )
+        # The resolver matches the legal identity (CUI, registration
+        # number) as before, and now also a company found elsewhere by the
+        # same name in the same town. The registry's website field is
+        # self-declared: a domain another business already holds may be a
+        # shared group site or simply wrong, so on its own it is a possible
+        # match for review, never a reason to hang these administrators and
         # this address on that business.
-        existing = (await batch.get_company_by_cui(firm.cui)
-                    or await batch.get_company_by_external_id(external))
-        domain, website = firm.domain, firm.website
+        match = await batch.match_company(draft, declared_domain=True)
+        existing = match.company_id if match.attach else None
+        domain = firm.domain
         holder = await batch.get_company_by_domain(domain) if domain else None
-        if holder and (existing is None or holder.id != existing.id):
+        if holder and (existing is None or holder.id != existing):
             report.shared_domain += 1
-            domain = ""
+            domain = draft.domain = ""
+        elif holder and not match.same_record:
+            # Joining the holder by a merge: the merge brings the domain.
+            draft.domain = ""
         if existing:
             report.known_companies += 1
         else:
@@ -881,21 +892,19 @@ async def save_firms(
         if dry_run:
             return
 
-        if existing:
-            company_id = existing.id
+        if existing and match.same_record:
+            company_id = existing
             changed = await batch.fill_company_fields(
-                company_id, cui=firm.cui, name=firm.name, website=website,
+                company_id, cui=firm.cui, name=firm.name, website=firm.website,
                 domain=domain, industry=industry, location=_location(firm),
                 address=firm.address)
+            await batch.register_ids(company_id, draft, match)
             if changed:
                 report.updated_companies += 1
         else:
-            company_id = await batch.add_company(Company(
-                name=firm.name, cui=firm.cui, external_id=external,
-                website=website, domain=domain, industry=industry,
-                location=_location(firm), address=firm.address,
-                source=SOURCE, source_url=evidence,
-            ))
+            # New, or the same company by other evidence (saved, then merged
+            # into it, which can be undone), or a possible one for review.
+            company_id = (await batch.save_company(draft, match)).company_id
 
         # What the company does, all of it: describes the record (like
         # its industry), so it isn't held behind the signal gate.

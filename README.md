@@ -276,6 +276,8 @@ Has a marketing agency  AND  running Google Ads  AND NOT  already has online boo
 
 That is a campaign with a reason behind it. You know exactly why each of those 23 is on the list, and so does the email Harvey writes them.
 
+Each condition is true, false or **not checked yet**, and every company lands in one of three tabs: **match** (every condition checked and met), **possible** (nothing rules it out, but something isn't checked yet) and **no match**. "NOT running ads" counts only companies checked and found without them, never ones nobody looked at. A disqualifier alone is a cohort too. The Signals tab shows, per signal, how many companies are yes, no and not checked, and the CSV export has a `verdict` column.
+
 ---
 
 ## The prospecting pipeline
@@ -371,6 +373,26 @@ and administrators' names and roles, in a few minutes. Then
 `harvey import-onrc dentist --county BV` brings the matching firms into
 Harvey to look for their contacts. A newer dataset is built aside and swapped in whole, one load at a
 time; offline, the newest dataset already downloaded is used.
+
+**One company, however many sources found it.** Every key a company is known by
+(CUI, registration number, a map listing's id, its domain, its phones, its name
+in its town) is kept, and each new record is scored against them: the same
+CUI, registration number or listing is the same record; the same domain counts
+0.9 (free mailboxes, directories, social networks, booking platforms, link
+shorteners and a site two companies already share never count), the same
+phone 0.8 (unless more than two companies share it), the same name without its
+legal form (`SRL`, `S.R.L.`, `PFA`, `LLC`... listed in
+`harvey/reference/legal_forms.csv`) in the same town 0.7, and kinds of evidence
+add up. At 0.85 or more the records are merged; from 0.6 they stay apart and the
+pair waits under **Possible duplicates** on the Companies tab (or
+`harvey duplicates`) for you to say "same company" or "different companies".
+Two different CUIs are never merged, no model ever decides, nothing is deleted:
+a merge moves one record's facts onto the other, fills only what the other
+lacked, and can be undone; an undone pair goes back on the review list. So a
+map hit for a registry firm with no website joins the firm instead of becoming
+a second company. Companies already on file are matched against each other once,
+on upgrade, by the same rules. A town nearby
+doesn't count yet: that needs a gazetteer.
 
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
@@ -677,6 +699,8 @@ harvey import-onrc --county BV [dentist]  # load + pull in one step (free);
 harvey search 8623 brasov    # search companies on file by CAEN code, activity in words
                              # (dentist, stomatologie), name or town; --json
 harvey caen 8623             # what a CAEN code means (every revision), or the codes for words
+harvey duplicates            # possible duplicates and merges; --merge KEEP MERGED,
+                             # --separate A B, --undo MERGED
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens

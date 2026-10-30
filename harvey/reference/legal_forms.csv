@@ -1,0 +1,55 @@
+# Legal forms stripped from a company name before two names are compared
+# (harvey/resolver.py): "EXEMPLU SRL", "S.C. Exemplu S.R.L." and "Exemplu"
+# are one name. A form is compared after folding (lowercase, no accents,
+# punctuation as spaces), so "S.R.L." and "s r l" are the same entry.
+# where: start | end | both, the end of the name a form can stand at.
+# A short form that is also an everyday word ("co") only counts at the end.
+country,form,where
+RO,SRL,both
+RO,S.R.L.,both
+RO,SRL-D,both
+RO,S.R.L.-D.,both
+RO,SA,end
+RO,S.A.,end
+RO,SNC,both
+RO,S.N.C.,both
+RO,SCS,both
+RO,SCA,both
+RO,SC,start
+RO,S.C.,start
+RO,PFA,both
+RO,P.F.A.,both
+RO,II,both
+RO,I.I.,both
+RO,IF,both
+RO,I.F.,both
+RO,CMI,both
+RO,C.M.I.,both
+RO,Cabinet Medical Individual,start
+RO,RA,end
+RO,R.A.,end
+RO,SCM,both
+RO,S.C.M.,both
+US,LLC,end
+US,L.L.C.,end
+US,Inc,end
+US,Inc.,end
+US,Incorporated,end
+US,Corp,end
+US,Corp.,end
+US,Corporation,end
+US,Co,end
+US,Co.,end
+US,Company,end
+US,Ltd,end
+US,Ltd.,end
+US,Limited,end
+US,LLP,end
+US,L.L.P.,end
+US,LP,end
+US,L.P.,end
+US,PLLC,end
+US,P.L.L.C.,end
+US,PC,end
+US,P.C.,end
+US,PLC,end

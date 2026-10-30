@@ -423,6 +423,14 @@ async def test_cohort_range_combines_with_require_and_exclude(state):
     ])
     await state.add_observation("RUNNING_GOOGLE_ADS", company_id=ids["Mid"],
                                 collector="profile", value_num=1)
+    # Mid was never seen in the pack: possible until a search says it isn't.
+    counts, rows = await state.cohort_verdicts(
+        [], ["IN_LOCAL_PACK"], ranges=[{"code": "SERP_RANK", "min": 11, "max": 30}],
+        verdicts=("possible", "no_match"))
+    assert counts == {"match": 0, "possible": 1, "no_match": 1}
+    assert [(r["name"], r["verdict"]) for r in rows] == [("Mid", "possible"), ("Pack", "no_match")]
+    await state.add_observation("IN_LOCAL_PACK", company_id=ids["Mid"], collector="discover",
+                                value_num=0, value_text="roofer Denver")
     size, rows = await state.cohort_companies(
         [], ["IN_LOCAL_PACK"], ranges=[{"code": "SERP_RANK", "min": 11, "max": 30}])
     assert [r["name"] for r in rows] == ["Mid"]

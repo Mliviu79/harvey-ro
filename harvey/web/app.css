@@ -622,6 +622,19 @@ tr:hover .copy, .copy:focus-visible, .drow .copy, .copy.done { opacity: 1; }
 @media (hover: hover) { .segmented button:not(.on):hover { color: var(--text); } }
 #company-actions, #contact-actions { margin-left: auto; }
 
+/* Possible duplicates: two records side by side, decided by a person */
+.chip-btn.on { color: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
+.dup-panel { padding: var(--sp-4); margin-bottom: var(--sp-3); }
+.dup-head { display: flex; gap: var(--sp-3); align-items: flex-start; justify-content: space-between; }
+.dup-head h3 { margin: 0 0 var(--sp-1); }
+.dup-head p { margin: 0 0 var(--sp-3); max-width: 70ch; }
+.dup-tabs { margin-bottom: var(--sp-3); }
+.dup-pair { padding: var(--sp-3) 0; border-top: 1px solid var(--line); display: grid; gap: var(--sp-2); }
+.dup-why { font-size: var(--fs-caption); color: var(--text-2); }
+.dup-sides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); }
+.dup-side { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .dup-sides { grid-template-columns: minmax(0, 1fr); } }
+
 .selbar {
   display: flex; align-items: center; gap: var(--sp-3); margin: 0 0 var(--sp-2);
   padding: 6px 6px 6px 12px; border-radius: var(--r-md);

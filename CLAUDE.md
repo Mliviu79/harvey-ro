@@ -200,7 +200,8 @@ Most signals are free (they read pages a business already publishes). Only
 Once signals are confirmed, the **cohort builder** at the bottom of the Signals
 tab turns them into a target list: pick what a good prospect must have (and what
 disqualifies them, and a range for numeric signals like organic rank 11-30) and it
-counts the matches live.
+counts the matches live. Results come in three tabs: match, possible (something
+isn't checked yet, so "possible" means unknown, not no) and no match.
 
 ### Step 5: Find Businesses
 
@@ -349,6 +350,7 @@ harvey registry search dentist BV  # Every firm in Romania: name, activity words
 harvey import-onrc dentist --county BV  # Shortcut: loads the latest dataset if needed, then pulls by area + activity (--dry-run counts). No activity = every operating company in the area (county or --locality required); --administrators all|none. Every authorised CAEN class is saved per company
 harvey search <words|code>   # Search companies on file locally: CAEN code (8623), activity in RO/EN words (stomatologie, dentist), name, town — all words must match, -word excludes; --json
 harvey caen <code|words>     # CAEN reference: a code's name in every revision, or the codes for some words (not a filter)
+harvey duplicates            # Companies that may be on file twice (resolver.py): --merge KEEP MERGED / --separate A B / --undo MERGED. Merges at >= 0.85 are automatic, 0.6-0.85 wait for review, two CUIs never merge, every merge can be undone
 harvey sending pause|resume  # Kill switch for all outbound
 harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
 harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or record another service

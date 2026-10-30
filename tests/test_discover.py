@@ -285,8 +285,10 @@ async def test_every_fact_becomes_an_observation(state, config, register):
     assert rows["SERP_RANK"]["value_num"] == 14
     assert rows["REVIEW_RATING"]["value_num"] == pytest.approx(4.6)
     assert rows["REVIEW_COUNT"]["value_num"] == 88
-    assert "UNCLAIMED_LISTING" in rows
-    assert "NO_WEBSITE" not in rows
+    assert rows["UNCLAIMED_LISTING"]["value_num"] == 1
+    # The listing names a site: recorded as an explicit "no", so excluding
+    # NO_WEBSITE can tell it from a business nobody checked.
+    assert rows["NO_WEBSITE"]["value_num"] == 0
     assert rows["FOUND_IN_SERP"]["collector"] == "discover"
 
 

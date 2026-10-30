@@ -142,10 +142,16 @@ def test_cohort_is_a_set_intersection(client):
     one = client.post("/api/cohort", json={"require": ["RUNNING_GOOGLE_ADS"]}).json()
     assert one["size"] == 2
 
+    # Alpha was never checked for booking: not a match, a possible one.
     excluded = client.post("/api/cohort", json={
         "require": ["RUNNING_GOOGLE_ADS"], "exclude": ["NO_ONLINE_BOOKING"]}).json()
-    assert excluded["size"] == 1
-    assert excluded["companies"][0]["name"] == "Alpha Roofing"
+    assert excluded["size"] == 0
+    assert excluded["counts"] == {"match": 0, "possible": 2, "no_match": 1}
+    possible = client.post("/api/cohort", json={
+        "require": ["RUNNING_GOOGLE_ADS"], "exclude": ["NO_ONLINE_BOOKING"],
+        "verdict": "possible"}).json()
+    assert [c["name"] for c in possible["companies"]] == ["Alpha Roofing", "Beta Roofing"]
+    assert {c["verdict"] for c in possible["companies"]} == {"possible"}
 
 
 async def _seed_large_cohort(db_path, n):
@@ -196,13 +202,14 @@ def test_cohort_csv_exports_the_whole_cohort(client):
     assert r.status_code == 200
     assert "text/csv" in r.headers["content-type"]
     lines = r.text.strip().splitlines()
-    assert lines[0] == "name,domain,website,industry,location"
+    assert lines[0] == "name,domain,website,industry,location,verdict"
     assert len(lines) == 121  # header + every match, not one page
+    assert all(line.endswith(",match") for line in lines[1:])
 
 
 def test_cohort_csv_with_no_requirements_is_header_only(client):
     r = client.get("/api/cohort.csv")
-    assert r.text.strip() == "name,domain,website,industry,location"
+    assert r.text.strip() == "name,domain,website,industry,location,verdict"
 
 
 def test_cohort_with_no_requirements_is_empty_not_everything(client):
@@ -383,12 +390,14 @@ def test_cohort_csv_preserves_text_and_neutralizes_formulas(client, monkeypatch)
     import csv
     import io
     async def rows(*args, **kwargs):
-        return 1, [dict(name=' =HYPERLINK("evil")', domain='é, "quoted"',
-                        website='\t=1+1', industry='@SUM(1)', location='line\nnext')]
+        return {"match": 1}, [dict(name=' =HYPERLINK("evil")', domain='é, "quoted"',
+                        website='\t=1+1', industry='@SUM(1)', location='line\nnext',
+                        verdict='match')]
     monkeypatch.setattr(dash, '_cohort_companies', rows)
     response = client.get('/api/cohort.csv', params={'require': 'RUNNING_GOOGLE_ADS'})
     cells = list(csv.reader(io.StringIO(response.text)))[1]
-    assert cells == ['\' =HYPERLINK("evil")', 'é, "quoted"', "'\t=1+1", "'@SUM(1)", 'line\nnext']
+    assert cells == ['\' =HYPERLINK("evil")', 'é, "quoted"', "'\t=1+1", "'@SUM(1)", 'line\nnext',
+                     'match']
 
 
 def test_cohort_csv_requires_authorization(client):

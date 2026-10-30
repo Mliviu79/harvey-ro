@@ -144,7 +144,9 @@ async def test_published_first_name_addresses_set_the_owners_guess(no_network):
     named = [p for p in contacts if not p.is_company_inbox]
     assert [(p.first_name, p.email) for p in named][:2] == [
         ("Nate", "nate@lanternagency.test"), ("Iris", "iris@lanternagency.test")]
-    assert all(p.email_status == "guess" for p in named)   # unverified: never sent
+    assert all(p.email_status == "guess" for p in named[:2])   # unverified: never sent
+    # Everyone else named on the site is kept too, with no lookup spent.
+    assert all(p.email == "" and p.email_status == "" for p in named[2:])
 
 
 @pytest.mark.asyncio
@@ -160,7 +162,7 @@ async def test_obfuscated_address_on_the_owners_card_is_theirs(no_network):
     scout = site_scout(pages, titles=["Owner", "Partner"])
     contacts = await scout._contacts_from_company("c1", "ashbykerr.test", "Ashby & Kerr", "Law")
     assert [(p.first_name, p.email) for p in contacts if not p.is_company_inbox] == [
-        ("Renata", "rashby@ashbykerr.test")]
+        ("Renata", "rashby@ashbykerr.test"), ("Lise", "")]     # kept, not looked up
 
 
 @pytest.mark.asyncio
@@ -171,8 +173,9 @@ async def test_inbox_is_added_when_the_owners_address_is_only_a_guess(no_network
     }
     scout = site_scout(pages)
     contacts = await scout._contacts_from_company("c1", "whitlockheating.test", "Whitlock", "HVAC")
-    assert [p.is_company_inbox for p in contacts] == [False, True]
-    assert contacts[0].email_status == "guess" and contacts[1].email == "office@whitlockheating.test"
+    assert [p.is_company_inbox for p in contacts] == [False, False, True]
+    assert contacts[0].email_status == "guess" and contacts[-1].email == "office@whitlockheating.test"
+    assert contacts[1].email == ""          # another person named there, kept without a lookup
 
 
 @pytest.mark.asyncio

@@ -1203,7 +1203,7 @@ def cmd_signals(args):
             return
 
         rows = await state.get_signal_codes()
-        counts = {c["signal_code"]: c for c in await state.signal_counts()}
+        states = await state.signal_states([r["code"] for r in rows])
         by_status = {"confirmed": 0, "proposed": 0, "rejected": 0}
         for r in rows:
             by_status[r["status"]] = by_status.get(r["status"], 0) + 1
@@ -1217,8 +1217,10 @@ def cmd_signals(args):
             if r["category"] != current:
                 current = r["category"]
                 print(f"\n  {current.upper()}")
-            seen = counts.get(r["code"], {}).get("companies", 0)
-            seen_txt = f"  ({seen} companies)" if seen else ""
+            # Companies checked either way; the rest are not checked yet.
+            st = states.get(r["code"], {})
+            seen_txt = (f"  ({st['true']} yes, {st['false']} no, {st['unknown']} not checked)"
+                        if st.get("true") or st.get("false") else "")
             print(f"    {mark.get(r['status'], '     ')} {r['code']:<22} "
                   f"{r['label']}{seen_txt}")
             print(f"          {r['cost_note']}")
@@ -1231,6 +1233,96 @@ def cmd_signals(args):
             print("")
 
     asyncio.run(_signals())
+
+
+# Why the resolver thinks two companies may be one, in words.
+_MATCH_REASONS = {
+    "cui": "same tax code (CUI) {value}",
+    "reg": "same registration number {value}",
+    "external": "same listing {value}",
+    "domain": "same website {value}",
+    "declared_domain": "the registry lists their website {value}",
+    "phone": "same phone {value}",
+    "name": "same name in the same town",
+    "different_websites": "different websites, so the name alone doesn't count",
+}
+_MERGE_REFUSED = {
+    "different_cui": "they have different tax codes (CUI): two companies, never merged",
+    "different_reg": "they have different registration numbers: two companies, never merged",
+    "already_merged": "one of them is already merged; undo that first",
+    "survivor_merged": "the company it joined has since been merged itself; undo that first",
+    "not_merged": "that company isn't merged",
+    "not_found": "no such company",
+    "same_company": "that is the same company twice",
+}
+
+
+def _match_reasons(reasons) -> str:
+    return "; ".join(_MATCH_REASONS.get(r.get("code"), r.get("code", ""))
+                     .format(value=r.get("value", "")) for r in reasons or [])
+
+
+def cmd_duplicates(args):
+    """Possible duplicates: pairs the resolver wasn't sure enough to merge,
+    and merges in force. Merge, keep apart, or undo a merge."""
+    from harvey.resolver import MergeRefused
+    from harvey.state import StateManager
+
+    def side(c) -> str:
+        if not c:
+            return "(gone)"
+        bits = [c.get("name") or "(no name)"]
+        if c.get("cui"):
+            bits.append(f"CUI {c['cui']}")
+        place = (c.get("location") or "").replace(", Romania", "")
+        if place:
+            bits.append(place)
+        bits += c.get("phones") or []
+        bits += c.get("domains") or []
+        return " · ".join(bits) + f"  [{c['id']}, {', '.join(c.get('sources') or []) or '?'}]"
+
+    async def _duplicates():
+        state = StateManager()
+        await state.init_db()
+        try:
+            if args.merge:
+                keep, merged = args.merge
+                await state.merge_companies(keep, merged)
+                print(f"\n  Merged {merged} into {keep}. Undo with: harvey duplicates --undo {merged}\n")
+                return
+            if args.separate:
+                await state.separate_companies(*args.separate)
+                print("\n  Kept apart: they won't be suggested again.\n")
+                return
+            if args.undo:
+                done = await state.undo_merge(args.undo)
+                print(f"\n  Undone: {done['merged']} is its own company again, "
+                      f"apart from {done['survivor']}.\n")
+                return
+        except MergeRefused as e:
+            print(f"\n  Can't: {_MERGE_REFUSED.get(e.code, e.code)}.\n")
+            sys.exit(1)
+
+        pending = await state.duplicates("pending", args.limit)
+        print(f"\n  Possible duplicates — {len(pending)} to decide")
+        print("  " + "=" * 66)
+        for p in pending:
+            print(f"\n  {round(p['score'] * 100)}%  {_match_reasons(p['reasons'])}")
+            print(f"    A  {side(p['a'])}")
+            print(f"    B  {side(p['b'])}")
+            print(f"    same:      harvey duplicates --merge {p['company_a']} {p['company_b']}")
+            print(f"    different: harvey duplicates --separate {p['company_a']} {p['company_b']}")
+        merged = await state.merges(args.limit)
+        if merged:
+            print(f"\n  Merged — {len(merged)} (newest first)")
+            for m in merged:
+                who = "automatically" if m["decided_by"] == "auto" else "by you"
+                print(f"\n    {side(m['b'])}")
+                print(f"      joined {side(m['a'])} {who}: {_match_reasons(m['reasons'])}")
+                print(f"      undo: harvey duplicates --undo {m['merged']}")
+        print("")
+
+    asyncio.run(_duplicates())
 
 
 def cmd_retry_writes(args):
@@ -1708,6 +1800,18 @@ def main():
     sub.add_argument("--reject", metavar="CODES", default="",
                      help="Comma-separated codes to turn off")
     sub.set_defaults(func=cmd_signals)
+
+    sub = subparsers.add_parser(
+        "duplicates", help="Companies that may be on file twice: merge, keep apart, undo")
+    group = sub.add_mutually_exclusive_group()
+    group.add_argument("--merge", nargs=2, metavar=("KEEP", "MERGED"),
+                       help="Same company: MERGED's facts move onto KEEP")
+    group.add_argument("--separate", nargs=2, metavar=("A", "B"),
+                       help="Different companies: stop suggesting the pair")
+    group.add_argument("--undo", metavar="MERGED",
+                       help="Undo the merge that took this company")
+    sub.add_argument("--limit", type=int, default=50, help="How many to list (default 50)")
+    sub.set_defaults(func=cmd_duplicates)
 
     sub = subparsers.add_parser(
         "retry-writes", help="Retry prospects the Writer couldn't write an email for")

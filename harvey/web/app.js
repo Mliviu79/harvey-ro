@@ -1138,8 +1138,13 @@ function sigLabel(sig) {
 function sigRow(sig) {
   const free = /free|included/i.test(sig.cost_note || '');
   const costCls = free ? 'free' : (/\$/.test(sig.cost_note || '') ? 'paid' : '');
-  const seen = sig.companies
-    ? '<span class="cost-chip">' + escHtml(t('sig.seen', {n: sig.companies})) + '</span>' : '';
+  // Checked either way, and the rest: "not checked" is unknown, never "no".
+  const st = sig.states || {};
+  const seen = st.true || st.false
+    ? '<span class="cost-chip" title="' + escHtml(t('sig.states_hint')) + '">' +
+        escHtml(t('sig.states', {yes: st.true || 0, no: st.false || 0, unk: st.unknown || 0})) + '</span>'
+    : sig.companies
+      ? '<span class="cost-chip">' + escHtml(t('sig.seen', {n: sig.companies})) + '</span>' : '';
   const floor = sig.confidence_floor > 0
     ? '<span class="cost-chip">' + escHtml(t('sig.floor', {p: Math.round(sig.confidence_floor * 100)})) + '</span>' : '';
 
@@ -1383,7 +1388,8 @@ function renderDiscoverResult(report, running) {
 
 // ── Cohort builder: a prospect list is a query ──
 
-let _cohort = { require: new Set(), exclude: new Set(), ranges: {} };
+// verdict: the result tab shown, match / possible / no_match.
+let _cohort = { require: new Set(), exclude: new Set(), ranges: {}, verdict: 'match' };
 let _cohortOffset = 0;
 let _cohortGeneration = 0;
 const COHORT_PAGE = 50;
@@ -1462,7 +1468,8 @@ async function runCohort() {
   if (!el) return;
   const require = [..._cohort.require], exclude = [..._cohort.exclude];
   const ranges = _cohortRanges();
-  if (!require.length && !ranges.length) { el.innerHTML = ''; return; }
+  const verdict = _cohort.verdict || 'match';
+  if (!require.length && !exclude.length && !ranges.length) { el.innerHTML = ''; return; }
   // Remove the prior export button as soon as its criteria become stale.
   el.innerHTML = '<p class="muted">' + escHtml(t('cohort.loading')) + '</p>';
 
@@ -1470,7 +1477,7 @@ async function runCohort() {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({require: require, exclude: exclude, ranges: ranges,
-                          offset: offset, limit: COHORT_PAGE}),
+                          verdict: verdict, offset: offset, limit: COHORT_PAGE}),
   });
   if (generation !== _cohortGeneration) return;
   if (!data || data.error) {
@@ -1478,9 +1485,19 @@ async function runCohort() {
     return;
   }
 
+  // Every company lands in one of three tabs; "possible" is not checked yet.
+  const counts = data.counts || {match: data.size};
+  const shown = data.total !== undefined ? data.total : data.size;
   let html = '<div class="cohort-out">' +
-    '<div class="cohort-size">' + fmtN(data.size) + '</div>' +
-    '<div class="muted small" style="margin-top:2px">' + escHtml(t('cohort.match', {n: data.size})) + '</div>';
+    '<div class="segmented" role="group" aria-label="' + escHtml(t('cohort.tabs_label')) + '">' +
+    ['match', 'possible', 'no_match'].map(v =>
+      '<button class="' + (v === verdict ? 'on' : '') + '" aria-pressed="' + (v === verdict) +
+        '" onclick="setCohortVerdict(\'' + v + '\')">' + escHtml(t('cohort.tab.' + v)) +
+        ' <span class="n">' + fmtN(counts[v] || 0) + '</span></button>').join('') + '</div>' +
+    '<div class="cohort-size" style="margin-top:14px">' + fmtN(shown) + '</div>' +
+    '<div class="muted small" style="margin-top:2px">' +
+      escHtml(verdict === 'match' ? t('cohort.match', {n: shown}) : t('cohort.count.' + verdict, {n: shown})) + '</div>' +
+    '<div class="muted small" style="margin-top:2px">' + escHtml(t('cohort.explain.' + verdict)) + '</div>';
 
   if (data.companies && data.companies.length) {
     html += '<div class="table-card" style="margin-top:16px"><table><thead><tr>' +
@@ -1494,9 +1511,9 @@ async function runCohort() {
       ).join('') + '</tbody></table></div>';
 
     const first = data.offset + 1, last = data.offset + data.companies.length;
-    const hasPrev = data.offset > 0, hasNext = last < data.size;
+    const hasPrev = data.offset > 0, hasNext = last < shown;
     html += '<div class="pager-row">' +
-      '<span class="muted small">' + escHtml(t('page.range', {from: first, to: last, total: data.size})) + '</span>' +
+      '<span class="muted small">' + escHtml(t('page.range', {from: first, to: last, total: shown})) + '</span>' +
       '<span style="flex:1"></span>' +
       '<button class="btn btn-secondary btn-sm" onclick="pageCohort(-1)"' +
         (hasPrev ? '' : ' disabled') + '>' + escHtml(t('page.prev')) + '</button>' +
@@ -1504,8 +1521,9 @@ async function runCohort() {
         (hasNext ? '' : ' disabled') + '>' + escHtml(t('page.next')) + '</button>' +
       '<button class="btn btn-secondary btn-sm" onclick="exportCohort(this)">' + escHtml(t('cohort.export')) + '</button>' +
       '</div>';
-  } else if (data.size === 0) {
-    html += '<p class="muted small" style="margin-top:12px">' + escHtml(t('cohort.none')) + '</p>';
+  } else if (shown === 0) {
+    html += '<p class="muted small" style="margin-top:12px">' +
+      escHtml(t(verdict === 'match' ? 'cohort.none' : 'cohort.none_tab')) + '</p>';
   } else if (_cohortOffset > 0) {
     // The cohort shrank under us (a re-profile, a delete): back to page one.
     _cohortOffset = 0;
@@ -1523,6 +1541,8 @@ function _cohortRanges() {
 async function exportCohort(button) {
   const qs = new URLSearchParams({require: [..._cohort.require].join(','),
                                   exclude: [..._cohort.exclude].join(',')});
+  // The tab on screen; the CSV says each company's verdict either way.
+  if (_cohort.verdict && _cohort.verdict !== 'match') qs.set('verdict', _cohort.verdict);
   // Ranges travel as "CODE:min:max", a blank side meaning no limit.
   const ranges = Object.entries(_cohort.ranges || {})
     .map(([code, r]) => code + ':' + (r.min ?? '') + ':' + (r.max ?? ''));
@@ -1554,6 +1574,12 @@ async function exportCohort(button) {
 
 function pageCohort(dir) {
   _cohortOffset = Math.max(0, _cohortOffset + dir * COHORT_PAGE);
+  runCohort();
+}
+
+function setCohortVerdict(verdict) {
+  _cohort.verdict = verdict;
+  _cohortOffset = 0;
   runCohort();
 }
 
@@ -2499,13 +2525,14 @@ async function loadCompanies() {
         'data-i18n-placeholder="' + searchPh('co') + '" data-i18n-aria="co.search_label" ' +
         'placeholder="' + escHtml(t(searchPh('co'))) + '" aria-label="' + escHtml(t('co.search_label')) + '" ' +
         'oninput="companySearchInput(this.value)"></label>' +
-      '<div id="company-actions"></div>' +
-      '</div><div id="company-selbar"></div><div id="company-rows"></div>';
+      '<div id="company-dupes"></div><div id="company-actions"></div>' +
+      '</div><div id="dupes-panel"></div><div id="company-selbar"></div><div id="company-rows"></div>';
     document.getElementById('company-search').value = _co.q;
   }
   const rowsEl = document.getElementById('company-rows');
   const q = _co.q.trim();
   const gen = ++_co.gen;
+  loadDuplicates();
   const res = q
     ? await api('/api/companies/search?limit=' + _co.limit + '&offset=' + _co.offset + '&q=' + encodeURIComponent(q))
     : await api('/api/companies?limit=' + _co.limit + '&offset=' + _co.offset);
@@ -2548,6 +2575,136 @@ async function loadCompanies() {
       '<td class="co-src muted" data-label="' + escHtml(t('co.col.source')) + '">' + sourceLabel(c.source) + '</td></tr>';
   });
   rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_co, _co.total, 'pageCompanies');
+}
+
+// ── Possible duplicates ──
+//
+// Pairs the resolver wasn't sure enough to merge on its own, side by side,
+// for a person to decide; and the merges in force, each one undoable.
+
+let _dup = { open: false, view: 'pending', pending: 0, rows: [], gen: 0, busy: false };
+
+async function loadDuplicates() {
+  const gen = ++_dup.gen;
+  const res = await api('/api/duplicates?status=' + (_dup.open ? _dup.view : 'pending'));
+  if (gen !== _dup.gen || !res) return;
+  _dup.pending = res.pending || 0;
+  _dup.rows = res.rows || [];
+  renderDuplicates();
+}
+
+function renderDuplicates() {
+  const btn = document.getElementById('company-dupes');
+  if (btn) {
+    btn.innerHTML = _dup.pending || _dup.open
+      ? '<button type="button" class="chip-btn' + (_dup.pending ? ' on' : '') + '" aria-expanded="' + _dup.open +
+        '" onclick="toggleDuplicates()">' + escHtml(t('dup.button', {n: _dup.pending})) + '</button>'
+      : '';
+  }
+  const el = document.getElementById('dupes-panel');
+  if (!el) return;
+  if (!_dup.open) { el.innerHTML = ''; return; }
+  const tab = (view, label) => '<button type="button"' + (_dup.view === view ? ' class="on" aria-pressed="true"' : ' aria-pressed="false"') +
+    ' onclick="setDuplicatesView(' + jsq(view) + ')">' + escHtml(label) + '</button>';
+  const rows = _dup.rows;
+  const body = !rows.length
+    ? '<p class="muted">' + escHtml(t(_dup.view === 'merged' ? 'dup.empty_merged' : 'dup.empty')) + '</p>'
+    : rows.map(_dup.view === 'merged' ? mergedRow : duplicateRow).join('');
+  el.innerHTML = '<div class="table-card dup-panel"><div class="dup-head"><div><h3>' + escHtml(t('dup.title')) + '</h3>' +
+    '<p class="muted">' + escHtml(t('dup.lede')) + '</p></div>' +
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="toggleDuplicates()">' + escHtml(t('dup.close')) + '</button></div>' +
+    '<div class="segmented dup-tabs" role="group" aria-label="' + escHtml(t('dup.title')) + '">' + tab('pending', t('dup.tab.pending', {n: _dup.pending})) + tab('merged', t('dup.tab.merged')) + '</div>' +
+    body + '</div>';
+}
+
+function dupReasons(reasons) {
+  return (reasons || []).map(r => escHtml(t('dup.reason.' + r.code, {value: r.value || ''}))).join(' · ');
+}
+
+function dupSide(c) {
+  if (!c) return '<div class="dup-side"></div>';
+  const place = String(c.location || '').replace(/,\s*Romania$/i, '');
+  const phones = (c.phones || []).length ? c.phones : (c.phone ? [c.phone] : []);
+  const domains = (c.domains || []).length ? c.domains : (c.domain ? [c.domain] : []);
+  const line = parts => parts.filter(Boolean).join('<span class="dot-sep">·</span>');
+  return '<div class="dup-side"><button type="button" class="link-btn cell-main" onclick="openCompany(' + jsq(c.id) + ')">' +
+      escHtml(c.name || t('dup.no_name')) + '</button>' +
+    '<div class="cell-sub">' + line([c.cui ? '<span class="mono">' + escHtml(t('co.cui', {cui: c.cui})) + '</span>' : '',
+      place ? escHtml(place) : '']) + '</div>' +
+    '<div class="cell-sub mono">' + (phones.length ? phones.map(escHtml).join(', ') : escHtml(t('co.no_phone'))) + '</div>' +
+    (domains.length ? '<div class="cell-sub">' + domains.map(escHtml).join(', ') + '</div>' : '') +
+    '<div class="cell-sub muted">' + line((c.sources || []).map(x => sourceLabel(String(x).replace(/^discover:/, '')))) + '</div></div>';
+}
+
+function duplicateRow(p) {
+  return '<div class="dup-pair"><div class="dup-why"><b>' + escHtml(t('dup.score', {n: Math.round((p.score || 0) * 100)})) + '</b> ' +
+      dupReasons(p.reasons) + '</div>' +
+    '<div class="dup-sides">' + dupSide(p.a) + dupSide(p.b) + '</div>' +
+    '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm" onclick="decideDuplicate(\'merge\', ' +
+      jsq(p.company_a) + ', ' + jsq(p.company_b) + ')">' + escHtml(t('dup.same')) + '</button>' +
+    '<button type="button" class="btn btn-secondary btn-sm" onclick="decideDuplicate(\'separate\', ' +
+      jsq(p.company_a) + ', ' + jsq(p.company_b) + ')">' + escHtml(t('dup.different')) + '</button></div></div>';
+}
+
+function mergedRow(m) {
+  return '<div class="dup-pair"><div class="dup-why"><b>' + escHtml(t(m.decided_by === 'auto' ? 'dup.by_auto' : 'dup.by_you')) + '</b> ' +
+      (m.score ? escHtml(t('dup.score', {n: Math.round(m.score * 100)})) + ' · ' : '') + dupReasons(m.reasons) + '</div>' +
+    '<div class="dup-sides">' + dupSide(m.b) + dupSide(m.a) + '</div>' +
+    '<div class="cell-sub">' + escHtml((m.b && m.b.name) || '') + ' ' + escHtml(t('dup.joined')) + ' ' + escHtml((m.a && m.a.name) || '') + '</div>' +
+    '<div class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="undoMerge(' + jsq(m.merged) + ')">' +
+      escHtml(t('dup.undo')) + '</button></div></div>';
+}
+
+function toggleDuplicates() {
+  _dup.open = !_dup.open;
+  _dup.view = 'pending';
+  _dup.rows = [];
+  renderDuplicates();
+  loadDuplicates();
+}
+
+function setDuplicatesView(view) {
+  _dup.view = view;
+  _dup.rows = [];
+  renderDuplicates();
+  loadDuplicates();
+}
+
+function dupRefused(res) {
+  const key = 'dup.refused.' + (res && res.error);
+  return t(hasKey(LANG, key) ? key : 'dup.refused.other');
+}
+
+// One decision at a time, its buttons off until it is answered: a double
+// click must not send the same merge twice.
+async function dupPost(path, body) {
+  if (_dup.busy) return undefined;
+  _dup.busy = true;
+  const panel = document.getElementById('dupes-panel');
+  if (panel) panel.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  try {
+    return await api(path, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+  } finally {
+    _dup.busy = false;
+  }
+}
+
+async function decideDuplicate(how, a, b) {
+  const res = await dupPost('/api/duplicates/' + how, {a: a, b: b});
+  if (res === undefined) return;
+  if (!res || res.success === false) { showToast(dupRefused(res), 'error'); return loadDuplicates(); }
+  showToast(t(how === 'merge' ? 'dup.toast.merged' : 'dup.toast.separate'));
+  loadCompanies();
+}
+
+async function undoMerge(companyId) {
+  const res = await dupPost('/api/duplicates/undo', {company_id: companyId});
+  if (res === undefined) return;
+  if (!res || res.success === false) { showToast(dupRefused(res), 'error'); return loadDuplicates(); }
+  showToast(t('dup.toast.undone'));
+  loadCompanies();
 }
 
 function companyIdLine(c) {

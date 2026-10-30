@@ -30,6 +30,8 @@ class Company(BaseModel):
     # authority and a map listing can all be joined on.
     cui: str = ""
     address: str = ""         # registered office, street and number
+    # The company this record was merged into (harvey/resolver.py), or "".
+    merged_into: str = ""
     notes: str = ""
     # Buying signals: detected tools on their site, and timely triggers
     # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]

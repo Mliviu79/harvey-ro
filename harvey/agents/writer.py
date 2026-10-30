@@ -19,7 +19,7 @@ from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager, poorly_scored
 from harvey.sending_mode import sync_sending_mode
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
@@ -78,6 +78,9 @@ class Writer:
             p for p in new_prospects
             if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
         ]
+        # Scout keeps poorly scored contacts on file, ranked last; they are
+        # not worth a cold email.
+        prospects_with_email = [p for p in prospects_with_email if not poorly_scored(p.score)]
         # Someone at their company already replied: no cold email to write.
         prospects_with_email = [
             p for p in prospects_with_email

@@ -640,6 +640,14 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
         numbers = site_phones.setdefault(r["company_id"], [])
         if r["value_text"] not in numbers:
             numbers.append(r["value_text"])
+    # Every number any source gave (a listing's, a merged record's): kept,
+    # shown after the main one.
+    for r in await query_db(
+            "SELECT company_id, value FROM company_ids WHERE kind = 'phone' "
+            f"AND company_id IN ({marks}) ORDER BY created_at, rowid", tuple(ids)):
+        numbers = site_phones.setdefault(r["company_id"], [])
+        if r["value"] not in numbers:
+            numbers.append(r["value"])
     people: dict[str, list[dict]] = {}
     for r in await query_db(
             "SELECT company_id, value_text FROM observations WHERE signal_code = 'CONTACT_FOUND' "
@@ -695,6 +703,9 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     return rows
 
 
+# Companies still standing on their own: a merged one's facts are its survivor's.
+_LIVE = "COALESCE(merged_into, '') = ''"
+
 _COMPANY_COLUMNS = ("c.id, c.name, c.cui, c.domain, c.website, c.industry, c.company_size, "
                     "c.location, c.address, c.phone, c.source, c.source_url, c.description, "
                     "c.external_id, c.created_at, c.updated_at")
@@ -710,12 +721,13 @@ async def get_companies(limit: int | None = None, offset: int | None = None):
         return await query_db("""
             SELECT c.*,
                 (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
-            FROM companies c ORDER BY c.created_at DESC LIMIT 200
+            FROM companies c WHERE COALESCE(c.merged_into, '') = ''
+            ORDER BY c.created_at DESC LIMIT 200
         """)
     limit, offset = _page_args(limit, offset)
-    total = await _scalar("SELECT COUNT(*) AS n FROM companies")
+    total = await _scalar(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
     rows = await query_db(
-        f"SELECT {_COMPANY_COLUMNS} FROM companies c "
+        f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE COALESCE(c.merged_into, '') = '' "
         "ORDER BY c.created_at DESC, c.rowid DESC LIMIT ? OFFSET ?", (limit, offset))
     rows = await _enrich_companies(rows, _load_config_quietly())
     return {"total": total, "offset": offset, "limit": limit, "companies": rows}
@@ -733,7 +745,8 @@ async def _company_search(state, q: str, limit: int, offset: int) -> tuple[int, 
         digits = m.group(1)
         hits = await query_db(
             "SELECT id, name, cui, location, address, phone, website, domain, industry, source "
-            "FROM companies WHERE cui != '' AND REPLACE(UPPER(REPLACE(cui, ' ', '')), 'RO', '') = ? "
+            f"FROM companies WHERE {_LIVE} AND cui != '' "
+            "AND REPLACE(UPPER(REPLACE(cui, ' ', '')), 'RO', '') = ? "
             "ORDER BY name", (digits,))
         if hits:
             activities = await state.get_company_activities([h["id"] for h in hits])
@@ -788,6 +801,101 @@ async def get_company(company_id: str):
         return JSONResponse({"error": "not found"}, status_code=404)
     (row,) = await _enrich_companies(rows, _load_config_quietly())
     return row
+
+
+# ── Possible duplicates ──
+#
+# The resolver (harvey/resolver.py) merges a company found twice on its own
+# only when sure; a possible match waits here for a person. Nothing is
+# deleted either way: a merge moves one company's facts onto the other and
+# can be undone.
+
+
+def _refused(e) -> JSONResponse:
+    return JSONResponse({"error": e.code}, status_code=409 if e.code != "not_found" else 404)
+
+
+@app.get("/api/duplicates")
+async def get_duplicates(status: str = "pending", limit: int = 100):
+    """Pairs on the review list (``status`` pending | separate) or merges in
+    force (``status`` merged), each side with its name, CUI, town, phones,
+    domains and sources, plus the score and why."""
+    empty = {"status": status, "pending": 0, "rows": []}
+    if status not in ("pending", "merged", "separate") or not DB_PATH.exists():
+        return empty
+    limit = max(1, min(limit, 500))
+    try:
+        state = _state()
+        await state.init_db()
+        rows = await (state.merges(limit) if status == "merged"
+                      else state.duplicates(status, limit))
+        pending = await state.count_duplicates()
+    except Exception as e:
+        logger.warning("duplicates failed: %s", e)
+        return JSONResponse({**empty, "error": "duplicates failed"}, status_code=500)
+    return {"status": status, "pending": pending, "rows": rows}
+
+
+async def _pair(request: Request) -> tuple[str, str]:
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    return str(data.get("a") or "").strip(), str(data.get("b") or "").strip()
+
+
+@app.post("/api/duplicates/merge")
+async def merge_duplicates(request: Request):
+    """"Same company": the one with a CUI (else the older) keeps the record,
+    the other's facts move onto it."""
+    from harvey.resolver import MergeRefused
+
+    a, b = await _pair(request)
+    if not a or not b:
+        return JSONResponse({"error": "two companies needed"}, status_code=400)
+    state = _state()
+    await state.init_db()
+    try:
+        return await state.merge_pair(a, b)
+    except MergeRefused as e:
+        return _refused(e)
+
+
+@app.post("/api/duplicates/separate")
+async def separate_duplicates(request: Request):
+    """"Different companies": the pair leaves the review list."""
+    from harvey.resolver import MergeRefused
+
+    a, b = await _pair(request)
+    if not a or not b:
+        return JSONResponse({"error": "two companies needed"}, status_code=400)
+    state = _state()
+    await state.init_db()
+    try:
+        await state.separate_companies(a, b)
+    except MergeRefused as e:
+        return _refused(e)
+    return {"ok": True}
+
+
+@app.post("/api/duplicates/undo")
+async def undo_duplicate(request: Request):
+    """Undo a merge: ``company_id`` is the company that was merged."""
+    from harvey.resolver import MergeRefused
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    company_id = str(data.get("company_id") or "").strip()
+    if not company_id:
+        return JSONResponse({"error": "company_id needed"}, status_code=400)
+    state = _state()
+    await state.init_db()
+    try:
+        return await state.undo_merge(company_id)
+    except MergeRefused as e:
+        return _refused(e)
 
 
 # ── Feedback ──
@@ -1979,7 +2087,8 @@ async def get_overview():
     has_phone = ("(COALESCE(c.phone, '') != '' OR EXISTS (SELECT 1 FROM observations o "
                  "WHERE o.company_id = c.id AND o.signal_code = 'PHONE_NUMBER' AND o.value_text != '') "
                  "OR EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id AND p.phone != ''))")
-    phone_ids = {r["id"] for r in await query_db(f"SELECT c.id FROM companies c WHERE {has_phone}")}
+    phone_ids = {r["id"] for r in await query_db(
+        f"SELECT c.id FROM companies c WHERE COALESCE(c.merged_into, '') = '' AND {has_phone}")}
     config = _load_config_quietly()
     blocked = _blocked_entries(config)
     email_ids = set()
@@ -1994,7 +2103,7 @@ async def get_overview():
             continue
         email_ids.add(r["company_id"])
     return {
-        "companies": await _scalar("SELECT COUNT(*) AS n FROM companies"),
+        "companies": await _scalar(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}"),
         "with_phone": len(phone_ids),
         "with_email": len(email_ids),
         "with_both": len(phone_ids & email_ids),
@@ -2492,8 +2601,8 @@ async def get_live_status():
     read), so a finished step always reaches 100% instead of sticking.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # DB stores naive UTC
-    has_site = "COALESCE(domain, '') != ''"
-    companies = await _scalar("SELECT COUNT(*) FROM companies")
+    has_site = f"COALESCE(domain, '') != '' AND {_LIVE}"
+    companies = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {_LIVE}")
     with_site = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {has_site}")
     no_site = companies - with_site
     profiled = await _scalar(
@@ -2703,7 +2812,7 @@ async def get_today():
             "SELECT COUNT(*) AS n FROM conversations WHERE status = 'needs_human'"
         )
         needs_human = handed[0]["n"] if handed else 0
-        companies = await query_db("SELECT COUNT(*) AS n FROM companies")
+        companies = await query_db(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
         n_companies = companies[0]["n"] if companies else 0
 
         unprofiled_count = await state.count_companies_needing_profile()
@@ -2909,7 +3018,7 @@ CATEGORY_ORDER = ["discovery", "profile", "people", "verification"]
 async def get_signals():
     """The signal vocabulary, grouped for review, with live cohort sizes."""
     try:
-        from harvey.signals import seed_signal_catalog
+        from harvey.signals import absence, seed_signal_catalog
 
         state = _state()
         await state.init_db()
@@ -2920,6 +3029,8 @@ async def get_signals():
 
         codes = await state.get_signal_codes()
         counts = {c["signal_code"]: c for c in await state.signal_counts()}
+        # True / false / unknown per company: "unknown" is not checked yet.
+        states = await state.signal_states([sig["code"] for sig in codes])
 
         groups, summary = [], {"proposed": 0, "confirmed": 0, "rejected": 0}
         for cat in CATEGORY_ORDER:
@@ -2932,6 +3043,8 @@ async def get_signals():
                     **sig,
                     "companies": seen.get("companies", 0),
                     "observations": seen.get("observations", 0),
+                    "states": states.get(sig["code"], {}),
+                    "absence": absence(sig["code"]),
                 })
             if rows:
                 meta = CATEGORY_META.get(cat, {})
@@ -2997,11 +3110,34 @@ COHORT_MAX_PAGE_SIZE = 200
 
 async def _cohort_companies(require: list[str], exclude: list[str],
                             offset: int = 0, limit: int | None = None,
-                            ranges: list[dict] | None = None):
+                            ranges: list[dict] | None = None,
+                            verdicts=("match",)):
+    """(counts per verdict, the page of companies in ``verdicts``)."""
     state = _state()
     await state.init_db()
-    return await state.cohort_companies(require, exclude, offset, limit,
-                                        ranges=ranges)
+    return await state.cohort_verdicts(require, exclude, ranges, verdicts=verdicts,
+                                       offset=offset, limit=limit)
+
+
+COHORT_VERDICTS = ("match", "possible", "no_match")
+
+
+def _verdicts(raw) -> list[str]:
+    """Which result tabs: one verdict, a list, CSV, or "all"."""
+    if raw is None or raw == "" or raw == []:
+        return ["match"]
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list) or any(not isinstance(v, str) for v in raw):
+        raise ValueError("verdict must be match, possible, no_match or all")
+    out = []
+    for v in (v.strip() for v in raw):
+        if v == "all":
+            return list(COHORT_VERDICTS)
+        if v not in COHORT_VERDICTS:
+            raise ValueError("verdict must be match, possible, no_match or all")
+        out.append(v)
+    return list(dict.fromkeys(out))
 
 
 def _codes(raw) -> list[str]:
@@ -3082,9 +3218,15 @@ async def preview_cohort(request: Request):
 
     The payoff for confirming signals: a cohort is a query, not a list. Set
     intersection happens in SQL — intersecting in JS over a capped fetch
-    silently returns the wrong answer. ``offset``/``limit`` page through the
-    matches; ``size`` is always the whole cohort. ``ranges`` adds numeric
-    filters — ``[{"code": "SERP_RANK", "min": 11, "max": 30}]``.
+    silently returns the wrong answer. ``ranges`` adds numeric filters —
+    ``[{"code": "SERP_RANK", "min": 11, "max": 30}]``. An exclusion alone is
+    a cohort too.
+
+    Every company gets a verdict: ``match`` (every condition checked and
+    met), ``possible`` (nothing rules it out, something isn't checked yet)
+    or ``no_match``. ``counts`` has all three and ``size`` is the matches.
+    ``verdict`` picks the tab ``companies`` pages through with
+    ``offset``/``limit`` (default ``match``); each row carries its verdict.
     """
     try:
         body = await request.json()
@@ -3096,13 +3238,16 @@ async def preview_cohort(request: Request):
         offset = max(0, _cohort_integer(body.get("offset"), 0))
         limit = min(max(1, _cohort_integer(body.get("limit"), COHORT_PAGE_SIZE)),
                     COHORT_MAX_PAGE_SIZE)
-        if not require and not ranges:
-            return {"size": 0, "offset": 0, "limit": limit, "companies": []}
-
-        size, rows = await _cohort_companies(require, exclude, offset, limit,
-                                             ranges=ranges)
-        return {"size": size, "offset": offset, "limit": limit,
-                "companies": rows}
+        verdicts = _verdicts(body.get("verdict"))
+        if not require and not exclude and not ranges:
+            # No condition is an empty cohort, never every company.
+            offset = 0
+        counts, rows = await _cohort_companies(require, exclude, offset, limit,
+                                               ranges=ranges, verdicts=verdicts)
+        return {"size": counts["match"], "counts": counts,
+                "verdict": verdicts[0] if len(verdicts) == 1 else "all",
+                "total": sum(counts[v] for v in verdicts),
+                "offset": offset, "limit": limit, "companies": rows}
     except (ValueError, TypeError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
@@ -3115,23 +3260,27 @@ def _csv_cell(value):
 
 
 @app.get("/api/cohort.csv")
-async def export_cohort(require: str = "", exclude: str = "", ranges: str = ""):
-    """The whole cohort as a CSV download — every match, not just one page."""
+async def export_cohort(require: str = "", exclude: str = "", ranges: str = "",
+                        verdict: str = ""):
+    """The whole cohort as a CSV download — every company in the chosen
+    verdicts (matches by default), not just one page, each with its verdict."""
     import csv
     import io
 
+    columns = ("name", "domain", "website", "industry", "location", "verdict")
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["name", "domain", "website", "industry", "location"])
+    writer.writerow(columns)
     try:
         codes = _codes(require)
         excluded = _codes(exclude)
         bounds = _ranges(ranges)
-        if codes or bounds:
-            _, rows = await _cohort_companies(codes, excluded, ranges=bounds)
+        verdicts = _verdicts(verdict)
+        if codes or excluded or bounds:
+            _, rows = await _cohort_companies(codes, excluded, ranges=bounds,
+                                              verdicts=verdicts)
             for r in rows:
-                writer.writerow([_csv_cell(r.get(k)) for k in
-                                 ("name", "domain", "website", "industry", "location")])
+                writer.writerow([_csv_cell(r.get(k)) for k in columns])
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:

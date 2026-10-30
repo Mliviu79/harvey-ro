@@ -11,6 +11,7 @@ upgrade cleanly in place.
 
 import json
 import re
+import sqlite3
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
@@ -25,6 +26,7 @@ from harvey.models.prospect import Prospect
 from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
+from harvey import resolver
 from harvey.paths import PROJECT_ROOT
 from harvey.startups import parse_funding
 
@@ -36,6 +38,14 @@ BUSY_TIMEOUT_SECONDS = 30.0
 # Email statuses the Writer drafts for. Shared with the heartbeat so it only
 # chooses write_campaign when there is something the Writer will act on.
 WRITABLE_EMAIL_STATUSES = ("verified", "risky")
+# Contacts Scout scored below this are kept, ranked last, but not written to.
+# A score of 0 means never scored (Hunter, LinkedIn, imports): still written.
+LOW_SCORE = 30
+
+
+def poorly_scored(score) -> bool:
+    """Scored, and below LOW_SCORE: kept on file, left out of campaigns."""
+    return 0 < (score or 0) < LOW_SCORE
 # Settings key, per prospect: the user emailed them by hand from the
 # dashboard. Its value is the status they had before, so undo is exact; its
 # presence tells the Sender never to email them as well.
@@ -738,7 +748,109 @@ MIGRATIONS: list[str] = [
                 COALESCE(NEW.confidence, 1.0));
     END;
     """,
+    # ── v17: one way to tell whether two records are the same company ──
+    """
+    -- Every key a company is known by, from every source (harvey/resolver.py):
+    -- cui, reg (registration number), external (a listing's id), domain,
+    -- phone (E.164), name ("<name without legal form>@<town>"). Keys add
+    -- up: an old phone stays beside a new one.
+    CREATE TABLE IF NOT EXISTS company_ids (
+        company_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT DEFAULT '',
+        confidence REAL DEFAULT 1.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (kind, value, company_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_ids_company ON company_ids(company_id);
+
+    -- "Is B the same company as A?": pending until a person answers
+    -- (merged | separate). Merges at high confidence are recorded here too.
+    CREATE TABLE IF NOT EXISTS match_candidates (
+        company_a TEXT NOT NULL,
+        company_b TEXT NOT NULL,
+        score REAL DEFAULT 0,
+        reasons_json TEXT DEFAULT '[]',
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        decided_at TIMESTAMP DEFAULT NULL,
+        PRIMARY KEY (company_a, company_b)
+    );
+    CREATE INDEX IF NOT EXISTS idx_match_candidates_status ON match_candidates(status);
+
+    -- A merged company keeps its row, pointing at the one it joined.
+    ALTER TABLE companies ADD COLUMN merged_into TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_companies_merged ON companies(merged_into)
+        WHERE merged_into != '';
+
+    -- Each merge, and every row it moved, so an undo is exact.
+    CREATE TABLE IF NOT EXISTS company_merges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        survivor TEXT NOT NULL,
+        merged TEXT NOT NULL,
+        score REAL,
+        reasons_json TEXT DEFAULT '[]',
+        decided_by TEXT DEFAULT '',
+        filled_json TEXT DEFAULT '{}',
+        moved_json TEXT DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        undone_at TIMESTAMP DEFAULT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_merges_merged ON company_merges(merged);
+    CREATE TABLE IF NOT EXISTS company_merge_moves (
+        merge_id INTEGER NOT NULL,
+        tbl TEXT NOT NULL,
+        key1 TEXT NOT NULL,
+        key2 TEXT DEFAULT '',
+        key3 TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_company_merge_moves ON company_merge_moves(merge_id, tbl, key1);
+
+    -- A merged company leaves the search index (its facts are the survivor's).
+    DROP VIEW IF EXISTS company_search_source;
+    CREATE VIEW company_search_source AS
+    SELECT c.id AS company_id,
+           COALESCE(c.name, '') AS name,
+           TRIM(COALESCE((
+               SELECT group_concat(DISTINCT a.code || ' ' || COALESCE(k.name_ro, '')
+                      || ' ' || COALESCE(k.name_en, '') || ' ' || COALESCE(k.keywords, ''))
+               FROM company_activities a
+               LEFT JOIN caen_classes k ON k.code = a.code AND k.version = a.version
+               WHERE a.company_id = c.id), '') || ' ' || COALESCE(c.industry, '')) AS activity,
+           TRIM(COALESCE(c.location, '') || ' ' || COALESCE(c.address, '')) AS place
+    FROM companies c
+    WHERE COALESCE(c.merged_into, '') = '';
+
+    -- Backfill what plain SQL can read; the rest (domain, phone and name
+    -- keys need Python) follows the migration (_backfill_company_ids).
+    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source)
+        SELECT id, 'external', external_id, source FROM companies WHERE external_id != '';
+    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source)
+        SELECT id, 'reg', substr(external_id, 6), source FROM companies
+        WHERE external_id LIKE 'onrc:_%';
+    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
+        SELECT company_id, 'phone', value_text, collector, MAX(confidence)
+        FROM observations
+        WHERE signal_code = 'PHONE_NUMBER' AND COALESCE(company_id, '') != ''
+          AND value_text LIKE '+%'
+        GROUP BY company_id, value_text;
+
+    -- A phone a site publishes is also a key of its company.
+    CREATE TRIGGER IF NOT EXISTS trg_observations_phone
+    AFTER INSERT ON observations
+    WHEN NEW.signal_code = 'PHONE_NUMBER' AND COALESCE(NEW.company_id, '') != ''
+         AND NEW.value_text LIKE '+%'
+    BEGIN
+        INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
+        VALUES (NEW.company_id, 'phone', NEW.value_text,
+                COALESCE(NEW.collector, ''), COALESCE(NEW.confidence, 1.0));
+    END;
+    """,
 ]
+
+# Live companies: not merged into another (SQL, on companies aliased "c").
+LIVE_COMPANY = "COALESCE(c.merged_into, '') = ''"
 
 # Settings key: fingerprint of the CAEN nomenclature loaded into caen_classes.
 CAEN_REFERENCE_KEY = "caen_reference"
@@ -801,7 +913,16 @@ async def _company_by(db, column: str, value: str) -> Company | None:
         if not row:
             return None
         names = [c[0] for c in cur.description]
-    return _company_from_row(dict(zip(names, row)))
+    found = dict(zip(names, row))
+    if found.get("merged_into"):
+        # A merged record stands for the company it joined.
+        survivor = await resolver.live_id(db, found["id"])
+        async with db.execute("SELECT * FROM companies WHERE id = ?", (survivor,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return None
+        found = dict(zip(names, row))
+    return _company_from_row(found)
 
 
 async def _insert_company(db, company: Company) -> str:
@@ -826,7 +947,9 @@ async def _insert_company(db, company: Company) -> str:
             company.updated_at.isoformat(),
         ),
     )
-    if cursor.rowcount == 0:
+    if cursor.rowcount:
+        await resolver.register(db, company.id, resolver.identifiers(company), company.source)
+    else:
         # Uniqueness conflict: hand back the existing record's id.
         for column, value in (("cui", company.cui),
                               ("domain", company.domain),
@@ -838,7 +961,7 @@ async def _insert_company(db, company: Company) -> str:
             ) as cur:
                 row = await cur.fetchone()
                 if row:
-                    company.id = row[0]
+                    company.id = await resolver.live_id(db, row[0]) or row[0]
                     break
     return company.id
 
@@ -876,6 +999,8 @@ async def _fill_company_fields(db, company_id: str, fields: dict) -> list[str]:
         )
         if cursor.rowcount:
             changed.append(column)
+    if changed:
+        await resolver.register_company(db, company_id)
     return changed
 
 
@@ -927,6 +1052,61 @@ async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
     return len(payload)
 
 
+class Resolution:
+    """What saving a company did: ``company_id`` is the record to write its
+    facts to; ``created`` whether that is a new company; ``match`` how it
+    was matched; ``merged_from`` the row an automatic merge folded in."""
+
+    __slots__ = ("company_id", "created", "match", "merged_from")
+
+    def __init__(self, company_id: str, created: bool, match: "resolver.Match",
+                 merged_from: str = ""):
+        self.company_id, self.created, self.match = company_id, created, match
+        self.merged_from = merged_from
+
+
+def _own_keys(company: Company, match: "resolver.Match") -> list[tuple[str, str]]:
+    """The keys a matched record gains: those it doesn't hold yet, less a
+    domain the caller dropped from the record (one another company holds)."""
+    return [(kind, value) for kind, value in match.new_ids
+            if kind != "domain" or value == company.domain]
+
+
+async def _save_company(db, company: Company, match: "resolver.Match",
+                        extra_ids=()) -> Resolution:
+    """Record a company the way ``match`` (resolver.match) found it:
+    - the same record (same CUI, listing id or domain): its keys are added
+      to that record, nothing else changes;
+    - the same company by other evidence (ATTACH or more): saved, then
+      merged into the one on file, which can be undone;
+    - a possible match (REVIEW to ATTACH): saved as a new company, and the
+      pair goes to the review list;
+    - otherwise: a new company."""
+    if match.attach and match.same_record:
+        await resolver.register(db, match.company_id, _own_keys(company, match), company.source)
+        return Resolution(match.company_id, False, match)
+    company.id = company.id or _new_id()
+    fresh = company.id
+    company_id = await _insert_company(db, company)
+    if company_id != fresh:
+        # A uniqueness conflict the match didn't see: that record it is.
+        return Resolution(company_id, False, match)
+    if extra_ids:
+        await resolver.register(db, company_id,
+                                [("external", x) for x in extra_ids if x], company.source)
+    if match.attach:
+        try:
+            await resolver.merge(db, match.company_id, company_id, score=match.score,
+                                 reasons=match.reasons, decided_by="auto")
+            return Resolution(match.company_id, False, match, merged_from=company_id)
+        except resolver.MergeRefused:
+            return Resolution(company_id, True, match)
+    if match.review:
+        await resolver.add_candidate(db, match.company_id, company_id, match.score,
+                                     match.reasons)
+    return Resolution(company_id, True, match)
+
+
 class CompanyBatch:
     """Company writes on one shared connection (StateManager.batch()).
 
@@ -950,6 +1130,23 @@ class CompanyBatch:
     async def add_company(self, company: Company) -> str:
         return await _insert_company(self.db, company)
 
+    async def match_company(self, company: Company, extra_ids=(),
+                            declared_domain: bool = False) -> "resolver.Match":
+        return await resolver.match(self.db, company, extra_ids, declared_domain)
+
+    async def save_company(self, company: Company, match: "resolver.Match | None" = None,
+                           extra_ids=()) -> Resolution:
+        if match is None:
+            match = await resolver.match(self.db, company, extra_ids)
+        return await _save_company(self.db, company, match, extra_ids)
+
+    async def register_ids(self, company_id: str, company: Company,
+                           match: "resolver.Match") -> None:
+        """Add the keys ``company`` brought that the matched record lacks."""
+        keys = _own_keys(company, match)
+        if keys:
+            await resolver.register(self.db, company_id, keys, company.source)
+
     async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
         return await _fill_company_fields(self.db, company_id, fields)
 
@@ -970,6 +1167,69 @@ class CompanyBatch:
 
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         return await _insert_observations(self.db, rows, run_id)
+
+
+async def _backfill_company_ids(db) -> None:
+    """The keys v17's SQL can't read: domains (free-mail and directory ones
+    left out), phones in E.164 and names in their town, for every company
+    already on file."""
+    async with db.execute(
+        "SELECT id, name, cui, external_id, domain, phone, location, source FROM companies"
+    ) as cur:
+        names = [c[0] for c in cur.description]
+        while True:
+            rows = await cur.fetchmany(2000)
+            if not rows:
+                break
+            payload = []
+            for row in rows:
+                company = dict(zip(names, row))
+                payload += [(company["id"], kind, value, company.get("source") or "")
+                            for kind, value in resolver.identifiers(company)]
+            await db.executemany(
+                "INSERT OR IGNORE INTO company_ids (company_id, kind, value, source) "
+                "VALUES (?, ?, ?, ?)", payload)
+
+
+async def _resolve_on_file(db) -> None:
+    """v17's Python step: every company's keys, then the companies on file
+    matched against each other once (resolver.scan), so duplicates from
+    before the resolver merge or reach the review list like new ones."""
+    await _backfill_company_ids(db)
+    await resolver.scan(db)
+    await _flush_company_search(db)
+
+
+async def _flush_company_search(db) -> None:
+    """Reindex the companies whose activities changed, once each. Runs in
+    the writer's transaction, before its commit."""
+    await db.execute(
+        "DELETE FROM company_search WHERE rowid IN (SELECT i.rid "
+        "FROM company_search_ids i JOIN company_search_dirty d USING (company_id))")
+    await db.execute(
+        "INSERT INTO company_search (rowid, company_id, name, activity, place) "
+        "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
+        "FROM company_search_dirty d "
+        "JOIN company_search_ids i ON i.company_id = d.company_id "
+        "JOIN company_search_source s ON s.company_id = d.company_id")
+    await db.execute("DELETE FROM company_search_dirty")
+
+
+def _statements(script: str):
+    """A migration script's statements, one at a time (a trigger's body,
+    semicolons and all, stays one statement)."""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            yield pending
+            pending = ""
+    if re.sub(r"--[^\n]*", "", pending).strip():
+        yield pending
+
+
+# Python steps run right after a migration, in its transaction.
+_AFTER_MIGRATION = {17: _resolve_on_file}
 
 
 class StateManager:
@@ -1011,17 +1271,42 @@ class StateManager:
         async with self._connect() as db:
             # WAL is persistent in the DB file: readers (dashboard) never
             # block the writer (agent) and vice versa.
-            await db.execute("PRAGMA journal_mode=WAL")
+            try:
+                await db.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                # A new file another process is setting up at this moment
+                # (changing the mode needs it alone); it sets the same mode.
+                pass
             await db.execute("PRAGMA synchronous=NORMAL")
 
             async with db.execute("PRAGMA user_version") as cursor:
                 (version,) = await cursor.fetchone()
 
             for target, script in enumerate(MIGRATIONS, start=1):
-                if version < target:
-                    await db.executescript(script)
-                    await db.execute(f"PRAGMA user_version = {target}")
+                if version >= target:
+                    continue
+                # One write transaction per migration: its script, its
+                # Python step and the version stamp land together or not at
+                # all, so a start killed halfway never leaves an ALTER
+                # applied with the version unchanged. The version is read
+                # again under the lock: another process starting at the
+                # same time may have run it while this one waited.
+                # (Statement by statement: executescript commits first.)
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    async with db.execute("PRAGMA user_version") as cursor:
+                        (version,) = await cursor.fetchone()
+                    if version < target:
+                        for statement in _statements(script):
+                            await db.execute(statement)
+                        if target in _AFTER_MIGRATION:
+                            await _AFTER_MIGRATION[target](db)
+                        await db.execute(f"PRAGMA user_version = {target}")
+                        version = target
                     await db.commit()
+                except BaseException:
+                    await db.rollback()
+                    raise
 
             await self._seed_caen(db)
 
@@ -1068,18 +1353,7 @@ class StateManager:
 
     @staticmethod
     async def _flush_company_search(db):
-        """Reindex the companies whose activities changed, once each. Runs
-        in the writer's transaction, before its commit."""
-        await db.execute(
-            "DELETE FROM company_search WHERE rowid IN (SELECT i.rid "
-            "FROM company_search_ids i JOIN company_search_dirty d USING (company_id))")
-        await db.execute(
-            "INSERT INTO company_search (rowid, company_id, name, activity, place) "
-            "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
-            "FROM company_search_dirty d "
-            "JOIN company_search_ids i ON i.company_id = d.company_id "
-            "JOIN company_search_source s ON s.company_id = d.company_id")
-        await db.execute("DELETE FROM company_search_dirty")
+        await _flush_company_search(db)
 
     # ── Companies ──
 
@@ -1099,6 +1373,173 @@ class StateManager:
             company_id = await _insert_company(db, company)
             await db.commit()
         return company_id
+
+    async def match_company(self, company: Company, extra_ids=(),
+                            declared_domain: bool = False) -> "resolver.Match":
+        """The company on file ``company`` is, if any (resolver.match)."""
+        async with self._connect() as db:
+            return await resolver.match(db, company, extra_ids, declared_domain)
+
+    async def save_company(self, company: Company, extra_ids=()) -> Resolution:
+        """Save a company from an outside source through the resolver: the
+        same company on file gets its keys (or is merged with it), a
+        possible one goes to the review list (_save_company)."""
+        async with self._connect() as db:
+            # The match and the save in one write transaction: two saves of
+            # one business at once can't both find nothing and both insert.
+            await db.execute("BEGIN IMMEDIATE")
+            match = await resolver.match(db, company, extra_ids)
+            result = await _save_company(db, company, match, extra_ids)
+            await self._flush_company_search(db)
+            await db.commit()
+        return result
+
+    async def duplicates(self, status: str = "pending", limit: int = 100) -> list[dict]:
+        """Pairs on the review list with ``status`` (pending | merged |
+        separate), most likely first, each side as the panel shows it."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT company_a, company_b, score, reasons_json, status, created_at, "
+                "decided_at FROM match_candidates WHERE status = ? "
+                "ORDER BY score DESC, created_at DESC LIMIT ?", (status, limit)
+            ) as cur:
+                pairs = [dict(r) for r in await cur.fetchall()]
+            ids = list({cid for p in pairs for cid in (p["company_a"], p["company_b"])})
+            sides = await self._duplicate_sides(db, ids)
+        out = []
+        for p in pairs:
+            try:
+                reasons = json.loads(p.pop("reasons_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                reasons = []
+            out.append({**p, "reasons": reasons, "a": sides.get(p["company_a"]),
+                        "b": sides.get(p["company_b"])})
+        return out
+
+    @staticmethod
+    async def _duplicate_sides(db, ids: list[str]) -> dict[str, dict]:
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        async with db.execute(
+            f"SELECT id, name, cui, location, address, phone, domain, website, source, "
+            f"merged_into, created_at FROM companies WHERE id IN ({marks})", ids
+        ) as cur:
+            sides = {r["id"]: dict(r) for r in await cur.fetchall()}
+        async with db.execute(
+            f"SELECT company_id, kind, value, source FROM company_ids "
+            f"WHERE company_id IN ({marks}) AND kind IN ('phone', 'domain', 'external') "
+            f"ORDER BY created_at, rowid", ids
+        ) as cur:
+            for r in await cur.fetchall():
+                side = sides.get(r["company_id"])
+                if side is None:
+                    continue
+                key = {"phone": "phones", "domain": "domains", "external": "listings"}[r["kind"]]
+                if r["value"] not in side.setdefault(key, []):
+                    side[key].append(r["value"])
+                if r["source"] and r["source"] not in side.setdefault("sources", []):
+                    side["sources"].append(r["source"])
+        for side in sides.values():
+            for key in ("phones", "domains", "listings", "sources"):
+                side.setdefault(key, [])
+            if side.get("source") and side["source"] not in side["sources"]:
+                side["sources"].insert(0, side["source"])
+        return sides
+
+    async def count_duplicates(self) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM match_candidates WHERE status = 'pending'"
+            ) as cur:
+                return (await cur.fetchone())[0]
+
+    async def merge_companies(self, keep: str, merged: str, decided_by: str = "you") -> int:
+        """Merge ``merged`` into ``keep`` (resolver.merge). Raises
+        resolver.MergeRefused when it can't be done."""
+        async with self._connect() as db:
+            # Checks and writes in one write transaction: a second merge of
+            # the same pair (a double click, or the other way round at the
+            # same moment) waits, then finds it merged and is refused.
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT score, reasons_json FROM match_candidates WHERE "
+                "(company_a = ? AND company_b = ?) OR (company_a = ? AND company_b = ?)",
+                (keep, merged, merged, keep)
+            ) as cur:
+                row = await cur.fetchone()
+            reasons = json.loads(row[1] or "[]") if row else []
+            merge_id = await resolver.merge(db, keep, merged, score=row[0] if row else None,
+                                            reasons=reasons, decided_by=decided_by)
+            await self._flush_company_search(db)
+            await db.commit()
+        return merge_id
+
+    async def merge_pair(self, a: str, b: str) -> dict:
+        """"Same company" on a review pair: the one with a CUI (the
+        registry's record) survives; otherwise the older one."""
+        if a == b:
+            raise resolver.MergeRefused("same_company")
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT id FROM companies WHERE id IN (?, ?) "
+                "ORDER BY (COALESCE(cui, '') = ''), created_at, rowid", (a, b)
+            ) as cur:
+                order = [r[0] for r in await cur.fetchall()]
+        if len(order) != 2:
+            raise resolver.MergeRefused("not_found")
+        keep, merged = order
+        merge_id = await self.merge_companies(keep, merged)
+        return {"survivor": keep, "merged": merged, "merge_id": merge_id}
+
+    async def separate_companies(self, a: str, b: str) -> bool:
+        """"Different companies": the pair leaves the review list for good.
+        Raises resolver.MergeRefused for an unknown company or a pair of one."""
+        if a == b:
+            raise resolver.MergeRefused("same_company")
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute("SELECT COUNT(*) FROM companies WHERE id IN (?, ?)",
+                                  (a, b)) as cur:
+                if (await cur.fetchone())[0] != 2:
+                    await db.rollback()
+                    raise resolver.MergeRefused("not_found")
+            changed = await resolver.decide_candidate(db, a, b, "separate")
+            if not changed:
+                await db.execute(
+                    "INSERT OR IGNORE INTO match_candidates (company_a, company_b, status, "
+                    "decided_at) VALUES (?, ?, 'separate', CURRENT_TIMESTAMP)", (a, b))
+            await db.commit()
+        return True
+
+    async def undo_merge(self, merged: str) -> dict:
+        """Undo the merge that took ``merged`` (resolver.undo)."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")      # one undo at a time
+            result = await resolver.undo(db, merged)
+            await self._flush_company_search(db)
+            await db.commit()
+        return result
+
+    async def merges(self, limit: int = 50) -> list[dict]:
+        """Merges still in force, newest first, both sides as the panel shows them."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, survivor, merged, score, reasons_json, decided_by, created_at "
+                "FROM company_merges WHERE undone_at IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+            ) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+            sides = await self._duplicate_sides(
+                db, list({x for r in rows for x in (r["survivor"], r["merged"])}))
+        for r in rows:
+            try:
+                r["reasons"] = json.loads(r.pop("reasons_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                r["reasons"] = []
+            r["a"], r["b"] = sides.get(r["survivor"]), sides.get(r["merged"])
+        return rows
 
     async def update_company_signals(
         self,
@@ -2261,7 +2702,7 @@ class StateManager:
     # each phrase — #4 for one search and #18 for another is in range on the
     # second. Ties within one second (two searches in a run) go to the row
     # written last. A search that no longer finds the company writes 0 for
-    # that phrase, which reads as absent. Rows from before phrases were
+    # that phrase: checked, not ranked. Rows from before phrases were
     # stored (empty value_text) stop counting once a phrased row exists.
     _RANK_CODES = "('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK')"
     _CURRENT_CTE = f"""
@@ -2293,6 +2734,9 @@ class StateManager:
         SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
         UNION ALL
         SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
+    ),
+    current_obs AS (
+        SELECT * FROM latest UNION ALL SELECT * FROM ranked
     )
     """
 
@@ -2314,6 +2758,42 @@ class StateManager:
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
+    async def signal_states(self, codes: list[str]) -> dict[str, dict]:
+        """Per signal, how many companies read true, false and unknown — the
+        same reading a cohort condition "has it" makes (see cohort_verdicts)."""
+        from harvey.signals import absence
+
+        async with self._connect() as db:
+            async with db.execute(f"SELECT COUNT(*) FROM companies c WHERE {LIVE_COMPANY}") as cursor:
+                total = (await cursor.fetchone())[0]
+            async with db.execute(
+                self._CURRENT_CTE + """,
+                per AS (
+                    SELECT company_id, signal_code, 1 AS checked, 0 AS found, 0 AS any_found
+                    FROM current_obs WHERE company_id != ''
+                    UNION ALL
+                    SELECT company_id, signal_code, 0, confidence >= 0, 1
+                    FROM positive WHERE company_id != ''
+                ),
+                per_company AS (
+                    SELECT p.signal_code, MAX(checked) AS checked, MAX(found) AS found,
+                           MAX(any_found) AS any_found
+                    FROM per p JOIN companies c ON c.id = p.company_id
+                    GROUP BY p.company_id, p.signal_code
+                )
+                SELECT signal_code, SUM(found), SUM(checked AND NOT any_found), SUM(any_found)
+                FROM per_company GROUP BY signal_code"""
+            ) as cursor:
+                seen = {row[0]: row[1:] for row in await cursor.fetchall()}
+        out = {}
+        for code in codes:
+            found, negative, any_found = seen.get(code, (0, 0, 0))
+            if absence(code) == "false":
+                negative = total - any_found
+            out[code] = {"true": found, "false": negative,
+                         "unknown": total - found - negative}
+        return out
+
     async def cohort(
         self,
         require: list[str],
@@ -2321,34 +2801,14 @@ class StateManager:
         min_confidence: float = 0.0,
         limit: int = 500,
     ) -> list[str]:
-        """Company IDs carrying ALL required signals and none excluded.
-
-        Set intersection happens in SQL — doing it in application code over a
-        capped SELECT silently returns the wrong cohort.
-        """
+        """IDs of the companies that match: every required signal found, and
+        every excluded one checked and not found (see cohort_verdicts)."""
         if not require:
             return []
-        req_ph = ",".join("?" for _ in require)
-        sql = self._CURRENT_CTE + (
-            f"SELECT company_id FROM positive "
-            f"WHERE signal_code IN ({req_ph}) AND company_id != '' "
-            "AND confidence >= ? "
-            "GROUP BY company_id HAVING COUNT(DISTINCT signal_code) = ?"
-        )
-        params: list = [*require, float(min_confidence), len(set(require))]
-        if exclude:
-            exc_ph = ",".join("?" for _ in exclude)
-            sql += (
-                " AND company_id NOT IN ("
-                f"SELECT company_id FROM positive WHERE signal_code IN ({exc_ph})"
-                ")"
-            )
-            params.extend(exclude)
-        sql += " LIMIT ?"
-        params.append(int(limit))
-        async with self._connect() as db:
-            async with db.execute(sql, params) as cursor:
-                return [row[0] for row in await cursor.fetchall()]
+        _, rows = await self.cohort_verdicts(
+            require, exclude or [], verdicts=("match",), limit=limit,
+            min_confidence=min_confidence)
+        return [r["id"] for r in rows]
 
     async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
         """Companies currently ranked (or in the pack) for this search phrase."""
@@ -2363,57 +2823,130 @@ class StateManager:
     async def cohort_companies(self, require: list[str], exclude: list[str],
                                offset: int = 0, limit: int | None = None,
                                ranges: list[dict] | None = None) -> tuple[int, list[dict]]:
-        """Count all matches and page company details in one read snapshot.
+        """The matches only, counted and paged: (match count, page)."""
+        counts, rows = await self.cohort_verdicts(
+            require, exclude, ranges, verdicts=("match",), offset=offset, limit=limit)
+        return counts["match"], rows
 
-        ``ranges`` are numeric filters, ``[{"code", "min", "max"}]`` with
-        either bound optional: organic rank 11-30 is
-        ``{"code": "SERP_RANK", "min": 11, "max": 30}``. A range implies the
-        signal is present, so a range alone is a cohort.
-        """
-        ranges = list(ranges or [])
-        if not require and not ranges:
-            return 0, []
-        require = list(dict.fromkeys(require))
-        exclude = list(dict.fromkeys(exclude))
-        where, params = [], []
-        if require:
-            where.append(
-                "id IN (SELECT company_id FROM positive WHERE company_id != '' AND "
-                f"signal_code IN ({','.join('?' for _ in require)}) "
-                "AND confidence >= 0 GROUP BY company_id "
-                "HAVING COUNT(DISTINCT signal_code) = ?)")
-            params += [*require, len(require)]
-        if exclude:
-            where.append("id NOT IN (SELECT company_id FROM positive "
-                         f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
-            params.extend(exclude)
+    # A cohort condition is true, false or unknown for each company, never
+    # just "has a row or not". "Has X" is true on a current positive reading,
+    # false on a current reading that is negative (value 0: checked, none),
+    # and unknown with no reading at all: nobody has looked. Excluding X is
+    # the mirror image, so "no ads" means checked and none, not never
+    # checked. A positive below ``min_confidence`` is unknown either way.
+    # A signal whose absence is "false" in the catalog (harvey/signals.py)
+    # reads a missing row as false.
+    #
+    # A company is a MATCH when every condition is true, NO_MATCH when any is
+    # false, and POSSIBLE otherwise: nothing rules it out, but something is
+    # not checked yet. Every company in the database gets a verdict; nothing
+    # is left out of the three counts.
+    VERDICTS = ("match", "possible", "no_match")
+
+    def _verdict_sql(self, require: list[str], exclude: list[str],
+                     ranges: list[dict], min_confidence: float) -> tuple[str, list]:
+        """(WITH clause ending in ``judged``: company columns plus ``verdict``,
+        its parameters)."""
+        from harvey.signals import absence
+
+        ctes: list[str] = []
+        params: list = []
+
+        def cte(sql: str, *args) -> str:
+            name = f"cond{len(ctes)}"
+            ctes.append(f"{name} AS ({sql})")
+            params.extend(args)
+            return f"c.id IN (SELECT company_id FROM {name})"
+
+        def readings(code: str, low=None, high=None, floor=None) -> str:
+            sql = ("SELECT DISTINCT company_id FROM positive "
+                   "WHERE signal_code = ? AND company_id != ''")
+            args: list = [code]
+            if low is not None or high is not None:
+                sql += " AND value_num IS NOT NULL"
+            if low is not None:
+                sql += " AND value_num >= ?"
+                args.append(float(low))
+            if high is not None:
+                sql += " AND value_num <= ?"
+                args.append(float(high))
+            if floor is not None:
+                sql += " AND confidence >= ?"
+                args.append(float(floor))
+            return cte(sql, *args)
+
+        def leaf(code: str, low=None, high=None) -> tuple[str, str]:
+            """(true, false) for "has a positive reading of code [in range]"."""
+            found = readings(code, low, high, floor=min_confidence)
+            any_found = readings(code, low, high)
+            if absence(code) == "false":
+                return found, f"NOT {any_found}"
+            checked = cte("SELECT DISTINCT company_id FROM current_obs "
+                          "WHERE signal_code = ? AND company_id != ''", code)
+            return found, f"({checked} AND NOT {any_found})"
+
+        trues, falses = [], []
+        for code in require:
+            t, f = leaf(code)
+            trues.append(t)
+            falses.append(f)
+        for code in exclude:
+            t, f = leaf(code)
+            trues.append(f)
+            falses.append(t)
         for r in ranges:
-            # The same current, positive, confidence >= 0 view require uses.
-            sub = ("id IN (SELECT company_id FROM positive WHERE signal_code = ? "
-                   "AND value_num IS NOT NULL AND confidence >= 0")
-            params.append(r["code"])
-            if r.get("min") is not None:
-                sub += " AND value_num >= ?"
-                params.append(float(r["min"]))
-            if r.get("max") is not None:
-                sub += " AND value_num <= ?"
-                params.append(float(r["max"]))
-            where.append(sub + ")")
-        base = (self._CURRENT_CTE +
-                " SELECT {columns} FROM companies WHERE " + " AND ".join(where))
+            t, f = leaf(r["code"], r.get("min"), r.get("max"))
+            trues.append(t)
+            falses.append(f)
+        verdict = ("CASE WHEN " + " OR ".join(falses) + " THEN 'no_match' "
+                   "WHEN " + " AND ".join(trues) + " THEN 'match' "
+                   "ELSE 'possible' END")
+        ctes.append("judged AS (SELECT c.id, c.name, c.domain, c.website, c.industry, "
+                    f"c.location, {verdict} AS verdict FROM companies c WHERE {LIVE_COMPANY})")
+        return self._CURRENT_CTE.rstrip() + "".join(",\n    " + c for c in ctes) + "\n", params
+
+    async def cohort_verdicts(self, require: list[str], exclude: list[str],
+                              ranges: list[dict] | None = None,
+                              verdicts=("match",), offset: int = 0,
+                              limit: int | None = None,
+                              min_confidence: float = 0.0) -> tuple[dict, list[dict]]:
+        """Every company's verdict counted, and a page of those in ``verdicts``.
+
+        Returns ``({"match": n, "possible": n, "no_match": n}, rows)``; each
+        row carries its ``verdict``. ``ranges`` are numeric filters,
+        ``[{"code", "min", "max"}]`` with either bound optional: organic rank
+        11-30 is ``{"code": "SERP_RANK", "min": 11, "max": 30}``. Any one
+        condition makes a cohort, an exclusion alone included; none at all is
+        an empty cohort, never every company.
+        """
+        counts = dict.fromkeys(self.VERDICTS, 0)
+        require = list(dict.fromkeys(require or []))
+        exclude = list(dict.fromkeys(exclude or []))
+        ranges = list(ranges or [])
+        if not require and not exclude and not ranges:
+            return counts, []
+        wanted = [v for v in dict.fromkeys(verdicts) if v in self.VERDICTS]
+        sql, params = self._verdict_sql(require, exclude, ranges, min_confidence)
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
+            # One read snapshot: the counts and the page agree.
             await db.execute("BEGIN")
-            async with db.execute(base.format(columns="COUNT(*)"), params) as cursor:
-                size = (await cursor.fetchone())[0]
-            sql = base.format(columns="id, name, domain, website, industry, location")
-            sql += " ORDER BY LOWER(COALESCE(name, '')), id"
-            page_params = list(params)
+            async with db.execute(
+                sql + "SELECT verdict, COUNT(*) FROM judged GROUP BY verdict", params
+            ) as cursor:
+                for verdict, n in await cursor.fetchall():
+                    counts[verdict] = n
+            if not wanted:
+                return counts, []
+            page = (sql + "SELECT * FROM judged WHERE verdict IN "
+                    f"({','.join('?' for _ in wanted)}) "
+                    "ORDER BY LOWER(COALESCE(name, '')), id")
+            page_params = [*params, *wanted]
             if limit is not None:
-                sql += " LIMIT ? OFFSET ?"
-                page_params.extend([limit, offset])
-            async with db.execute(sql, page_params) as cursor:
-                return size, [dict(row) for row in await cursor.fetchall()]
+                page += " LIMIT ? OFFSET ?"
+                page_params.extend([int(limit), int(offset)])
+            async with db.execute(page, page_params) as cursor:
+                return counts, [dict(row) for row in await cursor.fetchall()]
 
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
@@ -2437,7 +2970,7 @@ class StateManager:
                 f"""SELECT c.id, c.name, c.domain, c.location
                    FROM companies c
                    {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND {LIVE_COMPANY}
                      AND ({_LAST_PROFILED} IS NULL
                           OR {_LAST_PROFILED} < datetime('now', ?))
                    ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
@@ -2451,7 +2984,7 @@ class StateManager:
             async with db.execute(
                 f"""SELECT COUNT(*) FROM companies c
                    {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND {LIVE_COMPANY}
                      AND ({_LAST_PROFILED} IS NULL
                           OR {_LAST_PROFILED} < datetime('now', ?))""",
                 (f"-{int(stale_days)} days",),
@@ -2482,6 +3015,7 @@ class StateManager:
                 "WHERE company_id = ?",
                 (name, company_id),
             )
+            await resolver.register_company(db, company_id)
             await db.commit()
 
     async def fill_company_phone(self, company_id: str, phone: str) -> bool:
@@ -2495,6 +3029,8 @@ class StateManager:
                 "WHERE id = ? AND COALESCE(TRIM(phone), '') = ''",
                 (phone, company_id),
             )
+            if cursor.rowcount:
+                await resolver.register_company(db, company_id)
             await db.commit()
             return cursor.rowcount > 0
 
@@ -2517,10 +3053,10 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                """SELECT c.id, c.name, c.domain, c.industry
+                f"""SELECT c.id, c.name, c.domain, c.industry
                    FROM companies c
                    LEFT JOIN prospects p ON p.company_id = c.id
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND {LIVE_COMPANY}
                      AND (c.prospects_checked_at IS NULL
                           OR c.prospects_checked_at < datetime('now', ?))
                    GROUP BY c.id
@@ -2702,8 +3238,9 @@ class StateManager:
             async with db.execute(
                 f"""SELECT COUNT(*) FROM prospects p
                     WHERE status = 'new' AND email != ''
-                      AND email_status IN ({marks}) AND NOT {_company_answered('p')}""",
-                WRITABLE_EMAIL_STATUSES,
+                      AND email_status IN ({marks}) AND NOT {_company_answered('p')}
+                      AND NOT (COALESCE(score, 0) > 0 AND score < ?)""",
+                (*WRITABLE_EMAIL_STATUSES, LOW_SCORE),
             ) as cursor:
                 return (await cursor.fetchone())[0]
 

@@ -164,7 +164,9 @@ async def collect_companies(state: StateManager, config=None,
             if chunk is not None:
                 only, params = f" IN ({','.join('?' for _ in chunk)})", tuple(chunk)
             async with db.execute(
-                "SELECT * FROM companies" + (f" WHERE id{only}" if only else "")
+                # A merged company's facts are its survivor's: exported once.
+                "SELECT * FROM companies WHERE COALESCE(merged_into, '') = ''"
+                + (f" AND id{only}" if only else "")
                 + " ORDER BY name COLLATE NOCASE, created_at", params,
             ) as cursor:
                 companies += [dict(r) for r in await cursor.fetchall()]
@@ -179,6 +181,13 @@ async def collect_companies(state: StateManager, config=None,
                 "WHERE signal_code = 'PHONE_NUMBER' AND value_text != ''"
                 + (f" AND company_id{only}" if only else "")
                 + " ORDER BY observed_at, rowid", params,
+            ) as cursor:
+                phone_rows += list(await cursor.fetchall())
+            # Every number any source gave (a listing's, a merged record's).
+            async with db.execute(
+                "SELECT company_id, value AS value_text FROM company_ids WHERE kind = 'phone'"
+                + (f" AND company_id{only}" if only else "")
+                + " ORDER BY created_at, rowid", params,
             ) as cursor:
                 phone_rows += list(await cursor.fetchall())
     if len(chunks) > 1:

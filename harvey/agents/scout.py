@@ -83,7 +83,9 @@ MAX_SITE_FETCHES = 10
 FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us")
 # A .ro site's pages are named in Romanian; those go first, inside the same cap.
 RO_FALLBACK_SITE_PATHS = ("/despre-noi", "/echipa", "/contact")
-# Named decision makers taken from one company per visit, likeliest first.
+# Named decision makers whose email is looked up per company visit,
+# likeliest first. Everyone else named on the site is kept too, without an
+# address (no lookup spent on them).
 MAX_CONTACTS_PER_COMPANY = 2
 # With no evidence of a company's email format, guess first@ only when
 # something independent of its website says it is small: the ICP's company
@@ -658,8 +660,11 @@ class Scout:
                     f"Scout: Added {prospect.full_name()} ({prospect.title}) "
                     f"at {prospect.company} [hunter]"
                 )
-                if count >= MAX_PROSPECTS_PER_CYCLE:
-                    return count
+            # The cap is checked between companies: the company is already
+            # marked checked, so stopping halfway through its people would
+            # lose the rest for good.
+            if count >= MAX_PROSPECTS_PER_CYCLE:
+                return count
 
         return count
 
@@ -721,8 +726,9 @@ class Scout:
                     f"Scout: Added {prospect.full_name()} ({prospect.title}) "
                     f"at {prospect.company} [backfill]"
                 )
-                if count >= MAX_PROSPECTS_PER_CYCLE:
-                    return count
+            # Between companies, for the same reason as the Hunter pass.
+            if count >= MAX_PROSPECTS_PER_CYCLE:
+                return count
 
         return count
 
@@ -813,8 +819,10 @@ class Scout:
                             f"Scout: Added prospect {prospect.full_name()} "
                             f"at {company_name}"
                         )
-                        if count >= MAX_PROSPECTS_PER_CYCLE:
-                            return count
+                    # Between searches, never inside one: a search's
+                    # results are kept whole.
+                    if count >= MAX_PROSPECTS_PER_CYCLE:
+                        return count
 
             return count
 
@@ -961,6 +969,8 @@ class Scout:
         # Use Claude to score/personalize, with a Python heuristic fallback.
         scored_contacts = await self._score_contacts(all_contacts)
 
+        # Every contact found is kept, the poorly scored ones too: the pages
+        # were already read, so stopping at the cycle cap would only lose them.
         count = 0
         for prospect in scored_contacts:
             await self.state.add_prospect(prospect)
@@ -969,8 +979,6 @@ class Scout:
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
                 f"at {prospect.company} [score: {prospect.score}]"
             )
-            if count >= MAX_PROSPECTS_PER_CYCLE:
-                break
 
         return count
 
@@ -1278,7 +1286,8 @@ Respond ONLY with the JSON array."""
         else:
             logger.warning("Scout: Claude scoring failed, using heuristic scores.")
 
-        contacts = [c for c in contacts if c.score >= 30]
+        # The score only orders contacts, best first; none is dropped. The
+        # Writer leaves the poorly scored ones out (LOW_SCORE in state.py).
         contacts.sort(key=lambda c: c.score, reverse=True)
         return contacts
 
@@ -1351,7 +1360,9 @@ Respond ONLY with the JSON array."""
             source=source,
             source_url=source_url,
         )
-        return await self.state.add_company(company)
+        # Through the resolver: a site whose business is already on file
+        # under another key (a registry firm, a map listing) joins it.
+        return (await self.state.save_company(company)).company_id
 
     async def _resolve_base_url(
         self, domain: str, retries: int = 1
@@ -1662,7 +1673,8 @@ Respond ONLY with the JSON array."""
         signal_note: str = "",
         source: str = "company_website",
     ) -> list[Prospect]:
-        """Team-page scrape → ICP-matched, email-resolved, deduped prospects."""
+        """Team-page scrape → deduped prospects: every named person, the
+        ICP-matched ones (and the owner) first and email-resolved."""
         try:
             team_members = await self._scrape_team_page(domain)
         except Exception as e:
@@ -1672,25 +1684,28 @@ Respond ONLY with the JSON array."""
         contacts: list[Prospect] = []
         named_on_site = False
         considered = 0
-        ranked = sorted(team_members, key=lambda m: -(m.get("rank") or 0))
+
+        def wanted(member) -> bool:
+            return self._title_matches_icp(member.get("title", "")) or \
+                (bool(member.get("owner")) and self._icp_wants_owner())
+
+        ranked = sorted(team_members, key=lambda m: (not wanted(m), -(m.get("rank") or 0)))
         for member in ranked:
             title = member.get("title", "")
             owner = bool(member.get("owner"))
-            if not (self._title_matches_icp(title) or (owner and self._icp_wants_owner())):
-                continue
-
             first_name = member.get("first_name", "")
             last_name = member.get("last_name", "")
             if not first_name or not last_name:
                 continue
-            named_on_site = True
-            if considered >= MAX_CONTACTS_PER_COMPANY:
-                break
-            considered += 1
 
-            email, email_status = await self._resolve_email(
-                first_name, last_name, domain
-            )
+            email, email_status = "", ""
+            if wanted(member):
+                named_on_site = True
+                if considered < MAX_CONTACTS_PER_COMPANY:
+                    considered += 1
+                    email, email_status = await self._resolve_email(
+                        first_name, last_name, domain
+                    )
 
             prospect = Prospect(
                 first_name=first_name,
@@ -2033,8 +2048,6 @@ Respond ONLY with the JSON array."""
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
                 f"at {prospect.company} via job-board signal [score: {prospect.score}]"
             )
-            if count >= MAX_PROSPECTS_PER_CYCLE:
-                break
         return count
 
     # ── Buying signals (tech stack + hiring) ──

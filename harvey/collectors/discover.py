@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from harvey import resolver
 from harvey.models import Company
 
 logger = logging.getLogger("harvey.collectors.discover")
@@ -1917,21 +1918,20 @@ async def run_discovery(
 
 
 async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, bool]:
-    """Record the business, returning (id, was_new)."""
-    # Look before inserting, so "already knew this one" is a fact we report
-    # rather than something inferred from an insert's return value.
-    existing = None
-    if biz.domain:
-        existing = await state.get_company_by_domain(biz.domain)
-    for external in (biz.external_id, *biz.alt_ids):
-        if existing is None and external:
-            existing = await state.get_company_by_external_id(external)
-    if existing:
-        return existing.id, False
-
+    """Record the business, returning (id, was_new). The resolver decides
+    whether it is a company on file: by its listing id or domain as
+    before, and now also by phone and by name in the same town, so a map
+    hit for a registry firm without a website joins that firm (or, when
+    less sure, waits on the review list) instead of becoming a second one.
+    A known company gets the gaps in its record filled; nothing it holds
+    is replaced."""
+    # A booking platform, link shortener or directory the listing gives as
+    # its website is many businesses' domain, not this one's: the website
+    # is kept, the domain (an identity) isn't.
+    domain = biz.domain if not biz.domain or resolver.usable_domain(biz.domain) else ""
     company = Company(
         name=biz.name,
-        domain=biz.domain,
+        domain=domain,
         website=biz.website,
         phone=biz.phone,
         industry=biz.category or query.term,
@@ -1940,7 +1940,13 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
         source_url=biz.source_url,
         external_id=biz.external_id,
     )
-    return await state.add_company(company), True
+    result = await state.save_company(company, extra_ids=tuple(x for x in biz.alt_ids if x))
+    if not result.created and not result.merged_from:
+        # (An automatic merge has filled the gaps already, and logged them
+        # so an undo can take them back.)
+        await state.fill_company_fields(
+            result.company_id, phone=biz.phone, website=biz.website, domain=domain)
+    return result.company_id, result.created
 
 
 RANK_FIELDS = ("rank", "local_pack_rank", "maps_rank")
@@ -1982,10 +1988,12 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
         return rows
 
     add("FOUND_IN_SERP", text=biz.provider)
-    if biz.has_website is False:
-        add("NO_WEBSITE", num=1.0)
-    if biz.is_claimed is False:
-        add("UNCLAIMED_LISTING", num=1.0)
+    # Both ways when the listing says: a cohort that excludes "no website"
+    # must tell "the listing names a site" from "never looked".
+    if biz.has_website is not None:
+        add("NO_WEBSITE", num=0.0 if biz.has_website else 1.0)
+    if biz.is_claimed is not None:
+        add("UNCLAIMED_LISTING", num=0.0 if biz.is_claimed else 1.0)
     if biz.rating is not None:
         add("REVIEW_RATING", num=float(biz.rating))
     if biz.review_count is not None:

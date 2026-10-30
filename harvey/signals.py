@@ -17,6 +17,33 @@ and provenance travel with the fact.
 # category: discovery | profile | people | verification
 # value_type: num | text | bool
 # cost_note: what collecting it actually costs, in plain language
+# absence: what a company with no current observation of the signal reads as
+#   in a cohort. "unknown" (the default): nobody looked, or the collector
+#   only writes what it finds. "false": the collector looks at every company
+#   and writes only positives, so no row means no. A collector that looks at
+#   one company and finds nothing should write an explicit negative row
+#   (value_num 0) instead, which reads as false whatever this says.
+#
+# How each signal records "no" today. None is "false": every collector here
+# visits only some companies, so no row can mean "not looked at yet".
+#   SERP_RANK, IN_LOCAL_PACK, MAPS_RANK  0 for a phrase that no longer finds a
+#       business it found before; never searched, or never found, has no row
+#   FOUND_IN_SERP, REVIEW_RATING, REVIEW_COUNT  positives only
+#   NO_WEBSITE, UNCLAIMED_LISTING  1 or 0 from the listing (0 when it names a
+#       site or says claimed); a listing that doesn't say writes nothing
+#   ACTIVITY_CODE  positives only (one row per CAEN class the import kept)
+#   RUNNING_GOOGLE_ADS, RUNNING_META_ADS, NO_SCHEMA_MARKUP, NO_ONLINE_BOOKING,
+#   BLOCKS_AI_CRAWLERS, ACCELERATOR, FUNDING_ROUND  1 or 0 whenever the
+#       homepage was read; an unreachable site writes nothing
+#   YC_BACKED  1 or 0, except that silence leaves a search hit standing
+#   HIRING_ROLE  0 when a job board answered with no matching role; a careers
+#       page that lists none writes nothing
+#   OPEN_ROLES  the count, 0 included, when a job board answered
+#   INCUMBENT_AGENCY, TECH_STACK, SITE_PAGE_COUNT, BLOG_STALE  positives only:
+#       an uncredited agency or a missing sitemap is not a "no"
+#   CONTACT_FOUND, DECISION_MAKER_TITLE, REGISTRY_VERIFIED, LIKELY_OWNER,
+#   EMAIL_PATTERN, EMAIL_STATUS, CONTACT_FORM_URL, PHONE_NUMBER  positives
+#       only: a page Harvey didn't read can still have one
 SIGNAL_CATALOG: list[dict] = [
     # ── Discovery: who exists, and how visible are they ──
     {
@@ -422,6 +449,17 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
 ]
+
+
+ABSENCE_VALUES = ("unknown", "false")
+
+
+def absence(code: str) -> str:
+    """How a company with no current observation of ``code`` reads."""
+    for sig in SIGNAL_CATALOG:
+        if sig["code"] == code:
+            return sig.get("absence", "unknown")
+    return "unknown"
 
 
 async def seed_signal_catalog(state) -> int:
