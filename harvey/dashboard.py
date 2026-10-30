@@ -2070,9 +2070,8 @@ async def export_selected_prospects(request: Request):
 
 # ── Modules: what Harvey is made of, and which parts are on ──
 #
-# The Email switch is the email_outreach module's. It only changes what the
-# dashboard SHOWS (and which .env keys Settings offers): sending, approval,
-# autopilot and the kill switch work the same whether it is on or off.
+# The Email switch is the email_outreach module's. Off, the dashboard hides
+# its tabs and the heartbeat writes, sends and reads no mail at all.
 
 UI_MODULES = {"email": "email_outreach"}
 

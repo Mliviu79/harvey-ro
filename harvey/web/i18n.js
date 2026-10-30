@@ -577,8 +577,8 @@ const I18N = {
     'set.modules': 'Module', 'mod.email.title': 'Email (campanii)',
     'mod.email.desc': 'Arată filele pentru campanii de email: Astăzi, Coadă de trimitere, Conversații și Campanii, plus setările de trimitere. Doar afișarea se schimbă: modul de trimitere, aprobarea și oprirea de urgență rămân exact cum sunt.',
     'mod.on': 'Pornit', 'mod.off': 'Oprit',
-    'mod.email.shown': 'Modulul Email e afișat. Trimiterea funcționează exact ca înainte.',
-    'mod.email.hidden': 'Modulul Email e ascuns. Doar afișarea s-a schimbat: nimic din trimitere nu s-a modificat.',
+    'mod.email.shown': 'Modulul Email e pornit. Harvey poate scrie și trimite emailuri, după regulile din harvey.yaml.',
+    'mod.email.hidden': 'Modulul Email e oprit. Harvey nu scrie, nu trimite și nu citește niciun email; caută doar firme și contacte.',
     'mod.failed': 'Modulul nu s-a putut schimba.',
     'modp.title': 'Surse', 'modp.lede': 'Din ce e făcut Harvey: surse de date, căutări, citiri de site, limbi și acțiuni. Pornește doar ce folosești. Când oprești un modul nu se șterge nimic: datele lui rămân, doar ascunse.',
     'modp.empty': 'Niciun modul găsit', 'modp.empty_copy': 'Harvey n-a putut citi niciun modul. Verifică dosarul harvey/modules sau rulează harvey modules list.',
@@ -666,7 +666,7 @@ const I18N = {
     'help.file.db': 'Baza de date: firme, contacte, activități, observații',
     'help.file.log': 'Jurnalul cu ce face Harvey',
     'help.file.skills': 'Textele după care scrie Harvey (doar pentru modulul Email)',
-    'help.email': '<h2>Modulul Email</h2><p>Harvey a pornit ca agent de vânzări prin email: scrie emailuri reci, le trimite după aprobarea ta și răspunde la mesaje. În Harvey RO partea asta e ascunsă implicit. Când pornești modulul Email la Setări → Module, apar filele Astăzi, Coadă de trimitere, Conversații și Campanii.</p><p>Modulul schimbă doar ce vezi. Modul de trimitere (cu aprobare sau pilot automat), oprirea de urgență și limitele zilnice rămân cum sunt configurate în <code>harvey.yaml</code>, fie că modulul e afișat sau nu.</p>',
+    'help.email': '<h2>Modulul Email</h2><p>Harvey a pornit ca agent de vânzări prin email: scrie emailuri reci, le trimite după aprobarea ta și răspunde la mesaje. În Harvey RO partea asta e ascunsă implicit. Când pornești modulul Email la Setări → Module, apar filele Astăzi, Coadă de trimitere, Conversații și Campanii.</p><p>Oprit, modulul ascunde filele și oprește tot emailul: Harvey nu scrie, nu trimite și nu citește răspunsuri, orice ar scrie în <code>harvey.yaml</code>. Pornit, modul de trimitere (cu aprobare sau pilot automat), oprirea de urgență și limitele zilnice sunt cele din <code>harvey.yaml</code>.</p>',
     'help.issues': '<h2>Probleme obișnuite</h2><details><summary>„command not found: harvey”</summary><div class="faq-body">În afara Docker, activează întâi mediul virtual: <code>source .venv/bin/activate</code>. În Docker, rulează comenzile prin <code>docker compose run --rm harvey …</code>.</div></details><details><summary>Căutarea nu găsește nimic</summary><div class="faq-body">Toate cuvintele trebuie să se potrivească. Încearcă un singur cuvânt, un cod CAEN de 4 cifre sau o localitate. Diacriticele nu contează.</div></details><details><summary>Firmele n-au telefon sau email</summary><div class="faq-body">Registrul nu publică telefoane sau adrese de email. Le găsește citirea site-urilor (Descoperă → Citește site-urile) sau o sursă cu telefon, ca DataForSEO Business Listings. Firmele fără site rămân, de obicei, fără email.</div></details><details><summary>Panoul spune că e blocat</summary><div class="faq-body">Deschide linkul afișat de <code>harvey dashboard</code>, sau rulează <code>harvey dashboard --url</code> ca să-l vezi din nou.</div></details>',
 
     // Server-vs-network wording, empty logs, stored role labels, short search hints.
@@ -1180,8 +1180,8 @@ const I18N = {
     'set.modules': 'Modules', 'mod.email.title': 'Email (campaigns)',
     'mod.email.desc': 'Shows the email campaign tabs: Today, Outbox, Conversations and Campaigns, plus the sending settings. Only what you see changes: sending mode, approval and the kill switch stay exactly as they are.',
     'mod.on': 'On', 'mod.off': 'Off',
-    'mod.email.shown': 'The Email module is shown. Sending works exactly as before.',
-    'mod.email.hidden': 'The Email module is hidden. Only the view changed: nothing about sending did.',
+    'mod.email.shown': 'The Email module is on. Harvey can write and send email, as harvey.yaml says.',
+    'mod.email.hidden': 'The Email module is off. Harvey writes, sends and reads no email; it only finds companies and contacts.',
     'mod.failed': 'Couldn’t change the module.',
     'modp.title': 'Sources', 'modp.lede': 'What Harvey is made of: data sources, searches, site readers, languages and actions. Turn on only what you use. Turning a module off deletes nothing: its data stays, just hidden.',
     'modp.empty': 'No modules found', 'modp.empty_copy': 'Harvey couldn’t read any module. Check the harvey/modules folder, or run harvey modules list.',
@@ -1269,7 +1269,7 @@ const I18N = {
     'help.file.db': 'The database: companies, contacts, activities, observations',
     'help.file.log': 'Log file showing what Harvey is doing',
     'help.file.skills': 'What Harvey writes from (Email module only)',
-    'help.email': '<h2>The Email module</h2><p>Harvey started as an email sales agent: it writes cold email, sends it after you approve it, and answers replies. In Harvey RO that part is hidden by default. Turn on the Email module under Settings → Modules and the Today, Outbox, Conversations and Campaigns tabs appear.</p><p>The module only changes what you see. Sending mode (approval or autopilot), the kill switch and daily limits stay as <code>harvey.yaml</code> sets them, whether the module is shown or not.</p>',
+    'help.email': '<h2>The Email module</h2><p>Harvey started as an email sales agent: it writes cold email, sends it after you approve it, and answers replies. In Harvey RO that part is hidden by default. Turn on the Email module under Settings → Modules and the Today, Outbox, Conversations and Campaigns tabs appear.</p><p>Off, the module hides those tabs and stops all email: Harvey writes, sends and reads no replies, whatever <code>harvey.yaml</code> says. On, sending mode (approval or autopilot), the kill switch and daily limits are as <code>harvey.yaml</code> sets them.</p>',
     'help.issues': '<h2>Common issues</h2><details><summary>"command not found: harvey"</summary><div class="faq-body">Outside Docker, activate the virtual environment first: <code>source .venv/bin/activate</code>. In Docker, run commands through <code>docker compose run --rm harvey …</code>.</div></details><details><summary>Search finds nothing</summary><div class="faq-body">Every word must match. Try one word, a 4-digit CAEN code or a town. Accents don’t matter.</div></details><details><summary>Companies have no phone or email</summary><div class="faq-body">The registry’s open data has no phone numbers or email addresses. Reading websites (Discover → Read their sites) finds them, or a source with phones such as DataForSEO Business Listings. Companies with no website usually stay without an email.</div></details><details><summary>The dashboard says it is locked</summary><div class="faq-body">Open the link <code>harvey dashboard</code> printed, or run <code>harvey dashboard --url</code> to print it again.</div></details>',
 
     // Server-vs-network wording, empty logs, stored role labels, short search hints.

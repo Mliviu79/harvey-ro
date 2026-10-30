@@ -23,8 +23,10 @@ import harvey.brain as brain_mod
 import harvey.codex as hc
 
 # The Codex provider supports macOS and Linux only (see harvey.codex).
-pytestmark = pytest.mark.skipif(sys.platform == "win32",
-                                reason="the Codex provider isn't supported on Windows")
+pytestmark = [pytest.mark.skipif(sys.platform == "win32",
+                                 reason="the Codex provider isn't supported on Windows"),
+              # These cycles read replies and send: the Email module is on.
+              pytest.mark.modules_on("email_outreach")]
 import harvey.main as main_mod
 from harvey.config import EnvConfig, HarveyConfig
 from harvey.integrations.mail_provider import InboundMessage

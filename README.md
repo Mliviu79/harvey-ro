@@ -758,8 +758,9 @@ stays on if one of its `.env` keys is set (a search or enrichment provider
 that was set up), if you had confirmed one of its signals, or if the install
 has data from it (companies found through keyless web search or G2/Clutch,
 tools detected on sites, open roles or job-board contacts). The Email
-switch in Settings is the email campaigns module: it changes what the
-dashboard shows, never how sending works.
+switch in Settings is the email campaigns module. Off, the dashboard hides
+its tabs and `harvey run` writes, sends and reads no email at all; it only
+looks for companies and contacts. On, sending works as `harvey.yaml` says.
 
 ## Using a ChatGPT plan instead (Codex)
 

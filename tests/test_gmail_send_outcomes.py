@@ -11,6 +11,9 @@ from harvey.state import MAYBE_SENT_PREFIX, StateManager
 from tests.test_outbox_native import make_sender, seed_prospect, _now_iso
 from tests.test_gmail_inbox import message
 
+# These tests read replies and send: the Email module is on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 def transport_provider(monkeypatch, handler):
     client = httpx.AsyncClient

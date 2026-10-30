@@ -15,6 +15,7 @@ from harvey.config import (
     compliance_notice, send_window_of,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+from harvey.modules import switches
 from harvey.pidfile import (
     LOCK_FILE, hold_loop_lock, read_pid, release_loop_lock, remove_pid_file, write_pid_file,
 )
@@ -139,8 +140,12 @@ async def decide_next_action(
     state: StateManager,
     config: HarveyConfig,
     summary: dict | None = None,
+    email_on: bool = True,
 ) -> str:
     """Decide what Harvey should do next based on current state.
+
+    With the Email module off, Harvey only looks for companies and
+    contacts: nothing is written, sent or read from the mailbox.
 
     Uses deterministic priority rules (handle_replies > send_campaign >
     write_campaign > prospect > idle) instead of burning a Claude call on a
@@ -160,7 +165,9 @@ async def decide_next_action(
     # every cycle would starve the writer and scout forever.
     deployable = 0 if legacy_sending_held(config) else draft_campaigns
 
-    if open_conversations > 0:
+    if not email_on:
+        action, reason = "prospect", "the Email module is off: finding contacts only"
+    elif open_conversations > 0:
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
     elif deployable > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
@@ -297,6 +304,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
     while not stop_event.is_set():
         try:
+            # The Email module's switch is read every cycle: off means no
+            # writing, sending or reading mail, whatever harvey.yaml says.
+            email_on = await switches.is_enabled(state, switches.EMAIL_MODULE)
+
             # 0. Approval or autopilot, as the config file says now: the
             # dashboard can switch it while Harvey runs.
             await sync_sending_mode(config, state)
@@ -305,7 +316,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # zones, quiet hours only stop prospecting and writing: a cycle
             # still reads replies and sends what's due (sends_through_quiet_hours).
             quiet = in_quiet_hours(config)
-            send_only = quiet and sender.is_native and sends_through_quiet_hours(config)
+            send_only = (email_on and quiet and sender.is_native
+                         and sends_through_quiet_hours(config))
             if quiet and not send_only:
                 sleep_for = seconds_until_quiet_hours_end(config)
                 logger.info(f"Quiet hours. Sleeping for {sleep_for // 60} minutes.")
@@ -375,7 +387,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             else:
                 logger.info("Checking pipeline state...")
                 summary = await state.get_state_summary()
-                action = await decide_next_action(brain, state, config, summary=summary)
+                action = await decide_next_action(brain, state, config, summary=summary,
+                                                  email_on=email_on)
 
             # 5. Execute — run independent agents in parallel where possible
             # Handler is always safe to run alongside other agents
@@ -387,7 +400,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             elif action == "prospect":
                 tasks.append(("prospect", scout.run()))
                 # Also handle replies in parallel if needed
-                if has_open_convos:
+                if has_open_convos and email_on:
                     tasks.append(("handle_replies", handler.run()))
                 # Analyst is cheap (no Claude calls) — keep analytics fresh
                 tasks.append(("analyze", analyst.run()))
@@ -405,11 +418,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # read every cycle too (handle_replies above only runs when a
             # conversation is already open).
             send_tasks = []
-            if action == "send_campaign":
+            if not email_on:
+                pass
+            elif action == "send_campaign":
                 send_tasks.append(("send_campaign", sender.run))
             elif sender.is_native:
                 send_tasks.append(("send_outbox", sender.run))
-            if sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
+            if email_on and sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
                 tasks.append(("read_replies", handler.run()))
 
             # Profiling rides along every cycle. It is three HTTP requests per

@@ -28,6 +28,7 @@ from harvey.config import EmailChannelConfig, HarveyConfig, SendWindowConfig
 from harvey.integrations.precleared import SETTINGS_PREFIX, PreclearedClient
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
+from harvey.modules import switches
 from harvey.send_window import (
     START_SPREAD, country_for, icp_country, in_window, next_send_time, recipient_country,
     recipient_zone, zone_country, zone_for,
@@ -60,6 +61,8 @@ async def state():
     with tempfile.TemporaryDirectory() as tmpdir:
         sm = StateManager(os.path.join(tmpdir, "test.db"))
         await sm.init_db()
+        # These tests send: the Email module is on (it ships off).
+        await switches.set_enabled(sm, switches.EMAIL_MODULE, True)
         yield sm
 
 
@@ -984,3 +987,19 @@ async def test_existing_prospects_get_an_empty_zone_on_upgrade(tmp_path):
     assert (await sm.get_prospect("p1")).timezone == ""
     await sm.set_prospect_timezone("p1", "Europe/Oslo")
     assert (await sm.get_prospect("p1")).timezone == "Europe/Oslo"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quiet", [True, False])
+async def test_email_module_off_writes_sends_and_reads_nothing(state, monkeypatch, quiet):
+    cfg = HarveyConfig(**BASE, channels={"email": {"provider": "gmail", "send_window": {}}})
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.jp")
+    await approved(state, pid, "aiko@tokyo-acme.jp")
+    await switches.set_enabled(state, switches.EMAIL_MODULE, False)
+    calls, stop = [], asyncio.Event()
+    main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: quiet)
+    if quiet:  # no mail to wake for: the cycle sleeps out the quiet hours
+        monkeypatch.setattr(main_mod, "seconds_until_quiet_hours_end", lambda c: 60)
+    await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
+    assert calls == ([] if quiet else ["prospect", "analyze"])

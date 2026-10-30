@@ -7,6 +7,9 @@ import pytest
 
 from harvey.integrations.gmail import GmailProvider
 
+# These tests read replies and send: the Email module is on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 def message(message_id, sender='person@example.test', body='Hello'):
     return {'id': message_id, 'payload': {
