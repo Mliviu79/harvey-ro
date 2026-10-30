@@ -1007,14 +1007,22 @@ class OpenStreetMap(DiscoveryProvider):
     # Several public Overpass instances run the same API. The main one
     # throttles readily, so try the mirrors before giving up — a free source
     # that fails half the time is not usable as a default.
+    # lz4. and z. are the main instance's sister servers; private.coffee
+    # (which kumi.systems now points at) is IPv6-only, so it comes last.
     ENDPOINTS = (
         "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://z.overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
     )
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
     MIN_INTERVAL = 2.0
     BACKOFF = 5.0
+    # The server may take QUERY_TIMEOUT seconds; wait a little longer than
+    # that for its answer, since a loaded instance is slow but still right.
+    QUERY_TIMEOUT = 90
+    READ_TIMEOUT = httpx.Timeout(connect=10.0, read=QUERY_TIMEOUT + 30.0,
+                                 write=10.0, pool=10.0)
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
     TAG_MAP = {
@@ -1125,7 +1133,8 @@ class OpenStreetMap(DiscoveryProvider):
             f'way[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
             for tag in tags
         )
-        body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
+        body = (f"[out:json][timeout:{self.QUERY_TIMEOUT}];({clauses});"
+                f"out center {query.limit};")
 
         # Overpass is a free volunteer service and 429s/504s readily under
         # load. Walk the mirrors, then RAISE: returning [] would make a
@@ -1138,17 +1147,28 @@ class OpenStreetMap(DiscoveryProvider):
                 await asyncio.sleep(self.BACKOFF)
             try:
                 r = await client.post(endpoint, content=body.encode(),
-                                      headers=headers)
+                                      headers=headers, timeout=self.READ_TIMEOUT)
             except httpx.HTTPError as e:
                 logger.warning("osm: %s unreachable (%s)", endpoint, e)
+                r = None
                 continue
-            if r.status_code not in (429, 504):
+            # 429 and every 5xx (502 and 503 come from an overloaded
+            # instance's proxy, not from the query) mean "try another one".
+            if r.status_code != 429 and r.status_code < 500:
+                # An instance that ran out of time or memory still answers
+                # 200, with what it had so far and a remark: a partial list
+                # must not pass for the whole market.
+                if r.status_code == 200 and _overpass_gave_up(r):
+                    logger.warning("osm: %s stopped part-way (%s) — trying the "
+                                   "next mirror", endpoint, _overpass_gave_up(r))
+                    r = None
+                    continue
                 break
-            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
+            logger.warning("osm: %s is overloaded (%s) — trying the next mirror",
                            endpoint, r.status_code)
         else:
             raise RuntimeError(
-                "Every public Overpass mirror is throttling right now. This is "
+                "Every public Overpass mirror is overloaded right now. This is "
                 "free volunteer infrastructure — wait a few minutes and re-run, "
                 "or use a paid provider for bulk work.")
         if r is None:
@@ -1180,6 +1200,15 @@ class OpenStreetMap(DiscoveryProvider):
                 provider=self.key,
             ))
         return out
+
+
+def _overpass_gave_up(r: httpx.Response) -> str:
+    """Overpass's remark when it stopped a query part-way, else ''."""
+    try:
+        remark = (r.json() or {}).get("remark") or ""
+    except ValueError:
+        return ""
+    return remark if "error" in remark.lower() else ""
 
 
 class ScavioProvider(DiscoveryProvider):

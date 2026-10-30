@@ -921,7 +921,7 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
         return httpx.Response(504, text="")
 
     provider = D.OpenStreetMap()
-    with pytest.raises(RuntimeError, match="throttling"):
+    with pytest.raises(RuntimeError, match="overloaded"):
         async with _client(handler) as client:
             await provider.fetch(client, {}, D.DiscoveryQuery(
                 term="roofer", coordinate="39.7,-104.9,40"))
@@ -929,14 +929,15 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_overpass_falls_over_to_the_next_mirror(monkeypatch):
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+async def test_overpass_falls_over_to_the_next_mirror(monkeypatch, status):
     monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
     calls = {"n": 0}
 
     def handler(request):
         calls["n"] += 1
         if calls["n"] == 1:
-            return httpx.Response(504, text="")
+            return httpx.Response(status, text="")
         return httpx.Response(200, json={"elements": [{
             "type": "node", "id": 42,
             "tags": {"name": "Sandpiper Exteriors", "craft": "roofer",
@@ -951,6 +952,46 @@ async def test_overpass_falls_over_to_the_next_mirror(monkeypatch):
     assert out[0].name == "Sandpiper Exteriors"
     assert out[0].external_id == "osm:node/42"
     assert out[0].has_website is False
+
+
+@pytest.mark.asyncio
+async def test_an_overpass_answer_cut_short_is_not_the_whole_market(monkeypatch):
+    """Out of time, Overpass answers 200 with what it had and a remark."""
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    seen = []
+    cut_short = {"elements": [{"type": "node", "id": 1, "tags": {"name": "Partial"}}],
+                 "remark": "runtime error: Query timed out in \"query\" at line 1"}
+    whole = {"elements": [{"type": "node", "id": n, "tags": {"name": f"Firm {n}"}}
+                          for n in (1, 2)]}
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json=cut_short if len(seen) == 1 else whole)
+
+    async with _client(handler) as client:
+        out = await D.OpenStreetMap().fetch(client, {}, D.DiscoveryQuery(
+            term="dentist", coordinate="45.64,25.59,10"))
+    assert [b.name for b in out] == ["Firm 1", "Firm 2"]
+    assert len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_slow_overpass_server_moves_on_to_the_next(monkeypatch):
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(200, json={"elements": [
+            {"type": "node", "id": 7, "tags": {"name": "Firm 7"}}]})
+
+    async with _client(handler) as client:
+        out = await D.OpenStreetMap().fetch(client, {}, D.DiscoveryQuery(
+            term="dentist", coordinate="45.64,25.59,10"))
+    assert [b.name for b in out] == ["Firm 7"]
+    assert seen[1] == D.OpenStreetMap.ENDPOINTS[1]
 
 
 @pytest.mark.asyncio
