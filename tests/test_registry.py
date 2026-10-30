@@ -113,7 +113,9 @@ def test_load_stores_nothing_private(db_path):
         dump = "\n".join(db.iterdump())
         admins = sorted(db.execute(
             "SELECT first_name, last_name, role FROM administrators").fetchall())
-    for private in (CNP, BIRTH, "Satul Nasterii", "Satul Domiciliului", "Str. Casei"):
+    # A representative's birth data and home are never read; a sole trader's
+    # registered office (Str. Casei) is public registry data and is kept.
+    for private in (CNP, BIRTH, "Satul Nasterii", "Satul Domiciliului"):
         assert private not in dump
     # Insolvency practitioners and companies acting as representatives are left out.
     assert admins == [("Andrei-Mihai", "Doi", "Administrator"),
@@ -212,7 +214,9 @@ def test_rows_carry_activities_in_words_matched_first(con):
         ("8623", True), ("8622", False)]
     assert row["activities"][0]["name_en"] == "Dental practice"
     pfa = registry.search(con, "testescu")["rows"][0]
-    assert pfa["address"] == "" and pfa["cui"] == ""
+    # Its registered office is kept; the personal numeric code never is.
+    assert pfa["address"] == "Str. Casei 9, 500999" and pfa["cui"] == ""
+    assert CNP not in str(pfa)
 
 
 def test_explicit_filters_as_import_onrc_gives_them(con):

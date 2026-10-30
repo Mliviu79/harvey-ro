@@ -362,8 +362,9 @@ async def test_the_registry_returns_only_what_it_declares(manifests, tmp_path):
     finally:
         con.close()
     assert draft.records and draft.counts["matched"] == len(draft.records)
-    # A sole trader's office is a home: never kept.
-    assert all(not r.address for r in draft.records if r.legal_form == "PFA")
+    # A sole trader keeps its registered office; a CNP is never its CUI.
+    sole = [r for r in draft.records if r.legal_form == "PFA"]
+    assert sole and all(r.address and not r.ids.get("cui") for r in sole)
     for name, cap in ((loaded, "registry_sync"), (draft, "registry_search")):
         assert _declared(name, manifests, "onrc", cap) == []
 
@@ -488,13 +489,28 @@ def test_ingest_is_the_only_writer_of_what_modules_find(manifests):
     assert found == {}
 
 
-def test_the_privacy_rule_names_the_registrys_personal_forms():
+def test_every_legal_form_keeps_its_registered_office():
+    # PFA, II and IF are legal forms whose registry details are public.
+    for form in ("PFA", "II", "IF", "SRL"):
+        record = api.Record(name=f"TESTESCU ANA {form}", legal_form=form,
+                            address="Str. Casei 9", phone="+40 268 000 000")
+        company = ingest.company_from(record)
+        assert (company.address, company.phone) == ("Str. Casei 9", "+40 268 000 000")
+    assert not hasattr(ingest, "PERSONAL_FORMS")
+
+
+def test_do_not_contact_still_keeps_a_sole_trader_out():
+    record = api.Record(name="TESTESCU ANA PFA", legal_form="PFA", domain="testescu.example.ro",
+                        address="Str. Casei 9")
+    assert ingest.excluded(record, ["testescu.example.ro"])
+    assert not ingest.excluded(record, ["altceva.example.ro"])
+
+
+def test_a_personal_numeric_code_is_never_a_cui():
     from harvey.collectors import onrc
 
-    assert ingest.PERSONAL_FORMS == onrc.PERSONAL_FORMS
-    record = api.Record(name="TESTESCU ANA PFA", legal_form="PFA", address="Str. Casei 9")
-    assert ingest.company_from(record).address == ""
-    assert ingest.company_from(api.Record(legal_form="SRL", address="Str. X 1")).address
+    assert onrc.valid_cui("1900101123456") == ""
+    assert onrc.valid_cui("RO90000017") == "90000017"
 
 
 def test_a_phone_fact_that_does_not_parse_is_left_out():

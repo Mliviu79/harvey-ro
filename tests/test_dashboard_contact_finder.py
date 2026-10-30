@@ -385,8 +385,11 @@ def test_page_loads_i18n_after_auth_and_before_app(client):
 
 
 def test_every_signal_has_a_romanian_label():
+    from harvey.modules import switches
+
     src = (WEB / "i18n.js").read_text(encoding="utf-8")
-    for sig in SIGNAL_CATALOG:
+    declared = [sig for m in switches.manifests() for sig in m.signals]
+    for sig in [*SIGNAL_CATALOG, *declared]:
         assert f'"sigc.{sig["code"]}.label"' in src, sig["code"]
 
 

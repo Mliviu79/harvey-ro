@@ -433,6 +433,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # turns a name and a domain into something worth writing about.
             if summary.get("unprofiled", 0):
                 tasks.append(("profile", run_profile_stage(state, limit=25, config=config)))
+            # A free local source the user set to update on its own (the
+            # financial statements) checks for a new year when it is due.
+            # Off by default: then this only reads two settings.
+            if not send_only:
+                from harvey.modules.runs import sync_due_sources
+                tasks.append(("sources", sync_due_sources(state)))
 
             outcomes = await _run_agents(tasks)
 

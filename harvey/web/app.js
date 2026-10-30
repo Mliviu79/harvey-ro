@@ -559,6 +559,251 @@ async function loadModulesPage() {
   markLoadFailed('modules', !data || data.error);
   if (!data || data.error) { el.innerHTML = offlineState(); return; }
   renderModulesPage(data);
+  loadPublicData();
+}
+
+// ── Date publice: the official datasets kept locally (registry, statements) ──
+
+let _pdTimer = null;
+
+async function loadPublicData() {
+  const data = await api('/api/public-data');
+  if (!data || data.error) return;
+  renderPublicData(data);
+}
+
+function renderPublicData(data) {
+  const el = document.getElementById('public-data');
+  if (!el) return;
+  _pdRunning = {fin: !!(data.financials || {}).running, tax: !!(data.taxpayers || {}).running};
+  const fin = data.financials || {};
+  const reg = data.registry;
+  const num = v => fmtN(Number(v || 0));
+  const regLine = reg
+    ? escHtml(t('pd.registry_loaded', {dataset: reg.dataset || '', firms: num(reg.firms),
+                                       operating: num(reg.operating)})) + ' ' + relTime(reg.loaded_at)
+    : escHtml(t('pd.registry_none'));
+  const settings = fin.settings || {};
+  const loaded = fin.loaded;
+  let finBody;
+  if (!fin.on) {
+    finBody = '<p class="desc">' + escHtml(t('pd.off')) + '</p>';
+  } else {
+    const lines = [];
+    lines.push(loaded
+      ? escHtml(t('pd.fin_loaded', {years: String(loaded.years || '').split(' ').join(', '),
+                                    companies: num(loaded.companies), rows: num(loaded.rows)})) +
+        ' ' + relTime(loaded.loaded_at)
+      : escHtml(t('pd.fin_none', {years: settings.years || 3})));
+    lines.push(fin.checked_at ? escHtml(t('pd.fin_checked')) + ' ' + relTime(fin.checked_at)
+                              : escHtml(t('pd.fin_never_checked')));
+    const todo = fin.updates || [];
+    if (todo.length) {
+      lines.push(escHtml(t('pd.fin_updates')) + ' ' + todo.map(u =>
+        '<span class="cost-chip">' + escHtml(u.year + ' ' + u.form + ' · ' + t('pd.why.' + u.why)) + '</span>').join(''));
+    } else if (loaded && fin.checked_at) {
+      lines.push(escHtml(t('pd.fin_uptodate')));
+    }
+    const rep = fin.report;
+    if (rep && (rep.unconfirmed || []).length) {
+      lines.push(escHtml(t('pd.unconfirmed', {codes: rep.unconfirmed.join(', ')})));
+    }
+    if (rep && (rep.errors || []).length) {
+      lines.push('<span class="error">' + escHtml(t('pd.failed', {error: rep.errors[0]})) + '</span>');
+    }
+    const busy = !!fin.running;
+    finBody = lines.map(l => '<p class="desc">' + l + '</p>').join('') +
+      '<div class="pd-actions">' +
+        '<button class="btn primary" ' + (busy ? 'disabled ' : '') + 'onclick="loadFinancials()">' +
+          escHtml(busy ? t('pd.loading') : t(loaded ? 'pd.update' : 'pd.load')) + '</button> ' +
+        '<button class="btn" ' + (busy ? 'disabled ' : '') + 'onclick="checkFinancials()">' + escHtml(t('pd.check')) + '</button>' +
+        '<label class="pd-setting">' + escHtml(t('pd.years')) + ' <input type="number" min="1" max="30" value="' +
+          escHtml(String(settings.years || 3)) + '" onchange="setFinancialsSetting(\'years\', this.value)"></label>' +
+        '<label class="pd-setting"><input type="checkbox" ' + (settings.auto_update ? 'checked ' : '') +
+          'onchange="setFinancialsSetting(\'auto_update\', this.checked)"> ' + escHtml(t('pd.auto')) + '</label>' +
+      '</div>' +
+      '<div class="module-terms">' + escHtml(t('pd.source', {attribution: fin.attribution || ''})) + '</div>';
+  }
+  clearTimeout(_pdTimer);
+  if (fin.running || (data.taxpayers || {}).running || (data.anaf || {}).running) {
+    _pdTimer = setTimeout(pollFinancials, 3000);
+  }
+  el.innerHTML = '<div class="subhead">' + escHtml(t('pd.title')) + '</div>' +
+    '<p class="desc">' + escHtml(t('pd.lede')) + '</p>' +
+    '<div class="card module-list">' +
+      '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.registry')) + '</h3>' +
+        '<p class="desc">' + regLine + '</p></div></div>' +
+      '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.fin')) + '</h3>' +
+        finBody + '</div></div>' +
+      '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.tax')) + '</h3>' +
+        taxpayersBody(data.taxpayers || {}) + '</div></div>' +
+      '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.anaf')) + '</h3>' +
+        anafBody(data.anaf || {}) + '</div></div>' +
+    '</div>';
+}
+
+// The Ministry of Finance's taxpayer file: loaded once a year, read locally.
+function taxpayersBody(tax) {
+  if (!tax.on) return '<p class="desc">' + escHtml(t('pd.tax_off')) + '</p>';
+  const num = v => fmtN(Number(v || 0));
+  const loaded = tax.loaded;
+  const settings = tax.settings || {};
+  const lines = [];
+  lines.push(loaded
+    ? escHtml(t('pd.tax_loaded', {year: loaded.year || '', rows: num(loaded.rows), phones: num(loaded.with_phone),
+                                  vat: num(loaded.vat), employers: num(loaded.employers), micro: num(loaded.micro)})) +
+      ' ' + relTime(loaded.loaded_at)
+    : escHtml(t('pd.tax_none')));
+  lines.push(tax.checked_at ? escHtml(t('pd.fin_checked')) + ' ' + relTime(tax.checked_at)
+                            : escHtml(t('pd.fin_never_checked')));
+  if (tax.update) {
+    lines.push(escHtml(t('pd.fin_updates')) + ' <span class="cost-chip">' +
+      escHtml(tax.update.year + ' · ' + t('pd.why.' + tax.update.why)) + '</span>');
+  } else if (loaded && tax.checked_at) {
+    lines.push(escHtml(t('pd.fin_uptodate')));
+  }
+  const rep = tax.report;
+  if (rep && (rep.unconfirmed || []).length) lines.push(escHtml(t('pd.unconfirmed', {codes: rep.unconfirmed.join(', ')})));
+  if (rep && (rep.errors || []).length) lines.push('<span class="error">' + escHtml(t('pd.failed', {error: rep.errors[0]})) + '</span>');
+  const busy = !!tax.running;
+  return lines.map(l => '<p class="desc">' + l + '</p>').join('') +
+    '<div class="pd-actions">' +
+      '<button class="btn primary" ' + (busy ? 'disabled ' : '') + 'onclick="loadTaxpayers()">' +
+        escHtml(busy ? t('pd.tax_loading') : t(loaded ? 'pd.update' : 'pd.load')) + '</button> ' +
+      '<button class="btn" ' + (busy ? 'disabled ' : '') + 'onclick="checkTaxpayers()">' + escHtml(t('pd.check')) + '</button>' +
+      '<label class="pd-setting"><input type="checkbox" ' + (settings.auto_update ? 'checked ' : '') +
+        'onchange="setTaxpayersSetting(\'auto_update\', this.checked)"> ' + escHtml(t('pd.tax_auto')) + '</label>' +
+    '</div>' +
+    '<div class="module-terms">' + escHtml(t('pd.source', {attribution: tax.attribution || ''})) + '</div>';
+}
+
+// ANAF's public web service: asked per company, one request a second.
+function anafBody(anaf) {
+  if (!anaf.on) return '<p class="desc">' + escHtml(t('pd.anaf_off')) + '</p>';
+  const kept = anaf.kept || {};
+  const job = anaf.job;
+  const lines = [escHtml(t('pd.anaf_kept', {answers: fmtN(kept.answers || 0), found: fmtN(kept.found || 0),
+                                            days: (anaf.settings || {}).cache_days || 30}))];
+  if (anaf.running && job) {
+    lines.push(escHtml(t('pd.anaf_running', {done: fmtN(job.done || 0), total: fmtN(job.total || 0)})));
+  } else if (job && job.report) {
+    lines.push(escHtml(anafSummary(job.report)));
+    if ((job.report.unconfirmed || []).length) lines.push(escHtml(t('pd.unconfirmed', {codes: job.report.unconfirmed.join(', ')})));
+    if ((job.report.errors || []).length) lines.push('<span class="error">' + escHtml(t('pd.anaf_failed', {error: job.report.errors[0]})) + '</span>');
+  }
+  const busy = !!anaf.running;
+  return lines.map(l => '<p class="desc">' + l + '</p>').join('') +
+    '<div class="pd-actions">' +
+      '<button class="btn primary" ' + (busy ? 'disabled ' : '') + 'onclick="anafCheck({missing: true})">' +
+        escHtml(t('pd.anaf_missing')) + '</button> ' +
+      '<button class="btn" ' + (busy ? 'disabled ' : '') + 'onclick="anafCheck({})">' + escHtml(t('pd.anaf_all')) + '</button>' +
+    '</div>' +
+    '<div class="module-terms">' + escHtml(t('pd.anaf_terms')) + '</div>' +
+    '<div class="module-terms">' + escHtml(t('pd.source', {attribution: anaf.attribution || ''})) + '</div>';
+}
+
+function anafSummary(rep) {
+  if (rep.stopped === 'unconfirmed') return t('pd.anaf_unconfirmed');
+  const done = t('pd.anaf_done', {companies: fmtN(rep.companies || 0), asked: fmtN(rep.checked || 0),
+                                  cached: fmtN(rep.cached || 0), updated: fmtN(rep.updated || 0),
+                                  missing: fmtN(rep.not_found || 0)});
+  return rep.stopped === 'busy' ? done + ' ' + t('pd.anaf_busy') : done;
+}
+
+let _anafWatch = null;
+
+// Start an ANAF check ({ids}, {q}, {missing: true} or {} for every company
+// with a CUI) and say when it is done.
+async function anafCheck(body) {
+  const res = await api('/api/anaf/check', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.anaf_failed', {error: ''})), 'error'); return; }
+  showToast(t('pd.anaf_started'));
+  loadPublicData();
+  clearTimeout(_anafWatch);
+  _anafWatch = setTimeout(watchAnaf, 2000);
+}
+
+async function watchAnaf() {
+  const data = await api('/api/public-data');
+  const anaf = data && data.anaf;
+  if (!anaf) return;
+  if (anaf.running) { _anafWatch = setTimeout(watchAnaf, 2000); return; }
+  const rep = anaf.job && anaf.job.report;
+  if (rep) {
+    if ((rep.errors || []).length && !rep.updated && !rep.cached) showToast(t('pd.anaf_failed', {error: rep.errors[0]}), 'error');
+    else showToast(anafSummary(rep), 'success');
+  }
+  if (document.getElementById('public-data')) renderPublicData(data);
+  if (_drawer.id) openCompany(_drawer.id);
+}
+
+async function loadTaxpayers() {
+  const res = await api('/api/public-data/taxpayers/load', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.failed', {error: ''})), 'error'); return; }
+  loadPublicData();
+}
+
+async function checkTaxpayers() {
+  const res = await api('/api/public-data/taxpayers/check', {method: 'POST'});
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.check_failed')), 'error'); return; }
+  renderPublicData(res);
+}
+
+async function setTaxpayersSetting(key, value) {
+  const res = await api('/api/public-data/taxpayers/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[key]: value}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('mod.failed')), 'error'); return; }
+  renderPublicData(res);
+}
+
+let _pdRunning = {};
+
+async function pollFinancials() {
+  const data = await api('/api/public-data');
+  if (!data || data.error) return;
+  const fin = data.financials || {};
+  const tax = data.taxpayers || {};
+  if (_pdRunning.fin && !fin.running && fin.report) {
+    const rep = fin.report;
+    if ((rep.errors || []).length && !rep.companies) showToast(t('pd.failed', {error: rep.errors[0]}), 'error');
+    else showToast(rep.unchanged ? t('pd.unchanged_toast') : t('pd.loaded_toast', {companies: fmtN(rep.companies || 0)}), 'success');
+  }
+  if (_pdRunning.tax && !tax.running && tax.report) {
+    const rep = tax.report;
+    if ((rep.errors || []).length && !rep.companies) showToast(t('pd.failed', {error: rep.errors[0]}), 'error');
+    else showToast(rep.unchanged ? t('pd.tax_unchanged_toast') : t('pd.tax_loaded_toast', {companies: fmtN(rep.companies || 0)}), 'success');
+  }
+  _pdRunning = {fin: !!fin.running, tax: !!tax.running};
+  renderPublicData(data);
+}
+
+async function loadFinancials() {
+  const res = await api('/api/public-data/financials/load', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.failed', {error: ''})), 'error'); return; }
+  loadPublicData();
+}
+
+async function checkFinancials() {
+  const res = await api('/api/public-data/financials/check', {method: 'POST'});
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.check_failed')), 'error'); return; }
+  renderPublicData(res);
+}
+
+async function setFinancialsSetting(key, value) {
+  const res = await api('/api/public-data/financials/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[key]: value}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('mod.failed')), 'error'); return; }
+  renderPublicData(res);
 }
 
 function renderModulesPage(data) {
@@ -2943,10 +3188,17 @@ function renderCompanyActions() {
     {sep: true, label: t('actions.selection', {n: n})},
     {label: t('actions.csv'), action: 'exportCompanies(\'csv\', true)', disabled: !n},
     {label: t('actions.json'), action: 'exportCompanies(\'json\', true)', disabled: !n},
+    {label: t('actions.anaf'), action: 'anafCompanies(true)', disabled: !n},
     {sep: true, label: all},
     {label: t('actions.csv'), action: 'exportCompanies(\'csv\', false)', disabled: !_co.total},
     {label: t('actions.json'), action: 'exportCompanies(\'json\', false)', disabled: !_co.total},
+    {label: t('actions.anaf'), action: 'anafCompanies(false)', disabled: !_co.total},
   ]);
+}
+
+// Check the selection, the search's results or every company at ANAF.
+function anafCompanies(selection) {
+  anafCheck(selection ? {ids: [..._co.selected]} : (_co.q.trim() ? {q: _co.q.trim()} : {}));
 }
 
 function exportCompanies(format, selection) {
@@ -3037,6 +3289,7 @@ function renderDrawer() {
     (count ? '<span class="count">' + fmtN(count) + '</span>' : '') + '</h3>' + body + '</section>';
   const none = text => '<p class="none">' + escHtml(text) + '</p>';
 
+  const findings = c.findings || {};
   const phones = [];
   const mainPhone = c.phone_display || c.phone;
   if (mainPhone) phones.push({n: mainPhone, kind: c.phone_type, main: true});
@@ -3044,9 +3297,11 @@ function renderDrawer() {
   const phoneRows = phones.map(p => {
     const href = telHref(p.n);
     const kind = p.kind ? t('phone.' + p.kind) : '';
+    const found = (findings.phones || []).find(f => phoneTail(f.value) === phoneTail(p.n));
     return '<div class="drow">' +
       (href ? '<a class="mono big tel" href="' + href + '">' + escHtml(p.n) + '</a>' : '<span class="mono big">' + escHtml(p.n) + '</span>') +
-      '<span class="drow-meta">' + [p.main ? escHtml(t('drawer.main')) : '', kind && kind !== 'phone.' + p.kind ? escHtml(kind) : '']
+      '<span class="drow-meta">' + [p.main ? escHtml(t('drawer.main')) : '', kind && kind !== 'phone.' + p.kind ? escHtml(kind) : '',
+        found ? findingSources(found) : '']
         .filter(Boolean).join(' · ') + '</span>' +
       '<button class="copy" onclick="copyText(' + jsq(p.n) + ', this)" aria-label="' + escHtml(t('common.copy')) + '">' + icon('copy') + '</button></div>';
   }).join('');
@@ -3088,9 +3343,19 @@ function renderDrawer() {
     [t('drawer.added'), relTime(c.created_at)],
   ].filter(f => f[1]);
 
+  const addressRows = (findings.addresses || []).map(a =>
+    '<div class="drow addr"><span class="drow-text">' + escHtml(a.value) + '</span>' +
+    '<span class="drow-meta">' + findingSources(a) + '</span></div>').join('');
+  const factRows = (findings.facts || []).map(f =>
+    '<dt>' + escHtml(tServer('sigc.' + f.code + '.label', f.label)) + '</dt><dd>' + escHtml(factValue(f)) +
+    '<span class="drow-meta"> · ' + escHtml(f.name) + (f.observed_at ? ' · ' + escHtml(String(f.observed_at).slice(0, 10)) : '') +
+    '</span></dd>').join('');
+
   el.innerHTML = head(escHtml(c.name), companyIdLine(c)) +
     '<div class="drawer-scroll">' +
     section(t('drawer.phones'), 'phone', phoneRows || none(t('drawer.no_phones')), phones.length) +
+    (addressRows ? section(t('drawer.addresses'), 'pin', addressRows, (findings.addresses || []).length) : '') +
+    (factRows ? section(t('drawer.official'), 'layers', '<dl class="facts-list">' + factRows + '</dl>') : '') +
     section(t('drawer.emails'), 'mail', emailRows || none(t('drawer.no_emails')), (c.emails || []).length) +
     section(t('drawer.people'), 'contacts', people || none(t('drawer.no_people')), (c.people || []).length) +
     (contacts ? section(t('drawer.contacts'), 'layers', contacts, (_drawer.contacts || []).length) : '') +
@@ -3098,7 +3363,29 @@ function renderDrawer() {
     section(t('drawer.details'), 'pin', '<dl class="facts-list">' + facts.map(f => '<dt>' + escHtml(f[0]) + '</dt><dd>' + f[1] + '</dd>').join('') + '</dl>') +
     '</div>' +
     '<div class="drawer-foot"><button class="btn btn-secondary btn-sm" onclick="exportOne(\'csv\')">' + icon('download') + 'CSV</button>' +
-    '<button class="btn btn-secondary btn-sm" onclick="exportOne(\'json\')">' + icon('download') + 'JSON</button></div>';
+    '<button class="btn btn-secondary btn-sm" onclick="exportOne(\'json\')">' + icon('download') + 'JSON</button>' +
+    (c.cui ? '<button class="btn btn-secondary btn-sm" onclick="anafCheck({ids: [_drawer.id]})">' + escHtml(t('drawer.anaf')) + '</button>' : '') +
+    '</div>';
+}
+
+// The last nine digits: one number written in two ways (+40 268..., 0268...).
+function phoneTail(n) {
+  return String(n || '').replace(/\D/g, '').slice(-9);
+}
+
+// Who gave a phone or an address, and when: official registers first.
+function findingSources(f) {
+  return (f.sources || []).map(s => (s.official ? '<b>' + escHtml(s.name) + '</b>' : escHtml(s.name)) +
+    (s.observed_at ? ' ' + escHtml(String(s.observed_at).slice(0, 10)) : '')).join(', ');
+}
+
+function factValue(f) {
+  if (f.value_type === 'bool') return f.value_num ? t('drawer.yes') : t('drawer.no');
+  let v = f.value_text || '';
+  if (f.value_num !== null && f.value_num !== undefined && f.value_type === 'num') {
+    v = fmtN(Number(f.value_num)) + (f.unit ? ' ' + f.unit : '');
+  }
+  return v + (f.year ? ' (' + f.year + ')' : '');
 }
 
 function exportOne(format) {

@@ -52,6 +52,7 @@ confirmed signals, searching contacts, and the same screen in dark mode:
 - [Nothing sends without you](#nothing-sends-without-you)
 - [The dashboard](#the-dashboard)
 - [How the data is stored](#how-the-data-is-stored)
+- [Romanian public data](#romanian-public-data)
 - [Configuration](#configuration)
 - [Using a ChatGPT plan instead (Codex)](#using-a-chatgpt-plan-instead-codex)
 - [Legal and deliverability](#legal-and-deliverability)
@@ -385,6 +386,34 @@ and administrators' names and roles, in a few minutes. Then
 Harvey to look for their contacts. A newer dataset is built aside and swapped in whole, one load at a
 time; offline, the newest dataset already downloaded is used.
 
+**Every company's yearly figures, also loaded once.** The Ministry of Finance
+publishes each company's annual statements on data.gov.ro, a year at a time
+(year N around June of N+1, revised a year later with late filers).
+`harvey financials load` downloads the latest three published years (about
+90 MB a year; only what is missing, kept in `data/mf_financials/<year>/` and
+never deleted on its own) and loads them into `data/financials.db`: turnover,
+average employees, net profit or loss, equity, debts and assets per CUI and
+year, under the same names whatever the year's column numbering (the mapping
+is `harvey/modules/ro/mf_financials/indicators.csv`). An empty cell stays
+unknown, never 0. `--years 5` (or `all`) keeps more years, `harvey financials
+status` shows what is loaded and whether data.gov.ro has something newer, and
+`harvey financials check` asks now. The dashboard shows the same under
+**Sources → Public data**, with a Load button and an opt-in switch to update on
+its own when a new year is out (off by default: nothing downloads unless you
+ask). Companies on file with a CUI get `TURNOVER`, `EMPLOYEES`, `NET_RESULT`,
+`EQUITY`, `DEBTS`, `TOTAL_ASSETS` (derived: fixed + current assets + prepaid
+expenses), `TURNOVER_GROWTH`, `ACCOUNTS_FORM` and `FILED_ACCOUNTS` once you
+confirm them, one reading per year; cohort ranges compare the latest year on
+file, or a year you name. Registry search, pull and `import-onrc` take
+`--min-turnover 1M`, `--max-turnover`, `--min-employees`, `--max-employees`
+and `--unknown include|exclude (turnover and headcount alike)`, so the list is narrowed before
+anything is pulled or paid for. Sole traders and family businesses (PFA, II,
+IF) file no balance sheet: for them a missing statement is "not applicable",
+never "didn't file". Nor is a struck-off firm's, or a year's first release:
+about one filer in seven only appears in the revised files a year later, so
+"didn't file" waits for a year's final release. Credit: Ministerul Finanțelor, data.gov.ro (CC-BY 4.0;
+OGL-ROU 1.0 before 2019); the companies JSON export carries it in `notes`.
+
 **One company, however many sources found it.** Every key a company is known by
 (CUI, registration number, a map listing's id, its domain, its phones, its name
 in its town) is kept, and each new record is scored against them: the same
@@ -670,6 +699,84 @@ Other tables: `companies`, `prospects`, `campaigns`, `conversations`, `outbox`, 
 
 ---
 
+## Romanian public data
+
+Four free official sources describe Romanian companies. Each is a module in
+the Romanian set, on by default when that set is, and listed on **Surse** with
+its licence and terms. Three are open datasets loaded once into their own
+database under `data/` and read locally, so what they say is on a company
+the moment it is pulled from the registry, and every filter on it applies
+before any paid search. The fourth is ANAF's web service, asked per company.
+
+| Source | Module | What it gives | How it is read | Licence and terms |
+|---|---|---|---|---|
+| Trade registry (ONRC) | `onrc` | every firm, its status, CAEN classes, registered office, administrators | `harvey registry load` into `data/registry.db` | CC-BY 4.0, credit ONRC |
+| Annual financial statements (Ministry of Finance) | `mf_financials` | turnover, employees, profit, equity, debts, one reading per year | `harvey financials load` into `data/financials.db` (~90 MB a year) | CC-BY 4.0 (OGL-ROU 1.0 before 2019), credit the Ministry of Finance |
+| Taxpayer identification file (Ministry of Finance) | `mf_taxpayers` | address, phone, VAT registered, employer (wage tax), micro-enterprise tax | `harvey taxpayers load` into `data/taxpayers.db` (~870 MB a year, June, corrected in July) | CC-BY 4.0, credit the Ministry of Finance |
+| ANAF – date firmă (PlatitorTvaRest v9) | `anaf` | VAT and VAT since, VAT on cash basis, split VAT, fiscally inactive, e-Factura, registration status, legal form, registered office and fiscal domicile, phone | `harvey anaf check`, the company panel, or on its own after a registry pull | free public web service, no key; at most 100 CUIs a request and one request a second |
+
+**ANAF, at its pace.** ANAF allows one request a second and warns that
+overloading it is punished. Every request Harvey makes to it waits its turn in
+one lane, shared by everything Harvey runs (the dashboard and a CLI command
+on the same machine take turns through `data/lanes/anaf.last`), and goes out at
+least 1.1 s after the one before. A request carries up to 100 CUIs, each
+checked first (digits, valid check digit; ANAF refuses a whole request for one
+`RO`-prefixed code). A busy answer (HTTP 429 or 5xx) is retried at most three
+times, waiting 2, 5 and 10 s (or what `Retry-After` asks, up to a minute);
+anything else is reported, never retried. When ANAF stays busy or can't be
+reached, or two batches in a row fail, the run stops instead of moving on to
+the next batch (`--missing` finishes later). Answers are kept in `data/anaf.db`
+for 30 days (the module's `cache_days` setting), so a company is asked about
+again only after that. `harvey anaf check --missing` asks about every company
+never checked, `--all-on-file` about every company with a CUI (kept answers are
+reused), `--cui N` about one; `harvey anaf status` counts the answers kept. On
+the dashboard the same is under **Sources → Public data**, in the Actions menu
+of the Companies tab (the selection, a search's results, or everything) and on
+a company's panel. While the module is on and at least one of its signals is
+confirmed, `harvey registry pull` and `harvey import-onrc` check each saved
+firm at ANAF in the background while the rest is saved, then wait for the last
+batch, with progress. With none confirmed, ANAF is never asked and no phone is
+filled from it.
+
+**The taxpayer file.** `harvey taxpayers load` takes the newest year's file
+(2026: two parts of about 430 MB each, `^`-separated), keeps the download in
+`data/mf_taxpayers/<year>/`, and loads only the columns Harvey uses into
+`data/taxpayers.db`: name, address parts, phone, fax, status, VAT, and the tax
+flags (wage income tax or the labour insurance contribution mean an employer;
+the micro-enterprise income tax). A load of 2.6 million rows takes under two
+minutes. `harvey taxpayers status` and `harvey taxpayers check` say whether a
+newer file is out; automatic updates are opt-in. Its readings are dated the day
+the file was published, so ANAF's newer answer stays the current one. The
+file's status column is the last event on a taxpayer's record (a transfer, a
+resumption), not its state, so the registration status comes from ANAF only.
+Downloads are kept, a year's beside the last (about 875 MB a year for the
+taxpayer file, 90 MB for the statements): delete old ones in
+`data/mf_taxpayers/` and `data/mf_financials/` by hand when space runs short.
+A download is refused when the disk hasn't room for it and its load.
+
+**Signals.** `VAT_REGISTERED`, `VAT_SINCE`, `VAT_ON_CASH`, `SPLIT_VAT`,
+`FISCALLY_INACTIVE`, `EFACTURA_REGISTERED`, `REGISTRATION_STATUS`,
+`LEGAL_FORM` and `ADDRESS` (the `anaf` module), `HAS_EMPLOYEES_TAX` and
+`MICRO_TAX_REGIME` (`mf_taxpayers`) and the yearly figures (`mf_financials`)
+are free, known from the source itself, and recorded once you confirm them on
+**Semnale**, where the cohort builder filters on them: turnover and employee
+ranges, VAT registered, employer, micro-enterprise, and "fiscally inactive"
+to leave out (ANAF's explicit "not inactive" is a real no; a company never
+checked is unknown, not "active"). Before anything is pulled, registry search,
+pull and `import-onrc` take `--employer yes|no`, `--vat yes|no` and
+`--micro yes|no` from the taxpayer file, beside the turnover and employee
+bounds (a firm not in the file matches neither yes nor no).
+
+**Findings accumulate.** Every phone and address any source gives is kept as
+its own reading, with the module that found it, the date and its confidence:
+a second source adds beside the first, never over it. A company's panel shows
+each one with who gave it, official registers first, then the newest, and
+lists the latest official facts (status, VAT, legal form, figures). A company
+without a phone gets the first official one as its phone. PFA, II and IF are
+legal forms whose registry and tax details are public, and are kept like any
+other; a 13-digit personal numeric code (CNP) is never stored as a CUI or
+shown, and the do-not-contact list applies to them as to anyone.
+
 ## Configuration
 
 Two files, both plain text.
@@ -704,6 +811,14 @@ harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
 harvey registry load         # the whole trade registry into data/registry.db, once per dataset
 harvey registry search dentist BV  # every firm in Romania: words, CAEN code, county, town
+                             # (--min-turnover 1M, --max-employees 49 ... once statements are loaded;
+                             #  --employer yes, --vat yes, --micro no once the taxpayer file is)
+harvey financials load       # the Ministry of Finance's yearly statements into data/financials.db
+harvey financials status     # what is loaded; check: is a new or revised year out
+harvey taxpayers load        # the Ministry of Finance's taxpayer file into data/taxpayers.db
+harvey taxpayers status      # what is loaded; check: is a newer file out
+harvey anaf check --missing  # ANAF's company data for companies never checked
+                             # (--all-on-file, --cui N; one request a second, kept 30 days)
 harvey import-onrc --county BV [dentist]  # load + pull in one step (free);
                              # no activity = every operating company in the area;
                              # --administrators all|none; --dry-run counts
@@ -742,7 +857,7 @@ Everything beyond the core is a module with a `module.toml` manifest under
 export, geocoding, English), the original set (US market, the discovery
 sources, web-marketing, startup and hiring signals, email verification,
 Hunter, LinkedIn, the email loop) and the Romanian set (market, language,
-ONRC). A manifest names the code it describes, the `.env` keys it reads, what
+ONRC, the Ministry of Finance's statements and taxpayer file, ANAF). A manifest names the code it describes, the `.env` keys it reads, what
 it costs, its terms, and the signals it declares; each signal in the catalog
 is declared by exactly one module. `harvey modules list` reads them all
 without importing any code. `data/modules/<id>/` can hold a data-only market
@@ -783,7 +898,9 @@ step saves it, so every module goes through the same rules: the same
 company found twice is one company, only confirmed signals are recorded
 (and only ones the capability declares), a module that is off does
 nothing whoever asks it, phones and people accumulate instead of being
-overwritten, and a sole trader's address is never kept. Each recorded
+overwritten. A sole trader's or family business's (PFA, II, IF) registered
+office and phone are public registry data and are kept like any firm's;
+a personal numeric code (CNP) is never stored as a CUI or shown. Each recorded
 fact says which module and
 capability found it and for which company, so undoing a merge sends back
 exactly the facts found for the merged company, including ones found

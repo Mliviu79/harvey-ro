@@ -40,16 +40,19 @@ REQUIRED = ("id", "set", "kind", "version", "api")
 # The manifest keys a data pack may use: everything else either names code,
 # reads a key, or claims what another module does.
 PACK_KEYS = {*REQUIRED, "name", "description", "markets", "requires",
-             "default_enabled", "terms_note", "cost", "signals"}
+             "default_enabled", "terms_note", "attribution", "cost", "signals"}
+# How a lane may say its pace: one request every N seconds, or N a second.
+LANE_PACES = ("min_interval_seconds", "max_per_second", "max_per_minute", "max_per_hour")
 CAPABILITY_OPS = ("query", "lookup", "read", "sync", "expand", "judge", "action")
 SETTING_TYPES = ("bool", "int", "float", "str", "list")
 ABSENCE_VALUES = ("unknown", "false")
 # What a signal is about, how many current values it has, what its rows are
-# told apart by, and when in a search it can be known (from the source
+# told apart by (the search phrase of a rank, the financial year of a
+# yearly figure), and when in a search it can be known (from the source
 # itself, from a search, by reading the company, or by a model's judgement).
 SUBJECTS = ("company", "person")
 CARDINALITIES = ("one", "many")
-KEYED_BY = ("", "phrase")
+KEYED_BY = ("", "phrase", "year")
 WHEN_KNOWN = ("source", "search", "enrich", "judged")
 SIGNAL_DEFAULTS = {"subject": "company", "unit": "", "cardinality": "one",
                    "keyed_by": "", "absence": "unknown", "when_known": "enrich"}
@@ -96,6 +99,12 @@ class Manifest:
     wraps: tuple[str, ...] = ()
     secrets: tuple[str, ...] = ()
     terms_note: str = ""
+    # The credit its data needs wherever it is shown or exported (an open
+    # licence's attribution).
+    attribution: str = ""
+    # Its data comes from an official source (a public register, a
+    # ministry): shown before what other sources found.
+    official: bool = False
     cost: dict = field(default_factory=dict)
     lanes: tuple[dict, ...] = ()
     settings: dict = field(default_factory=dict)
@@ -221,6 +230,13 @@ def _check_lanes(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
             isinstance(lane, dict) and isinstance(lane.get("id"), str) for lane in raw):
         problems.append(f"{where}: every [[lanes]] entry needs an id")
         return ()
+    for lane in raw:
+        for key in LANE_PACES:
+            value = lane.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or value <= 0):
+                problems.append(f"{where}: lane {lane['id']} {key} must be a number above 0, "
+                                f"got {value!r}")
     return tuple(dict(lane) for lane in raw)
 
 
@@ -342,6 +358,12 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
     terms = raw.get("terms_note", "")
     if not isinstance(terms, str):
         problems.append(f"{where}: terms_note must be a string")
+    attribution = raw.get("attribution", "")
+    if not isinstance(attribution, str):
+        problems.append(f"{where}: attribution must be a string")
+    official = raw.get("official", False)
+    if not isinstance(official, bool):
+        problems.append(f"{where}: official must be true or false")
     texts = {k: raw.get(k, "") for k in ("name", "description")}
     for k, v in texts.items():
         if not isinstance(v, str):
@@ -359,6 +381,8 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         wraps=wraps,
         secrets=_str_list(raw.get("secrets"), "secrets", where, problems),
         terms_note=terms if isinstance(terms, str) else "",
+        attribution=attribution if isinstance(attribution, str) else "",
+        official=official is True,
         cost=_check_cost(raw.get("cost"), where, problems),
         lanes=_check_lanes(raw.get("lanes"), where, problems),
         settings=_check_settings(raw.get("settings"), where, problems),
@@ -435,4 +459,13 @@ def cross_check(manifests) -> list[str]:
                 if first is not m:
                     problems.append(f"{m.path}: {field_} {key!r} is already claimed "
                                     f"by {first.id} ({first.path})")
+    # A capability's lane must be one a manifest declares, or its requests
+    # would go out unpaced (lanes.wait refuses one it doesn't know).
+    declared = {lane["id"] for m in manifests for lane in m.lanes}
+    for m in manifests:
+        for cap in m.capabilities:
+            lane = cap.get("lane")
+            if lane is not None and lane not in declared:
+                problems.append(f"{m.path}: capability {cap['id']} names lane {lane!r}, "
+                                "which no module declares in [[lanes]]")
     return problems

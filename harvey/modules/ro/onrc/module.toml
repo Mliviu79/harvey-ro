@@ -11,10 +11,12 @@ api = 1
 markets = ["RO"]
 requires = ["market_ro"]
 default_enabled = true
+official = true
 entry = "harvey.modules.ro.onrc.capabilities"
 wraps = ["harvey.registry", "harvey.collectors.onrc"]
 secrets = []
-terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a natural person's name and role are kept from the representatives file; sole traders get no street address."
+attribution = "ONRC open data, data.gov.ro (CC-BY 4.0)"
+terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a natural person's name and role are kept from the representatives file; a personal numeric code is never kept."
 
 [cost]
 as_of = 2026-10-30

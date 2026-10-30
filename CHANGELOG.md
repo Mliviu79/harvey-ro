@@ -19,6 +19,47 @@ minor versions can still change behaviour.
   first (about a cent a search), so its price is exact. A run whose
   estimate is over the cap now runs up to the cap instead of refusing.
   `--limit` and `--depth` default to everything.
+- **Romanian companies' annual financial statements.** `harvey financials load`
+  downloads the Ministry of Finance's yearly statement files from data.gov.ro
+  (the latest three published years by default; only what is missing) into a
+  local `data/financials.db`. Companies on file get turnover, employees, net
+  result, equity, debts, total assets, turnover growth, the form filed and
+  whether they filed, one reading per year, once those signals are confirmed.
+  Registry search, pull and `import-onrc` filter on turnover and employees
+  before anything is pulled (`--unknown include` keeps firms whose figure is
+  missing). "Did not file" is said only for a year whose final, revised
+  release is loaded, and never for a struck-off firm. Downloads are checked:
+  only https://data.gov.ro, redirects included, never outside
+  `data/mf_financials/`, and refused when the disk hasn't room. The company
+  export's figures all come from one year, named in `financial_year`. The dashboard's Sources page shows what is
+  loaded and loads or checks for a newer year; automatic updates are opt-in.
+- **ANAF company data.** The new `anaf` module asks ANAF's free public web
+  service about companies on file by CUI: VAT registration and since when,
+  VAT on cash basis, split VAT, fiscal inactivity (an explicit "no" when ANAF
+  says so), e-Factura, registration status, legal form, registered office and
+  fiscal domicile, and phone. Up to 100 CUIs a request, one request every
+  1.1 s through one lane shared across Harvey (and across processes on one
+  machine), retries only on HTTP 429 or 5xx, answers kept 30 days.
+  `harvey anaf check --missing|--all-on-file|--cui N`, a Check at ANAF action
+  on the Companies tab and the company panel, and a background check of every
+  firm a registry pull saves while the module is on and at least one of its
+  signals is confirmed (nothing is asked, and no phone filled, before that).
+  A busy or unreachable ANAF stops the run instead of being asked batch
+  after batch.
+- **The Ministry of Finance's taxpayer file.** `harvey taxpayers load` loads
+  the yearly identification file (about 870 MB) into `data/taxpayers.db`:
+  address, phone, VAT, whether a company is an employer (`HAS_EMPLOYEES_TAX`)
+  or on the micro-enterprise tax (`MICRO_TAX_REGIME`). Companies with a CUI
+  get its readings right after a registry pull, dated the day it was
+  published so ANAF's newer answer stays current.
+- **Findings accumulate, official first.** Every phone and address a source
+  gives is kept with its module, date and confidence; the company panel shows
+  each with who gave it, official registers first, and the latest official
+  facts. Modules declare `official = true`, and `[[lanes]]` paces
+  (`min_interval_seconds`) are now enforced (`harvey/modules/lanes.py`).
+- **Yearly signals.** A signal can be keyed by year (`keyed_by = "year"`):
+  its current reading is the latest year on file, and a cohort range can name
+  another year.
 - **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
   listings around each city, with phone, website, category, rating and review
   count, and Google organic results with rank, both from one
@@ -210,6 +251,11 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- Sole traders and family businesses (PFA, II, IF) keep their registered
+  office and phone like any firm: their registry details are public. A
+  personal numeric code is still never stored as a CUI. Reload the registry
+  (`harvey registry load --force`, or the next `import-onrc` does it) to fill
+  in the addresses left out before.
 - **Precleared is told the company's and person's names Harvey already has.**
   For a UK address, cold email may go to a limited company's staff without
   consent but not to a sole trader, so Precleared has to find the company

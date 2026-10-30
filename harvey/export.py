@@ -365,6 +365,69 @@ async def export_prospects_csv(
     return len(rows), text
 
 
+async def source_notes(state: StateManager, ids: list[str]) -> list[str]:
+    """The credit each source whose data these companies carry asks for
+    (a manifest's ``attribution``): an open dataset's licence travels with
+    every export of it."""
+    import aiosqlite
+
+    from harvey.modules import switches
+
+    found: set[str] = set()
+    async with aiosqlite.connect(state.db_path) as db:
+        for i in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[i:i + _ID_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            async with db.execute(
+                    f"SELECT DISTINCT module FROM observations WHERE company_id IN ({marks}) "
+                    "AND COALESCE(module, '') != ''", chunk) as cursor:
+                found |= {r[0] for r in await cursor.fetchall()}
+            async with db.execute(
+                    f"SELECT DISTINCT source FROM companies WHERE id IN ({marks}) "
+                    "AND source LIKE 'registry:%'", chunk) as cursor:
+                found |= {r[0].split(":", 1)[1] for r in await cursor.fetchall()}
+    return [m.attribution for m in switches.manifests() if m.id in found and m.attribution]
+
+
+def yearly_codes(enabled) -> list[str]:
+    """The numeric yearly signals (``keyed_by = "year"``) of the modules
+    that are on, in manifest order: the figures a company export carries."""
+    from harvey.modules import switches
+
+    return [sig["code"] for m in switches.manifests() if m.id in enabled for sig in m.signals
+            if sig.get("keyed_by") == "year" and sig.get("value_type") == "num"]
+
+
+async def latest_year_figures(state: StateManager, ids: list[str],
+                              codes) -> dict[str, tuple[str, dict[str, float]]]:
+    """Company -> (year, {code: value}): the latest year any of ``codes``
+    has a reading for, and each code's reading for that same year only
+    (within a year, the one written last). A figure missing that year is
+    left out rather than taken from another year, so a row never puts one
+    year's turnover beside another year's headcount."""
+    import aiosqlite
+
+    codes = tuple(codes)
+    years: dict[str, dict[str, dict[str, float]]] = {}
+    if not codes:
+        return {}
+    async with aiosqlite.connect(state.db_path) as db:
+        for i in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[i:i + _ID_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            async with db.execute(
+                    f"SELECT company_id, signal_code, value_num, value_text FROM observations "
+                    f"WHERE company_id IN ({marks}) "
+                    f"AND signal_code IN ({','.join('?' * len(codes))}) "
+                    "AND value_num IS NOT NULL ORDER BY observed_at, rowid",
+                    [*chunk, *codes]) as cursor:
+                for company_id, code, value, year in await cursor.fetchall():
+                    if str(year or "").isdigit():
+                        years.setdefault(company_id, {}).setdefault(year, {})[code] = value
+    return {cid: (max(by_year, key=int), by_year[max(by_year, key=int)])
+            for cid, by_year in years.items()}
+
+
 async def export_companies_csv(
     state: StateManager, out_path: str | None = None, config=None,
 ) -> tuple[int, str]:
@@ -375,4 +438,6 @@ async def export_companies_csv(
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             f.write(text)
         logger.info(f"Exported {len(rows)} companies to {out_path}")
+        for note in await source_notes(state, [r["id"] for r in rows if r.get("id")]):
+            logger.info(f"Source: {note}")
     return len(rows), text

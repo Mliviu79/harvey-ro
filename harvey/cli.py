@@ -401,7 +401,12 @@ def cmd_export(args):
             out = args.out or "companies.csv"
             count, _ = await export_companies_csv(state, out_path=out)
             print(f"\n  Exported {count} companies to {out}  (one row per business, "
-                  "with its best contact where one was found)\n")
+                  "with its best contact where one was found)")
+            from harvey.export import collect_companies, source_notes
+            ids = [r["id"] for r in await collect_companies(state) if r.get("id")]
+            for note in await source_notes(state, ids):
+                print(f"  Source: {note}")
+            print()
             return
 
         args.out = args.out or "prospects.csv"
@@ -855,6 +860,9 @@ def _print_registry_rows(total: int, rows: list[dict], words: str, offset: int,
                                None if row.get("operating") else row.get("status")) if x]
         if details:
             print("    " + " · ".join(details))
+        figures = _figures_line(row.get("financials"))
+        if figures:
+            print(f"    {figures}")
         lines, more = _activity_lines(row.get("activities") or [])
         for line in lines[:4]:
             print(f"    {line}")
@@ -886,6 +894,109 @@ def _print_pull_report(report, where: str = ""):
               f"(harvey signals --confirm {code})")
     for err in report.errors[:5]:
         print(f"    ! {err}")
+
+
+def _amount(raw: str) -> float:
+    """A number as typed: 1000000, 1.5M, 500k, 2,5M (lei or people)."""
+    text = (raw or "").strip().lower().replace(" ", "").replace("_", "")
+    scale = 1
+    if text[-1:] in ("k", "m"):
+        scale = 1_000 if text[-1] == "k" else 1_000_000
+        text = text[:-1]
+    if text.count(",") == 1 and "." not in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text.replace(",", "")) * scale
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r} (1000000, 1.5M, 500k)")
+
+
+def _fin_filter_args(p):
+    g = p.add_argument_group(
+        "financial statements (the latest year on file; harvey financials load)")
+    g.add_argument("--min-turnover", type=_amount, metavar="LEI",
+                   help="Net turnover at least this, in lei (1M, 500k)")
+    g.add_argument("--max-turnover", type=_amount, metavar="LEI",
+                   help="Net turnover at most this, in lei")
+    g.add_argument("--min-employees", type=_amount, metavar="N",
+                   help="At least this many employees (yearly average)")
+    g.add_argument("--max-employees", type=_amount, metavar="N",
+                   help="At most this many employees")
+    g.add_argument("--unknown", dest="unknown_figures",
+                   choices=("exclude", "include"), default="exclude",
+                   help="Firms whose bounded figure is missing, turnover or headcount alike "
+                        "(no statement, a sole trader, a new firm, an empty headcount cell): "
+                        "left out (exclude, the default) or kept (include)")
+
+
+def _yes_no(raw: str) -> bool:
+    text = (raw or "").strip().lower()
+    if text in ("yes", "da", "y", "true", "1"):
+        return True
+    if text in ("no", "nu", "n", "false", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"yes or no, not {raw!r}")
+
+
+def _tax_filter_args(p):
+    g = p.add_argument_group("the taxpayer file (harvey taxpayers load)")
+    g.add_argument("--employer", type=_yes_no, metavar="yes|no",
+                   help="Registered for wage tax (an employer), or explicitly not")
+    g.add_argument("--vat", type=_yes_no, metavar="yes|no", help="VAT registered, or not")
+    g.add_argument("--micro", type=_yes_no, metavar="yes|no",
+                   help="On the micro-enterprise income tax, or not")
+
+
+def _tax_filter(args):
+    """The --employer/--vat/--micro conditions, or None. Refused (before
+    anything is read) while the taxpayer file's module is off."""
+    from harvey.modules.ro.mf_taxpayers.store import Filter
+
+    tax = Filter(employer=getattr(args, "employer", None), vat=getattr(args, "vat", None),
+                 micro=getattr(args, "micro", None))
+    if not tax.active():
+        return None
+    _require_module("mf_taxpayers", "Filtering by employer, VAT or micro-enterprise tax")
+    return tax
+
+
+def _fin_filter(args):
+    """The --min/--max turnover and employees bounds, or None. Refused
+    (before anything is read) while the financial statements module is off."""
+    from harvey.modules.ro.mf_financials.store import Filter
+
+    fin = Filter(min_turnover=getattr(args, "min_turnover", None),
+                 max_turnover=getattr(args, "max_turnover", None),
+                 min_employees=getattr(args, "min_employees", None),
+                 max_employees=getattr(args, "max_employees", None),
+                 unknown=getattr(args, "unknown_figures", "exclude") or "exclude")
+    if not fin.active():
+        return None
+    _require_module("mf_financials", "Filtering by turnover or employees")
+    return fin
+
+
+def _fin_display(con) -> None:
+    """Show each firm's latest filed figures beside it when the statements
+    are loaded and their module is on."""
+    from harvey.modules.ro.mf_financials import store
+
+    try:
+        if store.FINANCIALS_PATH.is_file() and "mf_financials" in asyncio.run(_modules_on()):
+            store.attach(con)
+    except Exception:
+        pass
+
+
+def _figures_line(fin: dict | None) -> str:
+    if not fin:
+        return ""
+    parts = []
+    if fin.get("turnover") is not None:
+        parts.append(f"turnover {fin['turnover']:,} lei")
+    if fin.get("employees") is not None:
+        parts.append(f"{fin['employees']:,} employees")
+    return f"{fin.get('year')} ({fin.get('form')}): " + ", ".join(parts) if parts else ""
 
 
 # registry pull copies at most this many firms unless --limit says how many.
@@ -935,9 +1046,16 @@ def cmd_registry(args):
               "(downloads ~1.5 GB once per dataset).\n")
         raise SystemExit(2)
 
+    fin = _fin_filter(args)
+    tax = _tax_filter(args)
+    _fin_display(con)
     if action == "search":
-        found = registry.search(con, words, all_statuses=args.all_statuses,
-                                limit=args.limit, offset=args.offset)
+        try:
+            found = registry.search(con, words, all_statuses=args.all_statuses,
+                                    limit=args.limit, offset=args.offset, fin=fin, tax=tax)
+        except FileNotFoundError as e:
+            print(f"\n  {e} (the filter needs it).\n")
+            raise SystemExit(2)
         if args.json:
             print(_json.dumps({"query": words, "total": found["total"],
                                "more": found["more"], "offset": args.offset,
@@ -952,9 +1070,14 @@ def cmd_registry(args):
         from harvey.modules.runs import registry_pull
         from harvey.state import StateManager
 
-        q = registry.resolve(con, words, all_statuses=args.all_statuses)
+        q = registry.resolve(con, words, all_statuses=args.all_statuses, fin=fin, tax=tax)
         if not q.match:
             print("\n  Say what to pull: words, a CAEN code, a county (BV) or a town.\n")
+            raise SystemExit(2)
+        try:
+            registry.count(con, q, 1)
+        except FileNotFoundError as e:
+            print(f"\n  {e} (the filter needs it).\n")
             raise SystemExit(2)
         if args.limit is None and not args.dry_run:
             n = registry.count(con, q, PULL_WITHOUT_LIMIT + 1)
@@ -971,14 +1094,16 @@ def cmd_registry(args):
             if with_admins and meta.get("with_administrators") != "1":
                 print("  (this registry was loaded without administrators: "
                       "harvey registry load --force)")
+            follow = await _start_follow_up(state, args.dry_run)
             report = await registry_pull(
                 state, con, q, limit=args.limit, with_administrators=with_admins,
                 dry_run=args.dry_run, do_not_contact=live_do_not_contact(load_config()),
-                progress=_pull_progress(args.dry_run))
+                progress=_pull_progress(args.dry_run), follow_up=follow)
             print(f"\n  {report.in_area:,} firm{'' if report.in_area == 1 else 's'} "
                   f"matching \"{words}\" from {meta.get('dataset')}"
                   + (f" (first {args.limit:,})" if args.limit else ""))
             _print_pull_report(report)
+            await _finish_follow_up(follow)
             print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
             if report.dry_run:
                 print("  Dry run: nothing was saved.\n")
@@ -1031,17 +1156,25 @@ def cmd_import_onrc(args):
         await state.init_db()
         con = registry.connect(path)
         q = registry.resolve(con, "", classes=classes, counties=names or [],
-                             localities=localities, all_statuses=args.include_inactive)
+                             localities=localities, all_statuses=args.include_inactive,
+                             fin=fin, tax=tax)
+        try:
+            registry.count(con, q, 1)
+        except FileNotFoundError as e:
+            print(f"\n  {e} (the filter needs it).\n")
+            raise SystemExit(2)
         where = f"{args.locality}, {county}" if args.locality else county
         what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
         print(f"  Looking for {what} in {where}"
               f"{'' if args.include_inactive else ' (operating companies only)'}...")
+        follow = await _start_follow_up(state, args.dry_run)
         report = await registry_pull(
             state, con, q, with_administrators=with_admins, dry_run=args.dry_run,
             do_not_contact=live_do_not_contact(load_config()), area=where,
-            progress=_pull_progress(args.dry_run))
+            progress=_pull_progress(args.dry_run), follow_up=follow)
         print(f"  {report.in_area:,} match\n")
         _print_pull_report(report)
+        await _finish_follow_up(follow)
         print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
         if report.dry_run:
             print("  Dry run: nothing was saved. Re-run without --dry-run to import.\n")
@@ -1051,7 +1184,371 @@ def cmd_import_onrc(args):
             print("  Next: harvey contacts (reads the sites of those with one)\n")
 
     _require_module("onrc", "harvey import-onrc")
+    fin = _fin_filter(args)
+    tax = _tax_filter(args)
     asyncio.run(_import())
+
+
+FIN_MODULE = "mf_financials"
+
+
+def _print_financials_status(meta: dict | None, updates: list[dict], checked_at: str,
+                             settings: dict):
+
+    if not meta:
+        print("\n  No financial statements loaded. harvey financials load")
+    else:
+        size = int(meta.get("bytes", 0)) / 1e6
+        print(f"\n  Financial statements for {meta.get('years', '').replace(' ', ', ')}")
+        print(f"  loaded {meta.get('loaded_at')} UTC in {meta.get('load_seconds')} s, "
+              f"{size:.0f} MB at {meta.get('path')}")
+        print(f"  {int(meta.get('rows', 0)):,} yearly statements, "
+              f"{int(meta.get('companies', 0)):,} companies")
+        for f in meta.get("files") or []:
+            print(f"    {f['year']} {f['form']}: {f['rows']:,} companies, published "
+                  f"{(f.get('published') or '')[:10]} ({f.get('licence')})")
+    if checked_at:
+        print(f"  data.gov.ro last checked {checked_at} UTC")
+    for u in updates:
+        print(f"    {u['year']} {u['form']}: {u['why']}")
+    if updates:
+        print("  Load them: harvey financials load")
+    print(f"  Keeps the latest {settings.get('years', 3)} years; checks every "
+          f"{settings.get('check_days', 30)} days"
+          + ("; updates on its own" if settings.get("auto_update") else
+             " when asked (automatic updates are off)"))
+    print(f"  Source: {_attribution(FIN_MODULE)}\n")
+
+
+def cmd_financials(args):
+    """The Ministry of Finance's annual statements in data/financials.db:
+    load the latest years, show what is loaded, ask whether newer is out.
+    No Claude."""
+    import json as _json
+
+    from harvey.modules import switches
+    from harvey.modules.ro.mf_financials import source, store
+    from harvey.modules.ro.mf_financials.capabilities import updates as pending
+    from harvey.state import StateManager
+
+    action = args.financials_action
+
+    async def _settings():
+        state = StateManager()
+        await state.init_db()
+        return state, await switches.module_settings(state, FIN_MODULE)
+
+    if action == "status":
+        state, settings = asyncio.run(_settings())
+        meta = store.status()
+        checked_at, found = source.load_catalog()
+        todo = pending(found, meta, int(settings.get("years") or 3)) if found else []
+        if args.json:
+            print(_json.dumps({"loaded": meta, "checked_at": checked_at, "updates": todo,
+                               "settings": settings}, ensure_ascii=False, indent=2))
+        else:
+            _print_financials_status(meta, todo, checked_at, settings)
+        return
+    _require_module(FIN_MODULE, f"harvey financials {action}")
+
+    if action == "check":
+        async def _check():
+            from harvey.modules.runs import sync_source
+
+            state, settings = await _settings()
+            draft = await sync_source(state, FIN_MODULE, "statements_check")
+            checked_at, _ = source.load_catalog()
+            _print_financials_status(store.status(), draft.values.get("updates") or [],
+                                     checked_at, settings)
+        asyncio.run(_check())
+        return
+
+    async def _load():
+        from harvey.modules.runs import lookup_by_id, sync_source
+
+        state, settings = await _settings()
+        if args.years:
+            years = 30 if args.years.strip().lower() == "all" else args.years
+            try:
+                settings["years"] = await switches.set_module_setting(
+                    state, FIN_MODULE, "years", years)
+            except ValueError as e:
+                print(f"\n  {e}\n")
+                raise SystemExit(2)
+        print(f"\n  Ministry of Finance statements: the latest {settings['years']} "
+              "published years (downloads only what is missing, ~90 MB a year)...",
+              flush=True)
+
+        def progress(step, rows):
+            if isinstance(rows, int) and step.startswith("downloading"):
+                print(f"    {step} ({rows / 1e6:.0f} MB)...", flush=True)
+            elif rows is None:
+                print(f"    {step}...", flush=True)
+
+        try:
+            draft = await sync_source(state, FIN_MODULE, "statements_sync",
+                                      extra={"force": args.force, "progress": progress})
+        except store.FinancialsBusy as e:
+            print(f"\n  {e}.\n")
+            raise SystemExit(2)
+        except (RuntimeError, store.FormatChanged) as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+        values = draft.values
+        if values.get("offline"):
+            print(f"  {values['offline']}: loaded the files already downloaded")
+        if values.get("unchanged"):
+            print("  Nothing new on data.gov.ro; already loaded (--force loads again).")
+        found = await lookup_by_id(state, progress=lambda done, total: print(
+            f"    companies on file: {done:,} of {total:,}...", flush=True))
+        checked_at, _ = source.load_catalog()
+        _print_financials_status(values.get("financials"), [], checked_at, settings)
+        print(f"  {found['companies']:,} companies on file got figures, "
+              f"{found['observations']:,} observations recorded")
+        for module, codes in found["unconfirmed"].items():
+            if module == FIN_MODULE and codes:
+                print(f"    not recorded, not confirmed: {', '.join(codes)} "
+                      f"(harvey signals --confirm {','.join(codes)})")
+        for err in found["errors"][:3]:
+            print(f"    ! {err}")
+        print()
+
+    asyncio.run(_load())
+
+
+TAX_MODULE = "mf_taxpayers"
+ANAF_MODULE = "anaf"
+
+
+def _print_taxpayers_status(meta: dict | None, change: dict | None, checked_at: str,
+                            settings: dict):
+
+    if not meta:
+        print("\n  No taxpayer file loaded. harvey taxpayers load")
+    else:
+        size = int(meta.get("bytes", 0)) / 1e6
+        print(f"\n  Taxpayer identification file {meta.get('year')} "
+              f"(published {(meta.get('published') or '')[:10]})")
+        print(f"  loaded {meta.get('loaded_at')} UTC in {meta.get('load_seconds')} s, "
+              f"{size:.0f} MB at {meta.get('path')}")
+        print(f"  {int(meta.get('rows', 0)):,} taxpayers: {int(meta.get('with_phone', 0)):,} "
+              f"with a phone, {int(meta.get('vat', 0)):,} VAT registered, "
+              f"{int(meta.get('employers', 0)):,} employers, "
+              f"{int(meta.get('micro', 0)):,} on the micro-enterprise tax")
+    if checked_at:
+        print(f"  data.gov.ro last checked {checked_at} UTC")
+    if change:
+        print(f"  {change['year']}: {change['why']} on data.gov.ro. Load it: harvey taxpayers load")
+    print(f"  Checks every {settings.get('check_days', 30)} days"
+          + ("; updates on its own" if settings.get("auto_update") else
+             " when asked (automatic updates are off)"))
+    print(f"  Source: {_attribution(TAX_MODULE)}\n")
+
+
+def cmd_taxpayers(args):
+    """The Ministry of Finance's taxpayer identification file in
+    data/taxpayers.db: load the newest, show what is loaded, ask whether a
+    newer one is out. No Claude."""
+    import json as _json
+
+    from harvey.modules import switches
+    from harvey.modules.ro.mf_taxpayers import source, store
+    from harvey.modules.ro.mf_taxpayers.capabilities import update as pending
+    from harvey.state import StateManager
+
+    action = args.taxpayers_action
+
+    async def _settings():
+        state = StateManager()
+        await state.init_db()
+        return state, await switches.module_settings(state, TAX_MODULE)
+
+    if action == "status":
+        state, settings = asyncio.run(_settings())
+        meta = store.status()
+        checked_at, found = source.load_catalog()
+        change = pending(found, meta)
+        if args.json:
+            print(_json.dumps({"loaded": meta, "checked_at": checked_at, "update": change,
+                               "settings": settings}, ensure_ascii=False, indent=2))
+        else:
+            _print_taxpayers_status(meta, change, checked_at, settings)
+        return
+    _require_module(TAX_MODULE, f"harvey taxpayers {action}")
+
+    if action == "check":
+        async def _check():
+            from harvey.modules.runs import sync_source
+
+            state, settings = await _settings()
+            draft = await sync_source(state, TAX_MODULE, "taxpayers_check")
+            checked_at, _ = source.load_catalog()
+            _print_taxpayers_status(store.status(), draft.values.get("update"), checked_at,
+                                    settings)
+        asyncio.run(_check())
+        return
+
+    async def _load():
+        from harvey.modules.runs import lookup_by_id, sync_source
+
+        state, settings = await _settings()
+        print("\n  Ministry of Finance taxpayer file: the newest year (downloads only what "
+              "is missing, ~870 MB)...", flush=True)
+
+        def progress(step, rows):
+            if isinstance(rows, int) and step.startswith("downloading"):
+                print(f"    {step} ({rows / 1e6:.0f} MB)...", flush=True)
+            elif isinstance(rows, int) and rows % 500_000 == 0:
+                print(f"    {step}: {rows:,} rows...", flush=True)
+
+        try:
+            draft = await sync_source(state, TAX_MODULE, "taxpayers_sync",
+                                      extra={"force": args.force, "progress": progress})
+        except store.TaxpayersBusy as e:
+            print(f"\n  {e}.\n")
+            raise SystemExit(2)
+        except (RuntimeError, store.FormatChanged) as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+        values = draft.values
+        if values.get("offline"):
+            print(f"  {values['offline']}: loaded the files already downloaded")
+        if values.get("unchanged"):
+            print("  Nothing new on data.gov.ro; already loaded (--force loads again).")
+        found = await lookup_by_id(state, progress=lambda done, total: print(
+            f"    companies on file: {done:,} of {total:,}...", flush=True))
+        checked_at, _ = source.load_catalog()
+        _print_taxpayers_status(values.get("taxpayers"), None, checked_at, settings)
+        print(f"  {found['companies']:,} companies on file got readings, "
+              f"{found['observations']:,} observations recorded")
+        for module, codes in found["unconfirmed"].items():
+            if codes:
+                print(f"    {module}: not recorded, not confirmed: {', '.join(codes)} "
+                      f"(harvey signals --confirm {','.join(codes)})")
+        for err in found["errors"][:3]:
+            print(f"    ! {err}")
+        print()
+
+    asyncio.run(_load())
+
+
+def _attribution(module_id: str) -> str:
+    """The credit a module's data asks for, as its manifest gives it."""
+    from harvey.modules import switches
+
+    m = switches.by_id().get(module_id)
+    return (m.attribution or m.name or m.id) if m else module_id
+
+
+def _module_name(module_id: str) -> str:
+    from harvey.modules import switches
+
+    m = switches.by_id().get(module_id)
+    return (m.name or m.id) if m else module_id
+
+
+def _print_check_report(r: dict) -> None:
+    name = _module_name(r["module"])
+    print(f"  {name}: {r['companies']:,} compan{'y' if r['companies'] == 1 else 'ies'} "
+          f"with a CUI; {r['checked']:,} asked in {r['requests']:,} request"
+          f"{'' if r['requests'] == 1 else 's'}, {r['cached']:,} from answers kept, "
+          f"{r['not_found']:,} unknown to it" + (f", {r['invalid']:,} with an invalid CUI"
+                                                  if r["invalid"] else ""))
+    print(f"  {r['observations']:,} observations recorded on {r['updated']:,} companies"
+          + (f"; {r['phones_set']:,} got a phone" if r["phones_set"] else ""))
+    if r["unconfirmed"]:
+        print(f"    not recorded, not confirmed: {', '.join(r['unconfirmed'])} "
+              f"(harvey signals --confirm {','.join(r['unconfirmed'])})")
+    if r["stopped"] == "unconfirmed":
+        print("    nothing asked: none of its signals is confirmed")
+    elif r["stopped"] == "busy":
+        print("    stopped: the service stayed busy or couldn't be reached; "
+              "harvey anaf check --missing finishes later")
+    elif r["stopped"]:
+        print(f"    stopped: {r['stopped']}")
+    for err in r["errors"][:3]:
+        print(f"    ! {err}")
+
+
+def cmd_anaf(args):
+    """ANAF's public web service for the companies on file: VAT and
+    e-Factura registration, fiscal inactivity, status, legal form, address
+    and phone. One request a second, 100 companies a request; answers are
+    kept for the module's cache_days. No Claude."""
+    from harvey.modules.ro.anaf import service
+    from harvey.state import StateManager
+
+    if args.anaf_action == "status":
+        kept = service.status()
+        print(f"\n  ANAF answers kept: {kept['answers']:,} ({kept['found']:,} known to ANAF)"
+              + (f", newest {kept['latest']}" if kept["latest"] else ""))
+        print("  Check companies: harvey anaf check --missing | --all-on-file | --cui N\n")
+        return
+    _require_module(ANAF_MODULE, "harvey anaf check")
+    cuis = [c for raw in args.cui or [] for c in raw.replace(",", " ").split()]
+    if not cuis and not args.all_on_file and not args.missing:
+        print("\n  Say which companies: --cui N (one or more), --missing (never checked) "
+              "or --all-on-file.\n")
+        raise SystemExit(2)
+
+    async def _check():
+        from harvey.modules.runs import check_by_id
+
+        state = StateManager()
+        await state.init_db()
+        ids = None
+        if cuis:
+            wanted = {service.clean_cui(c) or c for c in cuis}
+            rows = await state.companies_with_id("cui")
+            ids = [r["id"] for r in rows if r["value"] in wanted]
+            on_file = {r["value"] for r in rows if r["value"] in wanted}
+            for c in sorted(wanted - on_file):
+                print(f"  {c}: no company on file has this CUI (import it first)")
+            if not ids:
+                print()
+                raise SystemExit(2)
+        print("\n  Asking ANAF (one request a second, up to 100 companies each)...", flush=True)
+        report = await check_by_id(
+            state, ANAF_MODULE, "company_check", ids, missing_only=args.missing,
+            progress=lambda done, total: done and print(f"    {done:,} of {total:,}...",
+                                                        flush=True))
+        _print_check_report(report)
+        print(f"  Source: {_attribution(ANAF_MODULE)}\n")
+        if report["errors"] and not report["updated"] and not report["cached"]:
+            raise SystemExit(1)
+
+    asyncio.run(_check())
+
+
+async def _start_follow_up(state, dry_run: bool):
+    """The checks that run for the firms a pull saves (ANAF's), started in
+    the background of the pull; None when it is a dry run or none is on."""
+    from harvey.modules.runs import FollowUp
+
+    if dry_run:
+        return None
+
+    def progress(done, total):
+        if done % 500 < 100 or done == total:
+            print(f"    checked at ANAF: {done:,} of {total:,}...", flush=True)
+
+    follow = FollowUp(state, progress=progress)
+    if not await follow.start():
+        return None
+    names = ", ".join(_module_name(m.id) for m, _, _ in follow.checks)
+    print(f"  {names}: checking each saved firm in the background (one request a "
+          "second; Ctrl-C stops it, harvey anaf check --missing finishes later)", flush=True)
+    return follow
+
+
+async def _finish_follow_up(follow) -> None:
+    if follow is None:
+        return
+    if follow.queued > follow.done:
+        print(f"  Waiting for the checks of {follow.queued - follow.done:,} more firms...",
+              flush=True)
+    for report in (await follow.finish()).values():
+        _print_check_report(report)
 
 
 def cmd_discover(args):
@@ -1938,6 +2435,8 @@ def main():
     r.add_argument("--limit", type=int, default=20, help="Firms to show (default: 20)")
     r.add_argument("--offset", type=int, default=0, help="Skip this many first")
     r.add_argument("--json", action="store_true", help="Print JSON")
+    _fin_filter_args(r)
+    _tax_filter_args(r)
     _registry_common(r)
     r = registry_sub.add_parser(
         "pull", help="Copy the firms a search matches into Harvey (what import-onrc and Find use)")
@@ -1950,8 +2449,72 @@ def main():
     r.add_argument("--all-statuses", action="store_true",
                    help="Also firms that aren't operating")
     r.add_argument("--dry-run", action="store_true", help="Count; save nothing")
+    _fin_filter_args(r)
+    _tax_filter_args(r)
     _registry_common(r)
     sub.set_defaults(func=cmd_registry)
+
+    sub = subparsers.add_parser(
+        "financials",
+        help="Romanian companies' annual financial statements (Ministry of Finance open "
+             "data) in data/financials.db: load, status, check",
+        description="Downloads the Ministry of Finance's yearly statement files from "
+                    "data.gov.ro (only what is missing; kept in data/mf_financials/) "
+                    "and loads the latest years into a local database: turnover, "
+                    "employees, profit, equity and debts per company (CUI). Companies "
+                    "on file get the figures as signals, and registry search, pull and "
+                    "import-onrc can filter on turnover and employees before pulling "
+                    "anything. Free; no Claude calls.")
+    fin_sub = sub.add_subparsers(dest="financials_action", required=True)
+    r = fin_sub.add_parser("load", help="Download what is missing and load the latest years")
+    r.add_argument("--years", default="",
+                   help="How many of the latest published years to keep loaded (saved as "
+                        "the module's setting; default 3, 'all' for every year)")
+    r.add_argument("--force", action="store_true",
+                   help="Load again even when nothing new is published")
+    r = fin_sub.add_parser("status", help="What is loaded, and whether data.gov.ro has newer")
+    r.add_argument("--json", action="store_true", help="Print JSON")
+    fin_sub.add_parser("check", help="Ask data.gov.ro now whether a new or revised year is out")
+    sub.set_defaults(func=cmd_financials)
+
+    sub = subparsers.add_parser(
+        "taxpayers",
+        help="Romanian taxpayers' identification file (Ministry of Finance open data) in "
+             "data/taxpayers.db: load, status, check",
+        description="Downloads the Ministry of Finance's yearly taxpayer identification "
+                    "file from data.gov.ro (about 870 MB; kept in data/mf_taxpayers/) and "
+                    "loads it into a local database: each taxpayer's address, phone, VAT "
+                    "registration, and whether it is an employer or on the "
+                    "micro-enterprise tax. Companies on file get them as signals. Free; "
+                    "no Claude calls.")
+    tax_sub = sub.add_subparsers(dest="taxpayers_action", required=True)
+    r = tax_sub.add_parser("load", help="Download the newest file if missing and load it")
+    r.add_argument("--force", action="store_true",
+                   help="Load again even when nothing new is published")
+    r = tax_sub.add_parser("status", help="What is loaded, and whether data.gov.ro has newer")
+    r.add_argument("--json", action="store_true", help="Print JSON")
+    tax_sub.add_parser("check", help="Ask data.gov.ro now whether a newer file is out")
+    sub.set_defaults(func=cmd_taxpayers)
+
+    sub = subparsers.add_parser(
+        "anaf",
+        help="Check companies on file at ANAF's public web service (VAT, e-Factura, "
+             "inactive, status, legal form, address, phone): check, status",
+        description="Asks ANAF's free public web service about the companies on file by "
+                    "CUI: up to 100 a request, one request a second, answers kept for "
+                    "30 days (the module's cache_days). Firms a registry pull brings in "
+                    "are checked on their own while the module is on. No Claude calls.")
+    anaf_sub = sub.add_subparsers(dest="anaf_action", required=True)
+    r = anaf_sub.add_parser("check", help="Check companies on file")
+    r.add_argument("--cui", action="append", default=[],
+                   help="A company's CUI (repeat, or comma-separated); it must be on file")
+    r.add_argument("--all-on-file", action="store_true",
+                   help="Every company on file with a CUI (kept answers younger than "
+                        "cache_days are reused)")
+    r.add_argument("--missing", action="store_true",
+                   help="Only companies ANAF was never asked about")
+    anaf_sub.add_parser("status", help="How many ANAF answers are kept")
+    sub.set_defaults(func=cmd_anaf)
 
     sub = subparsers.add_parser(
         "import-onrc",
@@ -1991,6 +2554,8 @@ def main():
     sub.add_argument("--keep-download", action="store_true",
                      help=argparse.SUPPRESS)     # downloads are always kept now
     sub.add_argument("--registry", default="", help=argparse.SUPPRESS)
+    _fin_filter_args(sub)
+    _tax_filter_args(sub)
     sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(

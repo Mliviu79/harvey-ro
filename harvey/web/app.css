@@ -715,6 +715,9 @@ tr:hover .copy, .copy:focus-visible, .drow .copy, .copy.done { opacity: 1; }
 .drow .mono.big { font-size: var(--fs-lead); }
 .drow .drow-meta { font-size: var(--fs-caption); color: var(--text-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .drow .copy { margin-left: auto; }
+.drow.addr { flex-wrap: wrap; gap: 2px 10px; }
+.drow.addr .drow-text { min-width: 0; overflow-wrap: anywhere; }
+.drow.addr .drow-meta { white-space: normal; flex-basis: 100%; }
 .person { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; }
 .person .cell-stack { flex: 1; }
 .person-lines { font-size: var(--fs-caption); margin-top: 3px; line-height: 1.6; }
@@ -1033,6 +1036,10 @@ select.form-input { cursor: pointer; }
 .module-meta .v { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; color: var(--text-2); min-width: 0; }
 .module-meta .email-tag { margin-left: 0; }
 .module-terms { margin-top: var(--sp-2); font-size: var(--fs-caption); color: var(--wait); background: var(--wait-bg); padding: 8px 10px; border-radius: var(--r-sm); max-width: 72ch; text-wrap: pretty; }
+/* Date publice: the local official datasets, above the modules */
+.pd-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: center; margin-top: var(--sp-3); }
+.pd-setting { display: inline-flex; gap: 6px; align-items: center; font-size: var(--fs-caption); color: var(--text-2); }
+.pd-setting input[type="number"] { width: 5ch; }
 .module-problems ul { margin: 6px 0 0 18px; }
 .module-problems li { overflow-wrap: anywhere; }
 @media (max-width: 600px) {

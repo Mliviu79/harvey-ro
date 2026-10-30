@@ -1,0 +1,151 @@
+# ANAF's public web service for a company's tax registration
+# (PlatitorTvaRest v9): VAT and e-Factura registration, fiscal inactivity,
+# registration status, legal form, its registered office and phone. Asked
+# by CUI, up to 100 a request, at most one request a second; answers are
+# kept in data/anaf.db so a company is asked again only once they are old.
+id = "anaf"
+name = "ANAF – date firmă"
+description = "A Romanian company's VAT, e-Factura and inactive status, legal form, address and phone, from ANAF's public web service."
+set = "ro"
+kind = "enricher"
+version = "0.1.0"
+api = 1
+markets = ["RO"]
+requires = ["market_ro"]
+default_enabled = true
+official = true
+entry = "harvey.modules.ro.anaf.capabilities"
+wraps = ["harvey.modules.ro.anaf.service"]
+secrets = []
+attribution = "ANAF, webservicesp.anaf.ro (public web service)"
+terms_note = "ANAF's free public web service (webservicesp.anaf.ro), no key: at most 100 CUIs a request and one request a second, and ANAF warns that overloading it is punished. Harvey sends one request every 1.1 s across everything it runs, retries only when ANAF is busy (HTTP 429 or 5xx), and keeps each answer for 30 days. Credit ANAF."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free (public web service, one request a second)"
+
+# One pace for every request to ANAF's web services, whoever makes it.
+[[lanes]]
+id = "anaf"
+min_interval_seconds = 1.1
+
+# How long an answer is kept before the company is asked about again.
+[settings.cache_days]
+type = "int"
+default = 30
+min = 1
+max = 365
+
+[[signals]]
+code = "VAT_REGISTERED"
+label = "VAT registered"
+description = "Whether the company is registered for VAT (plătitor de TVA): from ANAF's web service when it was checked, else from the Ministry of Finance's yearly taxpayer file."
+category = "tax"
+value_type = "bool"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+absence = "unknown"
+when_known = "source"
+
+[[signals]]
+code = "VAT_SINCE"
+label = "VAT registered since"
+description = "The date the company's current VAT registration started (YYYY-MM-DD)."
+category = "tax"
+value_type = "text"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "VAT_ON_CASH"
+label = "VAT on cash basis"
+description = "Whether the company pays VAT on a cash basis (TVA la încasare), from ANAF's register."
+category = "tax"
+value_type = "bool"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "SPLIT_VAT"
+label = "Split VAT"
+description = "Whether the company is in ANAF's split VAT register (plata defalcată a TVA)."
+category = "tax"
+value_type = "bool"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "FISCALLY_INACTIVE"
+label = "Fiscally inactive"
+description = "Whether ANAF lists the company as fiscally inactive (contribuabil inactiv): usually a firm that stopped filing or can't be found at its office. No when ANAF answered that it isn't; unknown until it was checked."
+category = "tax"
+value_type = "bool"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+absence = "unknown"
+when_known = "source"
+
+[[signals]]
+code = "EFACTURA_REGISTERED"
+label = "In the e-Factura register"
+description = "Whether the company is in ANAF's RO e-Factura register."
+category = "tax"
+value_type = "bool"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "REGISTRATION_STATUS"
+label = "Tax registration status"
+description = "The company's registration status with the tax authority, as it words it (INREGISTRAT, RADIERE, ...), without the date it gives."
+category = "tax"
+value_type = "text"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "LEGAL_FORM"
+label = "Legal form"
+description = "The company's legal form as ANAF words it (for example a limited liability company, an authorised natural person, a sole proprietorship)."
+category = "profile"
+value_type = "text"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "ADDRESS"
+label = "Address on file"
+description = "A postal address an official source gives for the company: its registered office or fiscal domicile. Every one is kept with its source and date, official sources first."
+category = "profile"
+value_type = "text"
+collector = "anaf"
+cost_note = "free (ANAF public web service)"
+cardinality = "many"
+when_known = "source"
+
+[[capabilities]]
+id = "company_check"
+op = "lookup"
+inputs = [["id:cui"]]
+# Up to this many companies a call (one request); runs again for the
+# companies a registry pull brings in.
+batch = 100
+after_source = true
+lane = "anaf"
+outputs = { ids = ["phone"], facts = ["VAT_REGISTERED", "VAT_SINCE", "VAT_ON_CASH", "SPLIT_VAT", "FISCALLY_INACTIVE", "EFACTURA_REGISTERED", "REGISTRATION_STATUS", "LEGAL_FORM", "ADDRESS", "PHONE_NUMBER"], values = ["asked", "cached", "not_found", "invalid", "requests"] }
+cost = { usd = 0.0, per = "company" }

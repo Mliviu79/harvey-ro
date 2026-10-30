@@ -378,7 +378,8 @@ _REPORT_COUNTS = ("catch_all_only", "shared_domain", "excluded", "new_companies"
 
 async def save_source_draft(state, draft: api.Draft, report, *, module: str,
                             run_params: dict | None = None, dry_run: bool = False,
-                            do_not_contact: list[str] | None = None, progress=None):
+                            do_not_contact: list[str] | None = None, progress=None,
+                            saved_ids: list[str] | None = None, on_saved=None):
     """Save what an official source (``module``) read, SOURCE_SAVE_BATCH records
     per transaction, through ingest's rules for an official source.
     ``report`` is the source's own report (its ``values["report"]``); the
@@ -388,7 +389,8 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     everything and writes nothing. A fact is written once per dataset:
     re-reading the same dataset adds nothing, a newer one adds its readings
     beside the old. ``progress(done, total)`` is called every
-    SOURCE_PROGRESS_EVERY records."""
+    SOURCE_PROGRESS_EVERY records. ``saved_ids`` collects the id each saved
+    record landed on; ``on_saved(ids)`` is told them as each batch commits."""
     from harvey.modules import switches
     from harvey.signals import sync_vocabulary
 
@@ -422,6 +424,8 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
         report.administrators += record.counts.get("administrators", 0)
         if dry_run:
             return
+        if saved_ids is not None:
+            saved_ids.append(saved.company_id)
         report.updated_companies += saved.updated
         report.activities += saved.activities
         rows = ingest.rows([replace(f, record="") for f in found],
@@ -436,6 +440,7 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
         for start in range(0, len(records), SOURCE_SAVE_BATCH):
             # A batch that fails is rolled back, so are its counts.
             counts = {k: getattr(report, k) for k in _REPORT_COUNTS}
+            first = len(saved_ids) if saved_ids is not None else 0
             try:
                 async with state.batch() as batch:
                     for record in records[start:start + SOURCE_SAVE_BATCH]:
@@ -446,7 +451,11 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
             except Exception:
                 for k, v in counts.items():
                     setattr(report, k, v)
+                if saved_ids is not None:
+                    del saved_ids[first:]
                 raise
+            if on_saved is not None and saved_ids is not None:
+                on_saved(saved_ids[first:])
         if not dry_run:
             await state.finish_run(report.run_id, status="completed",
                                    records=report.new_companies + report.known_companies)
@@ -472,18 +481,29 @@ async def _source_read(state, cap_id: str, inp: api.Input):
 async def registry_pull(state, con, q, *, limit: int | None = None,
                         with_administrators: bool = True, dry_run: bool = False,
                         do_not_contact: list[str] | None = None, progress=None,
-                        area: str = ""):
+                        area: str = "", follow_up: "FollowUp | None" = None):
     """Copy the firms a resolved registry query matches (the first
     ``limit``, best first) into the working database: the onrc module's
     registry_search, then save_source_draft. ACTIVITY_CODE is recorded
-    only for the classes the query named."""
+    only for the classes the query named. ``follow_up`` (a started
+    FollowUp) is handed each batch of saved firms as it commits, so its
+    checks run while the rest is saved; the caller finishes it."""
     draft = await _source_read(state, "registry_search", api.Input(
         query=q, area=area, extra={"con": con, "limit": limit,
                                    "with_administrators": with_administrators}))
-    return await save_source_draft(
+    saved: list[str] = []
+    report = await save_source_draft(
         state, draft, draft.values["report"], module="onrc",
         run_params=draft.values.get("run_params"), dry_run=dry_run,
-        do_not_contact=do_not_contact, progress=progress)
+        do_not_contact=do_not_contact, progress=progress, saved_ids=saved,
+        on_saved=follow_up.add if follow_up is not None else None)
+    if saved and not report.errors:
+        # What other free local sources know about them (their yearly
+        # figures), at once: a filter on those is decided before any paid
+        # search runs.
+        found = await lookup_by_id(state, saved)
+        report.observations += found["observations"]
+    return report
 
 
 async def import_registry(state, files, dataset, *, county: str = "", classes=None,
@@ -504,6 +524,488 @@ async def import_registry(state, files, dataset, *, county: str = "", classes=No
         state, draft, draft.values["report"], module="onrc",
         run_params=draft.values.get("run_params"), dry_run=dry_run,
         do_not_contact=do_not_contact, progress=progress)
+
+
+# ── Free local lookups by legal identifier (a source's own database) ──
+
+def id_lookups(enabled) -> list[tuple]:
+    """(manifest, capability, identifier kind) for every free lookup a
+    source module that is on can make from one identifier alone (its CUI):
+    what it knows is local, so it is read for every company that has one."""
+    from harvey.modules import switches
+
+    out = []
+    for m, cap in api.declared(switches.by_id()):
+        if m.id not in enabled or m.kind != "source" or cap.get("op") != "lookup":
+            continue
+        if float((cap.get("cost") or {}).get("usd", 0) or 0) > 0:
+            continue
+        kinds = [need[0][len("id:"):] for need in cap.get("inputs") or ()
+                 if len(need) == 1 and need[0].startswith("id:")]
+        if kinds:
+            out.append((m, cap, kinds[0]))
+    return out
+
+
+async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
+    """Read every free local source that knows companies by an identifier
+    (the financial statements by CUI) for these companies (all of them when
+    None), and record what each knows through the confirmation gate. A
+    reading is written once per published file: running it again adds
+    nothing, a revised file adds its readings beside the old.
+
+    A capability that declares ``batch`` is called with up to that many
+    companies at once (``extra["batch"]``: ``[{"key": <company id>, <kind>:
+    <identifier>}]``, its facts and contacts keyed to them), so it opens its
+    database once for them; one without is called a company at a time.
+
+    Returns {"observations", "companies", "unconfirmed": {module: [codes]},
+    "skipped" (a source with nothing loaded), "errors"}."""
+    from harvey.modules import switches
+    from harvey.signals import sync_vocabulary
+
+    await sync_vocabulary(state)
+    confirmed = await state.confirmed_signal_codes()
+    enabled = await _enabled(state)
+    out = {"observations": 0, "companies": 0, "unconfirmed": {}, "skipped": [], "errors": []}
+    for m, cap, kind in id_lookups(enabled):
+        codes = list((cap.get("outputs") or {}).get("facts") or ())
+        missing = [c for c in codes if c not in confirmed]
+        if missing:
+            out["unconfirmed"][m.id] = missing
+        if not _wanted(cap, confirmed):
+            continue
+        companies = await state.companies_with_id(kind, company_ids)
+        if not companies:
+            continue
+        run = api.capability(m.id, cap["id"])
+        ctx = api.Context(settings=await switches.module_settings(state, m.id),
+                          wanted=frozenset(confirmed), enabled=enabled)
+        size = int(cap.get("batch") or 0)
+
+        async def read(rows) -> tuple[str | None, dict[str, api.Draft]]:
+            """(why it failed or None, company id -> what it knows)."""
+            found: dict[str, api.Draft] = {}
+            if not size:
+                for row in rows:
+                    draft = await run(api.Input(company_id=row["id"], name=row["name"] or "",
+                                                ids={kind: row["value"]}), ctx)
+                    if draft.failed is not None:
+                        return draft.failed, found
+                    found[row["id"]] = draft
+                return None, found
+            for at in range(0, len(rows), size):
+                part = rows[at:at + size]
+                draft = await run(api.Input(extra={"batch": [
+                    {"key": r["id"], kind: r["value"]} for r in part]}), ctx)
+                if draft.failed is not None:
+                    return draft.failed, found
+                for r in part:
+                    found[r["id"]] = api.Draft()
+                for fact in draft.facts:
+                    if fact.record in found:
+                        found[fact.record].facts.append(replace(fact, record=""))
+                for contact in draft.contacts:
+                    if contact.record in found:
+                        found[contact.record].contacts.append(replace(contact, record=""))
+            return None, found
+
+        first_rows = companies[:SOURCE_SAVE_BATCH]
+        failed, first = await read(first_rows)
+        if failed is not None and not first:
+            # Its data isn't there (never loaded): nothing to read, no run.
+            out["skipped"].append(f"{m.id}: {failed}")
+            continue
+        run_id = await state.start_run("lookup", provider=m.id,
+                                       params={"capability": cap["id"], "companies": len(companies)})
+        written = touched = 0
+        try:
+            for start in range(0, len(companies), SOURCE_SAVE_BATCH):
+                rows_here = companies[start:start + SOURCE_SAVE_BATCH]
+                if start:
+                    failed, found = await read(rows_here)
+                else:
+                    found = first
+                async with state.batch() as batch:
+                    for row in rows_here:
+                        draft = found.get(row["id"])
+                        if draft is None:
+                            continue
+                        rows = ingest.rows(draft.facts, company_id=row["id"], run_id=run_id,
+                                           confirmed=confirmed)
+                        await ingest.company_phones(batch, row["id"], draft.contacts)
+                        fresh = []
+                        for url in dict.fromkeys(r["evidence_url"] for r in rows):
+                            fresh += await ingest.unseen(
+                                batch, row["id"], url, [r for r in rows if r["evidence_url"] == url])
+                        if fresh:
+                            touched += 1
+                            written += await ingest.write(batch, fresh, run_id)
+                if failed is not None:
+                    out["errors"].append(f"{m.id}: {failed}")
+                    break
+                if progress:
+                    progress(min(start + SOURCE_SAVE_BATCH, len(companies)), len(companies))
+            await state.finish_run(run_id, status="failed" if out["errors"] else "completed",
+                                   records=touched, error="; ".join(out["errors"][:1]))
+        except Exception as e:
+            logger.exception("%s lookup failed", m.id)
+            out["errors"].append(f"{m.id}: {e}")
+            await state.finish_run(run_id, status="failed", records=touched, error=str(e))
+        out["observations"] += written
+        out["companies"] += touched
+    return out
+
+
+# ── Checks by legal identifier at an outside service (an enricher) ──
+
+def id_enrichers(enabled, *, after_source: bool = False) -> list[tuple]:
+    """(manifest, capability, identifier kind) for every free lookup an
+    enricher module that is on makes from one identifier (a CUI), asked
+    of an outside service a batch at a time. ``after_source`` keeps only
+    the ones that run for the companies a source brings in."""
+    from harvey.modules import switches
+
+    out = []
+    for m, cap in api.declared(switches.by_id()):
+        if m.id not in enabled or m.kind != "enricher" or cap.get("op") != "lookup":
+            continue
+        if float((cap.get("cost") or {}).get("usd", 0) or 0) > 0:
+            continue
+        if after_source and not cap.get("after_source"):
+            continue
+        kinds = [need[0][len("id:"):] for need in cap.get("inputs") or ()
+                 if len(need) == 1 and need[0].startswith("id:")]
+        if kinds:
+            out.append((m, cap, kinds[0]))
+    return out
+
+
+# A check by identifier stops after this many failed batches in a row.
+CHECK_FAILURES_IN_A_ROW = 2
+
+# Why a check by identifier asked nothing: none of its signals is confirmed.
+NOTHING_CONFIRMED = "unconfirmed"
+
+
+def _wanted(cap: dict, confirmed) -> bool:
+    """Whether any signal a capability answers with is confirmed: a free
+    lookup by identifier is made only then (Harvey proposes, the user
+    confirms)."""
+    return bool(set((cap.get("outputs") or {}).get("facts") or ()) & set(confirmed))
+
+
+def _new_check_report(module: str) -> dict:
+    return {"module": module, "companies": 0, "checked": 0, "cached": 0, "not_found": 0,
+            "invalid": 0, "requests": 0, "observations": 0, "updated": 0, "phones_set": 0,
+            "unconfirmed": [], "errors": [], "stopped": ""}
+
+
+async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
+                      missing_only: bool = False, progress=None, http=None,
+                      stop=None, run_id: str = "") -> dict:
+    """Ask an enricher's lookup-by-identifier capability about these
+    companies (every company with that identifier when None), a batch at
+    a time (the capability's ``batch``), and record what it answers: each
+    reading through the confirmation gate, written only when it says
+    something new (ingest.changed), and a phone as the company's phone when
+    it has none. ``missing_only`` asks only about companies the module has
+    never answered for. ``progress(done, total)`` after each batch;
+    ``stop()`` returning True ends it between batches. ``run_id`` adds to a
+    run already open (a follow-up's) instead of logging one of its own.
+    Refused while the module is off.
+
+    Returns {"companies", "checked", "cached", "not_found", "invalid",
+    "requests", "observations", "updated", "phones_set", "unconfirmed",
+    "errors", "stopped"}."""
+    from harvey.modules import switches
+    from harvey.signals import sync_vocabulary
+
+    await switches.require(state, module_id)
+    manifest = switches.by_id()[module_id]
+    cap = next(c for c in manifest.capabilities if c.get("id") == cap_id)
+    kinds = [need[0][len("id:"):] for need in cap.get("inputs") or ()
+             if len(need) == 1 and need[0].startswith("id:")]
+    if not kinds:
+        raise ValueError(f"{module_id}.{cap_id} doesn't look companies up by an identifier")
+    kind = kinds[0]
+    size = max(1, int(cap.get("batch") or 1))
+    await sync_vocabulary(state)
+    confirmed = await state.confirmed_signal_codes()
+    enabled = await _enabled(state)
+    out = _new_check_report(module_id)
+    codes = list((cap.get("outputs") or {}).get("facts") or ())
+    out["unconfirmed"] = [c for c in codes if c not in confirmed]
+    companies = await state.companies_with_id(kind, company_ids)
+    out["companies"] = len(companies)
+    if not companies:
+        return out
+    if not _wanted(cap, confirmed):
+        # Nothing it answers is confirmed: no request, no phone, no run.
+        out["stopped"] = NOTHING_CONFIRMED
+        return out
+    run = api.capability(module_id, cap_id)
+    many = ingest.many_codes()
+    owned = http is None
+    if owned:
+        http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=60.0), follow_redirects=True)
+    own_run = not run_id
+    if own_run:
+        run_id = await state.start_run("lookup", provider=module_id,
+                                       params={"capability": cap_id, "companies": len(companies),
+                                               "missing_only": missing_only})
+    touched = 0
+    if progress:
+        progress(0, len(companies))
+    try:
+        ctx = api.Context(http=http, settings=await switches.module_settings(state, module_id),
+                          wanted=frozenset(confirmed), enabled=enabled)
+        done = failed_in_a_row = 0
+        for start in range(0, len(companies), size):
+            if stop is not None and stop():
+                out["stopped"] = "stopped"
+                break
+            chunk = companies[start:start + size]
+            draft = await run(api.Input(extra={
+                "batch": [{"key": r["id"], kind: r["value"]} for r in chunk],
+                "missing_only": missing_only}), ctx)
+            values = draft.values or {}
+            for key in ("cached", "not_found", "invalid", "requests"):
+                out[key] += int(values.get(key) or 0)
+            out["checked"] += int(values.get("asked") or 0)
+            done += len(chunk)
+            if draft.failed is not None:
+                out["errors"].append(draft.failed)
+                failed_in_a_row += 1
+                if draft.stop or failed_in_a_row >= CHECK_FAILURES_IN_A_ROW:
+                    # The service is down or busy: stop asking it.
+                    out["stopped"] = draft.stop or "failed"
+                    break
+                if progress:
+                    progress(done, len(companies))
+                continue
+            failed_in_a_row = 0
+            facts_of: dict[str, list[api.Fact]] = {}
+            for fact in draft.facts:
+                facts_of.setdefault(fact.record, []).append(fact)
+            contacts_of: dict[str, list[api.Contact]] = {}
+            for contact in draft.contacts:
+                contacts_of.setdefault(contact.record, []).append(contact)
+            async with state.batch() as batch:
+                for row in chunk:
+                    cid = row["id"]
+                    rows = ingest.rows(facts_of.get(cid, []), run_id=run_id, confirmed=confirmed,
+                                       records={cid: ingest.Saved(cid, cid)})
+                    fresh = await ingest.changed(batch, cid, module_id, rows, many)
+                    written = await ingest.write(batch, fresh, run_id)
+                    out["observations"] += written
+                    out["phones_set"] += await ingest.company_phones(
+                        batch, cid, contacts_of.get(cid, []))
+                    touched += bool(written)
+            if progress:
+                progress(done, len(companies))
+        out["updated"] = touched
+        if own_run:
+            await state.finish_run(run_id, status="failed" if out["errors"] and not touched
+                                   else "completed", records=touched,
+                                   error="; ".join(out["errors"][:1]))
+    except Exception as e:
+        logger.exception("%s check failed", module_id)
+        out["errors"].append(str(e))
+        out["updated"] = touched
+        if own_run:
+            await state.finish_run(run_id, status="failed", records=touched, error=str(e))
+    finally:
+        if owned:
+            await http.aclose()
+    return out
+
+
+class FollowUp:
+    """Checks that run, in the background, for the companies a source
+    brings in: every enricher capability marked ``after_source`` whose
+    module is on (ANAF's company check). Saved companies are queued with
+    ``add(ids)`` as the source saves them and checked a batch at a time
+    while it goes on; ``finish()`` waits for the queue to empty and
+    returns one report per capability. ``progress(module, done, total)``
+    says how far each has got."""
+
+    def __init__(self, state, progress=None):
+        self.state = state
+        self.progress = progress
+        self.checks: list[tuple] = []
+        self.queue: asyncio.Queue | None = None
+        self.task: asyncio.Task | None = None
+        self.reports: dict[str, dict] = {}
+        self.runs: dict[str, str] = {}
+        self.queued = 0
+        self.done = 0
+        self._stop = False
+        self._failures: dict[str, int] = {}
+        self._given_up: set[str] = set()
+
+    async def start(self) -> bool:
+        """Find the checks to run; False (and nothing started) when none is
+        on, or none has a confirmed signal to record."""
+        from harvey.signals import sync_vocabulary
+
+        await sync_vocabulary(self.state)
+        confirmed = await self.state.confirmed_signal_codes()
+        self.checks = [c for c in id_enrichers(await _enabled(self.state), after_source=True)
+                       if _wanted(c[1], confirmed)]
+        if not self.checks:
+            return False
+        self.queue = asyncio.Queue()
+        self.task = asyncio.create_task(self._work())
+        return True
+
+    def add(self, company_ids) -> None:
+        if self.queue is None:
+            return
+        ids = [i for i in company_ids if i]
+        if ids:
+            self.queued += len(ids)
+            self.queue.put_nowait(ids)
+
+    def stop(self) -> None:
+        self._stop = True
+
+    async def _work(self):
+        size = max([int(cap.get("batch") or 1) for _, cap, _ in self.checks] or [1])
+        pending: list[str] = []
+        closing = False
+        while True:
+            if not closing and len(pending) < size:
+                item = await self.queue.get()
+                if item is None:
+                    closing = True
+                else:
+                    pending += item
+                    continue
+            if not pending:
+                break
+            take, pending = pending[:size], pending[size:]
+            for m, cap, _ in self.checks:
+                if m.id in self._given_up:
+                    continue
+                if m.id not in self.runs:
+                    self.runs[m.id] = await self.state.start_run(
+                        "lookup", provider=m.id, params={"capability": cap["id"],
+                                                         "after": "source"})
+                report = await check_by_id(self.state, m.id, cap["id"], take,
+                                           stop=lambda: self._stop, run_id=self.runs[m.id])
+                self._merge(m.id, report)
+                # A service that is down or busy isn't asked about the
+                # rest of what the source brings in (check_by_id --missing
+                # finishes later).
+                failed = bool(report["errors"])
+                self._failures[m.id] = self._failures.get(m.id, 0) + 1 if failed else 0
+                if (report["stopped"] and report["stopped"] != "stopped") or \
+                        self._failures[m.id] >= CHECK_FAILURES_IN_A_ROW:
+                    self._given_up.add(m.id)
+            self.done += len(take)
+            if self.progress:
+                self.progress(self.done, self.queued)
+            if self._stop:
+                break
+
+    def _merge(self, module: str, report: dict) -> None:
+        total = self.reports.setdefault(module, _new_check_report(module))
+        for key, value in report.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                total[key] += value
+        total["unconfirmed"] = report["unconfirmed"] or total["unconfirmed"]
+        total["errors"] += [e for e in report["errors"] if e not in total["errors"]][:3]
+        total["stopped"] = report["stopped"] or total["stopped"]
+
+    async def finish(self) -> dict[str, dict]:
+        if self.task is None:
+            return {}
+        self.queue.put_nowait(None)
+        try:
+            await self.task
+        except Exception as e:
+            logger.exception("follow-up checks failed")
+            for m, _, _ in self.checks:
+                self.reports.setdefault(m.id, _new_check_report(m.id))["errors"].append(str(e))
+        for module, run_id in self.runs.items():
+            report = self.reports.get(module) or _new_check_report(module)
+            await self.state.finish_run(
+                run_id, status="failed" if report["errors"] and not report["updated"]
+                else "completed", records=report["updated"],
+                error="; ".join(report["errors"][:1]))
+        return self.reports
+
+
+async def sync_source(state, module_id: str, cap_id: str, *, extra: dict | None = None,
+                      http=None) -> api.Draft:
+    """Run a source module's sync capability (a check of what is published,
+    or a download and load) with the module's settings; refused while the
+    module is off. Opens an HTTP client when none is given."""
+    from harvey.modules import switches
+
+    await switches.require(state, module_id)
+    settings = await switches.module_settings(state, module_id)
+    owned = http is None
+    if owned:
+        http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=300.0),
+                                 follow_redirects=True)
+    try:
+        return await api.capability(module_id, cap_id)(
+            api.Input(extra=dict(extra or {})),
+            api.Context(http=http, settings=settings, enabled=await _enabled(state)))
+    finally:
+        if owned:
+            await http.aclose()
+
+
+# The settings a source module declares to be kept up to date on its own.
+AUTO_SETTING, CHECK_DAYS_SETTING = "auto_update", "check_days"
+CHECKED_KEY = "modules.{}.checked_at"
+
+
+async def sync_due_sources(state) -> list[str]:
+    """For each source module that is on and whose ``auto_update`` setting
+    the user switched on: when its ``check_days`` have passed since the last
+    check, download and load what is new (its sync capability marked
+    ``auto = true``), then
+    record what it knows about the companies on file. Nothing happens for a
+    module whose auto_update is off (the default). Returns the modules synced."""
+    from datetime import datetime, timedelta, timezone
+
+    from harvey.modules import switches
+
+    done = []
+    enabled = await _enabled(state)
+    for m in switches.manifests():
+        if m.id not in enabled or m.kind != "source" or AUTO_SETTING not in m.settings:
+            continue
+        settings = await switches.module_settings(state, m.id)
+        if not settings.get(AUTO_SETTING):
+            continue
+        # The sync its manifest marks as the one to run unattended.
+        sync = [c["id"] for c in m.capabilities if c.get("op") == "sync" and c.get("auto")]
+        if not sync:
+            continue
+        key = CHECKED_KEY.format(m.id)
+        last = await state.get_setting(key)
+        days = int(settings.get(CHECK_DAYS_SETTING) or 30)
+        now = datetime.now(timezone.utc)
+        try:
+            if last and now - datetime.fromisoformat(last) < timedelta(days=days):
+                continue
+        except ValueError:
+            pass
+        await state.set_setting(key, now.isoformat(timespec="seconds"))
+        try:
+            draft = await sync_source(state, m.id, sync[0])
+        except Exception as e:
+            logger.warning("%s: automatic update failed: %s", m.id, e)
+            continue
+        if not draft.values.get("unchanged"):
+            await lookup_by_id(state)
+        done.append(m.id)
+    return done
 
 
 # ── Reading companies' sites (the website module and what reads its pages) ──

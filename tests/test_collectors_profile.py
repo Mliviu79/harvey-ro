@@ -181,8 +181,11 @@ async def test_only_confirmed_signals_are_collected(state, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_seeded_catalog_starts_unconfirmed(state):
+    from harvey.modules import switches
+
     n = await sync_vocabulary(state)
-    assert n == len(SIGNAL_CATALOG)
+    assert n == len({sig["code"] for m in switches.shipped() for sig in m.signals})
+    assert n >= len(SIGNAL_CATALOG)
     assert await state.confirmed_signal_codes() == set()
     proposed = await state.get_signal_codes(status="proposed")
     assert len(proposed) == n

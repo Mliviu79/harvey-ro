@@ -133,6 +133,66 @@ async def require(state, module_id: str, what: str = "") -> None:
         raise ModuleOff(module_id, what)
 
 
+# A module's own settings ([settings] in its manifest), per install.
+SETTING_KEY = "modules.{}.{}"
+
+
+def setting_value(spec: dict, raw):
+    """A stored (or given) value read as its manifest ``spec`` types it,
+    clamped to ``min``/``max``; the default when it can't be read."""
+    kind, default = spec.get("type"), spec.get("default")
+    if raw is None or raw == "":
+        return default
+    try:
+        if kind == "bool":
+            if isinstance(raw, bool):
+                return raw
+            text = str(raw).strip().lower()
+            if text in ("1", "true", "on", "yes"):
+                return True
+            if text in ("0", "false", "off", "no"):
+                return False
+            return default
+        if kind in ("int", "float"):
+            value = int(raw) if kind == "int" else float(raw)
+            if spec.get("min") is not None:
+                value = max(value, spec["min"])
+            if spec.get("max") is not None:
+                value = min(value, spec["max"])
+            return value
+        if kind == "list":
+            return [v.strip() for v in str(raw).split(",") if v.strip()] \
+                if not isinstance(raw, list) else raw
+        return str(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+async def module_settings(state, module_id: str) -> dict:
+    """Every setting a module's manifest declares, as stored for this
+    install or else its default."""
+    m = by_id().get(module_id)
+    if m is None:
+        return {}
+    stored = await state.settings_with_prefix(f"{PREFIX}{module_id}.")
+    return {key: setting_value(spec, stored.get(SETTING_KEY.format(module_id, key)))
+            for key, spec in m.settings.items() if isinstance(spec, dict)}
+
+
+async def set_module_setting(state, module_id: str, key: str, value):
+    """Store one setting (typed and clamped as the manifest says); returns
+    what was stored. ValueError for a setting the manifest doesn't declare."""
+    m = by_id().get(module_id)
+    spec = (m.settings if m else {}).get(key)
+    if not isinstance(spec, dict) or key == "enabled":
+        raise ValueError(f"{module_id} has no setting {key!r}")
+    typed = setting_value(spec, value)
+    stored = ("on" if typed else "off") if spec.get("type") == "bool" else (
+        ",".join(typed) if isinstance(typed, list) else str(typed))
+    await state.set_setting(SETTING_KEY.format(module_id, key), stored)
+    return typed
+
+
 def capability_owner(field: str, key: str) -> str | None:
     """The module whose capability names ``field = key`` (a discovery
     ``provider`` or ``preset`` key), or None."""

@@ -670,10 +670,13 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     blocked = _blocked_entries(config)
     marks = _in(ids)
     site_phones: dict[str, list[str]] = {}
-    for r in await query_db(
-            "SELECT company_id, value_text FROM observations WHERE signal_code = 'PHONE_NUMBER' "
-            f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
-            tuple(ids)):
+    official = _official_modules()
+    found = await query_db(
+        "SELECT company_id, value_text, module FROM observations WHERE signal_code = 'PHONE_NUMBER' "
+        f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
+        tuple(ids))
+    # An official register's numbers first, then the rest as they were found.
+    for r in sorted(found, key=lambda r: (r.get("module") or "") not in official):
         numbers = site_phones.setdefault(r["company_id"], [])
         if r["value_text"] not in numbers:
             numbers.append(r["value_text"])
@@ -831,13 +834,107 @@ async def get_company_contacts(company_id: str):
 @app.get("/api/companies/{company_id}")
 async def get_company(company_id: str):
     """One company for the detail panel: its record, every phone and email
-    on file, the named people, its activities in words."""
+    on file, the named people, its activities in words, and ``findings``:
+    every phone and address any source gave with who gave it and when,
+    and the latest official facts (official sources first)."""
     rows = await query_db(f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE c.id = ?",
                           (company_id,))
     if not rows:
         return JSONResponse({"error": "not found"}, status_code=404)
     (row,) = await _enrich_companies(rows, _load_config_quietly())
+    try:
+        row["findings"] = await _company_findings(company_id, row)
+    except Exception as e:
+        logger.warning("company findings failed: %s", e)
+        row["findings"] = {"phones": [], "addresses": [], "facts": []}
     return row
+
+
+def _official_modules() -> set[str]:
+    from harvey.modules import switches
+
+    return {m.id for m in switches.manifests() if m.official}
+
+
+async def _company_findings(company_id: str, company: dict) -> dict:
+    """Every phone and address on file for a company, each with every
+    source that gave it (module, when, confidence, whether it is an
+    official register), official sources first, then the newest; and the
+    latest reading of each fact an official source gave (a yearly one's
+    latest year)."""
+    from harvey.modules import switches
+
+    mans = switches.by_id()
+    official = {m for m, man in mans.items() if man.official}
+
+    def who(module: str, collector: str) -> str:
+        m = mans.get(module or "")
+        return (m.name or m.id) if m else (collector or module or "")
+
+    rows = await query_db(
+        "SELECT signal_code, value_num, value_text, module, collector, confidence, "
+        "observed_at, evidence_url FROM observations WHERE company_id = ? "
+        "ORDER BY observed_at DESC, rowid DESC", (company_id,))
+    lists: dict[str, dict[str, dict]] = {"PHONE_NUMBER": {}, "ADDRESS": {}}
+    for r in rows:
+        code = r["signal_code"]
+        if code not in lists or not (r["value_text"] or "").strip():
+            continue
+        entry = lists[code].setdefault(r["value_text"], {"value": r["value_text"], "sources": []})
+        entry["sources"].append({
+            "module": r["module"] or "", "name": who(r["module"], r["collector"]),
+            "official": (r["module"] or "") in official, "observed_at": r["observed_at"],
+            "confidence": r["confidence"], "evidence_url": r["evidence_url"] or ""})
+    address = (company.get("address") or "").strip()
+    source = (company.get("source") or "")
+    if address and address not in lists["ADDRESS"]:
+        module = source.split(":", 1)[1] if source.startswith("registry:") else ""
+        lists["ADDRESS"][address] = {"value": address, "sources": [{
+            "module": module, "name": who(module, source), "official": module in official,
+            "observed_at": company.get("updated_at") or company.get("created_at") or "",
+            "confidence": 1.0, "evidence_url": company.get("source_url") or ""}]}
+
+    def ordered(entries: dict) -> list[dict]:
+        out = list(entries.values())
+        for e in out:
+            # Official first, then the newest (two stable sorts).
+            e["sources"].sort(key=lambda x: x["observed_at"] or "", reverse=True)
+            e["sources"].sort(key=lambda x: not x["official"])
+            e["official"] = any(x["official"] for x in e["sources"])
+            e["latest"] = max((x["observed_at"] or "" for x in e["sources"]), default="")
+        out.sort(key=lambda e: e["latest"], reverse=True)
+        out.sort(key=lambda e: not e["official"])
+        return out
+
+    from harvey.collectors.phones import phone_hit
+
+    phones = ordered(lists["PHONE_NUMBER"])
+    for e in phones:
+        hit = phone_hit(e["value"])
+        e["display"] = hit.display if hit else e["value"]
+    codes = {r["code"]: r for r in await query_db(
+        "SELECT code, label, value_type, unit, keyed_by FROM signal_codes")}
+    facts: dict[str, dict] = {}
+    for r in rows:
+        code, module = r["signal_code"], r["module"] or ""
+        if module not in official or code in lists or code == "ACTIVITY_CODE":
+            continue
+        meta = codes.get(code) or {}
+        year = r["value_text"] if meta.get("keyed_by") == "year" else ""
+        old = facts.get(code)
+        if old is not None and not (year.isdigit() and old["year"].isdigit()
+                                    and int(year) > int(old["year"])):
+            continue
+        facts[code] = {
+            "code": code, "label": meta.get("label") or code,
+            "value_type": meta.get("value_type") or "text", "unit": meta.get("unit") or "",
+            "value_num": r["value_num"], "value_text": "" if year else r["value_text"],
+            "year": year, "module": module, "name": who(module, r["collector"]),
+            "observed_at": r["observed_at"], "evidence_url": r["evidence_url"] or ""}
+    order = [m.id for m in switches.manifests()]
+    fact_list = sorted(facts.values(), key=lambda f: (
+        order.index(f["module"]) if f["module"] in order else len(order), f["code"]))
+    return {"phones": phones, "addresses": ordered(lists["ADDRESS"]), "facts": fact_list}
 
 
 # ── Possible duplicates ──
@@ -1980,14 +2077,36 @@ async def _export_company_rows(request: Request) -> tuple[list[dict], int]:
                 listed.append({"code": a["code"], "name": a.get("name") or a.get("name_en") or ""})
         r["activity_list"] = listed
         r["activities"] = "; ".join(f"{a['code']} {a['name']}".strip() for a in listed)
+    from harvey.export import latest_year_figures
+    codes = await _figure_codes(state)
+    figures = await latest_year_figures(state, [r["id"] for r in rows], codes)
+    for r in rows:
+        year, values = figures.get(r["id"], ("", {}))
+        for code in codes:
+            value = values.get(code)
+            r[code.lower()] = "" if value is None else (
+                int(value) if float(value).is_integer() else value)
+        r["financial_year"] = year
     return rows, max(matched, len(rows))
 
 
-# The dashboard's company CSV: the CLI's columns, then the registry identity
-# and the activities a Romanian user looks for first.
-def _dashboard_company_columns() -> list[str]:
+async def _figure_codes(state) -> list[str]:
+    """The yearly figures the modules that are on record (a financial
+    statements module's turnover, headcount, ...): export columns."""
+    from harvey.export import yearly_codes
+    from harvey.modules import switches
+
+    return yearly_codes(set(await switches.enabled_ids(state)))
+
+
+# The dashboard's company CSV: the CLI's columns, then the registry identity,
+# the activities, and the latest year's figures from the modules that are on
+# (all from one year, named in financial_year).
+def _dashboard_company_columns(codes=()) -> list[str]:
     from harvey.export import COMPANY_CSV_COLUMNS
-    return [*COMPANY_CSV_COLUMNS, "cui", "address", "activities"]
+    figures = [c.lower() for c in codes]
+    return [*COMPANY_CSV_COLUMNS, "cui", "address", "activities", *figures,
+            *(["financial_year"] if figures else [])]
 
 
 # Downloads from the dashboard open in a spreadsheet: a UTF-8 byte order
@@ -2018,7 +2137,8 @@ async def export_companies_csv_api(request: Request):
     except Exception as e:
         logger.warning("Company export failed: %s", e)
         return JSONResponse({"error": "Company export failed"}, status_code=500)
-    return _csv_download(to_csv(rows, _dashboard_company_columns()), "companies.csv",
+    columns = _dashboard_company_columns(await _figure_codes(_state()))
+    return _csv_download(to_csv(rows, columns), "companies.csv",
                          _truncated_header(rows, matched))
 
 
@@ -2033,11 +2153,16 @@ async def export_companies_json_api(request: Request):
     except Exception as e:
         logger.warning("Company export failed: %s", e)
         return JSONResponse({"error": "Company export failed"}, status_code=500)
-    keys = ("id", "cui", *COMPANY_CSV_COLUMNS, "address")
+    from harvey.export import source_notes
+    figures = [c.lower() for c in await _figure_codes(_state())]
+    keys = ("id", "cui", *COMPANY_CSV_COLUMNS, "address", *figures,
+            *(["financial_year"] if figures else []))
     return JSONResponse(
         {"companies": [{**{k: r.get(k, "") for k in keys}, "activities": r.get("activity_list", [])}
                        for r in rows],
-         "count": len(rows), "matched": matched},
+         "count": len(rows), "matched": matched,
+         # The credit each source's data needs (an open licence's attribution).
+         "notes": await source_notes(_state(), [r["id"] for r in rows])},
         headers={"Content-Disposition": 'attachment; filename="companies.json"',
                  **_truncated_header(rows, matched)})
 
@@ -3124,6 +3249,361 @@ async def get_today():
 # ── CAEN: Romanian activity codes, found by words ──
 
 
+# ── Public data: the free official datasets kept locally ──
+
+FIN_MODULE = "mf_financials"
+_financials_task: asyncio.Task | None = None
+_financials_report: dict | None = None
+
+
+def _attribution(module_id: str) -> str:
+    """The credit a module's data asks for (its manifest's attribution,
+    licence included): one source of truth for the panels and the CLI."""
+    from harvey.modules import switches
+
+    m = switches.by_id().get(module_id)
+    return (m.attribution or m.name or m.id) if m else ""
+
+
+async def _public_data() -> dict:
+    """The trade registry's and the financial statements' local copies: what
+    is loaded, what data.gov.ro had at the last check, the module's
+    settings, and whether a load is running."""
+    from harvey import registry
+    from harvey.modules import switches
+    from harvey.modules.ro.mf_financials import source, store
+    from harvey.modules.ro.mf_financials.capabilities import updates
+
+    state = _state()
+    await state.init_db()
+    on = await switches.enabled_ids(state)
+    settings = await switches.module_settings(state, FIN_MODULE) if FIN_MODULE in on else {}
+    loaded = await asyncio.to_thread(store.status)
+    checked_at, found = source.load_catalog()
+    reg = await asyncio.to_thread(registry.status)
+    return {
+        "registry": None if reg is None else {
+            k: reg.get(k) for k in ("dataset", "date", "loaded_at", "firms", "operating")},
+        "registry_on": "onrc" in on,
+        "taxpayers": await _taxpayers_status(state, on),
+        "anaf": await _anaf_status(state, on),
+        "financials": {
+            "on": FIN_MODULE in on,
+            "loaded": None if loaded is None else {
+                **{k: loaded.get(k) for k in ("years", "loaded_at", "load_seconds", "rows",
+                                              "companies", "bytes")},
+                "files": loaded.get("files") or []},
+            "checked_at": checked_at,
+            "published": source.published_years(found)[:8] if found else [],
+            "updates": updates(found, loaded, int(settings.get("years") or 3)) if found else [],
+            "settings": settings,
+            "running": bool(_financials_task and not _financials_task.done()),
+            "report": _financials_report,
+            "attribution": _attribution(FIN_MODULE),
+        },
+    }
+
+
+@app.get("/api/public-data")
+async def get_public_data():
+    try:
+        return await _public_data()
+    except Exception as e:
+        logger.exception("public data status failed")
+        return {"error": str(e)}
+
+
+async def _financials_refused() -> JSONResponse | None:
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    try:
+        await switches.require(state, FIN_MODULE, "Loading the financial statements")
+    except switches.ModuleOff as e:
+        return JSONResponse(_error_body(e, "message", success=False), status_code=409)
+    return None
+
+
+@app.post("/api/public-data/financials/check")
+async def check_financials():
+    """Ask data.gov.ro now whether a new or revised year is published."""
+    refused = await _financials_refused()
+    if refused:
+        return refused
+    from harvey.modules.runs import sync_source
+
+    try:
+        await sync_source(_state(), FIN_MODULE, "statements_check")
+    except Exception as e:
+        logger.warning("financial statements check failed: %s", e)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=502)
+    return {"success": True, **await _public_data()}
+
+
+@app.post("/api/public-data/financials/load")
+async def load_financials(request: Request):
+    """Download what is missing for the years wanted and load them, in the
+    background; then the companies on file get their figures. {"force":
+    true} loads again when nothing new is published."""
+    global _financials_task, _financials_report
+
+    if _financials_task and not _financials_task.done():
+        return JSONResponse({"success": False, "message": "a load is already running"},
+                            status_code=409)
+    refused = await _financials_refused()
+    if refused:
+        return refused
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    force = bool(isinstance(body, dict) and body.get("force"))
+
+    async def _go():
+        global _financials_report
+        from harvey.modules.runs import lookup_by_id, sync_source
+
+        state = _state()
+        try:
+            draft = await sync_source(state, FIN_MODULE, "statements_sync",
+                                      extra={"force": force})
+            found = await lookup_by_id(state)
+            _financials_report = {
+                "unchanged": bool(draft.values.get("unchanged")),
+                "offline": draft.values.get("offline") or "",
+                "downloaded": draft.values.get("downloaded") or [],
+                "companies": found["companies"], "observations": found["observations"],
+                "unconfirmed": found["unconfirmed"].get(FIN_MODULE, []),
+                "errors": found["errors"][:3]}
+        except Exception as exc:
+            logger.exception("financial statements load failed")
+            _financials_report = {"errors": [str(exc)]}
+
+    _financials_report = None
+    _financials_task = asyncio.create_task(_go())
+    return {"success": True}
+
+
+@app.post("/api/public-data/financials/settings")
+async def set_financials_settings(request: Request):
+    """{"years": n, "auto_update": bool, "check_days": n}: any of them."""
+    from harvey.modules import switches
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = ("years", "auto_update", "check_days")
+    if not isinstance(body, dict) or not body or any(k not in allowed for k in body):
+        return JSONResponse({"success": False,
+                             "message": "expected years, auto_update or check_days"},
+                            status_code=400)
+    refused = await _financials_refused()
+    if refused:
+        return refused
+    state = _state()
+    for key, value in body.items():
+        await switches.set_module_setting(state, FIN_MODULE, key, value)
+    return {"success": True, **await _public_data()}
+
+
+TAX_MODULE = "mf_taxpayers"
+ANAF_MODULE = "anaf"
+_taxpayers_task: asyncio.Task | None = None
+_taxpayers_report: dict | None = None
+_anaf_task: asyncio.Task | None = None
+_anaf_job: dict | None = None
+
+
+async def _taxpayers_status(state, on: set[str]) -> dict:
+    """The taxpayer file's local copy: what is loaded, what data.gov.ro had
+    at the last check, the module's settings, whether a load is running."""
+    from harvey.modules import switches
+    from harvey.modules.ro.mf_taxpayers import source, store
+    from harvey.modules.ro.mf_taxpayers.capabilities import update
+
+    loaded = await asyncio.to_thread(store.status)
+    checked_at, found = source.load_catalog()
+    return {
+        "on": TAX_MODULE in on,
+        "loaded": None if loaded is None else {
+            k: loaded.get(k) for k in ("year", "published", "loaded_at", "load_seconds", "rows",
+                                       "with_phone", "vat", "employers", "micro", "bytes")},
+        "checked_at": checked_at,
+        "published": found[0].year if found else None,
+        "update": update(found, loaded) if found else None,
+        "settings": await switches.module_settings(state, TAX_MODULE) if TAX_MODULE in on else {},
+        "running": bool(_taxpayers_task and not _taxpayers_task.done()),
+        "report": _taxpayers_report,
+        "attribution": _attribution(TAX_MODULE),
+    }
+
+
+async def _anaf_status(state, on: set[str]) -> dict:
+    """ANAF's company check: the answers kept, whether a check is running
+    and how far it got, the last check's report."""
+    from harvey.modules import switches
+    from harvey.modules.ro.anaf import service
+
+    return {
+        "on": ANAF_MODULE in on,
+        "kept": await asyncio.to_thread(service.status),
+        "settings": await switches.module_settings(state, ANAF_MODULE) if ANAF_MODULE in on else {},
+        "running": bool(_anaf_task and not _anaf_task.done()),
+        "job": _anaf_job,
+        "attribution": _attribution(ANAF_MODULE),
+    }
+
+
+async def _module_refused(module_id: str, what: str) -> JSONResponse | None:
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    try:
+        await switches.require(state, module_id, what)
+    except switches.ModuleOff as e:
+        return JSONResponse(_error_body(e, "message", success=False), status_code=409)
+    return None
+
+
+@app.post("/api/public-data/taxpayers/check")
+async def check_taxpayers():
+    """Ask data.gov.ro now whether a newer taxpayer file is published."""
+    refused = await _module_refused(TAX_MODULE, "Checking the taxpayer file")
+    if refused:
+        return refused
+    from harvey.modules.runs import sync_source
+
+    try:
+        await sync_source(_state(), TAX_MODULE, "taxpayers_check")
+    except Exception as e:
+        logger.warning("taxpayer file check failed: %s", e)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=502)
+    return {"success": True, **await _public_data()}
+
+
+@app.post("/api/public-data/taxpayers/load")
+async def load_taxpayers(request: Request):
+    """Download the newest taxpayer file when missing and load it, in the
+    background; then the companies on file get its readings. {"force":
+    true} loads again when nothing new is published."""
+    global _taxpayers_task, _taxpayers_report
+
+    if _taxpayers_task and not _taxpayers_task.done():
+        return JSONResponse({"success": False, "message": "a load is already running"},
+                            status_code=409)
+    refused = await _module_refused(TAX_MODULE, "Loading the taxpayer file")
+    if refused:
+        return refused
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    force = bool(isinstance(body, dict) and body.get("force"))
+
+    async def _go():
+        global _taxpayers_report
+        from harvey.modules.runs import lookup_by_id, sync_source
+
+        state = _state()
+        try:
+            draft = await sync_source(state, TAX_MODULE, "taxpayers_sync",
+                                      extra={"force": force})
+            found = await lookup_by_id(state)
+            _taxpayers_report = {
+                "unchanged": bool(draft.values.get("unchanged")),
+                "offline": draft.values.get("offline") or "",
+                "downloaded": draft.values.get("downloaded") or [],
+                "companies": found["companies"], "observations": found["observations"],
+                "unconfirmed": found["unconfirmed"].get(TAX_MODULE, []),
+                "errors": found["errors"][:3]}
+        except Exception as exc:
+            logger.exception("taxpayer file load failed")
+            _taxpayers_report = {"errors": [str(exc)]}
+
+    _taxpayers_report = None
+    _taxpayers_task = asyncio.create_task(_go())
+    return {"success": True}
+
+
+@app.post("/api/public-data/taxpayers/settings")
+async def set_taxpayers_settings(request: Request):
+    """{"auto_update": bool, "check_days": n}: either of them."""
+    from harvey.modules import switches
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = ("auto_update", "check_days")
+    if not isinstance(body, dict) or not body or any(k not in allowed for k in body):
+        return JSONResponse({"success": False, "message": "expected auto_update or check_days"},
+                            status_code=400)
+    refused = await _module_refused(TAX_MODULE, "Changing the taxpayer file's settings")
+    if refused:
+        return refused
+    state = _state()
+    for key, value in body.items():
+        await switches.set_module_setting(state, TAX_MODULE, key, value)
+    return {"success": True, **await _public_data()}
+
+
+@app.post("/api/anaf/check")
+async def check_at_anaf(request: Request):
+    """Check companies at ANAF in the background: {"ids": [...]} (a
+    selection, or one company), {"q": "..."} (every match of a search),
+    {"missing": true} (every company never checked) or {} (every company
+    with a CUI, kept answers reused). One request a second; the progress
+    is in /api/public-data's ``anaf.job``."""
+    global _anaf_task, _anaf_job
+
+    if _anaf_task and not _anaf_task.done():
+        return JSONResponse({"success": False, "message": "an ANAF check is already running"},
+                            status_code=409)
+    refused = await _module_refused(ANAF_MODULE, "Checking companies at ANAF")
+    if refused:
+        return refused
+    try:
+        ids, q = await _export_request(request)
+    except ValueError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    missing = bool(isinstance(body, dict) and body.get("missing"))
+    state = _state()
+    await state.init_db()
+    if ids is None and q.strip():
+        ids, _ = await _search_all_ids(state, q)
+    job = {"done": 0, "total": 0, "report": None, "started_at": _now_iso()}
+
+    def progress(done, total):
+        job["done"], job["total"] = done, total
+
+    async def _go():
+        from harvey.modules.runs import check_by_id
+
+        try:
+            job["report"] = await check_by_id(state, ANAF_MODULE, "company_check", ids,
+                                              missing_only=missing, progress=progress)
+        except Exception as exc:
+            logger.exception("ANAF check failed")
+            job["report"] = {"errors": [str(exc)]}
+
+    _anaf_job = job
+    _anaf_task = asyncio.create_task(_go())
+    return {"success": True}
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 @app.get("/api/caen/search")
 async def search_caen(q: str = "", limit: int = 50):
     """CAEN classes for some words (offline, no Claude), plus the codes a
@@ -3316,8 +3796,10 @@ def _range_bound(raw):
 
 
 def _ranges(raw) -> list[dict]:
-    """Numeric cohort filters: a list of {code, min, max}, or the CSV query
-    form "SERP_RANK:11:30,MAPS_RANK::3". At least one bound per range."""
+    """Numeric cohort filters: a list of {code, min, max} (and, for a yearly
+    signal, an optional ``key``: the year to compare instead of the latest),
+    or the CSV query form "SERP_RANK:11:30,MAPS_RANK::3,TURNOVER:1000000::2024".
+    At least one bound per range."""
     if raw is None or raw == "" or raw == []:
         return []
     if isinstance(raw, str):
@@ -3326,9 +3808,12 @@ def _ranges(raw) -> list[dict]:
             if not part.strip():
                 continue
             pieces = part.split(":")
-            if len(pieces) != 3:
-                raise ValueError("ranges look like CODE:min:max")
-            items.append({"code": pieces[0], "min": pieces[1], "max": pieces[2]})
+            if len(pieces) not in (3, 4):
+                raise ValueError("ranges look like CODE:min:max (or CODE:min:max:year)")
+            item = {"code": pieces[0], "min": pieces[1], "max": pieces[2]}
+            if len(pieces) == 4 and pieces[3].strip():
+                item["key"] = pieces[3]
+            items.append(item)
         raw = items
     if not isinstance(raw, list) or any(not isinstance(r, dict) for r in raw):
         raise ValueError("ranges must be a list of {code, min, max}")
@@ -3344,7 +3829,14 @@ def _ranges(raw) -> list[dict]:
             raise ValueError(f"range on {code} needs a min or a max")
         if low is not None and high is not None and low > high:
             raise ValueError(f"range on {code}: min is above max")
-        out.append({"code": code.strip(), "min": low, "max": high})
+        item = {"code": code.strip(), "min": low, "max": high}
+        key = r.get("key")
+        if key is not None and str(key).strip():
+            key = str(key).strip()
+            if not key.isdigit() or len(key) != 4:
+                raise ValueError(f"range on {code}: the year must be 4 digits")
+            item["key"] = key
+        out.append(item)
     return out
 
 

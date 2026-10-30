@@ -1207,6 +1207,23 @@ class CompanyBatch:
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         return await _insert_observations(self.db, rows, run_id)
 
+    async def module_readings(self, company_id: str, module: str
+                              ) -> tuple[dict[str, tuple], set[tuple[str, str]]]:
+        """What ``module`` has recorded for the company: its latest
+        (value_num, value_text) per signal, and every (signal, value_text)
+        it ever recorded. What a repeated check compares its answer with."""
+        latest: dict[str, tuple] = {}
+        ever: set[tuple[str, str]] = set()
+        async with self.db.execute(
+            "SELECT signal_code, value_num, value_text FROM observations "
+            "WHERE company_id = ? AND module = ? ORDER BY observed_at, rowid",
+            (company_id, module),
+        ) as cur:
+            for code, num, text in await cur.fetchall():
+                latest[code] = (num, text or "")
+                ever.add((code, text or ""))
+        return latest, ever
+
 
 async def _backfill_company_ids(db) -> None:
     """The keys v17's SQL can't read: domains (free-mail and directory ones
@@ -2876,7 +2893,15 @@ class StateManager:
     # that phrase: checked, not ranked. Rows from before phrases were
     # stored (empty value_text) stop counting once a phrased row exists.
     # Which signals are rank signals is the manifests' keyed_by = "phrase".
+    #
+    # A yearly figure (keyed_by = "year": turnover, headcount) carries its
+    # financial year in value_text. Its current reading is the latest year
+    # on file for the company (within a year, the row written last: a
+    # revised dataset's reading over the first release's), so "turnover
+    # over 1M" compares the latest year by default. Older years stay as
+    # history, and a range can name one (``key``).
     _RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
+    _YEAR_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'year')"
     _CURRENT_CTE = f"""
     WITH latest AS (
         SELECT o.* FROM observations o
@@ -2886,6 +2911,16 @@ class StateManager:
          AND newest.signal_code = o.signal_code
          AND newest.t = o.observed_at
         WHERE o.signal_code NOT IN {_RANK_CODES}
+          AND o.signal_code NOT IN {_YEAR_CODES}
+        UNION ALL
+        SELECT o.* FROM observations o
+        WHERE o.signal_code IN {_YEAR_CODES}
+          AND o.rowid = (
+              SELECT n.rowid FROM observations n
+              WHERE n.company_id = o.company_id
+                AND n.signal_code = o.signal_code
+              ORDER BY CAST(n.value_text AS INTEGER) DESC, n.observed_at DESC,
+                       n.rowid DESC LIMIT 1)
     ),
     ranked AS (
         SELECT o.* FROM observations o
@@ -2982,6 +3017,30 @@ class StateManager:
             min_confidence=min_confidence)
         return [r["id"] for r in rows]
 
+    async def companies_with_id(self, kind: str, company_ids=None) -> list[dict]:
+        """Companies on file (not merged away) holding an identifier of
+        ``kind`` (a CUI): ``{"id", "name", "value"}``, one row per
+        identifier. Only ``company_ids`` when given."""
+        sql = (f"SELECT c.id, c.name, i.value FROM company_ids i "
+               f"JOIN companies c ON c.id = i.company_id "
+               f"WHERE i.kind = ? AND i.value != '' AND {LIVE_COMPANY}")
+        args: list = [kind]
+        ids = list(dict.fromkeys(company_ids)) if company_ids is not None else None
+        if ids is not None and not ids:
+            return []
+        out: list[dict] = []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for start in range(0, len(ids) if ids is not None else 1, 900):
+                chunk = ids[start:start + 900] if ids is not None else None
+                query, params = sql, list(args)
+                if chunk is not None:
+                    query += f" AND c.id IN ({','.join('?' * len(chunk))})"
+                    params += chunk
+                async with db.execute(query + " ORDER BY c.id, i.value", params) as cursor:
+                    out += [dict(r) for r in await cursor.fetchall()]
+        return out
+
     async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
         """Companies currently ranked (or in the pack) for this search phrase."""
         async with self._connect() as db:
@@ -3030,12 +3089,26 @@ class StateManager:
             params.extend(args)
             return f"c.id IN (SELECT company_id FROM {name})"
 
-        def readings(code: str, low=None, high=None, floor=None) -> str:
-            sql = ("SELECT DISTINCT company_id FROM positive "
-                   "WHERE signal_code = ? AND company_id != ''")
+        def readings(code: str, low=None, high=None, floor=None, key=None) -> str:
+            ranged = low is not None or high is not None
             args: list = [code]
-            if low is not None or high is not None:
-                sql += " AND value_num IS NOT NULL"
+            if key is not None:
+                # One year (or phrase) named: that key's newest reading.
+                sql = ("SELECT DISTINCT company_id FROM keyed "
+                       "WHERE signal_code = ? AND value_text = ? AND company_id != ''")
+                args.append(str(key))
+                sql += (" AND value_num IS NOT NULL" if ranged
+                        else " AND (value_num IS NULL OR value_num != 0)")
+            elif ranged:
+                # A number in range. 0 is "not found" for a rank, but a real
+                # figure for a yearly one (no turnover that year).
+                sql = ("SELECT DISTINCT company_id FROM current_obs "
+                       "WHERE signal_code = ? AND company_id != '' "
+                       "AND value_num IS NOT NULL "
+                       f"AND (value_num != 0 OR signal_code IN {self._YEAR_CODES})")
+            else:
+                sql = ("SELECT DISTINCT company_id FROM positive "
+                       "WHERE signal_code = ? AND company_id != ''")
             if low is not None:
                 sql += " AND value_num >= ?"
                 args.append(float(low))
@@ -3047,14 +3120,19 @@ class StateManager:
                 args.append(float(floor))
             return cte(sql, *args)
 
-        def leaf(code: str, low=None, high=None) -> tuple[str, str]:
-            """(true, false) for "has a positive reading of code [in range]"."""
-            found = readings(code, low, high, floor=min_confidence)
-            any_found = readings(code, low, high)
+        def leaf(code: str, low=None, high=None, key=None) -> tuple[str, str]:
+            """(true, false) for "has a positive reading of code [in range]"
+            ([for that key: one financial year])."""
+            found = readings(code, low, high, floor=min_confidence, key=key)
+            any_found = readings(code, low, high, key=key)
             if absence(code) == "false":
                 return found, f"NOT {any_found}"
-            checked = cte("SELECT DISTINCT company_id FROM current_obs "
-                          "WHERE signal_code = ? AND company_id != ''", code)
+            if key is not None:
+                checked = cte("SELECT DISTINCT company_id FROM keyed WHERE signal_code = ? "
+                              "AND value_text = ? AND company_id != ''", code, str(key))
+            else:
+                checked = cte("SELECT DISTINCT company_id FROM current_obs "
+                              "WHERE signal_code = ? AND company_id != ''", code)
             return found, f"({checked} AND NOT {any_found})"
 
         trues, falses = [], []
@@ -3067,12 +3145,25 @@ class StateManager:
             trues.append(f)
             falses.append(t)
         for r in ranges:
-            t, f = leaf(r["code"], r.get("min"), r.get("max"))
+            t, f = leaf(r["code"], r.get("min"), r.get("max"), r.get("key"))
             trues.append(t)
             falses.append(f)
         verdict = ("CASE WHEN " + " OR ".join(falses) + " THEN 'no_match' "
                    "WHEN " + " AND ".join(trues) + " THEN 'match' "
                    "ELSE 'possible' END")
+        keyed_codes = sorted({r["code"] for r in ranges if r.get("key") is not None})
+        if keyed_codes:
+            # Each key's newest reading, for the signals a range names a key
+            # of (a year). First, so its parameters come first.
+            marks = ",".join("?" * len(keyed_codes))
+            ctes.insert(0, f"""keyed AS (
+                SELECT o.* FROM observations o
+                WHERE o.signal_code IN ({marks}) AND o.rowid = (
+                    SELECT n.rowid FROM observations n
+                    WHERE n.company_id = o.company_id AND n.signal_code = o.signal_code
+                      AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
+                    ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1))""")
+            params[:0] = keyed_codes
         ctes.append("judged AS (SELECT c.id, c.name, c.domain, c.website, c.industry, "
                     f"c.location, {verdict} AS verdict FROM companies c WHERE {LIVE_COMPANY})")
         return self._CURRENT_CTE.rstrip() + "".join(",\n    " + c for c in ctes) + "\n", params
@@ -3087,7 +3178,9 @@ class StateManager:
         Returns ``({"match": n, "possible": n, "no_match": n}, rows)``; each
         row carries its ``verdict``. ``ranges`` are numeric filters,
         ``[{"code", "min", "max"}]`` with either bound optional: organic rank
-        11-30 is ``{"code": "SERP_RANK", "min": 11, "max": 30}``. Any one
+        11-30 is ``{"code": "SERP_RANK", "min": 11, "max": 30}``. A yearly
+        signal compares its latest year, or the year a ``key`` names
+        (``{"code": "TURNOVER", "min": 1e6, "key": "2024"}``). Any one
         condition makes a cohort, an exclusion alone included; none at all is
         an empty cohort, never every company.
         """

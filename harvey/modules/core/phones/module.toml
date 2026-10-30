@@ -21,11 +21,11 @@ note = "free: pages the website module already fetched"
 
 [[signals]]
 code = "PHONE_NUMBER"
-label = "Phone number on the site"
+label = "Phone number"
 category = "verification"
 value_type = "text"
 collector = "profile"
-cost_note = "free (site HTML)"
+cost_note = "free (site HTML, public registers)"
 cardinality = "many"
 
 [[capabilities]]

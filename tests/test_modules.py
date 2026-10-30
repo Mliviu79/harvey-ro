@@ -32,8 +32,12 @@ def test_every_catalog_signal_is_declared_by_exactly_one_module(shipped):
     owners: dict[str, list[str]] = {}
     for mid, sig in _declared(shipped):
         owners.setdefault(sig["code"], []).append(mid)
-    assert set(owners) == set(CATALOG)
+    assert set(CATALOG) <= set(owners)
     assert {code: ids for code, ids in owners.items() if len(ids) != 1} == {}
+    # A signal only a module declares carries its own words.
+    for _, sig in _declared(shipped):
+        if sig["code"] not in CATALOG:
+            assert sig.get("label") and sig.get("description") and sig.get("cost_note"), sig["code"]
 
 
 @pytest.mark.parametrize("field,default", [
@@ -43,8 +47,8 @@ def test_every_catalog_signal_is_declared_by_exactly_one_module(shipped):
 ])
 def test_declared_signals_match_the_catalog(shipped, field, default):
     wrong = {sig["code"]: (sig.get(field, default), CATALOG[sig["code"]].get(field, default))
-             for _, sig in _declared(shipped)
-             if sig.get(field, default) != CATALOG[sig["code"]].get(field, default)}
+             for _, sig in _declared(shipped) if sig["code"] in CATALOG
+             and sig.get(field, default) != CATALOG[sig["code"]].get(field, default)}
     assert wrong == {}
 
 
@@ -119,7 +123,9 @@ def test_cli_lists_modules_as_json(tmp_path, monkeypatch):
     rows = json.loads(out.getvalue())
     by_id = {r["id"]: r for r in rows}
     assert by_id["onrc"] == {**by_id["onrc"], "set": "ro", "kind": "source", "signals": 1}
-    assert sum(r["signals"] for r in rows) == len(SIGNAL_CATALOG)
+    declared = sum(len(m.signals) for m in load_manifests(data_dir=None))
+    assert sum(r["signals"] for r in rows) == declared >= len(SIGNAL_CATALOG)
+    assert by_id["mf_financials"]["signals"] == 9
     assert by_id["linkedin"]["default_enabled"] is False
 
 

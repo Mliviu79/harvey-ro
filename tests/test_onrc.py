@@ -244,7 +244,10 @@ async def test_import_filters_and_counts(state, files):
     assert b.location == "Cristian, Brașov, Romania"
 
     h = await state.get_company_by_external_id("onrc:F08/800/2018")
-    assert h.cui == "" and h.address == ""     # a sole trader: no CNP, no home
+    # A sole trader keeps its registered office (public registry data); the
+    # personal numeric code is never stored as its CUI.
+    assert h.cui == "" and h.address == "Str. Casei 9, 500999"
+    assert CNP not in str(vars(h))
 
 
 @pytest.mark.asyncio
@@ -262,7 +265,9 @@ async def test_no_personal_data_is_stored(state, files):
     await run(state, files)
     with sqlite3.connect(state.db_path) as db:
         dump = "\n".join(db.iterdump())
-    for private in (CNP, BIRTH, "Satul Nasterii", "Satul Domiciliului", "Str. Casei"):
+    # A representative's birth data and home are never read; a sole trader's
+    # registered office (Str. Casei) is public registry data and is kept.
+    for private in (CNP, BIRTH, "Satul Nasterii", "Satul Domiciliului"):
         assert private not in dump
 
 

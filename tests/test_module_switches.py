@@ -29,6 +29,8 @@ from harvey.state import MIGRATIONS, StateManager
 
 WEB = Path(dash.__file__).resolve().parent / "web"
 CATALOG = {s["code"]: s for s in SIGNAL_CATALOG}
+# Signals a module declares with no entry in the old catalog (its own words).
+MODULE_ONLY = {sig["code"] for m in switches.shipped() for sig in m.signals} - set(CATALOG)
 OLD_COLUMNS = ("code", "label", "description", "category", "value_type", "collector",
                "cost_note", "confidence_floor", "status")
 
@@ -39,7 +41,7 @@ OLD_COLUMNS = ("code", "label", "description", "category", "value_type", "collec
 DEFAULT_ON = {
     "export", "lang_en", "nominatim", "people", "phones", "website",
     "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper", "tinyfish",
-    "lang_ro", "market_ro", "onrc",
+    "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
 }
 DEFAULT_OFF = {"email_outreach", "hiring", "linkedin", "startups", "web_marketing",
                "web_search_scrape"}
@@ -100,9 +102,12 @@ async def test_parity_old_catalog_rows_equal_the_new_ones(state, tmp_path):
             category=sig["category"], value_type=sig["value_type"],
             collector=sig["collector"], cost_note=sig["cost_note"],
             confidence_floor=sig.get("confidence_floor", 0.0))
-    assert await sync_vocabulary(state) == len(SIGNAL_CATALOG)
-    sql = f"SELECT {', '.join(OLD_COLUMNS)} FROM signal_codes ORDER BY code"
-    assert await _rows(state, sql) == await _rows(old, sql)
+    assert await sync_vocabulary(state) == len(SIGNAL_CATALOG) + len(MODULE_ONLY)
+    marks = ",".join("?" * len(SIGNAL_CATALOG))
+    sql = (f"SELECT {', '.join(OLD_COLUMNS)} FROM signal_codes "
+           f"WHERE code IN ({marks}) ORDER BY code")
+    codes = [s["code"] for s in SIGNAL_CATALOG]
+    assert await _rows(state, sql, codes) == await _rows(old, sql, codes)
 
 
 @pytest.mark.asyncio
@@ -182,6 +187,8 @@ async def test_a_core_module_cant_be_turned_off(state):
 @pytest.mark.asyncio
 async def test_enabling_needs_the_requirements_on_and_enables_nothing_else(state):
     await switches.set_enabled(state, "onrc", False)
+    for module in ("mf_financials", "mf_taxpayers", "anaf"):
+        await switches.set_enabled(state, module, False)
     await switches.set_enabled(state, "market_ro", False)
     with pytest.raises(switches.SwitchRefused, match=r"market_ro"):
         await switches.set_enabled(state, "onrc", True)
@@ -420,9 +427,11 @@ def test_signals_page_hides_modules_that_are_off(client):
     data = client.get("/api/signals").json()
     shown = {s["code"] for g in data["groups"] for s in g["signals"]}
     assert "TECH_STACK" not in shown and "YC_BACKED" not in shown and "HIRING_ROLE" not in shown
-    assert data["total"] == len(shown) and data["hidden"] == len(CATALOG) - len(shown)
+    assert data["total"] == len(shown)
+    assert data["hidden"] == len(CATALOG) + len(MODULE_ONLY) - len(shown)
     assert [g["key"] for g in data["groups"]] == ["people", "phones", "website", "dataforseo",
-                                                 "email_verify", "onrc"]
+                                                 "email_verify", "anaf", "mf_financials",
+                                                 "mf_taxpayers", "onrc"]
     assert all(s["when_known"] for g in data["groups"] for s in g["signals"])
 
     r = client.post("/api/signals/status", json={"codes": ["TECH_STACK"], "status": "confirmed"})
@@ -715,7 +724,7 @@ async def test_a_broken_pack_is_left_out_and_said_so(packs, tmp_path, monkeypatc
     sm = StateManager(str(path))
     await sm.init_db()
     assert (await _rows(sm, "PRAGMA user_version"))[0][0] == len(MIGRATIONS)
-    assert await sync_vocabulary(sm) == len(CATALOG)
+    assert await sync_vocabulary(sm) == len(CATALOG) + len(MODULE_ONLY)
 
 
 def test_the_modules_page_shows_why_a_pack_was_left_out(packs, client):

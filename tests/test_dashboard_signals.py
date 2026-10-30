@@ -12,8 +12,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import harvey.dashboard as dash
+from harvey.modules import switches
 from harvey.signals import SIGNAL_CATALOG
 from harvey.state import StateManager
+
+# Every signal the shipped modules declare: the old catalog's, and the ones a
+# module brings with its own words (the financial statements').
+DECLARED = sorted({sig["code"] for m in switches.shipped() for sig in m.signals})
 
 # These modules ship off; here they are on, as a user who wants them has them.
 pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
@@ -42,8 +47,8 @@ def client(monkeypatch):
 def test_signals_seed_as_proposed_not_confirmed(client):
     """Harvey proposes. Nothing is live until a human says so."""
     data = client.get("/api/signals").json()
-    assert data["total"] == len(SIGNAL_CATALOG)
-    assert data["summary"]["proposed"] == len(SIGNAL_CATALOG)
+    assert data["total"] == len(DECLARED)
+    assert data["summary"]["proposed"] == len(DECLARED)
     assert data["summary"]["confirmed"] == 0
 
 
@@ -51,7 +56,8 @@ def test_signals_grouped_by_module_with_plain_language(client):
     data = client.get("/api/signals").json()
     keys = [g["key"] for g in data["groups"]]
     assert keys == ["people", "phones", "website", "dataforseo", "email_verify", "hiring",
-                    "startups", "web_marketing", "onrc"]
+                    "startups", "web_marketing", "anaf", "mf_financials", "mf_taxpayers",
+                    "onrc"]
     for group in data["groups"]:
         assert group["label"] and group["blurb"]  # every module explains itself
         for sig in group["signals"]:
@@ -240,12 +246,11 @@ def test_today_leads_with_unconfirmed_signals(client):
     assert "signals" in keys
     item = next(i for i in data["items"] if i["key"] == "signals")
     assert item["tab"] == "signals"
-    assert str(len(SIGNAL_CATALOG)) in item["title"]
+    assert str(len(DECLARED)) in item["title"]
 
 
 def test_today_flags_a_fully_rejected_vocabulary(client):
-    codes = [s["code"] for s in SIGNAL_CATALOG]
-    client.post("/api/signals/status", json={"codes": codes, "status": "rejected"})
+    client.post("/api/signals/status", json={"codes": DECLARED, "status": "rejected"})
     data = client.get("/api/today").json()
     keys = [i["key"] for i in data["items"]]
     assert "signals-none" in keys
@@ -323,8 +328,9 @@ def test_cost_notes_are_machine_classifiable():
 def test_every_signal_shows_under_its_module_with_when_it_is_known(client):
     data = client.get("/api/signals").json()
     shown = {s["code"]: (g["key"], s["when_known"]) for g in data["groups"] for s in g["signals"]}
-    assert set(shown) == {s["code"] for s in SIGNAL_CATALOG}
+    assert set(shown) == set(DECLARED)
     assert shown["SERP_RANK"] == ("dataforseo", "search")
+    assert shown["TURNOVER"] == ("mf_financials", "source")
     assert shown["ACTIVITY_CODE"] == ("onrc", "source")
     assert shown["TECH_STACK"] == ("web_marketing", "enrich")
 

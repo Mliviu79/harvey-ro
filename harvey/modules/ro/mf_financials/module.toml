@@ -1,0 +1,182 @@
+# The Ministry of Finance's annual financial statements (data.gov.ro): every
+# Romanian company's yearly turnover, headcount, profit, equity and debts,
+# loaded once per year into data/financials.db and read there, free.
+id = "mf_financials"
+name = "Financial statements (Ministry of Finance)"
+description = "Every Romanian company's yearly turnover, employees, profit, equity and debts, from the Ministry of Finance's open data, kept locally."
+set = "ro"
+kind = "source"
+version = "0.1.0"
+api = 1
+markets = ["RO"]
+requires = ["market_ro"]
+default_enabled = true
+official = true
+entry = "harvey.modules.ro.mf_financials.capabilities"
+wraps = ["harvey.modules.ro.mf_financials.store", "harvey.modules.ro.mf_financials.source"]
+secrets = []
+attribution = "Ministerul Finanțelor, data.gov.ro (CC-BY 4.0; OGL-ROU 1.0 before 2019)"
+terms_note = "Ministry of Finance open data from data.gov.ro (Ministerul Finanțelor, data.gov.ro), CC-BY 4.0 from 2019 and OGL-ROU 1.0 before: credit the Ministry of Finance. Companies only: sole traders and family businesses (PFA, II, IF) file no balance sheet."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free (open data download, about 90 MB a year)"
+
+# How many of the latest published years to keep loaded (growth needs two).
+[settings.years]
+type = "int"
+default = 3
+min = 1
+max = 30
+
+# How often to ask data.gov.ro whether a new year or a revised one is out.
+[settings.check_days]
+type = "int"
+default = 30
+min = 1
+max = 365
+
+# Download and load a new or revised year on its own when a check finds one.
+[settings.auto_update]
+type = "bool"
+default = false
+
+[[signals]]
+code = "TURNOVER"
+label = "Net turnover (RON)"
+description = "The company's net turnover for a financial year, in lei, as filed with its annual statements (Ministry of Finance open data). One reading per year; filters compare the latest year on file. 0 is a real figure (a dormant firm); no reading means no statement on file."
+category = "financial"
+value_type = "num"
+unit = "RON"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "EMPLOYEES"
+label = "Employees (yearly average)"
+description = "The average number of employees in a financial year, as filed with the annual statements: an average over the year, not the headcount at its end. One reading per year; filters compare the latest year on file."
+category = "financial"
+value_type = "num"
+unit = "people"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "NET_RESULT"
+label = "Net profit or loss (RON)"
+description = "Net profit minus net loss for a financial year, in lei: negative is a loss. From the annual statements, one reading per year."
+category = "financial"
+value_type = "num"
+unit = "RON"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "EQUITY"
+label = "Equity (RON)"
+description = "Total equity at the end of a financial year, in lei. Negative equity means the company owes more than it owns. From the annual statements, one reading per year."
+category = "financial"
+value_type = "num"
+unit = "RON"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "DEBTS"
+label = "Debts (RON)"
+description = "Total debts at the end of a financial year, in lei, from the annual statements. One reading per year."
+category = "financial"
+value_type = "num"
+unit = "RON"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "TOTAL_ASSETS"
+label = "Total assets (RON, derived)"
+description = "Fixed assets plus current assets plus prepaid expenses at the end of a financial year, in lei. Derived by Harvey: the published files have no total-assets column. One reading per year."
+category = "financial"
+value_type = "num"
+unit = "RON"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "TURNOVER_GROWTH"
+label = "Turnover growth (%)"
+description = "How much net turnover changed from the previous financial year, in percent. Only when both years were filed and the previous year's turnover was above 0. One reading per year."
+category = "financial"
+value_type = "num"
+unit = "%"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[signals]]
+code = "ACCOUNTS_FORM"
+label = "Accounts form filed"
+description = "The form of the latest annual statements on file: BL (long balance sheet, larger companies), UU (abridged, micro and small companies) or IR (IFRS)."
+category = "financial"
+value_type = "text"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "FILED_ACCOUNTS"
+label = "Filed annual accounts"
+description = "Whether the company's annual statements for a financial year are in the published files. Yes when they are; no only for a company the trade registry lists as operating, as a firm that files (not a PFA, II or IF) and registered before that year, in a year whose final release is loaded (the revised files a year after the first, which add the late filers). Sole traders and family businesses file no balance sheet: for them it stays unknown, never no."
+category = "financial"
+value_type = "bool"
+collector = "financials"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+keyed_by = "year"
+when_known = "source"
+
+[[capabilities]]
+id = "statements_check"
+op = "sync"
+inputs = []
+outputs = { values = ["catalog", "updates"] }
+cost = { usd = 0.0, per = "check" }
+
+[[capabilities]]
+id = "statements_sync"
+op = "sync"
+# The one an automatic update runs (the auto_update setting).
+auto = true
+inputs = []
+outputs = { values = ["financials", "catalog", "updates", "downloaded"] }
+cost = { usd = 0.0, per = "year" }
+
+[[capabilities]]
+id = "statements_lookup"
+op = "lookup"
+inputs = [["id:cui"]]
+# Up to this many companies a call: the database is opened once for them.
+batch = 500
+outputs = { facts = ["TURNOVER", "EMPLOYEES", "NET_RESULT", "EQUITY", "DEBTS", "TOTAL_ASSETS", "TURNOVER_GROWTH", "ACCOUNTS_FORM", "FILED_ACCOUNTS"] }
+cost = { usd = 0.0, per = "company" }

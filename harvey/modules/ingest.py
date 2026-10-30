@@ -10,8 +10,6 @@ Here is where a draft becomes rows, under the rules no module can skip:
   (the confirmation gate), and a phone number only when it parses;
 - people and contacts accumulate: a second source adds beside the first,
   never over it;
-- a sole trader's or family business's record keeps no street address
-  (theirs is usually a home);
 - every observation says which module and capability found it and which
   record it was found for before any merge (``origin_company_id``), which
   is what lets undoing an automatic merge take back exactly its facts.
@@ -34,11 +32,6 @@ from harvey.modules.api import Budget, Fact, Record
 
 logger = logging.getLogger("harvey.ingest")
 
-# Legal forms of a natural person trading on their own account (PF, PFA,
-# II) or with family (IF, AF): their registered office is a home address.
-PERSONAL_FORMS = frozenset({"PF", "PFA", "II", "IF", "AF"})
-
-
 @dataclass
 class Saved:
     """Where a record landed: ``company_id`` to write its facts to,
@@ -55,12 +48,13 @@ class Saved:
 
 
 def company_from(record: Record) -> Company:
-    """The company row a record describes, under the privacy rule."""
-    personal = (record.legal_form or "").strip().upper() in PERSONAL_FORMS
+    """The company row a record describes. Every legal form keeps its
+    registered office: a sole trader's or family business's address and
+    phone are public registry data like any company's."""
     return Company(
         name=record.name, domain=record.domain, website=record.website,
         phone=record.phone, industry=record.industry, location=record.location,
-        address="" if personal else record.address, description=record.description,
+        address=record.address, description=record.description,
         company_size=record.company_size, cui=record.ids.get("cui", ""),
         external_id=record.external_id,
         source=record.source, source_url=record.source_url,
@@ -238,6 +232,53 @@ async def unseen(batch, company_id: str, evidence_url: str, found: list[dict]) -
         return []
     seen = await batch.observed(company_id, evidence_url)
     return [r for r in found if (r["signal_code"], r["value_text"]) not in seen]
+
+
+def many_codes() -> frozenset[str]:
+    """Signals a company can hold several values of at once (phones,
+    addresses): a new one is added beside the others."""
+    from harvey.modules import switches
+
+    return frozenset(sig["code"] for m in switches.manifests() for sig in m.signals
+                     if sig.get("cardinality") == "many")
+
+
+async def changed(batch, company_id: str, module: str, found: list[dict],
+                  many: frozenset[str] | None = None) -> list[dict]:
+    """The rows of a repeated check that say something new about the
+    company: for a signal with many values, one ``module`` hasn't recorded
+    before; for a single-valued one, a value other than the module's
+    latest reading (so a status that flips back is recorded again, and an
+    unchanged one isn't written twice)."""
+    if not found:
+        return []
+    many = many_codes() if many is None else many
+    latest, ever = await batch.module_readings(company_id, module)
+    out = []
+    for row in found:
+        code, text = row["signal_code"], row.get("value_text") or ""
+        value = (row.get("value_num"), text)
+        if code in many:
+            if (code, text) in ever:
+                continue
+            ever.add((code, text))
+        else:
+            if latest.get(code) == value:
+                continue
+            latest[code] = value
+        out.append(row)
+    return out
+
+
+async def company_phones(batch, company_id: str, contacts) -> bool:
+    """An official record's phone as the company's phone when it has none
+    (on a batch); every number is also kept as a reading when PHONE_NUMBER
+    is confirmed. True when the company's phone was set."""
+    phones = [c for c in contacts if c.kind == "phone" and (c.display or c.value)]
+    if not phones:
+        return False
+    changed_ = await batch.fill_company_fields(company_id, phone=phones[0].display or phones[0].value)
+    return "phone" in (changed_ or [])
 
 
 # ── People, contacts and what a company is called ──

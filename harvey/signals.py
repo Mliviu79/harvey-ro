@@ -432,20 +432,22 @@ SIGNAL_CATALOG: list[dict] = [
     },
     {
         "code": "PHONE_NUMBER",
-        "label": "Phone number on the site",
+        "label": "Phone number",
         "description": (
-            "A phone number the business publishes on its own pages (a tap-to-call "
-            "link, its schema.org markup, or one written out), one row per number "
-            "in +40… form. Fax numbers are left out; a tap-to-call link or the "
-            "markup counts with full confidence, a number in the text with a "
-            "little less. The company's phone is "
-            "filled from its site either way when no listing gave one; this "
-            "keeps every number found, for the export's other_phones."
+            "A phone number found for the company, one row per number and "
+            "source, in international form: on its own pages (a tap-to-call "
+            "link, its schema.org markup, or one written out) or in an "
+            "official register a source module reads. Fax numbers are left "
+            "out; a tap-to-call link, the markup or a register counts with "
+            "full confidence, a number in the text with a little less. The "
+            "company's phone is filled from the first one either way when no "
+            "listing gave one; this keeps every number found, with who gave "
+            "it, for the export's other_phones."
         ),
         "category": "verification",
         "value_type": "text",
         "collector": "profile",
-        "cost_note": "free (site HTML)",
+        "cost_note": "free (site HTML, public registers)",
         "confidence_floor": 0.0,
     },
 ]

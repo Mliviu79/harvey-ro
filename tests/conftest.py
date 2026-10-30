@@ -20,6 +20,8 @@ def pytest_configure(config):
         "markers", "real_claude_cli: runs the installed Claude CLI (no stand-in)")
     config.addinivalue_line(
         "markers", "modules_on(*ids): these modules count as switched on")
+    config.addinivalue_line(
+        "markers", "live_anaf_client: the ANAF request code runs (against a stubbed client)")
 
 
 @pytest.fixture(autouse=True)
@@ -85,3 +87,27 @@ def _no_browser_services(monkeypatch):
     for name in ("BROWSER_CDP_URL", "BROWSER_CDP_FALLBACK_URL", "BROWSER_CDP_TOKEN",
                  "HARVEY_BROWSER_CDP_DEFAULT"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_anaf(monkeypatch, tmp_path_factory, request):
+    """No test reaches ANAF's real web service (a fictional CUI could be a
+    real business's), keeps its answers in the checkout's data/, or waits
+    on the checkout's lane file. A test of the request itself stubs the
+    HTTP client and marks itself ``live_anaf_client``."""
+    from harvey.modules import lanes
+    from harvey.modules.ro.anaf import service
+
+    monkeypatch.setattr(lanes, "LANE_DIR", tmp_path_factory.mktemp("lanes"))
+    monkeypatch.setattr(service, "CACHE_PATH", tmp_path_factory.mktemp("anaf") / "anaf.db")
+    from harvey.modules.ro.mf_taxpayers import store as taxpayers
+
+    monkeypatch.setattr(taxpayers, "TAXPAYERS_PATH",
+                        tmp_path_factory.mktemp("taxpayers") / "taxpayers.db")
+    if request.node.get_closest_marker("live_anaf_client"):
+        return
+
+    async def refuse(client, cuis, **kw):
+        raise service.AnafError("ANAF is not asked in tests")
+
+    monkeypatch.setattr(service, "ask", refuse)

@@ -27,8 +27,9 @@ searches that; this module's streaming import still works on its own.
 What is kept is deliberately narrow. The representatives file also carries
 birth dates and places and home localities; only a natural person's name
 and role are read. A CUI that is really a personal numeric code (13
-digits, as some sole traders' rows have) is dropped. Sole traders and
-family businesses get no street address, since theirs is usually a home.
+digits, as some sole traders' rows have) is dropped: it is an identity
+number, not a contact detail. Every firm keeps its registered office,
+sole traders and family businesses too: theirs is public registry data.
 The downloaded files themselves are kept as published (data/onrc/<date>/):
 prune_downloads() deletes the representatives file and older datasets, but
 only when called.
@@ -84,9 +85,10 @@ MIN_BYTES = {
 ACTIVE_STATUS = "1048"      # "funcțiune": operating
 
 # Forms that are a natural person trading (PF/PFA sole traders, II sole
-# proprietorships, IF and AF family businesses). Their registered office
-# is usually a home, so no street address is stored for them.
-PERSONAL_FORMS = frozenset({"PF", "PFA", "II", "IF", "AF"})
+# proprietorships, IF and AF family businesses). They keep single-entry
+# books and file no annual balance sheet, so a missing financial statement
+# says nothing about them. Their registry details are kept like any firm's.
+NATURAL_PERSON_FORMS = frozenset({"PF", "PFA", "II", "IF", "AF"})
 
 # Roles that run the company day to day. Insolvency practitioners
 # (lichidator, administrator judiciar/provizoriu/special/concordatar) are
@@ -232,9 +234,9 @@ def valid_cui(raw: str) -> str:
     (CNP) where the CUI goes: that is a person's national id, and it is
     never stored. A CUI has at most 10 digits.
     """
-    digits = re.sub(r"\D", "", (raw or "").upper().removeprefix("RO"))
-    digits = digits.lstrip("0")
-    return digits if 2 <= len(digits) <= 10 else ""
+    from harvey.modules.ro import cui as ro_cui
+
+    return ro_cui.clean(raw)
 
 
 def split_person(raw: str) -> tuple[str, str]:
@@ -609,8 +611,8 @@ def registrations_in_area(path: Path, county: list[str] | str | None = None,
 
 def parse_firm(rec: dict) -> Firm:
     """One row of the firms file (column name -> raw value) as a Firm:
-    names with Romanian's comma-below letters, a real CUI or none, no street
-    address for a sole trader or family business, a website only when it
+    names with Romanian's comma-below letters, a real CUI or none (never a
+    personal numeric code), the registered office, a website only when it
     looks like one."""
     form = rec["FORMA_JURIDICA"].strip().upper()
     website, domain = _website(rec["WEB"]) if rec["WEB"].strip() else ("", "")
@@ -621,7 +623,7 @@ def parse_firm(rec: dict) -> Firm:
         form=form,
         county=_comma_below(rec["ADR_JUDET"].strip()),
         locality=clean_locality(rec["ADR_LOCALITATE"]),
-        address="" if form in PERSONAL_FORMS else _address(rec),
+        address=_address(rec),
         website=website, domain=domain,
         registered=rec["DATA_INMATRICULARE"].strip(),
     )

@@ -109,6 +109,23 @@ def phone_hit(raw: str, region: str | None = None, source: str = "") -> PhoneHit
     return _hit(number, source) if number is not None else None
 
 
+def field_phones(raw: str, region: str | None = None) -> list[PhoneHit]:
+    """Every valid number in a register's phone field, which can hold
+    several ("0268 000 000 / 0722 000 000") or a national number written
+    without its trunk 0. Shorter fragments are left out."""
+    out: list[PhoneHit] = []
+    for part in re.split(r"[/,;]|\s{2,}", str(raw or "")):
+        part = part.strip()
+        if len(_digits(part)) < 6:
+            continue
+        hit = phone_hit(part, region, "register")
+        if hit is None and region and not part.startswith(("0", "+")):
+            hit = phone_hit("0" + part, region, "register")
+        if hit is not None and hit.number not in {h.number for h in out}:
+            out.append(hit)
+    return out
+
+
 # Text that holds digits but is never a phone number. Masked (not deleted)
 # before matching, so the digits either side of it can't join up.
 _NOT_PHONES = [

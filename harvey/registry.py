@@ -6,8 +6,7 @@ activity someone asks about, ``build()`` loads all of it once into its own
 SQLite database, data/registry.db, beside the working one (harvey.db):
 
     firms            every registration, any status: name, CUI, registration
-                     number, county, locality, registered office (none for
-                     sole traders and family businesses), website, status
+                     number, county, locality, registered office, website, status
                      codes and whether it is operating
     firm_caen        every CAEN class each firm is authorised for, as codes
     administrators   the people who run each firm: name and role only
@@ -18,11 +17,11 @@ SQLite database, data/registry.db, beside the working one (harvey.db):
     caen_fts         full-text index over class names and everyday words
     meta             which dataset this is, when it was loaded, counts
 
-The same privacy rules as the streaming import apply when loading: no
-personal numeric code (CNP) where a CUI goes, no birth data or home
-locality (those columns are never read), no street address for natural
-persons trading. A new dataset is built in a temporary file and renamed
-over the old one, so a reader never sees a half-loaded registry.
+The same rules as the streaming import apply when loading: no personal
+numeric code (CNP) where a CUI goes, no birth data or home locality of a
+representative (those columns are never read). A new dataset is built in
+a temporary file and renamed over the old one, so a reader never sees a
+half-loaded registry.
 
 ``search()`` answers words the way harvey search does (every word must
 match, accent-insensitive, prefixes, a 4-digit code exact, -word excludes),
@@ -47,7 +46,8 @@ from harvey.collectors import onrc
 from harvey.paths import PROJECT_ROOT
 
 REGISTRY_PATH = PROJECT_ROOT / "data" / "registry.db"
-SCHEMA_VERSION = "2"
+# 3: sole traders' and family businesses' registered offices are kept.
+SCHEMA_VERSION = "3"
 
 # Rows per executemany while loading; progress is reported this often.
 LOAD_BATCH = 50_000
@@ -464,6 +464,16 @@ class Query:
     # The query's words that name a place (a locality or county): firms
     # there rank before firms that only carry the word in their name.
     places: list[str] = field(default_factory=list)
+    # Bounds on the latest filed year's turnover and headcount (a
+    # mf_financials store.Filter), checked in data/financials.db before
+    # anything is read or pulled; and where that database is.
+    fin: object = None
+    fin_path: Path | None = None
+    # Yes/no conditions from the taxpayer file (a mf_taxpayers
+    # store.Filter: employer, VAT, micro-enterprise tax), checked in
+    # data/taxpayers.db the same way.
+    tax: object = None
+    tax_path: Path | None = None
 
     @property
     def classes(self) -> list[tuple[str, int | None]]:
@@ -509,18 +519,22 @@ def _tags(classes) -> str:
 
 
 def resolve(con, words: str = "", *, classes=None, counties=None, localities=None,
-            all_statuses: bool = False) -> Query:
+            all_statuses: bool = False, fin=None, fin_path: Path | None = None,
+            tax=None, tax_path: Path | None = None) -> Query:
     """Turn a query into a Query. ``words`` follow harvey search: every
     word must match the firm's name, locality or county, or one of its
     classes (by everyday word, class name, or a 4-digit code: "8623",
     "86.23", "8623/2" for Rev.2 only); "-word" must not; single letters
     are dropped, except a county code ("B" is București, "BV" Brașov).
     ``classes`` (code, version or None), ``counties`` (registry spelling)
-    and ``localities`` are filters on top, as import-onrc gives them.
-    Operating firms only, unless ``all_statuses``."""
+    and ``localities`` are filters on top, as import-onrc gives them;
+    ``fin`` bounds turnover and headcount (financials.db at ``fin_path``),
+    ``tax`` asks for employers, VAT payers or micro-enterprises (taxpayers.db
+    at ``tax_path``). Operating firms only, unless ``all_statuses``."""
     from harvey.words import SEARCH_STOPWORDS as _SEARCH_STOPWORDS, fold_words as _fold_words
 
-    q = Query(explicit_classes=list(classes or []))
+    q = Query(explicit_classes=list(classes or []), fin=fin, fin_path=fin_path,
+              tax=tax, tax_path=tax_path)
     text = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", words or "")
     wanted: list[str] = []
     unwanted: list[str] = []
@@ -669,7 +683,42 @@ def _county_code(name: str) -> str:
     return _county_codes().get(onrc._fold(name or ""), "")
 
 
-def _count(con, match: str, cap: int | None = None) -> int:
+def _where(con, q: Query | None) -> tuple[str, list]:
+    """The query's financial bounds and taxpayer conditions as one
+    condition on ``f`` (a firms row), with their databases attached: ("",
+    []) when there are none. FileNotFoundError when one is asked for and
+    its database isn't loaded."""
+    conds, args = [], []
+    fin = getattr(q, "fin", None)
+    if fin is not None and fin.active():
+        from harvey.modules.ro.mf_financials import store
+
+        if not store.attach(con, q.fin_path or store.FINANCIALS_PATH):
+            raise FileNotFoundError("no financial statements loaded: harvey financials load")
+        cond, more = fin.sql("f.cui")
+        conds.append(cond)
+        args += more
+    tax = getattr(q, "tax", None)
+    if tax is not None and tax.active():
+        from harvey.modules.ro.mf_taxpayers import store as taxpayers
+
+        if not taxpayers.attach(con, q.tax_path or taxpayers.TAXPAYERS_PATH):
+            raise FileNotFoundError("no taxpayer file loaded: harvey taxpayers load")
+        cond, more = tax.sql("f.cui")
+        conds.append(cond)
+        args += more
+    return (" AND ".join(conds), args) if conds else ("", [])
+
+
+def _count(con, match: str, cap: int | None = None, where=("", [])) -> int:
+    cond, args = where
+    if cond:
+        inner = ("SELECT firm_fts.rowid FROM firm_fts JOIN firms f ON f.id = firm_fts.rowid "
+                 f"WHERE firm_fts MATCH ? AND {cond}")
+        if cap:
+            return con.execute(f"SELECT COUNT(*) FROM ({inner} LIMIT ?)",
+                               (match, *args, cap)).fetchone()[0]
+        return con.execute(f"SELECT COUNT(*) FROM ({inner})", (match, *args)).fetchone()[0]
     if cap:
         return con.execute("SELECT COUNT(*) FROM (SELECT rowid FROM firm_fts "
                            "WHERE firm_fts MATCH ? LIMIT ?)", (match, cap)).fetchone()[0]
@@ -679,12 +728,18 @@ def _count(con, match: str, cap: int | None = None) -> int:
 
 def count(con, q: Query, cap: int | None = None) -> int:
     """How many firms a resolved query matches, counting no further than ``cap``."""
-    return _count(con, q.match, cap) if q.match else 0
+    return _count(con, q.match, cap, _where(con, q)) if q.match else 0
 
 
-def _ids(con, match: str, limit: int, offset: int) -> list[int]:
+def _ids(con, match: str, limit: int, offset: int, where=("", [])) -> list[int]:
     if limit <= 0:
         return []
+    cond, args = where
+    if cond:
+        return [r[0] for r in con.execute(
+            "SELECT firm_fts.rowid FROM firm_fts JOIN firms f ON f.id = firm_fts.rowid "
+            f"WHERE firm_fts MATCH ? AND {cond} ORDER BY firm_fts.rowid LIMIT ? OFFSET ?",
+            (match, *args, limit, offset))]
     return [r[0] for r in con.execute(
         "SELECT rowid FROM firm_fts WHERE firm_fts MATCH ? ORDER BY rowid LIMIT ? OFFSET ?",
         (match, limit, offset))]
@@ -716,32 +771,37 @@ def matching_ids(con, q: Query, limit: int | None = None, offset: int = 0) -> li
     out: list[int] = []
     big = 1 << 62
     want = big if limit is None else limit
+    where = _where(con, q)
     for match in _tiers(q):
         if len(out) >= want:
             break
         if offset:
-            n = _count(con, match, offset + 1)      # only: is the offset inside it?
+            n = _count(con, match, offset + 1, where)    # only: is the offset inside it?
             if offset >= n:
                 offset -= n
                 continue
-        got = _ids(con, match, min(want - len(out), big), offset)
+        got = _ids(con, match, min(want - len(out), big), offset, where)
         offset = 0
         out += got
     return out
 
 
 def search(con, words: str = "", *, classes=None, counties=None, localities=None,
-           all_statuses: bool = False, limit: int = 20, offset: int = 0) -> dict:
+           all_statuses: bool = False, limit: int = 20, offset: int = 0,
+           fin=None, fin_path: Path | None = None, tax=None,
+           tax_path: Path | None = None) -> dict:
     """{"total", "more", "rows", "query"}: how many firms match, and one
     page of them, each with its activities in words (the ones the query
     named first). Counting stops at COUNT_CAP: then "total" is COUNT_CAP
-    and "more" is True (there are more than that)."""
+    and "more" is True (there are more than that). ``fin`` bounds the
+    latest filed year's turnover and headcount (see resolve)."""
     q = resolve(con, words, classes=classes, counties=counties, localities=localities,
-                all_statuses=all_statuses)
+                all_statuses=all_statuses, fin=fin, fin_path=fin_path,
+                tax=tax, tax_path=tax_path)
     if not q.match:
         return {"total": 0, "more": False, "rows": [], "query": q}
     limit = max(1, min(int(limit), 500))
-    total = _count(con, q.match, COUNT_CAP + 1)
+    total = _count(con, q.match, COUNT_CAP + 1, _where(con, q))
     more = total > COUNT_CAP
     ids = matching_ids(con, q, limit, max(0, int(offset)))
     return {"total": min(total, COUNT_CAP), "more": more,
@@ -771,6 +831,7 @@ def firm_rows(con, ids: list[int], q: Query | None = None) -> list[dict]:
             "name": r["name"], "name_en": r["name_en"],
             "matched": bool(q and q.names_class(code, r["version"])),
         })
+    latest = _latest_figures(con, [r["cui"] for r in firms.values() if r["cui"]])
     out = []
     for i in ids:
         row = firms.get(i)
@@ -782,9 +843,21 @@ def firm_rows(con, ids: list[int], q: Query | None = None) -> list[dict]:
             onrc.ACTIVE_STATUS if onrc.ACTIVE_STATUS in codes else (codes[0] if codes else ""))
         row["operating"] = bool(row["operating"])
         row["status"] = names.get(label, label)
+        row["financials"] = latest.get(row["cui"]) if row["cui"] else None
         row["activities"] = sorted(acts.get(i, []), key=lambda a: not a["matched"])
         out.append(row)
     return out
+
+
+def _latest_figures(con, cuis: list[str]) -> dict[str, dict]:
+    """CUI -> its latest filed year's {year, form, turnover, employees}, when
+    the financials database is attached (a search with financial bounds)."""
+    attached = {r[1] for r in con.execute("PRAGMA database_list")}
+    if "fin" not in attached or not cuis:
+        return {}
+    marks = ",".join("?" * len(cuis))
+    return {r["cui"]: {k: r[k] for k in ("year", "form", "turnover", "employees")}
+            for r in con.execute(f"SELECT * FROM fin.latest WHERE cui IN ({marks})", cuis)}
 
 
 _STATUS_NAMES: dict[str, str] | None = None

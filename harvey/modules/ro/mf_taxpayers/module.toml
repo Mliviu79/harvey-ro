@@ -1,0 +1,84 @@
+# The Ministry of Finance's yearly taxpayer identification file
+# ("Date de identificare plătitori", data.gov.ro): every Romanian taxpayer's
+# address, phone, VAT registration and the taxes it is registered for,
+# loaded once a year into data/taxpayers.db and read there, free.
+id = "mf_taxpayers"
+name = "Date de identificare plătitori (MF)"
+description = "Every Romanian taxpayer's address, phone, VAT registration and whether it pays wage tax (an employer) or the micro-enterprise tax, from the Ministry of Finance's yearly open data file, kept locally."
+set = "ro"
+kind = "source"
+version = "0.1.0"
+api = 1
+markets = ["RO"]
+requires = ["market_ro"]
+default_enabled = true
+official = true
+entry = "harvey.modules.ro.mf_taxpayers.capabilities"
+wraps = ["harvey.modules.ro.mf_taxpayers.store", "harvey.modules.ro.mf_taxpayers.source"]
+secrets = []
+attribution = "Ministerul Finanțelor, data.gov.ro (CC-BY 4.0)"
+terms_note = "Ministry of Finance open data from data.gov.ro (Ministerul Finanțelor, data.gov.ro), CC-BY 4.0: credit the Ministry of Finance. Published once a year (June, corrected in July), so VAT and status can be months old: ANAF's check is newer and wins. Sole traders and family businesses (PFA, II, IF) are kept like every other legal form; a row whose tax code is a personal numeric code is never kept."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.0
+note = "free (open data download, about 870 MB a year)"
+
+# How often to ask data.gov.ro whether a newer file is out.
+[settings.check_days]
+type = "int"
+default = 30
+min = 1
+max = 365
+
+# Download and load a newer file on its own when a check finds one.
+[settings.auto_update]
+type = "bool"
+default = false
+
+[[signals]]
+code = "HAS_EMPLOYEES_TAX"
+label = "Employer (pays wage tax)"
+description = "Whether the company is registered for the taxes only an employer owes: wage income tax or the labour insurance contribution (Ministry of Finance's yearly taxpayer file). No when it is on file and registered for neither."
+category = "tax"
+value_type = "bool"
+collector = "taxpayers"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+when_known = "source"
+
+[[signals]]
+code = "MICRO_TAX_REGIME"
+label = "Micro-enterprise tax regime"
+description = "Whether the company pays the micro-enterprise income tax instead of profit tax (Ministry of Finance's yearly taxpayer file): a small company by turnover. No when it is on file and not registered for it."
+category = "tax"
+value_type = "bool"
+collector = "taxpayers"
+cost_note = "free (Ministry of Finance open data, data.gov.ro)"
+cardinality = "one"
+when_known = "source"
+
+[[capabilities]]
+id = "taxpayers_check"
+op = "sync"
+inputs = []
+outputs = { values = ["catalog", "update"] }
+cost = { usd = 0.0, per = "check" }
+
+[[capabilities]]
+id = "taxpayers_sync"
+op = "sync"
+# The one an automatic update runs (the auto_update setting).
+auto = true
+inputs = []
+outputs = { values = ["taxpayers", "catalog", "update", "downloaded"] }
+cost = { usd = 0.0, per = "year" }
+
+[[capabilities]]
+id = "taxpayer_lookup"
+op = "lookup"
+inputs = [["id:cui"]]
+# Up to this many companies a call: the database is opened once for them.
+batch = 500
+outputs = { ids = ["phone"], facts = ["HAS_EMPLOYEES_TAX", "MICRO_TAX_REGIME", "VAT_REGISTERED", "VAT_SINCE", "PHONE_NUMBER", "ADDRESS"] }
+cost = { usd = 0.0, per = "company" }
