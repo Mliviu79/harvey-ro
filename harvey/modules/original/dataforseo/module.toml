@@ -24,7 +24,7 @@ label = "Search rank position"
 category = "discovery"
 value_type = "num"
 collector = "discover"
-cost_note = "~$0.006 per search at depth 30 (paid SERP API, Live endpoint)"
+cost_note = "$0.002 per 10 results ranked (paid SERP API, Live endpoint): up to $0.04 a search at the full 200"
 keyed_by = "phrase"
 cardinality = "many"
 when_known = "search"
@@ -46,7 +46,7 @@ label = "Google Maps rank position"
 category = "discovery"
 value_type = "num"
 collector = "discover"
-cost_note = "~$0.002 per Maps search of up to 100 results (paid SERP API)"
+cost_note = "$0.002 per 100 Maps results (paid SERP API): up to $0.014 a search at the full 700"
 keyed_by = "phrase"
 cardinality = "many"
 when_known = "search"
@@ -103,7 +103,7 @@ op = "query"
 provider = "dataforseo_listings"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
-cost = { usd = 0.012, per = "query", plus_usd = 0.00036, plus_per = "business" }
+cost = { usd = 0.012, per = "page", plus_usd = 0.00036, plus_per = "business", note = "every business the search matches, 1,000 a page; the estimate counts them first" }
 
 [[capabilities]]
 id = "organic_rank"
@@ -111,7 +111,7 @@ op = "query"
 provider = "dataforseo_serp"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "IN_LOCAL_PACK", "FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
-cost = { usd = 0.006, per = "search", note = "depth 30, Live endpoint" }
+cost = { usd = 0.002, per = "page", note = "10 results a page, up to 200 (DataForSEO's maximum), Live endpoint" }
 
 [[capabilities]]
 id = "maps_rank"
@@ -119,4 +119,4 @@ op = "query"
 provider = "dataforseo_maps"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["MAPS_RANK", "FOUND_IN_SERP", "NO_WEBSITE", "UNCLAIMED_LISTING", "REVIEW_RATING", "REVIEW_COUNT"] }
-cost = { usd = 0.002, per = "search", note = "up to 100 results, Live endpoint" }
+cost = { usd = 0.002, per = "page", note = "100 results a page, up to 700 (DataForSEO's maximum), Live endpoint" }

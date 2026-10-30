@@ -1124,16 +1124,30 @@ def cmd_discover(args):
         queries = build_queries(config, cities=cities,
                                 depth=args.depth, limit=args.limit, preset=preset)
 
+        # --estimate asks a source that can count how many results each
+        # search has (a small paid request each), so the price is exact.
         report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend, dry_run=True)
+                                     max_spend=args.max_spend, dry_run=True,
+                                     count=args.estimate)
         print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
         for q in queries[:8]:
             print(f"    - {q.keyword()}" + ("" if q.coordinate else
                   "   (no coordinates — add icp.geo_coordinates for radius search)"))
         if len(queries) > 8:
             print(f"    ... and {len(queries) - 8} more")
+        if report.counted:
+            print(f"\n  {report.available:,} results in all"
+                  f"   (counting them cost ${report.count_cost:.4f})")
+        elif provider.can_count:
+            print("\n  Not counted yet: each search is priced at one full page."
+                  "\n  harvey discover --estimate counts them for the exact price.")
         print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
               f"   (cap: ${args.max_spend:.2f})")
+        if report.estimated_cost > args.max_spend:
+            print(f"  More than the cap: the run stops when ${args.max_spend:.2f} is "
+                  "spent and says what was left.")
+        for err in report.errors[:3]:
+            print(f"    ! {err}")
 
         if args.estimate:
             print("\n  Estimate only. Re-run without --estimate to collect.\n")
@@ -1161,6 +1175,10 @@ def cmd_discover(args):
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
         if r.get("stopped"):
             print(f"    stopped early: {r['stopped']}")
+        if r.get("left_behind"):
+            # A re-run pages from the start again, so the cap has to cover all.
+            print(f"    {r['left_behind']}")
+            print("    A re-run starts from the first page: raise --max-spend to cover it all.")
 
         if args.no_profile:
             print("\n  PROFILE — skipped (--no-profile)")
@@ -1819,10 +1837,12 @@ def main():
     sub.add_argument("--city", default="",
                      help='Semicolon-separated cities, e.g. "Denver, CO;Dallas, TX" '
                           '(default: icp.geography)')
-    sub.add_argument("--depth", type=int, default=30,
-                     help="SERP depth (default: 30 — depth 100 costs 10x since Sept 2025)")
-    sub.add_argument("--limit", type=int, default=100,
-                     help="Max records per query (default: 100)")
+    sub.add_argument("--depth", type=int, default=None,
+                     help="How deep a ranked search goes (default: as deep as the "
+                          "source serves; each page of results is billed)")
+    sub.add_argument("--limit", type=int, default=None,
+                     help="Most records to take per query (default: every result; "
+                          "the spend cap stops the run)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
     sub.add_argument("--preset", default="", choices=["", "yc", "hiring", "accelerator", "funding"],

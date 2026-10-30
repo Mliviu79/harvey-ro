@@ -253,11 +253,11 @@
  "prospects": [],
  "runs": [
   {
-   "cost_usd": 0.0,
+   "cost_usd": 0.004,
    "ended_at": true,
    "error": "",
    "id": "R1",
-   "params_json": "{\"queries\": 2, \"estimate\": 0.002}",
+   "params_json": "{\"queries\": 2, \"estimate\": 0.04}",
    "provider": "serper",
    "records": 3,
    "stage": "discover",

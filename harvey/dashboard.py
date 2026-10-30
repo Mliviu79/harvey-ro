@@ -2499,10 +2499,11 @@ def _discovery_queries(body: dict, config):
     if problem:
         raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
+    # No depth or limit: every result the source has (the cap stops the run).
     return build_queries(
         config, cities=cities,
-        depth=int(body.get("depth") or 30),
-        limit=int(body.get("limit") or 100),
+        depth=int(body.get("depth") or 0) or None,
+        limit=int(body.get("limit") or 0) or None,
         preset=preset,
     )
 
@@ -2539,10 +2540,14 @@ async def get_discovery_providers():
 
 @app.post("/api/discover/estimate")
 async def estimate_discovery(request: Request):
-    """Projected spend and the exact query list, before anything is called."""
+    """Projected spend and the exact query list, before anything is
+    collected. A source that can count (DataForSEO Business Listings) is
+    asked how many results each search has first, a small paid request
+    each, so the price is exact; the answer says what counting cost."""
     try:
         from harvey.collectors.discover import PROVIDERS, estimate_cost
         from harvey.config import load_config
+        from harvey.modules.runs import run_discovery
 
         body = await request.json()
         provider = body.get("provider") or ""
@@ -2553,16 +2558,27 @@ async def estimate_discovery(request: Request):
         if refusal:
             return JSONResponse(_error_body(refusal), status_code=409)
 
+        config = load_config()
         try:
-            queries = _discovery_queries(body, load_config())
+            queries = _discovery_queries(body, config)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+        counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
+        if PROVIDERS[provider].can_count:
+            state = _state()
+            await state.init_db()
+            report = await run_discovery(state, config, provider, queries,
+                                         dry_run=True, count=True)
+            counted = {"counted": report.counted, "available": report.available,
+                       "count_cost": round(report.count_cost, 4),
+                       "errors": report.errors}
         return {
             "provider": provider,
             "queries": [q.keyword() for q in queries],
             "query_count": len(queries),
             "estimated_cost": round(estimate_cost(provider, queries), 4),
             "free": PROVIDERS[provider].estimate(queries) == 0,
+            **counted,
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

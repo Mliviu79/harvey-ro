@@ -169,13 +169,19 @@ async def test_dry_run_estimates_without_calling_anything(state, config, registe
 
 
 @pytest.mark.asyncio
-async def test_budget_cap_refuses_before_spending(state, config, register):
-    fake = register(FakeProvider([[biz(domain="a.com")]] * 10, per_query_cost=1.0))
+async def test_budget_cap_stops_before_spending_past_it(state, config, register):
+    """An estimate over the cap runs up to the cap, never past it, and says
+    what it left: the cap is checked before each search, not after."""
+    fake = register(FakeProvider([[biz(domain=f"{c}.com")] for c in "abcdefghij"],
+                                 per_query_cost=1.0))
     q = [D.DiscoveryQuery(term="roofer", location=c) for c in "abcdefghij"]
     report = await R.run_discovery(state, config, "fake", q, max_spend=2.0)
-    assert report.stopped == "over budget"
-    assert fake.calls == 0, "the cap must be checked before the first call, not after"
-    assert report.actual_cost == 0.0
+    assert report.stopped == "budget reached"
+    assert fake.calls == 2
+    assert report.actual_cost == 2.0
+    assert report.queries_left == 8
+    assert report.unfetched_cost == pytest.approx(8.0)
+    assert "8 searches not run" in report.as_dict()["left_behind"]
 
 
 @pytest.mark.asyncio
@@ -1476,7 +1482,7 @@ def test_new_junk_filters_reject_aggregators(domain):
 
 
 @pytest.mark.asyncio
-async def test_serper_caps_request_and_estimate():
+async def test_serper_keeps_num_at_ten_and_prices_every_page():
     import json
     requests = []
     def respond(request):
@@ -1486,8 +1492,12 @@ async def test_serper_caps_request_and_estimate():
     provider = D.Serper()
     async with _client(respond) as client:
         await provider.fetch(client, {"serper_api_key": "fixture"}, query)
-    assert requests[0]["num"] == 10
-    assert provider.estimate([query]) == pytest.approx(0.001)
+    # Free accounts reject num > 10; an empty first page is the end.
+    assert requests == [{"q": "roofer", "num": 10}]
+    assert provider.estimate([query]) == pytest.approx(10 * 0.001)
+    # No depth: priced at the pages Google seldom serves past.
+    assert provider.estimate([D.DiscoveryQuery(term="roofer")]) == pytest.approx(
+        D.SEARCH_PAGES_ESTIMATE * 0.001)
 
 
 @pytest.mark.asyncio

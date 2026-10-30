@@ -24,7 +24,7 @@ op = "query"
 provider = "scavio_maps"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
-cost = { usd = 0.01, per = "page", note = "up to 20 listings a page" }
+cost = { usd = 0.01, per = "page", note = "up to 20 listings a page, 6 pages (120 places), all Google Maps serves" }
 
 [[capabilities]]
 id = "google_search"
@@ -32,4 +32,4 @@ op = "query"
 provider = "scavio_search"
 inputs = [["query", "area"], ["query"]]
 outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP", "NO_WEBSITE"] }
-cost = { usd = 0.01, per = "page", note = "up to 10 results a page" }
+cost = { usd = 0.01, per = "page", note = "up to 10 results a page, every page Google serves" }

@@ -9,6 +9,16 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Discovery takes every result.** A search is no longer one page of 100:
+  each source is paged until it has nothing more (DataForSEO Business
+  Listings 1,000 a page with its `offset_token`, Serper and Scavio until
+  Google has no next page, DataForSEO SERP and Maps at their deepest, 200
+  and 700). The only stop is the spend cap, checked before each page, and
+  the stop button; a stopped run says how many results were left and what
+  they would cost. For Business Listings the estimate counts the businesses
+  first (about a cent a search), so its price is exact. A run whose
+  estimate is over the cap now runs up to the cap instead of refusing.
+  `--limit` and `--depth` default to everything.
 - **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
   listings around each city, with phone, website, category, rating and review
   count, and Google organic results with rank, both from one

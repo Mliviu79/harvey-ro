@@ -29,4 +29,4 @@ op = "query"
 provider = "tinyfish"
 inputs = [["query", "area"], ["query"]]
 outputs = { records = "companies", ids = ["domain"], facts = ["FOUND_IN_SERP", "NO_WEBSITE"] }
-cost = { usd = 0.0, per = "search" }
+cost = { usd = 0.0, per = "search", note = "up to 11 pages of 10, all TinyFish serves for a phrase" }

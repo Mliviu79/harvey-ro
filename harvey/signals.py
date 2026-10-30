@@ -61,7 +61,7 @@ SIGNAL_CATALOG: list[dict] = [
         "category": "discovery",
         "value_type": "num",
         "collector": "discover",
-        "cost_note": "~$0.006 per search at depth 30 (paid SERP API, Live endpoint)",
+        "cost_note": "$0.002 per 10 results ranked (paid SERP API, Live endpoint): up to $0.04 a search at the full 200",
         "confidence_floor": 0.0,
     },
     {
@@ -91,7 +91,7 @@ SIGNAL_CATALOG: list[dict] = [
         "category": "discovery",
         "value_type": "num",
         "collector": "discover",
-        "cost_note": "~$0.002 per Maps search of up to 100 results (paid SERP API)",
+        "cost_note": "$0.002 per 100 Maps results (paid SERP API): up to $0.014 a search at the full 700",
         "confidence_floor": 0.0,
     },
     {

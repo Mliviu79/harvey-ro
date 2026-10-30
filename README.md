@@ -294,16 +294,27 @@ harvey discover --estimate    # projected spend, then exits
 harvey discover               # go
 ```
 
+Every search takes every result the source has, page by page: "dentist
+București" is not a page of 100, it is all of them. The one stop is your spend
+cap (`--max-spend`, or the cap on the Discover tab), checked before each page,
+and the stop button. A run the cap stops says how many results were left
+unfetched and what fetching them would cost. For DataForSEO Business Listings,
+`--estimate` (and the Discover tab's estimate) first asks how many businesses
+each search matches, about a cent a search, so the price is exact ("1,840
+businesses, $0.68") before the rest is paid for. Where the source itself stops
+serving, the table says so. `--limit` and `--depth` still take fewer when you
+want fewer.
+
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
 | **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront: OSM maps premises, so whole trades are barely present (under 2,000 roofers and under 2,300 plumbers in the entire US). Harvey says so in the UI rather than quietly under-delivering. |
-| **TinyFish** | free | 30 searches a minute, 500 an hour, no card | Finding businesses by phrase (including the startup and hiring presets) at no cost. Records no search rank: its ordering isn't Google's and it takes no location, so use Serper or DataForSEO SERP for rank signals. |
-| **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
-| **DataForSEO SERP** | $0.006 / search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Organic rank as the buying signal, plus who holds the local 3-pack, searched from the city centre. |
-| **DataForSEO Google Maps** | $0.002 / search (up to 100 results) | $1 credit + free sandbox | Map rank, rating, category and claimed status, including businesses with no website. |
-| **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
-| **Scavio Google Maps** | $0.01 / page (up to 20 listings) | 50 credits, no card | Google Maps listings around each city: phone, website, category, rating and reviews, including businesses with no website. |
-| **Scavio Google Search** | ~$0.03 / depth-30 search | same 50 credits | Rank as the signal, on the same key as Scavio Google Maps. |
+| **TinyFish** | free | 30 searches a minute, 500 an hour, no card | Finding businesses by phrase (including the startup and hiring presets) at no cost. TinyFish serves at most 11 pages (about 110 results) a phrase. Records no search rank: its ordering isn't Google's and it takes no location, so use Serper or DataForSEO SERP for rank signals. |
+| **DataForSEO Business Listings** | $0.372 / 1,000 ($0.012 a page of up to 1,000 + $0.00036 a business) | $1 credit | Local trades, clinics, contractors. Every business the search matches, with no ceiling. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
+| **DataForSEO SERP** | $0.002 per 10 results (Live): up to $0.04 a search | $1 credit + free sandbox | Organic rank as the buying signal, plus who holds the local 3-pack, searched from the city centre. DataForSEO stops at 200 results a search. |
+| **DataForSEO Google Maps** | $0.002 per 100 results (Live): up to $0.014 a search | $1 credit + free sandbox | Map rank, rating, category and claimed status, including businesses with no website. DataForSEO stops at 700 results a search. |
+| **Serper** | ~$0.30–1.00 / 1,000 searches, a search per page of 10 | 2,500 free, no card | The easiest paid one to try. Pages until Google has no more. |
+| **Scavio Google Maps** | $0.01 / page (up to 20 listings) | 50 credits, no card | Google Maps listings around each city: phone, website, category, rating and reviews, including businesses with no website. Google Maps serves at most 120 places a search. |
+| **Scavio Google Search** | $0.01 / page of 10, every page Google serves | same 50 credits | Rank as the signal, on the same key as Scavio Google Maps. |
 
 **Selling to startups?** Harvey has a built-in startup skill, made of three
 parts:
@@ -396,7 +407,7 @@ doesn't count yet: that needs a gazetteer.
 
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
-> **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.
+> **Every page is billed.** Google removed 100-results-per-page in September 2025, so a deep search is billed as one request per page of 10 nearly everywhere, and below rank 30 it is mostly directories. Harvey still goes as deep as the source serves; `--depth 30` keeps a rank search to the first three pages.
 
 ### 2. PROFILE — what they are
 

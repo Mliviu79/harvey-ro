@@ -221,6 +221,12 @@ harvey discover --preset accelerator --provider serper   # ...Techstars, Antler,
 harvey discover --preset funding --provider serper       # companies announcing a raise
 ```
 
+Every search takes every result the source has, page by page; the only stop
+is the spend cap (`--max-spend` or the tab's cap, checked before each page) and
+the stop button, and a stopped run says how many results were left and what
+they would cost. For DataForSEO Business Listings, the estimate first counts the
+businesses (about a cent a search), so its price is exact.
+
 The dashboard's **Discover** tab is the same thing with the tradeoffs laid out
 side by side: what each source does, what it costs, its free tier, and which
 `.env` keys it needs. Nothing is called until the user presses Run.
@@ -228,10 +234,10 @@ side by side: what each source does, what it costs, its free tier, and which
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
 | **OpenStreetMap** (default) | free | unlimited | Trying the whole pipeline with no account. Thin coverage for service-area trades — OSM maps premises, so it has under 2,000 roofers in the entire US. A trial source, not a complete list. |
-| **DataForSEO Business Listings** | $0.372/1k businesses | $1 credit | Local trades, clinics, contractors. Phone + domain + rating + whether the listing is claimed, and it can filter for businesses with **no website at all**. |
-| **DataForSEO SERP** | $0.006 a search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Rank as the buying signal. Positions 11-30 are the sweet spot. Also records who holds the local 3-pack (`IN_LOCAL_PACK`). |
-| **DataForSEO Google Maps** | $0.002 a search (up to 100 results) | $1 credit + free sandbox | Map rank (`MAPS_RANK`), rating, category, claimed status; keeps businesses with no website. |
-| **Serper** | ~$0.30-$1.00/1k | 2,500 free, no card | The easiest paid one to try. |
+| **DataForSEO Business Listings** | $0.372/1k businesses ($0.012 a page of up to 1,000 + $0.00036 each) | $1 credit | Local trades, clinics, contractors. Every business the search matches, no ceiling. Phone + domain + rating + whether the listing is claimed, and it can filter for businesses with **no website at all**. |
+| **DataForSEO SERP** | $0.002 per 10 results (Live): up to $0.04 a search | $1 credit + free sandbox | Rank as the buying signal. Positions 11-30 are the sweet spot. Also records who holds the local 3-pack (`IN_LOCAL_PACK`). DataForSEO stops at 200 results. |
+| **DataForSEO Google Maps** | $0.002 per 100 results (Live): up to $0.014 a search | $1 credit + free sandbox | Map rank (`MAPS_RANK`), rating, category, claimed status; keeps businesses with no website. DataForSEO stops at 700 results. |
+| **Serper** | ~$0.30-$1.00/1k searches, one per page of 10 | 2,500 free, no card | The easiest paid one to try. Pages until Google has no more. |
 
 Cities are geocoded automatically (cached forever, one lookup per city), or set
 `icp.geo_coordinates` in harvey.yaml to control the radius:
@@ -258,9 +264,10 @@ the playbook. Harvey never reads ycombinator.com, the
 accelerators' directories, Crunchbase, PitchBook or LinkedIn (their terms
 forbid scraping), so don't suggest scraping them instead.
 
-**Depth 20-30, not 100.** Google removed 100-results-per-page in September 2025,
-so depth 100 is now billed as ten pages at nearly every provider. Below rank 30
-it is mostly directories anyway.
+**Every page is billed.** Google removed 100-results-per-page in September 2025,
+so a deep search is billed as ten pages per 100 results at nearly every provider,
+and below rank 30 it is mostly directories. Harvey goes as deep as the source
+serves; `--depth 30` keeps a rank search to three pages.
 
 ### Step 6: Behavior Settings
 

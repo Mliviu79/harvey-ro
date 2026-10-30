@@ -1373,8 +1373,9 @@ function discoverBody() {
     provider: _provider,
     // Semicolons or newlines, never commas: "Denver, CO" is one city.
     cities: raw ? raw.split(/[;\n]/).map(c => c.trim()).filter(Boolean) : [],
-    depth: Number(document.getElementById('disc-depth').value) || 30,
-    limit: Number(document.getElementById('disc-limit').value) || 100,
+    // Blank: every result the source has; the cap is what stops a run.
+    depth: Number(document.getElementById('disc-depth').value) || null,
+    limit: Number(document.getElementById('disc-limit').value) || null,
     max_spend: Number(document.getElementById('disc-cap').value) || 1,
     preset: (document.getElementById('disc-preset') || {}).value || '',
   };
@@ -1402,6 +1403,10 @@ async function estimateDiscovery() {
     '<div class="muted small" style="margin-top:2px">' +
       escHtml(t('disc.queries', {n: data.query_count})) +
       (data.free ? '' : ' &middot; ' + escHtml(t('disc.cap_is', {cap: fmtUsd(cap, 2)}))) + '</div>' +
+    (data.counted ? '<div class="muted small" style="margin-top:2px">' +
+      escHtml(t('disc.counted', {n: fmtN(data.available || 0), cost: fmtUsd(data.count_cost || 0, 4)})) + '</div>' : '') +
+    (data.counted === false && (data.errors || []).length ? '<div class="muted small" style="margin-top:2px">' +
+      escHtml(t('disc.uncounted')) + ' ' + (data.errors || []).map(escHtml).join(' ') + '</div>' : '') +
     (over ? '<div class="test-result error" style="margin-top:12px">' + escHtml(t('disc.over_cap')) + '</div>' : '') +
     '<div class="query-list">' +
       data.queries.slice(0, 40).map(escHtml).join('<br>') +
@@ -1409,9 +1414,10 @@ async function estimateDiscovery() {
     '</div></div>';
 
   const btn = document.getElementById('disc-run');
-  btn.disabled = over;
-  btn.textContent = over ? t('disc.over')
-    : (data.free ? t('disc.run_free') : t('disc.run_paid', {cost: fmtUsd(data.estimated_cost, 2)}));
+  // Over the cap still runs: the cap stops it, and it says what was left.
+  btn.disabled = false;
+  btn.textContent = data.free ? t('disc.run_free')
+    : t('disc.run_paid', {cost: fmtUsd(Math.min(data.estimated_cost, cap), 2)});
 }
 
 async function runDiscovery() {
@@ -1497,6 +1503,9 @@ function renderDiscoverResult(report, running) {
     '</div>' +
     (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
       escHtml(t('disc.stopped_early', {why: report.stopped})) + '</div>' : '') +
+    (report.left_behind ? '<div class="test-result" style="margin-top:8px">' +
+      escHtml(t('disc.unfetched', {n: fmtN(report.unfetched || 0), q: fmtN(report.queries_left || 0),
+                                    cost: fmtUsd(report.unfetched_cost || 0, 2)})) + '</div>' : '') +
     ((report.errors || []).length
       ? '<div class="card" style="margin-top:14px"><h2>' + escHtml(t('disc.problems')) + '</h2>' +
         (report.errors || []).slice(0, 8).map(e =>

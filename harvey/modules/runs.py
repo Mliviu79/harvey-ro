@@ -101,10 +101,15 @@ async def resolve_coordinates(state, queries, radius_km: int = 40,
 # ── Discovery (the search modules and the presets) ──
 
 async def run_discovery(state, config, provider_key: str | None = None, queries=None,
-                        max_spend: float = 1.0, dry_run: bool = False):
-    """Discover businesses and record what was learned about them.
+                        max_spend: float = 1.0, dry_run: bool = False, count: bool = False):
+    """Discover businesses and record what was learned about them: every
+    result each search has, page by page, until the spend cap or the kill
+    switch stops it (read between pages); a stop says what was left.
 
-    ``dry_run`` estimates and returns without calling anything. Run it first,
+    ``dry_run`` estimates and returns without collecting anything. With
+    ``count``, a source that can count (DataForSEO Business Listings) is
+    asked how many results each search has first, a small paid request per
+    search, so the estimate is exact; nothing else is called. Run it first,
     every time: the first small trial is what exposes the data-quality
     problems that would otherwise poison every market you scale to.
     """
@@ -129,6 +134,8 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     report.estimated_cost = provider.estimate(queries)
 
     if dry_run:
+        if count and provider.can_count:
+            await _count(provider_key, queries, report)
         return report
 
     env = load_env().model_dump()
@@ -139,13 +146,6 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
             f"{provider.label} is not ready: {names} is empty or still the "
             f"template placeholder in .env")
         report.stopped = "not configured"
-        return report
-
-    if report.estimated_cost > max_spend:
-        report.errors.append(
-            f"estimated ${report.estimated_cost:.2f} exceeds the ${max_spend:.2f} "
-            f"cap — raise the cap or run fewer queries")
-        report.stopped = "over budget"
         return report
 
     await sync_vocabulary(state)
@@ -181,17 +181,27 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
     best_ranks: dict[tuple[str, str], tuple] = {}
     saved: dict[str, ingest.Saved] = {}
     ranked_in_run: dict[tuple[str, str], set[str]] = {}
+
+    async def paused() -> bool:
+        return bool(await state.get_setting("discovery_paused"))
+
+    next_query = 0
     try:
         async with httpx.AsyncClient(timeout=D.TIMEOUT, follow_redirects=True) as client:
             for i, query in enumerate(queries):
-                # The kill switch is read between batches, not once at the
-                # top: a long run has to be stoppable while it is running.
-                if await state.get_setting("discovery_paused"):
+                next_query = i
+                # The kill switch is read between searches and between a
+                # search's pages, not once at the top: a long run has to be
+                # stoppable while it is running.
+                if await paused():
                     report.stopped = "paused"
                     break
-                if report.actual_cost > max_spend:
+                # The cap is checked before spending: a search starts only
+                # if its first request fits in what is left.
+                if report.actual_cost + provider.first_cost(query) > max_spend + 1e-9:
                     report.stopped = "budget reached"
                     break
+                next_query = i + 1
                 if i and provider.key == "osm":
                     await asyncio.sleep(D.OpenStreetMap.MIN_INTERVAL)
 
@@ -204,14 +214,20 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                 ctx = api.Context(http=client, env=env, budget=budget, config=config,
                                   wanted=frozenset(confirmed), enabled=enabled,
                                   settings={"provider": provider_key,
-                                            "searcher": (searcher.module, searcher.id)})
+                                            "searcher": (searcher.module, searcher.id),
+                                            "paused": paused})
                 report.queries_ran += 1
                 draft = await cap(api.Input(query=query, area=query.location,
                                             extra={"provider": provider_key}), ctx)
                 report.actual_cost += draft.cost
+                if "available" in draft.counts:
+                    report.available = (report.available or 0) + draft.counts["available"]
+                report.unfetched += draft.counts.get("unfetched", 0)
+                report.unfetched_cost += draft.values.get("unfetched_cost", 0.0)
                 if draft.failed is not None:
                     if draft.stop:
                         report.stopped = draft.stop
+                        next_query = i       # it found nothing: still to run
                         break
                     report.errors.append(f"{query.keyword()}: {draft.failed}")
                     continue
@@ -299,6 +315,13 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                     report.stopped = draft.stop
                     break
 
+        if report.stopped in ("budget reached", "paused"):
+            # What the stop left: the searches never started, at their
+            # estimate (the results a stopped search had left are counted
+            # above, from what the source said it holds).
+            left = queries[next_query:]
+            report.queries_left = len(left)
+            report.unfetched_cost += provider.estimate(left) if left else 0.0
         await state.finish_run(report.run_id, status="completed",
                                records=report.new_companies + report.known_companies,
                                cost_usd=report.actual_cost)
@@ -309,6 +332,35 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                                records=report.new_companies,
                                cost_usd=report.actual_cost, error=str(e))
     return report
+
+
+async def _count(provider_key: str, queries, report):
+    """Ask the source how many results each search has, so the estimate is
+    exact (``report.available``, ``report.count_cost``). Needs the
+    provider's keys; without them, or if asking fails, the estimate stays
+    the uncounted one and says why."""
+    from harvey.collectors import discover as D
+    from harvey.config import load_env
+
+    provider = D.PROVIDERS[provider_key]
+    env = load_env().model_dump()
+    if provider.missing_keys(env):
+        report.errors.append(f"{provider.label} has no key yet, so the searches "
+                             "weren't counted: the estimate prices a full first "
+                             "page for each")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=D.TIMEOUT, follow_redirects=True) as client:
+            report.count_cost = await D.count_results(provider_key, queries, client, env)
+    except Exception as e:
+        logger.warning("discover: counting %s failed: %s", provider_key, e)
+        report.errors.append(f"counting the results failed: {e}")
+        for q in queries:
+            q.total = None
+        return
+    report.counted = True
+    report.available = sum(q.total or 0 for q in queries)
+    report.estimated_cost = provider.estimate(queries)
 
 
 # ── Official sources (a trade registry: the onrc module) ──

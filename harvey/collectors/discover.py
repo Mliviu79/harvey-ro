@@ -343,10 +343,16 @@ class DiscoveryQuery:
     location: str = ""               # "Denver, CO"
     category: str = ""               # provider-native category slug, optional
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
-    depth: int = 30                  # SERP depth; ignored by listings providers
-    limit: int = 100                 # max records to take from one query
+    # How deep a ranked search goes. None: as deep as the source serves.
+    depth: int | None = None
+    # The most records to take from one query. None: every result the
+    # source has; the spend cap is what stops a run.
+    limit: int | None = None
     preset: str = ""                 # PRESETS key that built it, if any
     language: str = "en"             # search language code for SERP providers
+    # How many results the source holds for it, once counted (a listings
+    # provider's count request); the estimate is exact when every query has one.
+    total: int | None = None
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -409,6 +415,19 @@ def _dfs_location(query: "DiscoveryQuery", point_suffix: str) -> dict:
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
+# A web search can't say beforehand how many results Google will serve. An
+# estimate for "every result" prices this many pages of 10: Google seldom
+# serves more than about 200 for a phrase, and paging stops where it ends.
+SEARCH_PAGES_ESTIMATE = 20
+
+
+def search_pages(depth: int | None, page_size: int) -> int:
+    """Pages an estimate prices: enough for ``depth``, or for every result."""
+    if not depth:
+        return SEARCH_PAGES_ESTIMATE
+    return max(1, -(-depth // page_size))
+
+
 # Match whole placeholder values, never substrings of opaque credentials.
 _PLACEHOLDER_RE = re.compile(
     r"(?i)(placeholder|change[-_]?me|your[_-](?:api[_-])?key(?:[_-]here)?"
@@ -467,8 +486,42 @@ class DiscoveryProvider:
         return not self.missing_keys(env)
 
     def estimate(self, queries: list[DiscoveryQuery]) -> float:
-        """Projected spend, in dollars, before anything is called."""
+        """Projected spend, in dollars, before anything is called: every
+        page a query can take, not just the first."""
         return 0.0
+
+    def first_cost(self, query: DiscoveryQuery) -> float:
+        """The least a query can cost: what the remaining budget must cover
+        before the run starts it. A paging provider checks each further
+        page itself (``halt``)."""
+        return self.estimate([query])
+
+    # A provider that can say how many results a query has before paying for
+    # them (``count``) makes the estimate exact.
+    can_count: bool = False
+
+    async def count(self, client: httpx.AsyncClient, env: dict,
+                    query: DiscoveryQuery) -> tuple[int, float]:
+        """(results the source holds for ``query``, what asking cost)."""
+        raise NotImplementedError
+
+    async def halt(self, page_cost: float) -> str:
+        """Why the next page must not be fetched ("paused", "budget
+        reached"), or "": the kill switch and the spend cap, read between
+        pages."""
+        if self.paused is not None and await self.paused():
+            return "paused"
+        if self.last_cost + page_cost > self.remaining_budget + 1e-9:
+            return "budget reached"
+        return ""
+
+    def _stopped(self, why: str, unfetched: int | None = None,
+                 unfetched_cost: float = 0.0):
+        """Record that this query ended early with results left behind."""
+        self.stop_reason = why
+        self.complete = False
+        self.unfetched = unfetched
+        self.unfetched_cost = unfetched_cost
 
     async def fetch(self, client: httpx.AsyncClient, env: dict,
                     query: DiscoveryQuery) -> list[Business]:
@@ -481,6 +534,14 @@ class DiscoveryProvider:
     stop_reason: str = ""
     complete: bool = True
     remaining_budget: float = math.inf
+    # Set per search by search_draft: reads the kill switch.
+    paused = None
+    # Results the source said it holds for the last query, when it says.
+    available: int | None = None
+    # Left behind when the cap or the kill switch stopped the last query
+    # part-way: how many (None: unknown) and what fetching them would cost.
+    unfetched: int | None = None
+    unfetched_cost: float = 0.0
 
 
 class DataForSEOListings(DiscoveryProvider):
@@ -498,17 +559,42 @@ class DataForSEOListings(DiscoveryProvider):
     blurb = ("Enumerate every business of a type within a radius, with phone, "
              "domain, rating and whether the listing is claimed. Best choice "
              "for local trades, clinics and contractors.")
-    cost_note = "$0.372 per 1,000 businesses ($0.012/query + $0.00036 each)"
+    cost_note = ("$0.012 a request (up to 1,000 businesses) + $0.00036 a business: "
+                 "$0.372 per 1,000. Every result is fetched, 1,000 a page")
     free_tier = "$1 signup credit; $50 minimum deposit to go live"
     signup_url = "https://app.dataforseo.com/api-access"
     env_keys = ("dataforseo_login", "dataforseo_password")
-    caveat = "No email addresses — Harvey resolves those in a later stage."
+    caveat = ("No email addresses — Harvey resolves those in a later stage. "
+              "Fetches every business the search matches, 1,000 a page; the "
+              "estimate counts them first (about a cent a search) so the price "
+              "is exact before the rest is paid for.")
+    can_count = True
 
     TASK_COST = 0.012
     ITEM_COST = 0.00036
+    PAGE_SIZE = 1000          # the API's maximum ``limit``
+
+    def cost_of(self, n: int) -> float:
+        """What fetching ``n`` businesses costs: a request per 1,000, plus
+        each business."""
+        pages = max(1, -(-n // self.PAGE_SIZE))
+        return self.TASK_COST * pages + self.ITEM_COST * n
+
+    def _wanted(self, query: DiscoveryQuery) -> int | None:
+        """How many businesses the query will take, when known."""
+        n = query.total
+        if query.limit is not None:
+            n = query.limit if n is None else min(n, query.limit)
+        return n
 
     def estimate(self, queries):
-        return sum(self.TASK_COST + self.ITEM_COST * q.limit for q in queries)
+        # Uncounted, a query is priced at one full page: the count (the
+        # estimate's own request, or the first page) makes it exact.
+        return sum(self.cost_of(self.PAGE_SIZE if (n := self._wanted(q)) is None else n)
+                   for q in queries)
+
+    def first_cost(self, query):
+        return self.TASK_COST + self.ITEM_COST
 
     def _auth(self, env: dict) -> str:
         raw = f"{env['dataforseo_login']}:{env['dataforseo_password']}"
@@ -521,9 +607,10 @@ class DataForSEOListings(DiscoveryProvider):
                 if env.get("dataforseo_sandbox") else
                 "https://api.dataforseo.com/v3")
 
-    async def fetch(self, client, env, query):
+    def _payload(self, query: DiscoveryQuery, limit: int) -> dict:
         payload = {
-            "limit": min(query.limit, 1000),
+            "limit": limit,
+            # A stable order, so pages neither overlap nor skip.
             "order_by": ["rating.votes_count,desc"],
         }
         if query.category:
@@ -536,7 +623,9 @@ class DataForSEOListings(DiscoveryProvider):
             # Without coordinates the API can only match on the title, so say
             # so rather than silently returning nationwide results.
             payload["description"] = query.location
+        return payload
 
+    async def _search(self, client, env, payload: dict) -> tuple[dict, float]:
         r = await client.post(
             f"{self.base_url(env)}/business_data/business_listings/search/live",
             headers={"Authorization": f"Basic {self._auth(env)}",
@@ -545,8 +634,87 @@ class DataForSEOListings(DiscoveryProvider):
         )
         r.raise_for_status()
         data = r.json()
-        self.last_cost = float(data.get("cost") or 0.0)
-        return [self._to_business(item) for item in _dfs_items(data)]
+        return data, float(data.get("cost") or 0.0)
+
+    async def count(self, client, env, query):
+        # One business is the cheapest request that carries total_count.
+        data, cost = await self._search(client, env, self._payload(query, 1))
+        total = _dfs_result(data).get("total_count")
+        return (int(total) if isinstance(total, int) else 0), cost
+
+    async def fetch(self, client, env, query):
+        """Every business the search matches, page by page.
+
+        The first page says how many there are (``total_count``). After
+        it, each page is asked for with the ``offset_token`` the previous
+        one returned and otherwise the same request, as DataForSEO asks;
+        a response without a token pages by ``offset`` instead. Before each
+        further page the kill switch and the spend cap are read; a stop
+        says how many were left and what fetching them would cost.
+        """
+        self.last_cost = 0.0
+        want = query.limit
+        page_size = min(self.PAGE_SIZE, want) if want is not None else self.PAGE_SIZE
+        # A first page the cap can't pay for in full is asked for smaller,
+        # so the cap buys what it can. Later pages keep the first one's
+        # size: an offset_token request must repeat the request it follows.
+        if math.isfinite(self.remaining_budget):
+            affordable = int((self.remaining_budget - self.TASK_COST) / self.ITEM_COST + 1e-6)
+            if affordable < 1:
+                raise ProviderExhausted("budget reached")
+            page_size = min(page_size, affordable)
+        base = self._payload(query, page_size)
+
+        out: list[Business] = []
+        seen: set[str] = set()
+        token, offset, total = None, 0, None
+        while True:
+            left = None if total is None else max(0, total - offset)
+            if want is not None:
+                left = want - offset if left is None else min(left, want - offset)
+            if left is not None and left <= 0:
+                break
+            if offset:
+                why = await self.halt(self.TASK_COST + self.ITEM_COST * min(page_size, left or page_size))
+                if why:
+                    self._stopped(why, left, self.cost_of(left) if left else 0.0)
+                    logger.info("%s: %s after %d of %s for %r", self.key, why, offset,
+                                total if total is not None else "?", query.keyword())
+                    break
+            payload = dict(base)
+            if want is not None and left is not None and left < page_size:
+                # The last page of a limited query: a smaller page, so it
+                # isn't billed for businesses it would drop. A token must
+                # repeat the previous request, so this one goes by offset.
+                payload.update(limit=left, offset=offset)
+            elif token:
+                payload["offset_token"] = token
+            elif offset:
+                payload["offset"] = offset
+            data, cost = await self._search(client, env, payload)
+            self.last_cost += cost
+            result = _dfs_result(data)
+            items = result.get("items") or []
+            if total is None:
+                count = result.get("total_count")
+                total = count if isinstance(count, int) else None
+                self.available = total
+            new = 0
+            for item in items:
+                biz = self._to_business(item)
+                ident = biz.external_id or biz.domain or f"{biz.name}|{biz.address}"
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                out.append(biz)
+                new += 1
+            offset += len(items)
+            token = result.get("offset_token") or None
+            # The end: a short page, or one with nothing new in it (a source
+            # repeating itself must never become an endless loop).
+            if len(items) < page_size or not new:
+                break
+        return out
 
     def _to_business(self, item: dict) -> Business:
         url = item.get("url") or ""
@@ -588,19 +756,25 @@ class DataForSEOSerp(DiscoveryProvider):
     blurb = ("Search '<service> <city>' from the city centre and record where "
              "each business ranks, plus who holds the local 3-pack. Discovers "
              "businesses you didn't have AND scores the ones you did.")
-    cost_note = "$0.002 per 10 results (Live) — depth 30 costs $0.006 a search"
+    cost_note = ("$0.002 per 10 results (Live), billed for the results Google "
+                 "serves: at most $0.04 a search (200 results)")
     free_tier = "$1 signup credit; free sandbox; $50 minimum deposit to go live"
     signup_url = "https://app.dataforseo.com/api-access"
     env_keys = ("dataforseo_login", "dataforseo_password")
-    caveat = ("Google removed 100-results-per-page in September 2025, so depth "
-              "100 now costs 10x depth 10. Depth 20-30 is the sweet spot; "
-              "below rank 30 it is mostly directories anyway. Rank depends on "
-              "where the searcher stands — this is the view from the city centre.")
+    caveat = ("Searches as deep as DataForSEO goes: 200 results, its maximum for "
+              "Google organic, so a search never finds more than 200 businesses. "
+              "Below rank 30 it is mostly directories. Rank depends on where the "
+              "searcher stands — this is the view from the city centre.")
 
     # Live mode. The standard queue is $0.0006 but asynchronous (post a task,
     # poll for it minutes later); the run loop checks the spend cap between
     # synchronous calls, so Live keeps that check honest.
     PAGE_COST = 0.002
+    # What is billed as one unit (a SERP of 10 results), and the deepest
+    # DataForSEO searches Google organic.
+    UNIT_COST = PAGE_COST
+    UNIT_RESULTS = 10
+    MAX_DEPTH = 200
     # The radius of the search point. DataForSEO documents it in mm
     # (199-199999), so 2000 is 2 m: a pinpoint at the city centre, which is
     # what "when we searched from downtown Denver" means. Chosen so that if
@@ -608,9 +782,35 @@ class DataForSEOSerp(DiscoveryProvider):
     POINT_RADIUS = "2000"
     rank_codes = ("SERP_RANK", "IN_LOCAL_PACK")
 
+    def _depth(self, query: DiscoveryQuery) -> int:
+        """The depth asked for: the query's, or the deepest the source goes."""
+        return min(query.depth or self.MAX_DEPTH, self.MAX_DEPTH)
+
+    def _units(self, depth: int) -> int:
+        return max(1, -(-depth // self.UNIT_RESULTS))
+
     def estimate(self, queries):
-        # Billing is base price x number of pages, 10 results to a page.
-        return sum(self.PAGE_COST * max(1, -(-q.depth // 10)) for q in queries)
+        # Billing is the unit price x the units served; priced at the full
+        # depth, since a search can't say beforehand how many Google serves.
+        return sum(self.UNIT_COST * self._units(self._depth(q)) for q in queries)
+
+    def first_cost(self, query):
+        return self.UNIT_COST
+
+    def _affordable_depth(self, query: DiscoveryQuery) -> int:
+        """The depth to ask for: as deep as asked, or as deep as the spend
+        cap still pays for (the run then stops, saying what is left)."""
+        depth = self._depth(query)
+        if not math.isfinite(self.remaining_budget):
+            return depth
+        units = int(self.remaining_budget / self.UNIT_COST + 1e-6)
+        if units < 1:
+            raise ProviderExhausted("budget reached")
+        if units < self._units(depth):
+            self._stopped("budget reached", None,
+                          self.UNIT_COST * (self._units(depth) - units))
+            return units * self.UNIT_RESULTS
+        return depth
 
     _auth = DataForSEOListings._auth
     base_url = DataForSEOListings.base_url
@@ -630,7 +830,8 @@ class DataForSEOSerp(DiscoveryProvider):
     async def fetch(self, client, env, query):
         keyword = query.keyword()
         items = await self._post(client, env, "serp/google/organic/live/advanced", {
-            "keyword": keyword, "language_code": query.language, "depth": query.depth,
+            "keyword": keyword, "language_code": query.language,
+            "depth": self._affordable_depth(query),
             "device": "desktop", **_dfs_location(query, self.POINT_RADIUS)})
 
         # One Business per identity: a company in the pack AND at organic 14
@@ -693,24 +894,28 @@ class DataForSEOMaps(DataForSEOSerp):
     blurb = ("Search Google Maps for '<service> <city>' and record each "
              "business's map position, rating, category and claimed status — "
              "including businesses with no website at all.")
-    cost_note = "$0.002 per search of up to 100 results (Live)"
-    caveat = ("Map rank depends heavily on where the searcher stands; Harvey "
-              "searches from the city centre at city zoom. Treat it as 'when we "
-              "searched from downtown', not an absolute position.")
+    cost_note = ("$0.002 per 100 results (Live), billed for the results served: "
+                 "at most $0.014 a search (700 results)")
+    caveat = ("Searches as deep as DataForSEO goes: 700 results, its maximum for "
+              "Google Maps, so one search never finds more than 700 places. Map "
+              "rank depends heavily on where the searcher stands; Harvey searches "
+              "from the city centre at city zoom. Treat it as 'when we searched "
+              "from downtown', not an absolute position.")
 
     SERP_COST = 0.002     # per SERP of up to 100 results
+    UNIT_COST = SERP_COST
+    UNIT_RESULTS = 100
+    MAX_DEPTH = 700
     rank_codes = ("MAPS_RANK",)
     # City-wide zoom; DataForSEO accepts 3z-21z and defaults to 17z (a few
     # streets), which would rank only whoever is closest to the pin.
     ZOOM = "12z"
 
-    def estimate(self, queries):
-        return sum(self.SERP_COST * max(1, -(-q.depth // 100)) for q in queries)
-
     async def fetch(self, client, env, query):
         keyword = query.keyword()
         items = await self._post(client, env, "serp/google/maps/live/advanced", {
-            "keyword": keyword, "language_code": query.language, "depth": query.depth,
+            "keyword": keyword, "language_code": query.language,
+            "depth": self._affordable_depth(query),
             **_dfs_location(query, self.ZOOM)})
         out = []
         for item in items:
@@ -779,39 +984,84 @@ class Serper(DiscoveryProvider):
     free_tier = "2,500 queries free, no card required"
     signup_url = "https://serper.dev"
     env_keys = ("serper_api_key",)
-    caveat = "Returns at most 10 results per query, including when a greater depth is requested."
+    caveat = ("Pages through every result Google serves for the phrase, 10 a "
+              "page (one search each); Google itself seldom serves more than a "
+              "few hundred.")
+
+    PAGE_COST = 0.001
+    PAGE_SIZE = 10
 
     def estimate(self, queries):
-        # One request per query, capped at ten results for free-account compatibility.
-        return 0.001 * len(queries)
+        return sum(self.PAGE_COST * search_pages(q.depth, self.PAGE_SIZE) for q in queries)
+
+    def first_cost(self, query):
+        return self.PAGE_COST
 
     async def fetch(self, client, env, query):
-        r = await client.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": env["serper_api_key"],
-                     "Content-Type": "application/json"},
-            # Free accounts reject num > 10 (HTTP 400 "Query pattern not
-            # allowed for free accounts"), verified 2026-10-26.
-            json={"q": query.keyword(), "num": max(1, min(query.depth, 10))},
-        )
-        r.raise_for_status()
-        data = r.json()
-        out = []
-        for item in data.get("organic") or []:
-            domain = normalize_domain(item.get("link") or "")
-            if not domain:
-                continue
-            out.append(Business(
-                name=business_name(item.get("title") or "", domain),
-                raw_title=item.get("title") or "",
-                domain=domain,
-                website=item.get("link") or "",
-                location=query.location,
-                rank=item.get("position"),
-                has_website=True,
-                source_url=item.get("link") or "",
-                provider=self.key,
-            ))
+        """Page 1, 2, 3... until Google has no more, a page brings nothing
+        new, or the query's depth is reached. The kill switch and the spend
+        cap are read before each page after the first."""
+        self.last_cost = 0.0
+        out: list[Business] = []
+        seen: set[str] = set()
+        pages = (search_pages(query.depth, self.PAGE_SIZE) if query.depth
+                 else None)
+        page = 0
+        while pages is None or page < pages:
+            page += 1
+            if page > 1:
+                why = await self.halt(self.PAGE_COST)
+                if why:
+                    self._stopped(why)
+                    break
+            body = {"q": query.keyword(),
+                    # Free accounts reject num > 10 (HTTP 400 "Query pattern
+                    # not allowed for free accounts"), verified 2026-10-26.
+                    "num": self.PAGE_SIZE}
+            if page > 1:
+                body["page"] = page
+            try:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": env["serper_api_key"],
+                             "Content-Type": "application/json"},
+                    json=body,
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                if page == 1:
+                    raise
+                # A later page that fails keeps what the earlier ones found.
+                self.complete = False
+                self.last_error = f"page {page} failed: {e}"
+                break
+            self.last_cost += self.PAGE_COST
+            items = data.get("organic") or []
+            new = 0
+            for item in items:
+                domain = normalize_domain(item.get("link") or "")
+                if not domain or domain in seen:
+                    continue
+                seen.add(domain)
+                new += 1
+                position = item.get("position")
+                if isinstance(position, int) and 0 < position <= self.PAGE_SIZE:
+                    # Positions may restart on each page: page 2's first is 11.
+                    position += (page - 1) * self.PAGE_SIZE
+                out.append(Business(
+                    name=business_name(item.get("title") or "", domain),
+                    raw_title=item.get("title") or "",
+                    domain=domain,
+                    website=item.get("link") or "",
+                    location=query.location,
+                    rank=position if isinstance(position, int) else None,
+                    has_website=True,
+                    source_url=item.get("link") or "",
+                    provider=self.key,
+                ))
+            if not items or not new:
+                break
         return out
 
 
@@ -831,12 +1081,14 @@ class TinyFish(DiscoveryProvider):
     free_tier = "free with a key, no card: 30 searches a minute, 500 an hour"
     signup_url = "https://agent.tinyfish.ai/api-keys"
     env_keys = ("tinyfish_api_key",)
-    caveat = ("Needs TINYFISH_API_KEY in .env. Harvey paces itself to 30 searches "
-              "a minute; a depth-30 phrase is 3 searches, so about 160 phrases an "
-              "hour fit in the 500. No SERP_RANK: use Serper or DataForSEO SERP "
-              "for rank signals.")
+    caveat = ("Needs TINYFISH_API_KEY in .env. TinyFish serves at most 11 pages "
+              "of 10 (about 110 results) for a phrase, and Harvey takes them all. "
+              "It paces itself to 30 searches a minute; a phrase is up to 11 "
+              "searches, so about 45 phrases an hour fit in the 500. No SERP_RANK: "
+              "use Serper or DataForSEO SERP for rank signals.")
 
     ENDPOINT = "https://api.search.tinyfish.ai"
+    MAX_PAGES = 11      # page index 0..10 is all it serves
     # 30 a minute, with a little room, and a little under 500 an hour.
     MIN_INTERVAL = 2.1
     HOURLY_LIMIT = 490
@@ -882,12 +1134,15 @@ class TinyFish(DiscoveryProvider):
             "Accept": "application/json",
         }
 
-        # TinyFish returns up to 10 results per page, with page index 0..10.
-        # depth 30 = 3 pages (pages 0, 1, 2). Max supported page is 10.
-        pages_needed = max(1, min(11, -(-query.depth // 10)))
+        # TinyFish returns up to 10 results per page, with page index 0..10:
+        # every page it serves, unless the query asks for less depth.
+        pages_needed = min(self.MAX_PAGES, -(-query.depth // 10)) if query.depth else self.MAX_PAGES
         out: list[Business] = []
 
         for page in range(pages_needed):
+            if page and await self.halt(0.0):
+                self._stopped("paused")
+                break
 
             params = {
                 "query": query.keyword(),
@@ -1133,8 +1388,9 @@ class OpenStreetMap(DiscoveryProvider):
             f'way[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
             for tag in tags
         )
-        body = (f"[out:json][timeout:{self.QUERY_TIMEOUT}];({clauses});"
-                f"out center {query.limit};")
+        # Every match, unless the query asks for fewer.
+        cap = f" {query.limit}" if query.limit else ""
+        body = f"[out:json][timeout:{self.QUERY_TIMEOUT}];({clauses});out center{cap};"
 
         # Overpass is a free volunteer service and 429s/504s readily under
         # load. Walk the mirrors, then RAISE: returning [] would make a
@@ -1270,15 +1526,24 @@ class ScavioProvider(DiscoveryProvider):
         return data
 
     async def _pages(self, client, env, query, path: str, body: dict,
-                     results_key: str, page_size: int, pages: int
+                     results_key: str, page_size: int, pages: int | None
                      ) -> list[tuple[int, dict]]:
-        """Every result as (offset of its page, item), page by page."""
+        """Every result as (offset of its page, item), page by page: up to
+        ``pages``, or (None) until the source has no more. The kill switch
+        and the spend cap are read before each page after the first."""
         self.last_cost = 0.0
         self.last_error = self.stop_reason = ""
         self.complete = True
         rows: list[tuple[int, dict]] = []
-        for page in range(pages):
+        page = -1
+        while pages is None or page + 1 < pages:
+            page += 1
             start = page * page_size
+            if rows:
+                why = await self.halt(self.CREDIT_PRICE)
+                if why:
+                    self._stopped(why)
+                    break
             try:
                 data = await self._post(client, env, path, dict(body, start=start))
                 items = data.get(results_key)
@@ -1313,6 +1578,9 @@ class ScavioProvider(DiscoveryProvider):
     def _last_page(self, data: dict, items: list, page_size: int) -> bool:
         return len(items) < page_size
 
+    def first_cost(self, query):
+        return self.CREDIT_PRICE
+
 
 class ScavioMaps(ScavioProvider):
     """Google Maps listings, the source issue #28 asked for.
@@ -1328,16 +1596,19 @@ class ScavioMaps(ScavioProvider):
     kind = "listings"
     blurb = ("Google Maps results around each city: phone, website, category, "
              "rating and review count for every place. Up to 120 businesses "
-             "per search.")
+             "per search: all Google Maps serves.")
     cost_note = "1 credit per page (up to 20 listings); estimates use $0.01/credit"
-    caveat = ("Google Maps does not say whether a listing is claimed, so the "
-              "unclaimed-listing signal stays empty. Same key as Scavio Google "
-              "Search.")
+    caveat = ("Google Maps serves at most 120 places for one search (6 pages of "
+              "20), and Harvey takes them all. It does not say whether a listing "
+              "is claimed, so the unclaimed-listing signal stays empty. Same key "
+              "as Scavio Google Search.")
 
     PAGE_SIZE = 20
     MAX_PAGES = 6        # the API accepts start up to 100
 
     def _page_count(self, query: DiscoveryQuery) -> int:
+        if not query.limit:
+            return self.MAX_PAGES
         return max(1, min(self.MAX_PAGES, -(-query.limit // self.PAGE_SIZE)))
 
     def estimate(self, queries):
@@ -1415,14 +1686,15 @@ class ScavioSearch(ScavioProvider):
     kind = "serp"
     blurb = ("Google organic results with rank positions. One Scavio key "
              "covers this and Google Maps listings.")
-    cost_note = "1 credit per page (up to 10 results); depth 30 estimated at $0.03"
+    cost_note = ("1 credit per page (up to 10 results), every page Google serves; "
+                 "estimated at 20 pages ($0.20) a search")
     caveat = ("Results come from google.com in English (US) unless the search "
-              "names another place. Depth 20-30 is the sweet spot.")
+              "names another place. Pages until Google has no next page.")
 
     PAGE_SIZE = 10
 
     def estimate(self, queries):
-        return sum(self.CREDIT_PRICE * max(1, -(-q.depth // self.PAGE_SIZE))
+        return sum(self.CREDIT_PRICE * search_pages(q.depth, self.PAGE_SIZE)
                    for q in queries)
 
     def _last_page(self, data, items, page_size):
@@ -1439,7 +1711,7 @@ class ScavioSearch(ScavioProvider):
         for start, item in await self._pages(
                 client, env, query, "", {"query": query.keyword()},
                 "organic_results", self.PAGE_SIZE,
-                max(1, -(-query.depth // self.PAGE_SIZE))):
+                -(-query.depth // self.PAGE_SIZE) if query.depth else None):
             domain = normalize_domain(item.get("link") or "")
             if not domain:
                 continue
@@ -1480,7 +1752,13 @@ NO_SEARCH_RESULTS = 40102
 
 
 def _dfs_items(payload: dict) -> list[dict]:
-    """Pull result items out of a DataForSEO envelope, surfacing errors.
+    """Pull result items out of a DataForSEO envelope, surfacing errors."""
+    return _dfs_result(payload).get("items") or []
+
+
+def _dfs_result(payload: dict) -> dict:
+    """The first result of a DataForSEO envelope (its items, total_count,
+    offset_token), surfacing errors; {} when there is none.
 
     A bare status code costs three wrong guesses; the message in the body
     usually makes the problem obvious immediately.
@@ -1491,19 +1769,19 @@ def _dfs_items(payload: dict) -> list[dict]:
             f"{payload.get('status_message')}")
     tasks = payload.get("tasks") or []
     if not tasks:
-        return []
+        return {}
     task = tasks[0]
     if task.get("status_code") == NO_SEARCH_RESULTS:
         # A real answer — nobody ranks for this search here — not a failure.
-        return []
+        return {}
     if task.get("status_code") not in (20000, None):
         raise RuntimeError(
             f"DataForSEO task {task.get('status_code')}: "
             f"{task.get('status_message')}")
     results = task.get("result") or []
-    if not results or not results[0]:
-        return []
-    return results[0].get("items") or []
+    if not results or not isinstance(results[0], dict):
+        return {}
+    return results[0]
 
 
 # ── The run ───────────────────────────────────────────────────────────
@@ -1532,6 +1810,32 @@ class DiscoveryReport:
     run_id: str = ""
     errors: list[str] = field(default_factory=list)
     stopped: str = ""
+    # What the source said it holds for the searches that said (a listings
+    # count), and what the estimate's count requests cost.
+    available: int | None = None
+    counted: bool = False
+    count_cost: float = 0.0
+    # Left behind when the spend cap or the kill switch stopped the run:
+    # results a search had left (as far as the source said), searches not
+    # run at all, and what fetching all of it would cost.
+    unfetched: int = 0
+    queries_left: int = 0
+    unfetched_cost: float = 0.0
+
+    def left_behind(self) -> str:
+        """One line on what a stopped run left unfetched, or ""."""
+        if not (self.unfetched or self.queries_left or self.unfetched_cost):
+            return ""
+        parts = []
+        if self.unfetched:
+            parts.append(f"{self.unfetched:,} results left unfetched")
+        if self.queries_left:
+            parts.append(f"{self.queries_left:,} "
+                         f"{'search' if self.queries_left == 1 else 'searches'} not run")
+        if not parts:
+            parts.append("more results left unfetched")
+        return (", ".join(parts)
+                + f": fetching them would cost about ${self.unfetched_cost:.2f} more")
 
     def as_dict(self) -> dict:
         return {
@@ -1547,6 +1851,11 @@ class DiscoveryReport:
             "observations": self.observations,
             "run_id": self.run_id, "errors": self.errors,
             "stopped": self.stopped,
+            "available": self.available, "counted": self.counted,
+            "count_cost": round(self.count_cost, 4),
+            "unfetched": self.unfetched, "queries_left": self.queries_left,
+            "unfetched_cost": round(self.unfetched_cost, 4),
+            "left_behind": self.left_behind(),
         }
 
 
@@ -1654,13 +1963,15 @@ def preset_problem(preset: str, provider_key: str, config=None) -> str | None:
 
 
 def build_queries(config, cities: list[str] | None = None,
-                  depth: int = 30, limit: int = 100, preset: str = "") -> list[DiscoveryQuery]:
+                  depth: int | None = None, limit: int | None = None,
+                  preset: str = "") -> list[DiscoveryQuery]:
     """Turn the configured ICP into a concrete query list.
 
     One query per (industry or keyword variant x city). Coordinates come from
     ``icp.geo_coordinates`` when present, because listings providers need a
     radius, not a place name. A ``preset`` (PRESETS) rewrites each industry
-    into its search; a non-local one only uses cities you pass.
+    into its search; a non-local one only uses cities you pass. ``depth``
+    and ``limit`` left None take every result the source has.
     """
     icp = config.icp
     terms = list(icp.industries) or [config.product.name]
@@ -1697,6 +2008,22 @@ def estimate_cost(provider_key: str, queries: list[DiscoveryQuery]) -> float:
     """Projected spend. Always call this before a run — and print it."""
     provider = PROVIDERS.get(provider_key)
     return provider.estimate(queries) if provider else 0.0
+
+
+async def count_results(provider_key: str, queries: list[DiscoveryQuery],
+                        client: httpx.AsyncClient, env: dict) -> float:
+    """Ask the source how many results each query has (``query.total``), so
+    the estimate is exact. Returns what the asking cost. A provider that
+    can't count leaves the queries as they were."""
+    provider = PROVIDERS[provider_key]
+    if not provider.can_count:
+        return 0.0
+    spent = 0.0
+    for query in queries:
+        total, cost = await provider.count(client, env, query)
+        query.total = total
+        spent += cost
+    return spent
 
 
 RANK_FIELDS = ("rank", "local_pack_rank", "maps_rank")
@@ -1791,19 +2118,27 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
 
 
 async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.AsyncClient,
-                       env: dict, remaining: float = math.inf, host=None) -> Draft:
+                       env: dict, remaining: float = math.inf, host=None,
+                       paused=None) -> Draft:
     """One search through one provider, as a Draft: a record per result
     (junk dropped and counted in ``counts``, each keyed by its position),
     the facts each result gives, and what the search really cost.
     ``host`` rewrites a result's domain before the junk check (a preset's
     careers.acme.com is acme.com). A failure is the draft's ``failed``,
-    with ``stop`` set when the provider can take no more this run."""
+    with ``stop`` set when the provider can take no more this run.
+    ``paused`` (async, true when the kill switch is on) is read between
+    pages; ``counts["available"]`` is what the source said it holds, and
+    ``counts["unfetched"]`` / ``values["unfetched_cost"]`` what a stop
+    left behind."""
     provider = PROVIDERS[provider_key]
     draft = Draft()
     provider.last_cost = 0.0
     provider.last_error = provider.stop_reason = ""
     provider.complete = True
     provider.remaining_budget = remaining
+    provider.paused = paused
+    provider.available = provider.unfetched = None
+    provider.unfetched_cost = 0.0
     try:
         found = await provider.fetch(client, env, query)
     except ProviderExhausted as e:
@@ -1822,6 +2157,12 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     if provider.last_error:
         draft.errors.append(provider.last_error)
     draft.stop = provider.stop_reason
+    if provider.available is not None:
+        draft.counts["available"] = provider.available
+    if provider.unfetched:
+        draft.counts["unfetched"] = provider.unfetched
+    if provider.unfetched_cost:
+        draft.values["unfetched_cost"] = provider.unfetched_cost
     draft.complete_codes = tuple(provider.rank_codes) if provider.complete else ()
     draft.counts["found"] = len(found)
     for i, biz in enumerate(found):
@@ -1851,7 +2192,8 @@ def provider_capabilities(module_id: str, caps: dict[str, str]) -> dict:
     def make(cap_id: str, key: str) -> Capability:
         async def run(inp, ctx) -> Draft:
             draft = await search_draft(key, inp.query, ctx.http, ctx.env,
-                                       remaining=ctx.budget.remaining)
+                                       remaining=ctx.budget.remaining,
+                                       paused=ctx.settings.get("paused"))
             return draft.stamp(module_id, cap_id)
 
         return Capability(module_id, cap_id, run,
@@ -1872,7 +2214,8 @@ def preset_capabilities(module_id: str, caps: dict[str, str]) -> dict:
             key = ctx.settings["provider"]
             draft = await search_draft(key, inp.query, ctx.http, ctx.env,
                                        remaining=ctx.budget.remaining,
-                                       host=company_host if preset == "hiring" else None)
+                                       host=company_host if preset == "hiring" else None,
+                                       paused=ctx.settings.get("paused"))
             draft.stamp(*ctx.settings["searcher"])
             extra = [(r.key, f) for r in draft.records
                      for f in preset_facts(inp.query, r.source_url, r.key)]

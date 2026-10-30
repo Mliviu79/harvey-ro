@@ -25,4 +25,4 @@ op = "query"
 provider = "osm"
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone"], facts = ["FOUND_IN_SERP", "NO_WEBSITE"] }
-cost = { usd = 0.0, per = "query" }
+cost = { usd = 0.0, per = "query", note = "every mapped match in the radius, one request" }

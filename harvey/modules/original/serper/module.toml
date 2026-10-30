@@ -25,4 +25,4 @@ op = "query"
 provider = "serper"
 inputs = [["query", "area"], ["query"]]
 outputs = { records = "companies", ids = ["domain"], facts = ["SERP_RANK", "FOUND_IN_SERP", "NO_WEBSITE"] }
-cost = { usd = 0.001, per = "search" }
+cost = { usd = 0.001, per = "page", note = "10 results a page, every page Google serves" }
