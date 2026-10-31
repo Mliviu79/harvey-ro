@@ -1,6 +1,6 @@
 """The keyless web search module's capabilities. The code they run is
-harvey/collectors/web_search.py; ``ctx.http`` is the caller's fetch
-(Scout's), ``fetch(url, **kw)`` returning a response or None."""
+harvey/collectors/web_search.py; ``ctx.http`` is the caller's fetch,
+``fetch(url, **kw)`` returning a response or None."""
 
 from harvey.collectors import web_search
 from harvey.modules.api import Capability, Draft, Record

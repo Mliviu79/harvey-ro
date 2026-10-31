@@ -104,10 +104,6 @@ def _clean_domain(domain: str) -> str:
     return domain
 
 
-# A domain as the pattern cache keys it.
-clean_domain = _clean_domain
-
-
 def _clean_name_part(value: str) -> str:
     # Accents folded first: "Ștefan" -> "stefan", not "tefan".
     value = "".join(c for c in unicodedata.normalize("NFKD", value or "") if not unicodedata.combining(c))
@@ -390,8 +386,7 @@ def _module_on(enabled, module_id: str) -> bool:
 # every call spends one no matter how many people it returns. Every
 # domain-search call in Harvey draws from one counter that core keeps (the
 # Budget passed in; the cap is the hunter manifest's monthly_searches,
-# HUNTER_MONTHLY_SEARCHES), so the pattern lookup and Scout's named-contact
-# strategy can't each assume they have the full quota.
+# HUNTER_MONTHLY_SEARCHES), so no caller can assume it has the full quota.
 
 
 async def hunter_domain_people(

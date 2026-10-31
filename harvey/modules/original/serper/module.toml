@@ -1,5 +1,5 @@
-# Serper: Google search with rank positions, for discovery and for Scout's
-# own searches.
+# Serper: Google search with rank positions, for discovery and for the
+# contact finder's website lookups.
 id = "serper"
 name = "Serper"
 description = "Google search with rank positions."

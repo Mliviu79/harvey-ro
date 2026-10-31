@@ -19,7 +19,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.models import Company
-from harvey.modules import api, ingest, lanes, runs, switches
+from harvey.modules import api, ingest, job_kinds, lanes, runs, switches
 from harvey.modules.ro.anaf import capabilities as caps
 from harvey.modules.ro.anaf import service
 from harvey.signals import sync_vocabulary
@@ -427,8 +427,7 @@ async def test_nothing_is_asked_or_written_until_one_of_its_signals_is_confirmed
     asked = []
     stub_anaf(monkeypatch, {A: answer(A)}, asked)
     report = await runs.check_by_id(state, "anaf", "company_check")
-    follow = runs.FollowUp(state)
-    assert not await follow.start()                       # a pull's follow-up starts nothing
+    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0   # nor after a pull
     assert asked == [] and report["requests"] == 0 and report["phones_set"] == 0
     assert report["stopped"] == runs.NOTHING_CONFIRMED and "VAT_REGISTERED" in report["unconfirmed"]
     assert not (await state.get_company(a)).phone
@@ -465,25 +464,6 @@ async def test_two_refused_batches_in_a_row_stop_the_run(state, real_ask):
 
 
 @pytest.mark.asyncio
-async def test_a_pull_s_follow_up_gives_up_on_a_busy_anaf(state, monkeypatch):
-    ids = await _companies(state, 300)
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
-    calls = []
-
-    async def busy(client, cuis, **kw):
-        calls.append(len(cuis))
-        raise service.AnafError("ANAF stayed busy (HTTP 503) after 4 requests", busy=True)
-
-    monkeypatch.setattr(service, "ask", busy)
-    follow = runs.FollowUp(state)
-    assert await follow.start()
-    for at in range(0, 300, 100):
-        follow.add(ids[at:at + 100])
-    reports = await follow.finish()
-    assert calls == [100] and reports["anaf"]["stopped"] == "busy"
-
-
-@pytest.mark.asyncio
 async def test_a_check_is_refused_while_the_module_is_off(state):
     await switches.set_enabled(state, "anaf", False)
     with pytest.raises(switches.ModuleOff, match="anaf"):
@@ -491,31 +471,22 @@ async def test_a_check_is_refused_while_the_module_is_off(state):
 
 
 @pytest.mark.asyncio
-async def test_firms_a_source_brings_in_are_checked_in_the_background(state, monkeypatch):
+async def test_firms_a_source_brings_in_are_queued_for_a_check(state):
     ids = [await state.add_company(Company(name=f"EXEMPLU {c} SRL", cui=c,
                                            source="registry:onrc")) for c in (A, B, C)]
-    asked = []
-    stub_anaf(monkeypatch, {A: answer(A), B: answer(B), C: answer(C)}, asked)
     await state.set_signal_status("VAT_REGISTERED", "confirmed")
-    seen = []
-    follow = runs.FollowUp(state, progress=lambda done, total: seen.append((done, total)))
-    assert await follow.start()
-    assert [m.id for m, _, _ in follow.checks] == ["anaf"]
-    follow.add(ids[:2])
-    follow.add(ids[2:])
-    reports = await follow.finish()
-    assert sorted(c for batch in asked for c in batch) == sorted([A, B, C])
-    assert reports["anaf"]["updated"] == 3 and reports["anaf"]["observations"] == 3
-    assert seen[-1] == (3, 3)
+    assert await job_kinds.enqueue_follow_up_checks(state, ids) == 1
     with sqlite3.connect(state.db_path) as db:
-        runs_logged = db.execute("SELECT stage, provider, status, records FROM runs").fetchall()
-    assert runs_logged == [("lookup", "anaf", "completed", 3)]          # one run, not one a batch
+        queued = db.execute("SELECT kind, module, capability FROM jobs").fetchall()
+    assert queued == [("id_check", "anaf", "company_check")]
 
 
 @pytest.mark.asyncio
 async def test_no_follow_up_while_the_module_is_off(state):
+    a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
+    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     await switches.set_enabled(state, "anaf", False)
-    assert not await runs.FollowUp(state).start()
+    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
 
 
 @pytest.mark.asyncio

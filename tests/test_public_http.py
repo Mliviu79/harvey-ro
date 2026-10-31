@@ -271,13 +271,9 @@ async def test_public_ip_literal_is_checked_without_dns(wire):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("caller", ["scout", "profile", "trainer"])
+@pytest.mark.parametrize("caller", ["profile", "trainer"])
 async def test_real_website_callers_block_private_targets(caller, wire):
-    if caller == "scout":
-        from harvey.agents.scout import Scout
-        scout = Scout.__new__(Scout)
-        assert await scout._fetch("http://127.0.0.1/", retries=1) is None
-    elif caller == "profile":
+    if caller == "profile":
         from harvey.collectors.profile import ProfileCollector
         async with ProfileCollector(None) as collector:
             assert await collector._get("http://127.0.0.1/") == ""

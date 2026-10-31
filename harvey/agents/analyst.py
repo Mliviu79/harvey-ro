@@ -177,8 +177,9 @@ class Analyst:
             )
         if total_new < 10 and total_queued == 0:
             insights.append(
-                f"ACTION: Prospect pool is nearly empty ({total_new} new). Scout should run "
-                "next cycle; if it keeps coming up dry, broaden the ICP in harvey.yaml."
+                f"ACTION: Prospect pool is nearly empty ({total_new} new). Find contacts "
+                "for more companies (Contacts tab); if it keeps coming up dry, broaden "
+                "the ICP in harvey.yaml."
             )
 
         if not insights:

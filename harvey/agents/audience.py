@@ -5,8 +5,8 @@ and knows nothing about email campaigns. This is the email campaign's side:
 each cycle it takes the email contacts it could write to (not
 do-not-contact, reaching a company with trust confirmed or likely) that
 have no prospect yet, and makes each a prospect for the Writer. An address
-a site published and nobody checked yet is checked first, like Scout did
-for a company's inbox (a verification credit each, counted against the
+a site published and nobody checked yet is checked first (a
+verification credit each, counted against the
 month's allowance, email_verify's monthly_searches); one that comes back a
 guess or invalid stays a contact and never becomes a prospect.
 """

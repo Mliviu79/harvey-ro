@@ -2,9 +2,8 @@
 through the scripted Codex CLI (tests/fake_codex.py).
 
 Everything outside Harvey is a fixture: a disposable database and config,
-a capturing mail transport (nothing is ever sent over the network), a
-stubbed Scout and profiler (they would reach the internet), and a fake
-ChatGPT login. These tests check what an operator would see across whole
+a capturing mail transport (nothing is ever sent over the network) and a
+fake ChatGPT login. These tests check what an operator would see across whole
 heartbeat cycles: what is queued or sent, what is consumed, what is
 counted, and what happens when Codex can't be used.
 """
@@ -71,7 +70,6 @@ class Harness:
         self.cycles = 0
         self.stop_after = 1
         self.between = {}
-        self.scout_runs = 0
         self.set_config(provider, model)
 
         runtimes = tmp_path / "runtimes"
@@ -93,16 +91,11 @@ class Harness:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_routed)
 
         import harvey.agents.handler as handler_mod
-        import harvey.agents.scout as scout_mod
         import harvey.agents.sender as sender_mod
 
         monkeypatch.setattr(handler_mod, "get_mail_provider", lambda c, e: self.mail)
         monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: self.mail)
 
-        async def scout_run(_self):
-            self.scout_runs += 1
-
-        monkeypatch.setattr(scout_mod.Scout, "run", scout_run)
         monkeypatch.setattr(main_mod, "load_config", lambda: self.config)
         monkeypatch.setattr(main_mod, "load_env", lambda: EnvConfig())
         monkeypatch.setattr(main_mod, "StateManager", lambda: self.state)
@@ -251,7 +244,6 @@ async def test_writer_drafts_through_codex_and_waits_for_approval(harvey):
     assert drafts and all(d["to_email"] == "jane@acme.com" for d in drafts)
     assert harvey.mail.sent == []
     assert await harvey.state.get_usage_today("codex") >= 1
-    assert harvey.scout_runs == 0
 
 
 # ── the provider can't be used: pause, touch nothing, recover ──

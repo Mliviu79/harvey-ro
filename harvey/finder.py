@@ -42,7 +42,7 @@ searches again what the others found nothing for). A search that failed
 isn't a search done.
 
 The finder never depends on the email loop: the Email module's switch
-doesn't stop it, and Scout and the heartbeat don't call it.
+doesn't stop it, and the heartbeat doesn't call it.
 """
 
 from __future__ import annotations

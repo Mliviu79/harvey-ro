@@ -5,8 +5,7 @@ a directory (G2, Clutch, a "company list") links the companies it lists.
 Both are read here into (url, snippet) results or company links. Their
 terms forbid automated access, so the web_search_scrape module that runs
 this ships off. Fetching is the caller's (``fetch(url, **kw)`` returns a
-response with ``.text``, or None): Scout's, with its retries, back-off and
-bot-challenge tracking.
+response with ``.text``, or None), with its own retries and back-off.
 """
 
 import logging
@@ -14,7 +13,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 
 from bs4 import BeautifulSoup
 
-logger = logging.getLogger("harvey.scout")
+logger = logging.getLogger("harvey.web_search")
 
 MAX_RESULTS_PER_QUERY = 20
 SCRAPE_TIMEOUT = 12.0

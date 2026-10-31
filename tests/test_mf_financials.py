@@ -607,18 +607,20 @@ async def test_settings_are_typed_and_clamped(state):
 
 @pytest.mark.asyncio
 async def test_nothing_is_downloaded_unless_auto_update_is_on(state, monkeypatch):
+    from harvey.modules import job_kinds
+
     called = []
 
-    async def fake_sync(*a, **k):
-        called.append(a)
-        return api.Draft(values={"unchanged": True})
+    async def fake_enqueue(state, kind, module, capability, **k):
+        called.append((kind, module, capability, k.get("auto")))
+        return "batch", "job"
 
-    monkeypatch.setattr(runs, "sync_source", fake_sync)
-    assert await runs.sync_due_sources(state) == []
+    monkeypatch.setattr(job_kinds, "enqueue_source", fake_enqueue)
+    assert await job_kinds.enqueue_due_sources(state) == []
     await switches.set_module_setting(state, "mf_financials", "auto_update", True)
-    assert await runs.sync_due_sources(state) == ["mf_financials"]
-    assert await runs.sync_due_sources(state) == []       # not due again for check_days
-    assert len(called) == 1
+    assert await job_kinds.enqueue_due_sources(state) == ["mf_financials"]
+    assert await job_kinds.enqueue_due_sources(state) == []   # not due again for check_days
+    assert len(called) == 1 and called[0][:2] == ("source_sync", "mf_financials") and called[0][3]
 
 
 @pytest.mark.asyncio

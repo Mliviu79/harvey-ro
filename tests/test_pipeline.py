@@ -1,8 +1,8 @@
-"""DISCOVER → PROFILE chaining.
+"""Which companies still need their site read, and how what was read counts.
 
-The stages are joined by a query, not a hand-off. These tests pin that
-property down, because it is what makes a crashed run resumable and
-re-observation a time series instead of a duplicate.
+Site reads are found by a query, not handed a list by discovery. These
+tests pin that property down, because it is what makes a crashed run
+resumable and re-observation a time series instead of a duplicate.
 """
 
 import os
@@ -11,11 +11,7 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from harvey import pipeline as P
-from harvey.collectors import discover as D
-from harvey.config import load_config
 from harvey.models import Company
-from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -29,11 +25,6 @@ async def state():
         for sig in SIGNAL_CATALOG:
             await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
-
-
-@pytest.fixture
-def config():
-    return load_config()
 
 
 # ── The join: which companies still need a look ──
@@ -91,135 +82,11 @@ async def test_websiteless_companies_are_never_queued_for_profiling(state):
     assert await state.count_companies_needing_profile() == 0
 
 
-# ── The chain ──
-
-
-class FakeDiscovery(D.DiscoveryProvider):
-    key = "fake"
-    label = "Fake"
-
-    def __init__(self, businesses):
-        self.businesses = businesses
-
-    def configured(self, env):
-        return True
-
-    def estimate(self, queries):
-        return 0.0
-
-    async def fetch(self, client, env, query):
-        return self.businesses
-
-
-@pytest.fixture
-def chain(monkeypatch, claim_provider):
-    """A fake discovery provider and a profile stage that records its input."""
-    seen = {"profiled": []}
-
-    def install(businesses):
-        claim_provider(FakeDiscovery(businesses))
-
-        async def fake_profile(state, companies, **_):
-            seen["profiled"] = [c["domain"] for c in companies]
-            for company in companies:
-                await state.add_observation(
-                    "TECH_STACK", company_id=company["id"],
-                    collector="profile", value_text="wordpress")
-            return len(companies), "run-x"
-
-        monkeypatch.setattr("harvey.modules.runs.profile_companies",
-                            fake_profile)
-        return seen
-
-    async def offline(state, city, radius_km=40, client=None):
-        return ""
-    monkeypatch.setattr(runs, "geocode_city", offline)
-    return install
-
-
-@pytest.mark.asyncio
-async def test_discovery_flows_straight_into_profiling(state, config, chain):
-    seen = chain([
-        D.Business(name="Baker", domain="baker.com", provider="fake"),
-        D.Business(name="Metro", domain="metro.com", provider="fake"),
-    ])
-    report = await P.run_prospecting(
-        state, config, "fake", [D.DiscoveryQuery(term="roofer")])
-
-    assert report.discover["new_companies"] == 2
-    assert sorted(seen["profiled"]) == ["baker.com", "metro.com"]
-    assert report.profiled_companies == 2
-    assert report.profile_observations == 2
-
-
-@pytest.mark.asyncio
-async def test_profiling_sweeps_up_what_an_earlier_run_left(state, config, chain):
-    """The stages join through a query, so a run interrupted before profiling
-    is finished by the next one — nothing has to remember anything."""
-    await state.add_company(Company(name="Left Over", domain="leftover.com"))
-    seen = chain([D.Business(name="Baker", domain="baker.com", provider="fake")])
-
-    await P.run_prospecting(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
-    assert sorted(seen["profiled"]) == ["baker.com", "leftover.com"]
-
-
-@pytest.mark.asyncio
-async def test_profiling_runs_even_when_discovery_finds_nothing(state, config, chain):
-    await state.add_company(Company(name="Left Over", domain="leftover.com"))
-    seen = chain([])
-
-    report = await P.run_prospecting(state, config, "fake",
-                                     [D.DiscoveryQuery(term="roofer")])
-    assert report.discover["new_companies"] == 0
-    assert seen["profiled"] == ["leftover.com"]
-
-
-@pytest.mark.asyncio
-async def test_no_profile_stops_at_discovery(state, config, chain):
-    seen = chain([D.Business(name="Baker", domain="baker.com", provider="fake")])
-    report = await P.run_prospecting(state, config, "fake",
-                                     [D.DiscoveryQuery(term="roofer")],
-                                     profile=False)
-    assert report.discover["new_companies"] == 1
-    assert seen["profiled"] == []
-    assert report.skipped == "profiling skipped"
-
-
-@pytest.mark.asyncio
-async def test_a_dry_run_neither_discovers_nor_profiles(state, config, chain):
-    seen = chain([D.Business(name="Baker", domain="baker.com", provider="fake")])
-    report = await P.run_prospecting(state, config, "fake",
-                                     [D.DiscoveryQuery(term="roofer")],
-                                     dry_run=True)
-    assert report.skipped == "dry run"
-    assert seen["profiled"] == []
-    assert await state.count_companies_needing_profile() == 0
-
-
-@pytest.mark.asyncio
-async def test_a_failing_profile_stage_does_not_lose_the_discovery(
-        state, config, monkeypatch, chain):
-    chain([D.Business(name="Baker", domain="baker.com", provider="fake")])
-
-    async def boom(state, companies, **_):
-        raise RuntimeError("network gone")
-    monkeypatch.setattr("harvey.modules.runs.profile_companies", boom)
-
-    report = await P.run_prospecting(state, config, "fake",
-                                     [D.DiscoveryQuery(term="roofer")])
-    assert report.discover["new_companies"] == 1, "the companies are still saved"
-    assert any("network gone" in e for e in report.errors)
-
-
-@pytest.mark.asyncio
-async def test_profile_stage_is_a_noop_with_nothing_to_do(state):
-    companies, observations, run_id = await P.run_profile_stage(state)
-    assert (companies, observations, run_id) == (0, 0, "")
+# ── The backlog ──
 
 
 @pytest.mark.asyncio
 async def test_state_summary_reports_the_profiling_backlog(state):
-    """The heartbeat reads this to decide whether to profile this cycle."""
     await state.add_company(Company(name="Baker", domain="baker.com"))
     summary = await state.get_state_summary()
     assert summary["unprofiled"] == 1

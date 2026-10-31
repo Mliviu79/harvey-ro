@@ -200,7 +200,7 @@ def test_stored_english_role_labels_are_translated_for_display():
     if not node:
         pytest.skip("node is not installed")
     # The fixed labels the collectors write must stay in the map.
-    assert 'title="General inbox"' in (ROOT / "agents" / "scout.py").read_text(encoding="utf-8")
+    assert '"General inbox"' in (ROOT / "agents" / "audience.py").read_text(encoding="utf-8")
     assert '("founder", "Founder")' in (ROOT / "collectors" / "people.py").read_text(encoding="utf-8")
     script = (
         "global.localStorage = {getItem: () => null, setItem() {}};"

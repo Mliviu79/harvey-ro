@@ -264,12 +264,14 @@ async def run_discover(ctx) -> dict:
 
 # ── Reading companies' sites: one job per company ──
 
+# How long a site read stays fresh. Re-reading a site every quarter is what
+# makes "they dropped their agency" a visible event.
+PROFILE_STALE_DAYS = 90
+
 async def enqueue_site_reads(state, company_ids=None, *, batch_id: str = "",
                              parent_id: str = "", stale_days: int | None = None):
     """Queue a site read for each company (all when None) that has a
     website and hasn't been read lately. Returns (new ids, already queued)."""
-    from harvey.pipeline import PROFILE_STALE_DAYS
-
     due = await state.companies_needing_profile(
         limit=-1, stale_days=stale_days or PROFILE_STALE_DAYS,
         ids=None if company_ids is None else list(dict.fromkeys(company_ids)))

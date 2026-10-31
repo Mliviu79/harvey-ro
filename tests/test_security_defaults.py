@@ -131,7 +131,7 @@ async def test_held_instantly_reply_spends_no_model_call(state):
 @pytest.mark.parametrize("new, expected", [(30, "write_campaign"), (0, "idle")])
 async def test_held_drafts_do_not_block_writing_or_prospecting(new, expected):
     # A held Instantly draft must not win "send_campaign" every cycle and
-    # starve the writer and scout forever.
+    # starve the writer forever.
     from harvey.main import decide_next_action
     summary = {"prospects": {"new": new}, "draft_campaigns": 1, "open_conversations": 0}
     assert await decide_next_action(None, None, legacy_config(), summary=summary) == expected

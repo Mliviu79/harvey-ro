@@ -1017,7 +1017,7 @@ const I18N = {
     'today.clear_title': 'Nothing needs you',
     'today.clear_copy': 'Harvey has everything it needs. Anything that requires a decision — an email to approve, a signal to confirm — shows up here.',
     'today.funnel_error': 'Couldn’t read the pipeline.',
-    'today.funnel_empty': 'No contacts yet. Scout adds them as it finds people.',
+    'today.funnel_empty': 'No contacts yet. They appear as Harvey finds people.',
     'today.activity_empty': 'Nothing yet. Every action Harvey takes shows up here.',
     'today.item.paused': 'Sending is paused', 'today.item.paused_detail': '{why}. Nothing will go out until you resume it.',
     'today.item.paused_action': 'Review and resume',
@@ -1642,9 +1642,9 @@ const I18N = {
   },
 };
 
-// Role labels Harvey itself writes onto a contact, in English: scout's
-// "General inbox" and the owner/founder words collectors/people.py and
-// agents/scout.py fill in. They are shown in the dashboard's language; any
+// Role labels Harvey itself writes onto a contact, in English: the
+// audience step's "General inbox" and the owner/founder words
+// collectors/people.py fills in. They are shown in the dashboard's language; any
 // other title (copied from a site or the registry) is shown as stored.
 const ROLE_KEYS = new Map([
   ['general inbox', 'general_inbox'], ['owner', 'owner'], ['co-owner', 'co_owner'],

@@ -311,16 +311,14 @@ async def test_keyless_searches_return_only_what_they_declare(manifests, monkeyp
     async def fetch(url, **kw):
         return SimpleNamespace(text=directory if "list" in url else results)
 
-    from harvey.agents.scout import Scout
-
     html = await api.capability("web_search_scrape", "html_search", manifests)(
         api.Input(query="roofers"), api.Context(http=fetch))
     assert [(r.source_url, r.description) for r in html.records] == [
         ("https://acme-roofing.example/", "Roofers")]
-    scout = Scout.__new__(Scout)
     found = await api.capability("web_search_scrape", "directories", manifests)(
         api.Input(extra={"url": "https://list.example/roofers",
-                         "domain_of": scout._extract_domain, "noise": scout._is_noise_domain}),
+                         "domain_of": lambda url: url.split("/")[2].removeprefix("www."),
+                         "noise": lambda domain: domain.endswith("linkedin.com")}),
         api.Context(http=fetch))
     assert [r.domain for r in found.records] == ["acme-roofing.example"]
 
@@ -697,7 +695,6 @@ def test_a_preset_estimates_what_its_search_charges(manifests):
 
 @pytest.mark.asyncio
 async def test_hunter_takes_its_key_from_the_context(manifests, monkeypatch):
-    from harvey.agents.scout import Scout
     from harvey.integrations import email_finder as ef
 
     keys = []
@@ -710,11 +707,7 @@ async def test_hunter_takes_its_key_from_the_context(manifests, monkeypatch):
     monkeypatch.setenv("HUNTER_API_KEY", "from-the-process")
     cap = api.capability("hunter", "domain_search", manifests)
     await cap(api.Input(domain="example.com"), api.Context(env={"hunter_api_key": "k1"}))
-    # Scout hands every capability the same shape: a dict of the .env keys.
-    ctx = await Scout(None, None, None, EnvConfig(hunter_api_key="k2"))._context()
-    assert isinstance(ctx.env, dict)
-    await cap(api.Input(domain="example.com"), ctx)
-    assert keys == ["k1", "k2"]
+    assert keys == ["k1"]
 
 
 @pytest.mark.asyncio
@@ -730,34 +723,6 @@ def test_a_site_read_is_told_only_the_preset_hits_a_read_declares():
     assert runs._hit_codes({"startups", "website"}, {"YC_BACKED", "TECH_STACK"}) == ("YC_BACKED",)
     assert runs._hit_codes({"website"}, {"YC_BACKED"}) == ()
     assert runs._hit_codes({"startups"}, {"TECH_STACK"}) == ()
-
-
-@pytest.mark.asyncio
-async def test_a_company_scout_finds_gives_its_later_facts_the_record_found(state, monkeypatch):
-    survivor = (await state.save_company(Company(
-        name="Northvale Roofing Company", phone="+13035550199", location="Denver, Colorado",
-        source="manual"))).company_id
-    saved = await ingest.found_company(state, api.Record(
-        name="Northvale Roofing Company", phone="+13035550199", location="Denver, Colorado",
-        domain="northvale.example", source="website"))
-    assert saved.company_id == survivor and saved.origin not in ("", survivor)
-
-    from harvey.agents.scout import Scout
-
-    async def found(store, record):
-        return saved
-
-    monkeypatch.setattr(ingest, "found_company", found)
-    scout = Scout(None, state, None, EnvConfig())
-    assert await scout._ensure_company("Northvale Roofing Company", "northvale-roofing.example") \
-        == survivor
-    await scout._observe_likely_owner(survivor, {"first_name": "Ana", "last_name": "Pop",
-                                                 "title": "Owner"})
-    assert _rows(state, "SELECT company_id, origin_company_id FROM observations "
-                        "WHERE signal_code = 'LIKELY_OWNER'") == [(survivor, saved.origin)]
-    await state.undo_merge(saved.origin)
-    assert _rows(state, "SELECT company_id FROM observations WHERE signal_code = 'LIKELY_OWNER'") \
-        == [(saved.origin,)]
 
 
 @pytest.mark.asyncio

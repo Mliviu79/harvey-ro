@@ -149,8 +149,8 @@ async def test_checkpoint_after_submit_holds_every_later_login(li):
     "https://www.linkedin.com/in/someone/",      # landed somewhere unexpected
 ])
 async def test_every_failed_submit_holds_later_logins(li, after_click):
-    """Scout makes a new LinkedInAutomation every cycle, so anything short
-    of the hold would send the credentials again next cycle."""
+    """A caller may make a new LinkedInAutomation every time, so anything
+    short of the hold would send the credentials again."""
     refused = FIXTURE.replace("<main>", '<main><div role="alert">Wrong password.</div>')
     assert await li(FakePage(refused, after_click="https://www.linkedin.com/login")).login() is False
     assert "refused" in linkedin.LinkedInAutomation.login_hold()["reason"]

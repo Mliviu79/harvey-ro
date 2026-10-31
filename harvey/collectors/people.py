@@ -1,6 +1,6 @@
 """PEOPLE — who decides at a small business, read off its own website.
 
-Cost: $0. Pure functions over HTML that Scout (and the profile collector)
+Cost: $0. Pure functions over HTML the site reader (collectors/profile.py)
 already fetched: no browser, no model, no paid lookup.
 
 A small business rarely has a tidy "team" page. The owner is in a <span>

@@ -300,8 +300,8 @@ class LinkedInAutomation:
         """Log into LinkedIn, once. Never retried: any failure returns
         False, and once the credentials may have been sent (a checkpoint, a
         refused password, a submit that didn't reach the feed) it also puts
-        a hold on automatic logins (see LOGIN_HOLD_PATH). Scout makes a new
-        instance every cycle, so only the hold stops the next attempt."""
+        a hold on automatic logins (see LOGIN_HOLD_PATH). A caller may make a
+        new instance every time, so only the hold stops the next attempt."""
         if self._login_result is not None:
             return self._login_result
         self._login_result = False

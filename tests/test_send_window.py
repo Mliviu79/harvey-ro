@@ -753,7 +753,6 @@ class _Brain:
 def _patch_heartbeat(monkeypatch, cfg, state, calls, stop):
     import harvey.agents.analyst
     import harvey.agents.handler
-    import harvey.agents.scout
     import harvey.agents.writer
     import harvey.main as main_mod
 
@@ -784,7 +783,6 @@ def _patch_heartbeat(monkeypatch, cfg, state, calls, stop):
     monkeypatch.setattr(main_mod, "Brain", _Brain)
     monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: True)
     monkeypatch.setattr(main_mod, "_interruptible_sleep", stop_instead_of_sleeping)
-    monkeypatch.setattr(harvey.agents.scout, "Scout", agent("prospect"))
     monkeypatch.setattr(harvey.agents.writer, "Writer", agent("write"))
     monkeypatch.setattr(sender_mod, "Sender", agent("send"))
     monkeypatch.setattr(harvey.agents.handler, "Handler", agent("replies"))

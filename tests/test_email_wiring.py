@@ -1,4 +1,4 @@
-"""Tests for email_status persistence and sender/scout wiring."""
+"""Tests for email_status persistence and sender wiring."""
 
 import os
 import tempfile

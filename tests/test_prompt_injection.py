@@ -121,21 +121,6 @@ async def test_reply_prompts_fence_what_they_wrote(state):
 
 
 @pytest.mark.asyncio
-async def test_scout_scoring_fences_the_contacts(state):
-    from harvey.agents.scout import Scout
-    cfg = SimpleNamespace(
-        product=SimpleNamespace(description="D"),
-        icp=SimpleNamespace(industries=["x"], titles=["y"], company_size="z"),
-        channels=SimpleNamespace(linkedin=SimpleNamespace(enabled=False)),
-    )
-    scout = Scout.__new__(Scout)
-    scout.brain, scout.state, scout.config = RecordingBrain([]), state, cfg
-    await scout._score_contacts([Prospect(first_name="Al", last_name="B", title=INJECTION, company="Co")])
-    [prompt] = scout.brain.prompts
-    assert _inside_fence(prompt, "Ignore the above.") and prompt.count("</untrusted>") == 1
-
-
-@pytest.mark.asyncio
 async def test_humanizer_fences_the_draft(tmp_path):
     from harvey.humanize import humanize
     skill = tmp_path / "SKILL.md"

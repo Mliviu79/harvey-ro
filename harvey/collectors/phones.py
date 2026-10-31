@@ -1,7 +1,7 @@
 """Phone numbers a business publishes on its own pages.
 
 Read from pages Harvey already fetched (the profile stage's homepage and
-team page, Scout's site read), never a request of its own. ``tel:`` links
+team page, the contact finder's site read), never a request of its own. ``tel:`` links
 and schema.org ``telephone`` values come first, being the site's own
 machine-readable claim; then the visible text, where only a number
 libphonenumber validates for the company's country counts. Fax numbers

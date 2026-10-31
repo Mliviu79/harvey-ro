@@ -507,13 +507,13 @@ async def _source_read(state, cap_id: str, inp: api.Input):
 async def registry_pull(state, con, q, *, limit: int | None = None,
                         with_administrators: bool = True, dry_run: bool = False,
                         do_not_contact: list[str] | None = None, progress=None,
-                        area: str = "", follow_up: "FollowUp | None" = None):
+                        area: str = "", follow_up=None):
     """Copy the firms a resolved registry query matches (the first
     ``limit``, best first) into the working database: the onrc module's
     registry_search, then save_source_draft. ACTIVITY_CODE is recorded
-    only for the classes the query named. ``follow_up`` (a started
-    FollowUp) is handed each batch of saved firms as it commits, so its
-    checks run while the rest is saved; the caller finishes it."""
+    only for the classes the query named. ``follow_up.add(ids)`` is
+    handed each batch of saved firms as it commits (the registry_pull job
+    collects them, to queue their checks and the contact finder)."""
     draft = await _source_read(state, "registry_search", api.Input(
         query=q, area=area, extra={"con": con, "limit": limit,
                                    "with_administrators": with_administrators}))
@@ -1012,122 +1012,6 @@ async def _call(fn, *args):
     return result
 
 
-class FollowUp:
-    """Checks that run, in the background, for the companies a source
-    brings in: every enricher capability marked ``after_source`` whose
-    module is on (ANAF's company check). Saved companies are queued with
-    ``add(ids)`` as the source saves them and checked a batch at a time
-    while it goes on; ``finish()`` waits for the queue to empty and
-    returns one report per capability. ``progress(module, done, total)``
-    says how far each has got."""
-
-    def __init__(self, state, progress=None):
-        self.state = state
-        self.progress = progress
-        self.checks: list[tuple] = []
-        self.queue: asyncio.Queue | None = None
-        self.task: asyncio.Task | None = None
-        self.reports: dict[str, dict] = {}
-        self.runs: dict[str, str] = {}
-        self.queued = 0
-        self.done = 0
-        self._stop = False
-        self._failures: dict[str, int] = {}
-        self._given_up: set[str] = set()
-
-    async def start(self) -> bool:
-        """Find the checks to run; False (and nothing started) when none is
-        on, or none has a confirmed signal to record."""
-        from harvey.signals import sync_vocabulary
-
-        await sync_vocabulary(self.state)
-        confirmed = await self.state.confirmed_signal_codes()
-        self.checks = [c for c in id_enrichers(await _enabled(self.state), after_source=True)
-                       if _wanted(c[1], confirmed)]
-        if not self.checks:
-            return False
-        self.queue = asyncio.Queue()
-        self.task = asyncio.create_task(self._work())
-        return True
-
-    def add(self, company_ids) -> None:
-        if self.queue is None:
-            return
-        ids = [i for i in company_ids if i]
-        if ids:
-            self.queued += len(ids)
-            self.queue.put_nowait(ids)
-
-    def stop(self) -> None:
-        self._stop = True
-
-    async def _work(self):
-        size = max([int(cap.get("batch") or 1) for _, cap, _ in self.checks] or [1])
-        pending: list[str] = []
-        closing = False
-        while True:
-            if not closing and len(pending) < size:
-                item = await self.queue.get()
-                if item is None:
-                    closing = True
-                else:
-                    pending += item
-                    continue
-            if not pending:
-                break
-            take, pending = pending[:size], pending[size:]
-            for m, cap, _ in self.checks:
-                if m.id in self._given_up:
-                    continue
-                if m.id not in self.runs:
-                    self.runs[m.id] = await self.state.start_run(
-                        "lookup", provider=m.id, params={"capability": cap["id"],
-                                                         "after": "source"})
-                report = await check_by_id(self.state, m.id, cap["id"], take,
-                                           stop=lambda: self._stop, run_id=self.runs[m.id])
-                self._merge(m.id, report)
-                # A service that is down or busy isn't asked about the
-                # rest of what the source brings in (check_by_id --missing
-                # finishes later).
-                failed = bool(report["errors"])
-                self._failures[m.id] = self._failures.get(m.id, 0) + 1 if failed else 0
-                if (report["stopped"] and report["stopped"] != "stopped") or \
-                        self._failures[m.id] >= CHECK_FAILURES_IN_A_ROW:
-                    self._given_up.add(m.id)
-            self.done += len(take)
-            if self.progress:
-                self.progress(self.done, self.queued)
-            if self._stop:
-                break
-
-    def _merge(self, module: str, report: dict) -> None:
-        total = self.reports.setdefault(module, _new_check_report(module))
-        for key, value in report.items():
-            if isinstance(value, int) and not isinstance(value, bool):
-                total[key] += value
-        total["unconfirmed"] = report["unconfirmed"] or total["unconfirmed"]
-        total["errors"] += [e for e in report["errors"] if e not in total["errors"]][:3]
-        total["stopped"] = report["stopped"] or total["stopped"]
-
-    async def finish(self) -> dict[str, dict]:
-        if self.task is None:
-            return {}
-        self.queue.put_nowait(None)
-        try:
-            await self.task
-        except Exception as e:
-            logger.exception("follow-up checks failed")
-            for m, _, _ in self.checks:
-                self.reports.setdefault(m.id, _new_check_report(m.id))["errors"].append(str(e))
-        for module, run_id in self.runs.items():
-            report = self.reports.get(module) or _new_check_report(module)
-            await self.state.finish_run(
-                run_id, status="failed" if report["errors"] and not report["updated"]
-                else "completed", records=report["updated"],
-                error="; ".join(report["errors"][:1]))
-        return self.reports
-
-
 async def sync_source(state, module_id: str, cap_id: str, *, extra: dict | None = None,
                       http=None) -> api.Draft:
     """Run a source module's sync capability (a check of what is published,
@@ -1153,50 +1037,6 @@ async def sync_source(state, module_id: str, cap_id: str, *, extra: dict | None 
 # The settings a source module declares to be kept up to date on its own.
 AUTO_SETTING, CHECK_DAYS_SETTING = "auto_update", "check_days"
 CHECKED_KEY = "modules.{}.checked_at"
-
-
-async def sync_due_sources(state) -> list[str]:
-    """For each source module that is on and whose ``auto_update`` setting
-    the user switched on: when its ``check_days`` have passed since the last
-    check, download and load what is new (its sync capability marked
-    ``auto = true``), then
-    record what it knows about the companies on file. Nothing happens for a
-    module whose auto_update is off (the default). Returns the modules synced."""
-    from datetime import datetime, timedelta, timezone
-
-    from harvey.modules import switches
-
-    done = []
-    enabled = await _enabled(state)
-    for m in switches.manifests():
-        if m.id not in enabled or m.kind != "source" or AUTO_SETTING not in m.settings:
-            continue
-        settings = await switches.module_settings(state, m.id)
-        if not settings.get(AUTO_SETTING):
-            continue
-        # The sync its manifest marks as the one to run unattended.
-        sync = [c["id"] for c in m.capabilities if c.get("op") == "sync" and c.get("auto")]
-        if not sync:
-            continue
-        key = CHECKED_KEY.format(m.id)
-        last = await state.get_setting(key)
-        days = int(settings.get(CHECK_DAYS_SETTING) or 30)
-        now = datetime.now(timezone.utc)
-        try:
-            if last and now - datetime.fromisoformat(last) < timedelta(days=days):
-                continue
-        except ValueError:
-            pass
-        await state.set_setting(key, now.isoformat(timespec="seconds"))
-        try:
-            draft = await sync_source(state, m.id, sync[0])
-        except Exception as e:
-            logger.warning("%s: automatic update failed: %s", m.id, e)
-            continue
-        if not draft.values.get("unchanged"):
-            await lookup_by_id(state)
-        done.append(m.id)
-    return done
 
 
 # ── Reading companies' sites (the website module and what reads its pages) ──

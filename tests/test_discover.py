@@ -1473,9 +1473,7 @@ def test_new_junk_filters_keep_employer_sites(domain):
 
 @pytest.mark.parametrize("domain", ["naukri.com", "www.indiamart.com", "thingiverse.com"])
 def test_new_junk_filters_reject_aggregators(domain):
-    from harvey.agents.scout import Scout
     assert D.is_junk(domain)
-    assert Scout._is_noise_domain(None, domain)
 
 
 @pytest.mark.asyncio
@@ -1495,18 +1493,6 @@ async def test_serper_keeps_num_at_ten_and_prices_every_page():
     # No depth: priced at the pages Google seldom serves past.
     assert provider.estimate([D.DiscoveryQuery(term="roofer")]) == pytest.approx(
         D.SEARCH_PAGES_ESTIMATE * 0.001)
-
-
-@pytest.mark.asyncio
-async def test_scout_serper_caps_request(monkeypatch):
-    from harvey.agents.scout import Scout
-    from types import SimpleNamespace
-    requests = []
-    async def fetch(url, **kwargs):
-        requests.append(kwargs["json_body"])
-        return httpx.Response(200, json={"organic": []})
-    await Scout._search_serper(SimpleNamespace(_fetch=fetch), "roofer", "fixture")
-    assert requests == [{"q": "roofer", "num": 10}]
 
 
 @pytest.mark.asyncio

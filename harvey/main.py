@@ -169,7 +169,7 @@ async def decide_next_action(
     open_conversations = summary.get("open_conversations", 0) or 0
 
     # Held Instantly drafts can't deploy; choosing send_campaign for them
-    # every cycle would starve the writer and scout forever.
+    # every cycle would starve the writer forever.
     deployable = 0 if legacy_sending_held(config) else draft_campaigns
 
     if not email_on:

@@ -1,12 +1,7 @@
-"""Romanian practice sites: team cards, booking wording and front-desk inboxes."""
-
-from types import SimpleNamespace
+"""Romanian practice sites: team cards, booking wording and team pages."""
 
 import pytest
 
-from harvey.agents.scout import (
-    FALLBACK_SITE_PATHS, INBOX_PREFERRED, MAX_SITE_FETCHES, Scout,
-)
 from harvey.collectors import people as people_mod
 from harvey.collectors.profile import (
     BOOKING_HINTS, RO_TEAM_PATHS, TEAM_PATHS, ProfileCollector, _reads_like_title, title_looks_like_role,
@@ -14,7 +9,6 @@ from harvey.collectors.profile import (
 from harvey.models.company import Company
 from harvey.signals import sync_vocabulary
 from tests.test_collectors_profile import state  # noqa: F401  (fixture)
-from tests.test_company_inbox import make_scout
 
 
 def collector():
@@ -155,78 +149,6 @@ def test_romanian_booking_wording(html):
 ])
 def test_no_booking_wording(html):
     assert not ProfileCollector._any(html, BOOKING_HINTS)
-
-
-# ── inbox ──
-
-@pytest.mark.asyncio
-async def test_practice_mailbox_beats_front_desk():
-    pages = {"https://acme.com": "programari@acme.com receptie@acme.com contact@acme.com",
-             "https://acme.com/contact": "cabinet@acme.com"}
-    assert await make_scout(pages)._find_inbox_address("acme.com") == "cabinet@acme.com"
-
-
-@pytest.mark.asyncio
-async def test_front_desk_inbox_is_used():
-    pages = {"https://acme.com": "Dr. Ana Pop: ana.pop@acme.com, programari@acme.com"}
-    assert await make_scout(pages)._find_inbox_address("acme.com") == "programari@acme.com"
-
-
-@pytest.mark.asyncio
-async def test_pharmacy_mailbox_beats_front_desk():
-    pages = {"https://acme.com": "programare@acme.com info@acme.com farmacia@acme.com"}
-    assert await make_scout(pages)._find_inbox_address("acme.com") == "farmacia@acme.com"
-
-
-@pytest.mark.asyncio
-async def test_singular_booking_inbox_is_used():
-    pages = {"https://acme.com": "Dr. Ana Pop: ana.pop@acme.com, programare@acme.com"}
-    assert await make_scout(pages)._find_inbox_address("acme.com") == "programare@acme.com"
-
-
-def test_english_inbox_order_is_unchanged():
-    english = [a for a in INBOX_PREFERRED if a in (
-        "owner", "office", "info", "contact", "contactus", "hello", "team", "service",
-        "sales", "estimates", "quotes", "inquiries", "enquiries", "admin", "support")]
-    assert english == ["owner", "office", "info", "contact", "contactus", "hello", "team",
-                       "service", "sales", "estimates", "quotes", "inquiries", "enquiries",
-                       "admin", "support"]
-
-
-# ── fallback pages ──
-
-def fetch_recorder(domain):
-    """A Scout whose homepage links nowhere, recording every page it requests."""
-    scout = Scout.__new__(Scout)
-    base, requested = f"https://{domain}", []
-
-    async def resolve(d, retries=1):
-        return base, SimpleNamespace(text="<html><body>Bine ați venit</body></html>", url=base)
-
-    async def fetch(url, **kw):
-        requested.append(url)
-        return None
-
-    scout._resolve_base_url = resolve
-    scout._fetch = fetch
-    return scout, base, requested
-
-
-@pytest.mark.asyncio
-async def test_english_site_fallback_requests_are_unchanged():
-    scout, base, requested = fetch_recorder("acme.com")
-    await scout._read_site("acme.com")
-    assert requested == [f"{base}{p}" for p in FALLBACK_SITE_PATHS]
-
-
-@pytest.mark.asyncio
-async def test_romanian_site_tries_romanian_pages_first():
-    scout, base, requested = fetch_recorder("clinica-exemplu.ro")
-    await scout._read_site("clinica-exemplu.ro")
-    assert requested == [f"{base}{p}" for p in (
-        "/despre-noi", "/echipa", "/contact",
-        "/about", "/about-us", "/team", "/our-team", "/contact-us")]
-    assert len(requested) + 1 <= MAX_SITE_FETCHES     # + the homepage
 
 
 async def team_requests(state, domain):  # noqa: F811

@@ -44,8 +44,9 @@ MIGRATION_TIMEOUT_SECONDS = 900.0
 # Email statuses the Writer drafts for. Shared with the heartbeat so it only
 # chooses write_campaign when there is something the Writer will act on.
 WRITABLE_EMAIL_STATUSES = ("verified", "risky")
-# Contacts Scout scored below this are kept, ranked last, but not written to.
-# A score of 0 means never scored (Hunter, LinkedIn, imports): still written.
+# Prospects scored below this when they were found are kept, ranked last, but
+# not written to. A score of 0 means never scored (the contact finder's
+# contacts, imports): still written.
 LOW_SCORE = 30
 
 
@@ -1928,13 +1929,13 @@ def _statements(script: str):
         yield pending
 
 
-# What an install that predates modules has on file from the parts of Scout
-# that ran with no switch: each module listed here stays on through the
+# What an install that predates modules has on file from the parts of the
+# old prospecting agent that ran with no switch: each module listed here stays on through the
 # upgrade when its query finds a row (switches.upgrade_enabled).
 _MODULE_TRACES = {
-    # Companies found by Scout's search-engine reading, or its G2/Clutch scan.
+    # Companies found by search-engine reading, or a G2/Clutch scan.
     "web_search_scrape": "SELECT 1 FROM companies WHERE source IN ('web_search', 'directory')",
-    # Tools detected on a site (Scout's tech note in email personalization).
+    # Tools detected on a site.
     "web_marketing": "SELECT 1 FROM companies WHERE COALESCE(tech_stack_json, '[]') "
                      "NOT IN ('', '[]')",
     # Open roles from a careers page, or contacts from the job-board sweep.
@@ -4271,17 +4272,6 @@ class StateManager:
                 (after,) = await cur.fetchone()
             await db.commit()
         return after - before
-
-    async def mark_prospects_checked(self, company_id: str):
-        """Record that a prospect-backfill pass looked at this company,
-        whether or not it found anyone — advances the rotation regardless."""
-        async with self._connect() as db:
-            await db.execute(
-                """UPDATE companies SET prospects_checked_at = CURRENT_TIMESTAMP,
-                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                (company_id,),
-            )
-            await db.commit()
 
     # ── Run log (what ran, when, what it produced and cost) ──
 

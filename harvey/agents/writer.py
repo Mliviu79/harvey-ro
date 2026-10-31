@@ -78,8 +78,8 @@ class Writer:
             p for p in new_prospects
             if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
         ]
-        # Scout keeps poorly scored contacts on file, ranked last; they are
-        # not worth a cold email.
+        # Contacts scored poorly when they were found (older prospects) stay
+        # on file, ranked last; they are not worth a cold email.
         prospects_with_email = [p for p in prospects_with_email if not poorly_scored(p.score)]
         # Someone at their company already replied: no cold email to write.
         prospects_with_email = [

@@ -291,7 +291,7 @@ async def test_waiting_for_a_page_slot_is_not_charged_to_the_page(monkeypatch):
     monkeypatch.setattr(browser, "RENDER_BUDGET_S", 0.3)
     browser._SLOTS.clear()
     site = Site((200, RENDERED, None), delay=0.2)
-    # Two readers (the profile collector and Scout) share the slot.
+    # Two readers share the slot.
     r1, _ = renderer_with({"http://obscura:9230": site}, TWO[:1])
     r2, _ = renderer_with({"http://obscura:9230": site}, TWO[:1])
     pages = await asyncio.gather(*(r.render(f"{PUBLIC}/{i}") for i, r in enumerate((r1, r2, r1))))
@@ -441,33 +441,3 @@ async def test_profile_collector_renders_a_challenged_site_and_clears_the_challe
     assert "clinica.test" not in c.challenged
 
 
-@pytest.mark.asyncio
-async def test_scout_renders_a_challenged_homepage():
-    from harvey.agents.scout import Scout
-    scout = Scout.__new__(Scout)
-    scout._challenged = set()
-
-    async def fake_fetch(url, **kwargs):
-        scout._challenged.add(scout._host(url))     # what _fetch does on a challenge
-        return None
-    scout._fetch = fake_fetch
-    scout.__dict__["_page_reader"] = FakeReader()
-    base, resp = await scout._resolve_base_url("clinica.test")
-    assert base == "https://clinica.test" and resp.text == RENDERED
-    assert not scout.challenged("clinica.test")
-    await scout.close_browser()
-    assert "_page_reader" not in scout.__dict__
-
-
-@pytest.mark.asyncio
-async def test_scout_dead_site_is_never_rendered():
-    from harvey.agents.scout import Scout
-    scout = Scout.__new__(Scout)
-    scout._challenged = set()
-
-    async def fake_fetch(url, **kwargs):
-        return None                                  # DNS / connection failure
-    scout._fetch = fake_fetch
-    reader = scout.__dict__["_page_reader"] = FakeReader()
-    assert await scout._resolve_base_url("gone.test") == ("", None)
-    assert reader.asked == []

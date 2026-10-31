@@ -734,6 +734,18 @@ minor versions can still change behaviour.
   Counts and exports include every match; pages use a stable name/id SQL order.
   CSV downloads carry dashboard authorization and escape spreadsheet formulas.
 
+### Removed
+
+- **The old prospecting code the contact finder replaced.** Nothing called it
+  any more: the Scout agent (`harvey/agents/scout.py`: its search-engine,
+  Hunter, LinkedIn, job-board and company-website strategies and its contact
+  scoring), the DISCOVER → PROFILE chain in `harvey/pipeline.py`, the
+  in-process ANAF follow-up of a registry pull (the pull queues ANAF check
+  jobs instead) and the in-process automatic update of public datasets (the
+  worker queues them). The module switches, `.env` keys and signals those
+  strategies used are all still there; what Harvey does is unchanged. Two
+  messages that said Scout would find people now say how contacts are found.
+
 ## [0.3.0] — 2026-10-13
 
 ### Added

@@ -477,14 +477,6 @@ async def email_pattern(store, domain: str, **found) -> None:
     await store.save_email_pattern(domain, **found)
 
 
-async def company_notes(store, company_id: str, tech_stack=None, new_signals=None) -> None:
-    """Tools seen on a site and timely triggers (a careers page's roles), on
-    the company's own record, beside what it had."""
-    found = {k: v for k, v in (("tech_stack", tech_stack), ("new_signals", new_signals))
-             if v is not None}
-    await store.update_company_signals(company_id, **found)
-
-
 async def place(store, key: str, point: str) -> None:
     """Where a place is ("-" for a place that can't be found), kept for
     good so it is asked once."""
@@ -576,15 +568,6 @@ async def learned_pattern(store, domain: str, learned: dict) -> None:
                                 is_catch_all=1)
         except Exception:
             pass
-
-
-async def found_company(store, record: Record) -> Saved:
-    """A company a contact search found (its site, a job post): through the
-    resolver, so one already on file under another key is joined, not
-    duplicated. What is found for it later is found for ``origin``, the
-    record before any merge, so undoing the merge takes that back too."""
-    result = await store.save_company(company_from(record))
-    return Saved(result.company_id, result.origin or result.company_id, result.created)
 
 
 async def person_contacts(store, company_id: str, person: str, role: str, found,

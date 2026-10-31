@@ -37,7 +37,7 @@ RENDER_BUDGET_S = 35.0          # one page, navigation and settle included
 SETTLE_MIN_S, SETTLE_MAX_S, SETTLE_POLL_S = 0.6, 4.0, 0.3
 MAX_HTML_CHARS = 2_000_000
 # Pages one browser renders at once, across every reader in the process
-# (the profile collector and Scout each have one). Obscura runs each page's
+# (each site reader has one). Obscura runs each page's
 # JavaScript on its own thread and slows down well before Chromium does.
 PAGES_PER_BROWSER = 3
 # Set by docker-compose.yml for the harvey service: the obscura service's

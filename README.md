@@ -483,8 +483,8 @@ Cities geocode themselves (cached forever, one lookup each). Directories, aggreg
 
 **Free.** Three HTTP requests per business. No browser, no model call. This is the highest value-per-effort stage in the whole system, because it produces the facts that make an email specific.
 
-Website requests from Scout, Profile, and the local training crawler are limited
-to public HTTP(S) destinations. Every DNS answer and redirect is checked; local,
+Website requests from the site reader (profiling and the contact finder) and the
+local training crawler are limited to public HTTP(S) destinations. Every DNS answer and redirect is checked; local,
 private, link-local, and metadata addresses are rejected. Connections use a
 validated IP while preserving the website's TLS identity. These website clients
 ignore environment proxies, so proxy routing cannot bypass that boundary.
@@ -495,22 +495,15 @@ Agency detection is the compounding one. Almost every agency credits itself in t
 
 ### 3. ENRICH — who decides
 
-The owner, from the company's own site. Harvey reads the homepage and follows the site's own menu to the pages where people are named — team, about, our story, meet the dentists, attorneys, contact — six pages at most, skipping links that land back on the homepage. On those pages it reads:
+The people a company's own site names. The site read looks for a team page at the usual paths (`/team`, `/about`, `/about-us`, `/our-team`, `/staff`…; on a `.ro` site `/echipa`, `/echipa-noastra`, `/medici` and `/despre-noi` first) and reads the names on the first one it finds: a name in a heading with its title after it, or a name on one line with its title on the next ("Dale Whitlock<br>Owner and CEO" in a span), twelve people at most. Headings made of ordinary words ("Team of Experts"), customers quoted in testimonials ("Founder at Quillnest") and titles that belong to another organisation are not people. A registry pull adds the registry's administrators. Everyone named, with no email or phone of their own, is a person to search (**People to search** on Contacts), and the [contact finder](#the-contact-finder) checks one address for each, up to three per company per search.
 
-- **cards and lists**: a name with a title under it, even when the title is only a `<br>` away inside a span;
-- **sentences**: "owned and operated by Gary Pruitt", "led today by President Ilan Brooks", "Ines Varga started Countwise";
-- **schema.org**: the business's own `founder` and `employee` entries (a blog post's author is not staff);
-- **the name on the door**: when two people both have owner titles, the one whose surname is in the business name comes first. A surname alone never makes anyone the owner: Linda Smith, Office Manager, at Smith & Sons isn't one.
-
-Owners rank first, and at most two people per company become prospects. Headings made of ordinary words ("Team of Experts"), customers quoted in testimonials or tweets ("Founder at Quillnest"), other organisations' officers ("KTR President Vic Hale"), former or late owners ("Past President", "the late Harold Smith"), and taglines are not people. Titles match your ICP by whole word: "Vice President" doesn't count as "President" unless you list it, and Proprietor, Principal, Managing Partner, Founder and CEO all count as an owner. With `LIKELY_OWNER` confirmed, each owner is recorded as an observation with the evidence that says so.
-
-When a company's site names nobody, or names an owner whose address is only a guess, and Harvey has no contact there yet — common for small trades — it also uses a general address the company prints on its own pages (only general mailboxes such as `owner@`, `office@`, `info@` or `hello@`, never a person's own address). Harvey reads whole pages for it, including schema.org and addresses hidden from scrapers, and accepts an address on another domain only when that domain leads to the company's own site. It is never guessed, it is verified like any other address, and those emails greet the company's team instead of a first name.
+The same read keeps the addresses the site publishes (one on the company's own domain is trusted, another only maybe), its contact form and the social profiles it links to. While the Email module is on, a general address the company publishes (`office@`, `info@`) can become a prospect too, checked first like any other, and those emails greet the company's team instead of a first name.
 
 A site behind a bot challenge (SiteGround's "sgcaptcha", Cloudflare's "Just a moment…") is reported as challenged, not unreachable, and isn't retried.
 
 ### 4. VERIFY — can you reach them
 
-Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Any address the site publishes can teach it: `nvale@` next to Nora Vale is `{first initial}{last}`, and `j.smith@` is an initial and surname. A lone dotless address no named person owns (`kmorrow@`: Kmorrow, or K. Morrow?) is ambiguous and teaches nothing. An address two named people could own (`jsmith@` when John and Jane Smith both work there) is format evidence only, and Harvey never guesses or verifies an address another named person could own: a verifier would confirm *their* mailbox. It decodes the usual hiding tricks (Cloudflare email protection, a mail link's `data-user`/`data-domain` attributes, `name [at] domain [dot] com`) and never invents an address from ordinary text. A person's own published address is used as is. With no evidence at all, it guesses `first.last@`, or `first@` when something besides the website says the company is small (your ICP's company size, or a local-business listing as its source). A cached guess never stops a real address or a Hunter lookup from replacing it, and Hunter is asked once per domain (a timeout or rate limit doesn't count). Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
+Harvey checks one address per person rather than brute-forcing name variations. The address is built from the company's **address pattern**: the one learned for that domain before, else a free Hunter domain lookup (asked once per domain; a timeout or rate limit doesn't count, and a cached guess never stops it), else `first.last@`. A registry name can be written either way round, so neither order is assumed (see [the contact finder](#the-contact-finder)). Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
 
 Every address is tagged honestly: `verified` / `risky` (catch-all) / `guess` / `invalid`. **Only deliverable ones are ever sent to.** A guess is never treated as a win.
 
@@ -553,7 +546,7 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 ### Which agent gets which
 
-Defined in `harvey/brain.py` — edit the map to change it.
+Defined in `harvey/brain.py` — edit the map to change it. No agent loads the Scout and LinkedIn columns now (the prospecting agent that did was replaced by the contact finder); they stay in the map until it's decided what those skills are for.
 
 | Skill | Scout | Writer | Handler | Sender | LinkedIn |
 |---|:-:|:-:|:-:|:-:|:-:|
@@ -575,11 +568,11 @@ Adding a skill: write the file, add its name to `skill_map` in `harvey/brain.py`
 
 ## The sub-agents
 
-Harvey feels like one agent. Underneath it's five, each loaded with different skills.
+Harvey feels like one agent. Underneath, the heartbeat runs these, each loaded with different skills. None of them looks for people: the [contact finder](#the-contact-finder) does, as background jobs.
 
 | Agent | What it does |
 |---|---|
-| **Scout** | Scores and personalizes what the collectors found. Python does the searching and the email resolution; the selected model is used only where judgment is actually needed — which is what keeps the token cost sane. |
+| **Audience** | Each cycle, turns the email contacts the contact finder found into prospects the Writer can use (not do-not-contact, trust confirmed or likely); an address nobody checked yet is checked first. No model call. |
 | **Writer** | Generates 3-email sequences. Email 1 under 75 words, email 2 under 75, email 3 under 40. Hard ban list on AI-sounding language. |
 | **Sender** | Renders merge variables per prospect and stages each email into the outbox with a send time. Drains due and approved items with human-like pacing, enforcing the daily cap and stop-on-reply: a reply from anyone at a company stops the sequence to everyone there. |
 | **Handler** | Polls for replies, dedups them, classifies intent, advances the conversation stage, and queues responses through the same approval ladder. Detects bounces, marks the address invalid, cancels that prospect's queued sends, and trips a global kill switch past a bounce-rate threshold. |
@@ -970,8 +963,8 @@ are off is refused, naming them, and one that an enabled module requires
 can't be turned off. Off means hidden, never deleted: its signals leave
 Semnale, the signal pickers and collection (their observations stay), its
 discovery sources and presets are refused with an error that names the
-module, Scout skips its strategies (saying so once per cycle in the log and
-Activity), Hunter and the verifiers aren't called, and Settings stops offering
+module, the contact finder stops using its searches, Hunter and the verifiers
+aren't called, and Settings stops offering
 its `.env` keys that are empty (one that holds a value stays editable). The signal vocabulary itself comes from the manifests of the modules
 that are on. On an install that predates modules, a module that ships off
 stays on if one of its `.env` keys is set (a search or enrichment provider
@@ -1128,14 +1121,14 @@ harvey/
 ├── codex.py             # Isolated Codex subscription runtime
 ├── state.py             # SQLite schema, migrations, observations, cohorts
 ├── signals.py           # the 23-signal catalog Harvey proposes
-├── pipeline.py          # DISCOVER → PROFILE chaining
+├── finder.py            # the contact finder (one company per job)
 ├── gate.py              # deterministic pre-send checks
 ├── dashboard.py         # FastAPI JSON API
 ├── dashboard_auth.py    # dashboard token, Host/Origin checks
 ├── collectors/
 │   ├── discover.py      # provider adapters, junk filtering, entity resolution
 │   └── profile.py       # the free HTTP profiler
-├── agents/              # scout, writer, sender, handler, analyst
+├── agents/              # audience, writer, sender, handler, analyst
 ├── modules/             # module manifests and capabilities, the loader, core ingest and runs,
 │                        #   jobs (the queue), worker (lanes, lease), job_kinds
 ├── integrations/        # mail providers, email finder, quota

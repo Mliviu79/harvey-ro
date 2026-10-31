@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from harvey.agents.scout import Scout
 from harvey.collectors.phones import (
     MAX_PHONES, phone_hit, phone_region, phones_from_html,
 )
@@ -346,64 +345,6 @@ async def test_unconfirmed_phone_signal_still_fills_the_company_phone(state, mon
     await _profile(state, {"TECH_STACK"}, [{"id": cid, "domain": "alfa.ro"}], monkeypatch)
     assert _rows(state, "SELECT phone FROM companies") == [("+40 268 000 101",)]
     assert _rows(state, "SELECT * FROM observations WHERE signal_code = 'PHONE_NUMBER'") == []
-
-
-def _scout(state, pages, extra=()):
-    scout = Scout.__new__(Scout)
-    scout.state = state
-    scout.config = _config("RO")
-    scout._site_reads = {"alfa.example": {"pages": list(pages), "extra_pages": list(extra)}}
-    return scout
-
-
-@pytest.mark.asyncio
-async def test_scout_reads_phones_from_pages_it_already_has(state):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.example"))
-    await state.set_signal_status("PHONE_NUMBER", "confirmed")
-    scout = _scout(state, [("https://alfa.example", "<p>Clinica Alfa</p>")],
-                   extra=[("https://alfa.example/contact", "<p>Telefon: 0268 000 120</p>")])
-    await scout._observe_phones(cid, "alfa.example")
-    assert _rows(state, "SELECT phone FROM companies") == [("+40 268 000 120",)]
-    assert _rows(state, "SELECT value_text, evidence_url FROM observations "
-                        "WHERE signal_code = 'PHONE_NUMBER'") == [
-        ("+40268000120", "https://alfa.example/contact")]
-
-
-@pytest.mark.asyncio
-async def test_scout_phone_rows_do_not_count_as_profiled(state):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.example"))
-    await state.set_signal_status("PHONE_NUMBER", "confirmed")
-    scout = _scout(state, [("https://alfa.example", "<p>Telefon: 0268 000 120</p>")])
-    await scout._observe_phones(cid, "alfa.example")
-    assert _rows(state, "SELECT collector FROM observations "
-                        "WHERE signal_code = 'PHONE_NUMBER'") == [("people",)]
-    assert [c["id"] for c in await state.companies_needing_profile()] == [cid]
-
-
-@pytest.mark.asyncio
-async def test_scout_phone_rows_wait_for_confirmation(state):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.example",
-                                          phone="0268 000 150"))
-    scout = _scout(state, [("https://alfa.example", "<p>Telefon: 0268 000 120</p>")])
-    await scout._observe_phones(cid, "alfa.example")
-    assert _rows(state, "SELECT phone FROM companies") == [("0268 000 150",)]
-    assert _rows(state, "SELECT * FROM observations WHERE signal_code = 'PHONE_NUMBER'") == []
-
-
-@pytest.mark.asyncio
-async def test_scout_never_fetches_for_phones(state):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.example"))
-    scout = Scout.__new__(Scout)
-    scout.state = state
-    scout._site_reads = {}
-
-    async def no_fetch(*a, **kw):
-        raise AssertionError("phones must come from pages already read")
-
-    scout._fetch = no_fetch
-    scout._resolve_base_url = no_fetch
-    await scout._observe_phones(cid, "alfa.example")
-    assert _rows(state, "SELECT phone FROM companies") == [("",)]
 
 
 # ── export ──
