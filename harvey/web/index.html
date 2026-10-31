@@ -287,6 +287,15 @@
         <input class="form-input" id="disc-cap" type="number" value="1.00" min="0" step="0.25">
       </div>
     </div>
+    <div class="form-row find-websites">
+      <label class="check-line"><input type="checkbox" id="disc-websites" checked onchange="discoverChanged()">
+        <span data-i18n="disc.websites">Caută și site-urile firmelor găsite fără site, până la</span></label>
+      <div class="form-group">
+        <label class="form-label" for="disc-websites-cap" data-i18n="disc.websites_cap">Pentru site-uri ($)</label>
+        <input class="form-input" id="disc-websites-cap" type="number" value="1.00" min="0" step="0.25" oninput="discoverChanged()">
+      </div>
+      <p class="muted small" id="disc-websites-note" data-i18n="disc.websites_note">Căutările gratuite rulează mereu; cele plătite, doar până la suma aceasta, peste plafonul căutărilor.</p>
+    </div>
     <div id="discover-estimate"></div>
     <div class="btn-group">
       <button class="btn btn-secondary" onclick="estimateDiscovery()" data-i18n="disc.estimate">Estimează costul</button>
@@ -386,6 +395,9 @@
       </label>
     </div>
   </div>
+
+  <div class="subhead" data-i18n="set.background">Căutări în fundal</div>
+  <div class="card" id="finder-bg-card"></div>
 
   <div data-env="REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY">
   <div class="subhead"><span data-i18n="set.verify">Verificarea adreselor de email</span> <span class="hint" data-i18n="set.verify_hint">Recomandat</span></div>

@@ -553,6 +553,10 @@ class DiscoveryProvider:
         so far, results so far, and what the search has cost so far, so the
         money is recorded before the next page is paid for."""
         self.pages += 1
+        # Counted against the module's free allowances as each page comes,
+        # not when the search ends: a long search on another lane would
+        # otherwise leave the background's share unseen meanwhile.
+        await _count_uses(self.key, 1)
         if self.on_page is not None:
             await self.on_page(self.pages, results, self.last_cost)
 
@@ -2394,6 +2398,44 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     return draft
 
 
+async def _count_uses(provider_key: str, requests: int) -> None:
+    """Count a search's requests against its module's free allowances
+    (lanes.count_uses), whoever ran it, so the background knows what is
+    left. Never fails a search."""
+    if not requests:
+        return
+    try:
+        from harvey.modules import lanes
+        from harvey.modules.switches import capability_owner
+
+        module = capability_owner("provider", provider_key)
+        if module and lanes.free_allowances(module):
+            await asyncio.to_thread(lanes.count_uses, module, requests)
+    except Exception as e:
+        logger.debug("discover: %s requests not counted: %s", provider_key, e)
+
+
+def is_discovery_source(provider_key: str) -> bool:
+    """Can Discover run ``provider_key`` to find companies? Only a
+    provider whose module claims it with a query capability: one claimed
+    by a lookup capability (a search whose terms forbid building a list of
+    its results) only finds a known company's website."""
+    from harvey.modules import switches
+
+    for m in switches.manifests():
+        for cap in m.capabilities:
+            if cap.get("provider") == provider_key:
+                return cap.get("op") == "query"
+    return False
+
+
+def _finds_websites(provider_key: str) -> bool:
+    from harvey.modules import switches
+
+    return any(cap.get("provider") == provider_key and cap.get("lookup") == "website"
+               for m in switches.manifests() for cap in m.capabilities)
+
+
 # ── Capabilities (the search modules' and the presets' code) ──
 
 
@@ -2481,6 +2523,10 @@ def provider_menu(env: dict | None = None, enabled: set[str] | None = None) -> l
             "needs_key": bool(p.env_keys),
             "module": capability_owner("provider", p.key) or "",
             "enabled": enabled is None or capability_owner("provider", p.key) in enabled,
+            # Finds a known company's website only: never a Discover source.
+            "lookup_only": not is_discovery_source(p.key),
+            # Finds a company on file by its name (the contact finder's lookup).
+            "website_lookup": _finds_websites(p.key),
         }
         for p in PROVIDERS.values()
     ]

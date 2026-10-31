@@ -19,6 +19,23 @@ wraps = ["harvey.collectors.discover"]
 secrets = []
 terms_note = "A search's results are read once, in memory, to pick the company's website, and never stored (some search providers' terms forbid keeping results). Only the website and what the company's own site publishes are saved."
 
+# The background's walk through the backlog may also look companies with
+# no website up, but only inside the free allowance each search module
+# declares ([[free_allowances]]: TinyFish's a minute and an hour, Brave's
+# monthly credit), never a paid search without spend.per_day_usd. Off: no
+# searches in the background except those a day's budget pays for.
+[settings.background_search]
+type = "bool"
+default = true
+
+# The share of each free allowance the background may take: the rest is
+# kept for your own runs (0.5: half of TinyFish's 30 a minute).
+[settings.background_share]
+type = "float"
+default = 0.5
+min = 0.05
+max = 1.0
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0

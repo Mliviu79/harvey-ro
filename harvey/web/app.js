@@ -512,7 +512,7 @@ function loadCurrentTab() {
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModulesCard(); if (_modules.email) loadSendingModeCard(); break;
+    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); if (_modules.email) loadSendingModeCard(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -1593,7 +1593,10 @@ async function loadDiscoverProviders() {
   _discData = data;
 
   // A source or preset whose module is off isn't offered (Surse turns it on).
-  const providers = data.providers.filter(p => p.enabled !== false);
+  // A lookup-only search (Brave) finds a known company's website: never a
+  // source here, only one of the searches "find websites" goes through.
+  const providers = data.providers.filter(p => p.enabled !== false && !p.lookup_only);
+  renderWebsiteFinders(data.providers.filter(p => p.enabled !== false && p.website_lookup));
   const jobbed = (data.sources || []).filter(s => s.enabled !== false);
   const known = new Set(providers.map(p => p.key).concat(jobbed.map(s => s.key)));
   if (_sources === null) {
@@ -1632,6 +1635,23 @@ async function loadDiscoverProviders() {
   renderActiveRuns(data.active_runs || []);
   const shown = (data.active_runs || []).some(r => data.last_report && r.batch_id === data.last_report.batch_id);
   renderDiscoverResult(shown ? null : data.last_report, running && !(data.active_runs || []).length);
+}
+
+// The searches "find websites" can go through, under its checkbox.
+function renderWebsiteFinders(finders) {
+  const el = document.getElementById('disc-websites-note');
+  if (!el) return;
+  const names = finders.map(p => tServer('prov.' + p.key + '.label', p.label) + ' (' +
+    (p.configured ? (p.cost_note ? tServer('prov.' + p.key + '.cost_note', p.cost_note) : t('runs.free'))
+                  : t('disc.needs_key')) + ')');
+  el.textContent = t('disc.websites_note') + ' ' +
+    (names.length ? t('disc.websites_via', {names: names.join(', ')}) : t('disc.websites_none'));
+}
+
+// Anything changed on the form: estimate again before running.
+function discoverChanged() {
+  document.getElementById('disc-run').disabled = true;
+  document.getElementById('disc-run').textContent = t('disc.estimate_first');
 }
 
 function toggleSource(key, on) {
@@ -1701,6 +1721,10 @@ function discoverBody() {
     // 0 is a cap of nothing (free sources only); blank, the $1 default.
     max_spend: discoverCap(document.getElementById('disc-cap').value),
     preset: (document.getElementById('disc-preset') || {}).value || '',
+    // Also look up a website for each company found with none: free
+    // searches always, paid ones up to this amount, on top of the cap.
+    find_websites: !!(document.getElementById('disc-websites') || {}).checked,
+    websites_max_spend: discoverCap((document.getElementById('disc-websites-cap') || {}).value),
   };
 }
 
@@ -1742,6 +1766,7 @@ async function estimateDiscovery() {
     ((data.notes || []).length ? '<div class="test-result" style="margin-top:8px">' +
       (data.notes || []).map(n => escHtml(t('disc.left_out', {why: n}))).join('<br>') + '</div>' : '') +
     (over ? '<div class="test-result error" style="margin-top:12px">' + escHtml(t('disc.over_cap')) + '</div>' : '') +
+    websitesEstimate(data.find_websites) +
     perSource +
     '<div class="query-list">' +
       data.queries.slice(0, 40).map(escHtml).join('<br>') +
@@ -1753,6 +1778,18 @@ async function estimateDiscovery() {
   btn.disabled = false;
   btn.textContent = data.free ? t('disc.run_free')
     : t('disc.run_paid', {cost: fmtUsd(Math.min(data.estimated_cost, cap), 2)});
+}
+
+// What "find websites" would use, in the estimate: its amount, what a paid
+// lookup costs, and the free searches that always run.
+function websitesEstimate(w) {
+  if (!w || !w.enabled) return '';
+  const name = (m) => tServer('module.' + m + '.name', m);
+  const parts = [t('disc.websites_up_to', {cap: fmtUsd(w.max_spend || 0, 2)})];
+  if (w.per_lookup) parts.push(t('disc.websites_paid', {cost: fmtUsd(w.per_lookup, 4), n: fmtN(w.paid_lookups || 0)}));
+  if ((w.free || []).length) parts.push(t('disc.websites_free', {names: w.free.map(name).join(', ')}));
+  if (!(w.searchers || []).length) parts.push(t('disc.websites_none'));
+  return '<div class="muted small" style="margin-top:6px">' + parts.map(escHtml).join(' &middot; ') + '</div>';
 }
 
 async function runDiscovery() {
@@ -1820,7 +1857,12 @@ function renderActiveRuns(runs) {
     }).join('');
     const finder = (r.contacts_found || r.finder_waiting)
       ? '<p class="muted small">' + escHtml(t('disc.finder_progress', {n: fmtN(r.contacts_found || 0), w: fmtN(r.finder_waiting || 0)})) + '</p>' : '';
-    return '<div class="card run-card">' + head + (rows ? '<table class="data"><tbody>' + rows + '</tbody></table>' : '') + finder + '</div>';
+    const w = r.websites;
+    const websites = w && (w.looked_up || w.waiting)
+      ? '<p class="muted small">' + escHtml(t('disc.websites_progress', {
+          n: fmtN(w.looked_up || 0), found: fmtN(w.found || 0), w: fmtN(w.waiting || 0),
+          spent: fmtUsd(w.spent || 0, 4), cap: fmtUsd(w.max_spend || 0, 2)})) + '</p>' : '';
+    return '<div class="card run-card">' + head + (rows ? '<table class="data"><tbody>' + rows + '</tbody></table>' : '') + finder + websites + '</div>';
   }).join('');
 }
 
@@ -3921,7 +3963,53 @@ async function loadFinderStatus() {
     ' &middot; ' + escHtml(t('finder.last_day', {n: fmtN((s.last_day || {}).companies || 0),
                                                  found: fmtN((s.last_day || {}).found || 0)})) +
     (waiting ? ' &middot; ' + escHtml(t('finder.waiting', {n: fmtN(waiting)})) : '') +
-    (s.day_budget ? '' : ' &middot; ' + escHtml(t('finder.no_budget'))) + '</p>';
+    (s.day_budget ? '' : ' &middot; ' + escHtml(t('finder.no_budget'))) + '</p>' +
+    backgroundSearchLine(s.background_search, s.no_website || 0);
+}
+
+// The background's website searches inside free allowances, beside the
+// backlog: on or off, and each search's period counts.
+function backgroundSearchLine(bg, noSite) {
+  if (!bg) return '';
+  if (!bg.on) return '<p class="muted small finder-status">' + escHtml(t('finder.bg_off')) + '</p>';
+  const name = (m) => tServer('module.' + m + '.name', m);
+  const per = (p) => t('finder.per.' + p);
+  const rows = (bg.searchers || []).map(x => name(x.module) + ': ' +
+    Object.keys(x.allowance || {}).map(p => t('finder.bg_used', {used: fmtN((x.used || {})[p] || 0),
+      of: fmtN(x.allowance[p]), per: per(p)})).join(', ') +
+    ' (' + t('finder.bg_left', {n: fmtN(x.left || 0), d: fmtN((x.last_day || {}).searches || 0),
+                                found: fmtN((x.last_day || {}).found || 0)}) + ')');
+  return '<p class="muted small finder-status">' + escHtml(t('finder.bg', {n: fmtN(noSite),
+    share: Math.round((bg.share || 0) * 100)})) + ' ' +
+    (rows.length ? rows.map(escHtml).join(' &middot; ') : escHtml(t('finder.bg_none'))) + '</p>';
+}
+
+// Settings: the background's searches inside free allowances (on or off,
+// and its share of each allowance).
+async function loadFinderBgCard() {
+  const el = document.getElementById('finder-bg-card');
+  if (!el) return;
+  const s = await api('/api/contacts/finder');
+  const bg = (s && s.background_search) || {on: true, share: 0.5};
+  el.innerHTML = '<div class="module-row"><div class="module-text">' +
+      '<h3>' + escHtml(t('set.bg_title')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('set.bg_desc')) + '</p>' +
+      '<label class="pd-setting">' + escHtml(t('set.bg_share')) +
+        ' <input type="number" id="finder-bg-share" min="5" max="100" step="5" value="' +
+        escHtml(String(Math.round((bg.share || 0.5) * 100))) + '" onchange="setFinderBg({background_share: Number(this.value) / 100})"> %</label>' +
+    '</div><label class="switch"><input type="checkbox" id="finder-bg-on"' + (bg.on ? ' checked' : '') +
+      ' onchange="setFinderBg({background_search: this.checked})">' +
+      '<span class="track" aria-hidden="true"><span class="thumb"></span></span>' +
+      '<span class="switch-label">' + escHtml(t(bg.on ? 'mod.on' : 'mod.off')) + '</span></label></div>';
+}
+
+async function setFinderBg(change) {
+  const res = await api('/api/contacts/finder/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(change),
+  });
+  showToast(res && res.success ? t('set.bg_saved') : failMsg(res, t('set.bg_failed')),
+            res && res.success ? 'success' : 'error');
+  loadFinderBgCard();
 }
 
 let _finder = null;

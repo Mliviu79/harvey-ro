@@ -1612,7 +1612,8 @@ def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
     from harvey.config import load_config, load_env
-    from harvey.collectors.discover import PROVIDERS, build_queries, preset_problem, provider_menu
+    from harvey.collectors.discover import (PROVIDERS, build_queries, is_discovery_source,
+                                            preset_problem, provider_menu)
     from harvey.modules import switches
     from harvey.modules.runs import run_discovery
 
@@ -1625,6 +1626,8 @@ def cmd_discover(args):
                 mark = "ready" if m["configured"] else "needs setup"
                 if not m["enabled"]:
                     mark = f"off: harvey modules enable {m['module']}"
+                if m.get("lookup_only"):
+                    mark += "; website lookups only, not a Discover source"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
                 print(f"    Cost: {m['cost_note']}")
@@ -1641,6 +1644,11 @@ def cmd_discover(args):
             if key not in PROVIDERS:
                 print(f"\n  Unknown provider {key!r}. See: harvey discover --providers\n")
                 return
+            if not is_discovery_source(key):
+                from harvey.modules.job_kinds import lookup_only_message
+
+                print(f"\n  {lookup_only_message(key)}.\n")
+                raise SystemExit(2)
             off = switches.discovery_problem(enabled, key, getattr(args, "preset", "") or "")
             if off:
                 print(f"\n  {off}\n")
@@ -1712,6 +1720,23 @@ def cmd_discover(args):
             sys.exit(2)
         print(f"\n  Estimated cost: ${total:.4f}   (cap: ${args.max_spend:.2f}"
               f"{', shared by every source' if len(plan) > 1 else ''})")
+        find_websites = (None if getattr(args, "no_find_websites", False)
+                         or getattr(args, "no_profile", False)
+                         else getattr(args, "websites_max_spend", 0.0))
+        if find_websites is not None:
+            from harvey import finder
+
+            found = finder.searchers(enabled, load_env().model_dump())
+            free = sorted({s.module for s in found if s.estimate <= 0})
+            paid = [s for s in found if s.estimate > 0]
+            print(f"  Websites for companies found with none: up to ${find_websites:.2f} of "
+                  "paid searches"
+                  + (f" (from ${min(s.estimate for s in paid):.4f} a lookup)" if paid else "")
+                  + (f"; free through {', '.join(free)}" if free else "")
+                  + ("" if found else "; no search module that finds a website is set up"))
+            if find_websites:
+                print(f"  Run's cap, searches and websites together: "
+                      f"${args.max_spend + find_websites:.2f}")
         if total > args.max_spend:
             print(f"  More than the cap: the run stops when ${args.max_spend:.2f} is "
                   "spent and says what was left.")
@@ -1726,6 +1751,7 @@ def cmd_discover(args):
         try:
             batch_id, ids, dupes = await enqueue_sources(
                 state, plan, max_spend=args.max_spend, read_sites=not args.no_profile,
+                find_websites=find_websites,
                 label=" + ".join(PROVIDERS[part["provider"]].label for part in plan))
         except jobs.Duplicate as e:
             print(f"\n  {e}\n")
@@ -1752,6 +1778,17 @@ def cmd_discover(args):
             print(f"    {r['excluded']} skipped — on your do-not-contact list")
         print(f"    {r.get('observations', 0)} observations recorded")
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
+        looking = [j for j in found if j.kind == "find_contacts"
+                   and j.params.get("pool") == "websites"]
+        if looking:
+            print(f"    websites looked up for {len(looking)} companies found with none: "
+                  f"{sum(1 for j in looking if (j.result or {}).get('website'))} found, "
+                  f"${sum(float(j.actual_cost or 0) for j in looking):.4f}")
+        batch = await jobs.get_batch(state, batch_id) or {}
+        deferred = int((batch.get("params") or {}).get("websites_deferred") or 0)
+        if deferred:
+            print(f"    {deferred} more companies with no website are left to the background "
+                  "search")
         limited = [j for j in searches if j.status == jobs.PAUSED
                    and j.paused_reason == jobs.SPEND_LIMIT]
         if r.get("stopped"):
@@ -1885,7 +1922,8 @@ def cmd_jobs(args):
                 said = "queued again, from where it got to"
             else:
                 if args.max_spend is not None and job.batch_id:
-                    await jobs.set_batch_cap(state, job.batch_id, args.max_spend)
+                    await jobs.set_batch_cap(state, job.batch_id, args.max_spend,
+                                             pool=(job.params or {}).get("pool") or "")
                     for other in await jobs.list_jobs(state, statuses=(jobs.PAUSED,),
                                                       batch_id=job.batch_id, limit=100000):
                         if other.id != job.id and other.paused_reason == jobs.SPEND_LIMIT:
@@ -2601,6 +2639,12 @@ def main():
                           "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't look for contacts at what was found (reading sites is free)")
+    sub.add_argument("--websites-max-spend", type=_dollars, default=0.0,
+                     help="Also look up a website for each company found with none: free "
+                          "searches always, paid ones up to this many dollars, on top of "
+                          "--max-spend (default: 0, free searches only)")
+    sub.add_argument("--no-find-websites", action="store_true",
+                     help="Don't look up websites for the companies found with none")
     _background_arg(sub)
     sub.set_defaults(func=cmd_discover)
 

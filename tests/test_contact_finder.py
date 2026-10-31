@@ -923,11 +923,12 @@ def test_a_discover_cap_of_0_is_0_and_blank_is_the_default(client, monkeypatch):
                         lambda body, config, provider="": [D.DiscoveryQuery(term=body["term"],
                                                                              location="Iasi")])
     monkeypatch.setattr("harvey.config.load_config", lambda *a, **k: None)
+    # (Without "find websites": its amount would be added to the batch's cap.)
     zero = client.post("/api/discover/run", json={"providers": ["serper"], "term": "dentist",
-                                                  "max_spend": 0})
+                                                  "max_spend": 0, "find_websites": False})
     assert zero.status_code == 200, zero.text
     blank = client.post("/api/discover/run", json={"providers": ["serper"], "term": "roofer",
-                                                   "max_spend": ""})
+                                                   "max_spend": "", "find_websites": False})
     assert blank.status_code == 200, blank.text
     assert _rows(client.db_path, "SELECT max_spend FROM job_batches ORDER BY rowid") == [
         (0.0,), (1.0,)]

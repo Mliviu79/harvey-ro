@@ -40,9 +40,16 @@ REQUIRED = ("id", "set", "kind", "version", "api")
 # The manifest keys a data pack may use: everything else either names code,
 # reads a key, or claims what another module does.
 PACK_KEYS = {*REQUIRED, "name", "description", "markets", "requires",
-             "default_enabled", "terms_note", "attribution", "cost", "signals"}
+             "default_enabled", "terms_note", "attribution", "cost", "signals",
+             "registry_name_order"}
 # How a lane may say its pace: one request every N seconds, or N a second.
 LANE_PACES = ("min_interval_seconds", "max_per_second", "max_per_minute", "max_per_hour")
+# The periods a recurring free allowance renews over ([[free_allowances]]).
+# A one-time credit (a sign-up bonus) is never declared: it doesn't renew.
+ALLOWANCE_PERIODS = ("minute", "hour", "day", "month")
+# How a market's official registers usually write a person's name: a hint
+# only (both orders are tried where it matters), "" when there is none.
+NAME_ORDERS = ("", "given_first", "family_first")
 CAPABILITY_OPS = ("query", "lookup", "read", "sync", "expand", "judge", "action")
 SETTING_TYPES = ("bool", "int", "float", "str", "list")
 ABSENCE_VALUES = ("unknown", "false")
@@ -115,6 +122,11 @@ class Manifest:
     # Kinds of contact the module finds ([[contact_kinds]]): kind, label,
     # channel. The contacts table takes only declared kinds.
     contact_kinds: tuple[dict, ...] = ()
+    # The requests a search module may make free in each period, renewed
+    # every period ([[free_allowances]]: per, requests).
+    free_allowances: tuple[dict, ...] = ()
+    # A market's: how its official registers usually write a name.
+    registry_name_order: str = ""
 
     def summary(self) -> dict:
         """The row ``harvey modules list`` prints."""
@@ -277,6 +289,23 @@ def _check_lanes(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
     return tuple(dict(lane) for lane in raw)
 
 
+def _check_allowances(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(a, dict) for a in raw):
+        problems.append(f"{where}: [[free_allowances]] must be a list of tables")
+        return ()
+    for a in raw:
+        if a.get("per") not in ALLOWANCE_PERIODS:
+            problems.append(f"{where}: a free allowance's per must be one of "
+                            f"{', '.join(ALLOWANCE_PERIODS)}, got {a.get('per')!r}")
+        n = a.get("requests")
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+            problems.append(f"{where}: a free allowance's requests must be a whole number "
+                            f"above 0, got {n!r}")
+    return tuple(dict(a) for a in raw)
+
+
 def _code_files(folder: Path) -> list[str]:
     """Files a data pack must not hold: code, and links (which can point
     anywhere, code included)."""
@@ -401,6 +430,10 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
     official = raw.get("official", False)
     if not isinstance(official, bool):
         problems.append(f"{where}: official must be true or false")
+    order = raw.get("registry_name_order", "")
+    if order not in NAME_ORDERS:
+        problems.append(f"{where}: registry_name_order must be one of "
+                        f"{', '.join(repr(o) for o in NAME_ORDERS)}, got {order!r}")
     texts = {k: raw.get(k, "") for k in ("name", "description")}
     for k, v in texts.items():
         if not isinstance(v, str):
@@ -426,6 +459,8 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         signals=_check_signals(raw.get("signals"), where, problems),
         capabilities=_check_capabilities(raw.get("capabilities"), where, problems),
         contact_kinds=_check_contact_kinds(raw.get("contact_kinds"), where, problems),
+        free_allowances=_check_allowances(raw.get("free_allowances"), where, problems),
+        registry_name_order=order if order in NAME_ORDERS else "",
     )
 
 

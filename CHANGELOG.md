@@ -9,6 +9,32 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Discover finds websites for what it saves with none.** On by default
+  ("Also find websites, up to $X"; `--websites-max-spend`,
+  `--no-find-websites`; `find_websites` / `websites_max_spend` in the API):
+  free searches always run, paid ones draw only from that amount ($0 when
+  the API or CLI names none; the Discover tab's field starts at $1.00),
+  kept apart from the searches' cap inside the same batch, and the estimate
+  and the run's progress show it. A run queues at most what its amount
+  pays for plus 500 free lookups; the rest wait for the background.
+- **Background website searches inside free allowances.** Search modules
+  declare the free allowance they renew each minute, hour, day or month
+  (`[[free_allowances]]`: TinyFish 30 a minute and 500 an hour, Brave 1,000
+  a month, counted over the last 30 days). Harvey counts every request itself, and the backlog's walk takes
+  only its share (half by default) for companies with no website; paid
+  searches still need `spend.per_day_usd`. Settings → Background searches
+  turns it off or changes the share; the Contacts page shows each
+  allowance's use.
+- **Brave Search, as a website finder.** `BRAVE_API_KEY`: the contact
+  finder looks up a company's website by its name and town ($5 per 1,000
+  searches, $5 free a month). Never a Discover source (its terms forbid
+  building a database of its results), and its results are never stored.
+- **Names in either order.** A person's email address no longer assumes a
+  name order: the order the company's own site confirms, else the likelier
+  one (the market pack's `registry_name_order`: family name first for the
+  Romanian registry) and, only if that address is invalid, the other. A
+  hyphenated given name is kept whole in greetings and checked whole first.
+
 - **Discovery takes every result.** A search is no longer one page of 100:
   each source is paged until it has nothing more (DataForSEO Business
   Listings 1,000 a page with its `offset_token`, Serper and Scavio until

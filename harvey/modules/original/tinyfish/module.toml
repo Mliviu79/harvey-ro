@@ -18,6 +18,17 @@ as_of = 2026-10-30
 usd = 0.0
 free_tier = "free with a key, no card"
 
+# Free with a key, renewed every minute and hour: what the background's
+# website lookups take their share of (the contact finder's
+# background_share). The pace below is TinyFish's own code's.
+[[free_allowances]]
+per = "minute"
+requests = 30
+
+[[free_allowances]]
+per = "hour"
+requests = 500
+
 [[lanes]]
 id = "tinyfish"
 max_per_minute = 30

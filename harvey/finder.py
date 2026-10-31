@@ -47,6 +47,7 @@ doesn't stop it, and Scout and the heartbeat don't call it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -318,9 +319,15 @@ class Found:
 
 async def find(state, company_id: str, *, spend: Spend, since: str | None = None,
                batch_id: str = "", config=None, env: dict | None = None,
-               run_id: str = "") -> Found:
+               run_id: str = "", background: bool = False,
+               want_website: bool = False, addresses: bool = True) -> Found:
     """Search one company for every way to reach it (the module docstring's
-    three steps), each written through ingest as it is found."""
+    three steps), each written through ingest as it is found.
+    ``background``: the backlog's walk, which may also search inside the
+    search modules' free allowances (its share of them). ``want_website``:
+    look a company with no website up even when it has a phone (a Discover
+    run's "find websites"). ``addresses`` False: no address is built and
+    checked (a verification credit each), only sites read and searched."""
     from harvey.modules import switches
 
     out = Found(company_id)
@@ -348,15 +355,16 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
             out.people += done.people
             out.trust = verdict(done.draft) if verdict else "confirmed"
         out.website = domain
-    elif not domain and (since or not had_contact):
+    elif not domain and (since or want_website or not had_contact):
         # (Forced, a company with a phone already is looked up too.)
         found = await _look_up(state, company, out, spend=spend, since=since,
                                batch_id=batch_id, enabled=enabled, env=env,
-                               confirmed=confirmed, config=config, run_id=run_id)
+                               confirmed=confirmed, config=config, run_id=run_id,
+                               background=background)
         if found:
             domain = found
     trust = out.trust or floor or "confirmed"
-    if domain and trust != "unconfirmed" and spend.cap:
+    if domain and trust != "unconfirmed" and spend.cap and addresses:
         # (An address built at a domain that may not be the company's would
         # be a guess about someone else's mailbox.)
         await _addresses(state, company, domain, out, trust, spend=spend, since=since,
@@ -394,12 +402,48 @@ def _env() -> dict:
         return {}
 
 
+# ── The background's share of the search modules' free allowances ──
+
+async def background_settings(state) -> tuple[bool, float]:
+    """(whether the backlog's walk searches inside free allowances, the
+    share of each allowance it may take): the contact finder's settings
+    background_search and background_share."""
+    from harvey.modules import switches
+
+    try:
+        s = await switches.module_settings(state, FINDER[0])
+    except Exception:
+        s = {}
+    return bool(s.get("background_search", True)), float(s.get("background_share", 0.5) or 0.0)
+
+
+def free_for_background(module: str, on: bool, share: float) -> int | None:
+    """Searches a module may still make free for the background this
+    period (lanes.free_left over its share), None for a module that
+    declares no free allowance; 0 when the switch is off."""
+    from harvey.modules import lanes
+
+    if not lanes.free_allowances(module):
+        return None
+    return lanes.free_left(module, share) if on and not lanes.held(module) else 0
+
+
+async def free_for_background_now(module: str, on: bool, share: float) -> int | None:
+    """free_for_background off the event loop (its counters sit behind an
+    OS file lock)."""
+    return await asyncio.to_thread(free_for_background, module, on, share)
+
+
 async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, batch_id,
-                   enabled, env, confirmed, config, run_id) -> str:
+                   enabled, env, confirmed, config, run_id, background: bool = False) -> str:
     """Step 2: the company's name and town through each search that can
-    find it, cheapest first, until one gives a website. Returns the domain
-    read, or ""."""
+    find it, cheapest first, until one gives a website. In the background,
+    a search with some of its free allowance left for the background comes
+    first, and costs nothing (its own counters keep the share); one whose
+    free allowance is used runs only when a day's budget can pay for it.
+    Returns the domain read, or ""."""
     from harvey.collectors.discover import TIMEOUT
+    from harvey.modules import lanes
     import httpx
 
     company_id = company["id"]
@@ -411,6 +455,13 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
     if not available:
         out.skipped.append("no search module that can find a company by name is on and set up")
         return ""
+    on, share = False, 0.0
+    if background:
+        on, share = await background_settings(state)
+        free = {s.module: await free_for_background_now(s.module, on, share)
+                for s in available}
+        available = sorted(available, key=lambda s: (not free.get(s.module), s.estimate,
+                                                     s.module, s.capability))
     cap = api.capability(*LOOKUP)
     town = (company.get("location") or "").split(",")[0].strip()
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -418,10 +469,21 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
             async with state._connect() as db:
                 if await searched(db, "company", company_id, s.module, s.capability, since):
                     continue
-            room = await spend.allow(s.estimate)
+            if background and await asyncio.to_thread(lanes.held, s.module):
+                # (It said it can take no more for now: out of credit, a
+                # spent quota, a refused key.)
+                _skip(out, f"{s.module}: said it can take no more searches for now")
+                continue
+            # (Counted again here: the lookup before this one may have used it up.)
+            left = await free_for_background_now(s.module, on, share) if background else None
+            gratis = bool(left)
+            if left is not None and not gratis and not (spend.cap and s.estimate > 0):
+                _skip(out, f"{s.module}: no free searches left for the background for now")
+                continue
+            room = float("inf") if gratis else await spend.allow(s.estimate)
             if room is None:
-                out.skipped.append(f"website search skipped: {spend.refused}")
-                return ""
+                _skip(out, f"website search skipped: {spend.refused}")
+                continue
             point = ""
             if s.coordinates:
                 from harvey.modules.runs import geocode_city
@@ -437,8 +499,10 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
                 draft = await cap(inp, ctx)
             except Exception as e:
                 draft = api.Draft(failed=str(e))
-            await spend.record(draft.cost)
-            out.cost += draft.cost
+            # Inside the free allowance a search costs nothing.
+            cost = 0.0 if gratis else draft.cost
+            await spend.record(cost)
+            out.cost += cost
             if draft.failed is None:
                 out.steps.append(f"search:{s.module}")
             else:
@@ -448,8 +512,12 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
             await state.record_search(
                 "company", company_id, s.module, s.capability, looked_for="website",
                 outcome="error" if draft.failed is not None else "found" if choice else "nothing",
-                found=1 if choice else 0, cost=draft.cost, batch_id=batch_id,
+                found=1 if choice else 0, cost=cost, batch_id=batch_id,
                 detail=draft.failed or (choice[0].domain if choice else ""))
+            if draft.failed is not None and draft.stop:
+                # Out of credit or a refused key: the background leaves it
+                # alone for a while (until when it said, when it did).
+                await asyncio.to_thread(lanes.hold, s.module, draft.values.get("retry_after"))
             if choice is None:
                 if draft.stop:
                     out.skipped.append(f"{s.module}: {draft.stop}")
@@ -475,6 +543,11 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
     return ""
 
 
+def _skip(out: Found, why: str) -> None:
+    if why not in out.skipped:
+        out.skipped.append(why)
+
+
 async def _addresses(state, company: dict, domain: str, out: Found, trust: str, *,
                      spend: Spend, since, batch_id, enabled, env) -> None:
     """Step 3: one checked address for each person at the company reached
@@ -491,28 +564,87 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         cached = None
     cap = api.capability(*EMAIL)
     credits = ingest.Allowance(state)
+    named = await _named_at(state, company_id)
+    twins = _twins(named)
+    searching = {p["id"] for p in people}
+    # Each name read checked once at the company, for whoever it was read
+    # for first: father and son both "Ion Popescu" can't be told apart by
+    # an address, and one mailbox isn't two people's. Kept with whether it
+    # came back invalid: only then may the next reading be tried.
+    checked: dict[str, tuple[str, bool]] = {}
     for person in people:
-        first, last = split_name(person["name"], person.get("source") or "")
-        if not (first and last):
+        source = person.get("source") or ""
+        twin = twins.get(person["id"])
+        if twin is not None and twin["id"] in searching and _official(twin["source"]):
+            # A team page naming the registry's administrator: the registry
+            # entry is searched, in the order the page confirms.
+            await state.record_search("person", person["id"], *EMAIL, looked_for="email",
+                                      outcome="nothing", batch_id=batch_id,
+                                      detail=f"searched as {twin['name']}", origin=company_id)
+            continue
+        if twin is not None and not _official(twin["source"]) and _official(source):
+            orders, confirmed = [contacts.name_orders(twin["name"], twin["source"])[0]], True
+        else:
+            orders, confirmed = contacts.name_orders(person["name"], source), False
+        if not orders:
             await state.record_search("person", person["id"], *EMAIL, looked_for="email",
                                       outcome="nothing", batch_id=batch_id,
                                       detail="no first and last name", origin=company_id)
             continue
-        # A verification credit each, counted against the month's checks
-        # (email_verify's monthly_searches): free tiers run out, and a
-        # cap in dollars can't see them.
-        if await credits.left(EMAIL[0]) <= 0:
-            out.skipped.append("address check skipped: this month's address checks are "
-                               "used (EMAIL_VERIFY_MONTHLY_CHECKS)")
-            return
-        await credits.take(EMAIL[0])
-        ctx = api.Context(env=env, enabled=frozenset(enabled), budget=credits)
-        try:
-            draft = await cap(api.Input(domain=domain, facts={"EMAIL_PATTERN": cached}, extra={
-                "first_name": first, "last_name": last, "verify": True}), ctx)
-        except Exception as e:
-            draft = api.Draft(failed=str(e))
-        await ingest.learned_pattern(state, domain, draft.values.get("email_pattern"))
+        # A hyphenated given name whole first ("anamaria"), then its first
+        # part ("ana") if that comes back invalid.
+        readings = list(dict.fromkeys(
+            r for first, last in orders
+            for r in ((first, last), (contacts.short_given(first), last))))
+        draft, tried, same_as = None, [], ""
+        for first, last in readings:
+            key = _reading_key(first, last)
+            if key in checked:
+                # Read so for someone else already: an invalid answer lets
+                # the next reading be tried, any other ends here (the
+                # other order is never tried in place of the likelier one).
+                who, invalid = checked[key]
+                if invalid:
+                    continue
+                same_as = who
+                break
+            # A verification credit each, counted against the month's checks
+            # (email_verify's monthly_searches): free tiers run out, and a
+            # cap in dollars can't see them. The other order is checked only
+            # when the likelier one comes back invalid.
+            if await credits.left(EMAIL[0]) <= 0:
+                _skip(out, "address check skipped: this month's address checks are "
+                           "used (EMAIL_VERIFY_MONTHLY_CHECKS)")
+                if draft is None:
+                    return
+                break
+            await credits.take(EMAIL[0])
+            ctx = api.Context(env=env, enabled=frozenset(enabled), budget=credits)
+            try:
+                draft = await cap(api.Input(domain=domain, facts={"EMAIL_PATTERN": cached},
+                                            extra={"first_name": first, "last_name": last,
+                                                   "verify": True}), ctx)
+            except Exception as e:
+                draft = api.Draft(failed=str(e))
+            tried.append(f"{first} {last}")
+            await ingest.learned_pattern(state, domain, draft.values.get("email_pattern"))
+            if draft.values.get("email_pattern"):
+                try:
+                    cached = await state.get_email_pattern(domain)
+                except Exception:
+                    pass
+            invalid = draft.failed is None and any(c.status == "invalid"
+                                                   for c in draft.contacts)
+            checked[key] = (person["name"], invalid)
+            if not invalid:
+                break
+        if draft is None:
+            await state.record_search(
+                "person", person["id"], *EMAIL, looked_for="email", outcome="nothing",
+                batch_id=batch_id, origin=company_id,
+                detail=f"read the same as {same_as or checked[_reading_key(*readings[0])][0]}: "
+                       "an address can't tell them apart")
+            continue
         kept = 0
         if draft.failed is None and draft.contacts:
             kept = await ingest.person_contacts(state, company_id, person["name"],
@@ -520,10 +652,70 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
                                                 trust=trust)
         out.contacts += kept
         out.steps.append("address")
+        # The registry text stays the person's name as written; the order
+        # used is said here, and that the company's own site confirmed it.
+        order = f"read as {tried[-1]}" + (" (the company's site names them so)"
+                                          if confirmed else "")
         await state.record_search(
             "person", person["id"], *EMAIL, looked_for="email",
             outcome="error" if draft.failed is not None else "found" if kept else "nothing",
-            found=kept, batch_id=batch_id, detail=draft.failed or "", origin=company_id)
+            found=kept, batch_id=batch_id,
+            detail="; ".join(x for x in (draft.failed or "", order) if x), origin=company_id)
+
+
+async def _named_at(state, company_id: str) -> list[dict]:
+    """Everyone named at a company (to confirm a name's order by)."""
+    async with state._connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, name, source FROM people WHERE company_id = ?",
+                              (company_id,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+def _official(source: str) -> bool:
+    """Is a name from an official source whose market says how it writes
+    names (so its order is a guess a site can settle)?"""
+    return contacts.name_order(source or "") != "given_first"
+
+
+def _reading_key(first: str, last: str) -> str:
+    """A name read as (first, last), as an address would spell it."""
+    return "".join(resolver.fold(first)) + "|" + "".join(resolver.fold(last))
+
+
+def _same_person(official: dict, other: dict) -> bool:
+    """Could a name from elsewhere (a team page) be the official one's
+    person? Two words at least each, every word of the shorter name in the
+    longer one, and the family name the official source most likely wrote
+    (its first word, family name first) among them: "Ion Mihai" isn't
+    POPESCU ION MIHAI."""
+    mine, theirs = set(resolver.fold(official["name"])), set(resolver.fold(other["name"]))
+    words = (official["name"] or "").split()
+    if len(mine) < 2 or len(theirs) < 2 or not words:
+        return False
+    family = words[0] if contacts.name_order(official["source"] or "") == "family_first" \
+        else words[-1]
+    family = set(resolver.fold(family))
+    return bool(family) and family <= theirs and (theirs <= mine or mine <= theirs)
+
+
+def _twins(named: list[dict]) -> dict:
+    """Person id -> the other mention of the same person at the company,
+    one official and one from elsewhere, only where the match is one to
+    one: a site name that fits two registry people (or the reverse)
+    confirms neither."""
+    officials = [p for p in named if _official(p["source"])]
+    others = [p for p in named if not _official(p["source"])]
+    pairs = [(o, x) for o in officials for x in others if _same_person(o, x)]
+    count: dict = {}
+    for o, x in pairs:
+        count[o["id"]] = count.get(o["id"], 0) + 1
+        count[x["id"]] = count.get(x["id"], 0) + 1
+    out = {}
+    for o, x in pairs:
+        if count[o["id"]] == 1 and count[x["id"]] == 1:
+            out[o["id"]], out[x["id"]] = x, o
+    return out
 
 
 # ── The backlog: every company with no contact ──
@@ -548,12 +740,13 @@ async def backlog(state, fresh: bool = False) -> dict:
     async with state._connect() as db:
         if fresh or kept is None or time.monotonic() - kept[0] > BACKLOG_CACHE_SECONDS:
             async with db.execute(
-                    f"SELECT COUNT(*), SUM({HAS_SITE} AND {site_cond}), SUM(NOT ({finder_cond})) "
+                    f"SELECT COUNT(*), SUM({HAS_SITE} AND {site_cond}), SUM(NOT ({finder_cond})), "
+                    f"SUM(NOT {HAS_SITE} AND COALESCE(c.name, '') != '') "
                     f"FROM companies c WHERE {LIVE} AND {NO_CONTACT}",
                     (*site_args, *finder_args)) as cur:
                 kept = (time.monotonic(), await cur.fetchone())
             _counted[key] = kept
-        total, free, searched_ = kept[1]
+        total, free, searched_, no_site = kept[1]
         async with db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(found), 0), COALESCE(SUM(cost), 0) FROM searches "
                 "WHERE target = 'company' AND module = ? AND capability = ? "
@@ -563,11 +756,40 @@ async def backlog(state, fresh: bool = False) -> dict:
                 "SELECT status, COUNT(*) FROM jobs WHERE kind = 'find_contacts' "
                 "AND status IN ('queued', 'running', 'paused') GROUP BY status") as cur:
             waiting = {s: n for s, n in await cur.fetchall()}
+        async with db.execute(
+                "SELECT module, COUNT(*), COALESCE(SUM(found), 0) FROM searches "
+                "WHERE target = 'company' AND looked_for = 'website' "
+                "AND searched_at >= datetime('now', '-1 day') GROUP BY module") as cur:
+            looked = {m: (n, f) for m, n, f in await cur.fetchall()}
     return {"without_contact": total or 0, "site_to_read": free or 0,
             "searched": searched_ or 0, "last_day": {"companies": day or 0,
                                                      "found": day_found or 0,
                                                      "cost": round(day_cost or 0.0, 4)},
-            "jobs": waiting}
+            "jobs": waiting, "no_website": no_site or 0,
+            "background_search": await background_status(state, looked)}
+
+
+async def background_status(state, looked: dict | None = None) -> dict:
+    """The background's website searches inside free allowances: whether
+    they are on, its share, and for each search module that is on and set
+    up and declares a free allowance, what each period allows, what was
+    used (by every run) and what the background may still take; with the
+    lookups each made in the last day (``looked``: module -> (searches,
+    websites found))."""
+    from harvey.modules import lanes, switches
+
+    on, share = await background_settings(state)
+    out = []
+    for s in searchers(await switches.enabled_ids(state), _env()):
+        specs = lanes.free_allowances(s.module)
+        if not specs or any(o["module"] == s.module for o in out):
+            continue
+        n, f = (looked or {}).get(s.module, (0, 0))
+        out.append({"module": s.module, "allowance": {a["per"]: a["requests"] for a in specs},
+                    "used": await asyncio.to_thread(lanes.uses, s.module),
+                    "left": await free_for_background_now(s.module, on, share) or 0,
+                    "last_day": {"searches": n, "found": f}})
+    return {"on": on, "share": share, "searchers": out}
 
 
 async def next_free(state, limit: int) -> list[str]:

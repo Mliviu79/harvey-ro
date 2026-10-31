@@ -40,8 +40,8 @@ OLD_COLUMNS = ("code", "label", "description", "category", "value_type", "collec
 # keyless-scraping, LinkedIn and email-campaign modules are off.
 DEFAULT_ON = {
     "contact_finder", "export", "lang_en", "nominatim", "people", "phones", "website",
-    "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper", "tinyfish",
-    "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
+    "brave", "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper",
+    "tinyfish", "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
 }
 DEFAULT_OFF = {"email_outreach", "hiring", "linkedin", "startups", "web_marketing",
                "web_search_scrape"}
@@ -476,7 +476,7 @@ def test_settings_offers_the_env_keys_of_enabled_modules(client):
 
 def test_the_email_switch_is_the_email_outreach_module(client):
     client.post("/api/ui/modules", json={"email": True})
-    assert client.get("/api/modules").json()["sets"][1]["modules"][1]["id"] == "email_outreach"
+    assert "email_outreach" in [m["id"] for m in client.get("/api/modules").json()["sets"][1]["modules"]]
     rows = {m["id"]: m for s in client.get("/api/modules").json()["sets"] for m in s["modules"]}
     assert rows["email_outreach"]["enabled"] is True
     assert "GMAIL_CLIENT_ID" in client.get("/api/settings").json()["env_keys"]

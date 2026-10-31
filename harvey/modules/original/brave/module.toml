@@ -1,0 +1,51 @@
+# Brave Search: finds the website of a company already on file, by its name
+# and town (the contact finder's website lookup). Never a Discover source:
+# Brave's terms forbid building a database of its results, so its capability
+# is a lookup, not a query, and Discover refuses it. The results are read
+# once, in memory, to pick the company's website; only that website (with
+# how sure Harvey is of it) and what the company's own site publishes are
+# kept. No result list, title, snippet or position is stored or logged.
+id = "brave"
+name = "Brave Search"
+description = "Finds the website of a company on file by its name and town."
+set = "original"
+kind = "search"
+version = "0.1.0"
+api = 1
+markets = []
+requires = []
+default_enabled = true
+entry = "harvey.modules.original.brave.capabilities"
+wraps = ["harvey.collectors.discover"]
+secrets = ["BRAVE_API_KEY"]
+terms_note = "Brave's results are used once, in memory, to pick one company's website, and never stored, cached or logged. Brave isn't a Discover source: its terms forbid building a database of its results."
+
+[cost]
+as_of = 2026-10-30
+usd = 0.005
+free_tier = "$5 of searches free every month (about 1,000); a card on file is needed"
+note = "$5 per 1,000 searches (the Search plan); a website lookup is one search"
+
+# Brave's monthly $5 credit at $5 per 1,000 searches: 1,000 searches a
+# month, renewed every month. Only this is ever spent in the background
+# without a day's budget (and only its background share).
+[[free_allowances]]
+per = "month"
+requests = 1000
+
+# The Search plan allows 50 searches a second; a key on an older plan 1 a
+# second. One a second suits both, and a lookup is one search a company.
+[[lanes]]
+id = "brave"
+min_interval_seconds = 1.0
+
+[[capabilities]]
+id = "website_search"
+op = "lookup"
+provider = "brave"
+lane = "brave"
+# Finds a company by its name and town (the contact finder's website lookup).
+lookup = "website"
+inputs = [["query", "area"], ["query"]]
+outputs = { records = "companies", ids = ["domain"] }
+cost = { usd = 0.005, per = "search", note = "one search of up to 20 results" }

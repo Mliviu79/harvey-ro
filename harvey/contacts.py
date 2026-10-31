@@ -82,15 +82,62 @@ def split_person(text: str) -> tuple[str, str]:
     return name.strip(), role.strip() if sep else ""
 
 
-def split_name(name: str, source: str = "") -> tuple[str, str]:
-    """(first, last) of a person's name. The trade registry writes the
-    family name first ("POPESCU ION MIHAI"); a team page writes it last."""
+def name_order(source: str = "") -> str:
+    """The order a name from ``source`` (a module id, or a collector one of
+    its signals names) is most likely written in: what the market pack of
+    an official source's market says (``registry_name_order``: Romania's
+    trade registry writes the family name first), else given name first.
+    A hint only: where it matters, both orders are tried."""
+    from harvey.modules import switches
+
+    mans = switches.manifests()
+    src = (source or "").strip()
+    # A registry record's source names its module ("registry:onrc").
+    src = src.split(":", 1)[1] if src.startswith("registry:") else src
+    module = next((m for m in mans if m.id == src), None) or next(
+        (m for m in mans if src and any(sig.get("collector") == src for sig in m.signals)), None)
+    if module is None or not module.official or not module.markets:
+        return "given_first"
+    for pack in mans:
+        if (pack.kind == "market" and pack.registry_name_order
+                and set(pack.markets) & set(module.markets)):
+            return pack.registry_name_order
+    return "given_first"
+
+
+def short_given(word: str) -> str:
+    """The first part of a hyphenated given name ("Ana-Maria": Ana), for an
+    address tried after the whole name's ("anamaria") comes back invalid."""
+    return word.split("-")[0] or word
+
+
+def name_orders(name: str, source: str = "") -> list[tuple[str, str]]:
+    """Every (first, last) a person's name can be read as, the likelier
+    first: given name first ("Ion Popescu") and family name first ("POPESCU
+    ION MIHAI"), the first given name of several, kept whole when
+    hyphenated ("Ana-Maria"). Two words read the same either way give one;
+    a single word none."""
     words = [w for w in (name or "").split() if w]
     if len(words) < 2:
-        return "", ""
-    if (source or "").startswith(("onrc", "registry")):
-        return words[1].title(), words[0].title()
-    return words[0], words[-1]
+        return []
+    upper = name == name.upper()
+
+    def word(w: str) -> str:
+        return w.title() if upper else w
+
+    given_first = (word(words[0]), word(words[-1]))
+    family_first = (word(words[1]), word(words[0]))
+    orders = [family_first, given_first] if name_order(source) == "family_first" \
+        else [given_first, family_first]
+    return list(dict.fromkeys(orders))
+
+
+def split_name(name: str, source: str = "") -> tuple[str, str]:
+    """(first, last) of a person's name in its likelier order (name_orders):
+    the market pack says how an official source's names are usually
+    written; a team page writes the given name first."""
+    orders = name_orders(name, source)
+    return orders[0] if orders else ("", "")
 
 
 def trust_for(confidence) -> str:

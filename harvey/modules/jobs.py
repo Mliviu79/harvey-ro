@@ -291,8 +291,22 @@ async def get_batch(state, batch_id: str) -> dict | None:
     return out
 
 
-async def set_batch_cap(state, batch_id: str, max_spend: float) -> None:
+async def set_batch_cap(state, batch_id: str, max_spend: float, pool: str = "") -> None:
+    """A run's new spend limit. A run with amounts of its own inside its
+    cap (``pools``) gives the change to ``pool`` (its first pool, a
+    Discover run's searches, when that names none of them): the others keep
+    their amount, so a search the old limit paused can carry on."""
+    batch = await get_batch(state, batch_id)
+    params = (batch or {}).get("params") or {}
+    pools = params.get("pools") or {}
     async with state._connect() as db:
+        if pools:
+            target = pool if pool in pools else next(iter(pools))
+            others = sum(float(v) for k, v in pools.items() if k != target)
+            pools[target] = round(max(0.0, float(max_spend) - others), 6)
+            params["pools"] = pools
+            await db.execute("UPDATE job_batches SET params_json = ? WHERE id = ?",
+                             (json.dumps(params), batch_id))
         await db.execute("UPDATE job_batches SET max_spend = ? WHERE id = ?",
                          (float(max_spend), batch_id))
         await db.commit()
@@ -306,6 +320,18 @@ async def batch_spent(state, batch_id: str, *, exclude: str = "") -> float:
                 "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
                 "THEN MAX(reserved - actual_cost, 0) ELSE 0 END), 0) "
                 "FROM jobs WHERE batch_id = ? AND id != ?", (batch_id, exclude)) as cur:
+            (spent,) = await cur.fetchone()
+    return float(spent or 0.0)
+
+
+async def pool_spent(state, batch_id: str, pool: str, *, exclude: str = "") -> float:
+    """batch_spent, of the batch's jobs in one pool (``params.pool``) only."""
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
+                "THEN MAX(reserved - actual_cost, 0) ELSE 0 END), 0) "
+                "FROM jobs WHERE batch_id = ? AND id != ? "
+                "AND json_extract(params_json, '$.pool') = ?", (batch_id, exclude, pool)) as cur:
             (spent,) = await cur.fetchone()
     return float(spent or 0.0)
 
@@ -338,6 +364,15 @@ async def reserve(state, job: Job, estimate: float, first: float, *,
     if cap is not None:
         limits.append((float(cap) - await batch_spent(state, job.batch_id, exclude=job.id) - own,
                        f"the run's spend limit (${float(cap):.2f}) is reached"))
+        # A run with amounts of its own inside its cap (``pools``: a
+        # Discover run's searches and its website lookups): a job draws
+        # from its own pool only.
+        pools = (batch.get("params") or {}).get("pools") or {}
+        pool = (job.params or {}).get("pool")
+        if pool in pools:
+            amount = float(pools[pool])
+            limits.append((amount - await pool_spent(state, job.batch_id, pool, exclude=job.id)
+                           - own, f"the run's amount for {pool} (${amount:.2f}) is reached"))
     for limit, since, what in ((per_day, "start of day", "day"),
                                (per_month, "start of month", "month")):
         if limit is not None:

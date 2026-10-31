@@ -10,3 +10,8 @@ api = 1
 markets = ["RO"]
 requires = []
 default_enabled = true
+# The trade registry (ONRC) usually writes an administrator's family name
+# first ("POPESCU ION MIHAI"), though not always: everyone writes it as they
+# like. A hint only: the contact finder tries the order a company's own site
+# confirms, else this one first and the other when it comes back invalid.
+registry_name_order = "family_first"

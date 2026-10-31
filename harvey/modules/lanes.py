@@ -170,3 +170,187 @@ async def wait(lane: str) -> None:
         return
     async with _lock(lane):
         await asyncio.to_thread(_turn, lane, gap)
+
+
+# ── Free allowances: what a service gives free each period ──
+#
+# A search module's manifest declares the requests it may make free each
+# period ([[free_allowances]]: per minute, hour, day or month; recurring
+# only, never a one-time sign-up credit). Every request a search makes
+# through it is counted here (count_uses), whoever made it: a person's run
+# or the background. The background then takes only its share of what is
+# left (free_left), so a person's own runs always find some.
+#
+# The counts are kept per module in data/lanes/<module>.uses, one counter
+# per period for the period it is in, under the same OS lock as the pace;
+# where that file can't be written, within the process. A month is the
+# last 30 days, counted per day: a service's monthly credit renews on its
+# own cycle (Brave's per key), not on the 1st, so a calendar month would
+# let the background spend a cycle's share twice across the 1st.
+
+_uses: dict[str, dict] = {}
+_uses_guard = threading.Lock()
+
+_WINDOWS = {"minute": "%Y-%m-%dT%H:%M", "hour": "%Y-%m-%dT%H", "day": "%Y-%m-%d"}
+# The rolling period: its days.
+ROLLING = {"month": 30}
+_PERIODS = (*_WINDOWS, *ROLLING)
+
+
+def free_allowances(module_id: str) -> tuple[dict, ...]:
+    """The free allowances a module's manifest declares (per, requests)."""
+    return _allowances().get(module_id, ())
+
+
+@lru_cache(maxsize=1)
+def _allowances() -> dict[str, tuple[dict, ...]]:
+    from harvey.modules.loader import load_manifests
+
+    return {m.id: m.free_allowances for m in load_manifests(data_dir=None)
+            if m.free_allowances}
+
+
+def _window(per: str, now: float) -> str:
+    return time.strftime(_WINDOWS[per], time.gmtime(now))
+
+
+def _days(counts: dict, per: str, now: float) -> dict[str, int]:
+    """A rolling period's counts per UTC day, those still inside it."""
+    days = counts.get(per)
+    if not isinstance(days, dict):
+        return {}
+    since = time.strftime("%Y-%m-%d", time.gmtime(now - ROLLING[per] * 86400))
+    return {d: int(n) for d, n in days.items() if d > since}
+
+
+def _current(counts: dict, specs, now: float) -> dict[str, int]:
+    out = {}
+    for spec in specs:
+        per = spec["per"]
+        if per in ROLLING:
+            out[per] = sum(_days(counts, per, now).values())
+            continue
+        window, used = (counts.get(per) or ["", 0])[:2] \
+            if isinstance(counts.get(per), list) else ("", 0)
+        out[per] = int(used) if window == _window(per, now) else 0
+    return out
+
+
+def _read_uses(handle) -> dict:
+    import json
+
+    handle.seek(0)
+    try:
+        data = json.loads(handle.read() or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _uses_file(module_id: str, change):
+    """Run ``change(counts) -> counts | None`` on the module's counters
+    under the OS lock (in memory when the file can't be written); returns
+    the counters after it."""
+    import json
+
+    with _uses_guard:
+        try:
+            Path(LANE_DIR).mkdir(parents=True, exist_ok=True)
+            handle = open(Path(LANE_DIR) / f"{module_id}.uses", "a+", encoding="utf-8")
+        except OSError:
+            handle = None
+        if handle is None:
+            counts = _uses.get(module_id, {})
+            new = change(dict(counts))
+            if new is not None:
+                _uses[module_id] = counts = new
+            return counts
+        try:
+            _lock_file(handle)
+            try:
+                counts = _read_uses(handle)
+                new = change(dict(counts))
+                if new is not None:
+                    counts = new
+                    try:
+                        handle.seek(0)
+                        handle.truncate()
+                        handle.write(json.dumps(counts))
+                        handle.flush()
+                    except OSError:
+                        pass
+                return counts
+            finally:
+                _unlock_file(handle)
+        finally:
+            handle.close()
+
+
+def count_uses(module_id: str, requests: int = 1) -> None:
+    """Count ``requests`` made through a module against each of its free
+    allowances (nothing for a module that declares none)."""
+    specs = free_allowances(module_id)
+    if not specs or requests <= 0:
+        return
+    now = time.time()
+
+    def change(counts):
+        used = _current(counts, specs, now)
+        out = {k: v for k, v in counts.items() if k not in _PERIODS}
+        for per in used:
+            if per in ROLLING:
+                days = _days(counts, per, now)
+                today = time.strftime("%Y-%m-%d", time.gmtime(now))
+                days[today] = days.get(today, 0) + int(requests)
+                out[per] = days
+            else:
+                out[per] = [_window(per, now), used[per] + int(requests)]
+        return out
+
+    _uses_file(module_id, change)
+
+
+def uses(module_id: str) -> dict[str, int]:
+    """The requests counted in each declared period so far ({} for a
+    module that declares no free allowance)."""
+    specs = free_allowances(module_id)
+    if not specs:
+        return {}
+    return _current(_uses_file(module_id, lambda counts: None), specs, time.time())
+
+
+def free_left(module_id: str, share: float = 1.0) -> int | None:
+    """How many more requests fit in every one of a module's free
+    allowances, taking only ``share`` of each (the background's), or None
+    when it declares none (it has no free allowance to count against)."""
+    specs = free_allowances(module_id)
+    if not specs:
+        return None
+    used = uses(module_id)
+    share = min(max(float(share), 0.0), 1.0)
+    return max(0, min(int(spec["requests"] * share) - used.get(spec["per"], 0)
+                      for spec in specs))
+
+
+# ── A search that said it can take no more for now ──
+#
+# Out of credit, a spent quota or a refused key: the background leaves the
+# module alone until the time it gave (``retry_after``), or HOLD_SECONDS
+# when it gave none, rather than make one more refused request a job.
+
+HOLD_SECONDS = 3600.0
+
+
+def hold(module_id: str, seconds: float | None = None) -> None:
+    """Leave ``module_id`` out of the background for ``seconds``."""
+    until = time.time() + max(float(seconds or HOLD_SECONDS), 1.0)
+    _uses_file(module_id, lambda counts: {**counts, "held_until": until})
+
+
+def held(module_id: str) -> float:
+    """Seconds the module is still left out of the background (0: not)."""
+    counts = _uses_file(module_id, lambda counts: None)
+    try:
+        return max(0.0, float(counts.get("held_until") or 0) - time.time())
+    except (TypeError, ValueError):
+        return 0.0

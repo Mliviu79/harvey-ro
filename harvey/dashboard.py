@@ -1816,6 +1816,42 @@ async def contact_finder_status():
     return out
 
 
+@app.post("/api/contacts/finder/settings")
+async def set_contact_finder_settings(request: Request):
+    """{"background_search": bool, "background_share": 0.05-1}: whether the
+    backlog's walk looks companies with no website up inside the search
+    modules' free allowances, and the share of each it may take (the rest
+    is kept for your own runs). Returns the background's status."""
+    from harvey import finder
+    from harvey.modules import switches
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = ("background_search", "background_share")
+    if not isinstance(body, dict) or not body or any(k not in allowed for k in body):
+        return JSONResponse({"success": False,
+                             "message": "expected background_search or background_share"},
+                            status_code=400)
+    if "background_search" in body and not isinstance(body["background_search"], bool):
+        return JSONResponse({"success": False, "message": "background_search must be "
+                             "true or false"}, status_code=400)
+    if "background_share" in body:
+        try:
+            share = float(body["background_share"])
+        except (TypeError, ValueError):
+            share = float("nan")
+        if not 0 < share <= 1:
+            return JSONResponse({"success": False, "message": "background_share must be "
+                                 "above 0 and at most 1"}, status_code=400)
+    state = _state()
+    await state.init_db()
+    for key, value in body.items():
+        await switches.set_module_setting(state, finder.FINDER[0], key, value)
+    return {"success": True, **await finder.background_status(state)}
+
+
 @app.get("/api/contacts/{contact_id}")
 async def get_contact_reach(contact_id: int):
     """Every live company a contact reaches, through whom and where."""
@@ -3042,10 +3078,27 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
             if j.kind == "registry_pull":
                 # (A search's are in the merged report already.)
                 report[k] += int(r.get(k) or 0)
+    pools = (batch.get("params") or {}).get("pools") or {}
+    looking = [j for j in finder if j.params.get("pool") == "websites"]
+    websites = None
+    if (batch.get("params") or {}).get("find_websites"):
+        websites = {"max_spend": pools.get("websites"),
+                    "spent": round(sum(float(j.actual_cost or 0.0) for j in looking), 4),
+                    "looked_up": sum(1 for j in looking if j.status == jobs.DONE),
+                    "found": sum(1 for j in looking if j.status == jobs.DONE
+                                 and (j.result or {}).get("website")),
+                    "waiting": sum(1 for j in looking if j.status in active),
+                    # Past the run's limit: left to the background's walk.
+                    "left_to_background": int((batch.get("params") or {})
+                                              .get("websites_deferred") or 0)}
     return {
         **report,
         "batch_id": batch_id, "label": batch.get("label") or "",
         "max_spend": batch.get("max_spend"),
+        # A run that also finds websites: the searches' amount, and the
+        # website lookups' own progress and spend (``websites``).
+        "search_max_spend": pools.get("search"),
+        "websites": websites,
         "spent": round(sum(float(j.actual_cost or 0.0) for j in found), 4),
         "sources": list(sources.values()),
         "profiled_companies": sum(1 for j in sites if j.status == jobs.DONE)
@@ -3118,8 +3171,8 @@ def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
     take this run (a preset it can't search with, filters that say
     nothing) is skipped with a note, unless it is the only one: then the
     run is refused (ValueError). Unknown sources are refused."""
-    from harvey.collectors.discover import PROVIDERS
-    from harvey.modules.job_kinds import discover_sources, registry_plan
+    from harvey.collectors.discover import PROVIDERS, is_discovery_source
+    from harvey.modules.job_kinds import discover_sources, lookup_only_message, registry_plan
 
     keys = _source_keys(body)
     if not keys:
@@ -3129,6 +3182,8 @@ def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
     plan, notes = [], []
     for key in keys:
         try:
+            if key in PROVIDERS and not is_discovery_source(key):
+                raise LookupError(lookup_only_message(key))
             if key in PROVIDERS:
                 plan.append({"provider": key, "label": PROVIDERS[key].label,
                              "queries": _discovery_queries(body, config, key)})
@@ -3268,7 +3323,13 @@ async def estimate_discovery(request: Request):
                                   "1.5 GB, once per dataset)"])})
         queries = [q for p_ in parts for q in p_["queries"]]
         counted_all = all(p_["counted"] for p_ in parts)
+        try:
+            websites = await _websites_estimate(state, _find_websites(body))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "websites_max_spend must be a number of dollars, "
+                                 "0 or more"}, status_code=400)
         return {
+            "find_websites": websites,
             "provider": parts[0]["key"],
             "sources": parts, "notes": notes,
             "queries": queries, "query_count": len(queries),
@@ -3289,6 +3350,46 @@ def _duplicate_body(e) -> dict:
     label and status) for the page to say it in the reader's language."""
     return {"success": False, "message": str(e), "duplicate": True, "code": "duplicate",
             "job": e.job.as_dict()}
+
+
+# What a Discover run may spend looking up websites for the companies it
+# saves with none when the request names no amount: nothing, so a caller's
+# max_spend is all it spends; free lookups still run while the option is
+# on. (The Discover tab sends the amount its field shows.)
+WEBSITES_DEFAULT_USD = 0.0
+
+
+def _find_websites(body: dict) -> float | None:
+    """A Discover request's "also find websites, up to $X": the amount
+    (``websites_max_spend``, $0 when absent: free lookups only), or None
+    when ``find_websites`` is false. On unless turned off. ValueError for
+    an amount that isn't one."""
+    if body.get("find_websites") is False:
+        return None
+    return _money(body.get("websites_max_spend"), default=WEBSITES_DEFAULT_USD)
+
+
+async def _websites_estimate(state, amount: float | None) -> dict:
+    """What "find websites" would use: the searches that can find a
+    company by name (free ones first), the price of a paid lookup, and how
+    many paid lookups the amount pays for. How many companies will need
+    one isn't known before the run."""
+    from harvey import finder
+    from harvey.config import load_env
+    from harvey.modules import switches
+
+    if amount is None:
+        return {"enabled": False}
+    found = finder.searchers(await switches.enabled_ids(state), load_env().model_dump())
+    paid = [s for s in found if s.estimate > 0]
+    cheapest = min((s.estimate for s in paid), default=0.0)
+    return {"enabled": True, "max_spend": amount,
+            "free": sorted({s.module for s in found if s.estimate <= 0}),
+            "paid": sorted({s.module for s in paid}),
+            "per_lookup": round(cheapest, 4),
+            "paid_lookups": int(amount / cheapest + 1e-9) if cheapest else 0,
+            "searchers": [{"module": s.module, "provider": s.provider, "cost": s.estimate}
+                          for s in found]}
 
 
 def _money(value, default: float | None = None) -> float:
@@ -3338,6 +3439,12 @@ async def start_discovery(request: Request):
         except (TypeError, ValueError):
             return JSONResponse({"success": False, "message": "max_spend must be a number "
                                  "of dollars, 0 or more", "code": "bad_cap"}, status_code=400)
+        try:
+            find_websites = _find_websites(body)
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "websites_max_spend must be a "
+                                 "number of dollars, 0 or more", "code": "bad_cap"},
+                                status_code=400)
 
         state = _state()
         await state.init_db()
@@ -3346,7 +3453,7 @@ async def start_discovery(request: Request):
         await state.set_setting("discovery_paused", "")
         try:
             batch_id, ids, dupes = await enqueue_sources(
-                state, plan, max_spend=max_spend,
+                state, plan, max_spend=max_spend, find_websites=find_websites,
                 label=" + ".join(p_.get("name") or p_["label"] for p_ in plan))
         except jobs.Duplicate as e:
             return JSONResponse(_duplicate_body(e), status_code=409)
@@ -3565,12 +3672,17 @@ async def act_on_lane(lane: str, action: str):
 @app.post("/api/jobs/batches/{batch_id}/cap")
 async def raise_batch_cap(batch_id: str, request: Request):
     """{"max_spend": n}: a new spend limit for a run; its jobs the old
-    limit paused go back to the queue and carry on from where they stopped."""
+    limit paused go back to the queue and carry on from where they stopped.
+    A run with amounts of its own (a Discover run's searches and website
+    lookups) gives the change to ``pool`` ("websites"), else its searches."""
     from harvey.modules import jobs
 
     try:
         body = await request.json()
         cap = _money((body or {}).get("max_spend"))
+        pool = (body or {}).get("pool") or ""
+        if not isinstance(pool, str):
+            raise ValueError(pool)
     except Exception:
         return JSONResponse({"success": False, "message": "expected max_spend, a number >= 0"},
                             status_code=400)
@@ -3578,7 +3690,7 @@ async def raise_batch_cap(batch_id: str, request: Request):
     await state.init_db()
     if await jobs.get_batch(state, batch_id) is None:
         return JSONResponse({"success": False, "message": "no such run"}, status_code=404)
-    await jobs.set_batch_cap(state, batch_id, cap)
+    await jobs.set_batch_cap(state, batch_id, cap, pool=pool)
     resumed = 0
     for job in await jobs.list_jobs(state, statuses=(jobs.PAUSED,), batch_id=batch_id,
                                     limit=100000):

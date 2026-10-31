@@ -61,8 +61,16 @@ def discovery_lane(provider_key: str) -> tuple[str, str]:
     if manifest is None:
         raise ValueError(f"No module claims the discovery source {provider_key!r}, so it "
                          "can't run. See: harvey modules list")
-    cap = next(c["id"] for c in manifest.capabilities if c.get("provider") == provider_key)
-    return owner, cap
+    cap = next(c for c in manifest.capabilities if c.get("provider") == provider_key)
+    if cap.get("op") != "query":
+        raise ValueError(lookup_only_message(provider_key))
+    return owner, cap["id"]
+
+
+def lookup_only_message(provider_key: str) -> str:
+    return (f"{provider_key} only finds the website of a company already on file (its "
+            "terms forbid building a list of companies from its results), so it isn't a "
+            "Discover source")
 
 
 def discovery_dedupe(provider_key: str, query) -> str:
@@ -85,6 +93,21 @@ async def enqueue_discovery(state, provider_key: str, queries, *, max_spend: flo
                                  label=label or D.PROVIDERS[provider_key].label)
 
 
+# A Discover run's two amounts (its batch's ``pools``): what its searches
+# may spend, and what looking up websites for the companies they saved with
+# none may (``find_websites``). The batch's cap is the two together; each
+# job draws from its own pool only (jobs.reserve).
+SEARCH_POOL = "search"
+WEBSITES_POOL = "websites"
+# The website lookups one Discover run queues beyond what its websites
+# amount pays for, when a free search can take them: about an hour of
+# TinyFish's free searches. The contacts lane runs its jobs in order, so a
+# county-wide registry pull must not fill it for days; the companies left
+# over wait for the background's walk, which looks up every company with
+# no contact inside the free allowances' share.
+WEBSITE_LOOKUPS_FREE_PER_RUN = 500
+
+
 def _search_specs(provider_key: str, queries, read_sites: bool) -> list[dict]:
     from harvey.collectors import discover as D
 
@@ -92,18 +115,23 @@ def _search_specs(provider_key: str, queries, read_sites: bool) -> list[dict]:
     provider = D.PROVIDERS[provider_key]
     return [dict(kind="discover", lane=lane, module=lane, capability=cap,
                  label=q.keyword() or provider.label,
-                 params={"provider": provider_key, "query": asdict(q), "read_sites": read_sites},
+                 params={"provider": provider_key, "query": asdict(q), "read_sites": read_sites,
+                         "pool": SEARCH_POOL},
                  dedupe_key=discovery_dedupe(provider_key, q),
                  est_cost=provider.estimate([q])) for q in queries]
 
 
 async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sites: bool = True,
-                          label: str = ""):
+                          label: str = "", find_websites: float | None = None):
     """One Discover run over several sources: one batch, one spend cap
     shared by all, a job per search (``{"provider", "queries"}``) and per
     registry pull (``{"source": "<module>.<capability>", "job": kind,
-    "params": {...}}``, queued on its module's lane). Returns (batch id, the
-    new job ids, jobs already waiting); Duplicate when every one is."""
+    "params": {...}}``, queued on its module's lane). ``find_websites``
+    (dollars; None: off) also looks up a website for each company the run
+    saves with none, in the same batch: free searches always, paid ones up
+    to that amount, kept apart from the searches' ``max_spend`` (the
+    batch's cap is the two together). Returns (batch id, the new job ids,
+    jobs already waiting); Duplicate when every one is."""
     specs: list[dict] = []
     sources = []
     for part in plan:
@@ -114,14 +142,19 @@ async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sit
         module, _, cap = part["source"].partition(".")
         specs.append(dict(kind=part["job"], lane=module, module=module, capability=cap,
                           label=part.get("label") or part["source"],
-                          params={**part["params"], "source": part["source"]},
+                          params={**part["params"], "source": part["source"],
+                                  "pool": SEARCH_POOL},
                           dedupe_key=f"{part['job']}:{_key(part['params'])}"))
         sources.append(part["source"])
-    batch_id = await jobs.new_batch(
-        state, "discover", label or ", ".join(sources),
-        params={"sources": sources, "provider": sources[0] if len(sources) == 1 else "",
-                "queries": [s["label"] for s in specs], "read_sites": read_sites},
-        max_spend=max_spend)
+    params = {"sources": sources, "provider": sources[0] if len(sources) == 1 else "",
+              "queries": [s["label"] for s in specs], "read_sites": read_sites}
+    total = max_spend
+    if find_websites is not None and read_sites:
+        params["find_websites"] = True
+        params["pools"] = {SEARCH_POOL: float(max_spend), WEBSITES_POOL: float(find_websites)}
+        total = float(max_spend) + float(find_websites)
+    batch_id = await jobs.new_batch(state, "discover", label or ", ".join(sources),
+                                    params=params, max_spend=total)
     ids, dupes = await jobs.enqueue_many(state, specs, batch_id=batch_id)
     if not ids and dupes:
         await jobs.drop_batch(state, batch_id)
@@ -595,7 +628,7 @@ async def run_id_check(ctx) -> dict:
 # ── Finding contacts: one company per job (harvey/finder.py) ──
 
 def _finder_spec(company_id: str, *, force_since: str = "", background: bool = False,
-                 free_only: bool = False) -> dict:
+                 free_only: bool = False, website: bool = False) -> dict:
     params = {"company_id": company_id}
     if force_since:
         params["since"] = force_since
@@ -603,6 +636,11 @@ def _finder_spec(company_id: str, *, force_since: str = "", background: bool = F
         params["background"] = True
     if free_only:
         params["free_only"] = True
+    if website:
+        # A Discover run's "find websites": looked up even with a phone on
+        # file, paid searches from the run's websites amount.
+        params["website"] = True
+        params["pool"] = WEBSITES_POOL
     # One waiting job per company and kind of request: a person's run (or
     # a forced one) isn't swallowed by a background job already waiting,
     # which would run without its cap (or without force).
@@ -628,7 +666,7 @@ async def _labels(state, company_ids) -> dict[str, str]:
 
 async def enqueue_find_contacts(state, company_ids, *, batch_id: str = "", parent_id: str = "",
                                 force_since: str = "", background: bool = False,
-                                free_only: bool = False):
+                                free_only: bool = False, website: bool = False):
     """Queue the contact finder for each company (one job each, on the
     contacts lane; a company already waiting isn't queued twice). Returns
     (new job ids, jobs already waiting)."""
@@ -639,7 +677,7 @@ async def enqueue_find_contacts(state, company_ids, *, batch_id: str = "", paren
     specs = []
     for company_id in ids:
         spec = _finder_spec(company_id, force_since=force_since, background=background,
-                            free_only=free_only)
+                            free_only=free_only, website=website)
         spec["label"] = labels.get(company_id) or company_id
         specs.append(spec)
     return await jobs.enqueue_many(state, specs, batch_id=batch_id, parent_id=parent_id)
@@ -648,10 +686,12 @@ async def enqueue_find_contacts(state, company_ids, *, batch_id: str = "", paren
 async def enqueue_finder_follow_ups(state, company_ids, *, batch_id: str = "",
                                     parent_id: str = "") -> int:
     """The finder for the companies a run saved or matched, in that run's
-    batch: those it has free work for (a website to read), free only. The
-    run's cap is the run's own searches': a website search or an address
-    check for what it saved is a Find-contacts run of its own, with its
-    own estimate and cap. Returns how many were queued."""
+    batch: those it has free work for (a website to read), free only. When
+    the run asked to find websites (its batch's ``find_websites``), those
+    with no website are looked up too, drawing paid searches from the
+    run's websites amount only. Anything else (an address check for what
+    it saved) is a Find-contacts run of its own, with its own estimate and
+    cap. Returns how many were queued."""
     from harvey import finder
 
     if not company_ids:
@@ -659,7 +699,54 @@ async def enqueue_finder_follow_ups(state, company_ids, *, batch_id: str = "",
     chosen = await finder.select(state, ids=company_ids, force=True, limit=len(company_ids))
     ids, _ = await enqueue_find_contacts(state, [c["id"] for c in chosen if c["site"]],
                                          batch_id=batch_id, parent_id=parent_id, free_only=True)
+    batch = await jobs.get_batch(state, batch_id) if batch_id else None
+    if batch and (batch.get("params") or {}).get("find_websites"):
+        wanted = [c["id"] for c in chosen if not c["site"]]
+        room = max(0, await website_lookups_limit(state, batch)
+                   - await _website_jobs(state, batch_id))
+        more, _ = await enqueue_find_contacts(state, wanted[:room], batch_id=batch_id,
+                                              parent_id=parent_id, website=True)
+        ids += more
+        if len(wanted) > room:
+            await _note_deferred(state, batch_id, len(wanted) - room)
     return len(ids)
+
+
+async def website_lookups_limit(state, batch: dict) -> int:
+    """How many website lookups a Discover run queues: the paid lookups
+    its websites amount pays for, at the cheapest paid search that is on,
+    plus WEBSITE_LOOKUPS_FREE_PER_RUN when a free search is on."""
+    from harvey import finder
+    from harvey.modules import switches
+
+    pools = (batch.get("params") or {}).get("pools") or {}
+    amount = float(pools.get(WEBSITES_POOL) or 0.0)
+    found = finder.searchers(await switches.enabled_ids(state), finder._env())
+    paid = [s.estimate for s in found if s.estimate > 0]
+    limit = int(amount / min(paid) + 1e-9) if paid else 0
+    if any(s.estimate <= 0 for s in found):
+        limit += WEBSITE_LOOKUPS_FREE_PER_RUN
+    return limit
+
+
+async def _website_jobs(state, batch_id: str) -> int:
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE batch_id = ? AND kind = 'find_contacts' "
+                "AND json_extract(params_json, '$.pool') = ?", (batch_id, WEBSITES_POOL)) as cur:
+            (n,) = await cur.fetchone()
+    return int(n or 0)
+
+
+async def _note_deferred(state, batch_id: str, n: int) -> None:
+    """Count the companies a run left to the background's walk (its
+    batch's ``websites_deferred``)."""
+    async with state._connect() as db:
+        await db.execute(
+            "UPDATE job_batches SET params_json = json_set(params_json, '$.websites_deferred', "
+            "COALESCE(json_extract(params_json, '$.websites_deferred'), 0) + ?) WHERE id = ?",
+            (int(n), batch_id))
+        await db.commit()
 
 
 async def _spend_for(ctx, config):
@@ -702,7 +789,12 @@ async def run_find_contacts(ctx) -> dict:
     run_id = await ctx.lane_run("contacts", "finder")
     found = await finder.find(ctx.state, company_id, spend=spend,
                               since=ctx.params.get("since") or None,
-                              batch_id=ctx.job.batch_id, config=config, run_id=run_id)
+                              batch_id=ctx.job.batch_id, config=config, run_id=run_id,
+                              background=bool(ctx.params.get("background")),
+                              want_website=bool(ctx.params.get("website")),
+                              # (A Discover run's website lookups check no
+                              # addresses: that is a Find-contacts run's.)
+                              addresses=not ctx.params.get("website"))
     ctx.count(1)
     for why in found.skipped:
         await ctx.say(f"  {why}")
@@ -743,10 +835,12 @@ _backlog_idle: dict[str, float] = {}
 async def enqueue_backlog(state) -> int:
     """Feed the finder's backlog to the contacts lane in the background:
     companies with no contact and a website to read (free), newest first;
-    and, only when the install has a day's budget (spend.per_day_usd),
-    those with no website a search module that is set up hasn't searched
-    (a paid search, drawn from that budget). Keeps at most BACKLOG_QUEUED
-    waiting. Returns how many were queued."""
+    then those with no website a search module that is set up hasn't
+    searched, through a search with some of its free allowance left for
+    the background (the contact finder's background_search and
+    background_share), or, only when the install has a day's budget
+    (spend.per_day_usd), a paid one drawn from that budget. Keeps at most
+    BACKLOG_QUEUED waiting. Returns how many were queued."""
     import time
 
     from harvey import finder
@@ -770,8 +864,17 @@ async def enqueue_backlog(state) -> int:
     # (Asked for more than there is room for: the newest are those waiting.)
     ids = [i for i in await finder.next_free(state, BACKLOG_QUEUED) if i not in waiting][:room]
     per_day = _spend_limits(_config())["per_day"]
-    if len(ids) < room and per_day and await jobs.spent_since(state, "start of day") < per_day:
-        available = finder.searchers(enabled, finder._env())
+    if len(ids) < room:
+        # Companies with no website: through the searches the day's budget
+        # can pay for, and those with some of their free allowance left for
+        # the background (its share; never a paid search without a budget).
+        everyone = finder.searchers(enabled, finder._env())
+        paid = bool(per_day) and await jobs.spent_since(state, "start of day") < per_day
+        on, share = await finder.background_settings(state)
+        free = {s.module: await finder.free_for_background_now(s.module, on, share)
+                for s in everyone}
+        available = [s for s in everyone
+                     if free[s.module] or (paid and (s.estimate > 0 or free[s.module] is None))]
         ids += [i for i in await finder.next_paid(state, BACKLOG_QUEUED, available)
                 if i not in waiting and i not in ids][:room - len(ids)]
     if not ids and not waiting:
