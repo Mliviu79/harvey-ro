@@ -402,6 +402,11 @@ class Filter:
         return any(v is not None for v in (self.min_turnover, self.max_turnover,
                                            self.min_employees, self.max_employees))
 
+    def parts(self) -> tuple[list[str], list]:
+        """The bounds on a ``latest`` row aliased ``l``, and their
+        arguments (each part also says how a missing value is taken)."""
+        return self._parts()
+
     def _parts(self) -> tuple[list[str], list]:
         """The bounds on a ``latest`` row aliased ``l``, and their arguments."""
         parts, args = [], []

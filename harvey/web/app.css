@@ -487,6 +487,13 @@ a.btn, a.btn:hover { text-decoration: none; }
 .tag { background: var(--surface-2); color: var(--text-2); border-color: var(--line); }
 .tag.accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
 .tag.t-bad { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-line); }
+.tag.t-good { background: var(--good-bg); color: var(--good); border-color: var(--good-line); }
+.tag.t-warn { background: var(--wait-bg); color: var(--wait); border-color: var(--wait-line); }
+button.tag { cursor: pointer; font: inherit; font-size: var(--fs-micro); }
+/* The Registry page: a firm no longer operating is dimmed, not hidden. */
+.rg-table tr.rg-closed td:not(.sel) { color: var(--text-2); }
+.fin-table.across th:first-child, .fin-table.across td:first-child { text-align: left; white-space: nowrap; }
+.fin-table.across td, .fin-table.across th { text-align: right; }
 .cost-chip {
   display: inline-flex; align-items: center; min-height: 20px; padding: 2px 8px; border-radius: 10px;
   font-size: var(--fs-micro); font-weight: 500; line-height: 1.35;

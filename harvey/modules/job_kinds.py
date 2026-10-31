@@ -399,7 +399,8 @@ async def run_registry_pull(ctx) -> dict:
                              classes=[tuple(c) for c in p.get("classes") or []] or None,
                              counties=p.get("counties") or None,
                              localities=p.get("localities") or None,
-                             all_statuses=bool(p.get("all_statuses")), fin=fin, tax=tax)
+                             all_statuses=bool(p.get("all_statuses")), fin=fin, tax=tax,
+                             regs=p.get("regs"))
         registry.count(con, q, 1)
         return q
 
@@ -1010,18 +1011,41 @@ def _number(value):
     return int(number) if number.is_integer() else number
 
 
+# Firms a pull may name one by one (a selection on the Registry page).
+REGS_MAX = 10_000
+
+
 def registry_plan(filters: dict) -> dict:
-    """A registry pull's parameters from the filters its Discover panel
-    sent. ValueError when they say nothing (that would be every firm in
-    Romania) or name an unknown county."""
+    """A registry pull's parameters from the filters its Discover panel (or
+    the Registry page) sent. ValueError when they say nothing (that would
+    be every firm in Romania) or name an unknown county."""
+    params = registry_params(filters)
+    if not (params["regs"] or params["words"] or params["counties"] or params["localities"]
+            or params["fin"] or params["tax"]):
+        raise ValueError("the registry needs an activity, an area or a filter: with none it "
+                         "would be every firm in Romania")
+    return params
+
+
+def registry_params(filters: dict) -> dict:
+    """A registry query's parameters from the filters the registry source
+    declares in its manifest (words, county, locality, status, turnover and
+    headcount bounds, unknown, employer, vat, micro), or ``regs``: firms
+    chosen by registration number, and nothing else. Saying nothing is
+    allowed here (the Registry page lists every operating firm then);
+    registry_plan refuses it for a pull. ValueError for an unknown county
+    or too many firms chosen."""
     from harvey.collectors import onrc
     from harvey.modules.ro.mf_financials.store import Filter as FinFilter
     from harvey.modules.ro.mf_taxpayers.store import Filter as TaxFilter
     from harvey.paths import PROJECT_ROOT
+    from harvey import registry
     from harvey.registry import REGISTRY_PATH
 
     f = filters or {}
     words = str(f.get("words") or "").strip()
+    if not registry.says_anything(words):
+        words = ""      # only joining words ("si", "de la"): no words at all
     counties = onrc.counties(str(f.get("county") or "")) or []
     localities = onrc._localities(str(f.get("locality") or ""))
     fin = FinFilter(min_turnover=_number(f.get("min_turnover")),
@@ -1035,17 +1059,29 @@ def registry_plan(filters: dict) -> dict:
         return None if value in (None, "") else value in (True, "yes", "1", 1)
 
     tax = TaxFilter(employer=yes_no("employer"), vat=yes_no("vat"), micro=yes_no("micro"))
-    if not (words or counties or localities or fin.active() or tax.active()):
-        raise ValueError("the registry needs an activity, an area or a filter: with none it "
-                         "would be every firm in Romania")
+    regs = f.get("regs")
+    if regs is not None:
+        if not isinstance(regs, list) or not all(isinstance(r, str) for r in regs):
+            raise ValueError("regs must be a list of registration numbers")
+        regs = list(dict.fromkeys(r.strip() for r in regs if r.strip()))
+        if len(regs) > REGS_MAX:
+            raise ValueError(f"at most {REGS_MAX:,} firms can be chosen one by one; "
+                             "pull the filter instead")
+    all_statuses = str(f.get("status") or "") == "all"
     where = ", ".join(localities + counties) or "Romania"
-    return {"path": str(REGISTRY_PATH), "data_dir": str(PROJECT_ROOT / "data" / "onrc"),
-            "ensure_latest": True, "words": words, "classes": [], "counties": counties,
-            "localities": localities, "all_statuses": False,
+    base = {"path": str(REGISTRY_PATH), "data_dir": str(PROJECT_ROOT / "data" / "onrc"),
+            "ensure_latest": True, "with_administrators": True, "dry_run": False}
+    if regs:
+        return {**base, "words": "", "classes": [], "counties": [], "localities": [],
+                "all_statuses": True, "fin": None, "tax": None, "regs": regs,
+                "area": "Romania",
+                "label": f"{len(regs):,} chosen firm{'' if len(regs) == 1 else 's'}"}
+    return {**base, "words": words, "classes": [], "counties": counties,
+            "localities": localities, "all_statuses": all_statuses,
             "fin": asdict(fin) if fin.active() else None,
-            "tax": asdict(tax) if tax.active() else None,
-            "with_administrators": True, "dry_run": False, "area": where,
-            "label": f"{words or 'every activity'} in {where}"}
+            "tax": asdict(tax) if tax.active() else None, "regs": None, "area": where,
+            "label": f"{words or 'every activity'} in {where}"
+                     + (" (every status)" if all_statuses else "")}
 
 
 def registry_count(params: dict) -> int | None:
@@ -1062,7 +1098,8 @@ def registry_count(params: dict) -> int | None:
         q = registry.resolve(con, params.get("words") or "",
                              counties=params.get("counties") or None,
                              localities=params.get("localities") or None,
-                             all_statuses=bool(params.get("all_statuses")), fin=fin, tax=tax)
+                             all_statuses=bool(params.get("all_statuses")), fin=fin, tax=tax,
+                             regs=params.get("regs"))
         return registry.count(con, q)
     finally:
         con.close()

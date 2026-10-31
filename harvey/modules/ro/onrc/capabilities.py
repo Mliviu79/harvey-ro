@@ -49,7 +49,8 @@ async def _search(inp, ctx) -> Draft:
     report.authorised = report.active = report.in_area = draft.counts.get("matched", 0)
     draft.values.update(
         report=report, codes=_codes(with_administrators), collector=onrc.COLLECTOR,
-        run_params={"dataset": dataset.name, "source": "registry", "match": q.match[:500],
+        run_params={"dataset": dataset.name, "source": "registry", "match": q.match[:500] or (
+                        f"{len(q.firm_ids)} chosen firms" if q.firm_ids is not None else ""),
                     "area": inp.area, "classes": report.classes or ["any"], "limit": limit,
                     "administrators": with_administrators})
     return draft

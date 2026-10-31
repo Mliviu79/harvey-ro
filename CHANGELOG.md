@@ -9,6 +9,24 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A Registry page.** The whole trade registry, every firm in Romania
+  operating or not, browsed with each firm's latest financial statements:
+  the registry source's own filters (activity, county, town, turnover and
+  employee bounds, employer, VAT, micro, and a new status filter for every
+  registration), sorted by name, turnover, employees, net profit or
+  registration date, with an exact total and page numbers. The first page
+  of a filter is ordered once and kept, so later pages and jumps are
+  instant; the rankings are computed in the background when the page is
+  first opened, one at a time and after any page being asked for, and a
+  registry gets an index for the registration-date sort (built with each
+  load, or added once to one loaded before). A search of only excluded
+  words ("-auto") lists every firm but those, and a pull of it takes the
+  same firms; only joining words ("si") count as no words. Each firm says
+  whether it is already in Harvey, by CUI or, for a firm with none, by its
+  registration number. Its panel
+  shows every financial year side by side, the registry's record and
+  administrators, the taxpayer file and ANAF's answer. The ticked firms or
+  the whole list are pulled into Harvey as a registry pull, counted first.
 - **Possible duplicates as groups.** The review list joins every pair still
   to decide into groups, each side followed to the company it stands for now:
   a pair made stale by a later merge is gone, and four or six records of one
@@ -402,6 +420,12 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A registry pull filtered only by figures works.** One filtered only by turnover, headcount or taxpayer flags
+  (no activity or area) found no firm; it now takes every operating firm
+  (or every firm, with all statuses) that meets them.
+- **Checks by CUI batch companies in id order.** A check of companies by CUI cut more than 900 companies into batches and
+  jobs in the order they were asked for, not by id, so where a company with
+  two CUIs fell depended on its random id (a test failed one run in five).
 - **Looking for duplicates on file no longer drops pairs.** When an earlier
   pair of the same pass had merged one side into a third company, the pair was
   skipped, so a record matching two others that merged was never merged or

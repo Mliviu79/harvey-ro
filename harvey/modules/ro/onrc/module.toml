@@ -53,6 +53,7 @@ filters = [
     { key = "words", type = "text", label = "Activity or CAEN code (words, or 8623)" },
     { key = "county", type = "text", label = "County (BV, Brașov; B is Bucharest)" },
     { key = "locality", type = "text", label = "Town" },
+    { key = "status", type = "choice", options = ["operating", "all"], label = "Status (operating firms, or every registration)" },
     { key = "min_turnover", type = "number", label = "Turnover from (lei)", module = "mf_financials" },
     { key = "max_turnover", type = "number", label = "Turnover up to (lei)", module = "mf_financials" },
     { key = "min_employees", type = "number", label = "Employees from", module = "mf_financials" },

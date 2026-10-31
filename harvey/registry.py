@@ -129,6 +129,9 @@ CREATE TABLE stage.closed (code TEXT PRIMARY KEY);
 """
 
 OPERATING_TAG = "activ"
+# A query's match when it names no words, area or status, only financial or
+# taxpayer conditions: every firm (no full-text expression says that).
+EVERY = "*"
 
 
 def county_tag(code: str) -> str:
@@ -322,6 +325,7 @@ def _build(files: dict[str, Path], dataset: onrc.Dataset, target: Path,
             ORDER BY f.sort, f.reg""")
         con.execute("CREATE UNIQUE INDEX firms_reg ON firms(reg)")
         con.execute("CREATE INDEX firms_cui ON firms(cui) WHERE cui != ''")
+        index_registered(con)
         say("activities by firm")
         con.execute("""
             INSERT OR IGNORE INTO firm_caen (firm_id, code, version)
@@ -340,19 +344,7 @@ def _build(files: dict[str, Path], dataset: onrc.Dataset, target: Path,
         say("nomenclature")
         _load_caen(con)
         say("search index")
-        con.execute(f"""
-            INSERT INTO firm_fts (rowid, name, locality, county, tags)
-            SELECT f.id, f.name, CASE WHEN f.places != '' THEN f.places ELSE f.locality END,
-                   f.county,
-                   trim(CASE WHEN f.county_code != '' THEN 'j' || lower(f.county_code)
-                             ELSE '' END
-                        || CASE WHEN f.operating THEN ' {OPERATING_TAG}' ELSE '' END
-                        || ' ' || COALESCE((
-                            SELECT group_concat(printf('c%04dr%d', k.code, k.version), ' ')
-                            FROM firm_caen k
-                            WHERE k.firm_id = f.id AND k.version IN (2, 3)), ''))
-            FROM firms f ORDER BY f.id""")
-        con.execute("INSERT INTO firm_fts (firm_fts) VALUES ('optimize')")
+        fill_search_index(con)
 
         counts = {
             "firms": con.execute("SELECT COUNT(*) FROM firms").fetchone()[0],
@@ -385,6 +377,60 @@ def _build(files: dict[str, Path], dataset: onrc.Dataset, target: Path,
         _remove(stage)
     os.replace(building, target)
     return meta
+
+
+# A firm's registration date as YYYYMMDD text (the registry writes
+# DD/MM/YYYY, sometimes with a time), for sorting; firms with a shorter
+# date have none.
+REGISTERED_KEY = ("substr(registered, 7, 4) || substr(registered, 4, 2) "
+                  "|| substr(registered, 1, 2)")
+REGISTERED_SORT = (f"SELECT id FROM firms WHERE length(registered) >= 10 "
+                   f"ORDER BY {REGISTERED_KEY} DESC, id")
+
+
+def index_registered(con):
+    """The index REGISTERED_SORT reads in order (a second, not a sort of
+    every firm)."""
+    con.execute(f"CREATE INDEX IF NOT EXISTS firms_registered ON firms({REGISTERED_KEY} DESC, id) "
+                "WHERE length(registered) >= 10")
+
+
+def ensure_registered_index(path: Path = REGISTRY_PATH) -> bool:
+    """Add index_registered's index to a registry loaded before it existed
+    (once, a few seconds). True when it was added."""
+    path = Path(path)
+    con = connect(path)
+    try:
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                       "AND name = 'firms_registered'").fetchone():
+            return False
+    finally:
+        con.close()
+    con = sqlite3.connect(path, timeout=30)
+    try:
+        index_registered(con)
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def fill_search_index(con):
+    """The firms' full-text index: name, place, county, and tags for the
+    county code, "operating" and each current class."""
+    con.execute(f"""
+        INSERT INTO firm_fts (rowid, name, locality, county, tags)
+        SELECT f.id, f.name, CASE WHEN f.places != '' THEN f.places ELSE f.locality END,
+               f.county,
+               trim(CASE WHEN f.county_code != '' THEN 'j' || lower(f.county_code)
+                         ELSE '' END
+                    || CASE WHEN f.operating THEN ' {OPERATING_TAG}' ELSE '' END
+                    || ' ' || COALESCE((
+                        SELECT group_concat(printf('c%04dr%d', k.code, k.version), ' ')
+                        FROM firm_caen k
+                        WHERE k.firm_id = f.id AND k.version IN (2, 3)), ''))
+        FROM firms f ORDER BY f.id""")
+    con.execute("INSERT INTO firm_fts (firm_fts) VALUES ('optimize')")
 
 
 def _load_caen(con):
@@ -476,6 +522,13 @@ class Query:
     # data/taxpayers.db the same way.
     tax: object = None
     tax_path: Path | None = None
+    all_statuses: bool = False
+    # Registry ids of firms chosen one by one (a selection on the Registry
+    # page): the query is exactly these, whatever else it says.
+    firm_ids: list[int] | None = None
+    # With match EVERY: the firms to leave out, as a full-text expression
+    # ("-auto" with every status).
+    excluded: str = ""
 
     @property
     def classes(self) -> list[tuple[str, int | None]]:
@@ -520,9 +573,24 @@ def _tags(classes) -> str:
     return "tags : " + _or([_quote(class_tag(c, v), False) for c, v in classes])
 
 
+def says_anything(words: str) -> bool:
+    """Whether ``words`` name anything resolve reads: a word that isn't a
+    joining word ("si", "de la") or a single letter, a class code, or a
+    county, wanted or excluded."""
+    from harvey.words import SEARCH_STOPWORDS, fold_words
+
+    for token in (words or "").split()[:20]:
+        bare = token.lstrip("-")
+        if _county_word(bare) or re.fullmatch(r"\d{2}\.?\d{2}(?:/\d+)?", bare):
+            return True
+        if any(len(w) > 1 and w not in SEARCH_STOPWORDS for w in fold_words(bare)):
+            return True
+    return False
+
+
 def resolve(con, words: str = "", *, classes=None, counties=None, localities=None,
             all_statuses: bool = False, fin=None, fin_path: Path | None = None,
-            tax=None, tax_path: Path | None = None) -> Query:
+            tax=None, tax_path: Path | None = None, regs=None) -> Query:
     """Turn a query into a Query. ``words`` follow harvey search: every
     word must match the firm's name, locality or county, or one of its
     classes (by everyday word, class name, or a 4-digit code: "8623",
@@ -532,11 +600,15 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
     and ``localities`` are filters on top, as import-onrc gives them;
     ``fin`` bounds turnover and headcount (financials.db at ``fin_path``),
     ``tax`` asks for employers, VAT payers or micro-enterprises (taxpayers.db
-    at ``tax_path``). Operating firms only, unless ``all_statuses``."""
+    at ``tax_path``). Operating firms only, unless ``all_statuses``.
+    ``regs`` (registration numbers) chooses those firms and nothing else:
+    every other argument is ignored."""
     from harvey.words import SEARCH_STOPWORDS as _SEARCH_STOPWORDS, fold_words as _fold_words
 
+    if regs is not None:
+        return Query(firm_ids=_ids_of(con, regs), all_statuses=True)
     q = Query(explicit_classes=list(classes or []), fin=fin, fin_path=fin_path,
-              tax=tax, tax_path=tax_path)
+              tax=tax, tax_path=tax_path, all_statuses=all_statuses)
     text = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", words or "")
     wanted: list[str] = []
     unwanted: list[str] = []
@@ -614,20 +686,40 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
             places.append("locality : (" + " AND ".join(_quote(t, False) for t in tokens) + ")")
     if places:
         parts.append(_or(places))
-    if not parts:
-        return q
-    if not all_statuses:
-        parts.append(f"tags : {OPERATING_TAG}")
-    match = " AND ".join(parts)
-    excluded = [term(w, False) for w in unwanted]
+    narrowed = (fin is not None and fin.active()) or (tax is not None and tax.active())
     skip_codes = [c for c in (_county_code(n) for n in skip_counties
                               if n not in names) if c]
+    if not parts and not narrowed and not unwanted and not skip_codes:
+        return q
+    excluded = [term(w, False) for w in unwanted]
     if skip_codes:
         excluded.append(_tags_raw([county_tag(c) for c in skip_codes]))
+    if not all_statuses:
+        parts.append(f"tags : {OPERATING_TAG}")
+    if not parts:
+        # Only exclusions or financial and taxpayer conditions, every
+        # status: every firm, less the excluded ones, narrowed by them
+        # (_where). A full-text expression can't start with NOT.
+        q.match = EVERY
+        q.excluded = _or(excluded) if excluded else ""
+        return q
+    match = " AND ".join(parts)
     if excluded:
         match = f"({match})" + "".join(f" NOT {x}" for x in excluded)
     q.match = match
     return q
+
+
+def _ids_of(con, regs) -> list[int]:
+    """Registry ids of these registration numbers, in name order (unknown
+    ones left out)."""
+    regs = [str(r) for r in dict.fromkeys(regs or []) if r]
+    out: list[int] = []
+    for at in range(0, len(regs), 900):
+        chunk = regs[at:at + 900]
+        out += [r[0] for r in con.execute(
+            f"SELECT id FROM firms WHERE reg IN ({','.join('?' * len(chunk))})", chunk)]
+    return sorted(out)
 
 
 def _phrase_units(words: list[str]) -> list:
@@ -685,12 +777,16 @@ def _county_code(name: str) -> str:
     return _county_codes().get(onrc._fold(name or ""), "")
 
 
-def _where(con, q: Query | None) -> tuple[str, list]:
-    """The query's financial bounds and taxpayer conditions as one
+def _where(con, q: Query | None, exclusions: bool = True) -> tuple[str, list]:
+    """The query's financial bounds and taxpayer conditions (and, with
+    match EVERY, its exclusions unless ``exclusions`` is False) as one
     condition on ``f`` (a firms row), with their databases attached: ("",
     []) when there are none. FileNotFoundError when one is asked for and
     its database isn't loaded."""
     conds, args = [], []
+    if exclusions and getattr(q, "excluded", "") and q.match == EVERY:
+        conds.append("f.id NOT IN (SELECT rowid FROM firm_fts WHERE firm_fts MATCH ?)")
+        args.append(q.excluded)
     fin = getattr(q, "fin", None)
     if fin is not None and fin.active():
         from harvey.modules.ro.mf_financials import store
@@ -714,6 +810,12 @@ def _where(con, q: Query | None) -> tuple[str, list]:
 
 def _count(con, match: str, cap: int | None = None, where=("", [])) -> int:
     cond, args = where
+    if match == EVERY:
+        inner = "SELECT 1 FROM firms f" + (f" WHERE {cond}" if cond else "")
+        if cap:
+            return con.execute(f"SELECT COUNT(*) FROM ({inner} LIMIT ?)",
+                               (*args, cap)).fetchone()[0]
+        return con.execute(f"SELECT COUNT(*) FROM ({inner})", args).fetchone()[0]
     if cond:
         inner = ("SELECT firm_fts.rowid FROM firm_fts JOIN firms f ON f.id = firm_fts.rowid "
                  f"WHERE firm_fts MATCH ? AND {cond}")
@@ -730,6 +832,8 @@ def _count(con, match: str, cap: int | None = None, where=("", [])) -> int:
 
 def count(con, q: Query, cap: int | None = None) -> int:
     """How many firms a resolved query matches, counting no further than ``cap``."""
+    if q.firm_ids is not None:
+        return min(len(q.firm_ids), cap) if cap else len(q.firm_ids)
     return _count(con, q.match, cap, _where(con, q)) if q.match else 0
 
 
@@ -737,6 +841,10 @@ def _ids(con, match: str, limit: int, offset: int, where=("", [])) -> list[int]:
     if limit <= 0:
         return []
     cond, args = where
+    if match == EVERY:
+        return [r[0] for r in con.execute(
+            "SELECT f.id FROM firms f" + (f" WHERE {cond}" if cond else "")
+            + " ORDER BY f.id LIMIT ? OFFSET ?", (*args, limit, offset))]
     if cond:
         return [r[0] for r in con.execute(
             "SELECT firm_fts.rowid FROM firm_fts JOIN firms f ON f.id = firm_fts.rowid "
@@ -770,6 +878,8 @@ def _tiers(q: Query) -> list[str]:
 def matching_ids(con, q: Query, limit: int | None = None, offset: int = 0) -> list[int]:
     """Firm ids for a resolved query, best tier first, alphabetical within
     a tier. All of them when ``limit`` is None."""
+    if q.firm_ids is not None:
+        return q.firm_ids[offset:None if limit is None else offset + limit]
     out: list[int] = []
     big = 1 << 62
     want = big if limit is None else limit
@@ -912,7 +1022,7 @@ def search_draft(con, q: Query, *, limit: int | None = None,
     """The firms a resolved query matches (the first ``limit``, best first)
     as a Draft (onrc.firms_draft): ``counts["matched"]`` how many,
     ``values["dataset"]`` the registry's dataset."""
-    ids = matching_ids(con, q, limit) if q.match else []
+    ids = matching_ids(con, q, limit) if q.match or q.firm_ids is not None else []
     firms, codes, people = firms_for_pull(con, ids, with_administrators)
     dataset = dataset_of(con)
     draft = onrc.firms_draft(firms, dataset, codes=codes, people=people, classes=q.classes,

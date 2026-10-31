@@ -948,6 +948,16 @@ async def test_a_companys_two_cuis_are_never_split_between_batches_or_jobs(state
     assert sum(h.count(order[999]) for h in held) == 1
 
 
+@pytest.mark.asyncio
+async def test_companies_with_an_id_come_in_id_order_whatever_order_they_are_asked_in(state):
+    # More than one read of 900, asked for in reverse: the reads used to
+    # follow the order asked, each sorted on its own, so where a company
+    # fell (and which job of 1,000 it went in) depended on its random id.
+    ids = await _companies(state, 1000)
+    rows = await state.companies_with_id("cui", sorted(ids, reverse=True))
+    assert [r["id"] for r in rows] == sorted(ids)
+
+
 async def _companies_from(state, start, n):
     return [await state.add_company(Company(name=f"EXEMPLU {start + i} SRL",
                                             cui=cui(str(start + i)), source="registry:onrc"))

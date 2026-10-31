@@ -404,15 +404,21 @@ class Filter:
     def active(self) -> bool:
         return any(v is not None for v in (self.employer, self.vat, self.micro))
 
-    def sql(self, cui_column: str, alias: str = "tax") -> tuple[str, list]:
-        """A WHERE condition on a row holding ``cui_column``, with the
-        taxpayers database attached as ``alias``."""
+    def parts(self) -> tuple[list[str], list]:
+        """The conditions on a ``taxpayers`` row aliased ``t``, and their
+        arguments."""
         parts, args = [], []
         for column, wanted in (("employer", self.employer), ("vat", self.vat),
                                ("micro_tax", self.micro)):
             if wanted is not None:
                 parts.append(f"t.{column} = ?")
                 args.append(1 if wanted else 0)
+        return parts, args
+
+    def sql(self, cui_column: str, alias: str = "tax") -> tuple[str, list]:
+        """A WHERE condition on a row holding ``cui_column``, with the
+        taxpayers database attached as ``alias``."""
+        parts, args = self.parts()
         if not parts:
             return "1", []
         return (f"EXISTS (SELECT 1 FROM {alias}.taxpayers t WHERE t.cui = {cui_column} "

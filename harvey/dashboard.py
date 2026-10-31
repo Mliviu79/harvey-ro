@@ -1060,6 +1060,119 @@ async def _company_findings(company_id: str, company: dict) -> dict:
     return {"phones": phones, "addresses": ordered(lists["ADDRESS"]), "facts": fact_list}
 
 
+# ── The Registry page: the whole trade registry, with its financials ──
+#
+# harvey/registry_view.py lists and orders the firms; the filters are the
+# registry source's own (its manifest, read by job_kinds.registry_params),
+# so the page shows what a pull of the same filters saves. Pulling goes
+# through Discover's estimate and run, with the same filters or the
+# registration numbers ticked.
+
+
+def _registry_source(enabled=None) -> dict | None:
+    from harvey.modules.job_kinds import discover_sources
+
+    return next((s for s in discover_sources(enabled) if s["job"] == "registry_pull"), None)
+
+
+async def _in_harvey(cuis: list[str], regs: list[str] = ()) -> dict[str, str]:
+    """CUI, or "onrc:" + registration number, -> the id of the company on
+    file with it (its own CUI or one it was also given; a firm with no CUI
+    is saved under its registration number; a merged record stands for
+    its survivor)."""
+    cuis = [c for c in dict.fromkeys(cuis) if c]
+    keys = [f"onrc:{r}" for r in dict.fromkeys(regs) if r]
+    if not (cuis or keys) or not DB_PATH.exists():
+        return {}
+    out: dict[str, str] = {}
+    rows = []
+    if cuis:
+        marks = _in(cuis)
+        rows += await query_db(
+            "SELECT i.value AS cui, c.id, COALESCE(c.merged_into, '') AS merged_into "
+            f"FROM company_ids i JOIN companies c ON c.id = i.company_id "
+            f"WHERE i.kind = 'cui' AND i.value IN ({marks})", tuple(cuis))
+        rows += await query_db(
+            "SELECT cui, id, COALESCE(merged_into, '') AS merged_into FROM companies "
+            f"WHERE cui != '' AND cui IN ({marks})", tuple(cuis))
+    if keys:
+        rows += await query_db(
+            "SELECT external_id AS cui, id, COALESCE(merged_into, '') AS merged_into "
+            f"FROM companies WHERE external_id IN ({_in(keys)})", tuple(keys))
+    for r in rows:
+        if r["cui"] not in out or not r["merged_into"]:
+            out[r["cui"]] = r["merged_into"] or r["id"]
+    return out
+
+
+def _on_file(found: dict[str, str], cui: str, reg: str) -> str | None:
+    return (found.get(cui) if cui else None) or (found.get(f"onrc:{reg}") if reg else None)
+
+
+@app.get("/api/registry")
+async def get_registry(request: Request, limit: int | None = None, offset: int | None = None,
+                       sort: str = "", dir: str = ""):
+    """One page of the trade registry: {total, offset, limit, sort, dir,
+    rows, filters, loaded}. Filters (query string) are the registry
+    source's: words (activity, CAEN code or name), county, locality,
+    status (operating, or all), min/max_turnover, min/max_employees,
+    unknown, employer, vat, micro. With none, every operating firm. Sort:
+    name, turnover, employees, profit (the latest filed year's) or
+    registered. Each row is the registry's firm with ``figures`` (its
+    latest year) and ``company_id`` when it is already on file."""
+    from harvey import registry_view
+    from harvey.modules import switches
+    from harvey.modules.job_kinds import registry_params
+
+    limit, offset = _page_args(limit, offset)
+    state = _state()
+    await state.init_db()
+    source = _registry_source(await switches.enabled_ids(state))
+    loaded = registry_view.loaded()
+    empty = {"total": 0, "offset": offset, "limit": limit, "sort": sort, "dir": dir,
+             "rows": [], "loaded": loaded, "source": source}
+    if source is None or not source["enabled"]:
+        return {**empty, "off": True}
+    if not loaded["registry"]:
+        return empty
+    args = {k: v for k, v in request.query_params.items()
+            if k not in ("limit", "offset", "sort", "dir")}
+    registry_view.warm()
+    try:
+        params = registry_params(args)
+        got = await asyncio.to_thread(registry_view.page, params, sort, dir, limit, offset)
+    except FileNotFoundError as e:
+        return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    except ValueError as e:
+        return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    on_file = await _in_harvey([r["cui"] for r in got["rows"]],
+                               [r["reg"] for r in got["rows"] if not r["cui"]])
+    for r in got["rows"]:
+        r["company_id"] = _on_file(on_file, r["cui"], r["reg"])
+    return {**empty, **got}
+
+
+@app.get("/api/registry/firm")
+async def get_registry_firm(reg: str = ""):
+    """One firm by registration number: the registry's row with its
+    activities and administrators, every financial year on file, the
+    taxpayer file's row and ANAF's kept answer, and the company on file
+    with its CUI (``company_id``)."""
+    from harvey import registry_view
+
+    if not reg.strip():
+        return JSONResponse({"error": "reg is required"}, status_code=400)
+    try:
+        found = await asyncio.to_thread(registry_view.firm, reg.strip())
+    except FileNotFoundError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    if found is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    found["company_id"] = _on_file(await _in_harvey([found["cui"]], [found["reg"]]),
+                                   found["cui"], found["reg"])
+    return found
+
+
 # ── Possible duplicates ──
 #
 # The resolver (harvey/resolver.py) merges a company found twice on its own

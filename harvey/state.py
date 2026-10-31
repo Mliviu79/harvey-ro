@@ -3854,12 +3854,16 @@ class StateManager:
     async def companies_with_id(self, kind: str, company_ids=None) -> list[dict]:
         """Companies on file (not merged away) holding an identifier of
         ``kind`` (a CUI): ``{"id", "name", "value"}``, one row per
-        identifier. Only ``company_ids`` when given."""
+        identifier, in company id order (then value), a company's rows
+        together. Only ``company_ids`` when given."""
         sql = (f"SELECT c.id, c.name, i.value FROM company_ids i "
                f"JOIN companies c ON c.id = i.company_id "
                f"WHERE i.kind = ? AND i.value != '' AND {LIVE_COMPANY}")
         args: list = [kind]
-        ids = list(dict.fromkeys(company_ids)) if company_ids is not None else None
+        # Sorted before they are read 900 at a time, so the chunks follow
+        # one another in id order too: callers cut the rows into batches
+        # and jobs, and resume a check after the last id it saved.
+        ids = sorted(set(company_ids)) if company_ids is not None else None
         if ids is not None and not ids:
             return []
         out: list[dict] = []
