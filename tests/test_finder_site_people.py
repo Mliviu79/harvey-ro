@@ -30,8 +30,8 @@ from harvey.signals import sync_vocabulary
 from harvey.state import StateManager, company_brief_lines
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sites"
-SITES = {"harborlinedental.example": "harborline", "clinica-exemplu.ro": "clinica"}
-EN, RO = "harborlinedental.example", "clinica-exemplu.ro"
+SITES = {"harborlinedental.example": "harborline", "clinica-exemplu.example": "clinica"}
+EN, RO = "harborlinedental.example", "clinica-exemplu.example"
 
 
 def run(coro):
@@ -101,14 +101,15 @@ def test_the_english_site_is_read_through_its_own_menu():
     assert [p.url for p in draft.pages] == [
         "https://harborlinedental.example", "https://harborlinedental.example/meet-the-dentists/",
         "https://harborlinedental.example/about-us/", "https://harborlinedental.example/contact/"]
-    # The owner first: named in schema.org and "owned and operated by".
+    # The owner first: named in schema.org, "owned and operated by" and her
+    # card ("Owner and Lead Dentist", a role, not another practice).
     people = [(p.first_name, p.last_name, p.fields.get("owner")) for p in draft.people]
     assert people[0] == ("Maren", "Calloway", True)
     assert {p[:2] for p in people} == {("Maren", "Calloway"), ("Lena", "Brightwater"),
                                         ("Theo", "Ashgrove")}
     [owner] = [f for f in draft.facts if f.code == "LIKELY_OWNER"]
     assert owner.value_num == 1 and owner.value_text.startswith("Maren Calloway — ")
-    assert "owned and operated by" in owner.value_text
+    assert owner.value_text == "Maren Calloway — Owner and Lead Dentist"
     assert (owner.module, owner.capability) == ("people", "find_people")
     assert api.undeclared(draft) == []
 
@@ -132,8 +133,8 @@ def test_the_romanian_site_founder_comes_first():
         ("Ioana", "Vrânceanu"), ("Mihai", "Olteanu")]
     assert draft.people[0].fields["owner"] is True
     emails = {c.value for c in draft.contacts if c.kind == "email"}
-    # "ioana.vranceanu [at] clinica-exemplu [dot] ro"
-    assert emails == {"ioana.vranceanu@clinica-exemplu.ro", "contact@clinica-exemplu.ro"}
+    # "ioana.vranceanu [at] clinica-exemplu [dot] example"
+    assert emails == {"ioana.vranceanu@clinica-exemplu.example", "contact@clinica-exemplu.example"}
     assert draft.values["email_pattern"]["pattern"] == "{f}.{l}"
     assert any(f.code == "LIKELY_OWNER" and "Ioana Vrânceanu" in f.value_text
                for f in draft.facts)
@@ -249,7 +250,7 @@ def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
     assert found.steps[0] == "site" and found.people == 3
     # The owner was saved first: the address step takes people in that order.
     assert _rows(db, "SELECT name, role FROM people ORDER BY id")[0] == (
-        "Maren Calloway", "Owner")
+        "Maren Calloway", "Owner and Lead Dentist")
     assert _addresses(db, cid) == [
         # Published on the site: theirs as it is, no check spent.
         ("Lena Brightwater", "lena@harborlinedental.example", "unchecked", "confirmed"),
@@ -281,8 +282,8 @@ def test_the_romanian_clinic_gets_its_doctors_addresses(tmp_path, no_network):
 
     cid = run(go())
     assert _addresses(db, cid) == [
-        ("Ioana Vrânceanu", "ioana.vranceanu@clinica-exemplu.ro", "unchecked", "confirmed"),
-        ("Mihai Olteanu", "mihai.olteanu@clinica-exemplu.ro", "guess", "likely"),
+        ("Ioana Vrânceanu", "ioana.vranceanu@clinica-exemplu.example", "unchecked", "confirmed"),
+        ("Mihai Olteanu", "mihai.olteanu@clinica-exemplu.example", "guess", "likely"),
     ]
 
 
@@ -302,8 +303,8 @@ def test_the_registrys_administrator_gets_the_address_the_site_publishes_for_the
     cid = run(go())
     # The team page names her too: one person, the registry's entry linked.
     assert _addresses(db, cid) == [
-        ("Mihai Olteanu", "mihai.olteanu@clinica-exemplu.ro", "guess", "likely"),
-        ("VRÂNCEANU IOANA", "ioana.vranceanu@clinica-exemplu.ro", "unchecked", "confirmed"),
+        ("Mihai Olteanu", "mihai.olteanu@clinica-exemplu.example", "guess", "likely"),
+        ("VRÂNCEANU IOANA", "ioana.vranceanu@clinica-exemplu.example", "unchecked", "confirmed"),
     ]
 
 
@@ -450,7 +451,7 @@ def test_the_audience_and_the_writer_get_the_companys_facts(tmp_path, monkeypatc
         ])
         from harvey import contacts
         await s.add_contacts(cid, [contacts.Found(
-            "email", "ioana.vranceanu@clinica-exemplu.ro", status="verified",
+            "email", "ioana.vranceanu@clinica-exemplu.example", status="verified",
             person="Ioana Vrânceanu", role="Medic primar stomatolog, fondator",
             source="website", trust="confirmed")])
         made = await Audience(s, env={}).run()
@@ -624,3 +625,115 @@ def test_a_catch_all_address_is_no_surer_than_likely():
     assert finder._guess_trust(risky, "confirmed") == "likely"
     assert finder._guess_trust(verified, "confirmed") == "confirmed"
     assert finder._guess_trust(risky, "unconfirmed") == "unconfirmed"
+
+
+# ── Published addresses, linked with no cap ──
+
+
+def _email_searches(db):
+    return sorted(_rows(db, "SELECT p.name, s.outcome FROM searches s "
+                            "JOIN people p ON CAST(p.id AS TEXT) = s.target_id "
+                            "WHERE s.target = 'person' AND s.module = 'email_verify'"))
+
+
+def test_with_no_cap_published_addresses_are_still_linked_to_their_people(tmp_path, no_network):
+    """The background walk with no spend.per_day_usd: no address is built or
+    checked, but a person's own address on the site is theirs for free; the
+    capped run later builds only the rest, and links nobody twice."""
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        cid = await s.add_company(Company(name="HARBORLINE DENTAL", domain=EN,
+                                          location="Port Ellery", source="discover:serper"))
+        free = await finder.find(s, cid, spend=finder.Spend(cap=False), env={})
+        linked = _addresses(db, cid)
+        searched = _email_searches(db)
+        await finder.find(s, cid, spend=finder.Spend(), env={}, since="9999-01-01")
+        return cid, free, linked, searched
+
+    cid, free, linked, searched = run(go())
+    assert linked == [
+        ("Lena Brightwater", "lena@harborlinedental.example", "unchecked", "confirmed"),
+        ("Maren Calloway", "maren@harborlinedental.example", "unchecked", "confirmed"),
+    ]
+    assert "address" not in free.steps
+    # Theo has no address of his own: not marked searched, left for a cap.
+    assert searched == [("Lena Brightwater", "found"), ("Maren Calloway", "found")]
+    # The capped run builds his, and links the others once.
+    assert _addresses(db, cid) == linked + [
+        ("Theo Ashgrove", "theo@harborlinedental.example", "guess", "likely")]
+    assert _rows(db, "SELECT COUNT(*) FROM company_contacts l JOIN contacts ct "
+                     "ON ct.id = l.contact_id WHERE ct.kind = 'email' AND l.person_id != 0 "
+                     "AND l.company_id = ?", (cid,)) == [(3,)]
+
+
+def test_with_no_cap_a_guess_on_file_is_never_linked_as_published(tmp_path, no_network):
+    from harvey import contacts
+
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        cid = await s.add_company(Company(name="HARBORLINE DENTAL", domain=EN,
+                                          location="Port Ellery", source="discover:serper"))
+        # An address built earlier and never confirmed, and one built by an
+        # address check: neither is evidence of anything.
+        await s.add_contacts(cid, [
+            contacts.Found("email", "theo@harborlinedental.example", status="guess",
+                           source="email_verify", capability="find_email", trust="likely"),
+            contacts.Found("email", "theo.ashgrove@harborlinedental.example", status="verified",
+                           source="email_verify", capability="find_email", trust="likely")])
+        await finder.find(s, cid, spend=finder.Spend(cap=False), env={})
+        return cid
+
+    cid = run(go())
+    assert [a[0] for a in _addresses(db, cid)] == ["Lena Brightwater", "Maren Calloway"]
+
+
+def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_not_at_all(
+        tmp_path, no_network):
+    db = tmp_path / "harvey.db"
+
+    async def go(trust, name="HARBORLINE DENTAL", town="Port Ellery"):
+        s = await _state(db)
+        cid = await s.add_company(Company(name=name, location=town, source="discover:serper"))
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE companies SET website = ?, website_trust = ? WHERE id = ?",
+                         (f"https://{EN}", trust, cid))
+        found = await finder.find(s, cid, spend=finder.Spend(cap=False), env={})
+        return cid, found
+
+    cid, found = run(go("likely"))
+    assert found.trust == "likely"
+    assert {a[3] for a in _addresses(db, cid)} == {"likely"} and len(_addresses(db, cid)) == 2
+    db.unlink()
+    # A site that may be another business's (neither its name nor its town).
+    cid, found = run(go("unconfirmed", "QUILLNEST LOGISTICS", "Northvale"))
+    assert found.trust == "unconfirmed" and _addresses(db, cid) == []
+
+
+@pytest.mark.parametrize("cap", [False, True])
+def test_a_twin_searched_earlier_with_nothing_found_does_not_block_her_published_address(
+        tmp_path, no_network, cap):
+    """The registry's administrator was searched before the site published
+    her address (nothing found then). The team page now names her with it:
+    the search with nothing found doesn't make the address the registry
+    entry's, so the team page's mention gets it, with or without a cap."""
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        cid = await s.add_company(Company(name="CLINICA EXEMPLU SRL", domain=RO,
+                                          location="Brașov, Brașov, Romania",
+                                          source="registry:onrc"))
+        await s.add_people(cid, [("VRÂNCEANU IOANA", "administrator")], source="onrc")
+        (pid,) = _rows(db, "SELECT id FROM people WHERE company_id = ?", (cid,))[0]
+        await s.record_search("person", pid, *finder.EMAIL, looked_for="email",
+                              outcome="nothing", origin=cid)
+        await finder.find(s, cid, spend=finder.Spend(cap=cap), env={})
+        return cid
+
+    cid = run(go())
+    assert ("Ioana Vrânceanu", "ioana.vranceanu@clinica-exemplu.example", "unchecked",
+            "confirmed") in _addresses(db, cid)

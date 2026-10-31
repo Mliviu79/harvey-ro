@@ -32,6 +32,18 @@ minor versions can still change behaviour.
   the finder read before this gets the deeper read once in the
   background, after the companies with no contact, whatever contacts the
   first read found (its read didn't look for the owner).
+- **A site read's other requests have a budget of their own.** The About
+  and press pages the startup signals look for, the page a search found,
+  `robots.txt`, `sitemap.xml`, the careers page and its job board's feed
+  share fourteen requests per read, apart from the menu read's ten, so they
+  can never starve the pages contacts come from. A signal whose page the
+  budget couldn't pay for stays unanswered (never a "no"), and a page is
+  fetched once per read: the About page the startup signals found is the
+  menu's About page too.
+- **Published addresses are linked with no spend cap.** A person's own
+  address on the company's site is linked to them by every finder run,
+  including the background walk with no `spend.per_day_usd`; addresses are
+  still built and checked only inside a cap.
 - **The Writer gets what the record knows.** Prospects made from contacts
   carry the company's town, its activity, and the latest tools on its site,
   open roles, ads, booking, website agency, employees and rating as notes,
@@ -455,6 +467,13 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A combined title on a team card is a role, not another company.**
+  "Owner and Lead Dentist", "Founder, Head of Growth" or "Fondator și
+  Director Medical" no longer drops the person as someone quoted from
+  another organisation; "Founder at Quillnest", "Partner, Example Law LLP",
+  "Owner and Lead Dentist, Bluefinch Dental" and any title's "at Another
+  Clinic" still do. A branch is not another organisation: "Associate
+  Dentist at Port Ellery" or "at Our Northvale Office" keeps the person.
 - A site read that looked for a raise (`FUNDING_ROUND`) no longer drops the
   contact and team pages it read afterwards from what it returns.
 

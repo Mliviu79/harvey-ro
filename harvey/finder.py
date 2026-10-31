@@ -22,7 +22,8 @@ search, whichever source brought it in. For one company at a time (the
    their own, gets one address built from the domain's pattern and checked
    by a verification tier (email_verify), inside the same cap and the
    month's address checks (a credit each: a cap in dollars can't see a
-   free tier running out).
+   free tier running out). An address the site publishes as the person's
+   own is linked to them as it is, with no check, cap or not.
 
 Nothing found is thrown away because the match is unproven. A website found
 by searching is tagged confirmed (its pages carry the company's CUI, or a
@@ -292,7 +293,8 @@ async def _on_file(state, company_id: str) -> set[str]:
             return {r[0].lower() for r in await cur.fetchall()}
 
 
-async def _people_to_search(state, company_id: str, since: str | None) -> list[dict]:
+async def _people_to_search(state, company_id: str, since: str | None,
+                            limit: int = MAX_PEOPLE_PER_COMPANY) -> list[dict]:
     cond, args = _not_searched(*EMAIL, since, "CAST(p.id AS TEXT)", "person")
     async with state._connect() as db:
         db.row_factory = aiosqlite.Row
@@ -300,7 +302,7 @@ async def _people_to_search(state, company_id: str, since: str | None) -> list[d
                 "SELECT p.id, p.name, p.role, p.source FROM people p WHERE p.company_id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM company_contacts l WHERE l.person_id = p.id "
                 f"AND l.person_id != 0) AND {cond} ORDER BY p.id LIMIT ?",
-                (company_id, *args, MAX_PEOPLE_PER_COMPANY)) as cur:
+                (company_id, *args, limit)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
@@ -350,7 +352,8 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
     search modules' free allowances (its share of them). ``want_website``:
     look a company with no website up even when it has a phone (a Discover
     run's "find websites"). ``addresses`` False: no address is built and
-    checked (a verification credit each), only sites read and searched."""
+    checked (a verification credit each), only sites read and searched and
+    the addresses a site publishes as a person's own linked to them."""
     from harvey.modules import switches
 
     out = Found(company_id)
@@ -387,11 +390,14 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
         if found:
             domain = found
     trust = out.trust or floor or "confirmed"
-    if domain and trust != "unconfirmed" and spend.cap and addresses:
+    if domain and trust != "unconfirmed":
         # (An address built at a domain that may not be the company's would
-        # be a guess about someone else's mailbox.)
+        # be a guess about someone else's mailbox.) With no cap, or no
+        # address checks wanted, only the addresses the site publishes as a
+        # person's own are linked to them: that costs nothing.
         await _addresses(state, company, domain, out, trust, spend=spend, since=since,
-                         batch_id=batch_id, enabled=enabled, env=env, config=config)
+                         batch_id=batch_id, enabled=enabled, env=env, config=config,
+                         verify=bool(spend.cap and addresses))
     if out.steps or out.failed:
         # Every search failed: an error, which isn't a search done.
         await state.record_search(
@@ -572,7 +578,8 @@ def _skip(out: Found, why: str) -> None:
 
 
 async def _addresses(state, company: dict, domain: str, out: Found, trust: str, *,
-                     spend: Spend, since, batch_id, enabled, env, config=None) -> None:
+                     spend: Spend, since, batch_id, enabled, env, config=None,
+                     verify: bool = True) -> None:
     """Step 3: one checked address for each person at the company reached
     by no contact of their own (a verification credit each). What the
     addresses on file at the domain say comes first (email_finder's
@@ -582,13 +589,17 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
     With no evidence and no pattern learned, a small company's address is
     built as first@ (SMALL_BUSINESS_PATTERN, see small_company), any
     other's as first.last@. A built address no verifier confirmed stays a
-    guess, kept no surer than "likely"."""
+    guess, kept no surer than "likely". ``verify`` False (no cap): only the
+    published addresses are linked, for everyone named there, and nobody
+    else is marked searched."""
     from harvey.integrations import email_finder as ef
 
     if EMAIL[0] not in enabled:
         return
     company_id = company["id"]
-    people = await _people_to_search(state, company_id, since)
+    # (Linking costs nothing: everyone named, not the few a check is spent on.)
+    people = await _people_to_search(state, company_id, since,
+                                     MAX_PEOPLE_PER_COMPANY if verify else -1)
     if not people:
         return
     try:
@@ -613,12 +624,22 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
     # an address, and one mailbox isn't two people's. Kept with whether it
     # came back invalid: only then may the next reading be tried.
     checked: dict[str, tuple[str, bool]] = {}
+    linked = await _linked_emails(state, company_id)
+    for other in named:
+        # Linked to their own address on an earlier pass: still theirs alone.
+        # (Only linked: someone searched with nothing found doesn't own it.)
+        if other["id"] not in searching:
+            own, key = _own_address(known, contacts.name_orders(other["name"], other["source"] or ""))
+            if own and (other["id"], own.lower()) in linked:
+                checked.setdefault(key, (other["name"], False))
     for person in people:
         source = person.get("source") or ""
         twin = twins.get(person["id"])
         if twin is not None and twin["id"] in searching and _official(twin["source"]):
             # A team page naming the registry's administrator: the registry
             # entry is searched, in the order the page confirms.
+            if not verify:
+                continue
             await state.record_search("person", person["id"], *EMAIL, looked_for="email",
                                       outcome="nothing", batch_id=batch_id,
                                       detail=f"searched as {twin['name']}", origin=company_id)
@@ -628,6 +649,8 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         else:
             orders, confirmed = contacts.name_orders(person["name"], source), False
         if not orders:
+            if not verify:
+                continue
             await state.record_search("person", person["id"], *EMAIL, looked_for="email",
                                       outcome="nothing", batch_id=batch_id,
                                       detail="no first and last name", origin=company_id)
@@ -636,6 +659,8 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         if own:
             if key in checked:
                 # Someone else here reads the same: one mailbox isn't two people's.
+                if not verify:
+                    continue
                 await state.record_search(
                     "person", person["id"], *EMAIL, looked_for="email", outcome="nothing",
                     batch_id=batch_id, origin=company_id,
@@ -654,6 +679,8 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
                 "person", person["id"], *EMAIL, looked_for="email", outcome="found",
                 found=kept, batch_id=batch_id, origin=company_id,
                 detail="their own address, published on the company's site")
+            continue
+        if not verify:
             continue
         # A hyphenated given name whole first ("anamaria"), then its first
         # part ("ana") if that comes back invalid.
@@ -750,6 +777,17 @@ def _own_address(known, orders) -> tuple[str, str]:
             if _reading_key(k_first, k_last) == mine:
                 return addr, mine
     return "", ""
+
+
+async def _linked_emails(state, company_id: str) -> set[tuple[int, str]]:
+    """(person id, address) for every email linked to a person at the company."""
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT l.person_id, LOWER(ct.value) FROM company_contacts l "
+                "JOIN contacts ct ON ct.id = l.contact_id "
+                "WHERE l.company_id = ? AND l.person_id != 0 AND ct.kind = 'email'",
+                (company_id,)) as cur:
+            return {(r[0], r[1]) for r in await cur.fetchall()}
 
 
 async def _emails_at(state, company_id: str, domain: str) -> list[str]:

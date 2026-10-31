@@ -131,6 +131,17 @@ AI_CRAWLERS = ("gptbot", "google-extended", "ccbot", "anthropic-ai", "claudebot"
 # guessed page counts only when it is a real page (over 500 characters).
 MAX_SITE_PAGES = 6
 MAX_SITE_FETCHES = 10
+# The read's other requests (the About and press pages the startup signals
+# look for, the page a search found, robots.txt, sitemap.xml, the careers
+# page and its job board's feed) have a budget of their own, so they never
+# eat into the menu read the contacts come from. With every signal they
+# answer confirmed, a site with no About and no press page takes 11 of them
+# (4 About paths, the search's page, 4 press paths, robots, sitemap), and a
+# careers link and its board's feed 2 more: 14 leaves one guess at a careers
+# path. Only a site with no careers link that misses most of these pages
+# runs out (they are 20 requests at most), and the signal left unread stays
+# unanswered, never a "no".
+MAX_EXTRA_FETCHES = 14
 FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us")
 # A .ro site's pages are named in Romanian: tried first on .ro domains only.
 RO_FALLBACK_SITE_PATHS = ("/echipa", "/despre-noi", "/medici", "/contact")
@@ -860,6 +871,20 @@ def open_http() -> httpx.AsyncClient:
     )
 
 
+def _cache_key(url: str, site: str = "") -> str:
+    """A read's cache key: the URL as asked, a trailing slash aside. The
+    scheme and www are different sites until one answers; once ``site``
+    (the base the homepage answered at) has, its host's other spellings
+    are that site ("https://www.acme.test/about" is "https://acme.test/about")."""
+    p = urlparse(url)
+    scheme, host = p.scheme, p.netloc.lower()
+    if site:
+        s = urlparse(site)
+        if host.removeprefix("www.") == s.netloc.lower().removeprefix("www."):
+            scheme, host = s.scheme, s.netloc.lower()
+    return f"{scheme}://{host}{p.path.rstrip('/')}{('?' + p.query) if p.query else ''}"
+
+
 class Known:
     """What core already knows about the company being read, handed in as
     values (no database): whether a preset search found it (by signal
@@ -929,6 +954,26 @@ class ProfileCollector:
         pages = getattr(self, "_pages", None)
         return pages.method(url) if pages is not None else HTTP
 
+    def _cached(self, url: str):
+        """(where the page landed, its HTML) when this read fetched ``url``
+        already (a trailing slash aside), else None."""
+        cache = getattr(self, "_read_cache", None)
+        return cache.get(self._key(url)) if cache is not None else None
+
+    def _key(self, url: str) -> str:
+        return _cache_key(url, getattr(self, "_read_site", ""))
+
+    async def _extra_get(self, url: str) -> str | None:
+        """``_get`` counted against the read's MAX_EXTRA_FETCHES: None when
+        they are spent (the signal asking stays unanswered). A page this
+        read fetched already costs nothing."""
+        if self._cached(url) is None:
+            left = getattr(self, "_extra_left", MAX_EXTRA_FETCHES)
+            if left <= 0:
+                return None
+            self._extra_left = left - 1
+        return await self._get(url)
+
     async def _get(self, url: str) -> str:
         """The page's HTML over HTTP, or rendered by a browser when HTTP got
         a JavaScript shell or a block (harvey/browser.py); "" when neither
@@ -944,7 +989,26 @@ class ProfileCollector:
 
     async def _fetch(self, url: str) -> tuple[str, str]:
         """(the URL the page was read at after any redirect, its HTML), as
-        ``_get`` reads it; (url, "") when nothing produced a page."""
+        ``_get`` reads it; (url, "") when nothing produced a page. Within a
+        read each URL is fetched once: the About page the startup signals
+        found is the menu's About page too."""
+        hit = self._cached(url)
+        if hit is not None:
+            return hit
+        got = await self._fetch_once(url)
+        if got is None:
+            # (A timeout or a refused connection isn't the page's answer:
+            # whoever asks next asks again.)
+            return url, ""
+        cache = getattr(self, "_read_cache", None)
+        if cache is not None:
+            cache[self._key(url)] = got
+            if got[1]:
+                cache.setdefault(self._key(got[0]), got)
+        return got
+
+    async def _fetch_once(self, url: str) -> tuple[str, str] | None:
+        """``_fetch`` with no cache; None when the request itself failed."""
         pages = getattr(self, "_pages", None)
         host = urlparse(url).netloc.lower().removeprefix("www.")
         if pages is not None and pages.browser_first(url):
@@ -955,7 +1019,7 @@ class ProfileCollector:
             resp = await self._client.get(url)
         except (httpx.HTTPError, ValueError) as e:
             logger.debug(f"fetch failed {url}: {e}")
-            return url, ""
+            return None
         final = str(getattr(resp, "url", "") or url)
         blocked = resp.status_code in (200, 202, 403, 429, 503) and looks_like_challenge(
             resp.text or "", resp.status_code)
@@ -998,11 +1062,15 @@ class ProfileCollector:
                 break       # every variant lands on the same challenge
         return "", ""
 
-    async def _first_present(self, site: str, paths) -> tuple[str, str]:
-        """Return (url, html) for the first path that returns content."""
+    async def _first_present(self, site: str, paths, extra: bool = False):
+        """Return (url, html) for the first path that returns content, or
+        ("", ""). ``extra``: counted against MAX_EXTRA_FETCHES, and None
+        when they ran out before any path answered."""
         for path in paths:
             url = f"{site}{path}"
-            html = await self._get(url)
+            html = await (self._extra_get(url) if extra else self._get(url))
+            if html is None:
+                return None
             if html and len(html) > 500:
                 return url, html
         return "", ""
@@ -1038,7 +1106,8 @@ class ProfileCollector:
             if _norm_url(url) in seen:
                 continue
             seen.add(_norm_url(url))
-            fetched += 1
+            if self._cached(url) is None:
+                fetched += 1
             final, html = await self._fetch(url)
             if not html:
                 if domain in getattr(self, "challenged", ()):
@@ -1055,9 +1124,10 @@ class ProfileCollector:
             out.append((final, html))
         return out
 
-    async def _careers_page(self, site: str, home: str, domain: str) -> tuple[str, str]:
+    async def _careers_page(self, site: str, home: str, domain: str):
         """(url, html) of the careers page: the homepage's own link to it
-        (same domain or a subdomain), else the first common path that exists."""
+        (same domain or a subdomain), else the first common path that exists;
+        None when the read's MAX_EXTRA_FETCHES ran out first."""
         for link in re.finditer(r'(?is)<a\b[^>]*href=["\']([^"\'#]+)["\'][^>]*>(.*?)</a>',
                                 _strip_code(home)):
             url = urljoin(site + "/", link.group(1).strip())
@@ -1071,19 +1141,32 @@ class ProfileCollector:
             if (segments or host != domain) and (
                     _CAREERS_HOST.match(host) or segments & _CAREERS_SEGMENTS
                     or _CAREERS_ANCHOR.match(html_unescape(anchor))):
-                html = await self._get(url)
+                html = await self._extra_get(url)
+                if html is None:
+                    return None
                 if html and len(html) > 500:
                     return url, html
                 break
-        return await self._first_present(site, CAREERS_PATHS)
+        return await self._first_present(site, CAREERS_PATHS, extra=True)
 
     async def _hiring(self, site: str, home: str, domain: str, add) -> None:
+        # The read's extra requests running out leaves both signals unanswered.
         curl, chtml = "", ""
         board = detect_board(home, domain)
         if board is None:
-            curl, chtml = await self._careers_page(site, home, domain)
+            careers = await self._careers_page(site, home, domain)
+            if careers is None:
+                return
+            curl, chtml = careers
             board = detect_board(chtml, domain)
-        postings = await read_board(self._client, board) if board else None
+        postings = None
+        if board:
+            # No request left for the board's feed: the careers page's own
+            # roles below, as when the feed fails.
+            left = getattr(self, "_extra_left", MAX_EXTRA_FETCHES)
+            if left > 0:
+                self._extra_left = left - 1
+                postings = await read_board(self._client, board)
         if postings is not None:
             add("OPEN_ROLES", num=len(postings), text=board.label, url=board.page_url)
             keywords = getattr(self, "role_keywords", None) or []
@@ -1096,7 +1179,10 @@ class ProfileCollector:
                 add("HIRING_ROLE", num=0, url=board.page_url)
             return
         if board and not chtml:
-            curl, chtml = await self._careers_page(site, home, domain)
+            careers = await self._careers_page(site, home, domain)
+            if careers is None:
+                return
+            curl, chtml = careers
         if chtml and self.wants("HIRING_ROLE"):
             roles = []
             for m in re.finditer(
@@ -1278,6 +1364,10 @@ class ProfileCollector:
         # Pages fetched for other signals, read again for phone numbers.
         pages: list[tuple[str, str]] = []
         domain = domain.lower().replace("www.", "").strip("/")
+        # Each read: every URL fetched once, and its own extra requests.
+        self._read_cache: dict[str, tuple[str, str]] = {}
+        self._read_site = ""
+        self._extra_left = MAX_EXTRA_FETCHES
         if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
             # YC's own sites forbid scraping; they're never a prospect anyway.
             return obs
@@ -1295,6 +1385,7 @@ class ProfileCollector:
             })
 
         site, home = await self._resolve_site(domain)
+        self._read_site = site
         if not home:
             # A failure IS an observation — silent failures look like clean results.
             if domain in self.challenged:
@@ -1323,20 +1414,24 @@ class ProfileCollector:
         # Booking gap
         add("NO_ONLINE_BOOKING", num=0 if self._any(home, BOOKING_HINTS) else 1)
 
-        # The About page, fetched once for the startup signals below.
-        about_page: list[tuple[str, str]] = []
+        # The About page, fetched once for the startup signals below (None:
+        # the read's extra requests ran out first).
+        about_page: list = []
 
-        async def about() -> tuple[str, str]:
+        async def about():
             if not about_page:
-                about_page.append(await self._first_present(site, YC_ABOUT_PATHS))
+                about_page.append(await self._first_present(site, YC_ABOUT_PATHS, extra=True))
             return about_page[0]
 
         # YC-backed, as the company says on its own site: the homepage, or
         # its About page (where most say it, if anywhere).
         if self.wants("YC_BACKED"):
             yc, where = yc_backed(home, domain), site
+            unread = False
             if yc is None:
-                about_url, about_html = await about()
+                got = await about()
+                unread = got is None
+                about_url, about_html = got or ("", "")
                 if about_html:
                     yc, where = yc_backed(about_html, domain), about_url
             # Most YC companies never say it on these pages, so silence
@@ -1344,7 +1439,7 @@ class ProfileCollector:
             # It does correct an earlier profile "yes", so a wrong tag or a
             # dropped claim doesn't last forever.
             searched = yc is None and await self._search_hit(company_id, "YC_BACKED")
-            if yc is not None or not searched:
+            if yc is not None or not (searched or unread):
                 add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
                     conf=yc[1] if yc else 1.0, url=where if yc else site)
 
@@ -1354,14 +1449,18 @@ class ProfileCollector:
         # "backed by Neo Capital"), so the hit alone is weaker evidence.
         if self.wants("ACCELERATOR"):
             programs, where = accelerators(home, domain), site
+            unread = False
             if not programs:
-                about_url, about_html = await about()
+                got = await about()
+                unread = got is None
+                about_url, about_html = got or ("", "")
                 if about_html:
                     programs, where = accelerators(about_html, domain), about_url
-            add("ACCELERATOR", num=1 if programs else 0,
-                text="; ".join(f"{p} {c}".strip() for p, c, _ in programs),
-                conf=max(c for _, _, c in programs) if programs else 1.0,
-                url=where if programs else site)
+            if programs or not unread:
+                add("ACCELERATOR", num=1 if programs else 0,
+                    text="; ".join(f"{p} {c}".strip() for p, c, _ in programs),
+                    conf=max(c for _, _, c in programs) if programs else 1.0,
+                    url=where if programs else site)
 
         # A raise they announced: the homepage, the page a search found on
         # their own site (a funding-preset hit is usually the announcement),
@@ -1369,20 +1468,27 @@ class ProfileCollector:
         if self.wants("FUNDING_ROUND"):
             # (Its own list: ``pages`` is what the read returns.)
             funding_pages = [(site, home)]
+            unread = False
             hit = await self._own_hit_page(company_id, domain, site)
             if hit:
-                funding_pages.append((hit, await self._get(hit)))
-            funding_pages.append(await about())
+                html = await self._extra_get(hit)
+                unread |= html is None
+                funding_pages.append((hit, html or ""))
+            got = await about()
+            unread |= got is None
+            funding_pages.append(got or ("", ""))
             found = [(f, url) for url, html in funding_pages if html
                      for f in [funding_round(html, domain, url)] if f]
-            if not found:
-                url, html = await self._first_present(site, FUNDING_PATHS)
+            if not found and not unread:
+                got = await self._first_present(site, FUNDING_PATHS, extra=True)
+                unread = got is None
+                url, html = got or ("", "")
                 f = funding_round(html, domain, url) if html else None
                 found = [(f, url)] if f else []
             if found:
                 best, where = max(found, key=lambda fu: fu[0]["date"])
                 add("FUNDING_ROUND", num=1, text=funding_text(best), conf=best["conf"], url=where)
-            else:
+            elif not unread:
                 add("FUNDING_ROUND", num=0, url=site)
 
         # Incumbent agency — the compounding signal
@@ -1391,8 +1497,10 @@ class ProfileCollector:
             add("INCUMBENT_AGENCY", text=agency[0], conf=agency[1], url=agency[2])
 
         # robots.txt → AI crawler policy
-        if self.wants("BLOCKS_AI_CRAWLERS"):
-            robots = (await self._get(f"{site}/robots.txt")).lower()
+        robots = await self._extra_get(f"{site}/robots.txt") \
+            if self.wants("BLOCKS_AI_CRAWLERS") else None
+        if robots is not None:
+            robots = robots.lower()
             blocked = any(
                 re.search(rf"user-agent:\s*{re.escape(bot)}[\s\S]{{0,200}}?disallow:\s*/",
                           robots)
@@ -1403,7 +1511,7 @@ class ProfileCollector:
 
         # sitemap.xml → size + content freshness
         if self.wants("SITE_PAGE_COUNT") or self.wants("BLOG_STALE"):
-            sm = await self._get(f"{site}/sitemap.xml")
+            sm = await self._extra_get(f"{site}/sitemap.xml")
             if sm:
                 locs = re.findall(r"<loc>\s*([^<]+)\s*</loc>", sm)
                 if self.wants("SITE_PAGE_COUNT") and locs:

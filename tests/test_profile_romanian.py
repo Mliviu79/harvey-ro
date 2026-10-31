@@ -51,13 +51,13 @@ SENTENCE_CASE_PEOPLE = [
 
 
 def test_sentence_case_titles_keep_their_cards():
-    people = collector().detect_people(SENTENCE_CASE_CARDS, domain="clinica-exemplu.ro")
+    people = collector().detect_people(SENTENCE_CASE_CARDS, domain="clinica-exemplu.example")
     assert [(p["first_name"], p["last_name"], p["title"]) for p in people] == SENTENCE_CASE_PEOPLE
 
 
 def test_sentence_case_titles_in_find_people():
-    people = people_mod.find_people([("https://clinica-exemplu.ro/echipa", SENTENCE_CASE_CARDS)],
-                                    "clinica-exemplu.ro", "Clinica Exemplu")
+    people = people_mod.find_people([("https://clinica-exemplu.example/echipa", SENTENCE_CASE_CARDS)],
+                                    "clinica-exemplu.example", "Clinica Exemplu")
     assert sorted((p["first_name"], p["last_name"], p["title"]) for p in people) \
         == sorted(SENTENCE_CASE_PEOPLE)
 
@@ -102,7 +102,7 @@ def test_romanian_decision_makers(title, owner):
 @pytest.mark.parametrize("heading", ["Igienizare Profesională", "Ecografie Doppler", "Victoria Dent"])
 def test_service_card_with_medical_title_is_nobody(heading):
     html = f"<div><h3>{heading}</h3><p>Medic primar stomatolog</p></div>"
-    assert collector().detect_people(html, domain="clinica-exemplu.ro") == []
+    assert collector().detect_people(html, domain="clinica-exemplu.example") == []
 
 
 @pytest.mark.parametrize("html, expected", [
@@ -111,7 +111,7 @@ def test_service_card_with_medical_title_is_nobody(heading):
     ("<h3>Andrei Popa</h3><p>Fondator</p>", ("Andrei", "Popa", "Fondator")),
 ])
 def test_medical_title_with_honorific_or_owner_title_is_kept(html, expected):
-    people = collector().detect_people(html, domain="clinica-exemplu.ro")
+    people = collector().detect_people(html, domain="clinica-exemplu.example")
     assert [(p["first_name"], p["last_name"], p["title"]) for p in people] == [expected]
 
 
@@ -177,7 +177,8 @@ async def test_english_fallback_paths_when_the_menu_links_nowhere(state):  # noq
 
 @pytest.mark.asyncio
 async def test_romanian_fallback_paths_go_first(state):  # noqa: F811
-    # Ten requests in all, the homepage's among them.
+    # Ten requests in all, the homepage's among them. (This test and the next
+    # read a .ro domain's Romanian paths: no .ro name is reserved for examples.)
     assert await team_requests(state, "clinica-exemplu.ro") \
         == ["/echipa", "/despre-noi", "/medici", "/contact", "/about", "/about-us", "/team",
             "/our-team", "/contact-us"][:MAX_SITE_FETCHES - 1]

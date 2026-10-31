@@ -407,6 +407,7 @@ def test_trailing_fax_note_does_not_label_the_next_number():
 
 
 def test_country_tld_beats_a_county_code_location():
+    # (A Romanian domain is what this reads: no .ro name is reserved for examples.)
     assert phone_region("Sibiu, SB", None, "clinica-exemplu.ro") == "RO"
     assert phone_region("Constanța, CT", None, "clinica-exemplu.ro") == "RO"
 

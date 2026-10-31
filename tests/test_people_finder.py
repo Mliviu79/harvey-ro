@@ -416,3 +416,55 @@ def test_nested_testimonials_are_bounded():
 def test_whole_page_is_scanned_not_just_the_top():
     html = "<p>x</p>" * 30000 + '<a href="mailto:info@summitcrestroofingandsiding.test">Email</a>'
     assert people.emails_on_page(html) == ["info@summitcrestroofingandsiding.test"]
+
+
+# ── a title that is a role, not another organisation ──
+
+@pytest.mark.parametrize("title", [
+    "Owner and Lead Dentist", "Owner & Lead Dentist", "Owner, Lead Dentist",
+    "Founder, Head of Growth", "Founder & Medical Director", "Owner and Principal Dentist",
+    "Fondator și medic primar", "Fondator și Medic Primar", "Fondator și Director Medical",
+    "Director Medical", "Owner of Harborline Dental", "Owner and Lead Dentist at Harborline Dental",
+    "Fondator, Medic Primar", "Founder, President of Harborline Dental",
+    # A branch of the practice, not another organisation.
+    "Associate Dentist at Port Ellery", "Lead Dentist at Our Northvale Office",
+    "Owner and Lead Dentist at Our Northvale Office", "Medic la Brașov",
+])
+def test_a_combined_role_is_not_another_organisation(title):
+    assert not people.title_names_other_org(title, "harborlinedental.example", "Harborline Dental")
+
+
+@pytest.mark.parametrize("title", [
+    "Co-founder and CEO at Bluefinch Labs", "Founder at Quillnest", "Founder @Quillnest",
+    "founder Signary", "President of the NC Chapter", "Partner, Example Law LLP",
+    "Principal, Example Law LLP", "Partner, Example Dental Partners",
+    "Dentist at Another Clinic", "Owner and Lead Dentist at Another Clinic",
+    "Managing Broker & Founder, Birchwood Realty",
+    # A combined role, then another organisation after a comma.
+    "Owner and Lead Dentist, Bluefinch Dental", "Principal Attorney, Example Law Group",
+    "Founder and CEO, Bluefinch Labs", "Founder, President of the NC Chapter",
+    # An organisation whose name starts with a role word.
+    "Owner, Lead Labs Inc", "Partner, Doctor Smile LLC", "Founder at Lead Genius",
+    "Owner, Principal Financial Group",
+    "Fondator, Clinica Altceva SRL", "Medic primar la Clinica Altceva",
+])
+def test_a_title_naming_another_organisation_is_rejected(title):
+    assert people.title_names_other_org(title, "harborlinedental.example", "Harborline Dental")
+
+
+def test_the_owners_card_keeps_a_combined_title():
+    html = "<h3>Maren Calloway</h3><p>Owner and Lead Dentist</p><h3>Theo Ashgrove</h3><p>Associate Dentist</p>"
+    found = people.find_people([("https://harborlinedental.example/team/", html)],
+                               "harborlinedental.example", "Harborline Dental")
+    assert [(p["first_name"], p["title"]) for p in found][0] == ("Maren", "Owner and Lead Dentist")
+    assert found[0]["owner"]
+
+
+# ── reserved example domains in an obfuscated address ──
+
+@pytest.mark.parametrize("text, address", [
+    ("ioana.pop [at] clinica-exemplu [dot] example", "ioana.pop@clinica-exemplu.example"),
+    ("lou (at) acme (dot) test", "lou@acme.test"),
+])
+def test_an_obfuscated_address_at_a_reserved_example_domain_is_read(text, address):
+    assert address in people.emails_on_page(f"<p>Email: {text}</p>")

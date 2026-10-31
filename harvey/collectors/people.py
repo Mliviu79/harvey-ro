@@ -332,20 +332,97 @@ def surname_on_the_door(last_name: str, domain: str, site_name: str = "") -> boo
 # An owner title that names another organisation: a quoted customer
 # ("Founder at Quillnest", "Co-founder and CEO at Bluefinch Labs", "founder
 # Signary") or a role outside the business ("President of the NC Chapter").
-_TITLE_ORG = re.compile(
-    r"(?i:\b(?:owner|founder|co-?founder|ceo|cto|coo|cmo|president|principal|partner|director)"
-    r"\b(?:\s*(?:,|&|and)\s*\w+)*?\s*(?:,|\bat\b|\bof\b|@|\s))\s*"
-    r"((?:the\s+)?[A-Z][\w&.'’-]*(?:\s+(?:[A-Z][\w&.'’-]*|&|and|of))*)")
+# Any title's "at" an organisation too ("Dentist at Another Clinic"), but
+# not a place: "Associate Dentist at Port Ellery" is often a branch.
+_TITLE_OWNER = re.compile(
+    r"(?i)^(?:owner|founder|co-?founder|ceo|cto|coo|cmo|president|principal|partner|director|"
+    r"fondator|fondatoare|co-?fondator|proprietar[ăa]?)$")
+# Where an organisation's name may start: after a comma, "at", "@", "of",
+# Romanian "la", or a plain space ("founder Signary").
+_TITLE_SEP = re.compile(r",|@|\b(?i:at|of)\b|\bla\b|(?<=\w)\s")
+_TITLE_PHRASE = re.compile(r"\s*((?:the\s+)?[A-Z][\w&.'’-]*(?:\s+(?:[A-Z][\w&.'’-]*|&|and|of))*)")
+# What follows a role is often the rest of the role: "Owner and Lead
+# Dentist", "Owner, Head of Growth", "Director Medical". A role ends in its
+# job (English "Lead Dentist"), is a job and its qualifiers (Romanian
+# "Medic Primar") or one "of" something ("Head of Growth"); an
+# organisation's name isn't, whatever its first word ("Lead Labs Inc",
+# "Doctor Smile LLC").
+_ROLE_NOUN = re.compile(
+    r"(?i)^(?:owner|co-?owner|founder|co-?founder|president|ceo|cfo|coo|cto|cmo|chief|"
+    r"principal|partner|proprietor|operator|director|manager|officer|head|vp|lead|attorney|"
+    r"lawyer|dds|dmd|md|esq|cpa|dentist|orthodontist|periodontist|endodontist|hygienist|"
+    r"physician|surgeon|doctor|nurse|therapist|associate|administrator|superintendent|"
+    r"estimator|medic|stomatolog|ortodont|farmacist[ăa]?|fondator|fondatoare|co-?fondator|"
+    r"proprietar[ăa]?|coordonator|coordonatoare|asistent[ăa]?|kinetoterapeut[ăa]?|"
+    r"fizioterapeut[ăa]?|psiholog|directoare|manager[ăa]?|administratoare|asociat[ăa]?)$")
+# The word that follows a role with only a space between ("Director
+# Medical") qualifies it; "founder Signary" names a company.
+_ROLE_QUALIFIER = re.compile(
+    r"(?i)^(?:medical|general|executive|financial|technical|clinical|managing|senior|"
+    r"primar|specialist|comercial|economic|tehnic|adjunct|executiv|operational)$")
+# A name ending so is a firm, never a role ("Example Dental Partners").
+_COMPANY_SUFFIX = re.compile(
+    r"(?i)^(?:llc|llp|lp|pllc|pc|inc|ltd|limited|co|corp|corporation|company|group|holdings|"
+    r"partners|associates|labs|gmbh|ag|srl|s\.r\.l|sa|s\.a|pfa)$")
+# Words that make a phrase after "at" an organisation, where a plain name
+# may be a place ("at Port Ellery") ...
+_ORG_WORD = re.compile(
+    r"(?i)^(?:clinic|clinics|clinica|clinică|cabinet|cabinetul|dental|dentistry|practice|"
+    r"hospital|spital|spitalul|law|lab|agency|studio|firm|university|universitatea|"
+    r"center|centre|centrul)$")
+# ... and words that make it one of the business's own places.
+_PLACE_WORD = re.compile(r"(?i)^(?:office|location|branch|campus|site|sediu|sediul|filiala|filială)$")
+
+
+def _words(phrase: str) -> list[str]:
+    raw = [w for w in (w.strip(".,'’") for w in phrase.split()) if w]
+    return raw[1:] if raw and raw[0].lower() == "the" else raw
+
+
+def _is_role(phrase: str, after_space: bool) -> bool:
+    raw = _words(phrase)
+    words = [w for w in raw if w.lower() not in ("and", "&", "of")]
+    if not words or _COMPANY_SUFFIX.match(words[-1]):
+        return False
+    if after_space and _ROLE_QUALIFIER.match(words[0]):
+        return True
+    if _ROLE_NOUN.match(words[-1]):
+        return True
+    if _ROLE_NOUN.match(words[0]) and words[1:] and all(_ROLE_QUALIFIER.match(w) for w in words[1:]):
+        return True     # "Medic Primar", "Director Medical"
+    return len(raw) > 2 and bool(_ROLE_NOUN.match(raw[0])) and raw[1].lower() == "of"
 
 
 def title_names_other_org(title: str, domain: str, site_name: str = "") -> bool:
-    for m in _TITLE_ORG.finditer(title or ""):
+    title = title or ""
+    for sep in _TITLE_SEP.finditer(title):
+        before = title[:sep.start()]
+        prev = re.findall(r"[\w-]+", before)
+        owner = any(_TITLE_OWNER.match(w) for w in prev)
+        kind = sep.group().strip().lower() or " "
+        if kind == "," and not owner:
+            continue
+        if kind in ("of", " ") and not (prev and _TITLE_OWNER.match(prev[-1])):
+            continue
+        m = _TITLE_PHRASE.match(title, sep.end())
+        if not m:
+            continue
         org = m.group(1).strip()
         if re.fullmatch(r"(?i)(?:and\s+)?(?:owner|founder|co-?founder|ceo|cto|coo|cmo|president|"
                         r"principal|partner|director|chief[\w\s]*|operations|executive officer)", org):
             continue
-        if not names_business(org, domain, site_name):
-            return True
+        if _is_role(org, kind == " ") or names_business(org, domain, site_name):
+            continue
+        if kind in ("at", "@", "la"):
+            words = _words(org)
+            if words and _PLACE_WORD.match(words[-1]):
+                continue
+            # An owner's "at" is their own business or another's; anyone
+            # else's names an organisation only when the phrase says so.
+            if (kind == "la" or not owner) and not (
+                    _COMPANY_SUFFIX.match(words[-1]) or any(_ORG_WORD.match(w) for w in words)):
+                continue
+        return True
     return False
 
 
@@ -944,14 +1021,15 @@ _JUNK_TLDS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".js", ".css")
 #   name [at] domain [dot] com, name(at)domain.com, name AT domain DOT com
 # "name [at] domain [dot] com", "lou (at) acme (dot) com": only a bracketed
 # "at", never the word in prose ("our office at Main dot Street"), and only
-# a real top-level domain.
+# a real top-level domain. "example" and "test" are reserved (RFC 2606):
+# no real site's address ends in them, and fictional data in tests can.
 _AT_DOT = re.compile(
     r"(?<![a-z0-9._%+\-])([a-z0-9][a-z0-9._%+\-]{0,63})\s{0,3}(?:\[\s{0,3}at\s{0,3}\]|\(\s{0,3}at\s{0,3}\)|\{\s{0,3}at\s{0,3}\})\s{0,3}"
     r"([a-z0-9\-]{1,63}(?:\s{0,3}(?:\[\s{0,3}dot\s{0,3}\]|\(\s{0,3}dot\s{0,3}\)|\{\s{0,3}dot\s{0,3}\}|\.)\s{0,3}[a-z0-9\-]{1,63}){1,4})", re.I)
 _KNOWN_TLDS = frozenset("""
 com net org edu gov io co us biz info me ca uk au nz ie de fr es it nl be ch at se no dk fi
 pl pt ro eu mx br in ai app dev law legal dental agency marketing design studio tech solutions
-services company group pro health care clinic roofing law
+services company group pro health care clinic roofing law example test
 """.split())
 # Recognised obfuscation schemes only: a mailto-ish element carrying a local
 # part and a domain (data-user/data-domain; data-front/data-back, as WordPress
