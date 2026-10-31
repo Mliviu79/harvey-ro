@@ -219,6 +219,14 @@ def _connect(path: Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
+    try:
+        # A write-ahead log: a batch's answers kept without waiting for the
+        # disk each time (an answer lost to a power cut is only asked again),
+        # and readers in other processes never wait for the writer.
+        con.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass            # another process is switching it at this moment
+    con.execute("PRAGMA synchronous=NORMAL")
     con.execute(SCHEMA)
     return con
 
@@ -249,7 +257,8 @@ def kept(path: Path, cuis: list[str]) -> dict[str, tuple[str, dict | None]]:
 def keep(path: Path, found: dict[str, dict], missing: set[str], when: str | None = None) -> None:
     """Keep ANAF's answers (and the CUIs it didn't know) as of ``when``."""
     when = when or now()
-    rows = [(cui, when, 1, json.dumps(item, ensure_ascii=False)) for cui, item in found.items()]
+    rows = [(cui, when, 1, json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+            for cui, item in found.items()]
     rows += [(cui, when, 0, "") for cui in missing if cui not in found]
     if not rows:
         return

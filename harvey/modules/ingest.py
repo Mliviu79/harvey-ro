@@ -283,6 +283,12 @@ async def changed(batch, company_id: str, module: str, found: list[dict],
         return []
     many = many_codes() if many is None else many
     latest, ever = await batch.module_readings(company_id, module)
+    return _new_readings(found, latest, ever, many)
+
+
+def _new_readings(found: list[dict], latest: dict, ever: set, many: frozenset[str]) -> list[dict]:
+    """The rows of ``found`` that ``changed`` keeps, against the module's
+    readings so far (``latest``, ``ever``: updated as rows are kept)."""
     out = []
     for row in found:
         code, text = row["signal_code"], row.get("value_text") or ""
@@ -295,6 +301,60 @@ async def changed(batch, company_id: str, module: str, found: list[dict],
             if latest.get(code) == value:
                 continue
             latest[code] = value
+        out.append(row)
+    return out
+
+
+async def checked(batch, module: str, found: dict[str, tuple[list[Fact], list]], *,
+                  run_id: str, confirmed, many: frozenset[str] | None = None) -> dict:
+    """What a lookup by identifier answered for many companies at once
+    (``found``: {company_id: (facts, contacts)}), saved on one batch the
+    way ``changed``, ``write`` and ``company_phones`` save one company's,
+    with a statement for the lot instead of several each: each fact through
+    the confirmation gate, written only when it says something new; every
+    number a contact of its company (with its source and trust), and the
+    first one the company's phone when it has none. Returns
+    {"observations", "updated", "phones_set"}: rows written, companies with
+    a new reading, phones set."""
+    many = many_codes() if many is None else many
+    rows_of = {cid: _one_each(rows(facts, run_id=run_id, confirmed=confirmed,
+                                   records={cid: Saved(cid, cid)}), many)
+               for cid, (facts, _) in found.items()}
+    readings = await batch.module_readings_of([cid for cid, r in rows_of.items() if r], module)
+    fresh: list[dict] = []
+    updated = 0
+    for cid, found_rows in rows_of.items():
+        if found_rows:
+            new = _new_readings(found_rows, *readings[cid], many)
+            fresh += new
+            updated += bool(new)
+    written = await write(batch, fresh, run_id)
+    items, phones = [], {}
+    for cid, (_, contacts_) in found.items():
+        items += _contact_items(cid, contacts_)
+        first = next((c for c in contacts_ or () if c.kind == "phone" and (c.display or c.value)),
+                     None)
+        if first is not None:
+            phones[cid] = first.display or first.value
+    if items:
+        await batch.add_contact_list(items)
+    set_ = await batch.fill_company_phones(phones) if phones else []
+    return {"observations": written, "updated": updated, "phones_set": len(set_)}
+
+
+def _one_each(found: list[dict], many: frozenset[str]) -> list[dict]:
+    """A company's rows with one reading of each single-valued signal, the
+    first (its identifiers come in order, so always the same one): a
+    company known by two identifiers that answer differently would
+    otherwise write both on every check, each one "new" against the other."""
+    seen: set[str] = set()
+    out = []
+    for row in found:
+        code = row["signal_code"]
+        if code not in many:
+            if code in seen:
+                continue
+            seen.add(code)
         out.append(row)
     return out
 
@@ -320,6 +380,16 @@ async def add_contacts(store, company_id: str, found, origin: str = "",
     most a contact can be trusted (found on a website whose match to the
     company is only likely, or unconfirmed): never thrown away, only marked.
     How many were kept (a number that doesn't parse isn't)."""
+    items = [f for _, f, _ in _contact_items(company_id, found, origin, trust, region)]
+    if not items or not company_id:
+        return 0
+    return await store.add_contacts(company_id, items, origin)
+
+
+def _contact_items(company_id: str, found, origin: str = "", trust: str = "",
+                   region: str | None = None) -> list[tuple]:
+    """(company_id, contacts.Found, origin) for each contact a capability
+    found (api.Contact), trusted at most ``trust`` (see add_contacts)."""
     from harvey import contacts
 
     def capped(c) -> str:
@@ -328,14 +398,11 @@ async def add_contacts(store, company_id: str, found, origin: str = "",
             return own
         return max(own, trust, key=contacts.TRUST_LEVELS.index)
 
-    items = [contacts.Found(c.kind, c.value, display=c.display, status=c.status,
-                            source=c.module, capability=c.capability,
-                            evidence_url=c.source_url, confidence=c.confidence,
-                            trust=capped(c), region=region)
-             for c in found or () if c.value]
-    if not items or not company_id:
-        return 0
-    return await store.add_contacts(company_id, items, origin)
+    return [(company_id, contacts.Found(c.kind, c.value, display=c.display, status=c.status,
+                                        source=c.module, capability=c.capability,
+                                        evidence_url=c.source_url, confidence=c.confidence,
+                                        trust=capped(c), region=region), origin)
+            for c in found or () if c.value]
 
 
 async def people(store, company_id: str, found, origin: str = "") -> int:

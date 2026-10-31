@@ -11,6 +11,7 @@ ANAF, invalid, and the requests made."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from harvey.modules.api import Capability, Contact, Draft, Fact
@@ -86,7 +87,8 @@ async def _check(inp, ctx) -> Draft:
     cuis = list(keys)
     if len(cuis) > service.MAX_BATCH:
         return Draft(failed=f"at most {service.MAX_BATCH} companies a call")
-    kept = service.kept(path, cuis)
+    # (Off the event loop: a run saves its last batch meanwhile.)
+    kept = await asyncio.to_thread(service.kept, path, cuis)
     answers: dict[str, tuple[str, dict | None]] = {}
     for cui, (fetched_at, answer) in kept.items():
         if missing_only or service.fresh(fetched_at, days):
@@ -104,7 +106,7 @@ async def _check(inp, ctx) -> Draft:
         values["requests"] = made
         when = service.now()
         try:
-            service.keep(path, found, missing, when)
+            await asyncio.to_thread(service.keep, path, found, missing, when)
         except OSError as e:
             ctx.log.warning("anaf: answers not kept (%s)", e)
         for cui in ask:

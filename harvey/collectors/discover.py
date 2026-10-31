@@ -355,6 +355,9 @@ class DiscoveryQuery:
     # How many results the source holds for it, once counted (a listings
     # provider's count request); the estimate is exact when every query has one.
     total: int | None = None
+    # The country to search in (two letters, "RO"), when known: a search
+    # that can be told one (Brave) gets results from there first.
+    country: str = ""
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()

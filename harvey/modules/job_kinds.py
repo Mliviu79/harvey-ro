@@ -556,13 +556,21 @@ async def enqueue_due_sources(state) -> list[str]:
 
 # ── Checks by legal identifier at an outside service (ANAF) ──
 
+# Calls of the capability a check job makes (ANAF: ten requests of 100
+# companies, about 11 s): enough that each request goes out while the last
+# batch is saved (runs.check_by_id), few enough that a pause or a cancel
+# takes effect within seconds and the queue shows progress as it goes.
+ID_CHECK_BATCHES = 10
+
+
 async def enqueue_id_checks(state, module_id: str, capability: str, company_ids=None, *,
                             missing_only: bool = False, batch_id: str = "",
                             parent_id: str = "", label: str = "",
                             then_find: bool = False) -> tuple[list[str], list]:
     """Queue checks of these companies (every one with the identifier when
-    None), as many per job as the capability asks about at once (ANAF:
-    100). Returns (new job ids, jobs already waiting for the same ones)."""
+    None), ID_CHECK_BATCHES times as many per job as the capability asks
+    about at once (ANAF: 1,000, ten requests). Returns (new job ids, jobs
+    already waiting for the same ones)."""
     from harvey.modules import switches
 
     manifest = switches.by_id()[module_id]
@@ -571,12 +579,15 @@ async def enqueue_id_checks(state, module_id: str, capability: str, company_ids=
              if len(need) == 1 and need[0].startswith("id:")]
     if not kinds:
         raise ValueError(f"{module_id}.{capability} doesn't look companies up by an identifier")
+    from harvey.modules.runs import _batches
+
     rows = await state.companies_with_id(kinds[0], company_ids)
-    size = max(1, int(cap.get("batch") or 1))
+    size = max(1, int(cap.get("batch") or 1)) * ID_CHECK_BATCHES
     lane = cap.get("lane") or module_id
     specs = []
-    for at in range(0, len(rows), size):
-        ids = [r["id"] for r in rows[at:at + size]]
+    # A company known by two identifiers is in one job, once.
+    for part in _batches(rows, size):
+        ids = list(dict.fromkeys(r["id"] for r in part))
         specs.append(dict(
             kind="id_check", lane=lane, module=module_id, capability=capability,
             label=label or f"{manifest.name or module_id}: {len(ids)} "
@@ -608,21 +619,87 @@ async def enqueue_follow_up_checks(state, company_ids, *, batch_id: str = "",
     return queued
 
 
-@jobs.kind("id_check")
+@jobs.kind("id_check", stoppable=True)
 async def run_id_check(ctx) -> dict:
+    """Check the job's companies a batch at a time, in the order of their
+    ids. After each batch is saved the job's progress says how far it got
+    (``after``: the last company id done, ``done``, ``total`` and the
+    report so far), so a job paused, cancelled part way, stopped with the
+    worker or tried again after a failure goes on from there. Progress
+    only moves over companies with none left unchecked before them: after
+    a batch that failed (or a save that did), the companies after it are
+    asked again on the next try (the service's kept answers make that
+    cheap) rather than the failed ones skipped. A job with any company
+    left unchecked never ends done."""
     from harvey.modules.runs import check_by_id
 
     p = ctx.params
-    report = await check_by_id(ctx.state, p["module"], p["capability"], p.get("company_ids"),
-                               missing_only=bool(p.get("missing_only")))
-    asked = report["checked"] + report["cached"]
-    if report["errors"] and not asked and not report["updated"]:
-        # The service was down or busy for this batch: tried again later.
-        raise Transient(report["errors"][0])
+    ids = sorted(set(p.get("company_ids") or ()))
+    after = str(ctx.progress.get("after") or "")
+    todo = [i for i in ids if i > after] if after else ids
+    if p.get("company_ids") is None:
+        todo = None                     # every company with the identifier
+    so_far = dict(ctx.progress.get("report") or {})
+    done_before = int(ctx.progress.get("done") or 0)
+    saved_now = [0]
+
+    async def saved(batch_ids, report_so_far):
+        if report_so_far.get("errors"):
+            # A batch before this one failed: its companies are still to
+            # check, so progress stays in front of them.
+            return
+        saved_now[0] += len(batch_ids)
+        await ctx.save(after=max(batch_ids), done=done_before + saved_now[0], total=len(ids),
+                       report=_added(so_far, report_so_far), busy=0)
+
+    async def stop():
+        return bool(await ctx.stop_reason())
+
+    report = await check_by_id(ctx.state, p["module"], p["capability"], todo,
+                               missing_only=bool(p.get("missing_only")), stop=stop, saved=saved)
+    total = _added(so_far, report)
+    total["companies"] = len(ids) if p.get("company_ids") is not None else report["companies"]
+    if ctx.outcome:
+        # Paused, cancelled or handed back: what it did is in its progress.
+        return total
+    if report["errors"]:
+        message = report["errors"][-1]
+        if report["stopped"] == "busy":
+            # The service is busy (or out of reach): the whole lane waits,
+            # longer each time, without using up a try. Its other jobs
+            # wait too, rather than each asking a busy service again.
+            busy = int(ctx.progress.get("busy") or 0) + 1
+            await ctx.save(busy=busy)
+            wait = jobs.backoff_seconds(busy)
+            await jobs.rest_lane(ctx.state, ctx.job.lane, wait, but=ctx.id)
+            raise LaneExhausted(message, retry_after=wait)
+        if saved_now[0]:
+            # Some went through: the rest later, from where it got,
+            # without using up a try (it is getting on).
+            raise LaneExhausted(message, retry_after=jobs.backoff_seconds(1))
+        # Nothing went through: tried again later, a try used.
+        raise Transient(message)
+    report = total
     if p.get("then_find"):
         report["finder_jobs"] = await enqueue_finder_follow_ups(
             ctx.state, p.get("company_ids") or [], batch_id=ctx.job.batch_id, parent_id=ctx.id)
     return report
+
+
+def _added(before: dict, report: dict) -> dict:
+    """A check's report with the counts of one before it added in."""
+    from harvey.modules.runs import _new_check_report
+
+    out = _new_check_report(report.get("module") or before.get("module") or "")
+    for part in (before, report):
+        for key, value in part.items():
+            if isinstance(value, int) and not isinstance(value, bool) and key in out:
+                out[key] += value
+            elif key in ("unconfirmed", "stopped") and value:
+                out[key] = value
+            elif key == "errors" and value:
+                out["errors"] = (out["errors"] + list(value))[:20]
+    return out
 
 
 # ── Finding contacts: one company per job (harvey/finder.py) ──

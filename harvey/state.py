@@ -1502,6 +1502,49 @@ async def _fill_company_fields(db, company_id: str, fields: dict) -> list[str]:
     return changed
 
 
+async def _fill_company_phones(db, phones: dict[str, str]) -> list[str]:
+    """_fill_company_fields(db, id, {"phone": ...}) for many companies, a
+    statement for the lot: each company with no phone gets its own, its
+    keys are registered and the number is also its phone contact. The ids
+    whose phone was set, in the order given."""
+    phones = {cid: phone for cid, phone in phones.items() if cid and phone}
+    ids = list(phones)
+    rows: dict[str, dict] = {}
+    for at in range(0, len(ids), 900):
+        chunk = ids[at:at + 900]
+        async with db.execute(
+            "SELECT id, name, cui, external_id, domain, phone, location, source FROM companies "
+            f"WHERE id IN ({','.join('?' * len(chunk))}) AND COALESCE(TRIM(phone), '') = ''",
+            chunk,
+        ) as cur:
+            names = [c[0] for c in cur.description]
+            rows.update({r[0]: dict(zip(names, r)) for r in await cur.fetchall()})
+    empty = [cid for cid in ids if cid in rows]
+    if not empty:
+        return []
+    await db.executemany(
+        "UPDATE companies SET phone = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ? AND COALESCE(TRIM(phone), '') = ''", [(phones[cid], cid) for cid in empty])
+    keys = []
+    for cid in empty:
+        row = {**rows[cid], "phone": phones[cid]}
+        keys += [(cid, kind, value, row.get("source") or "", 1.0)
+                 for kind, value in resolver.identifiers(row)]
+    if keys:
+        await db.executemany(
+            "INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?)", keys)
+    from harvey.collectors.phones import phone_region
+
+    await contacts.add_many(db, [
+        (cid, contacts.Found("phone", phones[cid], source=rows[cid].get("source") or "",
+                             trust="confirmed",
+                             region=phone_region(rows[cid].get("location") or "", None,
+                                                 rows[cid].get("domain") or "")), "")
+        for cid in empty])
+    return empty
+
+
 async def _company_phone_contact(db, company_id: str, phone: str, source: str = "",
                                  location: str | None = None, domain: str | None = None) -> None:
     """The company's own phone column is also a phone contact of it (read
@@ -1722,6 +1765,36 @@ class CompanyBatch:
                                  origin: str = "") -> None:
         await contacts.add_source(self.db, company_id, source, ref, origin)
 
+    async def add_contact_list(self, items) -> int:
+        """Contacts of many companies at once: (company_id, contacts.Found,
+        origin) each (contacts.add_many)."""
+        return await contacts.add_many(self.db, items)
+
+    async def fill_company_phones(self, phones: dict[str, str]) -> list[str]:
+        """``fill_company_fields(id, phone=...)`` for many companies: each
+        one with no phone gets its own. The ids whose phone was set."""
+        return await _fill_company_phones(self.db, phones)
+
+    async def module_readings_of(self, company_ids, module: str
+                                 ) -> dict[str, tuple[dict[str, tuple], set[tuple[str, str]]]]:
+        """``module_readings`` for many companies, read together: {id:
+        (latest, ever)}, a company with none holding empty ones."""
+        out: dict[str, tuple[dict[str, tuple], set[tuple[str, str]]]] = {
+            cid: ({}, set()) for cid in company_ids}
+        ids = list(out)
+        for at in range(0, len(ids), 900):
+            chunk = ids[at:at + 900]
+            async with self.db.execute(
+                "SELECT company_id, signal_code, value_num, value_text FROM observations "
+                f"WHERE company_id IN ({','.join('?' * len(chunk))}) AND module = ? "
+                "ORDER BY company_id, observed_at, rowid", (*chunk, module),
+            ) as cur:
+                for cid, code, num, text in await cur.fetchall():
+                    latest, ever = out[cid]
+                    latest[code] = (num, text or "")
+                    ever.add((code, text or ""))
+        return out
+
     async def module_readings(self, company_id: str, module: str
                               ) -> tuple[dict[str, tuple], set[tuple[str, str]]]:
         """What ``module`` has recorded for the company: its latest
@@ -1773,16 +1846,23 @@ async def _resolve_on_file(db) -> None:
 
 async def _flush_company_search(db) -> None:
     """Reindex the companies whose activities changed, once each. Runs in
-    the writer's transaction, before its commit."""
+    the writer's transaction, before its commit. Nothing to do (a batch
+    that changed no activity) costs one lookup; otherwise the marked
+    companies lead (CROSS JOIN keeps that order), so the work is theirs
+    alone, not a walk over every company on file."""
+    async with db.execute("SELECT EXISTS (SELECT 1 FROM company_search_dirty)") as cur:
+        if not (await cur.fetchone())[0]:
+            return
     await db.execute(
         "DELETE FROM company_search WHERE rowid IN (SELECT i.rid "
-        "FROM company_search_ids i JOIN company_search_dirty d USING (company_id))")
+        "FROM company_search_dirty d CROSS JOIN company_search_ids i "
+        "ON i.company_id = d.company_id)")
     await db.execute(
         "INSERT INTO company_search (rowid, company_id, name, activity, place) "
         "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
         "FROM company_search_dirty d "
-        "JOIN company_search_ids i ON i.company_id = d.company_id "
-        "JOIN company_search_source s ON s.company_id = d.company_id")
+        "CROSS JOIN company_search_ids i ON i.company_id = d.company_id "
+        "CROSS JOIN company_search_source s ON s.company_id = d.company_id")
     await db.execute("DELETE FROM company_search_dirty")
 
 
@@ -3603,7 +3683,10 @@ class StateManager:
                 chunk = ids[start:start + 900] if ids is not None else None
                 query, params = sql, list(args)
                 if chunk is not None:
-                    query += f" AND c.id IN ({','.join('?' * len(chunk))})"
+                    # Read by company (its index), not by kind: "kind = ?"
+                    # alone would walk every CUI on file for each call.
+                    query = query.replace("i.kind = ?", "+i.kind = ?") + \
+                        f" AND i.company_id IN ({','.join('?' * len(chunk))})"
                     params += chunk
                 async with db.execute(query + " ORDER BY c.id, i.value", params) as cursor:
                     out += [dict(r) for r in await cursor.fetchall()]

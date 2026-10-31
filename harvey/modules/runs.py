@@ -833,7 +833,7 @@ def _new_check_report(module: str) -> dict:
 
 async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
                       missing_only: bool = False, progress=None, http=None,
-                      stop=None, run_id: str = "") -> dict:
+                      stop=None, run_id: str = "", saved=None) -> dict:
     """Ask an enricher's lookup-by-identifier capability about these
     companies (every company with that identifier when None), a batch at
     a time (the capability's ``batch``), and record what it answers: each
@@ -841,9 +841,16 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
     something new (ingest.changed), and a phone as the company's phone when
     it has none. ``missing_only`` asks only about companies the module has
     never answered for. ``progress(done, total)`` after each batch;
-    ``stop()`` returning True ends it between batches. ``run_id`` adds to a
-    run already open (a follow-up's) instead of logging one of its own.
-    Refused while the module is off.
+    ``stop()`` returning True ends it between batches. ``saved(ids,
+    report)`` after each batch is committed, with its companies' ids and
+    the report so far. Each of the three may be a coroutine function.
+    ``run_id`` adds to a run already open (a follow-up's) instead of
+    logging one of its own. Refused while the module is off.
+
+    The next batch is asked for while this one is saved, so a service's
+    pace, not the saving, sets how fast it goes: one request at a time
+    still (each waits its turn in the lane), and never more than one batch
+    asked for ahead of the one being saved.
 
     Returns {"companies", "checked", "cached", "not_found", "invalid",
     "requests", "observations", "updated", "phones_set", "unconfirmed",
@@ -885,25 +892,41 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
                                        params={"capability": cap_id, "companies": len(companies),
                                                "missing_only": missing_only})
     touched = 0
-    if progress:
-        progress(0, len(companies))
+    total = len(companies)
+    chunks = _batches(companies, size)
+    ahead: asyncio.Task | None = None
+    await _call(progress, 0, total)
     try:
         ctx = api.Context(http=http, settings=await switches.module_settings(state, module_id),
                           wanted=frozenset(confirmed), enabled=enabled)
-        done = failed_in_a_row = 0
-        for start in range(0, len(companies), size):
-            if stop is not None and stop():
-                out["stopped"] = "stopped"
-                break
-            chunk = companies[start:start + size]
-            draft = await run(api.Input(extra={
+
+        async def ask(chunk):
+            return await run(api.Input(extra={
                 "batch": [{"key": r["id"], kind: r["value"]} for r in chunk],
                 "missing_only": missing_only}), ctx)
+
+        async def next_batch(at: int):
+            """Batch ``at`` asked for, unless there is none or a stop was asked."""
+            if at >= len(chunks):
+                return None
+            if await _call(stop):
+                out["stopped"] = "stopped"
+                return None
+            return asyncio.ensure_future(ask(chunks[at]))
+
+        done = failed_in_a_row = 0
+        ahead = await next_batch(0)
+        at = 0
+        while ahead is not None:
+            chunk = chunks[at]
+            draft = await ahead
+            ahead = None
             values = draft.values or {}
             for key in ("cached", "not_found", "invalid", "requests"):
                 out[key] += int(values.get(key) or 0)
             out["checked"] += int(values.get("asked") or 0)
             done += len(chunk)
+            at += 1
             if draft.failed is not None:
                 out["errors"].append(draft.failed)
                 failed_in_a_row += 1
@@ -911,29 +934,28 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
                     # The service is down or busy: stop asking it.
                     out["stopped"] = draft.stop or "failed"
                     break
-                if progress:
-                    progress(done, len(companies))
+                ahead = await next_batch(at)
+                await _call(progress, done, total)
                 continue
             failed_in_a_row = 0
-            facts_of: dict[str, list[api.Fact]] = {}
+            # The next batch goes out while this one is saved.
+            ahead = await next_batch(at)
+            found: dict[str, tuple[list, list]] = {r["id"]: ([], []) for r in chunk}
             for fact in draft.facts:
-                facts_of.setdefault(fact.record, []).append(fact)
-            contacts_of: dict[str, list[api.Contact]] = {}
+                if fact.record in found:
+                    found[fact.record][0].append(fact)
             for contact in draft.contacts:
-                contacts_of.setdefault(contact.record, []).append(contact)
+                if contact.record in found:
+                    found[contact.record][1].append(contact)
             async with state.batch() as batch:
-                for row in chunk:
-                    cid = row["id"]
-                    rows = ingest.rows(facts_of.get(cid, []), run_id=run_id, confirmed=confirmed,
-                                       records={cid: ingest.Saved(cid, cid)})
-                    fresh = await ingest.changed(batch, cid, module_id, rows, many)
-                    written = await ingest.write(batch, fresh, run_id)
-                    out["observations"] += written
-                    out["phones_set"] += await ingest.company_phones(
-                        batch, cid, contacts_of.get(cid, []))
-                    touched += bool(written)
-            if progress:
-                progress(done, len(companies))
+                result = await ingest.checked(batch, module_id, found, run_id=run_id,
+                                              confirmed=confirmed, many=many)
+            out["observations"] += result["observations"]
+            out["phones_set"] += result["phones_set"]
+            touched += result["updated"]
+            out["updated"] = touched
+            await _call(saved, list(found), dict(out))
+            await _call(progress, done, total)
         out["updated"] = touched
         if own_run:
             await state.finish_run(run_id, status="failed" if out["errors"] and not touched
@@ -946,9 +968,48 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
         if own_run:
             await state.finish_run(run_id, status="failed", records=touched, error=str(e))
     finally:
+        if ahead is not None:
+            # A batch asked for that won't be saved now (an error while
+            # saving, or the caller cancelled): not left running. Its
+            # companies aren't marked done anywhere, so a later run asks
+            # again (or reads the answer the capability kept).
+            ahead.cancel()
+            try:
+                await ahead
+            except BaseException:
+                pass
         if owned:
             await http.aclose()
     return out
+
+
+def _batches(companies: list[dict], size: int) -> list[list[dict]]:
+    """``companies`` (one row per identifier, a company's rows together) in
+    batches of at most ``size``, a company's rows never split between two
+    (unless it has more than ``size``): a batch saved is every identifier
+    of its companies checked, so a run that resumes after it skips none."""
+    out: list[list[dict]] = []
+    at = 0
+    while at < len(companies):
+        end = min(at + size, len(companies))
+        if end < len(companies):
+            cut = end
+            while cut > at and companies[cut]["id"] == companies[cut - 1]["id"]:
+                cut -= 1
+            end = cut if cut > at else end
+        out.append(companies[at:end])
+        at = end
+    return out
+
+
+async def _call(fn, *args):
+    """``fn(*args)``, awaited when it is a coroutine function; None for no fn."""
+    if fn is None:
+        return None
+    result = fn(*args)
+    if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+        result = await result
+    return result
 
 
 class FollowUp:

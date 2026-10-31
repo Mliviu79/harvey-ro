@@ -940,3 +940,103 @@ def test_the_free_allowance_is_read_off_the_event_loop(tmp_path, monkeypatch):
         return await finder.background_status(s)
 
     assert run(go())["searchers"] and threads and not any(threads)
+
+
+# ── Brave: the market's country, and its own count of what is left ──
+
+
+def test_a_lookup_is_searched_in_the_companys_country_when_known():
+    fake = FakeBrave()
+    run(_fetch(fake, D.DiscoveryQuery(term="ALFA DENT SRL", location="Brașov", depth=10,
+                                      limit=10, country="ro")))
+    run(_fetch(fake))
+    assert fake.requests[0].url.params["country"] == "RO"
+    assert "country" not in fake.requests[1].url.params       # not known: none sent
+
+
+def test_a_country_brave_refuses_is_dropped_and_not_sent_again(monkeypatch):
+    monkeypatch.setattr(brave, "_REFUSED_COUNTRIES", set())
+    fake = FakeBrave(_COUNTRY_REFUSED, (200, {"web": {"results": RESULTS}}, {}))
+    query = D.DiscoveryQuery(term="ALFA DENT SRL", location="Brașov", depth=10, limit=10,
+                             country="XQ")
+    p, found = run(_fetch(fake, query))
+    assert len(found) == 2 and p.last_cost == 0.005            # one search billed
+    assert fake.requests[0].url.params["country"] == "XQ"
+    assert "country" not in fake.requests[1].url.params
+    run(_fetch(fake, query))
+    assert "country" not in fake.requests[2].url.params
+
+
+_COUNTRY_REFUSED = (422, {"error": {"code": "VALIDATION", "status": 422, "meta": {
+    "errors": [{"loc": ["query", "country"], "msg": "not a supported country"}]}}}, {})
+
+
+def test_a_422_about_something_else_keeps_the_country(monkeypatch):
+    monkeypatch.setattr(brave, "_REFUSED_COUNTRIES", set())
+    bad_query = (422, {"error": {"code": "VALIDATION", "status": 422, "meta": {
+        "errors": [{"loc": ["query", "q"], "msg": "too long"}]}}}, {})
+    fake = FakeBrave(bad_query)
+    with pytest.raises(RuntimeError):
+        run(_fetch(fake, D.DiscoveryQuery(term="X" * 500, location="London", depth=10,
+                                          limit=10, country="GB")))
+    assert len(fake.requests) == 1 and brave._REFUSED_COUNTRIES == set()
+    ok = FakeBrave()
+    run(_fetch(ok, D.DiscoveryQuery(term="ALFA", location="London", depth=10, limit=10,
+                                    country="GB")))
+    assert ok.requests[0].url.params["country"] == "GB"
+
+
+def test_the_search_without_the_country_still_gets_its_retry(monkeypatch):
+    monkeypatch.setattr(brave, "_REFUSED_COUNTRIES", set())
+    monkeypatch.setattr(brave.asyncio, "sleep", _no_sleep)
+    fake = FakeBrave(_COUNTRY_REFUSED, (503, {}, {}), (200, {"web": {"results": RESULTS}}, {}))
+    p, found = run(_fetch(fake, D.DiscoveryQuery(term="ALFA DENT SRL", location="Brașov",
+                                                 depth=10, limit=10, country="XQ")))
+    assert len(found) == 2 and len(fake.requests) == 3
+
+
+async def _no_sleep(*_a, **_kw):
+    return None
+
+
+def test_the_market_country_comes_from_the_location_or_the_official_source():
+    assert finder.market_country({"location": "Brașov, Brașov, Romania"}) == "RO"
+    assert finder.market_country({"location": "Brașov", "source": "registry:onrc"}) == "RO"
+    assert finder.market_country({"location": "Springfield", "source": "osm"}) == ""
+
+
+def test_the_lookup_query_carries_the_country():
+    from harvey.modules.core.contact_finder.capabilities import lookup_query
+
+    q = lookup_query(api.Input(name="ALFA DENT SRL", locality="Brașov",
+                               extra={"country": "RO"}))
+    assert q.country == "RO" and lookup_query(api.Input(name="X")).country == ""
+
+
+def test_brave_saying_less_is_left_stops_the_background_below_its_share():
+    lanes.count_uses("brave", 100)
+    assert lanes.free_left("brave", 0.5) == 400               # Harvey's own count
+    # Brave says only 600 are left this month (the key is used elsewhere too):
+    # the background keeps the 500 it leaves a person, so 100 are its own.
+    fake = FakeBrave((200, {"web": {"results": RESULTS}},
+                      {"X-RateLimit-Remaining": "0, 600", "X-RateLimit-Reset": "1, 86000"}))
+    run(_fetch(fake))
+    assert lanes.reported_left("brave") == 600
+    assert lanes.free_left("brave", 0.5) == 100
+    assert lanes.free_left("brave") == 600
+    # Less than a person's part left: nothing for the background.
+    lanes.report_left("brave", 450, 86000)
+    assert lanes.free_left("brave", 0.5) == 0 and lanes.free_left("brave") == 450
+    # Brave saying more is left than Harvey counts (101 used, the search
+    # above too) changes nothing.
+    lanes.report_left("brave", 5000, 86000)
+    assert lanes.free_left("brave", 0.5) == 399
+    # Its word holds until its window renews.
+    lanes.report_left("brave", 10, 0)
+    assert lanes.reported_left("brave") is None and lanes.free_left("brave", 0.5) == 399
+
+
+def test_counting_a_search_keeps_what_brave_said():
+    lanes.report_left("brave", 300, 86000)
+    lanes.count_uses("brave", 1)
+    assert lanes.reported_left("brave") == 300

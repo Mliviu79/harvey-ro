@@ -12,9 +12,10 @@ LOOKUP_DEPTH = 10
 
 def lookup_query(inp) -> DiscoveryQuery:
     """The search a website lookup makes: the company's name in its town,
-    one page."""
+    one page, in its country when known (``extra["country"]``)."""
     return DiscoveryQuery(term=inp.name, location=inp.locality, depth=LOOKUP_DEPTH,
-                          limit=LOOKUP_DEPTH, coordinate=inp.point)
+                          limit=LOOKUP_DEPTH, coordinate=inp.point,
+                          country=str(inp.extra.get("country") or ""))
 
 
 async def _find_website(inp, ctx) -> Draft:

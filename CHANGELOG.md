@@ -277,6 +277,25 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **ANAF checks run at ANAF's pace.** Saving a batch of answers no longer
+  holds up the next request: while one batch is saved the next is asked,
+  one request at a time, still one every 1.1 s. On a database of
+  1.78 million companies the check went from about 1,000 to about 5,400
+  firms a minute. Looking companies up by CUI reads by company instead of
+  walking every CUI on file, the search index flush returns at once when
+  nothing changed, and a batch's readings, contacts, phones and keys are
+  saved with set-based statements in one transaction. Jobs hold 1,000
+  firms, can be paused and cancelled, and resume from the last saved
+  batch. A failed save or request hands the job back instead of ending it
+  done; a busy ANAF rests the whole lane with a growing wait (up to 15
+  min) and uses no try. A company's CUIs are never split between batches
+  or jobs, and a company with two CUIs that answer differently keeps its
+  lowest CUI's single-valued readings, so a re-check writes nothing new.
+- **Brave lookups send the company's country** (worked out from its
+  location or the market of the official source it came from); a country
+  Brave refuses is dropped for the process. Brave's own count of what is
+  left is read from each response, and the background stops at the lower
+  of it and Harvey's count.
 - Sole traders and family businesses (PFA, II, IF) keep their registered
   office and phone like any firm: their registry details are public. A
   personal numeric code is still never stored as a CUI. Reload the registry

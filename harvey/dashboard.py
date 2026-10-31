@@ -4356,6 +4356,9 @@ async def _anaf_batch(state) -> tuple[bool, dict | None]:
         elif j.status == jobs.FAILED:
             done += n
             report["errors"].append(j.error)
+        else:
+            # A job part way (ten requests each): the companies it has saved.
+            done += min(n, int((j.progress or {}).get("done") or 0))
     report["errors"] = report["errors"][:3]
     started = min((j.created_at or "" for j in found), default="")
     return bool(active and active[0]["n"]), {"done": done, "total": total, "report": report,

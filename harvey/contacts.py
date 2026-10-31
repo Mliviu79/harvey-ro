@@ -45,6 +45,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 TRUST_LEVELS = ("confirmed", "likely", "unconfirmed")
 EMAIL_STATUSES = ("verified", "risky", "guess", "invalid", "unchecked")
@@ -150,8 +151,10 @@ def trust_for(confidence) -> str:
     return "confirmed" if value >= 0.9 else "likely" if value >= 0.6 else "unconfirmed"
 
 
+@lru_cache(maxsize=4096)
 def phone_parts(raw: str, region: str | None = None) -> tuple[str, str, str] | None:
-    """(E.164, international display, line type) for a valid number, else None."""
+    """(E.164, international display, line type) for a valid number, else None
+    (remembered: one number is read several times as a batch is saved)."""
     from phonenumbers import PhoneNumberFormat, format_number
 
     from harvey.collectors.phones import line_type, parse_phone
@@ -169,7 +172,7 @@ def email_status(status: str) -> str:
 
 # ── Writes ──
 
-_UPSERT_CONTACT = """INSERT INTO contacts
+_UPSERT_CONTACT_ONLY = """INSERT INTO contacts
        (kind, value, display, line_type, status, first_seen, last_seen)
    VALUES (?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
    ON CONFLICT(kind, value) DO UPDATE SET
@@ -179,8 +182,8 @@ _UPSERT_CONTACT = """INSERT INTO contacts
        status = CASE WHEN excluded.status NOT IN ('', 'unchecked')
                      THEN excluded.status ELSE contacts.status END,
        first_seen = MIN(contacts.first_seen, excluded.first_seen),
-       last_seen = MAX(contacts.last_seen, excluded.last_seen)
-   RETURNING id"""
+       last_seen = MAX(contacts.last_seen, excluded.last_seen)"""
+_UPSERT_CONTACT = _UPSERT_CONTACT_ONLY + "\n   RETURNING id"
 
 # The best of two trust levels, in SQL (``a`` and ``b`` are expressions).
 _BEST_TRUST = ("CASE WHEN 'confirmed' IN ({a}, {b}) THEN 'confirmed' "
@@ -302,6 +305,54 @@ async def add(db, company_id: str, found: Found, origin: str = "") -> int | None
     return contact_id
 
 
+async def add_many(db, items) -> int:
+    """``add`` for many contacts at once, ``items`` being (company_id,
+    Found, origin): the same rows, written a statement for the lot instead
+    of two each (a check of a hundred companies at a time). The upserts run
+    in the order given, so the result is the one ``add`` gives item by item.
+    How many were kept (a value that isn't one, or a kind nobody declared,
+    isn't)."""
+    parsed = []
+    for company_id, found, origin in items:
+        parts = normalised(found) if company_id else None
+        if parts is not None:
+            parsed.append((company_id, found, origin, parts))
+    if not parsed:
+        return 0
+    kinds = sorted({found.kind for _, found, _, _ in parsed})
+    async with db.execute(f"SELECT kind FROM contact_kinds WHERE kind IN "
+                          f"({','.join('?' * len(kinds))})", kinds) as cur:
+        known = {r[0] for r in await cur.fetchall()}
+    # (A kind no module declares: contact_kinds' trigger would refuse it.)
+    parsed = [p for p in parsed if p[1].kind in known]
+    if not parsed:
+        return 0
+    await db.executemany(_UPSERT_CONTACT_ONLY, [
+        (found.kind, value, display, line, status, found.seen, found.seen)
+        for _, found, _, (value, display, line, status) in parsed])
+    ids: dict[tuple[str, str], int] = {}
+    for kind in {found.kind for _, found, _, _ in parsed}:
+        values = list({parts[0] for _, found, _, parts in parsed if found.kind == kind})
+        for at in range(0, len(values), 900):
+            chunk = values[at:at + 900]
+            async with db.execute(f"SELECT id, value FROM contacts WHERE kind = ? AND value IN "
+                                  f"({','.join('?' * len(chunk))})", (kind, *chunk)) as cur:
+                ids.update({(kind, r[1]): r[0] for r in await cur.fetchall()})
+    links = []
+    for company_id, found, origin, parts in parsed:
+        person_id = 0
+        if found.person:
+            person_id = await add_person(db, company_id, found.person, found.role, found.source,
+                                         origin, found.seen)
+        links.append((
+            company_id, ids[(found.kind, parts[0])], person_id, found.location_id or 0,
+            found.source or "", found.capability or "", found.evidence_url or "",
+            found.trust if found.trust in TRUST_LEVELS else trust_for(found.confidence),
+            float(found.confidence), found.seen, found.seen, origin or company_id))
+    await db.executemany(_UPSERT_LINK, links)
+    return len(links)
+
+
 async def add_location(db, company_id: str, *, name: str = "", address: str = "",
                        location: str = "", point: str = "", external_id: str = "",
                        phone: str = "", source: str = "", origin: str = "") -> int:
@@ -358,7 +409,7 @@ async def from_observations(db, rows: list[dict]) -> None:
     is a phone contact, a CONTACT_FOUND a person, a CONTACT_FORM_URL a
     contact form. Called by the one observation writer, so every path that
     writes those facts keeps the contacts in step."""
-    people = []
+    people, found = [], []
     for r in rows:
         company_id, code = r.get("company_id") or "", r.get("signal_code")
         text = (r.get("value_text") or "").strip()
@@ -373,11 +424,13 @@ async def from_observations(db, rows: list[dict]) -> None:
                 people.append((company_id, name, name_norm(name), role, source,
                                r.get("observed_at"), r.get("observed_at"), origin))
             continue
-        await add(db, company_id, Found(
+        found.append((company_id, Found(
             "phone" if code == "PHONE_NUMBER" else "contact_form", text,
             source=source, capability=r.get("capability") or "",
             evidence_url=r.get("evidence_url") or "", confidence=r.get("confidence", 1.0),
-            seen=r.get("observed_at")), origin)
+            seen=r.get("observed_at")), origin))
+    if found:
+        await add_many(db, found)
     if people:
         await db.executemany(_UPSERT_PERSON, people)
 

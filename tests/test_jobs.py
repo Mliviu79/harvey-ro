@@ -1138,8 +1138,8 @@ async def test_a_registry_pull_job_doesnt_freeze_the_event_loop(state, tmp_path)
 
 @pytest.mark.asyncio
 async def test_a_running_job_that_cant_stop_part_way_refuses_cancel_and_pause(state):
-    job_id = await jobs.enqueue(state, "id_check", "anaf", {"company_ids": ["x"]})
-    await jobs.claim(state, "anaf", "w")
+    job_id = await jobs.enqueue(state, "registry_load", "registry", {"dataset": "x"})
+    await jobs.claim(state, "registry", "w")
     for act in (jobs.cancel, jobs.pause):
         with pytest.raises(jobs.Refused) as refused:
             await act(state, job_id)
@@ -1147,10 +1147,12 @@ async def test_a_running_job_that_cant_stop_part_way_refuses_cancel_and_pause(st
     job = await jobs.get(state, job_id)
     assert job.stop_requested == "" and job.as_dict()["stoppable"] is False
     # Waiting, it can still be cancelled; a search can be asked to stop running.
-    waiting = await jobs.enqueue(state, "id_check", "anaf", {"company_ids": ["y"]},
+    waiting = await jobs.enqueue(state, "registry_load", "registry", {"dataset": "y"},
                                  dedupe_key="other")
     assert (await jobs.cancel(state, waiting)).status == "cancelled"
     assert jobs.stoppable("discover") and not jobs.stoppable("registry_load")
+    # A check at ANAF stops between its requests (ten to a job).
+    assert jobs.stoppable("id_check")
 
 
 @pytest.mark.asyncio

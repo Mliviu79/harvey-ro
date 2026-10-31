@@ -254,10 +254,29 @@ async def company_row(state, company_id: str) -> dict | None:
         db.row_factory = aiosqlite.Row
         async with db.execute(
                 "SELECT c.id, c.name, c.domain, c.website, c.website_trust, c.location, c.cui, "
-                f"c.phone, c.source_url FROM companies c WHERE c.id = ? AND {LIVE}",
+                f"c.phone, c.source_url, c.source FROM companies c WHERE c.id = ? AND {LIVE}",
                 (company_id,)) as cur:
             row = await cur.fetchone()
     return dict(row) if row else None
+
+
+def market_country(company: dict) -> str:
+    """The company's country as two letters, when something says: the one
+    its location certainly names, else the market of the official source
+    it came from (that module's one market: a trade registry's record is
+    in the registry's country). "" otherwise."""
+    from harvey.modules import switches
+    from harvey.send_window import country_for
+
+    country, certain = country_for(company.get("location") or "")
+    if country and certain:
+        return country.upper()
+    src = (company.get("source") or "").strip()
+    src = src.split(":", 1)[1] if src.startswith("registry:") else src
+    module = next((m for m in switches.manifests() if src and m.id == src), None)
+    if module is not None and module.official and len(module.markets) == 1:
+        return str(module.markets[0]).upper()
+    return ""
 
 
 async def _on_file(state, company_id: str) -> set[str]:
@@ -490,7 +509,7 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
 
                 point = await geocode_city(state, company.get("location") or "")
             inp = api.Input(company_id=company_id, name=name, locality=town, point=point,
-                            extra={"provider": s.provider})
+                            extra={"provider": s.provider, "country": market_country(company)})
             ctx = api.Context(http=client, env=env, enabled=frozenset(enabled),
                               budget=_Budget(room),
                               settings={"provider": s.provider,

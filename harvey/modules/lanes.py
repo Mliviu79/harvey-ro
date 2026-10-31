@@ -319,17 +319,54 @@ def uses(module_id: str) -> dict[str, int]:
     return _current(_uses_file(module_id, lambda counts: None), specs, time.time())
 
 
+# How long a service's own word on what is left holds when it doesn't say
+# when its window renews.
+REPORTED_HOLDS_SECONDS = 86400.0
+
+
+def report_left(module_id: str, remaining: float, renews_in: float | None = None) -> None:
+    """Keep what the service itself says is left in its longest window
+    (Brave's X-RateLimit-Remaining), until ``renews_in`` seconds from now."""
+    until = time.time() + (float(renews_in) if renews_in is not None
+                           else REPORTED_HOLDS_SECONDS)
+    _uses_file(module_id, lambda counts: {**counts, "reported": [int(remaining), until]})
+
+
+def reported_left(module_id: str) -> int | None:
+    """What the service last said is left, while that still holds; None
+    when it hasn't said (or its window has renewed since)."""
+    counts = _uses_file(module_id, lambda counts: None)
+    try:
+        left, until = counts.get("reported") or (None, 0)
+        return int(left) if left is not None and float(until) > time.time() else None
+    except (TypeError, ValueError):
+        return None
+
+
 def free_left(module_id: str, share: float = 1.0) -> int | None:
     """How many more requests fit in every one of a module's free
     allowances, taking only ``share`` of each (the background's), or None
-    when it declares none (it has no free allowance to count against)."""
+    when it declares none (it has no free allowance to count against).
+
+    The background leaves the rest of each allowance to a person's own
+    runs. When the service itself says fewer are left than Harvey's count
+    does (report_left), its word is what is left: the background stops
+    while what remains is the part kept for a person."""
     specs = free_allowances(module_id)
     if not specs:
         return None
     used = uses(module_id)
+    reported = reported_left(module_id)
     share = min(max(float(share), 0.0), 1.0)
-    return max(0, min(int(spec["requests"] * share) - used.get(spec["per"], 0)
-                      for spec in specs))
+    out = []
+    for spec in specs:
+        total = int(spec["requests"])
+        left = total - used.get(spec["per"], 0)
+        if reported is not None:
+            left = min(left, reported)
+        # (What is kept for a person: the allowance less the background's share.)
+        out.append(left - (total - int(total * share)))
+    return max(0, min(out))
 
 
 # ── A search that said it can take no more for now ──

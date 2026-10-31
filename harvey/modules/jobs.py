@@ -758,6 +758,20 @@ async def pause_lane(state, lane: str, reason: str = PAUSED_BY_HAND) -> None:
     await state.set_setting(LANE_PAUSED_KEY.format(lane), reason or PAUSED_BY_HAND)
 
 
+async def rest_lane(state, lane: str, seconds: float, *, but: str = "") -> int:
+    """Hold a lane's queued jobs (all but ``but``) for ``seconds``: none
+    starts before then, and one held longer already keeps its own time.
+    For a service that is busy for everyone, not for one job. How many."""
+    async with state._connect() as db:
+        cur = await db.execute(
+            "UPDATE jobs SET not_before = datetime('now', ?), updated_at = CURRENT_TIMESTAMP "
+            "WHERE lane = ? AND status = 'queued' AND id != ? "
+            "AND (not_before IS NULL OR not_before < datetime('now', ?))",
+            (f"+{int(seconds)} seconds", lane, but, f"+{int(seconds)} seconds"))
+        await db.commit()
+        return cur.rowcount
+
+
 async def resume_lane(state, lane: str) -> None:
     await state.delete_setting(LANE_PAUSED_KEY.format(lane))
     notify()

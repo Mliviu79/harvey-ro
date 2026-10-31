@@ -22,6 +22,10 @@ from harvey.collectors.discover import (Business, DiscoveryProvider, DiscoveryQu
 from harvey.transient import Transient
 
 LANE = "brave"
+MODULE = "brave"
+# Countries Brave refused as a search's ``country`` (HTTP 422) in this
+# process: searched without one from then on.
+_REFUSED_COUNTRIES: set[str] = set()
 # A wait longer than this is a window running out (the month's), not the
 # per-second pace: the search stops and says when Brave takes more.
 SHORT_WAIT_SECONDS = 5.0
@@ -35,6 +39,18 @@ def _numbers(header: str) -> list[float]:
         except ValueError:
             out.append(-1.0)
     return out
+
+
+def long_window(headers) -> tuple[float, float | None] | None:
+    """(searches left, seconds until it renews) in Brave's longest window
+    (the month's, the last of ``X-RateLimit-Remaining``), None when the
+    headers don't say."""
+    remaining = _numbers(headers.get("X-RateLimit-Remaining", ""))
+    if not remaining or remaining[-1] < 0:
+        return None
+    reset = _numbers(headers.get("X-RateLimit-Reset", ""))
+    renews = reset[len(remaining) - 1] if len(reset) >= len(remaining) else None
+    return remaining[-1], (renews if renews is not None and renews >= 0 else None)
 
 
 def retry_after(headers) -> float | None:
@@ -88,6 +104,9 @@ class Brave(DiscoveryProvider):
             return []
         count = min(self.MAX_COUNT, query.limit or query.depth or self.MAX_COUNT)
         params = {"q": query.keyword(), "count": count}
+        country = (query.country or "").strip().upper()
+        if len(country) == 2 and country.isalpha() and country not in _REFUSED_COUNTRIES:
+            params["country"] = country
         headers = {"Accept": "application/json", "X-Subscription-Token": api_key}
         r = await self._get(client, headers, params)
         self.last_cost += self.PRICE
@@ -112,18 +131,27 @@ class Brave(DiscoveryProvider):
         from harvey.modules import lanes
 
         r = None
-        for attempt in range(2):
+        attempt = 0
+        while attempt < 2:
             await lanes.wait(LANE)
             try:
                 r = await client.get(self.ENDPOINT, headers=headers, params=params)
             except httpx.HTTPError as e:
                 if attempt == 0:
+                    attempt += 1
                     await asyncio.sleep(1.0)
                     continue
                 raise Transient(f"Brave Search unreachable: {e}") from e
+            await _note_left(r.headers)
+            if r.status_code == 422 and "country" in params and self._refuses_country(r):
+                # A country Brave doesn't search in: once more without it
+                # (not one of the two tries), never sent again by this process.
+                _REFUSED_COUNTRIES.add(params.pop("country"))
+                continue
             if r.status_code == 429:
                 wait = retry_after(r.headers)
                 if attempt == 0 and (wait is None or wait <= SHORT_WAIT_SECONDS):
+                    attempt += 1
                     await asyncio.sleep(max(1.0, wait or 1.0))
                     continue
                 raise ProviderExhausted(
@@ -131,6 +159,7 @@ class Brave(DiscoveryProvider):
                     "used up.", retry_after=max(60.0, wait or 60.0))
             if r.status_code >= 500:
                 if attempt == 0:
+                    attempt += 1
                     await asyncio.sleep(1.0)
                     continue
                 raise Transient(f"Brave Search answered HTTP {r.status_code}")
@@ -152,6 +181,18 @@ class Brave(DiscoveryProvider):
         return r
 
     @staticmethod
+    def _refuses_country(r) -> bool:
+        """A 422 that says the ``country`` parameter is what Brave refused
+        (its validation errors name the parameter in ``loc``)."""
+        try:
+            err = (r.json() or {}).get("error") or {}
+            errors = ((err.get("meta") or {}).get("errors")) or []
+        except Exception:
+            return False
+        return any(isinstance(e, dict) and "country" in (e.get("loc") or ())
+                   for e in errors if isinstance(errors, list))
+
+    @staticmethod
     def _error_code(r) -> str:
         try:
             err = (r.json() or {}).get("error") or {}
@@ -168,3 +209,17 @@ class Brave(DiscoveryProvider):
         web = data.get("web") if isinstance(data, dict) else None
         items = web.get("results") if isinstance(web, dict) else None
         return items if isinstance(items, list) else []
+
+
+async def _note_left(headers) -> None:
+    """What Brave says is left in its longest window, for the background's
+    share (lanes.report_left): its own count can be lower than Harvey's (a
+    key used elsewhere too). Never fails a search."""
+    from harvey.modules import lanes
+
+    try:
+        left = long_window(headers)
+        if left is not None:
+            await asyncio.to_thread(lanes.report_left, MODULE, *left)
+    except Exception:
+        pass
