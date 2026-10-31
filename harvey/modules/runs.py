@@ -1195,14 +1195,21 @@ async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, ru
             draft.facts, company_id=company_id, run_id=run_id,
             confirmed=confirmed), run_id)
         _profile_log.info(f"profile: {domain} → {len(draft.facts)} observation(s)")
+    if draft.values.get("email_pattern") and own:
+        # How the addresses its pages publish are spelled: the address
+        # lookup builds each person's address the same way.
+        await ingest.learned_pattern(state, domain, draft.values["email_pattern"])
     return done
 
 
 # What a site read looks for: a plain read its phones and contact form; the
-# contact finder's (``contacts``) its emails, social profiles and people too.
-# Only the second closes the finder's read (finder.SITE_WANTS).
+# contact finder's (``contacts``) its emails, social profiles and people too,
+# across the pages the site's menu links to, and its owner and the way it
+# spells addresses ("owner"). Only a read that looked for the owner closes
+# the finder's read (finder.SITE_WANTS): a site read before the finder
+# followed the menu ("...,people" without "owner") is read once more.
 PLAIN_READ = "phone,contact_form"
-CONTACT_READ = "phone,email,contact_form,social,people"
+CONTACT_READ = "phone,email,contact_form,social,people,owner"
 
 
 async def _mark_profiled(state, company_id: str, outcome: str = "", found: int = 0,

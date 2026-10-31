@@ -16,7 +16,7 @@ import harvey.dashboard as dash
 from harvey import contacts, finder
 from harvey.collectors.profile import social_links
 from harvey.models import Company
-from harvey.modules import api, job_kinds, jobs
+from harvey.modules import api, job_kinds, jobs, runs
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
@@ -309,7 +309,7 @@ def test_a_person_with_no_contact_gets_one_checked_address(tmp_path, monkeypatch
         s = await _state(db)
         cid = await _company(s, name="ETA EXAMPLE SRL", domain="eta.example")
         await s.add_people(cid, [("POPESCU ION", "administrator")], source="onrc")
-        await s.record_search("company", cid, "website", "read_site", looked_for="phone,email")
+        await s.record_search("company", cid, "website", "read_site", looked_for=runs.CONTACT_READ)
         return cid, await finder.find(s, cid, spend=_spend(), env=ENV)
 
     cid, found = run(go())
@@ -812,7 +812,7 @@ def test_address_checks_count_against_the_months_checks(tmp_path, monkeypatch):
     async def go():
         s = await _state(db)
         cid = await _company(s, name="ZETA EXAMPLE SRL", domain="zeta.example")
-        await s.record_search("company", cid, "website", "read_site", looked_for="email")
+        await s.record_search("company", cid, "website", "read_site", looked_for=runs.CONTACT_READ)
         await s.add_people(cid, [("POPESCU ION", "a"), ("IONESCU ANA", "b"),
                                  ("GEORGESCU DAN", "c")], source="onrc")
         return await finder.find(s, cid, spend=_spend(), env=ENV)
@@ -896,7 +896,7 @@ def test_the_background_feed_skips_what_waits_and_rests_when_nothing_is_left(tmp
         async with s._connect() as conn:
             await conn.execute("UPDATE jobs SET status = 'done' WHERE rowid = 1")
             await conn.commit()
-        await s.record_search("company", ids[2], "website", "read_site", looked_for="email")
+        await s.record_search("company", ids[2], "website", "read_site", looked_for=runs.CONTACT_READ)
         second = await job_kinds.enqueue_backlog(s)
         waiting = sorted(json.loads(p)["company_id"] for (p,) in _rows(
             db, "SELECT params_json FROM jobs WHERE status = 'queued'"))
@@ -904,7 +904,7 @@ def test_the_background_feed_skips_what_waits_and_rests_when_nothing_is_left(tmp
             await conn.execute("UPDATE jobs SET status = 'done'")
             await conn.commit()
         for cid in ids:
-            await s.record_search("company", cid, "website", "read_site", looked_for="email")
+            await s.record_search("company", cid, "website", "read_site", looked_for=runs.CONTACT_READ)
         third = await job_kinds.enqueue_backlog(s)
         fourth = await job_kinds.enqueue_backlog(s)
         return ids, first, second, waiting, third, fourth

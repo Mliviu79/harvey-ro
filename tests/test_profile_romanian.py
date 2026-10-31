@@ -4,7 +4,8 @@ import pytest
 
 from harvey.collectors import people as people_mod
 from harvey.collectors.profile import (
-    BOOKING_HINTS, RO_TEAM_PATHS, TEAM_PATHS, ProfileCollector, _reads_like_title, title_looks_like_role,
+    BOOKING_HINTS, FALLBACK_SITE_PATHS, MAX_SITE_FETCHES, RO_FALLBACK_SITE_PATHS, ProfileCollector,
+    _reads_like_title, title_looks_like_role,
 )
 from harvey.models.company import Company
 from harvey.signals import sync_vocabulary
@@ -152,35 +153,38 @@ def test_no_booking_wording(html):
 
 
 async def team_requests(state, domain):  # noqa: F811
+    """The paths a read tries on a homepage whose menu links nowhere."""
     await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
     requested = []
 
-    async def fake_get(url):
+    async def fake_fetch(url):
         requested.append(url)
-        return "<html>home</html>"
-    c._get = fake_get
+        return url, "<html>home</html>"
+    c._fetch = fake_fetch
     cid = await state.add_company(Company(name="Exemplu", domain=domain))
     await c.profile_company(cid, domain)
-    team = set(TEAM_PATHS) | set(RO_TEAM_PATHS) | {"/contact"}
-    return [u.split(domain, 1)[1] for u in requested if u.split(domain, 1)[1] in team]
+    tried = set(FALLBACK_SITE_PATHS) | set(RO_FALLBACK_SITE_PATHS)
+    return [u.split(domain, 1)[1] for u in requested if u.split(domain, 1)[1] in tried]
 
 
 @pytest.mark.asyncio
-async def test_english_team_paths_are_unchanged(state):  # noqa: F811
-    assert await team_requests(state, "acme.com") == list(TEAM_PATHS)
+async def test_english_fallback_paths_when_the_menu_links_nowhere(state):  # noqa: F811
+    assert await team_requests(state, "acme.com") == list(FALLBACK_SITE_PATHS)
 
 
 @pytest.mark.asyncio
-async def test_romanian_team_paths_go_first(state):  # noqa: F811
+async def test_romanian_fallback_paths_go_first(state):  # noqa: F811
+    # Ten requests in all, the homepage's among them.
     assert await team_requests(state, "clinica-exemplu.ro") \
-        == ["/echipa", "/echipa-noastra", "/medici", "/despre-noi", *TEAM_PATHS, "/contact"]
+        == ["/echipa", "/despre-noi", "/medici", "/contact", "/about", "/about-us", "/team",
+            "/our-team", "/contact-us"][:MAX_SITE_FETCHES - 1]
 
 
 @pytest.mark.asyncio
-async def test_romanian_team_page_is_read_before_contact(state):  # noqa: F811
+async def test_romanian_team_page_is_read_with_the_contact_page(state):  # noqa: F811
     await sync_vocabulary(state)
     await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
@@ -190,10 +194,13 @@ async def test_romanian_team_page_is_read_before_contact(state):  # noqa: F811
              "/contact": f"<html>{pad}<p>Telefon 0712 000 000</p></html>",
              "/medici": f"<html>{pad}<h3>Dr. Ana Pop</h3><p>Medic primar</p></html>"}
 
-    async def fake_get(url):
-        return pages.get(url.split("clinica-exemplu.ro", 1)[1].rstrip("/"), "")
-    c._get = fake_get
+    async def fake_fetch(url):
+        return url, pages.get(url.split("clinica-exemplu.ro", 1)[1].rstrip("/"), "")
+    c._fetch = fake_fetch
     cid = await state.add_company(Company(name="Exemplu", domain="clinica-exemplu.ro"))
     obs = await c.profile_company(cid, "clinica-exemplu.ro")
     assert [(o["value_text"], o["evidence_url"]) for o in obs if o["signal_code"] == "CONTACT_FOUND"] \
         == [("Ana Pop — Medic primar", "https://clinica-exemplu.ro/medici")]
+    read = [url for url, _ in c.pages_read[cid]]
+    assert read == ["https://clinica-exemplu.ro", "https://clinica-exemplu.ro/medici",
+                    "https://clinica-exemplu.ro/contact"]

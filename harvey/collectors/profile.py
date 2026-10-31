@@ -122,12 +122,18 @@ BOOKING_HINTS = (r"calendly\.com", r"acuityscheduling", r"schedulicity",
 AI_CRAWLERS = ("gptbot", "google-extended", "ccbot", "anthropic-ai", "claudebot",
                "perplexitybot", "bytespider")
 
-TEAM_PATHS = ("/team", "/about", "/about-us", "/our-team", "/staff",
-              "/leadership", "/meet-the-team", "/company/team")
-# A .ro site's team page is named in Romanian; tried first on .ro domains only.
-# The first page that exists is the only one read, so /contact (which most
-# .ro sites have) goes after every team page, never before them.
-RO_TEAM_PATHS = ("/echipa", "/echipa-noastra", "/medici", "/despre-noi")
+# The pages where a site names its people and says how to reach it are
+# found by following the site's own menu (people.menu_links: team,
+# meet-the-doctors, about, contact), at most MAX_SITE_PAGES pages counting
+# the homepage and MAX_SITE_FETCHES requests counting the ones that found
+# the homepage. Only a homepage whose menu links to fewer than two of them
+# (a JavaScript menu, a one-page site) has these common paths tried, and a
+# guessed page counts only when it is a real page (over 500 characters).
+MAX_SITE_PAGES = 6
+MAX_SITE_FETCHES = 10
+FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", "/contact-us")
+# A .ro site's pages are named in Romanian: tried first on .ro domains only.
+RO_FALLBACK_SITE_PATHS = ("/echipa", "/despre-noi", "/medici", "/contact")
 CAREERS_PATHS = ("/careers", "/jobs", "/join-us", "/employment", "/hiring",
                  "/about/careers", "/careers/")
 # A homepage link to the careers page beats guessing paths: careers.acme.com
@@ -141,6 +147,22 @@ _CAREERS_ANCHOR = re.compile(r"^(careers?|jobs|join us|join (our|the) team|we['�
 # Roles recorded per company from a board. The first few say it; twenty rows
 # of "Account Executive, <city>" don't say more.
 MAX_BOARD_ROLES = 5
+# The signals a read of the team and about pages answers.
+PEOPLE_CODES = ("CONTACT_FOUND", "DECISION_MAKER_TITLE", "LIKELY_OWNER")
+# People kept per company from its site, and owners recorded as LIKELY_OWNER.
+MAX_TEAM = 12
+MAX_OWNERS = 3
+_CONTACT_URL = re.compile(r"(?i)contact")
+
+
+def _variant_number(site: str, domain: str) -> int:
+    """How many requests found the homepage at ``site`` (the scheme and www
+    variants _resolve_site tries in turn)."""
+    variants = [f"https://{domain}", f"https://www.{domain}", f"http://{domain}",
+                f"http://www.{domain}"]
+    return variants.index(site) + 1 if site in variants else len(variants)
+
+
 CONTACT_PATHS = ("/contact", "/contact-us", "/get-a-quote", "/free-estimate",
                  "/request-estimate", "/quote")
 
@@ -910,18 +932,31 @@ class ProfileCollector:
     async def _get(self, url: str) -> str:
         """The page's HTML over HTTP, or rendered by a browser when HTTP got
         a JavaScript shell or a block (harvey/browser.py); "" when neither
-        produced a page."""
+        produced a page. Where it landed after any redirect is kept in
+        ``landed_at`` (the last few URLs asked)."""
+        final, html = await self._fetch(url)
+        if html:
+            landed = self.__dict__.setdefault("landed_at", {})
+            if len(landed) > 16:
+                landed.clear()
+            landed[url] = final
+        return html
+
+    async def _fetch(self, url: str) -> tuple[str, str]:
+        """(the URL the page was read at after any redirect, its HTML), as
+        ``_get`` reads it; (url, "") when nothing produced a page."""
         pages = getattr(self, "_pages", None)
         host = urlparse(url).netloc.lower().removeprefix("www.")
         if pages is not None and pages.browser_first(url):
             page = await pages.render(url)
             if page is not None:
-                return page.text
+                return page.url or url, page.text
         try:
             resp = await self._client.get(url)
         except (httpx.HTTPError, ValueError) as e:
             logger.debug(f"fetch failed {url}: {e}")
-            return ""
+            return url, ""
+        final = str(getattr(resp, "url", "") or url)
         blocked = resp.status_code in (200, 202, 403, 429, 503) and looks_like_challenge(
             resp.text or "", resp.status_code)
         ctype = resp.headers.get("content-type", "")
@@ -931,15 +966,15 @@ class ProfileCollector:
                                           status=resp.status_code, blocked=blocked)
             if page is not None:
                 self.challenged.discard(host)
-                return page.text
+                return page.url or final, page.text
         if blocked:
             self.challenged.add(host)
-            return ""
+            return final, ""
         if resp.status_code != 200:
-            return ""
+            return final, ""
         if not html_ok:
-            return ""
-        return resp.text
+            return final, ""
+        return final, resp.text
 
     async def _resolve_site(self, domain: str) -> tuple[str, str]:
         """Return (working base url, homepage html), or ("", "") if none work.
@@ -954,6 +989,10 @@ class ProfileCollector:
         ):
             html = await self._get(base)
             if html:
+                # Where the homepage landed (a redirect to /ro/): its menu's
+                # relative links are relative to that page, not the root.
+                self.__dict__.setdefault("landed", {})[domain] = \
+                    self.__dict__.get("landed_at", {}).get(base, base)
                 return base, html
             if domain.lower().removeprefix("www.") in self.challenged:
                 break       # every variant lands on the same challenge
@@ -967,6 +1006,54 @@ class ProfileCollector:
             if html and len(html) > 500:
                 return url, html
         return "", ""
+
+    async def _site_pages(self, site: str, home: str, domain: str,
+                          fetched: int = 1) -> list[tuple[str, str]]:
+        """The pages the homepage's own menu links to where a business names
+        its people and says how to reach it (team, meet-the-doctors, about,
+        contact), as (url, html), at most MAX_SITE_PAGES - 1 of them and
+        MAX_SITE_FETCHES requests in all (``fetched``: the ones that found
+        the homepage). A link that redirects to another site (a franchisor's
+        team page), or lands back on the homepage, isn't read; a host that
+        answers with a bot check stops the read (it is never got around)."""
+        from harvey.collectors.people import _norm_url, menu_links
+
+        out: list[tuple[str, str]] = []
+        seen = {_norm_url(site)}
+        base = getattr(self, "landed", {}).get(domain) or site
+        if (urlparse(base).hostname or "").lower().removeprefix("www.") != domain:
+            base = site     # landed on another site: its menu isn't this one's
+        seen.add(_norm_url(base))
+        if base == site:
+            base = site + "/"
+        links = [(url, False) for url in menu_links(home, base, limit=MAX_SITE_PAGES - 1)]
+        if len(links) < 2:
+            paths = FALLBACK_SITE_PATHS
+            if domain.rstrip(".").endswith(".ro"):
+                paths = tuple(dict.fromkeys(RO_FALLBACK_SITE_PATHS + paths))
+            links += [(f"{site}{path}", True) for path in paths]
+        for url, guessed in links:
+            if len(out) >= MAX_SITE_PAGES - 1 or fetched >= MAX_SITE_FETCHES:
+                break
+            if _norm_url(url) in seen:
+                continue
+            seen.add(_norm_url(url))
+            fetched += 1
+            final, html = await self._fetch(url)
+            if not html:
+                if domain in getattr(self, "challenged", ()):
+                    break
+                continue
+            host = (urlparse(final).hostname or "").lower().removeprefix("www.")
+            if host != domain:
+                continue        # redirected to someone else's site
+            if html == home or (_norm_url(final) != _norm_url(url) and _norm_url(final) in seen):
+                continue        # a menu link that is really the homepage, or a page read already
+            if guessed and len(html) <= 500:
+                continue        # a guessed path that answered with next to nothing
+            seen.add(_norm_url(final))
+            out.append((final, html))
+        return out
 
     async def _careers_page(self, site: str, home: str, domain: str) -> tuple[str, str]:
         """(url, html) of the careers page: the homepage's own link to it
@@ -1280,12 +1367,13 @@ class ProfileCollector:
         # their own site (a funding-preset hit is usually the announcement),
         # About, then a press or news page. The newest wins.
         if self.wants("FUNDING_ROUND"):
-            pages = [(site, home)]
+            # (Its own list: ``pages`` is what the read returns.)
+            funding_pages = [(site, home)]
             hit = await self._own_hit_page(company_id, domain, site)
             if hit:
-                pages.append((hit, await self._get(hit)))
-            pages.append(await about())
-            found = [(f, url) for url, html in pages if html
+                funding_pages.append((hit, await self._get(hit)))
+            funding_pages.append(await about())
+            found = [(f, url) for url, html in funding_pages if html
                      for f in [funding_round(html, domain, url)] if f]
             if not found:
                 url, html = await self._first_present(site, FUNDING_PATHS)
@@ -1332,19 +1420,31 @@ class ProfileCollector:
                         except ValueError:
                             pass
 
-        # contact form — reaches the business without needing an email at all
+        # The pages the site's own menu links to where it names its people
+        # and says how to reach it (team, about, contact): read when anyone
+        # is wanted, and always for the contact finder (``contacts``).
         reach = getattr(self, "contacts", False)
+        people_wanted = reach or any(self.wants(code) for code in PEOPLE_CODES)
+        menu: list[tuple[str, str]] = []
+        if people_wanted:
+            menu = await self._site_pages(site, home, domain, fetched=_variant_number(site, domain))
+            pages.extend(menu)
+
+        # contact form — reaches the business without needing an email at all
         if self.wants("CONTACT_FORM_URL") or reach:
-            if re.search(r"(?is)<form\b", _strip_code(home)):
-                add("CONTACT_FORM_URL", text=site, url=site)
-                self.__dict__.setdefault("forms", {})[company_id] = site
-            else:
+            read = [(site, home)] + sorted(menu, key=lambda p: not _CONTACT_URL.search(p[0]))
+            form = next((url for url, html in read
+                         if re.search(r"(?is)<form\b", _strip_code(html))), "")
+            if not form and not people_wanted:
+                # A plain read (no menu read): the common contact paths.
                 curl, chtml = await self._first_present(site, CONTACT_PATHS)
                 if chtml:
                     pages.append((curl, chtml))
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
-                    add("CONTACT_FORM_URL", text=curl, url=curl)
-                    self.__dict__.setdefault("forms", {})[company_id] = curl
+                    form = curl
+            if form:
+                add("CONTACT_FORM_URL", text=form, url=form)
+                self.__dict__.setdefault("forms", {})[company_id] = form
 
         # open roles → hiring intent. The job-board feed when their site
         # links one (titles, departments and dates for every role), else
@@ -1356,28 +1456,44 @@ class ProfileCollector:
             except Exception as e:
                 logger.info(f"profile: {domain} open roles unread: {type(e).__name__}: {e}")
 
-        # team page → people
-        if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE") or reach:
-            paths = TEAM_PATHS
-            if domain.lower().rstrip(".").endswith(".ro"):
-                paths = RO_TEAM_PATHS + TEAM_PATHS + ("/contact",)
-            turl, thtml = await self._first_present(site, paths)
-            if thtml:
-                pages.append((turl, thtml))
-                for person in self.detect_people(thtml, domain=domain,
-                                                 site_name=self.site_names.get(company_id, "")):
-                    self.__dict__.setdefault("team", {}).setdefault(company_id, []).append(
-                        {**person, "url": turl})
-                    label = f"{person['first_name']} {person['last_name']}"
-                    add("CONTACT_FOUND",
-                        text=f"{label} — {person['title']}" if person["title"] else label,
-                        url=turl)
-                    if person["is_decision_maker"]:
-                        add("DECISION_MAKER_TITLE",
-                            text=f"{label} — {person['title']}", url=turl)
+        # the people the homepage and its menu pages name, owners first
+        if people_wanted:
+            self._people(company_id, [(site, home)] + menu, domain, add)
 
         self._phones(company_id, pages, phone_region(location, getattr(self, "config", None), domain), add)
         return obs
+
+    def _people(self, company_id: str, read: list[tuple[str, str]], domain: str, add) -> None:
+        """Everyone the pages read name (people.find_people: team cards and
+        lists, schema.org founder and employee markup, sentences such as
+        "owned and operated by" or "fondată de"), the likeliest owner
+        first; CSS team cards only when none of those name anyone. Kept for
+        the contact finder (``team``), with CONTACT_FOUND for each,
+        DECISION_MAKER_TITLE for an owner or a decision maker's title, and
+        LIKELY_OWNER for the owners."""
+        from harvey.collectors.people import find_people, is_owner_title, people_from_cards
+
+        site_name = self.site_names.get(company_id, "")
+        found = find_people(read, domain, site_name) or people_from_cards(read)
+        team = self.__dict__.setdefault("team", {}).setdefault(company_id, [])
+        owners = 0
+        for person in found[:MAX_TEAM]:
+            url = person.get("evidence_url") or read[0][0]
+            team.append({**person, "url": url})
+            label = f"{person['first_name']} {person['last_name']}"
+            title = person.get("title") or ""
+            text = f"{label} — {title}" if title else label
+            add("CONTACT_FOUND", text=text, url=url)
+            if person.get("owner") or any(t in title.lower() for t in DECISION_MAKER_TITLES):
+                add("DECISION_MAKER_TITLE", text=text, url=url)
+            if person.get("owner") and owners < MAX_OWNERS:
+                owners += 1
+                said = f"{label} — {title or 'owner'}"
+                evidence = (person.get("evidence") or "").strip()
+                if evidence and evidence != text:
+                    said += f": {evidence}"     # the sentence or markup that says so
+                add("LIKELY_OWNER", num=1, text=said[:300],
+                    conf=0.9 if is_owner_title(title) else 0.7, url=url)
 
     def _phones(self, company_id: str, pages: list[tuple[str, str]], region, add) -> None:
         """PHONE_NUMBER for each number the fetched pages publish (a tel:
@@ -1420,7 +1536,7 @@ READ_BY = {
     **{code: ("startups", "startup_claims") for code in (
         "YC_BACKED", "ACCELERATOR", "FUNDING_ROUND")},
     **{code: ("hiring", "job_board") for code in ("HIRING_ROLE", "OPEN_ROLES")},
-    **{code: ("people", "find_people") for code in ("CONTACT_FOUND", "DECISION_MAKER_TITLE")},
+    **{code: ("people", "find_people") for code in PEOPLE_CODES},
     "PHONE_NUMBER": ("phones", "site_phones"),
 }
 
@@ -1554,8 +1670,33 @@ def _reach(draft: Draft, c: "ProfileCollector", inp) -> None:
     form = c.__dict__.get("forms", {}).get(inp.company_id)
     if form:
         add("contact_form", form, form)
-    for person in c.__dict__.get("team", {}).get(inp.company_id, []):
+    team = c.__dict__.get("team", {}).get(inp.company_id, [])
+    for person in team:
         draft.people.append(Person(
             first_name=person["first_name"], last_name=person["last_name"],
             title=person.get("title") or "", source_url=person.get("url") or "",
+            fields={k: person[k] for k in ("owner", "rank", "source", "evidence") if k in person},
             module="people", capability="find_people"))
+    learned = site_pattern([x.value for x in draft.contacts if x.kind == "email"],
+                           [(p["first_name"], p["last_name"]) for p in team], own)
+    if learned:
+        draft.values["email_pattern"] = learned
+
+
+def site_pattern(addresses, named, domain: str) -> dict:
+    """What the addresses a company's own pages publish (obfuscated ones
+    decoded) say about how it spells its people's addresses, in the shape
+    an email lookup's ``learned`` has (ingest.learned_pattern keeps it):
+    the pattern, how sure, and whether an address was tied to someone named
+    on the site ("site_address") or only shows a format
+    ("site_address_guess", which Hunter still gets one look past). {} when
+    they say nothing (role mailboxes such as office@ never do)."""
+    from harvey.integrations.email_finder import site_email_evidence
+
+    if not domain:
+        return {}
+    known, pattern, confidence = site_email_evidence(list(addresses), list(named), domain)
+    if not pattern:
+        return {}
+    return {"pattern": pattern, "confidence": confidence,
+            "source": "site_address" if known else "site_address_guess"}

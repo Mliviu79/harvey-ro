@@ -59,9 +59,17 @@ def _ts(minutes_ago=0):
 
 
 def _company(env, cid, domain="", profiled=False, checked=False):
-    _sql(env, "INSERT INTO companies (id, name, domain, profile_checked_at, "
-              "prospects_checked_at) VALUES (?, ?, ?, ?, ?)",
-         (cid, cid, domain, _ts(30) if profiled else None, _ts(30) if checked else None))
+    _sql(env, "INSERT INTO companies (id, name, domain, profile_checked_at) VALUES (?, ?, ?, ?)",
+         (cid, cid, domain, _ts(30) if profiled else None))
+    if checked:
+        _searched(env, cid, minutes_ago=30)
+
+
+def _searched(env, cid, minutes_ago=30, outcome="nothing"):
+    """The contact finder searched the company (its searches row)."""
+    _sql(env, "INSERT INTO searches (target, target_id, module, capability, looked_for, "
+              "outcome, searched_at) VALUES ('company', ?, 'contact_finder', 'find_contacts', "
+              "'website,people,email,phone', ?, ?)", (cid, outcome, _ts(minutes_ago)))
 
 
 def _prospect(env, pid, email, email_status="verified", status="new"):
@@ -179,3 +187,34 @@ def test_opted_out_and_unreachable_people_are_never_asked_to_be_sent(client, env
     _prospect(env, "p2", "b@acme.test", email_status="guess", status="queued")
     _campaign(env, "c1", ["p1", "p2"])
     assert "Open Campaigns" not in client.get("/api/live-status").json()["next"]
+
+
+def test_find_emails_counts_the_contact_finders_searches(client, env):
+    _company(env, "a", "a.test", profiled=True, checked=True)
+    _company(env, "b", "b.test", profiled=True)
+    _company(env, "c", "c.test", profiled=True)
+    _searched(env, "c", outcome="error")        # a failed search isn't a search done
+    data = client.get("/api/live-status").json()
+    step = _step(data, "Find emails")
+    assert (step["done"], step["total"], step["state"]) == (1, 3, "partial")
+    assert data["next_key"] == "find_emails" and data["next_vars"] == {"n": 2}
+
+
+def test_a_search_a_moment_ago_shows_the_finder_at_work(client, env):
+    _company(env, "a", "a.test", profiled=True)
+    _searched(env, "a", minutes_ago=1)
+    data = client.get("/api/live-status").json()
+    assert _step(data, "Find emails")["state"] == "running"
+    assert data["next_key"] == "finding_emails"
+
+
+def test_a_running_contact_job_shows_the_finder_at_work(env, monkeypatch):
+    # No in-process worker: it would put this job (nobody's lease) back in
+    # the queue before the request, under load.
+    monkeypatch.setenv("HARVEY_DASHBOARD_WORKER", "off")
+    _company(env, "a", "a.test", profiled=True)
+    _sql(env, "INSERT INTO jobs (id, kind, lane, status) "
+              "VALUES ('j1', 'find_contacts', 'contacts', 'running')")
+    with TestClient(dash.app, base_url=ORIGIN,
+                    headers={"Authorization": f"Bearer {env['token']}"}) as client:
+        assert _step(client.get("/api/live-status").json(), "Find emails")["state"] == "running"

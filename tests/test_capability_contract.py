@@ -471,7 +471,7 @@ def test_the_writer_list_is_real():
     names = _writers()
     for expected in ("save_company", "add_observations", "add_prospect", "save_email_pattern",
                      "fill_company_phone", "rename_company", "mark_company_profiled",
-                     "set_setting", "increment_setting", "update_company_signals"):
+                     "set_setting", "increment_setting"):
         assert expected in names
 
 

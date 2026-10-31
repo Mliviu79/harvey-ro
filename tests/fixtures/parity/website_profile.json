@@ -90,6 +90,14 @@
    "kind": "phone",
    "source": "",
    "value": "+13035550142"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 0.9,
+   "created_at": true,
+   "kind": "phone",
+   "source": "profile",
+   "value": "+13035550177"
   }
  ],
  "company_merge_moves": [],
@@ -304,6 +312,18 @@
   {
    "collector": "profile",
    "company_id": "C1",
+   "confidence": 0.9,
+   "evidence_url": "https://brightpathdental.example/team",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "LIKELY_OWNER",
+   "value_num": 1.0,
+   "value_text": "Nora Ellison — Owner & President"
+  },
+  {
+   "collector": "profile",
+   "company_id": "C1",
    "confidence": 1.0,
    "evidence_url": "https://brightpathdental.example/team",
    "observed_at": true,
@@ -336,6 +356,18 @@
    "signal_code": "PHONE_NUMBER",
    "value_num": null,
    "value_text": "+13035550142"
+  },
+  {
+   "collector": "profile",
+   "company_id": "C1",
+   "confidence": 0.9,
+   "evidence_url": "https://brightpathdental.example/contact",
+   "observed_at": true,
+   "prospect_id": "",
+   "run_id": "R1",
+   "signal_code": "PHONE_NUMBER",
+   "value_num": null,
+   "value_text": "+13035550177"
   }
  ],
  "prospects": [],
@@ -347,7 +379,7 @@
    "id": "R1",
    "params_json": "{}",
    "provider": "http",
-   "records": 20,
+   "records": 22,
    "stage": "profile",
    "started_at": true,
    "status": "completed"

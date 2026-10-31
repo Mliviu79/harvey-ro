@@ -19,7 +19,7 @@ from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager, poorly_scored
+from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager, brief_note, poorly_scored
 from harvey.sending_mode import sync_sending_mode
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
@@ -300,16 +300,18 @@ class Writer:
                 company = await self.state.get_company(prospect.company_id)
             except Exception:
                 company = None
+        brief: list[str] = []
         if company:
             if company.description:
                 facts.append(f"- What the company says about itself: {company.description}")
-            if company.tech_stack:
-                facts.append(f"- Tools detected on their website: {', '.join(company.tech_stack[:6])}")
-            for signal in company.signals[:3]:
-                facts.append(
-                    f"- Signal ({signal.get('type', 'signal')}): {signal.get('detail', '')}"
-                )
-        if prospect.personalization_notes:
+            # What its record says now: the site read, the registry, the
+            # financial statements (state.company_brief).
+            try:
+                brief = await self.state.company_brief(prospect.company_id)
+            except Exception:
+                brief = []
+            facts.extend(f"- {line}" for line in brief)
+        if prospect.personalization_notes and prospect.personalization_notes != brief_note(brief):
             facts.append(f"- Research notes: {prospect.personalization_notes}")
         startup = await self._startup(prospect.company_id)
         if startup is not None:

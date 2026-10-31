@@ -786,6 +786,45 @@ def find_people(pages: list[tuple[str, str]], domain: str, site_name: str = "") 
     return people
 
 
+def people_from_cards(pages: list[tuple[str, str]]) -> list[dict]:
+    """The fallback when find_people names nobody: CSS-class team cards
+    (``.team-member``, ``[class*='person']``...), the first heading in a
+    card being the name. Only names that look like people, and only titles
+    that read like titles (a bio paragraph under the name is not one)."""
+    from bs4 import BeautifulSoup
+
+    members, seen = [], set()
+    for url, html in pages:
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+            cards = soup.select(".team-member, .person, .staff, [class*='team'], "
+                                "[class*='leadership'], [class*='member'], [class*='person']")
+        except Exception:
+            continue
+        for card in cards:
+            name_el = card.select_one("h2, h3, h4, .name, [class*='name']")
+            if not name_el:
+                continue
+            raw = re.sub(r"\s+", " ", name_el.get_text()).strip()
+            split = split_person_name(raw)
+            if not split or (split[0].lower(), split[1].lower()) in seen:
+                continue
+            title = ""
+            for el in card.select(".title, .role, .position, [class*='title'], "
+                                  "[class*='role'], [class*='position'], p, span"):
+                text = re.sub(r"\s+", " ", el.get_text()).strip()
+                if text and text != raw and len(text) <= 80 and _reads_like_title(text):
+                    title = text
+                    break
+            seen.add((split[0].lower(), split[1].lower()))
+            owner = is_owner_title(title)
+            members.append({**_person(split[0], split[1], title, source="card", url=url,
+                                      evidence=f"{split[0]} {split[1]} — {title}", owner=owner),
+                            "rank": owner_rank(title, owner)})
+    members.sort(key=lambda m: -m["rank"])
+    return members
+
+
 # ── which pages to read ──────────────────────────────────────────────────
 
 _LINK_WEIGHTS = (
@@ -857,7 +896,36 @@ def menu_links(html: str, page_url: str, limit: int = 5) -> list[str]:
         seen.add(key)
         scored.append((-score, len(p.path), i, url))
     scored.sort()
-    return [url for *_, url in scored[:limit]]
+    # The same page in another language (/en/team, /de/team) is read once:
+    # the homepage's own language first when it has one (/ro/), else the
+    # best-scored. Page budgets go to different pages, not translations.
+    own = _lang_segment(base.path)
+    scored.sort(key=lambda s: (s[0], _lang_segment(urlparse(s[3]).path) != own) if own else s[0])
+    out, pages = [], set()
+    for *_, url in scored:
+        path = urlparse(url).path
+        page = _norm_url(url.replace(path, _without_lang(path), 1)) if _lang_segment(path) else ""
+        if page and page in pages:
+            continue
+        if page:
+            pages.add(page)
+        out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_LANG_SEGMENT = re.compile(r"^/([a-z]{2})(?:-[a-z]{2})?(?=/|$)", re.I)
+
+
+def _lang_segment(path: str) -> str:
+    """The leading language segment of a path ("/en/team" -> "en"), or ""."""
+    m = _LANG_SEGMENT.match(path or "")
+    return m.group(1).lower() if m else ""
+
+
+def _without_lang(path: str) -> str:
+    return _LANG_SEGMENT.sub("", path or "", count=1) or "/"
 
 
 # ── addresses on a page ──────────────────────────────────────────────────

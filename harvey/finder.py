@@ -63,8 +63,11 @@ FINDER = ("contact_finder", "find_contacts")
 LOOKUP = ("contact_finder", "find_website")
 SITE = ("website", "read_site")
 # What the finder's site read looks for that a plain read doesn't: only a
-# read that looked for emails closes it.
-SITE_WANTS = "email"
+# read that looked for the owner closes it (runs.CONTACT_READ). A read that
+# looked for emails only on the homepage and the first team or contact path
+# that answered (before the finder followed the site's menu) doesn't: those
+# sites are read once more, the deeper way.
+SITE_WANTS = "owner"
 EMAIL = ("email_verify", "find_email")
 # Addresses built and checked per company and job: a registry firm has one
 # or two administrators; more is a big company whose site lists its people.
@@ -254,7 +257,8 @@ async def company_row(state, company_id: str) -> dict | None:
         db.row_factory = aiosqlite.Row
         async with db.execute(
                 "SELECT c.id, c.name, c.domain, c.website, c.website_trust, c.location, c.cui, "
-                f"c.phone, c.source_url, c.source FROM companies c WHERE c.id = ? AND {LIVE}",
+                "c.phone, c.source_url, c.source, c.company_size "
+                f"FROM companies c WHERE c.id = ? AND {LIVE}",
                 (company_id,)) as cur:
             row = await cur.fetchone()
     return dict(row) if row else None
@@ -387,7 +391,7 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
         # (An address built at a domain that may not be the company's would
         # be a guess about someone else's mailbox.)
         await _addresses(state, company, domain, out, trust, spend=spend, since=since,
-                         batch_id=batch_id, enabled=enabled, env=env)
+                         batch_id=batch_id, enabled=enabled, env=env, config=config)
     if out.steps or out.failed:
         # Every search failed: an error, which isn't a search done.
         await state.record_search(
@@ -568,9 +572,19 @@ def _skip(out: Found, why: str) -> None:
 
 
 async def _addresses(state, company: dict, domain: str, out: Found, trust: str, *,
-                     spend: Spend, since, batch_id, enabled, env) -> None:
+                     spend: Spend, since, batch_id, enabled, env, config=None) -> None:
     """Step 3: one checked address for each person at the company reached
-    by no contact of their own (a verification credit each)."""
+    by no contact of their own (a verification credit each). What the
+    addresses on file at the domain say comes first (email_finder's
+    site_email_evidence): a person's own published address is linked to
+    them as it is, with no check spent; the others are built the way those
+    addresses are spelled, and never as one another named there could own.
+    With no evidence and no pattern learned, a small company's address is
+    built as first@ (SMALL_BUSINESS_PATTERN, see small_company), any
+    other's as first.last@. A built address no verifier confirmed stays a
+    guess, kept no surer than "likely"."""
+    from harvey.integrations import email_finder as ef
+
     if EMAIL[0] not in enabled:
         return
     company_id = company["id"]
@@ -586,6 +600,14 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
     named = await _named_at(state, company_id)
     twins = _twins(named)
     searching = {p["id"] for p in people}
+    # Each name once: a registry entry and a team page naming the same
+    # person read the same, and an address is no less theirs for it.
+    names = list({_reading_key(*n): n for n in (split_name(p["name"], p["source"] or "")
+                                                for p in named) if all(n)}.values())
+    known, _, _ = ef.site_email_evidence(await _emails_at(state, company_id, domain), names,
+                                         domain)
+    default = (ef.SMALL_BUSINESS_PATTERN if await small_company(state, company, config)
+               else ef.DEFAULT_PATTERN)
     # Each name read checked once at the company, for whoever it was read
     # for first: father and son both "Ion Popescu" can't be told apart by
     # an address, and one mailbox isn't two people's. Kept with whether it
@@ -609,6 +631,29 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
             await state.record_search("person", person["id"], *EMAIL, looked_for="email",
                                       outcome="nothing", batch_id=batch_id,
                                       detail="no first and last name", origin=company_id)
+            continue
+        own, key = _own_address(known, orders)
+        if own:
+            if key in checked:
+                # Someone else here reads the same: one mailbox isn't two people's.
+                await state.record_search(
+                    "person", person["id"], *EMAIL, looked_for="email", outcome="nothing",
+                    batch_id=batch_id, origin=company_id,
+                    detail=f"read the same as {checked[key][0]}: an address can't tell "
+                           "them apart")
+                continue
+            checked[key] = (person["name"], False)
+            # Their own address, published on the company's site: theirs
+            # as it is, graded later like any published address.
+            kept = await ingest.person_contacts(
+                state, company_id, person["name"], person.get("role") or "",
+                [api.Contact("email", own, module="website", capability="read_site")],
+                trust=trust)
+            out.contacts += kept
+            await state.record_search(
+                "person", person["id"], *EMAIL, looked_for="email", outcome="found",
+                found=kept, batch_id=batch_id, origin=company_id,
+                detail="their own address, published on the company's site")
             continue
         # A hyphenated given name whole first ("anamaria"), then its first
         # part ("ana") if that comes back invalid.
@@ -642,7 +687,10 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
             try:
                 draft = await cap(api.Input(domain=domain, facts={"EMAIL_PATTERN": cached},
                                             extra={"first_name": first, "last_name": last,
-                                                   "verify": True}), ctx)
+                                                   "verify": True,
+                                                   "known_emails": known or None,
+                                                   "other_people": names or None,
+                                                   "default_pattern": default}), ctx)
             except Exception as e:
                 draft = api.Draft(failed=str(e))
             tried.append(f"{first} {last}")
@@ -668,7 +716,7 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         if draft.failed is None and draft.contacts:
             kept = await ingest.person_contacts(state, company_id, person["name"],
                                                 person.get("role") or "", draft.contacts,
-                                                trust=trust)
+                                                trust=_guess_trust(draft.contacts, trust))
         out.contacts += kept
         out.steps.append("address")
         # The registry text stays the person's name as written; the order
@@ -680,6 +728,89 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
             outcome="error" if draft.failed is not None else "found" if kept else "nothing",
             found=kept, batch_id=batch_id,
             detail="; ".join(x for x in (draft.failed or "", order) if x), origin=company_id)
+
+
+def _guess_trust(found, trust: str) -> str:
+    """A built address no verifier confirmed (a guess, or "risky": a
+    catch-all domain accepts every address) is no surer than "likely",
+    whatever the site's trust: the domain may be the company's, the
+    mailbox is unproven."""
+    if trust == "confirmed" and any(c.status in ("guess", "risky") for c in found):
+        return "likely"
+    return trust
+
+
+def _own_address(known, orders) -> tuple[str, str]:
+    """(the address published as this person's, site_email_evidence's
+    ``known``, read in any of their name's orders; that reading's key), or
+    ("", "") when none is."""
+    for first, last in orders:
+        mine = _reading_key(first, last)
+        for addr, k_first, k_last in known or ():
+            if _reading_key(k_first, k_last) == mine:
+                return addr, mine
+    return "", ""
+
+
+async def _emails_at(state, company_id: str, domain: str) -> list[str]:
+    """The addresses a source published for a company at ``domain`` (its
+    site, a registry, a listing). An address built here (an address check's
+    find_email) is no evidence of how the company spells its addresses,
+    nor is one a check found invalid or that stays a guess: learning from
+    those would pass a guess off as published, or teach the next check a
+    pattern nobody confirmed."""
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT DISTINCT ct.value FROM company_contacts l "
+                "JOIN contacts ct ON ct.id = l.contact_id "
+                "WHERE l.company_id = ? AND ct.kind = 'email' AND ct.value LIKE ? "
+                "AND COALESCE(ct.status, '') NOT IN ('guess', 'invalid') "
+                "AND NOT (COALESCE(l.capability, '') = ? AND COALESCE(l.source, '') = ?)",
+                (company_id, f"%@{domain}", EMAIL[1], EMAIL[0])) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+# A company this size or smaller is "small" (first@ before first.last@).
+SMALL_COMPANY_MAX = 20
+# Sources that list local businesses (a shop, a practice, a trade): a
+# company found there is small.
+LOCAL_BUSINESS_SOURCES = ("discover:osm", "discover:dataforseo_listings")
+
+
+def _upper(text) -> int | None:
+    nums = [int(n.replace(",", "")) for n in re.findall(r"\d[\d,]*", str(text or ""))]
+    return max(nums) if nums else None
+
+
+async def small_company(state, company: dict, config=None) -> bool:
+    """Is there a size signal independent of the website? The ICP's
+    company size, the company's size on file, its latest employee count
+    from the financial statements (EMPLOYEES), or a local-business listing
+    (OpenStreetMap, DataForSEO Business Listings) among its sources. Three
+    executives on a homepage say nothing about headcount."""
+    icp = getattr(config, "icp", None)
+    bound = _upper(getattr(icp, "company_size", "") or "")
+    if bound is not None and bound <= SMALL_COMPANY_MAX:
+        return True
+    size = _upper(company.get("company_size"))
+    if size is not None and size <= SMALL_COMPANY_MAX:
+        return True
+    if (company.get("source") or "") in LOCAL_BUSINESS_SOURCES:
+        return True
+    marks = ",".join("?" * len(LOCAL_BUSINESS_SOURCES))
+    async with state._connect() as db:
+        async with db.execute(
+                f"SELECT 1 FROM company_sources WHERE company_id = ? AND source IN ({marks}) "
+                "LIMIT 1", (company["id"], *LOCAL_BUSINESS_SOURCES)) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute(
+                "SELECT value_num FROM observations WHERE company_id = ? "
+                "AND signal_code = 'EMPLOYEES' AND value_num IS NOT NULL "
+                # (One reading per financial year, the year in value_text.)
+                "ORDER BY value_text DESC, observed_at DESC LIMIT 1", (company["id"],)) as cur:
+            row = await cur.fetchone()
+    return row is not None and row[0] <= SMALL_COMPANY_MAX
 
 
 async def _named_at(state, company_id: str) -> list[dict]:
@@ -811,24 +942,40 @@ async def background_status(state, looked: dict | None = None) -> dict:
     return {"on": on, "share": share, "searchers": out}
 
 
+# A site the finder read before it followed the site's menu: its read
+# looked for emails (on the homepage and the first team or contact path
+# that answered) but not for the owner (SITE_WANTS).
+SHALLOW_READ = ("EXISTS (SELECT 1 FROM searches s WHERE s.target = 'company' "
+                "AND s.target_id = c.id AND s.module = 'website' AND s.capability = 'read_site' "
+                "AND s.outcome != 'error' AND (',' || s.looked_for || ',') LIKE '%,email,%')")
+
+
 async def next_free(state, limit: int) -> list[str]:
-    """Companies with no contact and a website not read for its emails
-    yet, newest first: the free work the background takes next. Walks the
-    companies with a domain or a website (their indexes), never the whole
-    table: on a registry most companies have neither."""
+    """The free work the background takes next, newest first: companies
+    with no contact and a website not read for its emails yet; then, once
+    those are done, companies whose site the finder read the shallow way
+    (SHALLOW_READ), whatever contacts that read found, so each gets the
+    deeper read (menu, people, owner, pattern) once. Walks the companies
+    with a domain or a website (their indexes), never the whole table: on
+    a registry most companies have neither."""
     site_cond, site_args = _site_not_read()
-    rest = f"{LIVE} AND {NO_CONTACT} AND {site_cond}"
+    out: list[str] = []
     async with state._connect() as db:
-        async with db.execute(
-                "SELECT id FROM ("
-                f"SELECT c.id, c.created_at, c.rowid AS r FROM companies c "
-                f"WHERE c.domain > '' AND {rest} "
-                "UNION ALL "
-                f"SELECT c.id, c.created_at, c.rowid FROM companies c "
-                f"WHERE c.website != '' AND COALESCE(c.domain, '') = '' AND {rest}) "
-                "ORDER BY created_at DESC, r DESC LIMIT ?",
-                (*site_args, *site_args, int(limit))) as cur:
-            return [r[0] for r in await cur.fetchall()]
+        for extra in (NO_CONTACT, f"NOT {NO_CONTACT} AND {SHALLOW_READ}"):
+            if len(out) >= limit:
+                break
+            rest = f"{LIVE} AND {extra} AND {site_cond}"
+            async with db.execute(
+                    "SELECT id FROM ("
+                    f"SELECT c.id, c.created_at, c.rowid AS r FROM companies c "
+                    f"WHERE c.domain > '' AND {rest} "
+                    "UNION ALL "
+                    f"SELECT c.id, c.created_at, c.rowid FROM companies c "
+                    f"WHERE c.website != '' AND COALESCE(c.domain, '') = '' AND {rest}) "
+                    "ORDER BY created_at DESC, r DESC LIMIT ?",
+                    (*site_args, *site_args, int(limit) - len(out))) as cur:
+                out += [r[0] for r in await cur.fetchall()]
+    return out
 
 
 async def next_paid(state, limit: int, available: list[Searcher] | None = None) -> list[str]:

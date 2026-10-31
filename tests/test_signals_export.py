@@ -52,7 +52,9 @@ def test_detect_tech_no_false_positives_on_plain_page():
 
 
 @pytest.mark.asyncio
-async def test_company_signals_roundtrip_and_merge(state):
+async def test_company_signals_roundtrip(state):
+    """The columns an earlier version filled still load (nothing writes
+    them now: what a site read learns is an observation)."""
     cid = await state.add_company(Company(
         name="Acme", domain="acme.com",
         tech_stack=["Shopify"], signals=[{"type": "hiring", "detail": "Head of Growth"}],
@@ -60,19 +62,6 @@ async def test_company_signals_roundtrip_and_merge(state):
     fetched = await state.get_company(cid)
     assert fetched.tech_stack == ["Shopify"]
     assert fetched.signals[0]["detail"] == "Head of Growth"
-
-    # Merge: new tech appends, duplicate signal is ignored
-    await state.update_company_signals(
-        cid,
-        tech_stack=["Shopify", "Intercom"],
-        new_signals=[
-            {"type": "hiring", "detail": "Head of Growth"},        # dup
-            {"type": "hiring", "detail": "Growth Marketer"},       # new
-        ],
-    )
-    fetched = await state.get_company(cid)
-    assert fetched.tech_stack == ["Shopify", "Intercom"]
-    assert len(fetched.signals) == 2
 
 
 @pytest.mark.asyncio

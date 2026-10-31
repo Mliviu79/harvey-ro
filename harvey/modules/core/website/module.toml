@@ -32,7 +32,7 @@ cost_note = "free (site HTML)"
 id = "read_site"
 op = "read"
 inputs = [["domain"]]
-outputs = { records = "pages", facts = ["CONTACT_FORM_URL"], values = ["name"], contacts = ["email", "contact_form", "linkedin", "facebook", "instagram", "whatsapp"] }
+outputs = { records = "pages", facts = ["CONTACT_FORM_URL"], values = ["name", "email_pattern"], contacts = ["email", "contact_form", "linkedin", "facebook", "instagram", "whatsapp"] }
 cost = { usd = 0.0, per = "company" }
 
 # The ways a company's own site says it can be reached. A social profile is

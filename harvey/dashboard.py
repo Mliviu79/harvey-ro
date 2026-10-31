@@ -4070,8 +4070,13 @@ async def _first(sql: str, params: tuple = (), key: str = "t"):
 # A run row still says 'running' after its process was killed (closed window,
 # reboot). No new facts for this long means it is not coming back.
 STALE_RUN_SECONDS = 900
-# Contact-finding has no run row; a recent prospects_checked_at means it is active.
+# The contact finder has no run row: a company it searched this recently, or
+# a find_contacts job running, means it is at work.
 CONTACT_ACTIVE_SECONDS = 180
+# A company the contact finder searched (finder.FINDER's searches row).
+_FINDER_SEARCHED = ("EXISTS (SELECT 1 FROM searches s WHERE s.target = 'company' "
+                    "AND s.target_id = companies.id AND s.module = 'contact_finder' "
+                    "AND s.capability = 'find_contacts' AND s.outcome != 'error')")
 # Moved on from "waiting to be emailed" (opted_out too: never offered again).
 SENT_STATUSES = ("contacted", "replied", "meeting", "closed", "lost", "opted_out")
 REPLY_STATUSES = ("replied", "meeting", "closed")
@@ -4102,7 +4107,7 @@ async def get_live_status():
         f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at IS NOT NULL")
     checked = await _scalar(
         f"SELECT COUNT(*) FROM companies WHERE {has_site} "
-        "AND profile_checked_at IS NOT NULL AND prospects_checked_at IS NOT NULL")
+        f"AND profile_checked_at IS NOT NULL AND {_FINDER_SEARCHED}")
 
     prospects = await query_db("SELECT id, email, email_status, status FROM prospects")
     with_email = [p for p in prospects if p.get("email")]
@@ -4162,13 +4167,16 @@ async def get_live_status():
                 item["eta_min"] = left / (done_in_run / elapsed) / 60
         running.append(item)
 
+    # (The newest searches only: the table holds every search ever made.)
     last_contact = _parse_ts(await _first(
-        "SELECT MAX(prospects_checked_at) AS t FROM companies"))
-    finding_emails = bool(
-        last_contact and (now - last_contact).total_seconds() < CONTACT_ACTIVE_SECONDS)
+        "SELECT MAX(searched_at) AS t FROM (SELECT target, module, capability, searched_at "
+        "FROM searches ORDER BY id DESC LIMIT 500) WHERE target = 'company' "
+        "AND module = 'contact_finder' AND capability = 'find_contacts'"))
     # Work is jobs now: one running on its lane counts as the step running.
     busy = {r["kind"] for r in await query_db(
         "SELECT DISTINCT kind FROM jobs WHERE status = 'running'")}
+    finding_emails = "find_contacts" in busy or bool(
+        last_contact and (now - last_contact).total_seconds() < CONTACT_ACTIVE_SECONDS)
     reading = any(r["stage"] == "profile" for r in running) or "site_read" in busy
     finding = any(r["stage"] == "discover" for r in running) or "discover" in busy
 

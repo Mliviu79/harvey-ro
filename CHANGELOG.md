@@ -9,6 +9,35 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The contact finder reads a site the way the old prospecting did.** It
+  follows the homepage's own menu to the team, about and contact pages
+  (meet-the-doctors, echipa, medici, despre noi...), six pages at most and
+  ten requests, instead of the first of a fixed list of paths that answered
+  (and which missed pages under 500 characters). Only a homepage whose menu
+  links to fewer than two such pages has the usual paths tried. On those
+  pages it finds people in team cards, schema.org markup and sentences
+  ("owned and operated by", "fondată de", "fondatorul clinicii"), the
+  likeliest owner first, CSS team cards only as a fallback, and records
+  `LIKELY_OWNER` when it is confirmed. The addresses the site publishes,
+  obfuscated ones included, teach the domain's email pattern: a person's
+  own published address is linked to them with no check spent, everyone
+  else's is built the same way, and with no evidence a small company's
+  address is built as `first@` (your ICP's size, its size on file, its
+  employee count from the financial statements, or a local listing).
+  A built address no verifier confirmed (a guess, or a catch-all's
+  "risky") is kept no surer than "likely", and an address built earlier
+  is never taken for one the site published, nor teaches the pattern.
+  Relative menu links follow the page the homepage landed on (a redirect
+  to `/ro/`), and the same page in another language is read once. A site
+  the finder read before this gets the deeper read once in the
+  background, after the companies with no contact, whatever contacts the
+  first read found (its read didn't look for the owner).
+- **The Writer gets what the record knows.** Prospects made from contacts
+  carry the company's town, its activity, and the latest tools on its site,
+  open roles, ads, booking, website agency, employees and rating as notes,
+  and the Writer reads the same facts from the record when it writes to one
+  person (they used to come only from the removed prospecting stage).
+
 - **A Registry page.** The whole trade registry, every firm in Romania
   operating or not, browsed with each firm's latest financial statements:
   the registry source's own filters (activity, county, town, turnover and
@@ -333,6 +362,12 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- The Today page's "Find emails" step counts the companies the contact
+  finder searched and shows it at work while a contact job runs; it read a
+  column nothing has written since the prospecting stage went.
+- Removed `update_company_signals`: what a site read learns is an
+  observation, and nothing wrote those columns any more.
+
 - **ANAF checks run at ANAF's pace.** Saving a batch of answers no longer
   holds up the next request: while one batch is saved the next is asked,
   one request at a time, still one every 1.1 s. On a database of
@@ -419,6 +454,9 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- A site read that looked for a raise (`FUNDING_ROUND`) no longer drops the
+  contact and team pages it read afterwards from what it returns.
 
 - **A registry pull filtered only by figures works.** One filtered only by turnover, headcount or taxpayer flags
   (no activity or area) found no firm; it now takes every operating firm

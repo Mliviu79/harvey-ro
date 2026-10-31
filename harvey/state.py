@@ -50,6 +50,72 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 LOW_SCORE = 30
 
 
+# The signals whose latest reading the Writer is told about (company_brief).
+BRIEF_CODES = ("TECH_STACK", "HIRING_ROLE", "OPEN_ROLES", "RUNNING_GOOGLE_ADS",
+               "RUNNING_META_ADS", "NO_ONLINE_BOOKING", "INCUMBENT_AGENCY", "EMPLOYEES",
+               "REVIEW_RATING", "REVIEW_COUNT")
+
+
+def company_brief_lines(location: str, activity: str, rows: list[dict]) -> list[str]:
+    """The Writer's facts from a company's location, activity and
+    observations (``rows``: signal_code, value_num, value_text, observed_at,
+    newest first). Only each signal's latest reading counts, and a "no"
+    (0) says nothing worth writing about, except no online booking."""
+    latest: dict[str, list[dict]] = {}
+    for r in rows:
+        first = latest.setdefault(r["signal_code"], [r])
+        if first[0] is not r and r["observed_at"] == first[0]["observed_at"]:
+            first.append(r)         # several readings of one pass (open roles)
+    out = []
+    town = (location or "").split(",")[0].strip()
+    if town:
+        out.append(f"Based in {town}")
+    if activity:
+        out.append(f"Registered activity: {activity}")
+
+    def one(code):
+        return (latest.get(code) or [None])[0]
+
+    def num(code):
+        r = one(code)
+        return r["value_num"] if r is not None and r["value_num"] is not None else None
+
+    tech = one("TECH_STACK")
+    if tech is not None and (tech["value_text"] or "").strip():
+        out.append(f"Tools on their website: {tech['value_text'].strip()}")
+    roles = [r["value_text"].strip() for r in latest.get("HIRING_ROLE", [])
+             if (r["value_text"] or "").strip() and r["value_num"] != 0]
+    if roles:
+        out.append("Hiring: " + "; ".join(roles[:2]))
+    if (num("OPEN_ROLES") or 0) > 0:
+        out.append(f"{int(num('OPEN_ROLES'))} open roles on their job board")
+    if num("RUNNING_GOOGLE_ADS") == 1:
+        out.append("Running Google Ads")
+    if num("RUNNING_META_ADS") == 1:
+        out.append("Running Facebook/Instagram ads")
+    if num("NO_ONLINE_BOOKING") == 1:
+        out.append("No online booking on their website")
+    agency = one("INCUMBENT_AGENCY")
+    if agency is not None and (agency["value_text"] or "").strip():
+        out.append(f"Website credited to: {agency['value_text'].strip()}")
+    # (One reading per financial year, the year in value_text: the newest year.)
+    staff = max((r for r in rows if r["signal_code"] == "EMPLOYEES" and r["value_num"] is not None),
+                key=lambda r: r["value_text"] or "", default=None)
+    if staff is not None:
+        year = (staff["value_text"] or "").strip()
+        out.append(f"{int(staff['value_num'])} employees" + (f" ({year} accounts)" if year else ""))
+    if num("REVIEW_RATING") is not None:
+        count = num("REVIEW_COUNT")
+        out.append(f"Rated {num('REVIEW_RATING'):g}"
+                   + (f" from {int(count)} reviews" if count else ""))
+    return out
+
+
+def brief_note(lines: list[str]) -> str:
+    """company_brief's facts as one prospect note (personalization_notes)."""
+    return ". ".join(lines)[:400]
+
+
 def poorly_scored(score) -> bool:
     """Scored, and below LOW_SCORE: kept on file, left out of campaigns."""
     return 0 < (score or 0) < LOW_SCORE
@@ -2526,56 +2592,31 @@ class StateManager:
             r["a"], r["b"] = sides.get(r["survivor"]), sides.get(r["merged"])
         return rows
 
-    async def update_company_signals(
-        self,
-        company_id: str,
-        tech_stack: list[str] | None = None,
-        new_signals: list[dict] | None = None,
-    ):
-        """Merge freshly-detected tech + signals into a company record.
-
-        Signals are appended with dedup on (type, detail) so re-scans
-        don't multiply the same finding.
-        """
+    async def company_brief(self, company_id: str) -> list[str]:
+        """Short true facts about a company for the Writer, from its record:
+        where it is, what it does (its activity when no industry is on
+        file), and the latest reading of the signals that make an email
+        specific (company_brief_lines). [] for a company not on file."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT tech_stack_json, signals_json FROM companies WHERE id = ?",
-                (company_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-            if not row:
-                return
-
-            def _load(raw):
-                try:
-                    parsed = json.loads(raw) if raw else []
-                except (json.JSONDecodeError, TypeError):
-                    parsed = []
-                return parsed if isinstance(parsed, list) else []
-
-            tech = _load(row["tech_stack_json"])
-            signals = _load(row["signals_json"])
-
-            for t in tech_stack or []:
-                if t not in tech:
-                    tech.append(t)
-            seen = {(s.get("type"), s.get("detail")) for s in signals if isinstance(s, dict)}
-            for s in new_signals or []:
-                if not isinstance(s, dict):
-                    continue
-                if (s.get("type"), s.get("detail")) in seen:
-                    continue
-                signals.append(s)
-                seen.add((s.get("type"), s.get("detail")))
-
-            await db.execute(
-                "UPDATE companies SET tech_stack_json = ?, signals_json = ?, "
-                "updated_at = ? WHERE id = ?",
-                (json.dumps(tech), json.dumps(signals),
-                 _utcnow().isoformat(), company_id),
-            )
-            await db.commit()
+                    "SELECT location, industry FROM companies WHERE id = ?",
+                    (company_id,)) as cur:
+                company = await cur.fetchone()
+            if company is None:
+                return []
+            marks = ",".join("?" * len(BRIEF_CODES))
+            async with db.execute(
+                    "SELECT signal_code, value_num, value_text, observed_at FROM observations "
+                    f"WHERE company_id = ? AND signal_code IN ({marks}) "
+                    "ORDER BY observed_at DESC, rowid DESC", (company_id, *BRIEF_CODES)) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        activity = ""
+        if not (company["industry"] or "").strip():
+            classes = (await self.get_company_activities([company_id])).get(company_id) or []
+            activity = next((c["name_en"] or c["name"] for c in classes
+                             if c["name_en"] or c["name"]), "")
+        return company_brief_lines(company["location"] or "", activity, rows)
 
     async def get_company(self, company_id: str) -> Company | None:
         async with self._connect() as db:
