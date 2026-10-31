@@ -214,7 +214,7 @@ and Harvey reads over HTTP), then `docker compose up -d`:
 grep -q '^BROWSER_CDP_TOKEN=.' .env || printf '\nBROWSER_CDP_TOKEN=%s\n' "$(openssl rand -hex 32)" >> .env
 ```
 
-Chromium is optional, for LinkedIn and for the sites that refuse Obscura
+Chromium is optional, for the sites that refuse Obscura
 (Cloudflare and others that check the TLS fingerprint): start it with
 `docker compose --profile chromium up -d` and set
 `BROWSER_CDP_FALLBACK_URL=http://127.0.0.1:9231` in `.env`. Both listen on
@@ -537,8 +537,6 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 **`account_navigation.md`** — Companies versus contacts, multi-threading rules, which door to knock on first when a company has several.
 
-**`linkedin_outreach.md`** — Connection sequences and rate limits, opening with the risk section it should open with: automating LinkedIn violates their ToS, never use a fake identity, and if someone asks whether this is automated, say yes immediately.
-
 **Generated for your product by `harvey train <url>`:**
 
 - **`product_knowledge.md`** — what you sell, the benefits, pricing, use cases, the pain you solve, buying triggers
@@ -548,21 +546,20 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 ### Which agent gets which
 
-Defined in `harvey/brain.py` — edit the map to change it. No agent loads the Scout and LinkedIn columns now (the prospecting agent that did was replaced by the contact finder); they stay in the map until it's decided what those skills are for.
+Defined in `harvey/brain.py` — edit the map to change it. No agent loads the Scout column now (the prospecting agent that did was replaced by the contact finder); it stays in the map until it's decided what those skills are for.
 
-| Skill | Scout | Writer | Handler | Sender | LinkedIn |
-|---|:-:|:-:|:-:|:-:|:-:|
-| `prospecting_tactics` | ● | | | | ● |
-| `lead_qualification` | ● | | | | |
-| `account_navigation` | ● | | | | |
-| `signal_playbook` | ● | ● | | | |
-| `email_frameworks` | | ● | | ● | |
-| `sales_methodology` | | ● | ● | | |
-| `offer_strategy` | | ● | ● | | |
-| `objection_handling` | | | ● | | |
-| `linkedin_outreach` | | | | | ● |
-| `product_knowledge` | ● | ● | ● | ● | ● |
-| `competitive_intel` | | ● | ● | | |
+| Skill | Scout | Writer | Handler | Sender |
+|---|:-:|:-:|:-:|:-:|
+| `prospecting_tactics` | ● | | | |
+| `lead_qualification` | ● | | | |
+| `account_navigation` | ● | | | |
+| `signal_playbook` | ● | ● | | |
+| `email_frameworks` | | ● | | ● |
+| `sales_methodology` | | ● | ● | |
+| `offer_strategy` | | ● | ● | |
+| `objection_handling` | | | ● | |
+| `product_knowledge` | ● | ● | ● | ● |
+| `competitive_intel` | | ● | ● | |
 
 Adding a skill: write the file, add its name to `skill_map` in `harvey/brain.py`. That's the whole process.
 
@@ -944,7 +941,7 @@ Everything beyond the core is a module with a `module.toml` manifest under
 `harvey/modules/<set>/<id>/`: the core set (website reader, people, phones,
 export, geocoding, English), the original set (US market, the discovery
 sources, web-marketing, startup and hiring signals, email verification,
-Hunter, LinkedIn, the email loop) and the Romanian set (market, language,
+Hunter, the email loop) and the Romanian set (market, language,
 ONRC, the Ministry of Finance's statements and taxpayer file, ANAF). A manifest names the code it describes, the `.env` keys it reads, what
 it costs, its terms, and the signals it declares; each signal in the catalog
 is declared by exactly one module. `harvey modules list` reads them all
@@ -959,7 +956,7 @@ Each install turns modules on and off on the dashboard's **Surse** page or
 with `harvey modules enable|disable <id>`. Core modules are always on. A new
 install starts with the Romanian set, OpenStreetMap, DataForSEO, Serper,
 TinyFish, Scavio, Hunter and the email verifiers on; startups, hiring,
-website-marketing signals, keyless web search, LinkedIn and email campaigns
+website-marketing signals and email campaigns
 start off. Turning a module on never turns on another: one whose `requires`
 are off is refused, naming them, and one that an enabled module requires
 can't be turned off. Off means hidden, never deleted: its signals leave
@@ -971,8 +968,8 @@ its `.env` keys that are empty (one that holds a value stays editable). The sign
 that are on. On an install that predates modules, a module that ships off
 stays on if one of its `.env` keys is set (a search or enrichment provider
 that was set up), if you had confirmed one of its signals, or if the install
-has data from it (companies found through keyless web search or G2/Clutch,
-tools detected on sites, open roles or job-board contacts). The Email
+has data from it (tools detected on sites, open roles or job-board
+contacts). The Email
 switch in Settings is the email campaigns module. Off, the dashboard hides
 its tabs and `harvey run` writes, sends and reads no email at all; it only
 looks for companies and contacts. On, sending works as `harvey.yaml` says.
@@ -1042,12 +1039,6 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 **If the check is held up.** When Precleared can't answer (the day's free checks are used up, the key is out of checks, was rejected or is being rate limited, or Precleared can't be reached), cold email to new addresses waits and replies still go out; email to people Precleared has already cleared keeps going. If Precleared can't check one address, that email is tried again six hours later and the rest carry on, unless that happens at two different domains with no answer in between, which holds new addresses as above. The Today page and `harvey status` say how many cold emails are waiting on the check and what fixes it.
 
 **Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
-
-**LinkedIn.** Browser automation violates LinkedIn's ToS and can get the account restricted. Off by default. If you turn it on, use an account you can afford to lose.
-
-LinkedIn requires both `channels.linkedin.enabled: true` and configured
-credentials. Training a product does not enable it; the setup wizard records
-your explicit choice.
 
 **Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
 

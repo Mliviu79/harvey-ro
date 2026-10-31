@@ -802,6 +802,23 @@ minor versions can still change behaviour.
   worker queues them). The module switches, `.env` keys and signals those
   strategies used are all still there; what Harvey does is unchanged. Two
   messages that said Scout would find people now say how contacts are found.
+- **Three options that did nothing since the old prospecting went.**
+  LinkedIn prospecting (the `linkedin` module and its people search, the
+  browser login and its `data/linkedin_login_hold.json` hold, the setup
+  wizard's LinkedIn step, the LinkedIn row in Settings and on the Today
+  checklist, `channels.linkedin` and `LINKEDIN_EMAIL`/`LINKEDIN_PASSWORD`,
+  and the `linkedin_outreach` skill); the hiring module's job-board search
+  (python-jobspy, Indeed); and the keyless web search module
+  (`web_search_scrape`: DuckDuckGo, Bing and Google result pages, G2 and
+  Clutch). Nothing called any of them. A config that still has
+  `channels.linkedin`, a `.env` with the LinkedIn keys, or a saved
+  `modules.linkedin.enabled` or `modules.web_search_scrape.enabled` loads as
+  before and is ignored. The hiring module keeps its careers-page and job
+  board feed signals and its preset search. `harvey install` no longer
+  downloads a Chromium: only LinkedIn launched one, and the browser for
+  JavaScript-only sites is reached over CDP (`BROWSER_CDP_URL`, and the
+  Docker Chromium at `BROWSER_CDP_FALLBACK_URL`, which stays). LinkedIn
+  addresses a company's own site links to are still kept as contacts.
 
 ## [0.3.0] — 2026-10-13
 

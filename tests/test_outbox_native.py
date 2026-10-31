@@ -76,9 +76,6 @@ class Cfg:
             require_approval = True
             max_bounce_rate = 0.05
 
-        class linkedin:
-            enabled = False
-
 
 class Env:
     instantly_api_key = ""

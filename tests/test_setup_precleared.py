@@ -230,14 +230,14 @@ async def test_setup_asks_about_the_check_before_writing_anything(monkeypatch, c
     for name in ("_check_prerequisites", "_setup_email_platform", "_setup_product",
                  "_print_summary"):
         monkeypatch.setattr(wizard, name, record(name, is_async=True))
-    for name in ("_setup_linkedin", "_setup_cloudflare", "_setup_behavior",
+    for name in ("_setup_cloudflare", "_setup_behavior",
                  "_setup_compliance", "_write_env", "_write_config"):
         monkeypatch.setattr(wizard, name, record(name))
 
     await wizard.run()
 
     assert calls.index("_setup_behavior") < calls.index("_setup_compliance") < calls.index("_write_env")
-    assert "Step 7/7: Cold-Email Check (Optional)" in capsys.readouterr().out
+    assert "Step 6/6: Cold-Email Check (Optional)" in capsys.readouterr().out
 
 
 def test_saving_the_key_keeps_other_env_lines_and_stays_private(files, monkeypatch, capsys, caplog):
@@ -344,7 +344,6 @@ async def test_a_config_that_cannot_be_saved_is_reported_not_ticked(files, monke
     wizard = setup.SetupWizard()
     wizard._setup_compliance()
     wizard.config = {"channels": {"email": {"max_daily_sends": 50}}}
-    wizard.env_vars["LINKEDIN_EMAIL"] = ""
     wizard._write_env()
     wizard._write_config()  # must not crash setup
 

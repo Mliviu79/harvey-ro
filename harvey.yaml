@@ -80,10 +80,6 @@ channels:
     #   end: "17:00"
     #   weekdays_only: true      # Monday to Friday, in every country
     #   recipient_timezone: true  # false: one zone for everyone (quiet_hours.timezone)
-  linkedin:
-    enabled: false             # explicit opt-in; credentials alone do not enable it
-    max_daily_connections: 20
-    max_daily_messages: 10
 
 usage:
   max_daily_claude_percent: 80

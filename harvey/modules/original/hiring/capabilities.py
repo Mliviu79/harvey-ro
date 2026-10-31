@@ -23,22 +23,3 @@ async def _job_board(inp, ctx):
 
 CAPABILITIES["job_board"] = Capability("hiring", "job_board", _job_board)
 
-
-async def _job_board_search(inp, ctx):
-    """Job posts for a role (``inp.query``) near ``inp.area`` from the last
-    two weeks (python-jobspy, Indeed): a record per post, the employer's
-    name, the post's address and its title (``found_by``)."""
-    from harvey.collectors.ats import job_posts
-    from harvey.modules.api import Draft, Record
-
-    try:
-        rows = await job_posts(inp.query, inp.area)
-    except Exception as e:
-        return Draft(failed=str(e))
-    return Draft(records=[Record(key=str(i), name=str(r.get("company") or "").strip(),
-                                 source_url=str(r.get("job_url") or ""),
-                                 found_by=str(r.get("title") or "").strip()[:80])
-                          for i, r in enumerate(rows)])
-
-
-CAPABILITIES["job_board_search"] = Capability("hiring", "job_board_search", _job_board_search)

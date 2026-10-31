@@ -62,8 +62,8 @@ ORGANIC_WITH_PACK = _envelope([
      "title": "Sponsored Roofing", "domain": "adroofing.com", "is_paid": True,
      "cid": "111"},
     {"type": "local_pack", "rank_group": 2, "rank_absolute": 2, "position": "left",
-     "title": "Kettleman Roofing", "domain": "kettlemanroofing.com",
-     "url": "https://kettlemanroofing.com/", "phone": "+1 555-0100",
+     "title": "Kettleman Roofing", "domain": "kettlemanroofing.example",
+     "url": "https://kettlemanroofing.example/", "phone": "+1 555-0100",
      "is_paid": False, "cid": "222",
      "rating": {"rating_type": "Max5", "value": 4.8, "votes_count": 210,
                 "rating_max": 5}},
@@ -73,10 +73,10 @@ ORGANIC_WITH_PACK = _envelope([
      "rating": {"rating_type": "Max5", "value": 4.1, "votes_count": 9,
                 "rating_max": 5}},
     {"type": "organic", "rank_group": 1, "rank_absolute": 4, "position": "left",
-     "domain": "northvaleroofing.com", "url": "https://northvaleroofing.com/",
+     "domain": "northvaleroofing.example", "url": "https://northvaleroofing.example/",
      "title": "Northvale Roofing"},
     {"type": "organic", "rank_group": 14, "rank_absolute": 20, "position": "left",
-     "domain": "kettlemanroofing.com", "url": "https://kettlemanroofing.com/denver",
+     "domain": "kettlemanroofing.example", "url": "https://kettlemanroofing.example/denver",
      "title": "Kettleman Roofing | Denver"},
 ])
 
@@ -84,8 +84,8 @@ MAPS = _envelope([
     {"type": "maps_paid_item", "rank_group": 1, "rank_absolute": 1,
      "domain": "adroofing.com", "title": "Sponsored Roofing"},
     {"type": "maps_search", "rank_group": 1, "rank_absolute": 2,
-     "domain": "kettlemanroofing.com", "title": "Kettleman Roofing",
-     "url": "https://kettlemanroofing.com/", "phone": "+1 555-0100",
+     "domain": "kettlemanroofing.example", "title": "Kettleman Roofing",
+     "url": "https://kettlemanroofing.example/", "phone": "+1 555-0100",
      "rating": {"rating_type": "Max5", "value": 4.8, "votes_count": 210,
                 "rating_max": 5},
      "address": "1 Main St, Denver, CO 80202",
@@ -198,12 +198,12 @@ async def test_local_pack_is_parsed_and_ads_are_dropped():
     by_name = {b.name: b for b in out}
     assert "Sponsored Roofing" not in by_name, "is_paid pack entries are ads"
 
-    kettleman = next(b for b in out if b.domain == "kettlemanroofing.com")
+    kettleman = next(b for b in out if b.domain == "kettlemanroofing.example")
     # One business, both facts: pack slot 2 and organic 14.
     assert kettleman.local_pack_rank == 2 and kettleman.rank == 14
     assert kettleman.rating == 4.8 and kettleman.review_count == 210
     assert kettleman.keyword == "roofer Denver, CO"
-    assert len([b for b in out if b.domain == "kettlemanroofing.com"]) == 1
+    assert len([b for b in out if b.domain == "kettlemanroofing.example"]) == 1
 
     bob = by_name["Bob's Roof Fix"]
     assert bob.domain == "" and bob.external_id == "dataforseo:cid:333"
@@ -211,7 +211,7 @@ async def test_local_pack_is_parsed_and_ads_are_dropped():
     # A pack entry without a website button is not proof of no website.
     assert bob.has_website is None
 
-    northvale = next(b for b in out if b.domain == "northvaleroofing.com")
+    northvale = next(b for b in out if b.domain == "northvaleroofing.example")
     assert northvale.rank == 1 and northvale.local_pack_rank is None
 
 
@@ -309,7 +309,7 @@ async def test_rank_observations_name_the_keyword(state, monkeypatch):
     report = await runs.run_discovery(state, load_config(), "dataforseo_serp", [
         D.DiscoveryQuery(term="roofer", location="Denver, CO")], max_spend=1.0)
     assert report.errors == []
-    company = await state.get_company_by_domain("kettlemanroofing.com")
+    company = await state.get_company_by_domain("kettlemanroofing.example")
     rows = await state.get_observations(company_id=company.id)
     by_code = {r["signal_code"]: r for r in rows}
     assert by_code["SERP_RANK"]["value_num"] == 14
@@ -330,8 +330,8 @@ async def test_each_keyword_gets_its_own_rank_and_duplicates_keep_the_best(state
         kw = json.loads(request.content)[0]["keyword"]
         rank = ranks[kw].pop(0)
         return httpx.Response(200, json=_envelope([
-            {"type": "organic", "rank_group": rank, "domain": "kettlemanroofing.com",
-             "url": "https://kettlemanroofing.com/", "title": "Kettleman Roofing"}]))
+            {"type": "organic", "rank_group": rank, "domain": "kettlemanroofing.example",
+             "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing"}]))
 
     _install(monkeypatch, handler)
     queries = [D.DiscoveryQuery(term=t, location="Denver, CO")
@@ -339,7 +339,7 @@ async def test_each_keyword_gets_its_own_rank_and_duplicates_keep_the_best(state
     report = await runs.run_discovery(state, load_config(), "dataforseo_serp",
                                    queries, max_spend=1.0)
     assert report.new_companies == 1
-    company = await state.get_company_by_domain("kettlemanroofing.com")
+    company = await state.get_company_by_domain("kettlemanroofing.example")
     rows = await state.get_observations(company_id=company.id, signal_code="SERP_RANK")
     best: dict[str, float] = {}
     for r in rows:
@@ -452,19 +452,19 @@ async def test_a_repeat_search_never_overwrites_a_better_rank(state, monkeypatch
     """Second run of the same phrase: organic improves, pack slot gets worse.
     Only the improvement is written, so the pack slot's latest stays 1."""
     responses = [
-        [{"type": "local_pack", "rank_group": 1, "domain": "kettlemanroofing.com",
+        [{"type": "local_pack", "rank_group": 1, "domain": "kettlemanroofing.example",
           "title": "Kettleman Roofing", "is_paid": False, "cid": "222"},
-         {"type": "organic", "rank_group": 20, "domain": "kettlemanroofing.com",
-          "url": "https://kettlemanroofing.com/", "title": "Kettleman Roofing"}],
-        [{"type": "local_pack", "rank_group": 3, "domain": "kettlemanroofing.com",
+         {"type": "organic", "rank_group": 20, "domain": "kettlemanroofing.example",
+          "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing"}],
+        [{"type": "local_pack", "rank_group": 3, "domain": "kettlemanroofing.example",
           "title": "Kettleman Roofing", "is_paid": False, "cid": "222"},
-         {"type": "organic", "rank_group": 12, "domain": "kettlemanroofing.com",
-          "url": "https://kettlemanroofing.com/", "title": "Kettleman Roofing"}],
+         {"type": "organic", "rank_group": 12, "domain": "kettlemanroofing.example",
+          "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing"}],
     ]
     _install(monkeypatch, lambda r: httpx.Response(200, json=_envelope(responses.pop(0))))
     q = [D.DiscoveryQuery(term="roofer", location="Denver, CO") for _ in range(2)]
     await runs.run_discovery(state, load_config(), "dataforseo_serp", q, max_spend=1.0)
-    company = await state.get_company_by_domain("kettlemanroofing.com")
+    company = await state.get_company_by_domain("kettlemanroofing.example")
     pack = await state.get_observations(company_id=company.id, signal_code="IN_LOCAL_PACK")
     organic = await state.get_observations(company_id=company.id, signal_code="SERP_RANK")
     assert [r["value_num"] for r in pack] == [1]
@@ -474,12 +474,12 @@ async def test_a_repeat_search_never_overwrites_a_better_rank(state, monkeypatch
 # ── Review fixes: ranks that supersede, expire, and resolve to one company ──
 
 
-def _organic(rank, domain="kettlemanroofing.com"):
+def _organic(rank, domain="kettlemanroofing.example"):
     return {"type": "organic", "rank_group": rank, "domain": domain,
             "url": f"https://{domain}/", "title": "Kettleman Roofing"}
 
 
-def _pack(slot, cid="222", domain="kettlemanroofing.com"):
+def _pack(slot, cid="222", domain="kettlemanroofing.example"):
     return {"type": "local_pack", "rank_group": slot, "domain": domain,
             "title": "Kettleman Roofing", "is_paid": False, "cid": cid}
 
@@ -525,13 +525,13 @@ async def test_unphrased_legacy_ranks_give_way_to_phrased_ones(state):
 @pytest.mark.asyncio
 async def test_dropping_out_of_the_results_clears_the_rank(state, monkeypatch):
     await _run(state, monkeypatch, [[_organic(14), _pack(2)]])
-    company = await state.get_company_by_domain("kettlemanroofing.com")
+    company = await state.get_company_by_domain("kettlemanroofing.example")
     assert await _in_range(state) == 1
     size, _ = await state.cohort_companies(["SERP_RANK"], ["IN_LOCAL_PACK"])
     assert size == 0
 
     # Next run: same search, Kettleman is gone from both organic and pack.
-    await _run(state, monkeypatch, [[_organic(3, domain="northvaleroofing.com")]])
+    await _run(state, monkeypatch, [[_organic(3, domain="northvaleroofing.example")]])
     assert await _in_range(state) == 0
     present, _ = await state.cohort_companies(["SERP_RANK"], [])
     assert present == 1, "only Northvale still ranks"
@@ -544,7 +544,7 @@ async def test_dropping_out_of_the_results_clears_the_rank(state, monkeypatch):
 @pytest.mark.asyncio
 async def test_a_rank_for_another_phrase_is_untouched(state, monkeypatch):
     await _ranked(state, [("Kettleman", "SERP_RANK", 18, "roof repair Denver")])
-    await _run(state, monkeypatch, [[_organic(3, domain="northvaleroofing.com")]])
+    await _run(state, monkeypatch, [[_organic(3, domain="northvaleroofing.example")]])
     assert await _in_range(state) == 1
 
 
@@ -552,7 +552,7 @@ async def test_a_rank_for_another_phrase_is_untouched(state, monkeypatch):
 async def test_a_business_ranked_earlier_in_the_run_is_not_marked_gone(state, monkeypatch):
     """Two queries for one phrase: ranked in the first, missing in the second.
     The run's best rank stands."""
-    await _run(state, monkeypatch, [[_organic(14)], [_organic(3, domain="northvaleroofing.com")]])
+    await _run(state, monkeypatch, [[_organic(14)], [_organic(3, domain="northvaleroofing.example")]])
     assert await _in_range(state) == 1
 
 

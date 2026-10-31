@@ -1,20 +1,17 @@
-"""Approval requirements apply to legacy providers; LinkedIn needs opt-in."""
+"""Approval requirements apply to legacy providers."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-import yaml
 
 from harvey.agents.handler import Handler
 from harvey.agents.sender import Sender
-from harvey.config import BrainConfig, EnvConfig, LinkedInChannelConfig
+from harvey.config import EnvConfig
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.models.prospect import Prospect
-from harvey.paths import PROJECT_ROOT
 from harvey.state import StateManager
-from harvey.trainer import Trainer
 
 
 @pytest_asyncio.fixture
@@ -82,33 +79,6 @@ async def test_legacy_opt_out_is_honored_even_when_approval_blocks_sending(state
     await handler._process_reply("jane@acme.test", "Please unsubscribe me", "reply-id")
     assert (await state.get_prospect(pid)).status == "opted_out"
     handler.instantly.send_reply.assert_not_awaited()
-
-
-def test_linkedin_is_disabled_in_model_and_shipped_template():
-    assert LinkedInChannelConfig().enabled is False
-    template = yaml.safe_load((PROJECT_ROOT / "harvey.yaml").read_text())
-    assert template["channels"]["linkedin"]["enabled"] is False
-    assert LinkedInChannelConfig(enabled=True).enabled is True
-
-
-def test_product_training_does_not_enable_linkedin():
-    trainer = Trainer.__new__(Trainer)
-    trainer.brain_config = BrainConfig()
-    config = trainer._build_config({}, {}, {}, "acme.test")
-    assert config["channels"]["linkedin"]["enabled"] is False
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_setup_saves_explicit_linkedin_choice_for_existing_config(tmp_path, monkeypatch, enabled):
-    from harvey import setup
-    path = tmp_path / "harvey.yaml"
-    path.write_text(yaml.safe_dump({"channels": {"linkedin": {"enabled": not enabled}}}))
-    monkeypatch.setattr(setup, "CONFIG_FILE", path)
-    wizard = setup.SetupWizard()
-    wizard.env_vars["LINKEDIN_EMAIL"] = "user@example.test" if enabled else ""
-    wizard.config = {"channels": {"linkedin": {"enabled": enabled}}}
-    wizard._write_config()
-    assert yaml.safe_load(path.read_text())["channels"]["linkedin"]["enabled"] is enabled
 
 
 # ── a held Instantly setup stays visible and never stalls the pipeline ──

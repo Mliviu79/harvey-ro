@@ -1999,8 +1999,6 @@ def _statements(script: str):
 # old prospecting agent that ran with no switch: each module listed here stays on through the
 # upgrade when its query finds a row (switches.upgrade_enabled).
 _MODULE_TRACES = {
-    # Companies found by search-engine reading, or a G2/Clutch scan.
-    "web_search_scrape": "SELECT 1 FROM companies WHERE source IN ('web_search', 'directory')",
     # Tools detected on a site.
     "web_marketing": "SELECT 1 FROM companies WHERE COALESCE(tech_stack_json, '[]') "
                      "NOT IN ('', '[]')",

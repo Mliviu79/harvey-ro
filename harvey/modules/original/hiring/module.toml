@@ -1,9 +1,9 @@
 # Who is hiring for the roles that signal a purchase: the Greenhouse, Lever,
-# Ashby or Workable board a company's own site links to, its careers page,
-# and (with python-jobspy installed) a job-board search.
+# Ashby or Workable board a company's own site links to, and its careers
+# page.
 id = "hiring"
 name = "Hiring"
-description = "Who is hiring for your roles: the job boards a company's site links to, careers pages, job-board search."
+description = "Who is hiring for your roles: the job boards a company's site links to, and careers pages."
 set = "original"
 kind = "enricher"
 version = "0.3.0"
@@ -14,7 +14,7 @@ default_enabled = false
 entry = "harvey.modules.original.hiring.capabilities"
 wraps = ["harvey.collectors.discover", "harvey.collectors.profile", "harvey.collectors.ats"]
 secrets = []
-terms_note = "Job boards are read through their public JSON feeds, only when the company's own site links to one. The optional python-jobspy search reads Indeed, whose terms forbid automated access."
+terms_note = "Job boards are read through their public JSON feeds, only when the company's own site links to one."
 
 [cost]
 as_of = 2026-10-30
@@ -57,10 +57,3 @@ preset = "hiring"
 inputs = [["query"]]
 outputs = { records = "companies", ids = ["domain"] }
 cost = { usd = 0.0, per = "search", note = "runs through a search module" }
-
-[[capabilities]]
-id = "job_board_search"
-op = "query"
-inputs = [["query", "area"]]
-outputs = { records = "companies" }
-cost = { usd = 0.0, per = "search", note = "needs pip install python-jobspy" }

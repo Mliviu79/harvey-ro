@@ -886,11 +886,6 @@ What prospects do instead of buying a solution like ours:
                     # The trained site is yours: autopilot may link to it.
                     "link_domains": [email_domain],
                 },
-                "linkedin": {
-                    "enabled": False,
-                    "max_daily_connections": 20,
-                    "max_daily_messages": 10,
-                },
             },
             "usage": {
                 "max_daily_claude_percent": 80,

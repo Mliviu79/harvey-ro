@@ -201,7 +201,7 @@ class SetupWizard:
         _print_harvey("closing deals for you. I'll walk you through everything.")
         _print_harvey("This takes about 5 minutes.\n")
 
-        total_steps = 7
+        total_steps = 6
 
         # Step 1: Check prerequisites
         _print_step(1, total_steps, "Checking Prerequisites")
@@ -211,24 +211,20 @@ class SetupWizard:
         _print_step(2, total_steps, "Email Platform (Instantly)")
         await self._setup_email_platform()
 
-        # Step 3: LinkedIn (optional)
-        _print_step(3, total_steps, "LinkedIn (Optional)")
-        self._setup_linkedin()
-
-        # Step 4: Cloudflare crawling (optional)
-        _print_step(4, total_steps, "Website Crawling (Optional)")
+        # Step 3: Cloudflare crawling (optional)
+        _print_step(3, total_steps, "Website Crawling (Optional)")
         self._setup_cloudflare()
 
-        # Step 5: Train on product
-        _print_step(5, total_steps, "Train Harvey on Your Product")
+        # Step 4: Train on product
+        _print_step(4, total_steps, "Train Harvey on Your Product")
         await self._setup_product()
 
-        # Step 6: Configure behavior
-        _print_step(6, total_steps, "Configure Behavior")
+        # Step 5: Configure behavior
+        _print_step(5, total_steps, "Configure Behavior")
         self._setup_behavior()
 
-        # Step 7: Cold-email check (optional)
-        _print_step(7, total_steps, "Cold-Email Check (Optional)")
+        # Step 6: Cold-email check (optional)
+        _print_step(6, total_steps, "Cold-Email Check (Optional)")
         self._setup_compliance()
 
         # Write everything
@@ -369,32 +365,6 @@ class SetupWizard:
             _print_harvey("Sign up at https://instantly.ai (Growth plan for API access).")
             _print_harvey("Add your API key to .env later as INSTANTLY_API_KEY.")
             self.env_vars["INSTANTLY_API_KEY"] = ""
-
-    def _setup_linkedin(self):
-        """Configure LinkedIn credentials."""
-        _print_harvey("I can search LinkedIn to find prospects matching your ICP.")
-        _print_harvey("I'll log into your LinkedIn account using a browser, with")
-        _print_harvey("conservative rate limits and human-like pacing.")
-        print("\n  ⚠  Heads up: automating LinkedIn violates their Terms of Service.")
-        print("     Accounts doing this can be restricted or banned. Only use an")
-        print("     account you're comfortable putting at risk, and keep the")
-        print("     default rate limits. This is entirely optional.")
-
-        use_linkedin = _ask_yes_no("Set up LinkedIn prospecting anyway?", default=False)
-
-        if use_linkedin:
-            email = _ask("LinkedIn email/username")
-            password = _ask("LinkedIn password (input hidden)", secret=True)
-            self.env_vars["LINKEDIN_EMAIL"] = email
-            self.env_vars["LINKEDIN_PASSWORD"] = password
-
-            _print_harvey("Got it. I'll stay well under the rate limits and behave")
-            _print_harvey("like a careful human, but the ToS risk is yours to own.")
-        else:
-            _print_harvey("That's fine. I can still find prospects via Google")
-            _print_harvey("and company websites. You can add LinkedIn later.")
-            self.env_vars["LINKEDIN_EMAIL"] = ""
-            self.env_vars["LINKEDIN_PASSWORD"] = ""
 
     def _setup_cloudflare(self):
         """Configure Cloudflare Browser Rendering for deep crawling."""
@@ -561,11 +531,6 @@ class SetupWizard:
                     "enabled": True,
                     "provider": "instantly",
                     "max_daily_sends": 50,
-                },
-                "linkedin": {
-                    "enabled": bool(self.env_vars.get("LINKEDIN_EMAIL")),
-                    "max_daily_connections": 20,
-                    "max_daily_messages": 10,
                 },
             },
             "usage": {
@@ -753,7 +718,7 @@ class SetupWizard:
         existing = _read_env_file()
 
         # Wizard answers win, but never blank out a previously-set value
-        # (e.g. re-running setup and skipping the LinkedIn step).
+        # (e.g. re-running setup and skipping the Cloudflare step).
         merged = dict(existing)
         for key, value in self.env_vars.items():
             if value or key not in merged:
@@ -792,10 +757,6 @@ class SetupWizard:
                 existing = yaml.safe_load(read_user_text(config_file)) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
-                if "LINKEDIN_EMAIL" in self.env_vars:
-                    existing.setdefault("channels", {}).setdefault("linkedin", {})["enabled"] = bool(
-                        self.env_vars["LINKEDIN_EMAIL"]
-                    )
                 if "channels" in self.config:
                     existing.setdefault("channels", {})
                     if "email" in self.config["channels"]:
@@ -829,7 +790,6 @@ class SetupWizard:
              else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
                                       else _check_claude_cli()),
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
-            "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),
             "Product trained": _config_file().exists(),
             "Cold-email check (Precleared)": bool(

@@ -4,6 +4,7 @@ silence), and nothing is deleted when one goes off. All data is fictional."""
 
 import asyncio
 import contextlib
+import dataclasses
 import io
 import json
 import re
@@ -36,15 +37,29 @@ OLD_COLUMNS = ("code", "label", "description", "category", "value_type", "collec
 
 # What a new install has on. Core can't go off; the Romanian set is on;
 # the original Harvey's general search and verification sources are on
-# (they serve Romania too); its US-startup, hiring, website-marketing,
-# keyless-scraping, LinkedIn and email-campaign modules are off.
+# (they serve Romania too); its US-startup, hiring, website-marketing and
+# email-campaign modules are off.
 DEFAULT_ON = {
     "contact_finder", "export", "lang_en", "nominatim", "people", "phones", "website",
     "brave", "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper",
     "tinyfish", "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
 }
-DEFAULT_OFF = {"email_outreach", "hiring", "linkedin", "startups", "web_marketing",
-               "web_search_scrape"}
+DEFAULT_OFF = {"email_outreach", "hiring", "startups", "web_marketing"}
+# A search module that ships off and reads a key of its own. None ships like
+# that now, so the upgrade rule for one is checked on this fictional one.
+KEYED = "keyed_example"
+KEYED_SECRET = "KEYED_EXAMPLE_API_KEY"
+
+
+@pytest.fixture
+def keyed_module(monkeypatch):
+    fake = dataclasses.replace(switches.by_id()["serper"], id=KEYED, name="Keyed example",
+                               default_enabled=False, secrets=(KEYED_SECRET,), signals=(),
+                               capabilities=(), lanes=(), settings={}, free_allowances=())
+    shipped = (*switches.shipped(), fake)
+    monkeypatch.setattr(switches, "shipped", lambda: shipped)
+    monkeypatch.setattr(switches, "manifests", lambda: shipped)
+    return fake
 
 
 @pytest_asyncio.fixture
@@ -230,50 +245,51 @@ def _v17_db(path: Path, *, confirmed=(), settings=(), companies=0):
 
 
 @pytest.mark.asyncio
-async def test_an_upgrade_keeps_working_modules_on(tmp_path, monkeypatch):
-    """LinkedIn's keys are set and HIRING_ROLE was confirmed: both modules
+async def test_an_upgrade_keeps_working_modules_on(tmp_path, monkeypatch, keyed_module):
+    """A keyed module's key is set and HIRING_ROLE was confirmed: both modules
     ship off, and stay on here. The old Email switch moves over, and its old
     key stays for an older Harvey started on the same database."""
     monkeypatch.setattr(switches, "present_env_keys",
-                        lambda: {"LINKEDIN_EMAIL", "LINKEDIN_PASSWORD", "SERPER_API_KEY"})
+                        lambda: {KEYED_SECRET, "SERPER_API_KEY"})
     path = tmp_path / "old.db"
     _v17_db(path, confirmed=("HIRING_ROLE",), settings=[("ui.module.email", "on")])
     sm = StateManager(str(path))
     await sm.init_db()
     stored = await sm.settings_with_prefix("modules.")
-    assert stored == {"modules.linkedin.enabled": "on", "modules.hiring.enabled": "on",
+    assert stored == {f"modules.{KEYED}.enabled": "on", "modules.hiring.enabled": "on",
                       "modules.email_outreach.enabled": "on"}
     assert await sm.get_setting("ui.module.email") == "on"
     on = await switches.enabled_ids(sm)
-    assert {"linkedin", "hiring", "email_outreach"} <= on
-    assert not on & {"startups", "web_marketing", "web_search_scrape"}
+    assert {KEYED, "hiring", "email_outreach"} <= on
+    assert not on & {"startups", "web_marketing"}
 
 
 @pytest.mark.asyncio
-async def test_an_upgrade_with_no_key_set_takes_the_default(tmp_path, monkeypatch):
+async def test_an_upgrade_with_no_key_set_takes_the_default(tmp_path, monkeypatch, keyed_module):
     monkeypatch.setattr(switches, "present_env_keys", lambda: {"SERPER_API_KEY"})
     path = tmp_path / "old.db"
     _v17_db(path, companies=1, settings=[("ui.module.email", "")])
     sm = StateManager(str(path))
     await sm.init_db()
     assert await sm.settings_with_prefix("modules.") == {}
-    assert "linkedin" not in await switches.enabled_ids(sm)
+    assert KEYED not in await switches.enabled_ids(sm)
 
 
 @pytest.mark.asyncio
-async def test_a_new_install_takes_the_defaults_whatever_the_environment(tmp_path, monkeypatch):
-    monkeypatch.setattr(switches, "present_env_keys",
-                        lambda: {"LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"})
+async def test_a_new_install_takes_the_defaults_whatever_the_environment(tmp_path, monkeypatch,
+                                                                         keyed_module):
+    monkeypatch.setattr(switches, "present_env_keys", lambda: {KEYED_SECRET})
     sm = StateManager(str(tmp_path / "new.db"))
     await sm.init_db()
     assert await sm.settings_with_prefix("modules.") == {}
     assert await switches.enabled_ids(sm) == DEFAULT_ON
 
 
-def test_the_upgrade_rule_only_counts_keyed_search_and_enricher_modules():
+def test_the_upgrade_rule_only_counts_keyed_search_and_enricher_modules(keyed_module):
     mans = switches.manifests()
     every_key = {k for m in mans for k in m.secrets}
-    assert switches.upgrade_enabled(mans, every_key, set()) == ["linkedin"]
+    # email_outreach ships off with keys too, but it is an action, not a search.
+    assert switches.upgrade_enabled(mans, every_key, set()) == [KEYED]
     assert switches.upgrade_enabled(mans, set(), {"YC_BACKED"}) == ["startups"]
 
 
@@ -385,7 +401,7 @@ def client(monkeypatch, tmp_path):
     db = tmp_path / "harvey.db"
     monkeypatch.setattr(dash, "DB_PATH", db)
     monkeypatch.setattr(dash, "ENV_FILE", tmp_path / ".env")
-    for key in ("LINKEDIN_EMAIL", "LINKEDIN_PASSWORD", "REOON_API_KEY", "SERPER_API_KEY"):
+    for key in ("SMTP_HOST", "REOON_API_KEY", "SERPER_API_KEY"):
         monkeypatch.setenv(key, "")
     dash.token_store.configure(tmp_path / "data" / "dashboard-token")
     token = dash.token_store.get()
@@ -406,7 +422,7 @@ def test_modules_page_lists_sets_keys_present_never_values(client, monkeypatch):
     assert rows["website"]["locked"] and rows["website"]["enabled"]
     assert not rows["startups"]["enabled"]
     assert [s["code"] for s in rows["onrc"]["signals"]] == ["ACTIVITY_CODE"]
-    assert rows["linkedin"]["terms_note"] and rows["dataforseo"]["cost"]["free_tier"]
+    assert rows["hiring"]["terms_note"] and rows["dataforseo"]["cost"]["free_tier"]
 
 
 def test_modules_switch_through_the_api(client):
@@ -459,19 +475,19 @@ def test_discover_api_refuses_and_hides_disabled_sources(client):
 def test_settings_offers_the_env_keys_of_enabled_modules(client):
     data = client.get("/api/settings").json()
     assert "REOON_API_KEY" in data["env_keys"] and "HUNTER_API_KEY" in data["env_keys"]
-    assert "LINKEDIN_EMAIL" not in data["env_keys"]           # linkedin ships off
-    assert "GMAIL_CLIENT_ID" not in data["env_keys"]          # so does email_outreach
+    assert "SMTP_HOST" not in data["env_keys"]                # email_outreach ships off
+    assert "GMAIL_CLIENT_ID" not in data["env_keys"]
     assert "TRULYINBOX_API_KEY" not in data["env_keys"]       # saved by its own flow
 
-    r = client.post("/api/settings/env", json={"LINKEDIN_EMAIL": "someone@example.com"})
-    assert r.status_code == 409 and "linkedin" in r.json()["message"]
-    assert not (dash.ENV_FILE.exists() and "LINKEDIN" in dash.ENV_FILE.read_text())
+    r = client.post("/api/settings/env", json={"SMTP_HOST": "smtp.example.com"})
+    assert r.status_code == 409 and "email_outreach" in r.json()["message"]
+    assert not (dash.ENV_FILE.exists() and "SMTP_HOST" in dash.ENV_FILE.read_text())
 
-    client.post("/api/modules/linkedin", json={"enabled": True})
-    r = client.post("/api/settings/env", json={"LINKEDIN_EMAIL": "someone@example.com"})
+    client.post("/api/modules/email_outreach", json={"enabled": True})
+    r = client.post("/api/settings/env", json={"SMTP_HOST": "smtp.example.com"})
     assert r.json()["success"]
-    assert "LINKEDIN_EMAIL=someone@example.com" in dash.ENV_FILE.read_text()
-    assert "LINKEDIN_EMAIL" in client.get("/api/settings").json()["env_keys"]
+    assert "SMTP_HOST=smtp.example.com" in dash.ENV_FILE.read_text()
+    assert "SMTP_HOST" in client.get("/api/settings").json()["env_keys"]
 
 
 def test_the_email_switch_is_the_email_outreach_module(client):
@@ -582,7 +598,7 @@ def test_signal_rows_say_when_known_and_settings_hide_keys_of_modules_off():
 const fs = require('fs'), vm = require('vm');
 vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
 global.escHtml = s => String(s); global.jsq = s => JSON.stringify(s); global.badge = s => '';
-const fields = ['REOON_API_KEY', 'LINKEDIN_EMAIL', 'REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY']
+const fields = ['REOON_API_KEY', 'SMTP_HOST', 'REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY']
   .map(keys => ({dataset: {env: keys}, hidden: false}));
 global.document = {querySelectorAll: () => fields};
 vm.runInThisContext(process.argv[2]);
@@ -611,8 +627,6 @@ def _v17_with(path: Path, *statements):
 
 
 SCOUT_TRACES = {
-    "web_search_scrape": ("INSERT INTO companies (id, name, domain, source) VALUES (?, ?, ?, ?)",
-                          ("c1", "Exemplu Web", "web.example.com", "web_search")),
     "web_marketing": ("INSERT INTO companies (id, name, domain, tech_stack_json) VALUES (?, ?, ?, ?)",
                       ("c2", "Exemplu Tech", "tech.example.com", '["HubSpot"]')),
     "hiring": ("INSERT INTO companies (id, name, domain, signals_json) VALUES (?, ?, ?, ?)",
@@ -625,8 +639,8 @@ SCOUT_TRACES = {
 @pytest.mark.parametrize("module_id", sorted(SCOUT_TRACES))
 async def test_an_upgrade_keeps_the_scout_parts_the_install_has_data_from(tmp_path, monkeypatch,
                                                                           module_id):
-    """Scout's search-engine reading, tech detection and careers scan ran
-    with no switch before modules existed. An install with data from one
+    """Scout's tech detection and careers scan ran with no switch before
+    modules existed. An install with data from one
     keeps it on; one without (an install that only used OSM) takes the
     default, off."""
     monkeypatch.setattr(switches, "present_env_keys", lambda: set())
@@ -663,7 +677,21 @@ def test_the_upgrade_rule_needs_one_key_not_every_alternative():
 
 
 @pytest.mark.asyncio
-async def test_opening_an_old_database_reads_env_key_names_only(tmp_path, monkeypatch):
+async def test_a_switch_saved_for_a_removed_module_is_ignored(state):
+    """LinkedIn and the keyless web search were modules once. An install
+    that turned them on keeps the rows; nothing reads them, and they can't
+    be switched again."""
+    before = await switches.enabled_ids(state)
+    await state.set_setting("modules.linkedin.enabled", "on")
+    await state.set_setting("modules.web_search_scrape.enabled", "on")
+    assert await switches.enabled_ids(state) == before
+    with pytest.raises(switches.SwitchRefused, match="no module 'linkedin'"):
+        await switches.set_enabled(state, "linkedin", True)
+
+
+@pytest.mark.asyncio
+async def test_opening_an_old_database_reads_env_key_names_only(tmp_path, monkeypatch,
+                                                                keyed_module):
     """A port Harvey can't parse in .env used to stop the database opening
     (the upgrade loaded .env through config); and the upgrade wrote .env
     into the process environment. Only names are read now."""
@@ -672,18 +700,18 @@ async def test_opening_an_old_database_reads_env_key_names_only(tmp_path, monkey
     import harvey.config as config
 
     env = tmp_path / ".env"
-    env.write_text("SMTP_PORT=smtp\nLINKEDIN_EMAIL=someone@example.com\n")
+    env.write_text(f"SMTP_PORT=smtp\n{KEYED_SECRET}=fictional-key\n")
     monkeypatch.setattr(switches, "ENV_FILE", env)
     monkeypatch.setenv("SMTP_PORT", "smtp")
-    monkeypatch.delenv("LINKEDIN_EMAIL", raising=False)
+    monkeypatch.delenv(KEYED_SECRET, raising=False)
     monkeypatch.setattr(config, "load_env", lambda: pytest.fail("the upgrade loaded .env"))
     path = tmp_path / "old.db"
     _v17_db(path, companies=1)
     sm = StateManager(str(path))
     await sm.init_db()
     assert (await _rows(sm, "PRAGMA user_version"))[0][0] == len(MIGRATIONS)
-    assert "linkedin" in await switches.enabled_ids(sm)
-    assert "LINKEDIN_EMAIL" not in os.environ
+    assert KEYED in await switches.enabled_ids(sm)
+    assert KEYED_SECRET not in os.environ
 
 
 # ── Packs in data/modules: a broken one is left out, never fatal ──

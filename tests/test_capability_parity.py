@@ -33,7 +33,7 @@ from harvey.models import Company
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
-pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring", "web_search_scrape")
+pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
 
 GOLDEN = Path(__file__).parent / "fixtures" / "parity"
 # Columns added with the wrappers: provenance, not what was found. (A

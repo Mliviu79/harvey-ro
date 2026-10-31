@@ -8,20 +8,19 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 
 ## Skill → Agent Mapping
 
-| Skill | Scout | Writer | Handler | Sender | LinkedIn |
-|-------|-------|--------|---------|--------|----------|
-| `prospecting_tactics.md` | x | | | | x |
-| `lead_qualification.md` | x | | | | |
-| `account_navigation.md` | x | | | | |
-| `signal_playbook.md` | x | x | | | |
-| `email_frameworks.md` | | x | | x | |
-| `sales_methodology.md` | | x | x | | |
-| `offer_strategy.md` | | x | x | | |
-| `objection_handling.md` | | | x | | |
-| `linkedin_outreach.md` | | | | | x |
-| `product_knowledge.md` | x | x | x | x | x |
-| `competitive_intel.md` | | x | x | | |
-| `selling_to_startups.md` | | x* | x* | | |
+| Skill | Scout | Writer | Handler | Sender |
+|-------|-------|--------|---------|--------|
+| `prospecting_tactics.md` | x | | | |
+| `lead_qualification.md` | x | | | |
+| `account_navigation.md` | x | | | |
+| `signal_playbook.md` | x | x | | |
+| `email_frameworks.md` | | x | | x |
+| `sales_methodology.md` | | x | x | |
+| `offer_strategy.md` | | x | x | |
+| `objection_handling.md` | | | x | |
+| `product_knowledge.md` | x | x | x | x |
+| `competitive_intel.md` | | x | x | |
+| `selling_to_startups.md` | | x* | x* | |
 
 \* Only for prospects whose company is a startup by its own site's account (the `YC_BACKED` or `ACCELERATOR` signal, or a `FUNDING_ROUND` from the last 18 months), not loaded for everyone.
 
@@ -36,7 +35,6 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 - **`sales_methodology.md`** — ABC Loop, conversation flow, tone calibration, ethical guidelines
 - **`offer_strategy.md`** — Offer ladder by engagement level, closing mechanics, timing rules
 - **`objection_handling.md`** — LAARC framework, 4 objection categories with responses
-- **`linkedin_outreach.md`** — Connection sequences, messaging templates, rate limits
 
 ## Auto-Generated Skills
 

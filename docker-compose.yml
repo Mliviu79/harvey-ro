@@ -75,7 +75,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Optional: Chromium for LinkedIn and the sites that refuse Obscura (its
+  # Optional: Chromium for the sites that refuse Obscura (its
   # TLS fingerprint isn't a browser's). Start it with
   #   docker compose --profile chromium up -d
   # and set BROWSER_CDP_FALLBACK_URL=http://127.0.0.1:9231 in .env. Chromium's

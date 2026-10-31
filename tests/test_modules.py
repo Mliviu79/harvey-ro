@@ -91,6 +91,14 @@ def test_secrets_are_env_keys_harvey_documents(shipped):
             assert f"\n{key}=" in documented, (m.id, key)
 
 
+def test_env_example_names_no_removed_feature():
+    # LinkedIn prospecting, the keyless search scraper and the agent that used
+    # them are gone; their keys and fallbacks must not be promised.
+    documented = (ROOT / ".env.example").read_text()
+    for gone in ("LINKEDIN_", "DuckDuckGo", "Scout"):
+        assert gone not in documented, gone
+
+
 def test_shipped_sets_and_folders():
     sets = {m.set for m in load_manifests(data_dir=None)}
     assert sets == {"core", "original", "ro"}
@@ -126,7 +134,7 @@ def test_cli_lists_modules_as_json(tmp_path, monkeypatch):
     declared = sum(len(m.signals) for m in load_manifests(data_dir=None))
     assert sum(r["signals"] for r in rows) == declared >= len(SIGNAL_CATALOG)
     assert by_id["mf_financials"]["signals"] == 9
-    assert by_id["linkedin"]["default_enabled"] is False
+    assert by_id["startups"]["default_enabled"] is False
 
 
 # ── the loader on fictional manifests ──

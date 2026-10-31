@@ -718,7 +718,6 @@ class Brain:
             "writer": ["email_frameworks", "signal_playbook", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "handler": ["objection_handling", "sales_methodology", "offer_strategy", "product_knowledge", "competitive_intel"],
             "sender": ["email_frameworks", "product_knowledge"],
-            "linkedin": ["linkedin_outreach", "prospecting_tactics", "product_knowledge"],
         }
 
         skill_names = skill_map.get(agent_name, [])

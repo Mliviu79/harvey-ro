@@ -37,12 +37,12 @@ def _check_python_version():
 
 
 def cmd_install(args):
-    """Install all dependencies including Playwright browsers."""
+    """Install Harvey's Python dependencies."""
     _check_python_version()
     print("\n  Installing Harvey dependencies...\n")
 
     # Install Python packages
-    print("  [1/2] Installing Python packages...")
+    print("  Installing Python packages...")
     requirements = Path(args._project_root) / "requirements.txt"
     if requirements.exists():
         pip_args = ["-r", "requirements.txt"]
@@ -59,21 +59,6 @@ def cmd_install(args):
               "(python3 -m venv .venv && source .venv/bin/activate).")
         sys.exit(1)
     print("  ✓ Python packages installed.\n")
-
-    # Install Playwright browsers
-    print("  [2/2] Installing Playwright browsers...")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            timeout=600,
-        )
-        playwright_ok = result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        playwright_ok = False
-    if not playwright_ok:
-        print("\n  Playwright browser install failed (optional — needed for LinkedIn).")
-    else:
-        print("  ✓ Playwright browsers installed.\n")
 
     _ensure_importable(args._project_root)
     print("  Harvey is installed. Run 'harvey setup' next.\n")

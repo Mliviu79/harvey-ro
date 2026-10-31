@@ -2192,7 +2192,6 @@ async function loadSettings() {
   document.getElementById('imap-user').value = data.imap_username || '';
   document.getElementById('m365-client').value = data.m365_client_id || '';
   document.getElementById('m365-tenant').value = data.m365_tenant_id || '';
-  document.getElementById('linkedin-email').value = data.linkedin_email || '';
   document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
 
   savedPh('gmail-secret', data.gmail_client_secret_set, 'set.ph.gmail_secret');
@@ -2203,7 +2202,6 @@ async function loadSettings() {
   savedPh('reoon-key', data.reoon_api_key_set, 'set.ph.reoon');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, 'set.ph.zerobounce');
   savedPh('hunter-key', data.hunter_api_key_set, 'set.ph.hunter');
-  savedPh('linkedin-password', data.linkedin_password_set, 'set.ph.password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'set.ph.cf_token');
 
   const chip = (id, authorized, started, cmd) => {
@@ -2291,13 +2289,6 @@ function saveInstantly() {
   const key = document.getElementById('instantly-key').value.trim();
   if (!key) { showToast(t('set.need_new_key'), 'error'); return; }
   saveEnv({INSTANTLY_API_KEY: key}, t('set.saved_instantly'));
-}
-
-function saveLinkedIn() {
-  const payload = {LINKEDIN_EMAIL: document.getElementById('linkedin-email').value.trim()};
-  const pass = document.getElementById('linkedin-password').value;
-  if (pass) payload.LINKEDIN_PASSWORD = pass;
-  saveEnv(payload, t('set.saved_linkedin'));
 }
 
 function saveCloudflare() {

@@ -320,14 +320,14 @@ async def test_state_fills_an_empty_phone_only(state):
 
 @pytest.mark.asyncio
 async def test_profile_stores_site_phones(state, monkeypatch):
-    empty = await state.add_company(Company(name="Alfa", domain="alfa.ro",
+    empty = await state.add_company(Company(name="Alfa", domain="alfa.example.ro",
                                             location="Brașov"))
-    listed = await state.add_company(Company(name="Beta", domain="beta.ro",
+    listed = await state.add_company(Company(name="Beta", domain="beta.example.ro",
                                              phone="0268 000 150", location="Brașov"))
     await state.set_signal_status("PHONE_NUMBER", "confirmed")
     n = await _profile(state, {"PHONE_NUMBER"}, [
-        {"id": empty, "domain": "alfa.ro", "location": "Brașov"},
-        {"id": listed, "domain": "beta.ro", "location": "Brașov"},
+        {"id": empty, "domain": "alfa.example.ro", "location": "Brașov"},
+        {"id": listed, "domain": "beta.example.ro", "location": "Brașov"},
     ], monkeypatch)
     assert n == 4
     phones = dict(_rows(state, "SELECT name, phone FROM companies"))
@@ -335,14 +335,14 @@ async def test_profile_stores_site_phones(state, monkeypatch):
     obs = _rows(state, f"SELECT value_text, confidence, evidence_url, collector "
                        f"FROM observations WHERE company_id = '{empty}' "
                        f"AND signal_code = 'PHONE_NUMBER' ORDER BY confidence DESC")
-    assert obs == [("+40268000101", 1.0, "https://alfa.ro", "profile"),
-                   ("+40740000102", 0.9, "https://alfa.ro", "profile")]
+    assert obs == [("+40268000101", 1.0, "https://alfa.example.ro", "profile"),
+                   ("+40740000102", 0.9, "https://alfa.example.ro", "profile")]
 
 
 @pytest.mark.asyncio
 async def test_unconfirmed_phone_signal_still_fills_the_company_phone(state, monkeypatch):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.ro"))
-    await _profile(state, {"TECH_STACK"}, [{"id": cid, "domain": "alfa.ro"}], monkeypatch)
+    cid = await state.add_company(Company(name="Alfa", domain="alfa.example.ro"))
+    await _profile(state, {"TECH_STACK"}, [{"id": cid, "domain": "alfa.example.ro"}], monkeypatch)
     assert _rows(state, "SELECT phone FROM companies") == [("+40 268 000 101",)]
     assert _rows(state, "SELECT * FROM observations WHERE signal_code = 'PHONE_NUMBER'") == []
 
@@ -383,7 +383,7 @@ async def test_company_export_phone_columns(state):
     "0268000101, 0740 000 102",
 ])
 async def test_company_export_splits_a_listing_with_several_numbers(state, listed):
-    cid = await state.add_company(Company(name="Alfa", domain="alfa.ro", phone=listed))
+    cid = await state.add_company(Company(name="Alfa", domain="alfa.example.ro", phone=listed))
     await state.set_signal_status("PHONE_NUMBER", "confirmed")
     await state.add_observations([
         {"signal_code": "PHONE_NUMBER", "company_id": cid, "value_text": v}
@@ -395,7 +395,7 @@ async def test_company_export_splits_a_listing_with_several_numbers(state, liste
 
 @pytest.mark.asyncio
 async def test_company_export_keeps_a_slash_inside_one_number(state):
-    await state.add_company(Company(name="Alfa", domain="alfa.ro", phone="0268/000.101"))
+    await state.add_company(Company(name="Alfa", domain="alfa.example.ro", phone="0268/000.101"))
     (row,) = await collect_companies(state)
     assert (row["phone"], row["other_phones"]) == ("+40 268 000 101", "")
 

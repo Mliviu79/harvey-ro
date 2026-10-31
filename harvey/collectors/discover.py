@@ -142,7 +142,7 @@ def normalize_domain(url_or_domain: str) -> str:
 # Management Firm", "Home Page - NVCM | Community Association Management".
 # Stored as-is it lands in an email as "...at Denver, CO | HOA Management
 # Firm". The business is the title segment that shares a DISTINCTIVE word with
-# the domain — "management" matches managementharbor.com but says nothing.
+# the domain — "management" matches managementharbor.example but says nothing.
 
 _TITLE_SEPARATORS = re.compile(r"\s+[|\-–—·•]\s+|\s*[|•·]\s*|:\s+")
 _GENERIC_NAME_WORDS = frozenset("""

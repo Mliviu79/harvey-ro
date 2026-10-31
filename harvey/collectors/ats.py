@@ -337,32 +337,3 @@ def matching_roles(postings: list[Posting], keywords: list[str]) -> list[Posting
     return [p for p in postings
             if any(w <= _words(_REPORTS_TO.sub("", p.title)) for w in wanted)]
 
-
-# ── job-board search (python-jobspy, optional) ──
-
-async def job_posts(search_term: str, location: str = "") -> list[dict]:
-    """Indeed's posts for ``search_term`` near ``location`` from the last two
-    weeks, as rows (company, title, job_url...); [] when it has none.
-    Needs ``pip install python-jobspy`` (ImportError without it); a search
-    that takes over two minutes or fails raises."""
-    import asyncio
-
-    from jobspy import scrape_jobs
-
-    def _search():
-        return scrape_jobs(
-            site_name=["indeed"],
-            search_term=search_term,
-            location=location,
-            results_wanted=15,
-            hours_old=24 * 14,  # fresh signal only: last two weeks
-        )
-
-    loop = asyncio.get_event_loop()
-    df = await asyncio.wait_for(loop.run_in_executor(None, _search), timeout=120)
-    if df is None or getattr(df, "empty", True):
-        return []
-    try:
-        return df.to_dict("records")
-    except Exception:
-        return []

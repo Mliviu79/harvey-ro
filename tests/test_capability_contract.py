@@ -22,10 +22,8 @@ import os
 import re
 import socket
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -267,27 +265,18 @@ async def test_email_lookups_return_only_what_they_declare(manifests, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_people_sources_return_only_what_they_declare(manifests, monkeypatch):
+async def test_a_people_source_returns_only_what_it_declares(manifests, monkeypatch):
     from harvey.integrations import email_finder as ef
 
     async def hunter(domain, key, limit=10):
         return [{"first_name": "Ana", "last_name": "Pop", "position": "Owner",
                  "value": f"ana@{domain}"}]
 
-    class Session:
-        async def search_people(self, keywords, max_results=10):
-            return [{"first_name": "Ion", "last_name": "Pop", "title": "Owner",
-                     "linkedin_url": "https://linkedin.example/in/ionpop"}]
-
     monkeypatch.setattr(ef, "hunter_domain_people", hunter)
     found = await api.capability("hunter", "domain_search", manifests)(
         api.Input(domain="example.com"), api.Context(env=EnvConfig(hunter_api_key="k")))
     assert [p.email for p in found.people] == ["ana@example.com"]
-    li = await api.capability("linkedin", "people_search", manifests)(
-        api.Input(query="Owner Dental"), api.Context(browser=Session()))
-    assert [p.last_name for p in li.people] == ["Pop"]
     assert _declared(found, manifests, "hunter", "domain_search") == []
-    assert _declared(li, manifests, "linkedin", "people_search") == []
 
 
 @pytest.mark.asyncio
@@ -299,43 +288,6 @@ async def test_a_spent_allowance_stops_a_people_search(manifests):
     draft = await api.capability("hunter", "domain_search", manifests)(
         api.Input(domain="example.com"), api.Context(budget=Spent()))
     assert draft.stop and not draft.people
-
-
-@pytest.mark.asyncio
-async def test_keyless_searches_return_only_what_they_declare(manifests, monkeypatch):
-    results = ('<div class="result"><a class="result__a" href="https://acme-roofing.example/">'
-               'Acme</a><div class="result__snippet">Roofers</div></div>')
-    directory = ('<a href="https://acme-roofing.example/">Acme Roofing Co</a>'
-                 '<a href="https://www.linkedin.com/x">LinkedIn page</a>')
-
-    async def fetch(url, **kw):
-        return SimpleNamespace(text=directory if "list" in url else results)
-
-    html = await api.capability("web_search_scrape", "html_search", manifests)(
-        api.Input(query="roofers"), api.Context(http=fetch))
-    assert [(r.source_url, r.description) for r in html.records] == [
-        ("https://acme-roofing.example/", "Roofers")]
-    found = await api.capability("web_search_scrape", "directories", manifests)(
-        api.Input(extra={"url": "https://list.example/roofers",
-                         "domain_of": lambda url: url.split("/")[2].removeprefix("www."),
-                         "noise": lambda domain: domain.endswith("linkedin.com")}),
-        api.Context(http=fetch))
-    assert [r.domain for r in found.records] == ["acme-roofing.example"]
-
-    class Posts:
-        empty = False
-
-        def to_dict(self, orient):
-            return [{"company": "Acme Roofing", "title": "Estimator", "job_url": "https://jobs.example/1"}]
-
-    monkeypatch.setitem(sys.modules, "jobspy", SimpleNamespace(scrape_jobs=lambda **k: Posts()))
-    jobs = await api.capability("hiring", "job_board_search", manifests)(
-        api.Input(query="estimator", area="Denver, CO"), api.Context())
-    assert [(r.name, r.found_by) for r in jobs.records] == [("Acme Roofing", "Estimator")]
-    for draft, module, cap in ((html, "web_search_scrape", "html_search"),
-                               (found, "web_search_scrape", "directories"),
-                               (jobs, "hiring", "job_board_search")):
-        assert _declared(draft, manifests, module, cap) == []
 
 
 @pytest.mark.asyncio
@@ -654,9 +606,10 @@ def test_a_fact_its_capability_does_not_declare_is_left_out(caplog):
 async def test_a_capability_of_a_module_that_is_off_is_refused(manifests, no_network):
     from harvey.modules.switches import ModuleOff
 
-    cap = api.capability("hiring", "job_board_search", manifests)
+    cap = api.capability("hiring", "job_board", manifests)
     with pytest.raises(ModuleOff, match="hiring"):
-        await cap(api.Input(query="Dental Assistant"), api.Context(enabled=frozenset({"website"})))
+        await cap(api.Input(company_id="c1", domain="acme.example"),
+                  api.Context(enabled=frozenset({"website"})))
 
 
 @pytest.mark.asyncio

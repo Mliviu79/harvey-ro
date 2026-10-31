@@ -105,8 +105,19 @@ def test_usage_and_channel_overrides():
     assert config.usage.quiet_hours.timezone == "UTC"
     assert config.channels.email.enabled is False
     assert config.channels.email.max_daily_sends == 10
-    # linkedin channel keeps its defaults
-    assert config.channels.linkedin.max_daily_connections == 20
+
+
+def test_a_config_from_before_linkedin_was_removed_still_loads(tmp_path):
+    """LinkedIn prospecting is gone; a config that still has its channel
+    loads as before and the old keys are ignored."""
+    data = {**MINIMAL, "channels": {
+        "email": {"max_daily_sends": 10},
+        "linkedin": {"enabled": True, "max_daily_connections": 20, "max_daily_messages": 10}}}
+    path = tmp_path / "harvey.yaml"
+    path.write_text(yaml.safe_dump(data))
+    config = load_config(str(path))
+    assert config.channels.email.max_daily_sends == 10
+    assert not hasattr(config.channels, "linkedin")
 
 
 def test_quiet_hours_defaults():

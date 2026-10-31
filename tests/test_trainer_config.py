@@ -28,7 +28,6 @@ LEARNED = {
     },
     "channels": {
         "email": {"enabled": True, "provider": "instantly", "max_daily_sends": 50},
-        "linkedin": {"enabled": True, "max_daily_connections": 20, "max_daily_messages": 10},
     },
     "usage": {
         "max_daily_claude_percent": 80, "heartbeat_interval_minutes": 15,
@@ -58,7 +57,6 @@ TUNED = {
             "enabled": True, "provider": "gmail", "max_daily_sends": 20,
             "require_approval": False, "send_to_risky": True, "max_bounce_rate": 0.02,
         },
-        "linkedin": {"enabled": False, "max_daily_connections": 5, "max_daily_messages": 2},
     },
     "usage": {
         "max_daily_claude_percent": 40, "heartbeat_interval_minutes": 30,

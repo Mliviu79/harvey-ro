@@ -206,12 +206,12 @@ async def test_user_decision_survives_reseeding(state):
 @pytest.mark.asyncio
 async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypatch):
     cid = await state.add_company(Company(name="Denver, CO | HOA Management Firm",
-                                          domain="managementharbor.com"))
-    keep = await state.add_company(Company(name="Birch Management", domain="birchmgt.com"))
+                                          domain="managementharbor.example"))
+    keep = await state.add_company(Company(name="Birch Management", domain="birchmgt.example"))
     derived = await state.add_company(Company(name="Grow With Us", domain="growwithus.us"))
     pages = {
-        "managementharbor.com": '<meta property="og:site_name" content="Management Harbor">',
-        "birchmgt.com": "<title>Denver HOA | Birch Management Group</title>",
+        "managementharbor.example": '<meta property="og:site_name" content="Management Harbor">',
+        "birchmgt.example": "<title>Denver HOA | Birch Management Group</title>",
         "growwithus.us": '<meta property="og:site_name" content="Grow Community Management">',
     }
 
@@ -224,29 +224,29 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
     monkeypatch.setattr(ProfileCollector, "_first_present", fake_first)
     await runs.profile(state, [{"id": cid, "name": "Denver, CO | HOA Management Firm",
-                      "domain": "managementharbor.com"},
-                     {"id": keep, "name": "Birch Management", "domain": "birchmgt.com"},
+                      "domain": "managementharbor.example"},
+                     {"id": keep, "name": "Birch Management", "domain": "birchmgt.example"},
                      {"id": derived, "name": "Grow With Us", "domain": "growwithus.us"}],
                        {"TECH_STACK"})
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         names = dict(db.execute("SELECT domain, name FROM companies"))
-    assert names["managementharbor.com"] == "Management Harbor"
-    assert names["birchmgt.com"] == "Birch Management"   # already right: untouched
+    assert names["managementharbor.example"] == "Management Harbor"
+    assert names["birchmgt.example"] == "Birch Management"   # already right: untouched
     assert names["growwithus.us"] == "Grow Community Management"   # was domain-derived
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("current,domain,homepage,expected", [
-    ("Roofing Services in Denver", "kettlemanroofing.com", "Kettleman Roofing", "Kettleman Roofing"),
+    ("Roofing Services in Denver", "kettlemanroofing.example", "Kettleman Roofing", "Kettleman Roofing"),
     ("Plumbing Services in Austin", "acmeplumbing.com", "Acme Plumbing", "Acme Plumbing"),
     ("Contact Us", "contactcraft.com", "ContactCraft", "ContactCraft"),
-    ("Birch Management", "birchmgt.com", "Birch Management Group", "Birch Management"),
+    ("Birch Management", "birchmgt.example", "Birch Management Group", "Birch Management"),
     ("NVCM", "nvcmnet.com", "NVCM Group", "NVCM"),
     ("Northvale Association of Community Managers", "nacm.org",
      "Northvale Association of Community Managers Group", "Northvale Association of Community Managers"),
     ("Grow With Us", "growwithus.us", "Grow Community Management", "Grow Community Management"),
-    ("Roofing Services in Denver", "kettlemanroofing.com", "", "Roofing Services in Denver"),
+    ("Roofing Services in Denver", "kettlemanroofing.example", "", "Roofing Services in Denver"),
 ])
 async def test_profile_repairs_weak_names_and_retains_brands(
         state, monkeypatch, current, domain, homepage, expected):

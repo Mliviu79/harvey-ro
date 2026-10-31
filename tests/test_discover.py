@@ -114,7 +114,7 @@ def test_directories_and_institutions_are_junk(domain):
 
 
 @pytest.mark.parametrize("domain", [
-    "kettlemanroofing.com", "northvaleroofing.com", "sandpiperexteriors.com",
+    "kettlemanroofing.example", "northvaleroofing.example", "sandpiperexteriors.com",
     "quarrylaneroofing.com", "smith-and-sons.co.uk", "acme.dental",
 ])
 def test_real_businesses_survive_the_filter(domain):
@@ -222,7 +222,7 @@ async def test_nothing_runs_until_signals_are_confirmed(state, config, register)
 @pytest.mark.asyncio
 async def test_rerun_finds_everyone_already_known(state, config, register):
     batch = [
-        biz(name="Northvale Roofing", domain="northvaleroofing.com"),
+        biz(name="Northvale Roofing", domain="northvaleroofing.example"),
         biz(name="No Site Roofing", external_id="osm:node/1", has_website=False),
     ]
     register(FakeProvider([list(batch), list(batch)]))
@@ -352,7 +352,7 @@ DFS_LISTINGS = {
         {
             "title": "Northvale Roofing Company", "category": "Roofing contractor",
             "place_id": "ChIJabc123", "phone": "+15550100199",
-            "url": "https://www.northvaleroofing.com/", "domain": "northvaleroofing.com",
+            "url": "https://www.northvaleroofing.example/", "domain": "northvaleroofing.example",
             "address": "1400 Example Row, Raleigh, NC",
             "address_info": {"city": "Raleigh", "region": "North Carolina"},
             "is_claimed": True,
@@ -378,15 +378,15 @@ DFS_SERP = {
          "position": "left", "domain": "yelp.com",
          "url": "https://yelp.com/denver", "title": "Best Roofers"},
         {"type": "organic", "rank_group": 14, "rank_absolute": 18,
-         "position": "left", "domain": "kettlemanroofing.com",
-         "url": "https://kettlemanroofing.com/", "title": "Kettleman Roofing"},
+         "position": "left", "domain": "kettlemanroofing.example",
+         "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing"},
         {"type": "paid", "rank_group": 1, "domain": "ads.example.com"},
         {"type": "people_also_ask", "rank_group": 2},
     ]}]}],
 }
 
 SERPER_RESPONSE = {"organic": [
-    {"title": "Kettleman Roofing", "link": "https://www.kettlemanroofing.com/",
+    {"title": "Kettleman Roofing", "link": "https://www.kettlemanroofing.example/",
      "position": 3},
     {"title": "Angi", "link": "https://www.angi.com/companylist/denver/roofing",
      "position": 4},
@@ -454,7 +454,7 @@ async def test_dataforseo_listings_adapter():
     assert provider.last_cost == pytest.approx(0.0132)
 
     northvale, nosite = out
-    assert northvale.domain == "northvaleroofing.com"
+    assert northvale.domain == "northvaleroofing.example"
     assert northvale.phone == "+15550100199"
     assert northvale.location == "Raleigh, North Carolina"
     assert northvale.rating == 4.4 and northvale.review_count == 512
@@ -478,7 +478,7 @@ async def test_dataforseo_serp_adapter_reads_rank_group_not_position():
             D.DiscoveryQuery(term="roofer", location="Denver", depth=30))
 
     assert [b.rank for b in out] == [1, 14], "paid and PAA rows must be dropped"
-    assert out[1].domain == "kettlemanroofing.com"
+    assert out[1].domain == "kettlemanroofing.example"
 
 
 @pytest.mark.asyncio
@@ -487,7 +487,7 @@ async def test_serper_adapter():
     async with _client(lambda r: httpx.Response(200, json=SERPER_RESPONSE)) as client:
         out = await provider.fetch(client, {"serper_api_key": "k"},
                                    D.DiscoveryQuery(term="roofer", location="Denver"))
-    assert out[0].domain == "kettlemanroofing.com" and out[0].rank == 3
+    assert out[0].domain == "kettlemanroofing.example" and out[0].rank == 3
     # Junk filtering happens in the run, so the adapter still returns Angi.
     assert out[1].domain == "angi.com"
 
@@ -516,7 +516,7 @@ async def test_scavio_maps_adapter():
     seen = []
     payload = {"local_results": [
         {"position": 1, "title": "Kettleman Roofing", "place_id": "ChIJabc123",
-         "website": "https://www.kettlemanroofing.com/?utm_source=gbp",
+         "website": "https://www.kettlemanroofing.example/?utm_source=gbp",
          "phone": "(303) 555-0199", "address": "12 Grant St, Denver, CO 80203",
          "type": "Roofing contractor", "rating": 4.9, "reviews": 409},
         {"position": 2, "title": "No Site Roofing", "place_id": "ChIJxyz789",
@@ -543,7 +543,7 @@ async def test_scavio_maps_adapter():
     assert provider.last_cost == pytest.approx(0.01)
 
     kettleman, nosite = out
-    assert kettleman.domain == "kettlemanroofing.com"
+    assert kettleman.domain == "kettlemanroofing.example"
     assert kettleman.phone == "(303) 555-0199"
     assert kettleman.category == "Roofing contractor"
     assert kettleman.rating == 4.9 and kettleman.review_count == 409
@@ -1130,7 +1130,7 @@ async def test_an_unmappable_term_is_reported_not_silently_skipped(
     ("Brightwater Texas: Texas HOA Property Management Company", "brightwatertexas.com",
      "Brightwater Texas"),
     # No segment names the business → fall back to the domain, split sensibly.
-    ("Denver, CO | HOA Management Firm", "managementharbor.com", "Management Harbor"),
+    ("Denver, CO | HOA Management Firm", "managementharbor.example", "Management Harbor"),
     ("Texas HOA management", "kqresidential.com", "KQ Residential"),
     ("Great Texas Community Management Begins Here", "growwithus.us", "Grow With Us"),
 ])
@@ -1139,9 +1139,9 @@ def test_business_name_from_serp_title(title, domain, expected):
 
 
 def test_generic_words_alone_never_match_the_domain():
-    """'Management' is in managementharbor.com but says nothing about it."""
-    assert not D.name_matches_domain("HOA Management Firm", "managementharbor.com")
-    assert D.name_matches_domain("The Management Harbor", "managementharbor.com")
+    """'Management' is in managementharbor.example but says nothing about it."""
+    assert not D.name_matches_domain("HOA Management Firm", "managementharbor.example")
+    assert D.name_matches_domain("The Management Harbor", "managementharbor.example")
 
 
 def test_site_name_prefers_og_then_title_and_needs_domain_backing():
@@ -1151,7 +1151,7 @@ def test_site_name_prefers_og_then_title_and_needs_domain_backing():
     assert D.site_name_from_html(title, "lumenam.com") == "Lumen Association Management"
     both = ('<meta property="og:site_name" content="Management Harbor">'
             "<title>The Management Harbor: Community Management</title>")
-    assert D.site_name_from_html(both, "managementharbor.com") == "The Management Harbor"
+    assert D.site_name_from_html(both, "managementharbor.example") == "The Management Harbor"
     assert D.site_name_from_html("<title>Attention Required! | Cloudflare</title>",
                                  "lumenam.com") == ""
 
@@ -1166,8 +1166,8 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
             'url': f'https://{domain}/roofers', 'domain': domain,
             'position': 1, 'rank_group': 1, 'type': 'organic'}
     valid = dict(item, title='Kettleman Roofing | Denver',
-                 domain='kettlemanroofing.com', link='https://kettlemanroofing.com',
-                 url='https://kettlemanroofing.com', position=2, rank_group=2)
+                 domain='kettlemanroofing.example', link='https://kettlemanroofing.example',
+                 url='https://kettlemanroofing.example', position=2, rank_group=2)
     payload = ({'organic': [item, valid]} if provider == 'serper' else
                {'organic_results': [item, valid]} if provider == 'scavio_search' else
                {'status_code': 20000, 'tasks': [{'status_code': 20000,
@@ -1192,13 +1192,13 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         assert db.execute("SELECT domain, name FROM companies").fetchall() == [
-            ("kettlemanroofing.com", "Kettleman Roofing")]
+            ("kettlemanroofing.example", "Kettleman Roofing")]
 
 
 @pytest.mark.parametrize('title,domain,expected', [
     ('Contact Us | ContactCraft', 'contactcraft.com', 'ContactCraft'),
     ('Craft | ContactCraft', 'contactcraft.com', 'ContactCraft'),
-    ('Roofing Services in Denver | Kettleman Roofing', 'kettlemanroofing.com', 'Kettleman Roofing'),
+    ('Roofing Services in Denver | Kettleman Roofing', 'kettlemanroofing.example', 'Kettleman Roofing'),
     ('Plumbing Services in Austin | Acme Plumbing', 'acmeplumbing.com', 'Acme Plumbing'),
 ])
 def test_brand_wins_over_generic_service_segment(title, domain, expected):
