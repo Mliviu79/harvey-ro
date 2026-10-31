@@ -360,7 +360,8 @@ def test_endpoint_needs_the_token(client):
 
 def test_companies_tab_has_the_search_box():
     js = (Path(dash.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
-    # Paged on the server: the search and the plain list both take limit/offset.
-    assert "/api/companies/search?limit=' + _co.limit + '&offset=' + _co.offset + '&q=" in js
-    assert "/api/companies?limit=' + _co.limit + '&offset=' + _co.offset" in js
+    # Paged on the server: one list endpoint takes the search, filters, sort and page.
+    assert "apiRead('/api/companies?' + companyParams())" in js
+    assert "if (_co.q.trim()) f.search = _co.q.trim();" in js
+    assert "p.set('limit', _co.limit);" in js and "p.set('offset', _co.offset);" in js
     assert 'id="company-search"' in js

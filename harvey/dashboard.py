@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -792,12 +793,23 @@ _COMPANY_COLUMNS = ("c.id, c.name, c.cui, c.domain, c.website, c.industry, c.com
 
 
 @app.get("/api/companies")
-async def get_companies(limit: int | None = None, offset: int | None = None):
-    """Companies with contact counts. Without ``limit``/``offset`` it is the
-    original list (newest 200). With either, one page as
-    {total, offset, limit, companies}, each enriched for the phone/email-first
-    table (see _enrich_companies)."""
-    if limit is None and offset is None:
+async def get_companies(request: Request, limit: int | None = None, offset: int | None = None,
+                        sort: str = "", dir: str = ""):
+    """Companies with contact counts. Without any parameter it is the
+    original list (newest 200). Otherwise one page as {total, offset,
+    limit, sort, dir, companies, sources, financials}: sorted by ``sort``
+    (created, name, place, turnover, employees, contacts, searched;
+    ``relevance`` with a search), filtered by the Contacts page's company
+    filters (county, locality, website, require/exclude, min/max_turnover,
+    min/max_employees, unknown) plus caen (codes or words), contact (any,
+    phone, mobile, email, none, or a kind), found_in (a source) and search
+    (``q`` too: the full-text search, or a CUI). Each row is enriched for
+    the phone/email-first table (see _enrich_companies) and carries its
+    latest turnover and headcount, its contact count and last search.
+    Paging: harvey/companies.py."""
+    from harvey import companies
+
+    if not request.query_params:
         return await query_db("""
             SELECT c.*,
                 (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
@@ -805,12 +817,63 @@ async def get_companies(limit: int | None = None, offset: int | None = None):
             ORDER BY c.created_at DESC LIMIT 200
         """)
     limit, offset = _page_args(limit, offset)
-    total = await _scalar(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
-    rows = await query_db(
-        f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE COALESCE(c.merged_into, '') = '' "
-        "ORDER BY c.created_at DESC, c.rowid DESC LIMIT ? OFFSET ?", (limit, offset))
+    args = dict(request.query_params)
+    if args.get("q") and not args.get("search"):
+        args["search"] = args["q"]
+    args.pop("q", None)
+    empty = {"total": 0, "offset": offset, "limit": limit, "sort": sort, "dir": dir,
+             "companies": [], "sources": [], "financials": False}
+    if not DB_PATH.exists():
+        return empty
+    state = _state()
+    await state.init_db()
+    try:
+        f, attach = await _contact_filter(state, args)
+    except ValueError as e:
+        return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    from harvey.modules.ro.mf_financials import store as fin_store
+    has_fin = Path(fin_store.FINANCIALS_PATH).is_file()
+    relevance = sort in ("", "relevance") and bool(f.search)
+    if not relevance and sort not in companies.SORTS:
+        sort = "created"
+    if sort in companies.FIGURE_SORTS and not has_fin:
+        sort = "created"
+    way = companies.direction(sort, dir)
+    async with _contacts_db(attach or has_fin) as db:
+        db.row_factory = aiosqlite.Row
+        started = time.monotonic()
+        if relevance:
+            sort = "relevance"
+        total, rowids, how = await companies.page(db, f, sort, way, limit, offset,
+                                                  figures_mark=_figures_mark())
+        rows = []
+        if rowids:
+            marks = ",".join("?" * len(rowids))
+            async with db.execute(f"SELECT c.rowid AS _r, {_COMPANY_COLUMNS} FROM companies c "
+                                  f"WHERE c.rowid IN ({marks})", rowids) as cur:
+                found = {r["_r"]: dict(r) for r in await cur.fetchall()}
+            rows = [found[i] for i in rowids if i in found]
+            for r in rows:
+                r.pop("_r", None)
+        figures = await companies.figures(db, [r["cui"] for r in rows]) if has_fin else {}
+        extra = await companies.counts(db, [r["id"] for r in rows])
+        sources = await companies.sources(db)
+        took = round((time.monotonic() - started) * 1000)
     rows = await _enrich_companies(rows, _load_config_quietly())
-    return {"total": total, "offset": offset, "limit": limit, "companies": rows}
+    for r in rows:
+        r["figures"] = figures.get(r.get("cui") or "")
+        r.update(extra.get(r["id"], {}))
+    return {**empty, "total": total, "sort": sort, "dir": way, "companies": rows,
+            "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
+
+
+def _figures_mark():
+    """When the financial statements database last changed (a reload)."""
+    from harvey.modules.ro.mf_financials import store as fin_store
+    try:
+        return Path(fin_store.FINANCIALS_PATH).stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 _CUI_QUERY = re.compile(r"\s*(?:RO\s*)?(\d{2,10})\s*", re.IGNORECASE)
@@ -894,6 +957,19 @@ async def get_company(company_id: str):
     except Exception as e:
         logger.warning("company contacts failed: %s", e)
         row["reach"] = {"contacts": [], "people": [], "locations": [], "sources": []}
+    try:
+        from harvey import companies
+        async with _contacts_db() as db:
+            row["record"] = await companies.record(db, row)
+            if row["record"]["financials"]["state"] != companies.OK:
+                years = await companies.observed_years(db, company_id)
+                if years:
+                    row["record"]["financials"].update(state=companies.OK, years=years,
+                                                       from_observations=True)
+            row.update((await companies.counts(db, [company_id]))[company_id])
+    except Exception as e:
+        logger.warning("company record failed: %s", e)
+        row["record"] = None
     return row
 
 
@@ -1584,6 +1660,76 @@ def _number_arg(raw):
     return _range_bound(str(raw).strip())
 
 
+def _caen_arg(raw: str) -> tuple[str, ...]:
+    """CAEN codes from a filter box: 4-digit codes (also written 86.23 or
+    8623/3) and words, turned into the classes they name. ValueError when
+    words name no class."""
+    if not raw:
+        return ()
+    from harvey import caen
+
+    text = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", raw)
+    text = re.sub(r"\b(\d{4})/\d+\b", r"\1", text)
+    codes, words = [], []
+    for token in re.split(r"[\s,;]+", text):
+        if re.fullmatch(r"\d{4}", token):
+            codes.append(token)
+        elif re.fullmatch(r"\d{3}", token):
+            # A CAEN group (47.1): every class in it.
+            group = sorted({code for code, _ in caen._classes() if code.startswith(token)})
+            if not group:
+                raise ValueError(f"No CAEN class is in group {token}")
+            codes += group
+        elif token:
+            words.append(token)
+    if words:
+        named = sorted(caen.codes_for(" ".join(words)))
+        if not named:
+            raise ValueError(f"No CAEN class matches \"{' '.join(words)}\"")
+        codes += named
+    return tuple(dict.fromkeys(codes))
+
+
+def _contact_arg(raw: str) -> str:
+    """has-contact filter: any, none, mobile or a contact kind."""
+    if raw and not re.fullmatch(r"[a-z_]{1,32}", raw):
+        raise ValueError("contact must be any, none, mobile or a contact kind")
+    return raw
+
+
+def _search_arg(raw: str) -> tuple[str, str, bool]:
+    """(CUI digits, full-text expression, nothing) from the Companies search
+    box. A number typed on its own ("10004070", "RO 10004070"; a bare
+    four-digit number stays a CAEN code) gives both: the CUI when a company
+    has it, else the words (the caller decides, _contact_filter). Only
+    single letters or common words: ``nothing`` (no company matches).
+    ValueError when only -words are typed (nothing to look for)."""
+    if not raw.strip():
+        return "", "", False
+    from harvey.state import search_terms
+
+    match, _ = search_terms(raw)
+    m = _CUI_QUERY.fullmatch(raw)
+    if m and (len(m.group(1)) != 4 or raw.strip().upper().startswith("RO")):
+        return m.group(1), match, False
+    if not match:
+        if all(t.startswith("-") for t in raw.split()):
+            raise ValueError("Type a word to look for: a word with a minus only leaves things out.")
+        return "", "", True
+    return "", match, False
+
+
+async def _cui_on_file(state, cui: str) -> bool:
+    """Whether a live company has this CUI (the search box's number)."""
+    from harvey import contacts
+
+    conds, params = contacts.company_conditions(contacts.ContactFilter(cui=cui))
+    async with state._connect() as db:
+        async with db.execute(f"SELECT 1 FROM companies c WHERE {' AND '.join(conds)} LIMIT 1",
+                              params) as cur:
+            return await cur.fetchone() is not None
+
+
 async def _contact_filter(state, args) -> tuple[object, bool]:
     """The ContactFilter the query string asks for, and whether the
     financials database must be attached. Raises ValueError (or ModuleOff
@@ -1594,7 +1740,22 @@ async def _contact_filter(state, args) -> tuple[object, bool]:
     f = contacts.ContactFilter(
         kind=get("kind"), status=get("status"), trust=get("trust"),
         has_person=get("person"), source=get("source"), county=get("county"),
-        locality=get("locality"), website=get("website"), q=get("q"))
+        locality=get("locality"), website=get("website"), q=get("q"),
+        caen=_caen_arg(get("caen")), contact=_contact_arg(get("contact")),
+        found_in=get("found_in"))
+    f.cui, f.search, f.nothing = _search_arg(get("search"))
+    if f.county or f.locality:
+        from harvey import companies
+
+        async with state._connect() as db:
+            f.places = await companies.places(db, f.county, f.locality)
+    if f.cui:
+        # The company with that CUI, else the number as a word ("24").
+        if await _cui_on_file(state, f.cui):
+            f.search = ""
+        else:
+            f.cui = ""
+            f.nothing = not f.search
     require, exclude = _codes(args.get("require") or ""), _codes(args.get("exclude") or "")
     if require or exclude:
         await _refuse_hidden_signals(state, [*require, *exclude])
@@ -1608,7 +1769,7 @@ async def _contact_filter(state, args) -> tuple[object, bool]:
         figures = fin_store.Filter(**bounds, unknown="include" if get("unknown") == "include"
                                    else "exclude")
         if Path(fin_store.FINANCIALS_PATH).is_file():
-            f.figures = figures.sql("c.cui")
+            f.figures = figures.in_sql("c.cui")
             attach = True
         elif figures.unknown != "include":
             # No statements on file: no company has a known figure.
@@ -2451,8 +2612,9 @@ EXPORT_SEARCH_MAX = 100000
 
 
 async def _export_request(request: Request) -> tuple[list[str] | None, str]:
-    """{"ids": [...]} or {"q": "..."} (or neither: everything) from an
-    export POST. Raises ValueError on a malformed body."""
+    """{"ids": [...]}, {"q": "..."}, {"filter": {the Companies page's
+    filters}, "sort", "dir"} (its list, as ids) or none of them (everything)
+    from an export POST. Raises ValueError on a malformed body."""
     try:
         body = await request.json()
     except Exception:
@@ -2470,7 +2632,32 @@ async def _export_request(request: Request) -> tuple[list[str] | None, str]:
     q = body.get("q") or ""
     if not isinstance(q, str):
         raise ValueError("q must be text")
+    if ids is None and isinstance(body.get("filter"), dict):
+        # The Companies page's filters and sort: every result, in its order
+        # (how many matched in all is kept for the export's header).
+        ids, request.state.matched = await _company_filter_ids(
+            body["filter"], str(body.get("sort") or ""), str(body.get("dir") or ""),
+            EXPORT_SEARCH_MAX)
     return ids, q[:200]
+
+
+async def _company_filter_ids(raw: dict, sort: str, way: str, limit: int) -> tuple[list[str], int]:
+    """(the ids of the Companies page's list for these filters in its sort,
+    up to ``limit``; how many match in all). ValueError on a bad filter."""
+    from harvey import companies
+
+    state = _state()
+    await state.init_db()
+    f, attach = await _contact_filter(state, {k: str(v) for k, v in raw.items() if v is not None})
+    from harvey.modules.ro.mf_financials import store as fin_store
+    has_fin = Path(fin_store.FINANCIALS_PATH).is_file()
+    if f.search and sort in ("", "relevance"):
+        sort = "relevance"
+    elif sort not in companies.SORTS or (sort in companies.FIGURE_SORTS and not has_fin):
+        sort = "created"
+    async with _contacts_db(attach or (has_fin and sort in companies.FIGURE_SORTS)) as db:
+        return await companies.ids_for(db, f, sort, companies.direction(sort, way), limit,
+                                       figures_mark=_figures_mark())
 
 
 async def _search_all_ids(state, q: str) -> tuple[list[str], int]:
@@ -2504,7 +2691,11 @@ async def _export_company_rows(request: Request) -> tuple[list[dict], int]:
         rows = sorted(rows, key=lambda r: rank.get(r["id"], len(rank)))
     else:
         rows = await collect_companies(state, config=config, ids=ids)
-        matched = len(rows)
+        if ids:
+            # In the order asked for (a filtered page's sort).
+            rank = {cid: i for i, cid in enumerate(ids)}
+            rows.sort(key=lambda r: rank.get(r["id"], len(rank)))
+        matched = getattr(request.state, "matched", None) or len(rows)
     activities = await state.get_company_activities([r["id"] for r in rows])
     for r in rows:
         acts = activities.get(r["id"], [])
@@ -4449,7 +4640,7 @@ async def check_at_anaf(request: Request):
     state = _state()
     await state.init_db()
     if ids is None and q.strip():
-        ids, _ = await _search_all_ids(state, q)
+        ids, request.state.matched = await _search_all_ids(state, q)
     batch_id = await jobs.new_batch(state, "id_check", "ANAF", params={"missing": missing})
     queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", ids,
                                             missing_only=missing, batch_id=batch_id)
@@ -4458,8 +4649,13 @@ async def check_at_anaf(request: Request):
         await jobs.drop_batch(state, batch_id)
     if not queued and dupes:
         return JSONResponse(_duplicate_body(jobs.Duplicate(dupes[0])), status_code=409)
-    return {"success": True, "batch_id": batch_id, "jobs": len(queued),
-            "already_queued": len(dupes)}
+    out = {"success": True, "batch_id": batch_id, "jobs": len(queued),
+           "already_queued": len(dupes)}
+    matched = getattr(request.state, "matched", None)
+    if ids is not None and matched and matched > len(ids):
+        # A filtered list longer than the cap: only its first ids were queued.
+        out.update(matched=matched, capped=len(ids))
+    return out
 
 
 def _now_iso() -> str:

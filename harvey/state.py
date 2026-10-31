@@ -1340,6 +1340,21 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_companies_created ON companies(created_at);
     CREATE INDEX IF NOT EXISTS idx_searches_batch ON searches(batch_id) WHERE batch_id != '';
     """,
+    # ── v23: the Companies page's sorts ──
+    """
+    -- One index per column the Companies page sorts by, on live companies
+    -- only (written exactly as the page's condition, so SQLite uses them).
+    -- Each holds the sort key and the rowid: a page, and a jump half a
+    -- million rows deep, walks the index without reading the table
+    -- (harvey/companies.py). The sorts by a figure (turnover, contacts,
+    -- last searched) are ranked from the tables that hold them instead.
+    CREATE INDEX IF NOT EXISTS idx_companies_live_created ON companies(created_at)
+        WHERE COALESCE(merged_into, '') = '';
+    CREATE INDEX IF NOT EXISTS idx_companies_live_name ON companies(name)
+        WHERE COALESCE(merged_into, '') = '';
+    CREATE INDEX IF NOT EXISTS idx_companies_live_place ON companies(location)
+        WHERE COALESCE(merged_into, '') = '';
+    """,
 ]
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
@@ -1984,6 +1999,65 @@ def _signal_code_params(code: str, *, label: str = "", description: str = "",
             cost_note, float(confidence_floor), status,
             module, subject, unit, cardinality, keyed_by, absence, when_known,
             1 if available else 0, status)
+
+
+_RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
+_YEAR_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'year')"
+
+
+def _current_cte(codes: int = 0) -> str:
+    """The current-reading CTEs (latest, ranked, positive, current_obs; see
+    StateManager). ``codes``: how many signal codes to read, as that many
+    ``?`` four times over (pass the codes four times): every CTE then reads
+    those signals' rows only, not every observation on file. The readings
+    are the same, since each is the newest row of its own company and code."""
+    marks = ",".join("?" * codes)
+    where_only = f" WHERE signal_code IN ({marks})" if codes else ""
+    and_only = f" AND o.signal_code IN ({marks})" if codes else ""
+    return f"""
+    WITH latest AS (
+        SELECT o.* FROM observations o
+        JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
+              FROM observations{where_only} GROUP BY company_id, signal_code) newest
+          ON newest.company_id = o.company_id
+         AND newest.signal_code = o.signal_code
+         AND newest.t = o.observed_at
+        WHERE o.signal_code NOT IN {_RANK_CODES}
+          AND o.signal_code NOT IN {_YEAR_CODES}{and_only}
+        UNION ALL
+        SELECT o.* FROM observations o
+        WHERE o.signal_code IN {_YEAR_CODES}{and_only}
+          AND o.rowid = (
+              SELECT n.rowid FROM observations n
+              WHERE n.company_id = o.company_id
+                AND n.signal_code = o.signal_code
+              ORDER BY CAST(n.value_text AS INTEGER) DESC, n.observed_at DESC,
+                       n.rowid DESC LIMIT 1)
+    ),
+    ranked AS (
+        SELECT o.* FROM observations o
+        WHERE o.signal_code IN {_RANK_CODES}{and_only}
+          AND o.rowid = (
+              SELECT n.rowid FROM observations n
+              WHERE n.company_id = o.company_id
+                AND n.signal_code = o.signal_code
+                AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
+              ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1)
+          AND NOT (COALESCE(o.value_text, '') = '' AND EXISTS (
+              SELECT 1 FROM observations p
+              WHERE p.company_id = o.company_id
+                AND p.signal_code = o.signal_code
+                AND COALESCE(p.value_text, '') != ''))
+    ),
+    positive AS (
+        SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
+        UNION ALL
+        SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
+    ),
+    current_obs AS (
+        SELECT * FROM latest UNION ALL SELECT * FROM ranked
+    )
+    """
 
 
 class StateManager:
@@ -3550,50 +3624,7 @@ class StateManager:
     # history, and a range can name one (``key``).
     _RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
     _YEAR_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'year')"
-    _CURRENT_CTE = f"""
-    WITH latest AS (
-        SELECT o.* FROM observations o
-        JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
-              FROM observations GROUP BY company_id, signal_code) newest
-          ON newest.company_id = o.company_id
-         AND newest.signal_code = o.signal_code
-         AND newest.t = o.observed_at
-        WHERE o.signal_code NOT IN {_RANK_CODES}
-          AND o.signal_code NOT IN {_YEAR_CODES}
-        UNION ALL
-        SELECT o.* FROM observations o
-        WHERE o.signal_code IN {_YEAR_CODES}
-          AND o.rowid = (
-              SELECT n.rowid FROM observations n
-              WHERE n.company_id = o.company_id
-                AND n.signal_code = o.signal_code
-              ORDER BY CAST(n.value_text AS INTEGER) DESC, n.observed_at DESC,
-                       n.rowid DESC LIMIT 1)
-    ),
-    ranked AS (
-        SELECT o.* FROM observations o
-        WHERE o.signal_code IN {_RANK_CODES}
-          AND o.rowid = (
-              SELECT n.rowid FROM observations n
-              WHERE n.company_id = o.company_id
-                AND n.signal_code = o.signal_code
-                AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
-              ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1)
-          AND NOT (COALESCE(o.value_text, '') = '' AND EXISTS (
-              SELECT 1 FROM observations p
-              WHERE p.company_id = o.company_id
-                AND p.signal_code = o.signal_code
-                AND COALESCE(p.value_text, '') != ''))
-    ),
-    positive AS (
-        SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
-        UNION ALL
-        SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
-    ),
-    current_obs AS (
-        SELECT * FROM latest UNION ALL SELECT * FROM ranked
-    )
-    """
+    _CURRENT_CTE = _current_cte()
 
     async def signal_counts(self) -> list[dict]:
         """How many entities actually carry each signal — the cohort sizes."""
@@ -3817,7 +3848,14 @@ class StateManager:
             params[:0] = keyed_codes
         ctes.append("judged AS (SELECT c.id, c.name, c.domain, c.website, c.industry, "
                     f"c.location, {verdict} AS verdict FROM companies c WHERE {LIVE_COMPANY})")
-        return self._CURRENT_CTE.rstrip() + "".join(",\n    " + c for c in ctes) + "\n", params
+        # The matches alone, without judging every company: a leaf's true
+        # and false never hold together, so every condition true is exactly
+        # "match", and SQLite can start from the (small) sets of readings.
+        ctes.append(f"matched AS (SELECT c.id FROM companies c WHERE {LIVE_COMPANY} "
+                    f"AND {' AND '.join(trues)})")
+        codes = list(dict.fromkeys([*require, *exclude, *(r["code"] for r in ranges)]))
+        return (_current_cte(len(codes)).rstrip() + "".join(",\n    " + c for c in ctes) + "\n",
+                codes * 4 + params)
 
     async def cohort_verdicts(self, require: list[str], exclude: list[str],
                               ranges: list[dict] | None = None,

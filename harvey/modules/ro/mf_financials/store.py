@@ -402,9 +402,8 @@ class Filter:
         return any(v is not None for v in (self.min_turnover, self.max_turnover,
                                            self.min_employees, self.max_employees))
 
-    def sql(self, cui_column: str, alias: str = "fin") -> tuple[str, list]:
-        """A WHERE condition on a row holding ``cui_column``, with the
-        financials database attached as ``alias``."""
+    def _parts(self) -> tuple[list[str], list]:
+        """The bounds on a ``latest`` row aliased ``l``, and their arguments."""
         parts, args = [], []
         for column, low, high in (("turnover", self.min_turnover, self.max_turnover),
                                   ("employees", self.min_employees, self.max_employees)):
@@ -422,6 +421,12 @@ class Filter:
                 parts.append(f"(l.{column} IS NULL OR ({bound}))")
             else:
                 parts.append(f"(l.{column} IS NOT NULL AND {bound})")
+        return parts, args
+
+    def sql(self, cui_column: str, alias: str = "fin") -> tuple[str, list]:
+        """A WHERE condition on a row holding ``cui_column``, with the
+        financials database attached as ``alias``."""
+        parts, args = self._parts()
         if not parts:
             return "1", []
         cond = " AND ".join(parts)
@@ -432,6 +437,19 @@ class Filter:
                     f" AND {cond}))", args)
         return (f"EXISTS (SELECT 1 FROM {alias}.latest l WHERE l.cui = {cui_column} "
                 f"AND {cond})", args)
+
+    def in_sql(self, cui_column: str, alias: str = "fin") -> tuple[str, list]:
+        """The same condition as ``sql()``, written as IN over the matching
+        CUIs: SQLite reads them once and looks each company up by its CUI,
+        instead of probing the statements for every row it scans."""
+        parts, args = self._parts()
+        if not parts:
+            return "1", []
+        matching = f"SELECT l.cui FROM {alias}.latest l WHERE {' AND '.join(parts)}"
+        if self.unknown == "include":
+            return (f"({cui_column} NOT IN (SELECT l.cui FROM {alias}.latest l) "
+                    f"OR {cui_column} IN ({matching}))", args)
+        return f"({cui_column} != '' AND {cui_column} IN ({matching}))", args
 
 
 def attach(con, path: Path | None = None, alias: str = "fin") -> bool:

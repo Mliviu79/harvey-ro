@@ -42,6 +42,7 @@ Functions here take an open connection and never commit, like the resolver.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -677,7 +678,25 @@ class ContactFilter:
     locality: str = ""
     website: str = ""           # "yes" | "no": the company has a website
     q: str = ""
-    # The cohort condition (a WITH clause ending in ``judged`` and its
+    # The company does one of these CAEN classes (4-digit codes; words are
+    # turned into codes by the caller, harvey.caen.codes_for).
+    caen: tuple[str, ...] = ()
+    # The company is reached by a contact: "any", a kind ("phone", "email",
+    # ...), "mobile" (a phone on a mobile line), or "none" (no contact).
+    contact: str = ""
+    # The company was found in this source (company_sources).
+    found_in: str = ""
+    # The company matches this full-text expression (the Companies page's
+    # search box: state.search_terms), or has this CUI (digits).
+    search: str = ""
+    cui: str = ""
+    # Nothing can match (a search of single letters or common words only).
+    nothing: bool = False
+    # The place values (companies.location) the county and locality name,
+    # worked out once over the distinct places (place_matches); None: the
+    # conditions fold every company's place instead.
+    places: tuple[str, ...] | None = None
+    # The cohort condition (a WITH clause defining ``judged`` and ``matched``, and its
     # parameters, from StateManager._verdict_sql): a company must match it.
     cohort: tuple[str, list] | None = None
     # A financials condition on the company's CUI (mf_financials Filter.sql,
@@ -696,12 +715,42 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in plain if not unicodedata.combining(ch)).lower()
 
 
-def _company_conditions(f: ContactFilter, possible: bool = False) -> tuple[list[str], list]:
+def place_matches(location: str, county: str = "", locality: str = "") -> bool:
+    """Whether a place ("Town, County, Country") is in the county and
+    locality, exactly as the SQL conditions below decide it (the place
+    folded as sql_name_norm, the typed words as _fold; LIKE ignores ASCII
+    case only, and both sides are already lower case there)."""
+    folded = name_norm(location or "")
+    locality, county = (locality or "").strip(), (county or "").strip()
+    if locality and not (folded + ",").startswith(_fold(locality) + ","):
+        return False
+    if county and (", " + _fold(county) + ",") not in (", " + folded + ","):
+        return False
+    return True
+
+
+def _company_conditions(f: ContactFilter, possible: bool = False,
+                        probe: bool = False) -> tuple[list[str], list]:
     """Conditions on a company aliased ``c``. ``possible`` lets a company
     the cohort can't judge yet (a signal not checked) through, as the
-    contact finder does: unknown is searched."""
+    contact finder does: unknown is searched. ``probe``: the company is
+    already chosen (a correlated subquery, one contact's links), so each
+    set is only checked, never walked to find companies (``+c.id`` keeps
+    SQLite from starting at the set: for every contact it would otherwise
+    go through all the set's companies)."""
     conds, params = ["COALESCE(c.merged_into, '') = ''"], []
+    on = "+c." if probe else "c."
+    if f.places is not None and (f.county.strip() or f.locality.strip()):
+        # The places worked out beforehand: an index lookup per place
+        # instead of folding every company's.
+        if f.places:
+            conds.append(f"{on}location IN ({','.join('?' * len(f.places))})")
+            params += list(f.places)
+        else:
+            conds.append("0")
     for value, part in ((f.locality, "locality"), (f.county, "county")):
+        if f.places is not None:
+            break
         value = (value or "").strip()
         if not value:
             continue
@@ -718,11 +767,50 @@ def _company_conditions(f: ContactFilter, possible: bool = False) -> tuple[list[
         conds.append("(COALESCE(c.domain, '') != '' OR COALESCE(c.website, '') != '')")
     elif f.website == "no":
         conds.append("COALESCE(c.domain, '') = '' AND COALESCE(c.website, '') = ''")
+    if f.caen:
+        codes = [c for c in f.caen if c.isdigit() and len(c) == 4][:200]
+        if codes:
+            conds.append(f"{on}id IN (SELECT a.company_id FROM company_activities a "
+                         f"WHERE a.code IN ({','.join('?' * len(codes))}))")
+            params += codes
+        else:
+            conds.append("0")
+    # IN over rowids, not EXISTS: SQLite reads the (usually small) set once
+    # and looks each company up by rowid, instead of probing the links for
+    # every company it scans.
+    linked = ("SELECT x.rowid FROM company_contacts l JOIN companies x ON x.id = l.company_id")
+    if f.contact == "none":
+        conds.append(f"{on}rowid NOT IN ({linked})")
+    elif f.contact == "any":
+        conds.append(f"{on}rowid IN ({linked})")
+    elif f.contact:
+        kind, line = ("phone", "mobile") if f.contact == "mobile" else (f.contact, "")
+        conds.append(f"{on}rowid IN ({linked} JOIN contacts k ON k.id = l.contact_id "
+                     "WHERE k.kind = ?" + (" AND k.line_type = ?" if line else "") + ")")
+        params += [kind, line] if line else [kind]
+    if f.found_in:
+        conds.append(f"{on}id IN (SELECT s.company_id FROM company_sources s WHERE s.source = ?)")
+        params.append(f.found_in)
+    if f.cui:
+        # A UNION of two index lookups (an OR would scan every company).
+        conds.append(f"{on}rowid IN (SELECT x.rowid FROM companies x WHERE x.cui IN (?, ?) "
+                     "AND x.cui != '' UNION SELECT x.rowid FROM company_ids i JOIN companies x "
+                     "ON x.id = i.company_id WHERE i.kind = 'cui' AND i.value IN (?, ?))")
+        params += [f.cui, "RO" + f.cui, f.cui, "RO" + f.cui]
+    elif f.search:
+        conds.append(f"{on}id IN (SELECT company_id FROM company_search WHERE company_search MATCH ?)")
+        params.append(f.search)
+    if f.nothing:
+        conds.append("0")
     if f.cohort is not None:
-        verdicts = "('match', 'possible')" if possible else "('match')"
-        conds.append(f"c.id IN (SELECT id FROM judged WHERE verdict IN {verdicts})")
+        if possible:
+            conds.append(f"{on}id IN (SELECT id FROM judged WHERE verdict IN ('match', 'possible'))")
+        else:
+            conds.append(f"{on}id IN (SELECT id FROM matched)")
     if f.figures is not None:
         cond, args = f.figures
+        if probe:
+            cond = re.sub(r"\bc\.cui\b", "+c.cui", cond)
         conds.append(cond)
         params += list(args)
     return conds, params
@@ -780,7 +868,7 @@ def contact_query(f: ContactFilter) -> tuple[str, str, list]:
     if f.trust in TRUST_LEVELS:
         conds.append(f"{TRUST_RANK} = ?")
         params.append(TRUST_LEVELS.index(f.trust))
-    company, company_args = _company_conditions(f)
+    company, company_args = _company_conditions(f, probe=True)
     link = ["l.contact_id = ct.id", *company]
     if f.source:
         link.append("l.source = ?")

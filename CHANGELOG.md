@@ -9,6 +9,22 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Companies page: sort, filters, pages and the whole record.** Sort by
+  newest found, name, town and county, turnover, employees, contacts or last
+  searched, either way; filter by county, town, activity (CAEN codes or
+  words), website, has a contact (any, phone, mobile, email, none), source,
+  signals, turnover and employees, and the search box (words or a CUI): the
+  Contacts page's filter language, so the Actions menu's export, ANAF check
+  and Find contacts take the same list. Exact totals, page numbers, a page
+  box and the page size. Unfiltered pages read partial indexes on live
+  companies (migration v23: newest, name, place), so page 10,000 takes
+  about 20 ms of SQL; any other list is ordered once and kept up to five
+  minutes (dropped at once when a company in it gains a contact, a search or
+  a source the list depends on), so every page after the first is a slice.
+  A number no company has as its CUI is searched as a word, as before. The company panel adds
+  every CUI, every financial year, the trade registry's row (classes,
+  administrators), ANAF's kept answer, the taxpayer file, each person's own
+  contacts, and Find contacts / Search again for that company.
 - **Discover finds websites for what it saves with none.** On by default
   ("Also find websites, up to $X"; `--websites-max-spend`,
   `--no-find-websites`; `find_websites` / `websites_max_spend` in the API):
@@ -363,6 +379,15 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Signal, county and activity filters at install size.** A signal filter
+  (has / lacks) reads only that signal's readings instead of every
+  observation, and the matches without judging every company: on 1.78M
+  companies, 15-19 s became 4-6 s on the Companies page, and on the
+  Contacts page, where it ran past ten minutes, about 11 s. A county or town is
+  matched once against the distinct places and then read from the place
+  index (4.6 s to about 0.5 s). The Contacts page checks each contact's own
+  companies against these sets instead of walking them.
 
 - **Replies remember the whole conversation** (closes #97). A reply was
   written from the last six messages only, so a requirement the prospect

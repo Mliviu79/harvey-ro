@@ -732,7 +732,7 @@ async function anafCheck(body) {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
   });
   if (!res || !res.success) { showToast(failMsg(res, t('pd.anaf_failed', {error: ''})), 'error'); return; }
-  showToast(t('pd.anaf_started'));
+  showToast(res.capped ? t('pd.anaf_started_capped', {n: fmtN(res.capped), total: fmtN(res.matched)}) : t('pd.anaf_started'));
   loadPublicData();
   clearTimeout(_anafWatch);
   _anafWatch = setTimeout(watchAnaf, 2000);
@@ -3013,18 +3013,39 @@ function pagerHtml(state, total, fn, opts) {
     '<span class="pager-range">' + escHtml(t(o.more ? 'page.range_more' : 'page.range', {from: from, to: to, total: total})) + '</span>' +
     (o.jump ? '<label class="pager-size"><span>' + escHtml(t('page.page')) + '</span>' +
       '<input class="form-input" type="number" min="1"' + (o.more ? '' : ' max="' + pages + '"') +
-      ' value="' + (Math.floor(state.offset / state.limit) + 1) + '" onchange="' + fn + '(\'page\', this.value)" ' +
+      ' value="' + (Math.floor(state.offset / state.limit) + 1) + '" ' +
+      'onchange="if (this.dataset.sent !== this.value) ' + fn + '(\'page\', this.value)" ' +
+      'onkeydown="if (event.key === \'Enter\') { event.preventDefault(); this.dataset.sent = this.value; ' + fn + '(\'page\', this.value); }" ' +
       'aria-label="' + escHtml(t('page.page')) + '" style="width:6em"></label>' : '') +
     '<label class="pager-size"><span>' + escHtml(t('page.per_page')) + '</span>' +
       '<select class="form-input" onchange="' + fn + '(\'size\', this.value)" aria-label="' + escHtml(t('page.per_page')) + '">' +
       PAGE_SIZES.map(n => '<option value="' + n + '"' + (n === state.limit ? ' selected' : '') + '>' + n + '</option>').join('') +
       '</select></label>' +
+    (o.numbers ? pageNumbersHtml(state, total, fn) : '') +
     '<span class="pager-btns">' +
       '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'prev\')"' + (state.offset > 0 ? '' : ' disabled') +
         ' aria-label="' + escHtml(t('page.prev')) + '" title="' + escHtml(t('page.prev')) + '">' + icon('chev-left') + '</button>' +
       '<button class="btn btn-secondary btn-sm btn-icon" onclick="' + fn + '(\'next\')"' + (to < total || (o.more && to === total) ? '' : ' disabled') +
         ' aria-label="' + escHtml(t('page.next')) + '" title="' + escHtml(t('page.next')) + '">' + icon('chev-right') + '</button>' +
     '</span></div>';
+}
+
+// Page numbers around the current one, plus the first and the last.
+function pageNumbersHtml(state, total, fn) {
+  const pages = Math.max(1, Math.ceil(total / state.limit));
+  const cur = Math.floor(state.offset / state.limit) + 1;
+  if (pages < 2) return '';
+  const want = new Set([1, pages, cur - 2, cur - 1, cur, cur + 1, cur + 2].filter(n => n >= 1 && n <= pages));
+  const list = [...want].sort((a, b) => a - b);
+  let html = '<span class="pager-nums" role="group" aria-label="' + escHtml(t('page.pages')) + '">';
+  list.forEach((n, i) => {
+    if (i && n - list[i - 1] > 1) html += '<span class="pager-gap" aria-hidden="true">…</span>';
+    html += n === cur
+      ? '<button class="btn btn-primary btn-sm" aria-current="page" disabled>' + escHtml(fmtN(n)) + '</button>'
+      : '<button class="btn btn-ghost btn-sm" onclick="' + fn + '(\'page\', ' + n + ')" aria-label="' +
+        escHtml(t('page.go', {n: fmtN(n)})) + '">' + escHtml(fmtN(n)) + '</button>';
+  });
+  return html + '</span>';
 }
 
 function pageMove(state, how, value) {
@@ -3090,11 +3111,52 @@ function stamp() {
 
 // ── Companies: phone and email first ──
 //
-// Server-side pages: /api/companies/search when there is a query, else
-// /api/companies. The search box and the selection live outside the rows,
-// so the 15-second refresh re-renders them without losing either.
+// One server-side page of /api/companies: sorted, filtered (the Contacts
+// page's company filters, plus activity, contact and source), with the
+// total and page numbers. The search box, the filters and the selection
+// live outside the rows, so a refresh re-renders the rows without losing
+// any of them. A page cut from a kept ordering (a filter, or a sort by a
+// figure) isn't refetched every 15 seconds: the ordering is the costly part.
 
-let _co = { q: '', offset: 0, limit: 50, total: 0, selected: new Set(), timer: null, gen: 0 };
+let _co = { q: '', f: {}, sort: '', dir: '', offset: 0, limit: loadPageSize(), total: 0, selected: new Set(),
+            timer: null, gen: 0, pagedBy: '', sources: [], financials: false, error: '', ms: 0 };
+// [sort key, label key]: what the Sort menu offers (relevance only with a search).
+const COMPANY_SORTS = [['created', 'co.sort.created'], ['name', 'co.sort.name'], ['place', 'co.sort.place'],
+                       ['turnover', 'co.sort.turnover'], ['employees', 'co.sort.employees'],
+                       ['contacts', 'co.sort.contacts'], ['searched', 'co.sort.searched']];
+const COMPANY_CONTACT_FILTERS = [['any', 'co.f.contact_any'], ['phone', 'co.f.contact_phone'], ['mobile', 'co.f.contact_mobile'],
+                                 ['email', 'co.f.contact_email'], ['none', 'co.f.contact_none']];
+
+function companyFilter() {
+  const f = Object.assign({}, _co.f);
+  if (_co.q.trim()) f.search = _co.q.trim();
+  return f;
+}
+
+function companyParams() {
+  const p = new URLSearchParams();
+  const f = companyFilter();
+  Object.keys(f).forEach(k => { if (f[k] !== '' && f[k] !== undefined) p.set(k, f[k]); });
+  if (_co.sort) p.set('sort', _co.sort);
+  if (_co.dir) p.set('dir', _co.dir);
+  p.set('limit', _co.limit);
+  p.set('offset', _co.offset);
+  return p.toString();
+}
+
+// A GET whose refusal says why (a bad filter): {ok, body}, or null offline.
+async function apiRead(path) {
+  try {
+    const r = await authFetch(path);
+    if (await lockIfRefused(r)) return null;
+    const body = await r.json().catch(() => null);
+    if (!r.ok && !(body && body.error)) { _lastFail = r.status; return null; }
+    return {ok: r.ok, body: body || {}};
+  } catch {
+    _lastFail = 'network';
+    return null;
+  }
+}
 
 async function loadCompanies() {
   const el = document.getElementById('companies-list');
@@ -3105,42 +3167,76 @@ async function loadCompanies() {
         'data-i18n-placeholder="' + searchPh('co') + '" data-i18n-aria="co.search_label" ' +
         'placeholder="' + escHtml(t(searchPh('co'))) + '" aria-label="' + escHtml(t('co.search_label')) + '" ' +
         'oninput="companySearchInput(this.value)"></label>' +
+      '<div id="company-sort"></div>' +
       '<div id="company-dupes"></div><div id="company-actions"></div>' +
-      '</div><div id="dupes-panel"></div><div id="company-selbar"></div><div id="company-rows"></div>';
+      '</div><details class="more-fields" id="co-more"><summary id="co-more-sum"></summary><div id="co-filters"></div></details>' +
+      '<div id="dupes-panel"></div><div id="company-selbar"></div><div id="company-rows"></div>';
     document.getElementById('company-search').value = _co.q;
+    renderCompanyFilters();
   }
+  if (_cv.signals === null) loadSignalChoices(renderCompanyFilters);
+  renderCompanySort();
   const rowsEl = document.getElementById('company-rows');
   const q = _co.q.trim();
   const gen = ++_co.gen;
   loadDuplicates();
-  const res = q
-    ? await api('/api/companies/search?limit=' + _co.limit + '&offset=' + _co.offset + '&q=' + encodeURIComponent(q))
-    : await api('/api/companies?limit=' + _co.limit + '&offset=' + _co.offset);
+  if (q && q.split(/\s+/).every(w => w.startsWith('-'))) {
+    _co.total = 0;
+    _companies = [];
+    renderCompanyActions();
+    rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t('co.only_excluded'))) + '</div>';
+    return;
+  }
+  if (!_companies.length) rowsEl.innerHTML = '<div class="table-card"><div class="skeleton"></div><div class="skeleton"></div></div>';
+  const got = await apiRead('/api/companies?' + companyParams());
   if (gen !== _co.gen) return;                       // a newer page or search is on its way
-  if (!res || !document.getElementById('company-rows')) { rowsEl.innerHTML = offlineState(); return; }
+  if (!got || !document.getElementById('company-rows')) { rowsEl.innerHTML = offlineState(); return; }
+  const res = got.body;
+  if (!got.ok) {
+    _co.total = 0;
+    _companies = [];
+    renderCompanyActions();
+    rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), escHtml(t('cl.bad_filter')), escHtml(res.error || '')) + '</div>';
+    return;
+  }
   const data = res.companies || [];
-  _co.total = res.total || 0;
+  const facets = JSON.stringify([res.sources, res.financials]);
+  const changed = facets !== JSON.stringify([_co.sources, _co.financials]);
+  Object.assign(_co, {total: res.total || 0, pagedBy: res.paged_by || '', sources: res.sources || [],
+                      financials: !!res.financials, ms: res.ms || 0});
+  if (res.sort && res.sort !== _co.sort && _co.sort) _co.sort = res.sort;   // the server fell back
   if (!data.length && _co.offset > 0 && _co.total > 0) {   // the list shrank: back to page one
     _co.offset = 0;
     return loadCompanies();
   }
+  if (changed) renderCompanyFilters();
   _companies = data;
+  _co.shownDir = res.dir || '';
+  _co.shownSort = res.sort || '';
+  renderCompanySort();
   renderCompanyActions();
   renderCompanySelbar();
   if (!data.length) {
-    const onlyExcluded = q && q.split(/\s+/).every(w => w.startsWith('-'));
-    rowsEl.innerHTML = '<div class="table-card">' + (q
-      ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t(onlyExcluded ? 'co.only_excluded' : 'co.no_match_copy')))
+    const filtered = q || Object.keys(_co.f).length;
+    rowsEl.innerHTML = '<div class="table-card">' + (filtered
+      ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t(q ? 'co.no_match_copy' : 'cl.no_match_copy')))
       : emptyState(icon('companies'), escHtml(t('co.empty')), t('co.empty_copy'))) + '</div>';
     return;
   }
   const allOn = data.every(c => _co.selected.has(c.id));
+  const th = (key, label) => {
+    if (!key) return '<th>' + escHtml(t(label)) + '</th>';
+    const on = _co.shownSort === key;
+    return '<th aria-sort="' + (on ? (_co.shownDir === 'asc' ? 'ascending' : 'descending') : 'none') + '">' +
+      '<button type="button" class="link-btn" onclick="sortCompanies(\'' + key + '\')" title="' + escHtml(t('cl.sort_by', {col: t(label)})) + '">' +
+      escHtml(t(label)) + (on ? (_co.shownDir === 'asc' ? ' &#9650;' : ' &#9660;') : '') + '</button></th>';
+  };
   let html = selectPageMobile(allOn, 'selectCompanyPage') + '<div class="table-card"><table class="data co-table"><thead><tr>' +
     '<th class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.page')) + '"' + (allOn ? ' checked' : '') +
       ' onchange="selectCompanyPage(this.checked)"></th>' +
-    '<th>' + escHtml(t('co.col.company')) + '</th><th>' + escHtml(t('co.col.phone')) + '</th><th>' +
-    escHtml(t('co.col.email')) + '</th><th>' + escHtml(t('co.col.activities')) + '</th><th>' +
-    escHtml(t('co.col.source')) + '</th></tr></thead><tbody>';
+    th('name', 'co.col.company') + th(null, 'co.col.phone') + th(null, 'co.col.email') + th(null, 'co.col.activities') +
+    (_co.financials ? th('turnover', 'co.col.turnover') : '') + th('contacts', 'co.col.contacts') +
+    th('created', 'co.col.source') + '</tr></thead><tbody>';
   data.forEach((c, i) => {
     const on = _co.selected.has(c.id);
     html += '<tr class="clickable' + (on ? ' selected' : '') + '" onclick="rowOpen(event, ' + i + ')">' +
@@ -3152,9 +3248,141 @@ async function loadCompanies() {
       '<td class="co-phone" data-label="' + escHtml(t('co.col.phone')) + '">' + phoneCell(c) + '</td>' +
       '<td class="co-email" data-label="' + escHtml(t('co.col.email')) + '">' + emailCell(c) + '</td>' +
       '<td class="co-acts" data-label="' + escHtml(t('co.col.activities')) + '">' + companyActivities(c) + '</td>' +
-      '<td class="co-src muted" data-label="' + escHtml(t('co.col.source')) + '">' + sourceLabel(c.source) + '</td></tr>';
+      (_co.financials ? '<td class="co-figs nowrap" data-label="' + escHtml(t('co.col.turnover')) + '">' + figuresCell(c.figures) + '</td>' : '') +
+      '<td class="co-count" data-label="' + escHtml(t('co.col.contacts')) + '">' + (c.contacts ? fmtN(c.contacts) : '<span class="none">0</span>') + '</td>' +
+      '<td class="co-src muted" data-label="' + escHtml(t('co.col.source')) + '"><div class="cell-stack"><span>' + sourceLabel(c.source) + '</span>' +
+        '<span class="cell-sub">' + escHtml(t('co.found', {when: relTime(c.created_at)})) +
+        (c.searched_at ? ' · ' + escHtml(t('co.searched', {when: relTime(c.searched_at)})) : '') + '</span></div></td></tr>';
   });
-  rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_co, _co.total, 'pageCompanies');
+  rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_co, _co.total, 'pageCompanies', {jump: true, numbers: true});
+}
+
+// Turnover (lei) and headcount of the latest year filed, or a dash.
+function figuresCell(f) {
+  if (!f || (f.turnover === null && f.employees === null)) return '<span class="none">—</span>';
+  return '<div class="cell-stack"><span class="mono">' + (f.turnover === null ? '—' : escHtml(fmtLei(f.turnover))) + '</span>' +
+    '<span class="cell-sub">' + escHtml([f.employees === null ? '' : t('co.staff', {n: f.employees}), f.year ? String(f.year) : '']
+      .filter(Boolean).join(' · ')) + '</span></div>';
+}
+
+function fmtLei(n) {
+  return fmtN(Math.round(Number(n))) + ' lei';
+}
+
+function renderCompanySort() {
+  const el = document.getElementById('company-sort');
+  if (!el) return;
+  const searching = !!_co.q.trim();
+  const opts = (searching ? [['relevance', 'co.sort.relevance']] : []).concat(
+    COMPANY_SORTS.filter(s => _co.financials || (s[0] !== 'turnover' && s[0] !== 'employees')));
+  const current = _co.sort || (searching ? 'relevance' : 'created');
+  const dir = _co.shownDir || _co.dir || 'desc';
+  el.innerHTML = '<div class="sort-pick"><label class="sr-only" for="co-sort">' + escHtml(t('co.sort.label')) + '</label>' +
+    '<select class="form-input" id="co-sort" onchange="setCompanySort(this.value)" aria-label="' + escHtml(t('co.sort.label')) + '">' +
+    opts.map(o => '<option value="' + o[0] + '"' + (o[0] === current ? ' selected' : '') + '>' + escHtml(t(o[1])) + '</option>').join('') +
+    '</select>' + (current === 'relevance' ? '' :
+    '<button type="button" class="btn btn-secondary btn-sm btn-icon" onclick="flipCompanySort()" aria-label="' +
+      escHtml(t(dir === 'asc' ? 'co.sort.asc' : 'co.sort.desc')) + '" title="' + escHtml(t(dir === 'asc' ? 'co.sort.asc' : 'co.sort.desc')) + '">' +
+      (dir === 'asc' ? '&#9650;' : '&#9660;') + '</button>') + '</div>';
+}
+
+function setCompanySort(key) {
+  _co.sort = key === 'relevance' ? '' : key;
+  _co.dir = '';
+  _co.offset = 0;
+  loadCompanies();
+}
+
+function flipCompanySort() {
+  const dir = _co.shownDir || _co.dir || 'desc';
+  if (!_co.sort) _co.sort = _co.shownSort && _co.shownSort !== 'relevance' ? _co.shownSort : 'created';
+  _co.dir = dir === 'asc' ? 'desc' : 'asc';
+  _co.offset = 0;
+  loadCompanies();
+}
+
+function sortCompanies(key) {
+  if ((_co.shownSort || _co.sort) === key) _co.dir = (_co.shownDir || 'desc') === 'asc' ? 'desc' : 'asc';
+  else _co.dir = '';
+  _co.sort = key;
+  _co.offset = 0;
+  loadCompanies();
+}
+
+// The confirmed signals, for the require/exclude filters (shared with the
+// Contacts page).
+function loadSignalChoices(then) {
+  _cv.signals = [];
+  api('/api/signals').then(res => {
+    _cv.signals = [];
+    ((res && res.groups) || []).forEach(g => (g.signals || []).forEach(sig => {
+      if (sig.status === 'confirmed') _cv.signals.push({code: sig.code, label: sig.label || sig.code});
+    }));
+    renderContactFilters();
+    if (then) then();
+  });
+}
+
+function renderCompanyFilters() {
+  const el = document.getElementById('co-filters');
+  if (!el) return;
+  const f = _co.f;
+  const n = Object.keys(f).filter(k => k !== 'unknown').length;
+  const sum = document.getElementById('co-more-sum');
+  if (sum) sum.textContent = n ? t('co.filters_n', {n: n}) : t('cl.filters');
+  const opt = (value, label, current) => '<option value="' + escHtml(value) + '"' + (String(current || '') === value ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  const select = (key, label, options) => '<div class="form-group"><label class="form-label" for="co-f-' + key + '">' + escHtml(t(label)) + '</label>' +
+    '<select class="form-input" id="co-f-' + key + '" onchange="setCompanyFilter(\'' + key + '\', this.value)">' +
+    opt('', t('cl.f.any'), f[key]) + options.map(o => opt(o[0], o[1], f[key])).join('') + '</select></div>';
+  const input = (key, label, type, ph) => '<div class="form-group"><label class="form-label" for="co-f-' + key + '">' + escHtml(t(label)) + '</label>' +
+    '<input class="form-input" id="co-f-' + key + '" type="' + (type || 'text') + '" value="' + escHtml(f[key] || '') + '"' +
+    (ph ? ' placeholder="' + escHtml(t(ph)) + '"' : '') + ' oninput="setCompanyFilter(\'' + key + '\', this.value)"></div>';
+  const yesNo = [['yes', t('cl.f.yes')], ['no', t('cl.f.no')]];
+  const signals = (_cv.signals || []).map(s => [s.code, tServer('sigc.' + s.code + '.label', s.label)]);
+  let html = '<div class="form-row">' + input('county', 'cl.f.county') + input('locality', 'cl.f.locality') +
+    input('caen', 'co.f.caen', 'text', 'co.f.caen_ph') + '</div><div class="form-row">' +
+    select('website', 'cl.f.website', yesNo) +
+    select('contact', 'co.f.contact', COMPANY_CONTACT_FILTERS.map(v => [v[0], t(v[1])])) +
+    select('found_in', 'cl.f.source', (_co.sources || []).map(v => [v, sourceText(v)])) + '</div><div class="form-row">' +
+    select('require', 'cl.f.require', signals) + select('exclude', 'cl.f.exclude', signals) + '</div>' +
+    (f.require || f.exclude ? '<p class="muted small">' + escHtml(t('co.f.signals_hint')) + '</p>' : '');
+  if (_co.financials) {
+    html += '<div class="form-row">' + input('min_turnover', 'cl.f.min_turnover', 'number') + input('max_turnover', 'cl.f.max_turnover', 'number') +
+      input('min_employees', 'cl.f.min_employees', 'number') + input('max_employees', 'cl.f.max_employees', 'number') +
+      '<div class="form-group"><label class="form-label"><input type="checkbox"' + (f.unknown === 'include' ? ' checked' : '') +
+      ' onchange="setCompanyFilter(\'unknown\', this.checked ? \'include\' : \'\')"> ' + escHtml(t('cl.f.unknown')) + '</label></div></div>';
+  }
+  // Redrawn while someone types in it (the sources or signals arrived):
+  // keep the focus and the caret in the same box.
+  const active = el.contains(document.activeElement) ? document.activeElement : null;
+  const end = active && active.value ? active.value.length : 0;
+  const caret = active && /^(text|search)$/.test(active.type) ? [active.selectionStart ?? end, active.selectionEnd ?? end] : null;
+  el.innerHTML = html + '<div class="btn-row"><button class="btn btn-ghost btn-sm" onclick="clearCompanyFilters()">' +
+    escHtml(t('cl.f.clear')) + '</button></div>';
+  const again = active && active.id ? document.getElementById(active.id) : null;
+  if (again) {
+    if ('value' in active && again.tagName === 'INPUT' && again.type !== 'checkbox') again.value = active.value;
+    again.focus();
+    if (caret) try { again.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text box */ }
+  }
+}
+
+function setCompanyFilter(key, value) {
+  if (value === '' || value === null || value === undefined) delete _co.f[key]; else _co.f[key] = String(value);
+  _co.offset = 0;
+  const sum = document.getElementById('co-more-sum');
+  const n = Object.keys(_co.f).filter(k => k !== 'unknown').length;
+  if (sum) sum.textContent = n ? t('co.filters_n', {n: n}) : t('cl.filters');
+  if (key === 'require' || key === 'exclude') renderCompanyFilters();
+  clearTimeout(_co.timer);
+  _co.timer = setTimeout(loadCompanies, 300);
+}
+
+function clearCompanyFilters() {
+  _co.f = {};
+  _co.offset = 0;
+  renderCompanyFilters();
+  loadCompanies();
 }
 
 // ── Possible duplicates ──
@@ -3378,7 +3606,7 @@ function renderCompanyActions() {
   const el = document.getElementById('company-actions');
   if (!el) return;
   const n = _co.selected.size;
-  const all = _co.q.trim() ? t('actions.all_results', {n: _co.total}) : t('actions.all_companies', {n: _co.total});
+  const all = Object.keys(companyFilter()).length ? t('actions.all_results', {n: _co.total}) : t('actions.all_companies', {n: _co.total});
   el.innerHTML = menuHtml('company-menu', [
     {sep: true, label: t('actions.selection', {n: n})},
     {label: t('actions.csv'), action: 'exportCompanies(\'csv\', true)', disabled: !n},
@@ -3396,24 +3624,31 @@ function renderCompanyActions() {
 // The contact finder for the selection, or the search's results (every
 // company when nothing is searched): priced first, then run under a cap.
 function findForCompanies(selection) {
-  const body = selection ? {company_ids: [..._co.selected], force: true}
-                         : {filter: _co.q.trim() ? {q: _co.q.trim()} : {}};
+  const body = selection ? {company_ids: [..._co.selected], force: true} : {filter: companyFilter()};
   openFinder('dupes-panel', body);
 }
 
-// Check the selection, the search's results or every company at ANAF.
+// The page's list (its filters and sort), or every company when nothing narrows it.
+function companyListBody() {
+  const f = companyFilter();
+  return Object.keys(f).length ? {filter: f, sort: _co.sort, dir: _co.dir} : {};
+}
+
+// Check the selection, the list's results or every company at ANAF.
 function anafCompanies(selection) {
-  anafCheck(selection ? {ids: [..._co.selected]} : (_co.q.trim() ? {q: _co.q.trim()} : {}));
+  anafCheck(selection ? {ids: [..._co.selected]} : companyListBody());
 }
 
 function exportCompanies(format, selection) {
-  const body = selection ? {ids: [..._co.selected]} : (_co.q.trim() ? {q: _co.q.trim()} : {});
-  const name = 'firme-' + (selection ? 'selectie' : _co.q.trim() ? 'cautare' : 'toate') + '-' + stamp() + '.' + format;
+  const body = selection ? {ids: [..._co.selected]} : companyListBody();
+  const narrowed = Object.keys(companyFilter()).length;
+  const name = 'firme-' + (selection ? 'selectie' : narrowed ? 'cautare' : 'toate') + '-' + stamp() + '.' + format;
   postDownload('/api/export/companies.' + format, name, body);
 }
 
 function pageCompanies(how, value) {
   pageMove(_co, how, value);
+  if (_co.total && _co.offset >= _co.total) _co.offset = Math.floor((_co.total - 1) / _co.limit) * _co.limit;
   loadCompanies().then(() => {
     const top = document.getElementById('companies');
     if (top && how !== 'size') top.scrollIntoView({block: 'start'});
@@ -3525,10 +3760,14 @@ function renderDrawer() {
   const reach = c.reach || {};
   const peopleList = (reach.people || []).length ? reach.people.map(p => ({name: p.name, title: p.role, reached: p.reached, own: true}))
     : (c.people || []);
+  // Each person with the contacts found for them.
+  const ownContacts = name => (reach.contacts || []).filter(r => r.person && r.person === name).map(r =>
+    '<span class="person-lines">' + contactValue(r) + '</span>').join('');
   const people = peopleList.map(p =>
     '<div class="person"><span class="avatar">' + initials(...String(p.name).split(' ')) + '</span>' +
     '<div class="cell-stack"><span class="cell-main">' + escHtml(p.name) + '</span>' +
-    (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') + '</div>' +
+    (p.title ? '<span class="cell-sub">' + escHtml(roleText(p.title)) + '</span>' : '') +
+    (p.own ? ownContacts(p.name) : '') + '</div>' +
     (p.own && !p.reached ? '<span class="tag">' + escHtml(t('drawer.to_search')) + '</span>' : '') + '</div>').join('');
   const reachRows = (reach.contacts || []).map(r =>
     '<div class="drow">' + contactValue(r) +
@@ -3577,8 +3816,9 @@ function renderDrawer() {
     '<span class="drow-meta"> · ' + escHtml(f.name) + (f.observed_at ? ' · ' + escHtml(String(f.observed_at).slice(0, 10)) : '') +
     '</span></dd>').join('');
 
+  const rec = recordSections(c, section, none);
   el.innerHTML = head(escHtml(c.name), companyIdLine(c)) +
-    '<div class="drawer-scroll">' +
+    '<div class="drawer-scroll">' + rec.identity +
     section(t('drawer.phones'), 'phone', phoneRows || none(t('drawer.no_phones')), phones.length) +
     (addressRows ? section(t('drawer.addresses'), 'pin', addressRows, (findings.addresses || []).length) : '') +
     (factRows ? section(t('drawer.official'), 'layers', '<dl class="facts-list">' + factRows + '</dl>') : '') +
@@ -3587,7 +3827,11 @@ function renderDrawer() {
     section(t('drawer.people'), 'contacts', people || none(t('drawer.no_people')), peopleList.length) +
     (placeRows ? section(t('drawer.locations'), 'pin', placeRows, (reach.locations || []).length) : '') +
     (sourceRows ? section(t('drawer.sources'), 'discover', sourceRows, (reach.sources || []).length) : '') +
-    (searchRows ? section(t('drawer.searches'), 'discover', searchRows, (reach.searches || []).length) : '') +
+    rec.rest +
+    section(t('drawer.searches'), 'discover', (searchRows || none(t('drawer.never_searched'))) +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="findForOne(false)">' + escHtml(t('cl.find')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="findForOne(true)" title="' + escHtml(t('cl.find_force_title')) + '">' +
+      escHtml(t('drawer.search_again')) + '</button></div><div id="drawer-finder"></div>', (reach.searches || []).length) +
     (contacts ? section(t('drawer.contacts'), 'layers', contacts, (_drawer.contacts || []).length) : '') +
     section(t('drawer.activities'), 'companies', companyActivities(c, true)) +
     section(t('drawer.details'), 'pin', '<dl class="facts-list">' + facts.map(f => '<dt>' + escHtml(f[0]) + '</dt><dd>' + f[1] + '</dd>').join('') + '</dl>') +
@@ -3596,6 +3840,94 @@ function renderDrawer() {
     '<button class="btn btn-secondary btn-sm" onclick="exportOne(\'json\')">' + icon('download') + 'JSON</button>' +
     (c.cui ? '<button class="btn btn-secondary btn-sm" onclick="anafCheck({ids: [_drawer.id]})">' + escHtml(t('drawer.anaf')) + '</button>' : '') +
     '</div>';
+}
+
+// What the side databases hold on the company (c.record): its CUIs, every
+// financial year, the trade registry, ANAF's answer, the taxpayer file.
+// A database not loaded, or with nothing on the company, says so.
+function recordSections(c, section, none) {
+  const r = c.record;
+  if (!r) return {identity: section(t('rec.title'), 'layers', none(t('rec.unreadable'))), rest: ''};
+  const missing = part => none(t(part && part.state === 'not_loaded' ? 'rec.not_loaded' : 'rec.none'));
+  const dl = rows => '<dl class="facts-list">' + rows.filter(x => x[1] !== '' && x[1] !== null && x[1] !== undefined)
+    .map(x => '<dt>' + escHtml(x[0]) + '</dt><dd>' + x[1] + '</dd>').join('') + '</dl>';
+  const yn = v => v === null || v === undefined ? '' : escHtml(t(v ? 'drawer.yes' : 'drawer.no'));
+  const day = v => v ? escHtml(String(v).slice(0, 10)) : '';
+  const money = v => v === null || v === undefined ? '<span class="none">—</span>' : escHtml(fmtLei(v));
+  let html = '';
+
+  // Identity: CUIs (with who gave each), and the registry's or ANAF's legal form and status.
+  const firm = ((r.registry || {}).firms || [])[0];
+  const answer = ((r.anaf || {}).answers || []).find(a => a.found);
+  const cuis = (r.cuis || []).map(x => '<span class="mono">' + escHtml(x.cui) + '</span>' +
+    (x.sources.length ? ' <span class="drow-meta">' + x.sources.map(sourceLabel).join(', ') + '</span>' : '')).join('<br>');
+  const identity = section(t('rec.identity'), 'companies', dl([
+    [t('rec.cuis', {n: (r.cuis || []).length}), cuis || '<span class="none">' + escHtml(t('rec.no_cui')) + '</span>'],
+    [t('rec.legal_form'), escHtml((firm && firm.form) || (answer && answer.legal_form) || '')],
+    [t('rec.status'), escHtml((firm && firm.status) || (answer && answer.status) || '')],
+    [t('rec.registered_office'), escHtml((firm && firm.address) || c.address || '')],
+    [t('rec.registration'), firm ? '<span class="mono">' + escHtml(firm.reg) + '</span>' + (firm.registered ? ' · ' + day(firm.registered) : '') : ''],
+  ]));
+
+  // Financial years: one row per year (and CUI), newest first.
+  const fin = r.financials || {};
+  const years = fin.years || [];
+  const multi = new Set(years.map(y => y.cui)).size > 1;
+  html += section(t('rec.financials'), 'layers', years.length
+    ? '<div class="table-scroll"><table class="fin-table"><thead><tr><th>' + escHtml(t('rec.year')) + '</th>' +
+      (multi ? '<th>CUI</th>' : '') + '<th>' + escHtml(t('rec.turnover')) + '</th><th>' + escHtml(t('rec.employees')) + '</th><th>' +
+      escHtml(t('rec.net_result')) + '</th><th>' + escHtml(t('rec.equity')) + '</th><th>' + escHtml(t('rec.debts')) + '</th></tr></thead><tbody>' +
+      years.map(y => '<tr><td class="nowrap">' + escHtml(String(y.year)) + (y.form ? ' <span class="muted">' + escHtml(y.form) + '</span>' : '') + '</td>' +
+        (multi ? '<td class="mono">' + escHtml(y.cui) + '</td>' : '') +
+        '<td class="mono">' + money(y.turnover) + '</td><td class="mono">' + (y.employees === null ? '—' : escHtml(fmtN(y.employees))) + '</td>' +
+        '<td class="mono">' + money(y.net_result) + '</td><td class="mono">' + money(y.equity) + '</td><td class="mono">' + money(y.debts) + '</td></tr>').join('') +
+      '</tbody></table></div>' + (fin.from_observations ? '<p class="muted small">' + escHtml(t('rec.from_observations')) + '</p>' : '')
+    : missing(fin), years.length);
+
+  // The trade registry: registration, every CAEN class, administrators.
+  const reg = r.registry || {};
+  html += section(t('rec.registry'), 'layers', (reg.firms || []).length ? reg.firms.map(f =>
+    dl([[t('rec.name'), escHtml(f.name)], [t('rec.registration'), '<span class="mono">' + escHtml(f.reg) + '</span>'],
+        [t('rec.registered'), day(f.registered)], [t('rec.status'), escHtml(f.status || '')],
+        [t('rec.place'), escHtml([f.locality, f.county].filter(Boolean).join(', '))], [t('drawer.address'), escHtml(f.address || '')],
+        [t('drawer.website'), escHtml(f.website || '')]]) +
+    ((f.activities || []).length ? '<div class="acts">' + f.activities.map(a => '<div class="act"><span class="code">' + escHtml(a.code) +
+      '</span><span class="aname">' + escHtml(a.name || a.name_en || '') + (a.revision ? ' <span class="muted">(' + escHtml(a.revision) + ')</span>' : '') +
+      '</span></div>').join('') + '</div>' : '') +
+    ((f.administrators || []).length ? '<h4 class="dsub">' + escHtml(t('rec.administrators')) + '</h4>' + f.administrators.map(p =>
+      '<div class="drow"><span class="drow-text">' + escHtml(p.name) + '</span><span class="drow-meta">' + escHtml(p.role || '') + '</span></div>').join('') : '')
+  ).join('') + (reg.dataset ? '<p class="muted small">' + escHtml(t('rec.dataset', {name: reg.dataset})) + '</p>' : '') : missing(reg));
+
+  // ANAF's answer, as kept (30 days).
+  const anaf = r.anaf || {};
+  html += section(t('rec.anaf'), 'layers', (anaf.answers || []).length ? anaf.answers.map(a => a.found
+    ? dl([['CUI', '<span class="mono">' + escHtml(a.cui) + '</span>'], [t('rec.vat'), yn(a.vat) + (a.vat_since ? ' · ' + escHtml(t('rec.since', {date: a.vat_since})) : '')],
+          [t('rec.efactura'), yn(a.efactura)], [t('rec.inactive'), yn(a.inactive)], [t('rec.status'), escHtml(a.status || '')],
+          [t('rec.legal_form'), escHtml(a.legal_form || '')], [t('drawer.address'), (a.addresses || []).map(escHtml).join('<br>')],
+          [t('rec.phone'), (a.phones || []).map(escHtml).join(', ')], [t('rec.checked'), day(a.checked_at)]])
+    : '<p class="none">' + escHtml(t('rec.anaf_unknown', {cui: a.cui, date: String(a.checked_at || '').slice(0, 10)})) + '</p>').join('')
+    : missing(anaf));
+
+  // The Ministry of Finance's taxpayer file.
+  const tax = r.taxpayer || {};
+  html += section(t('rec.taxpayer'), 'layers', (tax.rows || []).length ? tax.rows.map(x =>
+    dl([['CUI', '<span class="mono">' + escHtml(x.cui) + '</span>'], [t('rec.name'), escHtml(x.name || '')],
+        [t('drawer.address'), escHtml(x.address || '')], [t('rec.phone'), escHtml(x.phone || '')],
+        [t('rec.vat'), yn(x.vat)], [t('rec.employer'), yn(x.employer)], [t('rec.micro'), yn(x.micro_tax)],
+        [t('rec.status'), escHtml(x.status || '')], [t('rec.published'), day(x.published)]])).join('')
+    : missing(tax));
+  // Every signal on file: its latest reading, who observed it and when.
+  const sigs = r.signals || [];
+  html += section(t('rec.signals'), 'signals', sigs.length ? '<dl class="facts-list">' + sigs.map(x =>
+    '<dt>' + escHtml(tServer('sigc.' + x.code + '.label', x.label)) + '</dt><dd>' + escHtml(factValue(x)) +
+    '<span class="drow-meta"> · ' + sourceLabel(x.module) + (x.observed_at ? ' · ' + escHtml(String(x.observed_at).slice(0, 10)) : '') +
+    '</span></dd>').join('') + '</dl>' : none(t('rec.no_signals')), sigs.length);
+  return {identity: identity, rest: html};
+}
+
+// Find contacts for the open company (or search it again everywhere).
+function findForOne(force) {
+  if (_drawer.id) openFinder('drawer-finder', {company_ids: [_drawer.id], force: !!force});
 }
 
 // The last nine digits: one number written in two ways (+40 268..., 0268...).
@@ -4830,7 +5162,8 @@ setInterval(() => {
   switch (currentTab) {
     case 'overview': loadOverview(); break;
     case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;
-    case 'companies': loadCompanies(); break;
+    // A page cut from a kept ordering isn't refetched: the ordering is the costly part.
+    case 'companies': if (_co.pagedBy !== 'snapshot') loadCompanies(); break;
     // The contacts list isn't refetched (its count is a big query): only
     // the outreach list, which the Email loop changes as it goes.
     case 'prospects': if (_cv.view === 'outreach' && !_optOut.id) loadOutreach(); break;

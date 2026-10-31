@@ -650,6 +650,23 @@ tr:hover .copy, .copy:focus-visible, .drow .copy, .copy.done { opacity: 1; }
 .pager-size select { height: 28px; width: auto; padding: 0 24px 0 8px; font-size: var(--fs-caption); }
 .pager-btns { display: inline-flex; gap: 4px; }
 .pager-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.pager-nums { display: inline-flex; align-items: center; gap: 2px; flex-wrap: wrap; }
+.pager-nums .btn { min-width: 32px; font-family: var(--num); }
+.pager-nums .btn[aria-current="page"] { opacity: 1; }
+.pager-gap { padding: 0 4px; color: var(--text-3); }
+
+/* Companies: the sort menu beside the search box. */
+.sort-pick { display: inline-flex; align-items: center; gap: 4px; }
+.sort-pick select { width: auto; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.co-count { font-family: var(--num); text-align: right; }
+
+/* The company panel's yearly figures. */
+.table-scroll { overflow-x: auto; }
+.fin-table { width: 100%; border-collapse: collapse; font-size: var(--fs-caption); }
+.fin-table th { text-align: left; font-weight: 500; color: var(--text-2); padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.fin-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.dsub { font-size: var(--fs-caption); color: var(--text-2); font-weight: 500; margin: var(--sp-3) 0 4px; }
 .table-foot { font-size: var(--fs-caption); color: var(--text-3); padding: var(--sp-3) 2px 0; }
 
 /* Actions menu */
@@ -1264,6 +1281,7 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   }
   table.data td.sel::before { display: none; }
   table.data .co-acts, table.data .co-src { display: none; }
+  table.data .co-count { text-align: left; }
   table.data td[data-label]::before { margin-top: 4px; }
   .stat-note { white-space: normal; }
   table.data a.tel { font-size: var(--fs-lead); white-space: normal; overflow-wrap: anywhere; overflow: visible; }
