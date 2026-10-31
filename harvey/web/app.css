@@ -634,6 +634,17 @@ tr:hover .copy, .copy:focus-visible, .drow .copy, .copy.done { opacity: 1; }
 .dup-sides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); }
 .dup-side { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 640px) { .dup-sides { grid-template-columns: minmax(0, 1fr); } }
+.dup-head .btn-row { flex-wrap: nowrap; }
+.dup-members { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--sp-2); }
+.dup-member { min-width: 0; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); display: grid; gap: var(--sp-1); align-content: start; }
+.dup-member.keeper { border-color: var(--accent-line); background: var(--select); }
+.dup-member.other { background: var(--surface-2); }
+.dup-member.other .dup-side { color: var(--text-3); }
+.dup-choice { display: flex; flex-wrap: wrap; gap: var(--sp-3); font-size: var(--fs-caption); color: var(--text-2); }
+.dup-pick { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; min-height: 24px; }
+.dup-pick:has(input:disabled) { cursor: not-allowed; opacity: .6; }
+.cell-sub.warn { color: var(--wait); }
+@media (max-width: 640px) { .dup-head { flex-wrap: wrap; } .dup-members { grid-template-columns: minmax(0, 1fr); } }
 
 .selbar {
   display: flex; align-items: center; gap: var(--sp-3); margin: 0 0 var(--sp-2);

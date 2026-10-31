@@ -439,15 +439,36 @@ in its town) is kept, and each new record is scored against them: the same
 CUI, registration number or listing is the same record; the same domain counts
 0.9 (free mailboxes, directories, social networks, booking platforms, link
 shorteners and a site two companies already share never count), the same
-phone 0.8 (unless more than two companies share it), the same name without its
+phone 0.8 and the same email 0.8 (never one on a free-mail provider such as
+gmail.com or yahoo.ro), each counted by how many firms (CUIs) hold it: shared by
+two or three firms it only puts a listing up for review, by more it is a chain's
+switchboard and counts for nothing, and with no firm behind it more than two
+records sharing it count for nothing either. The same name without its
 legal form (`SRL`, `S.R.L.`, `PFA`, `LLC`... listed in
 `harvey/reference/legal_forms.csv`) in the same town 0.7, and kinds of evidence
 add up. At 0.85 or more the records are merged; from 0.6 they stay apart and the
 pair waits under **Possible duplicates** on the Companies tab (or
-`harvey duplicates`) for you to say "same company" or "different companies".
+`harvey duplicates`). The list shows groups, not pairs: every pair still to
+decide, each side followed to the company it stands for now, joined with the
+pairs it shares a company with, so four listings of one business are one
+decision. Pick the record to keep (the registry's, or the one holding most, is
+chosen for you), untick any that aren't the same company, and merge the rest in
+one go, or take some out of the group, or say they are all different.
+A contact counts by who holds it, because a contact is many to many: a phone,
+email or website only one registered firm has makes the listings without a CUI
+holding it that firm's branches (merged on their own for a website or for up to
+three listings; more wait as one group); one two or three firms share is never
+evidence between them and only puts a listing up for review against each; one
+more firms share is a chain's switchboard and counts for nothing. When the
+companies merged have different addresses or towns, each merged one's place
+becomes one of the kept company's **locations**, its phone reached through it.
+**Look again** (or `harvey duplicates --scan`, a job on the duplicates lane)
+scores every company on file against the others, for keys that arrived after a
+company was saved, such as an email the contact finder found.
 Two different CUIs are never merged, no model ever decides, nothing is deleted:
 a merge moves one record's facts onto the other, fills only what the other
-lacked, and can be undone; an undone pair goes back on the review list. So a
+lacked, and can be undone, one member at a time or a whole group at once; an
+undone pair goes back on the review list and is never merged on its own again. So a
 map hit for a registry firm with no website joins the firm instead of becoming
 a second company. Companies already on file are matched against each other once,
 on upgrade, by the same rules. A town nearby
@@ -897,8 +918,9 @@ harvey caen 8623             # what a CAEN code means (every revision), or the c
 harvey modules list          # the modules Harvey is made of, on or off (--json)
 harvey modules enable <id>   # turn one on (disable <id> turns it off; nothing is deleted)
 harvey caps list             # every module's capabilities: inputs, outputs, cost, on/off (--json)
-harvey duplicates            # possible duplicates and merges; --merge KEEP MERGED,
-                             # --separate A B, --undo MERGED
+harvey duplicates            # possible duplicates, as groups, and merges;
+                             # --merge KEEP A B..., --separate A B... [--from C D...],
+                             # --undo MERGED, --undo-group MERGED, --scan
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens

@@ -2068,8 +2068,14 @@ _MATCH_REASONS = {
     "domain": "same website {value}",
     "declared_domain": "the registry lists their website {value}",
     "phone": "same phone {value}",
+    "email": "same email {value}",
     "name": "same name in the same town",
     "different_websites": "different websites, so the name alone doesn't count",
+    "one_firm": "only this registered firm has it: a branch",
+    "many_listings": "many listings share it with one firm: confirm them as a group",
+    "shared_contact": "several firms share it, so it is only a question",
+    "several_firms": "it could be any of several firms",
+    "shared_site": "two records hold this website, so it is only a question",
 }
 _MERGE_REFUSED = {
     "different_cui": "they have different tax codes (CUI): two companies, never merged",
@@ -2079,6 +2085,7 @@ _MERGE_REFUSED = {
     "not_merged": "that company isn't merged",
     "not_found": "no such company",
     "same_company": "that is the same company twice",
+    "several_groups": "it kept more than one group; name one of the companies merged into it",
 }
 
 
@@ -2243,8 +2250,9 @@ def _switch_module(module_id: str, on: bool):
 
 
 def cmd_duplicates(args):
-    """Possible duplicates: pairs the resolver wasn't sure enough to merge,
-    and merges in force. Merge, keep apart, or undo a merge."""
+    """Possible duplicates, as groups: companies that may be one, and the
+    merges in force. Merge a group into one record, take companies out of a
+    group, undo a merge (one member or the whole group), or look again."""
     from harvey.resolver import MergeRefused
     from harvey.state import StateManager
 
@@ -2258,40 +2266,84 @@ def cmd_duplicates(args):
         if place:
             bits.append(place)
         bits += c.get("phones") or []
+        bits += c.get("emails") or []
         bits += c.get("domains") or []
         return " · ".join(bits) + f"  [{c['id']}, {', '.join(c.get('sources') or []) or '?'}]"
+
+    async def _scan(state):
+        from harvey.modules import jobs
+        from harvey.modules.job_kinds import enqueue_duplicates_scan
+
+        batch_id = await jobs.new_batch(state, "duplicates_scan", "Look for duplicates")
+        try:
+            await enqueue_duplicates_scan(state, batch_id=batch_id)
+        except jobs.Duplicate as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        found = await _wait_for(state, batch_id)
+        code = _job_failures(found)
+        if code:
+            raise SystemExit(code)
+        done = next((j.result.get("duplicates") for j in found if j.status == jobs.DONE), None)
+        if done:
+            print(f"\n  Looked again: {done['merged']} merged on their own (undoable), "
+                  f"{done['review']} put up for review.")
 
     async def _duplicates():
         state = StateManager()
         await state.init_db()
         try:
             if args.merge:
-                keep, merged = args.merge
-                await state.merge_companies(keep, merged)
-                print(f"\n  Merged {merged} into {keep}. Undo with: harvey duplicates --undo {merged}\n")
+                keep, *members = args.merge
+                done = await state.merge_group(keep, members)
+                print(f"\n  Merged {', '.join(done['merged'])} into {keep}.")
+                for member in done["merged"]:
+                    print(f"  Undo with: harvey duplicates --undo {member}")
+                if len(done["merged"]) > 1:
+                    print(f"  Undo them all: harvey duplicates --undo-group {done['merged'][0]}")
+                print()
                 return
             if args.separate:
-                await state.separate_companies(*args.separate)
-                print("\n  Kept apart: they won't be suggested again.\n")
+                if args.separate_from:
+                    await state.separate_group(args.separate, args.separate_from)
+                else:
+                    await state.separate_group(args.separate)
+                print("\n  Kept apart: they won't be suggested as one company again.\n")
                 return
             if args.undo:
                 done = await state.undo_merge(args.undo)
                 print(f"\n  Undone: {done['merged']} is its own company again, "
                       f"apart from {done['survivor']}.\n")
                 return
+            if args.undo_group:
+                done = await state.undo_group(args.undo_group)
+                print(f"\n  Undone: {len(done)} compan{'y is' if len(done) == 1 else 'ies are'} "
+                      f"on their own again ({', '.join(d['merged'] for d in done)}).\n")
+                return
         except MergeRefused as e:
             print(f"\n  Can't: {_MERGE_REFUSED.get(e.code, e.code)}.\n")
             sys.exit(1)
+        if args.scan:
+            await _scan(state)
 
-        pending = await state.duplicates("pending", args.limit)
-        print(f"\n  Possible duplicates — {len(pending)} to decide")
+        total, groups = await state.duplicate_groups(args.limit)
+        print(f"\n  Possible duplicates — {total} group{'' if total == 1 else 's'} to decide")
         print("  " + "=" * 66)
-        for p in pending:
-            print(f"\n  {round(p['score'] * 100)}%  {_match_reasons(p['reasons'])}")
-            print(f"    A  {side(p['a'])}")
-            print(f"    B  {side(p['b'])}")
-            print(f"    same:      harvey duplicates --merge {p['company_a']} {p['company_b']}")
-            print(f"    different: harvey duplicates --separate {p['company_a']} {p['company_b']}")
+        for g in groups:
+            print(f"\n  {round(g['score'] * 100)}%  {len(g['members'])} companies: "
+                  f"{_match_reasons(g['reasons'])}")
+            keep = g["keeper"]
+            same = [m["id"] for m in g["members"] if m["id"] != keep and not m["conflict"]]
+            for m in g["members"]:
+                mark = "keep" if m["id"] == keep else ("other firm" if m["conflict"] else "")
+                print(f"    {mark:<10} {side(m)}")
+            if same:
+                print(f"    same:      harvey duplicates --merge {keep} {' '.join(same)}")
+            ids = " ".join(m["id"] for m in g["members"])
+            print(f"    different: harvey duplicates --separate {ids}")
+            if len(g["members"]) > 2:
+                print("    take one out: harvey duplicates --separate ID --from "
+                      "<the rest of the group>")
         merged = await state.merges(args.limit)
         if merged:
             print(f"\n  Merged — {len(merged)} (newest first)")
@@ -2299,7 +2351,11 @@ def cmd_duplicates(args):
                 who = "automatically" if m["decided_by"] == "auto" else "by you"
                 print(f"\n    {side(m['b'])}")
                 print(f"      joined {side(m['a'])} {who}: {_match_reasons(m['reasons'])}")
-                print(f"      undo: harvey duplicates --undo {m['merged']}")
+                print(f"      undo: harvey duplicates --undo {m['merged']}"
+                      + (f"   (whole group: --undo-group {m['merged']})"
+                         if m.get("group_id") and sum(1 for x in merged
+                                                      if x.get("group_id") == m["group_id"]) > 1
+                         else ""))
         print("")
 
     asyncio.run(_duplicates())
@@ -2906,13 +2962,22 @@ def main():
     sub = subparsers.add_parser(
         "duplicates", help="Companies that may be on file twice: merge, keep apart, undo")
     group = sub.add_mutually_exclusive_group()
-    group.add_argument("--merge", nargs=2, metavar=("KEEP", "MERGED"),
-                       help="Same company: MERGED's facts move onto KEEP")
-    group.add_argument("--separate", nargs=2, metavar=("A", "B"),
-                       help="Different companies: stop suggesting the pair")
+    group.add_argument("--merge", nargs="+", metavar="ID",
+                       help="Same company: KEEP MERGED [MERGED...]: every MERGED's facts move "
+                            "onto KEEP, a different address becoming one of its locations")
+    group.add_argument("--separate", nargs="+", metavar="ID",
+                       help="Different companies: never suggest these as one again (with "
+                            "--from: these are not any of those)")
     group.add_argument("--undo", metavar="MERGED",
                        help="Undo the merge that took this company")
-    sub.add_argument("--limit", type=int, default=50, help="How many to list (default 50)")
+    group.add_argument("--undo-group", metavar="MERGED",
+                       help="Undo the whole group merge this company joined (or kept, "
+                            "when it kept only one)")
+    group.add_argument("--scan", action="store_true",
+                       help="Look again among every company on file, then list")
+    sub.add_argument("--from", dest="separate_from", nargs="+", metavar="ID", default=None,
+                     help="With --separate: the rest of the group they are taken out of")
+    sub.add_argument("--limit", type=int, default=50, help="How many groups to list (default 50)")
     sub.set_defaults(func=cmd_duplicates)
 
     sub = subparsers.add_parser(

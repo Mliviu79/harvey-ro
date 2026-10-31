@@ -3387,10 +3387,14 @@ function clearCompanyFilters() {
 
 // ── Possible duplicates ──
 //
-// Pairs the resolver wasn't sure enough to merge on its own, side by side,
-// for a person to decide; and the merges in force, each one undoable.
+// Companies that may be one, as groups: every pair the resolver wasn't sure
+// enough to merge, joined with the pairs it shares a company with, so four
+// listings of one business are one decision. The person picks the record to
+// keep, unticks any that aren't the same, and merges the rest in one click;
+// another firm (a different CUI) is shown but can't be ticked. The merges in
+// force, grouped as they were made, each one undoable alone or all at once.
 
-let _dup = { open: false, view: 'pending', pending: 0, rows: [], gen: 0, busy: false };
+let _dup = { open: false, view: 'pending', pending: 0, rows: [], gen: 0, busy: false, picks: {} };
 
 async function loadDuplicates() {
   const gen = ++_dup.gen;
@@ -3417,10 +3421,11 @@ function renderDuplicates() {
   const rows = _dup.rows;
   const body = !rows.length
     ? '<p class="muted">' + escHtml(t(_dup.view === 'merged' ? 'dup.empty_merged' : 'dup.empty')) + '</p>'
-    : rows.map(_dup.view === 'merged' ? mergedRow : duplicateRow).join('');
+    : (_dup.view === 'merged' ? mergedGroups(rows).map(mergedGroup) : rows.map(duplicateGroup)).join('');
   el.innerHTML = '<div class="table-card dup-panel"><div class="dup-head"><div><h3>' + escHtml(t('dup.title')) + '</h3>' +
     '<p class="muted">' + escHtml(t('dup.lede')) + '</p></div>' +
-    '<button type="button" class="btn btn-ghost btn-sm" onclick="toggleDuplicates()">' + escHtml(t('dup.close')) + '</button></div>' +
+    '<div class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="scanDuplicates()">' + escHtml(t('dup.scan')) + '</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="toggleDuplicates()">' + escHtml(t('dup.close')) + '</button></div></div>' +
     '<div class="segmented dup-tabs" role="group" aria-label="' + escHtml(t('dup.title')) + '">' + tab('pending', t('dup.tab.pending', {n: _dup.pending})) + tab('merged', t('dup.tab.merged')) + '</div>' +
     body + '</div>';
 }
@@ -3429,38 +3434,121 @@ function dupReasons(reasons) {
   return (reasons || []).map(r => escHtml(t('dup.reason.' + r.code, {value: r.value || ''}))).join(' · ');
 }
 
-function dupSide(c) {
+function dupSide(c, extra) {
   if (!c) return '<div class="dup-side"></div>';
   const place = String(c.location || '').replace(/,\s*Romania$/i, '');
   const phones = (c.phones || []).length ? c.phones : (c.phone ? [c.phone] : []);
   const domains = (c.domains || []).length ? c.domains : (c.domain ? [c.domain] : []);
   const line = parts => parts.filter(Boolean).join('<span class="dot-sep">·</span>');
   return '<div class="dup-side"><button type="button" class="link-btn cell-main" onclick="openCompany(' + jsq(c.id) + ')">' +
-      escHtml(c.name || t('dup.no_name')) + '</button>' +
+      escHtml(c.name || t('dup.no_name')) + '</button>' + (extra || '') +
     '<div class="cell-sub">' + line([c.cui ? '<span class="mono">' + escHtml(t('co.cui', {cui: c.cui})) + '</span>' : '',
-      place ? escHtml(place) : '']) + '</div>' +
+      place ? escHtml(place) : '', c.address ? escHtml(c.address) : '']) + '</div>' +
     '<div class="cell-sub mono">' + (phones.length ? phones.map(escHtml).join(', ') : escHtml(t('co.no_phone'))) + '</div>' +
+    ((c.emails || []).length ? '<div class="cell-sub mono">' + c.emails.map(escHtml).join(', ') + '</div>' : '') +
     (domains.length ? '<div class="cell-sub">' + domains.map(escHtml).join(', ') + '</div>' : '') +
-    '<div class="cell-sub muted">' + line((c.sources || []).map(x => sourceLabel(String(x).replace(/^discover:/, '')))) + '</div></div>';
+    '<div class="cell-sub muted">' + line((c.sources || []).map(x => sourceLabel(String(x).replace(/^discover:/, ''))).concat(
+      c.locations ? [escHtml(t('dup.locations', {n: c.locations}))] : [])) + '</div></div>';
 }
 
-function duplicateRow(p) {
-  return '<div class="dup-pair"><div class="dup-why"><b>' + escHtml(t('dup.score', {n: Math.round((p.score || 0) * 100)})) + '</b> ' +
-      dupReasons(p.reasons) + '</div>' +
-    '<div class="dup-sides">' + dupSide(p.a) + dupSide(p.b) + '</div>' +
-    '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm" onclick="decideDuplicate(\'merge\', ' +
-      jsq(p.company_a) + ', ' + jsq(p.company_b) + ')">' + escHtml(t('dup.same')) + '</button>' +
-    '<button type="button" class="btn btn-secondary btn-sm" onclick="decideDuplicate(\'separate\', ' +
-      jsq(p.company_a) + ', ' + jsq(p.company_b) + ')">' + escHtml(t('dup.different')) + '</button></div></div>';
+// What the person chose in a group: the record to keep and the companies
+// ticked as the same, kept while the list reloads.
+function dupPick(g) {
+  let pick = _dup.picks[g.key];
+  if (!pick) {
+    pick = {keep: g.keeper, out: {}};
+    _dup.picks[g.key] = pick;
+  }
+  const keep = (g.members || []).find(m => m.id === pick.keep) || (g.members || [])[0] || {};
+  // The firm the group merges into: the keeper's CUI, or, when the record
+  // kept has none (a listing), the first member's that has one. Any other
+  // CUI is another firm, whichever record is kept.
+  const firm = keep.cui ? keep : ((g.members || []).find(m => m.id !== keep.id && m.cui) || {});
+  return {keep: keep.id, keepCui: firm.cui || '', out: pick.out};
 }
 
-function mergedRow(m) {
-  return '<div class="dup-pair"><div class="dup-why"><b>' + escHtml(t(m.decided_by === 'auto' ? 'dup.by_auto' : 'dup.by_you')) + '</b> ' +
+// Another firm than the group's: a different CUI, never one company.
+function dupOtherFirm(m, pick) {
+  return !!(m.cui && pick.keepCui && String(m.cui).replace(/\D/g, '').replace(/^0+/, '') !==
+    String(pick.keepCui).replace(/\D/g, '').replace(/^0+/, ''));
+}
+
+function duplicateGroup(g) {
+  const pick = dupPick(g);
+  const members = g.members || [];
+  const many = members.length > 2;
+  const key = jsq(g.key);
+  const rows = members.map(m => {
+    const other = m.id !== pick.keep && dupOtherFirm(m, pick);
+    const keepIt = '<label class="dup-pick"><input type="radio" name="keep-' + escHtml(g.key) + '"' +
+      (m.id === pick.keep ? ' checked' : '') +
+      ' onchange="dupSetKeep(' + key + ', ' + jsq(m.id) + ')"> ' + escHtml(t('dup.keep')) + '</label>';
+    const same = m.id === pick.keep ? '' : many
+      ? '<label class="dup-pick"><input type="checkbox"' + (!other && !pick.out[m.id] ? ' checked' : '') +
+        (other ? ' disabled' : '') + ' onchange="dupToggle(' + key + ', ' + jsq(m.id) + ', this.checked)"> ' +
+        escHtml(t('dup.in_group')) + '</label>' : '';
+    const note = other ? '<div class="cell-sub warn">' + escHtml(t('dup.other_firm')) + '</div>' : '';
+    return '<div class="dup-member' + (m.id === pick.keep ? ' keeper' : '') + (other ? ' other' : '') + '">' +
+      '<div class="dup-choice">' + keepIt + same + '</div>' + dupSide(m, note) + '</div>';
+  }).join('');
+  const chosen = members.filter(m => m.id !== pick.keep && !dupOtherFirm(m, pick) && !pick.out[m.id]);
+  const left = members.filter(m => m.id !== pick.keep && !dupOtherFirm(m, pick) && pick.out[m.id]);
+  return '<div class="dup-pair dup-group"><div class="dup-why"><b>' + escHtml(t('dup.score', {n: Math.round((g.score || 0) * 100)})) + '</b> ' +
+      (many ? escHtml(t('dup.members', {n: members.length})) + ' · ' : '') + dupReasons(g.reasons) + '</div>' +
+    '<div class="dup-members">' + rows + '</div>' +
+    '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm"' + (chosen.length ? '' : ' disabled') +
+      ' onclick="mergeGroup(' + key + ')">' + escHtml(chosen.length > 1 ? t('dup.merge_n', {n: chosen.length + 1}) : t('dup.same')) + '</button>' +
+    (many ? '<button type="button" class="btn btn-secondary btn-sm"' + (left.length ? '' : ' disabled') +
+      ' onclick="takeOut(' + key + ')">' + escHtml(t('dup.take_out', {n: left.length})) + '</button>' : '') +
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="separateGroup(' + key + ')">' +
+      escHtml(t(many ? 'dup.all_different' : 'dup.different')) + '</button></div></div>';
+}
+
+function dupGroup(key) { return (_dup.rows || []).find(g => g.key === key); }
+
+function dupSetKeep(key, id) {
+  const g = dupGroup(key);
+  if (!g) return;
+  dupPick(g);
+  _dup.picks[key].keep = id;
+  delete _dup.picks[key].out[id];
+  renderDuplicates();
+}
+
+function dupToggle(key, id, on) {
+  const g = dupGroup(key);
+  if (!g) return;
+  dupPick(g);
+  if (on) delete _dup.picks[key].out[id]; else _dup.picks[key].out[id] = true;
+  renderDuplicates();
+}
+
+// The merges in force, as they were made: one card per group merge.
+function mergedGroups(rows) {
+  const out = [];
+  const byGroup = {};
+  rows.forEach(m => {
+    const key = m.group_id ? 'g' + m.group_id : 'm' + m.id;
+    if (!byGroup[key]) { byGroup[key] = {key: key, survivor: m.survivor, keeper: m.a, rows: []}; out.push(byGroup[key]); }
+    byGroup[key].rows.push(m);
+  });
+  return out;
+}
+
+function mergedGroup(group) {
+  const first = group.rows[0];
+  const members = group.rows.map(m =>
+    '<div class="dup-member"><div class="dup-why"><b>' + escHtml(t(m.decided_by === 'auto' ? 'dup.by_auto' : 'dup.by_you')) + '</b> ' +
       (m.score ? escHtml(t('dup.score', {n: Math.round(m.score * 100)})) + ' · ' : '') + dupReasons(m.reasons) + '</div>' +
-    '<div class="dup-sides">' + dupSide(m.b) + dupSide(m.a) + '</div>' +
-    '<div class="cell-sub">' + escHtml((m.b && m.b.name) || '') + ' ' + escHtml(t('dup.joined')) + ' ' + escHtml((m.a && m.a.name) || '') + '</div>' +
-    '<div class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="undoMerge(' + jsq(m.merged) + ')">' +
-      escHtml(t('dup.undo')) + '</button></div></div>';
+      dupSide(m.b) +
+      '<div class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="undoMerge(' + jsq(m.merged) + ')">' +
+        escHtml(t('dup.undo')) + '</button></div></div>').join('');
+  return '<div class="dup-pair dup-group"><div class="dup-why">' + escHtml(t('dup.kept')) + '</div>' +
+    '<div class="dup-sides">' + dupSide(group.keeper) + '<div class="dup-side cell-sub">' +
+      escHtml(t(group.rows.length > 1 ? 'dup.joined_n' : 'dup.joined_one', {n: group.rows.length})) + '</div></div>' +
+    '<div class="dup-members">' + members + '</div>' +
+    (group.rows.length > 1 ? '<div class="btn-row"><button type="button" class="btn btn-ghost btn-sm" onclick="undoGroup(' +
+      jsq(first.merged) + ')">' + escHtml(t('dup.undo_group', {n: group.rows.length})) + '</button></div>' : '') + '</div>';
 }
 
 function toggleDuplicates() {
@@ -3489,7 +3577,7 @@ async function dupPost(path, body) {
   if (_dup.busy) return undefined;
   _dup.busy = true;
   const panel = document.getElementById('dupes-panel');
-  if (panel) panel.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  if (panel) panel.querySelectorAll('button, input').forEach(b => { b.disabled = true; });
   try {
     return await api(path, {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
@@ -3499,20 +3587,69 @@ async function dupPost(path, body) {
   }
 }
 
-async function decideDuplicate(how, a, b) {
-  const res = await dupPost('/api/duplicates/' + how, {a: a, b: b});
+async function dupDone(res, toast, key) {
   if (res === undefined) return;
   if (!res || res.success === false) { showToast(dupRefused(res), 'error'); return loadDuplicates(); }
-  showToast(t(how === 'merge' ? 'dup.toast.merged' : 'dup.toast.separate'));
+  if (key) delete _dup.picks[key];
+  showToast(toast);
   loadCompanies();
+}
+
+async function mergeGroup(key) {
+  const g = dupGroup(key);
+  if (!g) return;
+  const pick = dupPick(g);
+  const rest = (g.members || []).filter(m => m.id !== pick.keep && !dupOtherFirm(m, pick));
+  const members = rest.filter(m => !pick.out[m.id]).map(m => m.id);
+  const out = rest.filter(m => pick.out[m.id]).map(m => m.id);
+  if (!members.length) return;
+  const res = await dupPost('/api/duplicates/merge', {keep: pick.keep, members: members, out: out});
+  dupDone(res, t(members.length > 1 ? 'dup.toast.merged_n' : 'dup.toast.merged', {n: members.length + 1}), key);
+}
+
+async function takeOut(key) {
+  const g = dupGroup(key);
+  if (!g) return;
+  const pick = dupPick(g);
+  const rest = (g.members || []).filter(m => !dupOtherFirm(m, pick) || m.id === pick.keep);
+  const out = rest.filter(m => m.id !== pick.keep && pick.out[m.id]).map(m => m.id);
+  if (!out.length) return;
+  const res = await dupPost('/api/duplicates/separate', {out: out, rest: rest.filter(m => !out.includes(m.id)).map(m => m.id)});
+  dupDone(res, t('dup.toast.taken_out', {n: out.length}), key);
+}
+
+async function separateGroup(key) {
+  const g = dupGroup(key);
+  if (!g) return;
+  const res = await dupPost('/api/duplicates/separate', {out: (g.members || []).map(m => m.id)});
+  dupDone(res, t('dup.toast.separate'), key);
 }
 
 async function undoMerge(companyId) {
   const res = await dupPost('/api/duplicates/undo', {company_id: companyId});
+  dupDone(res, t('dup.toast.undone'));
+}
+
+async function undoGroup(companyId) {
+  const res = await dupPost('/api/duplicates/undo', {company_id: companyId, group: true});
+  dupDone(res, t('dup.toast.undone_group'));
+}
+
+async function scanDuplicates() {
+  const res = await dupPost('/api/duplicates/scan', {});
   if (res === undefined) return;
-  if (!res || res.success === false) { showToast(dupRefused(res), 'error'); return loadDuplicates(); }
-  showToast(t('dup.toast.undone'));
-  loadCompanies();
+  if (!res || res.success === false) { showToast(t('dup.refused.other'), 'error'); return loadDuplicates(); }
+  showToast(t('dup.toast.scan'));
+  renderDuplicates();
+  const job = res.job;
+  for (let i = 0; job && i < 120; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const q = await api('/api/jobs');
+    const lane = ((q && q.lanes) || []).find(l => l.lane === 'duplicates');
+    const busy = lane && [...(lane.running || []), ...(lane.waiting || [])].some(j => j.id === job);
+    if (!busy) break;
+  }
+  loadDuplicates();
 }
 
 function companyIdLine(c) {

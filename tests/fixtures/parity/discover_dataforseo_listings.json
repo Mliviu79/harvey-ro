@@ -208,6 +208,7 @@
    "created_at": true,
    "decided_by": "auto",
    "filled_json": "{\"external_id\": \"dataforseo:cid:1001\", \"domain\": \"northvaleroofing.example\", \"website\": \"https://www.northvaleroofing.example/\", \"industry\": \"Roofing contractor\"}",
+   "group_id": 0,
    "id": 1,
    "merged": "C3",
    "moved_json": "{\"external_id\": \"dataforseo:cid:1001\", \"domain\": \"northvaleroofing.example\"}",

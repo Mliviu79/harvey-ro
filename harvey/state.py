@@ -90,6 +90,8 @@ FREE_MAIL_DOMAINS = frozenset({
     "telus.net", "bigpond.com", "optusnet.com.au", "orange.fr", "free.fr",
     "wanadoo.fr", "laposte.net", "t-online.de", "libero.it", "mail.ru",
     "naver.com", "seznam.cz", "wp.pl", "o2.pl", "tutanota.com", "tuta.io",
+    "yahoo.ro", "yahoo.fr", "yahoo.it", "yahoo.de", "yahoo.es", "hotmail.fr",
+    "hotmail.it", "hotmail.de", "hotmail.es", "outlook.fr", "outlook.de",
 })
 
 
@@ -1355,7 +1357,37 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_companies_live_place ON companies(location)
         WHERE COALESCE(merged_into, '') = '';
     """,
+    # ── v24: groups of duplicates, and email as a key ──
+    """
+    -- The merges one "same company" on a group made share its first
+    -- merge's id, so the whole group can be undone at once (0: on its own).
+    ALTER TABLE company_merges ADD COLUMN group_id INTEGER DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS idx_company_merges_group ON company_merges(group_id)
+        WHERE group_id != 0;
+    CREATE INDEX IF NOT EXISTS idx_company_merges_survivor ON company_merges(survivor);
+    -- An email linked to a company is one of its keys, like a phone. Every
+    -- address is recorded; the resolver leaves out free-mail ones (anyone's
+    -- gmail.com box) and one many companies share when it scores.
+    CREATE TRIGGER IF NOT EXISTS trg_company_contacts_email
+    AFTER INSERT ON company_contacts
+    WHEN COALESCE(NEW.company_id, '') != ''
+         AND (SELECT kind FROM contacts WHERE id = NEW.contact_id) = 'email'
+    BEGIN
+        INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
+        SELECT NEW.company_id, 'email', value, COALESCE(NEW.source, ''),
+               COALESCE(NEW.confidence, 1.0)
+        FROM contacts WHERE id = NEW.contact_id;
+    END;
+    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
+        SELECT l.company_id, 'email', ct.value, COALESCE(MIN(l.source), ''), MAX(l.confidence)
+        FROM contacts ct JOIN company_contacts l ON l.contact_id = ct.id
+        WHERE ct.kind = 'email' AND COALESCE(l.company_id, '') != ''
+        GROUP BY l.company_id, ct.value;
+    """,
 ]
+
+# Pairs a look for duplicates merges or queues per write transaction.
+SCAN_WRITE_BATCH = 200
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
 LIVE_COMPANY = "COALESCE(c.merged_into, '') = ''"
@@ -1701,6 +1733,8 @@ async def _save_company(db, company: Company, match: "resolver.Match",
     if match.review:
         await resolver.add_candidate(db, match.company_id, company_id, match.score,
                                      match.reasons)
+    for other, score, reasons in match.others:
+        await resolver.add_candidate(db, other, company_id, score, reasons)
     return Resolution(company_id, True, match)
 
 
@@ -2225,7 +2259,8 @@ class StateManager:
 
     async def duplicates(self, status: str = "pending", limit: int = 100) -> list[dict]:
         """Pairs on the review list with ``status`` (pending | merged |
-        separate), most likely first, each side as the panel shows it."""
+        separate), most likely first, each side as the panel shows it. The
+        pending ones as the panel decides them are duplicate_groups."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2246,6 +2281,42 @@ class StateManager:
                         "b": sides.get(p["company_b"])})
         return out
 
+    async def duplicate_groups(self, limit: int = 100) -> tuple[int, list[dict]]:
+        """(how many groups there are, the first ``limit``): the review list
+        as resolver.groups reads it, each member as the panel shows it, the
+        record to keep (``keeper``: the registry's, else the one holding
+        most) and, per member, whether it is another firm than the group's
+        (``conflict``: a CUI other than the keeper's, or than the first
+        member's when the keeper has none, so never merged with it)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            found = await resolver.groups(db)
+            shown = found[:max(1, limit)]
+            ids = [cid for g in shown for cid in g["members"]]
+            sides = await self._duplicate_sides(db, ids)
+            firm = await resolver._firms(db, ids)
+            for group in shown:
+                order = await resolver.keeper_order(db, group["members"])
+                keeper = order[0] if order else group["members"][0]
+                group["keeper"] = keeper
+                reasons: list[dict] = []
+                for pair in group["pairs"]:
+                    for r in pair["reasons"]:
+                        if r.get("code") not in {x.get("code") for x in reasons}:
+                            reasons.append(r)
+                group["reasons"] = reasons
+                group["key"] = ",".join(group["members"])
+                members = order + [m for m in group["members"] if m not in order]
+                # The firm the group merges into: the keeper's, or (a keeper
+                # without a CUI) the first member's that has one.
+                anchor = firm.get(keeper) or next(
+                    (firm[cid] for cid in members if firm.get(cid)), None)
+                group["members"] = [
+                    {**(sides.get(cid) or {"id": cid}), "keeper": cid == keeper,
+                     "conflict": bool(firm.get(cid) and anchor and firm[cid] != anchor)}
+                    for cid in members]
+        return len(found), shown
+
     @staticmethod
     async def _duplicate_sides(db, ids: list[str]) -> dict[str, dict]:
         if not ids:
@@ -2258,31 +2329,38 @@ class StateManager:
             sides = {r["id"]: dict(r) for r in await cur.fetchall()}
         async with db.execute(
             f"SELECT company_id, kind, value, source FROM company_ids "
-            f"WHERE company_id IN ({marks}) AND kind IN ('phone', 'domain', 'external') "
+            f"WHERE company_id IN ({marks}) AND +kind IN ('phone', 'domain', 'external', 'email') "
             f"ORDER BY created_at, rowid", ids
         ) as cur:
             for r in await cur.fetchall():
                 side = sides.get(r["company_id"])
                 if side is None:
                     continue
-                key = {"phone": "phones", "domain": "domains", "external": "listings"}[r["kind"]]
+                key = {"phone": "phones", "domain": "domains", "external": "listings",
+                       "email": "emails"}[r["kind"]]
                 if r["value"] not in side.setdefault(key, []):
                     side[key].append(r["value"])
                 if r["source"] and r["source"] not in side.setdefault("sources", []):
                     side["sources"].append(r["source"])
+        async with db.execute(
+            f"SELECT company_id, COUNT(*) FROM locations WHERE company_id IN ({marks}) "
+            f"GROUP BY company_id", ids
+        ) as cur:
+            for cid, n in await cur.fetchall():
+                if cid in sides:
+                    sides[cid]["locations"] = n
         for side in sides.values():
-            for key in ("phones", "domains", "listings", "sources"):
+            side.setdefault("locations", 0)
+            for key in ("phones", "domains", "listings", "emails", "sources"):
                 side.setdefault(key, [])
             if side.get("source") and side["source"] not in side["sources"]:
                 side["sources"].insert(0, side["source"])
         return sides
 
     async def count_duplicates(self) -> int:
+        """How many groups wait on the review list."""
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM match_candidates WHERE status = 'pending'"
-            ) as cur:
-                return (await cur.fetchone())[0]
+            return len(await resolver.groups(db))
 
     async def merge_companies(self, keep: str, merged: str, decided_by: str = "you") -> int:
         """Merge ``merged`` into ``keep`` (resolver.merge). Raises
@@ -2311,16 +2389,92 @@ class StateManager:
         if a == b:
             raise resolver.MergeRefused("same_company")
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT id FROM companies WHERE id IN (?, ?) "
-                "ORDER BY (COALESCE(cui, '') = ''), created_at, rowid", (a, b)
-            ) as cur:
-                order = [r[0] for r in await cur.fetchall()]
+            async with db.execute("SELECT id FROM companies WHERE id IN (?, ?)", (a, b)) as cur:
+                if len(await cur.fetchall()) != 2:
+                    raise resolver.MergeRefused("not_found")
+            order = await resolver.keeper_order(db, (a, b))
         if len(order) != 2:
-            raise resolver.MergeRefused("not_found")
+            raise resolver.MergeRefused("already_merged")
         keep, merged = order
         merge_id = await self.merge_companies(keep, merged)
         return {"survivor": keep, "merged": merged, "merge_id": merge_id}
+
+    async def merge_group(self, keep: str, members, out=(), decided_by: str = "you") -> dict:
+        """"Same company" on a group: every one of ``members`` merges into
+        ``keep`` (resolver.merge_group), and each of ``out`` (taken out of
+        the group by the person) is marked a different company from them,
+        in one transaction. Raises resolver.MergeRefused."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                done = await resolver.merge_group(db, keep, members, decided_by=decided_by)
+                if out:
+                    await resolver.separate(db, list(out), [keep])
+            except Exception:
+                await db.rollback()
+                raise
+            await self._flush_company_search(db)
+            await db.commit()
+        return done
+
+    async def separate_group(self, out, rest=()) -> int:
+        """Take ``out`` out of their group: each is a different company from
+        every one of ``rest`` (or, with no ``rest``, they are all different
+        from one another). Raises resolver.MergeRefused for an unknown company."""
+        ids = list(dict.fromkeys([*out, *rest]))
+        if len(ids) < 2:
+            raise resolver.MergeRefused("same_company")
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            marks = ",".join("?" * len(ids))
+            async with db.execute(f"SELECT COUNT(*) FROM companies WHERE id IN ({marks})",
+                                  ids) as cur:
+                if (await cur.fetchone())[0] != len(ids):
+                    await db.rollback()
+                    raise resolver.MergeRefused("not_found")
+            n = await resolver.separate(db, list(out), list(rest))
+            await db.commit()
+        return n
+
+    async def undo_group(self, company_id: str) -> list[dict]:
+        """Undo the whole group merge ``company_id`` kept or joined."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                done = await resolver.undo_group(db, company_id)
+            except Exception:
+                await db.rollback()
+                raise
+            await self._flush_company_search(db)
+            await db.commit()
+        return done
+
+    async def scan_duplicates(self) -> dict:
+        """Look for duplicates among every company on file (resolver.scan):
+        the pairs are found with a read, and only the merges and the review
+        list are written under the write lock."""
+        import time
+
+        started = time.monotonic()
+        async with self._connect() as db:
+            scored = await resolver.scan_candidates(db)
+            fresh = await resolver.unknown_pairs(db, scored)
+            found = time.monotonic()
+            done = {"merged": 0, "review": 0}
+            # A few hundred pairs per write transaction: other writers (an
+            # ANAF check saving its batches) wait a moment, not the whole pass.
+            for at in range(0, len(fresh), SCAN_WRITE_BATCH):
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    part = await resolver.apply_scan(db, fresh[at:at + SCAN_WRITE_BATCH])
+                except Exception:
+                    await db.rollback()
+                    raise
+                await self._flush_company_search(db)
+                await db.commit()
+                done = {k: done[k] + part[k] for k in done}
+        return {**done, "pairs": len(scored), "read_s": round(found - started, 1),
+                "write_s": round(time.monotonic() - found, 1)}
 
     async def separate_companies(self, a: str, b: str) -> bool:
         """"Different companies": the pair leaves the review list for good.
@@ -2356,8 +2510,9 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT id, survivor, merged, score, reasons_json, decided_by, created_at "
-                "FROM company_merges WHERE undone_at IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT id, survivor, merged, score, reasons_json, decided_by, created_at, "
+                "group_id FROM company_merges WHERE undone_at IS NULL ORDER BY id DESC LIMIT ?",
+                (limit,)
             ) as cur:
                 rows = [dict(r) for r in await cur.fetchall()]
             sides = await self._duplicate_sides(

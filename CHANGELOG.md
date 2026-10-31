@@ -9,6 +9,28 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Possible duplicates as groups.** The review list joins every pair still
+  to decide into groups, each side followed to the company it stands for now:
+  a pair made stale by a later merge is gone, and four or six records of one
+  business are one decision. Pick the record to keep, untick any that aren't
+  the same, and merge the rest in one go (or take some out, or call them all
+  different). A group holding two CUIs shows the other firm but never merges
+  it. Each merge in a group can be undone alone, or the whole group at once
+  (`harvey duplicates --merge KEEP A B...`, `--separate A B... --from C...`,
+  `--undo-group MERGED`). **Look again** / `harvey duplicates --scan` scores every
+  company on file again, as a job on the duplicates lane.
+- **Branches become locations.** Merging companies at different addresses or
+  towns keeps each merged one's place as a location of the company kept, its
+  contacts reached through it; an undo takes it away again. A listing without
+  a CUI whose phone, email or website only one registered firm has is that
+  firm's branch: merged on its own for a website or up to three listings,
+  offered as one group beyond that. One that two or three firms share puts a
+  listing up for review against each, never merged; more firms than that, a
+  chain's switchboard, counts for nothing.
+- **Email as a matching key.** An email linked to two companies counts like a
+  shared phone (0.8); an address on a free-mail provider (gmail.com, yahoo.ro
+  and the like) never counts. Existing email links become keys on upgrade.
+
 - **Companies page: sort, filters, pages and the whole record.** Sort by
   newest found, name, town and county, turnover, employees, contacts or last
   searched, either way; filter by county, town, activity (CAEN codes or
@@ -379,6 +401,22 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Looking for duplicates on file no longer drops pairs.** When an earlier
+  pair of the same pass had merged one side into a third company, the pair was
+  skipped, so a record matching two others that merged was never merged or
+  asked about. It now follows the merge. A pair someone kept apart or whose
+  merge was undone is no longer merged again by the scan. A chain of sure
+  pairs that reaches two firms (one listing only one firm's, another only
+  another's, the two listings one business) is put to you as one group
+  instead of folding both listings into whichever firm came first. Two
+  records without a CUI sharing a website wait for review instead of merging
+  on their own, and a pair already on the list isn't counted as new on every
+  look.
+- **Undoing one member of a group merge** no longer takes from the company
+  kept what another member still merged into it gives it (a shared contact or
+  source, a key, a phone or address it could fill, a place both branches had
+  in one town). An email key goes back with its contact.
 
 - **Signal, county and activity filters at install size.** A signal filter
   (has / lacks) reads only that signal's readings instead of every

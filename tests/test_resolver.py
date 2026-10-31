@@ -508,11 +508,13 @@ async def test_duplicates_already_on_file_are_found_on_upgrade(tmp_path):
         await db.commit()
     pending = {frozenset((p["company_a"], p["company_b"])): p["score"]
                for p in await sm.duplicates("pending")}
-    assert pending == {frozenset((firm, osm)): 0.7,          # same name, same town
-                       frozenset((listing, clinic)): 0.8}    # same phone, another town
-    # Phone and name together: sure enough to merge, the registry's record kept.
-    [merge] = await sm.merges()
-    assert (merge["survivor"], merge["merged"], merge["decided_by"]) == (registry, site, "auto")
+    assert pending == {frozenset((firm, osm)): 0.7}          # same name, same town
+    # Phone and name together: sure enough to merge, the registry's record
+    # kept. A listing with the phone only one registered firm has is one of
+    # its branches: merged, its town kept as one of the firm's locations.
+    merges = {(m["survivor"], m["merged"], m["decided_by"]) for m in await sm.merges()}
+    assert merges == {(registry, site, "auto"), (clinic, listing, "auto")}
+    assert _rows(path, "SELECT company_id, locality FROM locations") == [(clinic, "Cluj")]
 
 
 @pytest.mark.asyncio
@@ -599,8 +601,10 @@ def test_review_list_merge_and_undo_over_the_api(client):
 
     data = client.get("/api/duplicates").json()
     assert data["pending"] == 1
-    [row] = data["rows"]
-    assert row["a"]["name"] == "EXEMPLU SRL" and row["b"]["phones"] == ["+40700000010"]
+    [group] = data["rows"]
+    assert group["keeper"] == firm and [m["id"] for m in group["members"]] == [firm, site]
+    assert group["members"][0]["name"] == "EXEMPLU SRL"
+    assert group["members"][1]["phones"] == ["+40700000010"]
     assert client.get("/api/companies?limit=50").json()["total"] == 2
 
     done = client.post("/api/duplicates/merge", json={"a": site, "b": firm}).json()
@@ -650,11 +654,12 @@ def test_cli_lists_merges_and_undoes(tmp_path, monkeypatch, capsys):
     sm, firm, site = asyncio.run(_seed_pair(tmp_path / "cli.db"))
     monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "cli.db")
     run = lambda **kw: cli.cmd_duplicates(SimpleNamespace(  # noqa: E731
-        **{"merge": None, "separate": None, "undo": None, "limit": 50, **kw}))
+        **{"merge": None, "separate": None, "separate_from": None, "undo": None,
+           "undo_group": None, "scan": False, "limit": 50, **kw}))
 
     run()
     out = capsys.readouterr().out
-    assert "1 to decide" in out and "same name in the same town" in out
+    assert "1 group to decide" in out and "same name in the same town" in out
     assert f"--merge {firm} {site}" in out
 
     run(merge=[firm, site])
@@ -684,52 +689,78 @@ def _node(script):
 
 
 @pytest.mark.parametrize("lang", ["ro", "en"])
-def test_review_panel_shows_both_sides_and_the_choices(lang):
+def test_review_panel_shows_a_group_and_the_choices(lang):
     data = _node(r'''
 const fs = require('fs'), vm = require('vm');
 const app = fs.readFileSync(process.argv[1], 'utf8');
 vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
 vm.runInThisContext("LANG = '%s';");
-const els = {'company-dupes': {innerHTML: ''}, 'dupes-panel': {innerHTML: ''}};
+const els = {'company-dupes': {innerHTML: ''}, 'dupes-panel': {innerHTML: '', querySelectorAll: () => []}};
 global.document = {getElementById: id => els[id] || null};
 global.escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 global.jsq = s => JSON.stringify(s);
 global.sourceLabel = s => escHtml(s);
+global.hasKey = (lang, key) => key in I18N[lang];
+let toasts = [], posts = [];
+global.showToast = (msg, kind) => toasts.push([msg, kind || '']);
+global.loadCompanies = () => {};
 const side = (id, name, extra) => Object.assign({id, name, location: 'Brașov, Romania', phones: [],
-  domains: [], sources: []}, extra);
+  emails: [], domains: [], sources: []}, extra);
 let calls = [];
-global.api = async (path) => { calls.push(path); return path.includes('merged')
-  ? {pending: 1, rows: [{merged: 'b1', survivor: 'a1', decided_by: 'auto', score: 0.94,
+global.api = async (path, opts) => {
+  calls.push(path);
+  if (opts && opts.method === 'POST') { posts.push([path, JSON.parse(opts.body)]); return {survivor: 'a1', merged: ['b1']}; }
+  return path.includes('merged')
+  ? {pending: 1, rows: [
+      {id: 2, merged: 'c1', survivor: 'a1', group_id: 1, decided_by: 'you', score: 0.8,
        reasons: [{code: 'phone', value: '+40700000000'}], a: side('a1', 'EXEMPLU SRL', {cui: '90000001'}),
+       b: side('c1', 'Exemplu Cluj')},
+      {id: 1, merged: 'b1', survivor: 'a1', group_id: 1, decided_by: 'you', score: 0.7,
+       reasons: [{code: 'name', value: 'exemplu@brasov'}], a: side('a1', 'EXEMPLU SRL', {cui: '90000001'}),
        b: side('b1', 'Exemplu')}]}
-  : {pending: 1, rows: [{company_a: 'a1', company_b: 'b1', score: 0.7,
-       reasons: [{code: 'name', value: 'exemplu@brasov'}],
-       a: side('a1', 'EXEMPLU SRL', {cui: '90000001', sources: ['registry:onrc']}),
-       b: side('b1', '<b>Exemplu</b>', {phones: ['+40700000000'], sources: ['discover:osm']})}]}; };
+  : {pending: 1, rows: [{key: 'a1,b1,c1,d1', keeper: 'a1', score: 0.8,
+       reasons: [{code: 'name', value: 'exemplu@brasov'}, {code: 'email', value: 'office@exemplu.example.com'}],
+       pairs: [],
+       members: [side('a1', 'EXEMPLU SRL', {cui: '90000001', sources: ['registry:onrc'], keeper: true}),
+                 side('b1', '<b>Exemplu</b>', {phones: ['+40700000000'], sources: ['discover:osm']}),
+                 side('c1', 'Exemplu Cluj', {emails: ['office@exemplu.example.com']}),
+                 side('d1', 'ALTA SRL', {cui: '90000002', conflict: true})]}]}; };
 vm.runInThisContext(app.slice(app.indexOf('let _dup = '), app.indexOf('function companyIdLine(')));
 (async () => {
   await loadDuplicates();
   const button = els['company-dupes'].innerHTML;
   toggleDuplicates(); await new Promise(r => setTimeout(r, 0));
   const pending = els['dupes-panel'].innerHTML;
+  dupToggle('a1,b1,c1,d1', 'c1', false);
+  const unticked = els['dupes-panel'].innerHTML;
+  await mergeGroup('a1,b1,c1,d1');
   setDuplicatesView('merged'); await new Promise(r => setTimeout(r, 0));
-  console.log(JSON.stringify({button, pending, merged: els['dupes-panel'].innerHTML, calls,
-    want: {button: t('dup.button', {n: 1}), same: t('dup.same'), different: t('dup.different'),
-           undo: t('dup.undo'), name: t('dup.reason.name'), score: t('dup.score', {n: 70}),
-           auto: t('dup.by_auto')}}));
+  console.log(JSON.stringify({button, pending, unticked, merged: els['dupes-panel'].innerHTML, calls, posts, toasts,
+    want: {button: t('dup.button', {n: 1}), keep: t('dup.keep'), inGroup: t('dup.in_group'),
+           other: t('dup.other_firm'), merge3: t('dup.merge_n', {n: 3}), same: t('dup.same'),
+           takeOut: t('dup.take_out', {n: 1}), allDiff: t('dup.all_different'), undo: t('dup.undo'),
+           undoGroup: t('dup.undo_group', {n: 2}), name: t('dup.reason.name'), members: t('dup.members', {n: 4}),
+           email: t('dup.reason.email', {value: 'office@exemplu.example.com'}), score: t('dup.score', {n: 80}),
+           scan: t('dup.scan')}}));
 })().catch(e => {console.error(e); process.exit(1);});
 ''' % lang)
     want = data["want"]
     assert want["button"] in data["button"]
     pending = data["pending"]
-    for key in ("same", "different", "name", "score"):
+    for key in ("keep", "inGroup", "other", "merge3", "allDiff", "name", "members", "email",
+                "score", "scan"):
         assert want[key] in pending, key
     assert "EXEMPLU SRL" in pending and "90000001" in pending and "+40700000000" in pending
     assert "&lt;b>Exemplu" in pending                    # values are escaped
-    assert "decideDuplicate('merge', \"a1\", \"b1\")" in pending
-    assert "decideDuplicate('separate', \"a1\", \"b1\")" in pending
-    assert want["undo"] in data["merged"] and want["auto"] in data["merged"]
-    assert 'undoMerge("b1")' in data["merged"]
+    # The other firm can't be ticked or kept; the record kept has no tick box.
+    assert pending.count('type="checkbox"') == 3 and pending.count("disabled") >= 2
+    assert want["takeOut"] in data["unticked"] and want["same"] in data["unticked"]
+    [[path, body]] = data["posts"]
+    assert path == "/api/duplicates/merge"
+    assert body == {"keep": "a1", "members": ["b1"], "out": ["c1"]}
+    merged = data["merged"]
+    assert want["undo"] in merged and want["undoGroup"] in merged
+    assert 'undoMerge("b1")' in merged and 'undoMerge("c1")' in merged and 'undoGroup("c1")' in merged
     assert data["calls"][-1] == "/api/duplicates?status=merged"
 
 
@@ -745,5 +776,6 @@ console.log(JSON.stringify({used,
 ''')
     assert sorted(data["ro"]) == sorted(data["en"])
     assert set(data["used"]) <= set(data["en"])
-    codes = set(resolver.WEIGHTS) | {"different_websites"}
+    codes = set(resolver.WEIGHTS) | {"different_websites", "one_firm", "many_listings",
+                                     "shared_contact", "several_firms"}
     assert {f"dup.reason.{c}" for c in codes} <= set(data["en"])

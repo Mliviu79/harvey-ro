@@ -32,6 +32,7 @@ from harvey.modules.jobs import JobError, LaneExhausted, SpendLimit, Transient
 logger = logging.getLogger("harvey.jobs")
 
 SITE_LANE = "website"          # the website reader's module
+DUPLICATES_LANE = "duplicates"  # the resolver's look for duplicates on file
 CONTACTS_LANE = "contacts"     # the contact finder, one company per job
 REGISTRY_LANE = "onrc"
 
@@ -317,6 +318,24 @@ async def run_site_read(ctx) -> dict:
                           config=lane["config"], role_keywords=lane["keywords"])
     ctx.count(1)
     return {"domain": company["domain"], "observations": found}
+
+
+# ── Duplicates on file (harvey/resolver.py) ──
+
+async def enqueue_duplicates_scan(state, *, batch_id: str = "") -> str:
+    """Queue one look for duplicates among every company on file. Raises
+    jobs.Duplicate while one is queued or running."""
+    return await jobs.enqueue(state, "duplicates_scan", DUPLICATES_LANE, {},
+                              dedupe_key="duplicates_scan", label="Look for duplicates",
+                              batch_id=batch_id)
+
+
+@jobs.kind("duplicates_scan")
+async def run_duplicates_scan(ctx) -> dict:
+    await ctx.say("Looking for duplicates among the companies on file")
+    done = await ctx.state.scan_duplicates()
+    await ctx.say(f"{done['merged']} merged on their own, {done['review']} to review")
+    return {"duplicates": done}
 
 
 # ── The trade registry (the onrc module) ──

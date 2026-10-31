@@ -363,6 +363,18 @@ async def add_location(db, company_id: str, *, name: str = "", address: str = ""
     address, which can't tell two places apart)."""
     if not company_id or not (external_id or address):
         return 0
+    return (await place(db, company_id, name=name, address=address, location=location,
+                        point=point, external_id=external_id, phone=phone, source=source,
+                        origin=origin))[0]
+
+
+async def place(db, company_id: str, *, name: str = "", address: str = "",
+                location: str = "", point: str = "", external_id: str = "",
+                phone: str = "", source: str = "", origin: str = "",
+                refresh: bool = True) -> tuple[int, bool]:
+    """add_location's work, for any place with a town at least (a merged
+    branch may have no street address): (its id, whether it is new). A
+    place on file already is refreshed unless ``refresh`` is False."""
     parts = [p.strip() for p in (location or "").split(",") if p.strip()]
     locality = parts[0] if parts else ""
     county = parts[1] if len(parts) >= 2 and not (len(parts) == 2 and _country(parts[1])) else ""
@@ -373,21 +385,24 @@ async def add_location(db, company_id: str, *, name: str = "", address: str = ""
             row = await cur.fetchone()
     else:
         async with db.execute("SELECT id FROM locations WHERE company_id = ? AND external_id = '' "
-                              "AND address = ?", (company_id, address)) as cur:
+                              "AND address = ? AND (address != '' OR locality = ?)",
+                              (company_id, address, locality)) as cur:
             row = await cur.fetchone()
+    if row and not refresh:
+        return row[0], False
     if row:
         await db.execute(
             "UPDATE locations SET last_seen = CURRENT_TIMESTAMP, "
             "address = CASE WHEN ? != '' THEN ? ELSE address END, "
             "phone = CASE WHEN phone = '' THEN ? ELSE phone END WHERE id = ?",
             (address, address, phone or "", row[0]))
-        return row[0]
+        return row[0], False
     cur = await db.execute(
         "INSERT INTO locations (company_id, name, address, locality, county, country, point, "
         "external_id, phone, source, origin_company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (company_id, name or "", address or "", locality, county, country, point or "",
          external_id or "", phone or "", source or "", origin or company_id))
-    return cur.lastrowid
+    return cur.lastrowid, True
 
 
 def _country(text: str) -> bool:
@@ -580,6 +595,29 @@ async def undo(db, survivor: str, merged: str, merge_id: int) -> None:
         "AND key1 = CAST(company_contacts.id AS TEXT)) "
         "WHERE CAST(id AS TEXT) IN (SELECT key1 FROM company_merge_moves "
         "WHERE merge_id = ? AND tbl = 'company_contacts.person')", (merge_id, merge_id))
+
+
+async def refill(db, survivor: str, merged: str) -> None:
+    """``merged`` is still merged into ``survivor`` after another company's
+    undo: the rows parked on it because the survivor held the same ones
+    (the same contact from the same source, a same-named person) move now
+    that the undo took those away. They keep their origin_company_id, so
+    undoing ``merged`` later sends them back. A link re-pointed at a person
+    the undo took away points at its own person again."""
+    if not await _ready(db):
+        return
+    for table in MOVED_TABLES:
+        await db.execute(f"UPDATE OR IGNORE {table} SET company_id = ? WHERE company_id = ?",
+                         (survivor, merged))
+    await db.execute(
+        "UPDATE OR IGNORE company_contacts SET person_id = (SELECT CAST(mm.key2 AS INTEGER) "
+        "FROM company_merge_moves mm WHERE mm.tbl = 'company_contacts.person' "
+        "AND mm.key1 = CAST(company_contacts.id AS TEXT) ORDER BY mm.merge_id DESC LIMIT 1) "
+        "WHERE company_id = ? AND origin_company_id = ? "
+        "AND person_id IN (SELECT id FROM people WHERE company_id NOT IN (?, ?)) "
+        "AND EXISTS (SELECT 1 FROM company_merge_moves mm WHERE mm.tbl = "
+        "'company_contacts.person' AND mm.key1 = CAST(company_contacts.id AS TEXT))",
+        (survivor, merged, survivor, merged))
 
 
 # ── v21's Python step ──

@@ -58,6 +58,14 @@
    "kind": "domain",
    "source": "",
    "value": "clinic1.example"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "email",
+   "source": "hunter_domain_search",
+   "value": "nora@clinic1.example"
   }
  ],
  "company_merge_moves": [],

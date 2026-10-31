@@ -1074,9 +1074,11 @@ def _refused(e) -> JSONResponse:
 
 @app.get("/api/duplicates")
 async def get_duplicates(status: str = "pending", limit: int = 100):
-    """Pairs on the review list (``status`` pending | separate) or merges in
-    force (``status`` merged), each side with its name, CUI, town, phones,
-    domains and sources, plus the score and why."""
+    """The review list as groups (``status`` pending: companies that may be
+    one, each member with its name, CUI, town, phones, emails, domains and
+    sources, the record to keep and why they match), pairs a person kept
+    apart (``status`` separate), or merges in force (``status`` merged,
+    with the group each belongs to). ``pending`` counts the groups."""
     empty = {"status": status, "pending": 0, "rows": []}
     if status not in ("pending", "merged", "separate") or not DB_PATH.exists():
         return empty
@@ -1084,35 +1086,53 @@ async def get_duplicates(status: str = "pending", limit: int = 100):
     try:
         state = _state()
         await state.init_db()
-        rows = await (state.merges(limit) if status == "merged"
-                      else state.duplicates(status, limit))
-        pending = await state.count_duplicates()
+        if status == "pending":
+            pending, rows = await state.duplicate_groups(limit)
+        else:
+            rows = await (state.merges(limit) if status == "merged"
+                          else state.duplicates(status, limit))
+            pending = await state.count_duplicates()
     except Exception as e:
         logger.warning("duplicates failed: %s", e)
         return JSONResponse({**empty, "error": "duplicates failed"}, status_code=500)
     return {"status": status, "pending": pending, "rows": rows}
 
 
-async def _pair(request: Request) -> tuple[str, str]:
+async def _body(request: Request) -> dict:
     try:
         data = await request.json()
     except Exception:
         data = {}
-    return str(data.get("a") or "").strip(), str(data.get("b") or "").strip()
+    return data if isinstance(data, dict) else {}
+
+
+def _ids(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(str(x).strip() for x in value if str(x or "").strip()))
 
 
 @app.post("/api/duplicates/merge")
 async def merge_duplicates(request: Request):
-    """"Same company": the one with a CUI (else the older) keeps the record,
-    the other's facts move onto it."""
+    """"Same company". A group: ``keep`` keeps the record, every one of
+    ``members`` merges into it, and each of ``out`` (taken out of the group)
+    is marked a different company. A pair (``a``, ``b``): the one with a CUI
+    (else the one holding most) keeps the record."""
     from harvey.resolver import MergeRefused
 
-    a, b = await _pair(request)
-    if not a or not b:
-        return JSONResponse({"error": "two companies needed"}, status_code=400)
+    data = await _body(request)
+    keep = str(data.get("keep") or "").strip()
+    members = _ids(data.get("members"))
+    a, b = str(data.get("a") or "").strip(), str(data.get("b") or "").strip()
     state = _state()
     await state.init_db()
     try:
+        if keep or members:
+            if not keep or not members:
+                return JSONResponse({"error": "keep and members needed"}, status_code=400)
+            return await state.merge_group(keep, members, out=_ids(data.get("out")))
+        if not a or not b:
+            return JSONResponse({"error": "two companies needed"}, status_code=400)
         return await state.merge_pair(a, b)
     except MergeRefused as e:
         return _refused(e)
@@ -1120,16 +1140,22 @@ async def merge_duplicates(request: Request):
 
 @app.post("/api/duplicates/separate")
 async def separate_duplicates(request: Request):
-    """"Different companies": the pair leaves the review list."""
+    """"Different companies": each of ``out`` is not any of ``rest`` (taken
+    out of its group), or with ``rest`` empty, all of ``out`` are different
+    from one another (a whole group). ``a`` and ``b``: one pair."""
     from harvey.resolver import MergeRefused
 
-    a, b = await _pair(request)
-    if not a or not b:
+    data = await _body(request)
+    out, rest = _ids(data.get("out")), _ids(data.get("rest"))
+    a, b = str(data.get("a") or "").strip(), str(data.get("b") or "").strip()
+    if not out and a and b:
+        out, rest = [a], [b]
+    if len(set(out) | set(rest)) < 2:
         return JSONResponse({"error": "two companies needed"}, status_code=400)
     state = _state()
     await state.init_db()
     try:
-        await state.separate_companies(a, b)
+        await state.separate_group(out, rest)
     except MergeRefused as e:
         return _refused(e)
     return {"ok": True}
@@ -1137,22 +1163,38 @@ async def separate_duplicates(request: Request):
 
 @app.post("/api/duplicates/undo")
 async def undo_duplicate(request: Request):
-    """Undo a merge: ``company_id`` is the company that was merged."""
+    """Undo a merge: ``company_id`` is the company that was merged; with
+    ``group`` true, the whole group merge it kept or joined."""
     from harvey.resolver import MergeRefused
 
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
+    data = await _body(request)
     company_id = str(data.get("company_id") or "").strip()
     if not company_id:
         return JSONResponse({"error": "company_id needed"}, status_code=400)
     state = _state()
     await state.init_db()
     try:
+        if data.get("group"):
+            return {"undone": await state.undo_group(company_id)}
         return await state.undo_merge(company_id)
     except MergeRefused as e:
         return _refused(e)
+
+
+@app.post("/api/duplicates/scan")
+async def scan_duplicates():
+    """Look for duplicates among every company on file: queued as a job on
+    the duplicates lane (the Queue page shows it), the panel reloads when it
+    is done."""
+    from harvey.modules import job_kinds, jobs
+
+    state = _state()
+    await state.init_db()
+    try:
+        job_id = await job_kinds.enqueue_duplicates_scan(state)
+    except jobs.Duplicate as e:
+        return {"job": e.job.id if getattr(e, "job", None) else "", "queued": False}
+    return {"job": job_id, "queued": True}
 
 
 # ── Feedback ──
@@ -3744,7 +3786,7 @@ def _lane_name(lane: str) -> str:
     m = switches.by_id().get(lane)
     if m is not None:
         return m.name or m.id
-    return {"contacts": "Contacts"}.get(lane, lane)
+    return {"contacts": "Contacts", "duplicates": "Duplicates"}.get(lane, lane)
 
 
 @app.get("/api/jobs")

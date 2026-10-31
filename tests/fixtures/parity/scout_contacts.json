@@ -58,6 +58,22 @@
    "kind": "phone",
    "source": "people",
    "value": "+13035550177"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "email",
+   "source": "known_company_backfill",
+   "value": "nellison@brightpathdental.example"
+  },
+  {
+   "company_id": "C1",
+   "confidence": 1.0,
+   "created_at": true,
+   "kind": "email",
+   "source": "known_company_backfill",
+   "value": "iquist@brightpathdental.example"
   }
  ],
  "company_merge_moves": [],
