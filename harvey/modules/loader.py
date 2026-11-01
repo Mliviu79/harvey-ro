@@ -128,7 +128,9 @@ class Manifest:
     # A market's: how its official registers usually write a name.
     registry_name_order: str = ""
     # The identifier schemes it declares ([[identifiers]]: name, numeric,
-    # legal): how firms are known in its register.
+    # legal, and ``legacy``: where schema 24 kept the key, as the
+    # company_ids kind and the value's prefix, "cui" or "external:osm:"):
+    # how firms are known in its register.
     identifiers: tuple[dict, ...] = ()
     # A register module's file and how the core reads it ([register]:
     # attach alias, file name in data/, the scheme its rows are keyed by,
@@ -196,6 +198,7 @@ def _check_signals(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
 
 _SCHEME = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 _FILE = re.compile(r"^[a-z][a-z0-9_]*\.db$")
+_LEGACY = re.compile(r"^[a-z][a-z0-9_]*(:[a-z0-9_]+:)?$")
 
 
 def _check_identifiers(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
@@ -218,8 +221,14 @@ def _check_identifiers(raw, where: str, problems: list[str]) -> tuple[dict, ...]
         for flag in ("numeric", "legal"):
             if not isinstance(ident.get(flag), bool):
                 problems.append(f"{where}: identifier {name} needs {flag} = true or false")
+        legacy = ident.get("legacy", "")
+        if not isinstance(legacy, str) or (legacy and not _LEGACY.match(legacy)):
+            problems.append(f"{where}: identifier {name} legacy must be a schema 24 key kind "
+                            f"and an optional value prefix (\"cui\", \"external:osm:\"), "
+                            f"got {legacy!r}")
+            legacy = ""
         out.append({"name": name, "numeric": ident.get("numeric") is True,
-                    "legal": ident.get("legal") is True})
+                    "legal": ident.get("legal") is True, "legacy": legacy})
     return tuple(out)
 
 

@@ -13,7 +13,10 @@ refuse the whole request (HTTP 400), so each is checked first.
 
 Answers are kept in data/anaf.db, one row per CUI (a CUI ANAF doesn't know
 too), so a company is asked about again only once its answer is older than
-the module's ``cache_days``.
+the module's ``cache_days``. The file is read and written in the form it
+has: the plain one (version 1, below), or the compressed one with every
+replaced answer kept (version 2, store.py), which the database upgrade
+writes.
 """
 
 from __future__ import annotations
@@ -231,14 +234,29 @@ def _connect(path: Path) -> sqlite3.Connection:
     return con
 
 
-def kept(path: Path, cuis: list[str]) -> dict[str, tuple[str, dict | None]]:
+def kept(path: Path, cuis: list[str], *,
+         read_only: bool = False) -> dict[str, tuple[str, dict | None]]:
     """{cui: (fetched_at, answer or None when ANAF didn't know it)} for the
-    CUIs with a kept answer."""
+    CUIs with a kept answer. ``read_only``: open the file only to read it
+    (a page showing a company), never to set it up."""
     if not cuis or not Path(path).is_file():
         return {}
     out = {}
-    con = _connect(path)
+    con = (sqlite3.connect(f"file:{Path(path).resolve().as_posix()}?mode=ro", uri=True)
+           if read_only else _connect(path))
     try:
+        from harvey.modules.ro.anaf import store
+
+        form = store.version(con)
+        if form == 0:
+            raise store.Unfinished(f"{path} is a rewrite that hasn't finished")
+        if form == store.VERSION:
+            for cui, (fetched_at, found, body) in store.kept(con, cuis).items():
+                try:
+                    out[cui] = (fetched_at, json.loads(body) if found else None)
+                except ValueError:
+                    continue
+            return out
         for start in range(0, len(cuis), 900):
             chunk = cuis[start:start + 900]
             rows = con.execute(f"SELECT cui, fetched_at, found, body FROM answers WHERE cui IN "
@@ -264,7 +282,16 @@ def keep(path: Path, found: dict[str, dict], missing: set[str], when: str | None
         return
     con = _connect(path)
     try:
-        con.executemany("INSERT OR REPLACE INTO answers VALUES (?, ?, ?, ?)", rows)
+        from harvey.modules.ro.anaf import store
+
+        form = store.version(con)
+        if form == 0:
+            raise store.Unfinished(f"{path} is a rewrite that hasn't finished")
+        if form == store.VERSION:
+            # The answer replaced goes to history when it said something else.
+            store.keep(con, rows)
+        else:
+            con.executemany("INSERT OR REPLACE INTO answers VALUES (?, ?, ?, ?)", rows)
         con.commit()
     finally:
         con.close()
@@ -291,9 +318,16 @@ def status(path: Path | None = None) -> dict:
         return {"answers": 0, "found": 0, "latest": ""}
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        n, found, latest = con.execute(
-            "SELECT COUNT(*), COALESCE(SUM(found), 0), COALESCE(MAX(fetched_at), '') "
-            "FROM answers").fetchone()
+        from harvey.modules.ro.anaf import store
+
+        if store.version(con) == store.VERSION:
+            n, found, latest = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(found), 0), MAX(fetched) FROM answers").fetchone()
+            latest = store.to_iso(latest) if latest is not None else ""
+        else:
+            n, found, latest = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(found), 0), COALESCE(MAX(fetched_at), '') "
+                "FROM answers").fetchone()
     except sqlite3.Error:
         return {"answers": 0, "found": 0, "latest": ""}
     finally:

@@ -43,7 +43,7 @@ from harvey.overlay.schema import EMAIL, ERROR, MOBILE, PHONE, TALLIES
 
 FIRM_COLUMNS = ("n_contacts", "n_email", "n_phone", "n_mobile", "best_trust", "n_people",
                 "last_search_at", "site_read_at", "site_read_deep", "finder_at")
-LINK_COLUMNS = ("trust", "person", "first_seen", "last_seen")
+LINK_COLUMNS = ("trust", "person", "location", "first_seen", "last_seen")
 READING_COLUMNS = ("num", "text", "confidence", "module", "at", "obs", "positive")
 
 
@@ -88,10 +88,10 @@ def _expected_links(con, pairs: str | None) -> None:
     _drop(con, "exp_link")
     where = (f" WHERE (firm, contact) IN (SELECT firm, contact FROM {pairs})" if pairs else "")
     con.execute("CREATE TEMP TABLE exp_link (firm INTEGER, contact INTEGER, trust INTEGER, "
-                "person INTEGER, first_seen INTEGER, last_seen INTEGER, "
+                "person INTEGER, location INTEGER, first_seen INTEGER, last_seen INTEGER, "
                 "PRIMARY KEY (firm, contact)) WITHOUT ROWID")
     con.execute("INSERT INTO exp_link SELECT firm, contact, MIN(trust), MAX(person), "
-                f"MIN(first_seen), MAX(last_seen) FROM link_evidence{where} "
+                f"MAX(location), MIN(first_seen), MAX(last_seen) FROM link_evidence{where} "
                 "GROUP BY firm, contact")
 
 
@@ -286,9 +286,11 @@ def _write_links(con, pairs: str | None) -> None:
                 "(SELECT 1 FROM exp_link e WHERE e.firm = link.firm AND e.contact = link.contact)")
     con.execute("""
         INSERT INTO link (firm, contact, trust, person, location, first_seen, last_seen)
-        SELECT firm, contact, trust, person, 0, first_seen, last_seen FROM exp_link WHERE true
+        SELECT firm, contact, trust, person, location, first_seen, last_seen FROM exp_link
+        WHERE true
         ON CONFLICT (firm, contact) DO UPDATE SET trust = excluded.trust,
-            person = excluded.person, first_seen = excluded.first_seen,
+            person = excluded.person, location = excluded.location,
+            first_seen = excluded.first_seen,
             last_seen = excluded.last_seen""")
 
 
@@ -395,17 +397,20 @@ def touched(con: sqlite3.Connection) -> None:
     _cleanup(con)
 
 
-def fix(con: sqlite3.Connection) -> None:
+def fix(con: sqlite3.Connection, *, fold_history: bool = False) -> None:
     """Write a full recount of every kept value (in bulk mode: one
-    transaction, triggers off; no observation is deleted), and put back
-    any trigger or guard that is missing."""
+    transaction, triggers off), and put back any trigger or guard that is
+    missing. No observation is deleted, unless ``fold_history``: then one
+    that repeats the observation before it is (a bulk load of history that
+    was kept on every check, not only on change), after the readings'
+    ``checked_at`` has taken the time it was last seen."""
     from harvey.overlay import schema
     from harvey.overlay.triggers import TOUCH_TABLES, bulk
 
     with bulk(con):
         schema.install_guards(con)
         _write_links(con, None)
-        _write_readings(con, None)
+        _write_readings(con, None, fold="main.obs" if fold_history else None)
         _scope_all(con)
         _groups(con)
         _write_firms_and_contacts(con)

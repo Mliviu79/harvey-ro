@@ -23,15 +23,18 @@ terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a na
 # is not that strict: one CUI can have several (an old, struck-off
 # registration and the current one), so two records with different numbers
 # may still be one firm and can be merged.
+# (legacy: where schema 24 kept the key, for the database upgrade.)
 [[identifiers]]
 name = "ro.cui"
 numeric = true
 legal = true
+legacy = "cui"
 
 [[identifiers]]
 name = "ro.onrc_reg"
 numeric = false
 legal = false
+legacy = "external:onrc:"
 
 # The registry file, read in place (never copied into harvey.db): the core
 # reaches it through the adapter, by CUI through the canonical row the load

@@ -1,37 +1,39 @@
 """ANAF's kept answers' adapter: how the core reads data/anaf.db.
 
-Answers are kept by CUI (as text) with ANAF's JSON body; a CUI ANAF didn't
-know has ``found = 0``, a checked answer: its yes/no signals read no. A CUI
-never asked has no row: unknown. Values are read from the body by key;
-there is no range over them until the file keeps the parsed fields beside
-the body (its rewrite), so a cohort condition on them is a count job.
+The core reads the compressed file (store.py, version 2), which the
+database upgrade writes: every signal is a column of ``parsed``, keyed by
+the CUI as an integer, dated by when the answer was fetched. A CUI ANAF
+didn't know has ``found = 0``, a checked answer: its yes/no signals read
+no, the rest unknown. A CUI never asked has no row: unknown. A plain file
+(version 1, the job's until the upgrade) is not read here: the register
+counts as not loaded until it is rewritten.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from harvey import queries
 from harvey.registers import Adapter as Base
 from harvey.registers import Read, chunks
 
 MODULE = "anaf"
+# When the answer was fetched, as the job writes the time (ISO, UTC).
+FETCHED = "strftime('%Y-%m-%dT%H:%M:%S+00:00', a.fetched, 'unixepoch')"
+TABLE = "{alias}.parsed c CROSS JOIN {alias}.answers a"
 
 queries.statement(
     "anaf.describe",
-    "SELECT j.value AS key, a.fetched_at, a.found, a.body FROM json_each(?) j "
-    "CROSS JOIN {alias}.answers a WHERE a.cui = CAST(j.value AS TEXT)",
+    "SELECT j.value AS key, a.fetched, a.found, a.dict, a.body FROM json_each(?) j "
+    "CROSS JOIN {alias}.answers a WHERE a.cui = j.value",
     params=("[1, 2]",), module=MODULE, drives="j")
+queries.statement("anaf.dicts", "SELECT id, zdict FROM {alias}.dict", module=MODULE,
+                  scans={"dict": "the preset dictionaries: one row each"})
 
 
-def _flag(signal: str, path: str) -> Read:
-    value = f"CASE WHEN c.found = 0 THEN 0 ELSE json_extract(c.body, '{path}') END"
-    return Read(signal, "{alias}.answers c", "cui", value, date="c.fetched_at", key_text=True)
-
-
-def _text(signal: str, path: str) -> Read:
-    return Read(signal, "{alias}.answers c", "cui", f"NULLIF(json_extract(c.body, '{path}'), '')",
-                date="c.fetched_at", key_text=True)
+def _read(signal: str, column: str) -> Read:
+    return Read(signal, TABLE, "cui", f"c.{column}", date=FETCHED, where="a.cui = c.cui")
 
 
 class Adapter(Base):
@@ -40,23 +42,49 @@ class Adapter(Base):
     # mark it (no statement reads all of it).
     marks_sql = ""
     reads = (
-        _flag("VAT_REGISTERED", "$.inregistrare_scop_Tva.scpTVA"),
-        _flag("VAT_ON_CASH", "$.inregistrare_RTVAI.statusTvaIncasare"),
-        _flag("SPLIT_VAT", "$.inregistrare_SplitTVA.statusSplitTVA"),
-        _flag("FISCALLY_INACTIVE", "$.stare_inactiv.statusInactivi"),
-        _flag("EFACTURA_REGISTERED", "$.date_generale.statusRO_e_Factura"),
-        _text("LEGAL_FORM", "$.date_generale.forma_juridica"),
+        _read("VAT_REGISTERED", "vat"),
+        _read("VAT_ON_CASH", "vat_cash"),
+        _read("SPLIT_VAT", "split_vat"),
+        _read("FISCALLY_INACTIVE", "inactive"),
+        _read("EFACTURA_REGISTERED", "efactura"),
+        _read("LEGAL_FORM", "legal_form"),
+        _read("VAT_SINCE", "vat_since"),
+        _read("REGISTRATION_STATUS", "status"),
+        # Every number ANAF lists (E.164, space-separated) and the address
+        # lines (registered office, then fiscal domicile when elsewhere).
+        _read("PHONE_NUMBER", "phone"),
+        _read("ADDRESS", "address"),
     )
 
+    def attach(self, con: sqlite3.Connection) -> bool:
+        """Attach the file when it is the compressed form; a plain or a
+        half-rewritten one counts as not loaded."""
+        from harvey.modules.ro.anaf import store
+
+        if self.path is None or not self.path.is_file():
+            return False
+        if self.alias not in {r[1] for r in con.execute("PRAGMA database_list")}:
+            probe = sqlite3.connect(f"file:{self.path.resolve().as_posix()}?mode=ro", uri=True)
+            try:
+                if store.version(probe) != store.VERSION:
+                    return False
+            finally:
+                probe.close()
+        return super().attach(con)
+
     def describe(self, con, keys) -> dict:
-        """{key: {"fetched_at", "found", "answer"}} (the answer parsed)."""
+        """{key: {"fetched_at", "found", "answer"}} (the raw answer parsed)."""
+        from harvey.modules.ro.anaf import store
+
+        zdicts = {**store.DICTIONARIES, **dict(con.execute(self.sql("dicts")).fetchall())}
         out = {}
         for chunk in chunks(keys):
-            for key, fetched_at, found, body in con.execute(self.sql("describe"),
-                                                            (json.dumps(chunk),)):
+            for key, fetched, found, dict_id, blob in con.execute(self.sql("describe"),
+                                                                  (json.dumps(chunk),)):
                 try:
-                    answer = json.loads(body) if found else None
+                    answer = json.loads(store.decompress(dict_id, blob, zdicts)) if found else None
                 except ValueError:
                     answer = None
-                out[key] = {"fetched_at": fetched_at, "found": bool(found), "answer": answer}
+                out[key] = {"fetched_at": store.to_iso(fetched), "found": bool(found),
+                            "answer": answer}
         return out

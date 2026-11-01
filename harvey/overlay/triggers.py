@@ -101,6 +101,7 @@ _LINK_FROM_EVIDENCE = """
   UPDATE link SET
     trust = (SELECT MIN(trust) FROM link_evidence e WHERE e.firm = {f} AND e.contact = {c}),
     person = (SELECT MAX(person) FROM link_evidence e WHERE e.firm = {f} AND e.contact = {c}),
+    location = (SELECT MAX(location) FROM link_evidence e WHERE e.firm = {f} AND e.contact = {c}),
     first_seen = (SELECT MIN(first_seen) FROM link_evidence e WHERE e.firm = {f} AND e.contact = {c}),
     last_seen = (SELECT MAX(last_seen) FROM link_evidence e WHERE e.firm = {f} AND e.contact = {c})
   WHERE firm = {f} AND contact = {c};"""
@@ -222,10 +223,12 @@ END""",
     # ── Links from their evidence ──
     "evidence_ins": f"""
 CREATE TRIGGER {PREFIX}evidence_ins AFTER INSERT ON link_evidence BEGIN
-  INSERT INTO link (firm, contact, trust, person, first_seen, last_seen)
-  VALUES (NEW.firm, NEW.contact, NEW.trust, NEW.person, NEW.first_seen, NEW.last_seen)
+  INSERT INTO link (firm, contact, trust, person, location, first_seen, last_seen)
+  VALUES (NEW.firm, NEW.contact, NEW.trust, NEW.person, NEW.location, NEW.first_seen,
+          NEW.last_seen)
   ON CONFLICT (firm, contact) DO UPDATE SET
     trust = MIN(link.trust, excluded.trust), person = MAX(link.person, excluded.person),
+    location = MAX(link.location, excluded.location),
     first_seen = MIN(link.first_seen, excluded.first_seen),
     last_seen = MAX(link.last_seen, excluded.last_seen);
 END""",

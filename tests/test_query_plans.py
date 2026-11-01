@@ -60,6 +60,7 @@ REGISTER_STATS = {
         "accounts": [("accounts", "2831693 3 1")],
         "files": [("sqlite_autoindex_files_1", "9 3 1")],
         "meta": [("sqlite_autoindex_meta_1", "7 1")],
+        "filed": [(None, "1700000")], "complete_year": [(None, "3")],
         "current": [(None, "1122150"), ("current_turnover", "1000000 3"),
                     ("current_employees", "1000000 20"), ("current_net_result", "1100000 3"),
                     ("current_debts", "1100000 3"), ("current_equity", "1100000 3"),
@@ -72,7 +73,8 @@ REGISTER_STATS = {
         "current": [(None, "2647765"), ("current_vat", "2600000 1300000"),
                     ("current_employer", "2600000 1300000"), ("current_micro", "2600000 1300000")],
     },
-    "anaf": {"answers": [("answers", "1780000 1")]},
+    "anaf": {"answers": [(None, "1785000")], "parsed": [(None, "1785000")],
+             "dict": [(None, "1")]},
 }
 
 # The overlay at the size of today's install (1.79M firms in Harvey).
@@ -255,12 +257,13 @@ def build_taxpayers(path: Path) -> None:
 
 
 def build_anaf(path: Path) -> None:
-    from harvey.modules.ro.anaf import service
+    """The compressed form (store.py), as the database upgrade writes it."""
+    from harvey.modules.ro.anaf import store
 
     con = sqlite3.connect(path)
-    con.execute(service.SCHEMA)
-    con.execute("INSERT INTO answers VALUES ('1000004', '2026-01-01T00:00:00+00:00', 1, ?)",
-                ('{"date_generale": {"cui": 1000004, "statusRO_e_Factura": true}}',))
+    store.create(con)
+    store.keep(con, [("1000004", "2026-01-01T00:00:00+00:00", 1,
+                      '{"date_generale": {"cui": 1000004, "statusRO_e_Factura": true}}')])
     con.commit()
     _inject(con, "main", REGISTER_STATS["anaf"], write="anaf" in ANALYSED)
     con.close()
@@ -474,10 +477,7 @@ def test_register_values_reach_firms_only_through_keys(files):
     for m in registers.declared():
         assert f"{m.id}.marks" in names or m.id == "anaf"
         for r in m.register["reads"]:
-            assert f"{m.id}.read.{r['code']}" in names or m.id == "anaf" and \
-                r["code"] in ("VAT_SINCE", "REGISTRATION_STATUS", "ADDRESS", "PHONE_NUMBER") \
-                or m.id == "mf_financials" and r["code"] == "FILED_ACCOUNTS" \
-                or m.id == "mf_taxpayers" and r["code"] == "ADDRESS", (m.id, r["code"])
+            assert f"{m.id}.read.{r['code']}" in names, (m.id, r["code"])
 
 
 def test_the_plan_checker_catches_what_it_should(overlay_con):

@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
+from urllib.parse import quote
 
 from harvey import queries
 from harvey.paths import PROJECT_ROOT
@@ -85,9 +86,13 @@ class Adapter:
 
     module = ""
     reads: tuple[Read, ...] = ()
+    # The identifier scheme its rows are keyed by (the manifest's keyed_by).
+    keyed_by = ""
 
-    def __init__(self, alias: str, path: Path | None = None, derived: str = ""):
+    def __init__(self, alias: str, path: Path | None = None, derived: str = "",
+                 keyed_by: str = ""):
         self.alias = alias
+        self.keyed_by = keyed_by or self.keyed_by
         self.path = Path(path) if path else None
         self.derived = derived or alias
         # (signal, scheme) -> Read; scheme "" is the register's own key.
@@ -96,12 +101,21 @@ class Adapter:
 
     # The register's file
 
+    # The file its derived tables are in, when they were built elsewhere
+    # (under the alias ``derived``); None: in the register's own file.
+    derived_path: Path | None = None
+
     def attach(self, con: sqlite3.Connection) -> bool:
-        """Attach the file read-only under the alias; False when it isn't loaded."""
+        """Attach the file read-only under the alias (and the derived
+        tables' file, when it is another); False when it isn't loaded."""
         if self.path is None or not self.path.is_file():
             return False
-        if self.alias not in {r[1] for r in con.execute("PRAGMA database_list")}:
+        have = {r[1] for r in con.execute("PRAGMA database_list")}
+        if self.alias not in have:
             attach_read_only(con, self.alias, self.path)
+        if self.derived_path is not None and self.derived != self.alias \
+                and self.derived not in have:
+            attach_read_only(con, self.derived, self.derived_path)
         return True
 
     def sql(self, name: str) -> str:
@@ -137,6 +151,23 @@ class Adapter:
                                                 (json.dumps(chunk),)):
                 out.setdefault(key, []).append((value, date))
         return out
+
+    def held_values(self, con: sqlite3.Connection, signal: str, scheme_id: int,
+                    scheme: str = ""):
+        """(record, value, date) for every record in Harvey whose key (of
+        scheme ``scheme_id``, the register's own or ``scheme``) has a value
+        for ``signal``: a walk of firm_ident, each key probed in the
+        register (a recount or an upgrade's check, never a page)."""
+        read = self.by_signal.get((signal, scheme))
+        if read is None:
+            raise ValueError(f"{self.module} doesn't read {signal} by {scheme or 'its key'}")
+        return con.execute(self.sql(f"held_values.{signal}{read.suffix}"), (scheme_id,))
+
+    def names_sql(self, scheme: str = "") -> str | None:
+        """A statement giving (record, the register's name for it) for the
+        records in Harvey keyed by ``scheme`` (its own key when empty; param:
+        the scheme's id), or None when the register names no firm by it."""
+        return None
 
     def range_sql(self, signal: str, op: str, scheme: str = "") -> str | None:
         """A statement selecting the keys whose value satisfies ``op ?``
@@ -202,6 +233,13 @@ def register_reads(adapter: Adapter) -> None:
             params=(1,), module=mod, drives="fi",
             scans={"firm_ident": "a recount job per load mark: every key of the scheme, "
                                  "each probed in the register by key"})
+        queries.statement(
+            f"{mod}.held_values.{name}",
+            f"SELECT fi.firm, {r.value}, {r.date} FROM firm_ident fi CROSS JOIN {r.table} "
+            f"WHERE fi.scheme = ? AND {probe} AND {r.value} IS NOT NULL",
+            params=(1,), module=mod, drives="fi",
+            scans={"firm_ident": "an upgrade's or recount's walk: every key of the scheme, "
+                                 "each probed in the register by key"})
         if r.indexed:
             matches = {r.base_table: "a range reads the index entries it matches (as many as "
                                      "the firms in range): an index search, never the table"}
@@ -243,7 +281,8 @@ def adapter_for(manifest, data_dir: Path = DATA_DIR, derived: str = "") -> Adapt
     """The module's adapter, over its file in ``data_dir``."""
     reg = manifest.register
     cls = import_module(reg["adapter"]).Adapter
-    return cls(reg["attach"], Path(data_dir) / reg["file"], derived=derived)
+    return cls(reg["attach"], Path(data_dir) / reg["file"], derived=derived,
+               keyed_by=reg["keyed_by"])
 
 
 def adapters(data_dir: Path = DATA_DIR, manifests=None, enabled=None) -> list[Adapter]:
@@ -291,18 +330,21 @@ def mark_built(con: sqlite3.Connection, dst: str, table: str, version: str) -> N
 
 
 def build_derived(source: Path, build, target: Path | None = None,
-                  tables: tuple[str, ...] = ()) -> dict:
+                  tables: tuple[str, ...] = (), attach: dict | None = None) -> dict:
     """Run a register's derived-table ``build(con, src, dst)`` and analyse
     the ``tables`` it builds. Into ``target``, a fresh file (the register
     attached read-only, never written), or, with no target, into the
     register's own file: one journalled transaction, so a build that fails
     part-way leaves the file as it was, and only the built tables are
     analysed (the register's own statistics, and so today's plans, stay as
-    its load left them). Returns {"seconds", "bytes", ...build's counts}."""
+    its load left them). ``attach``: alias -> path of other files the build
+    reads, attached read-only. Returns {"seconds", "bytes", ...build's counts}."""
     source = Path(source)
     started = time.monotonic()
     if target is None:
-        con = sqlite3.connect(source, isolation_level=None)
+        # (A URI, so a file attached read-only is read-only.)
+        con = sqlite3.connect(f"file:{quote(source.resolve().as_posix())}", uri=True,
+                              isolation_level=None)
         src = dst = "main"
     else:
         target = Path(target)
@@ -313,6 +355,8 @@ def build_derived(source: Path, build, target: Path | None = None,
         con.execute("ATTACH DATABASE ? AS out", (str(target),))
         src, dst = "main", "out"
     try:
+        for alias, path in (attach or {}).items():
+            attach_read_only(con, alias, Path(path))
         if target is not None:
             # A scratch file nobody reads until the build is done.
             con.execute(f"PRAGMA {dst}.journal_mode=OFF")

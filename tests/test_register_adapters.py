@@ -47,7 +47,8 @@ value_type = "bool"
 
 def test_a_manifest_declares_identifiers_and_its_register(tmp_path):
     m = _manifest(tmp_path, "example_register", REGISTER)
-    assert m.identifiers == ({"name": "example.tax_id", "numeric": True, "legal": True},)
+    assert m.identifiers == ({"name": "example.tax_id", "numeric": True, "legal": True,
+                              "legacy": ""},)
     assert m.register["attach"] == "exr" and m.register["keyed_by"] == "example.tax_id"
     assert m.register["reads"] == ({"code": "EXAMPLE_SIGNAL", "absent": "false",
                                     "precedence": 2},)
@@ -89,9 +90,12 @@ def test_the_romanian_registers_are_declared_by_their_modules():
     con = sqlite3.connect(":memory:")
     schema.create(con, triggers=False)
     ids = schema.sync_identifiers(con)
-    assert con.execute("SELECT name, numeric, legal FROM ident_scheme ORDER BY name").fetchall() \
-        == [("ro.cui", 1, 1), ("ro.onrc_reg", 0, 0)]
-    assert set(ids) == {"ro.cui", "ro.onrc_reg"}
+    assert con.execute("SELECT name, numeric, legal FROM ident_scheme WHERE name LIKE 'ro.%' "
+                       "ORDER BY name").fetchall() == [("ro.cui", 1, 1), ("ro.onrc_reg", 0, 0)]
+    # Listing sources declare how their listings are known again (never legal).
+    assert set(ids) == {"ro.cui", "ro.onrc_reg", "osm.element", "dataforseo.listing",
+                        "scavio.place"}
+    assert con.execute("SELECT COUNT(*) FROM ident_scheme WHERE legal = 1").fetchone()[0] == 1
 
 
 # ── Derived tables ──
@@ -238,6 +242,136 @@ def test_taxpayers_current_keeps_unknown_flags_unknown(tmp_path):
     con = sqlite3.connect(path)
     assert con.execute("SELECT * FROM current ORDER BY cui").fetchall() == [
         (1000004, 1, None, 0, "0268000000"), (1000012, 0, 1, None, None)]
+
+
+def _registry(path):
+    from harvey import registry
+    from harvey.modules.ro.onrc import derived
+
+    con = sqlite3.connect(path)
+    con.executescript(registry.SCHEMA)
+    rows = [  # reg, cui, form, registered, operating
+        ("J08/1/2015", "1000004", "SRL", "01/02/2015", 1),    # filed 2024: yes
+        ("J08/2/2015", "1000012", "SRL", "01/02/2015", 1),    # last filed 2022: no
+        ("J08/3/2015", "1000020", "SRL", "01/02/2015", 1),    # never filed: no
+        ("J08/4/2015", "1000039", "PFA", "01/02/2015", 1),    # a sole trader: unknown
+        ("J08/5/2025", "1000047", "SRL", "03/04/2025", 1),    # registered after: unknown
+        ("J08/6/2010", "1000055", "SRL", "01/02/2010", 0),    # struck off: unknown
+        ("J08/7/2010", "1000063", "SRL", "01/02/2010", 0),    # struck off, filed 2021: yes
+    ]
+    con.executemany("INSERT INTO firms (reg, name, cui, form, registered, operating) "
+                    "VALUES (?, 'EXEMPLU SRL', ?, ?, ?, ?)", rows)
+    con.execute("INSERT INTO meta VALUES ('dataset', 'firme-01-10-2026')")
+    con.commit()
+    con.close()
+    derived.reindex(path)
+
+
+def test_filed_accounts_says_no_only_for_a_firm_that_should_have_filed(tmp_path):
+    from harvey.modules.ro.mf_financials import derived, store
+
+    path = tmp_path / "financials.db"
+    con = sqlite3.connect(path)
+    con.executescript(store.SCHEMA)
+    con.executemany("INSERT INTO accounts (cui, year, form, turnover) VALUES (?, ?, 'UU', 1)",
+                    [("1000004", 2024), ("1000012", 2022), ("1000063", 2021),
+                     ("1000039", 2023)])
+    # 2024 loaded in full and final (every form, revised), 2025 not.
+    con.executemany("INSERT INTO files (year, form, package, published) VALUES (?, ?, ?, ?)",
+                    [(2024, f, "situatii_2024_actualizat", "2026-06-01") for f in store.FORMS]
+                    + [(2025, "UU", "situatii_2025", "2026-06-01")])
+    con.commit()
+    con.close()
+    # Without the registry nothing can say no.
+    counts = derived.reindex(path)
+    assert (counts["filed_yes"], counts["filed_no"], counts["filed_from"]) == (4, 0, "none")
+    reg = tmp_path / "registry.db"
+    _registry(reg)
+    counts = derived.reindex(path, registry=reg)
+    con = sqlite3.connect(path)
+    assert dict((c, (y, v)) for c, y, v in con.execute("SELECT cui, year, filed FROM filed")) == {
+        1000004: (2024, 1), 1000012: (2024, 0), 1000020: (2024, 0), 1000039: (2023, 1),
+        1000063: (2021, 1)}
+    assert counts["filed_from"].startswith("registry firme-01-10-2026")
+    assert con.execute("SELECT version FROM derived_meta WHERE name = 'filed'").fetchone()[0] == \
+        counts["filed_from"]
+    con.close()
+
+
+def test_anaf_reads_the_compressed_file_and_counts_a_plain_one_not_loaded(tmp_path):
+    import json
+
+    from harvey.modules.ro.anaf import queries as anaf_queries
+    from harvey.modules.ro.anaf import service, store
+
+    item = {"date_generale": {"cui": 1000004, "telefon": "0268 000 210",
+                              "stare_inregistrare": "INREGISTRAT din data 01.03.2015",
+                              "statusRO_e_Factura": True},
+            "inregistrare_scop_Tva": {"scpTVA": True, "perioade_TVA": [
+                {"data_inceput_ScpTVA": "2019-05-01", "data_sfarsit_ScpTVA": ""}]},
+            "adresa_sediu_social": {"sdenumire_Strada": "Str. Exemplu", "snumar_Strada": "1",
+                                    "sdenumire_Localitate": "Mun. Braşov"}}
+    plain = tmp_path / "plain" / "anaf.db"
+    service.keep(plain, {"1000004": item}, set(), "2026-10-01T08:00:00+00:00")
+    new = tmp_path / "anaf.db"
+    con = sqlite3.connect(new)
+    store.create(con)
+    store.keep(con, [("1000004", "2026-10-01T08:00:00+00:00", 1, json.dumps(item)),
+                     ("1000012", "2026-10-01T08:00:00+00:00", 0, "")])
+    con.commit()
+    con.close()
+    overlay = sqlite3.connect(":memory:", uri=True)
+    schema.create(overlay, triggers=False)
+    ids = schema.sync_identifiers(overlay)
+    overlay.executemany("INSERT INTO firm (id, created) VALUES (?, 1)", [(1,), (2,)])
+    overlay.executemany("INSERT INTO firm_ident (scheme, key, firm, since) VALUES (?, ?, ?, 1)",
+                        [(ids["ro.cui"], 1000004, 1), (ids["ro.cui"], 1000012, 2)])
+    assert anaf_queries.Adapter("anaf", plain, keyed_by="ro.cui").attach(overlay) is False
+    a = anaf_queries.Adapter("anaf", new, keyed_by="ro.cui")
+    assert a.attach(overlay) is True
+    got = {code: {f: v for f, v, _ in a.held_values(overlay, code, ids["ro.cui"])}
+           for code in ("PHONE_NUMBER", "ADDRESS", "REGISTRATION_STATUS", "VAT_SINCE",
+                        "VAT_REGISTERED", "EFACTURA_REGISTERED")}
+    assert got["PHONE_NUMBER"] == {1: "+40268000210"}
+    assert got["ADDRESS"][1].startswith("Str. Exemplu 1")
+    assert got["REGISTRATION_STATUS"] == {1: "INREGISTRAT"}
+    assert got["VAT_SINCE"] == {1: "2019-05-01"}
+    assert got["VAT_REGISTERED"] == {1: 1, 2: 0}               # ANAF didn't know 2: no
+    assert got["EFACTURA_REGISTERED"] == {1: 1, 2: 0}
+    _, _, date = next(iter(a.held_values(overlay, "VAT_REGISTERED", ids["ro.cui"])))
+    assert date == "2026-10-01T08:00:00+00:00"
+    assert a.describe(overlay, [1000004])[1000004]["answer"] == item
+
+
+def test_the_taxpayer_file_reads_the_address_as_one_line(tmp_path):
+    from harvey.modules.ro.mf_taxpayers import derived, store
+    from harvey.modules.ro.mf_taxpayers import queries as tax_queries
+
+    path = tmp_path / "taxpayers.db"
+    con = sqlite3.connect(path)
+    con.executescript(store.SCHEMA)
+    row = {"cui": "1000004", "street": "Str. Exemplu", "number": "7", "block": "A",
+           "apartment": "3", "locality": "Brașov", "county": "Brașov", "postal_code": "500001"}
+    con.execute(f"INSERT INTO taxpayers ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                tuple(row.values()))
+    con.execute("INSERT INTO taxpayers (cui, name) VALUES ('1000012', 'EXEMPLU DOI SRL')")
+    con.execute("INSERT INTO meta VALUES ('published', '2026-07-01')")
+    con.commit()
+    con.close()
+    derived.reindex(path)
+    overlay = sqlite3.connect(":memory:", uri=True)
+    schema.create(overlay, triggers=False)
+    ids = schema.sync_identifiers(overlay)
+    overlay.executemany("INSERT INTO firm (id, created) VALUES (?, 1)", [(1,), (2,)])
+    overlay.executemany("INSERT INTO firm_ident (scheme, key, firm, since) VALUES (?, ?, ?, 1)",
+                        [(ids["ro.cui"], 1000004, 1), (ids["ro.cui"], 1000012, 2)])
+    a = tax_queries.Adapter("tax", path, keyed_by="ro.cui")
+    assert a.attach(overlay)
+    got = {f: v for f, v, _ in a.held_values(overlay, "ADDRESS", ids["ro.cui"])}
+    # The same parts store.address() joins (it also leaves out a repeated
+    # one, like a county named as its town).
+    assert got == {1: "Str. Exemplu nr. 7, bl. A, ap. 3, Brașov, Brașov, 500001"}
+    assert store.address({**row, "number": "7"}) == "Str. Exemplu nr. 7, bl. A, ap. 3, Brașov, 500001"
 
 
 # ── harvey doctor --recount ──

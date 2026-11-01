@@ -75,6 +75,23 @@ queries.statement(
     "SELECT f.reg FROM {alias}.firm_fts t CROSS JOIN {alias}.firms f "
     "WHERE t.firm_fts MATCH ? AND f.id = t.rowid AND f.cui = ''",
     params=("tags : c8623r3",), module=MODULE, drives="t")
+# The registry's name for each firm in Harvey with a CUI (its canonical
+# row): an upgrade's comparison with the name Harvey shows.
+queries.statement(
+    "onrc.names.held",
+    "SELECT fi.firm, f.name FROM firm_ident fi CROSS JOIN {derived}.firm_by_cui b "
+    "CROSS JOIN {alias}.firms f WHERE fi.scheme = ? AND b.cui = fi.key AND f.id = b.firm_id",
+    params=(1,), module=MODULE, drives="fi",
+    scans={"firm_ident": "an upgrade's walk: every CUI in Harvey, each probed in the "
+                         "registry by key"})
+# The same for firms in Harvey known by registration number (no CUI).
+queries.statement(
+    f"onrc.names.held@{REG}",
+    "SELECT fi.firm, f.name FROM firm_ident fi CROSS JOIN {alias}.firms f "
+    "WHERE fi.scheme = ? AND f.reg = fi.key",
+    params=(1,), module=MODULE, drives="fi",
+    scans={"firm_ident": "an upgrade's walk: every registration number in Harvey, each "
+                         "probed in the registry by key"})
 queries.statement(
     "onrc.name_key.version",
     "SELECT version FROM {derived}.derived_meta WHERE name = 'name_key'", module=MODULE)
@@ -134,6 +151,13 @@ class Adapter(Base):
             for firm_id, first, last, role in con.execute(self.sql("describe.administrators"), arg):
                 by_id[firm_id]["administrators"].append((first, last, role))
         return out
+
+    def names_sql(self, scheme: str = "") -> str | None:
+        if scheme in ("", "ro.cui"):
+            return self.sql("names.held")
+        if scheme == REG:
+            return self.sql(f"names.held@{REG}")
+        return None
 
     def keys_of_ids(self, con, ids) -> list[tuple[str, object]]:
         """Registry ids (in order) as the core's (scheme, key), canonical

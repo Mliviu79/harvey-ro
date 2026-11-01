@@ -23,7 +23,8 @@ VERSION = 25
 TRUST = {"confirmed": 0, "likely": 1, "unconfirmed": 2}
 TRUST_NAMES = {v: k for k, v in TRUST.items()}
 LINE_TYPE = {"unknown": 0, "mobile": 1, "fixed": 2, "voip": 3, "toll_free": 4}
-CONTACT_STATUS = {"unchecked": 0, "verified": 1, "risky": 2, "guess": 3, "invalid": 4}
+# "valid": a phone number that parses as a real number of its country.
+CONTACT_STATUS = {"unchecked": 0, "verified": 1, "risky": 2, "guess": 3, "invalid": 4, "valid": 5}
 # A search that failed doesn't count as done (its outcome is ERROR).
 OUTCOME = {"error": 0, "found": 1, "nothing": 2, "skipped": 3}
 ERROR = OUTCOME["error"]
@@ -34,6 +35,9 @@ ERROR = OUTCOME["error"]
 EMAIL, PHONE = 1, 2
 MOBILE = LINE_TYPE["mobile"]
 CORE_KINDS = ((EMAIL, "email", "Email", "email"), (PHONE, "phone", "Phone", "phone"))
+
+# The kinds of key Harvey found for a firm (firm_key.kind).
+FIRM_KEY = {"email": 1, "domain": 2}
 
 # Roles the kept values need to recognise (role table): the capability a
 # website read is recorded under, the contact finder's, and the bit of
@@ -59,6 +63,8 @@ CREATE TABLE ident_scheme (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, module INTEGER NOT NULL,
   numeric INTEGER NOT NULL, legal INTEGER NOT NULL
 );
+-- The runs (job batches) searches and sources were made in, by their text id.
+CREATE TABLE batch (id INTEGER PRIMARY KEY, ref TEXT NOT NULL UNIQUE);
 -- The bits of search.looked_for (bit is the value: 1, 2, 4, ...).
 CREATE TABLE looked_for (bit INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE role (name TEXT PRIMARY KEY, id INTEGER NOT NULL) WITHOUT ROWID;
@@ -155,9 +161,11 @@ CREATE TABLE link (
 CREATE INDEX link_contact ON link(contact, firm);
 CREATE INDEX link_person  ON link(person) WHERE person != 0;
 
+-- location: the firm's place (locations row) the contact was found for, 0 none.
 CREATE TABLE link_evidence (
   firm INTEGER NOT NULL, contact INTEGER NOT NULL, source INTEGER NOT NULL,
-  person INTEGER NOT NULL DEFAULT 0, capability INTEGER, trust INTEGER NOT NULL,
+  person INTEGER NOT NULL DEFAULT 0, location INTEGER NOT NULL DEFAULT 0,
+  capability INTEGER, trust INTEGER NOT NULL,
   confidence REAL, evidence_url TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
   PRIMARY KEY (firm, contact, source, person)
 ) WITHOUT ROWID;
@@ -211,6 +219,11 @@ CREATE TABLE firm_key (
 CREATE INDEX firm_key_firm ON firm_key(firm);
 -- The old text ids still named by job payloads, actions and settings.
 CREATE TABLE legacy_id (uuid TEXT PRIMARY KEY, firm INTEGER NOT NULL) WITHOUT ROWID;
+-- What an upgrade kept aside instead of deciding for the user: a name that
+-- differs from the register's (a rename, or an older dataset: it becomes
+-- the display name only when the user says so), a key no module declares.
+CREATE TABLE migration_note (firm INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
+                             PRIMARY KEY (firm, kind, value)) WITHOUT ROWID;
 """
 
 SIGNALS = """
@@ -510,6 +523,16 @@ def capability_id(con: sqlite3.Connection, module: str, name: str) -> int:
                        (mod, name)).lastrowid
 
 
+def batch_id(con: sqlite3.Connection, ref: str) -> int | None:
+    """The integer id of a run's text id, added when new (None for none)."""
+    if not ref:
+        return None
+    row = con.execute("SELECT id FROM batch WHERE ref = ?", (ref,)).fetchone()
+    if row:
+        return row[0]
+    return con.execute("INSERT INTO batch (ref) VALUES (?)", (ref,)).lastrowid
+
+
 def looked_for_bit(con: sqlite3.Connection, name: str) -> int:
     """The bit ``name`` has in search.looked_for, assigned when new."""
     row = con.execute("SELECT bit FROM looked_for WHERE name = ?", (name,)).fetchone()
@@ -565,3 +588,50 @@ def sync_identifiers(con: sqlite3.Connection, manifests=None) -> dict[str, int]:
             out[ident["name"]] = ident_scheme(con, ident["name"], m.id,
                                               numeric=ident["numeric"], legal=ident["legal"])
     return out
+
+
+# ── The vocabulary ──
+
+SIGNAL_COLUMNS = ("code", "label", "description", "category", "value_type", "unit", "cardinality",
+                  "keyed_by", "when_known", "cost_note", "status", "confidence_floor")
+
+
+def sync_signals(con: sqlite3.Connection, rows=(), manifests=None) -> dict[str, int]:
+    """The signal vocabulary and who provides each signal: ``rows`` are
+    signal rows to keep as they are (the confirmation gate, ``status``,
+    is the user's: an upgrade brings the old vocabulary's rows); a signal
+    a manifest declares that isn't among them is added as proposed. Then
+    one ``signal_source`` row per (signal, module): stored (how 0) for a
+    module that declares the signal, read (how 1) for a register module
+    that reads it, with its precedence and what no row means. Returns
+    code -> id."""
+    from harvey.modules.loader import load_manifests
+
+    manifests = list(manifests if manifests is not None else load_manifests())
+    cols = ", ".join(SIGNAL_COLUMNS)
+    marks = ", ".join("?" * len(SIGNAL_COLUMNS))
+    for row in rows:
+        values = [row.get(c) for c in SIGNAL_COLUMNS]
+        values[SIGNAL_COLUMNS.index("status")] = row.get("status") or "proposed"
+        con.execute(f"INSERT INTO signal ({cols}) VALUES ({marks}) ON CONFLICT (code) DO UPDATE "
+                    f"SET {', '.join(f'{c} = excluded.{c}' for c in SIGNAL_COLUMNS[1:])}", values)
+    for m in manifests:
+        for sig in m.signals:
+            values = [sig.get(c) for c in SIGNAL_COLUMNS]
+            values[SIGNAL_COLUMNS.index("status")] = "proposed"
+            con.execute(f"INSERT OR IGNORE INTO signal ({cols}) VALUES ({marks})", values)
+    ids = dict(con.execute("SELECT code, id FROM signal").fetchall())
+    for m in manifests:
+        mod = dict_id(con, "module", m.id)
+        read = {r["code"]: r for r in (m.register or {}).get("reads", ())}
+        for sig in m.signals:
+            if sig["code"] not in read and sig["code"] in ids:
+                con.execute("INSERT OR IGNORE INTO signal_source (signal, module, how, precedence, "
+                            "absent) VALUES (?, ?, 0, 0, 0)", (ids[sig["code"]], mod))
+        for code, r in read.items():
+            if code in ids:
+                con.execute("INSERT INTO signal_source (signal, module, how, precedence, absent) "
+                            "VALUES (?, ?, 1, ?, ?) ON CONFLICT (signal, module) DO UPDATE SET "
+                            "how = 1, precedence = excluded.precedence, absent = excluded.absent",
+                            (ids[code], mod, r["precedence"], int(r["absent"] == "false")))
+    return ids

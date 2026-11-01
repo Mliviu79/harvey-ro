@@ -1,7 +1,8 @@
 """The financial statements' adapter: how the core reads data/financials.db.
 
 Every figure is read from ``current`` (derived.py), keyed by the CUI as an
-integer, and every range is an index search on it. A company with no
+integer, and every range is an index search on it; FILED_ACCOUNTS from
+``filed``. A company with no
 statement on file has no row: its figures are unknown, never 0.
 """
 
@@ -48,6 +49,10 @@ class Adapter(Base):
         _figure("TOTAL_ASSETS", "total_assets"),
         _figure("TURNOVER_GROWTH", "turnover_growth"),
         Read("ACCOUNTS_FORM", "{derived}.current c", "cui", "c.form", date="c.year"),
+        # derived.build_filed: yes at the newest year filed, no at the newest
+        # final year for a firm that should have filed for it; no row
+        # (a sole trader, a firm struck off or too new): unknown.
+        Read("FILED_ACCOUNTS", "{derived}.filed c", "cui", "c.filed", date="c.year"),
     )
 
     def describe(self, con, keys) -> dict:

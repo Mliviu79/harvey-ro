@@ -51,8 +51,11 @@ code = "TURNOVER_GROWTH"
 [[register.reads]]
 code = "ACCOUNTS_FORM"
 
-# Whether a missing year is a "no" depends on the registry and the year's
-# release; until that is settled against today's counts it reads unknown.
+# The load writes an explicit no (``filed``, built with the trade registry
+# when it is loaded) only for a company that should have filed: operating,
+# a legal form that files, registered before the year. Any other company
+# with no statement on file (a sole trader or family business, a firm
+# struck off or too new) stays unknown.
 [[register.reads]]
 code = "FILED_ACCOUNTS"
 absent = "unknown"

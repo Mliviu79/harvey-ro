@@ -13,6 +13,14 @@ entry = "harvey.modules.original.scavio.capabilities"
 wraps = ["harvey.collectors.discover"]
 secrets = ["SCAVIO_API_KEY"]
 
+# A Google Maps place id: how a listing found here is known again. Not a
+# legal identity: two listings can be one business.
+[[identifiers]]
+name = "scavio.place"
+numeric = false
+legal = false
+legacy = "external:gmaps:"
+
 [cost]
 as_of = 2026-10-30
 free_tier = "50 credits on signup, no card"

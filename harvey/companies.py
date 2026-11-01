@@ -556,28 +556,18 @@ def anaf_part(cuis: list[str], path: Path | None = None) -> dict:
     path = Path(path or service.CACHE_PATH)
     if not path.is_file():
         return {"state": NOT_LOADED, "answers": []}
-    con = _open(path)
     try:
-        kept = {}
-        for cui in cuis:
-            r = con.execute("SELECT fetched_at, found, body FROM answers WHERE cui = ?",
-                            (cui,)).fetchone()
-            if r:
-                kept[cui] = r
+        # Either form of the file (service.kept reads both).
+        kept = service.kept(path, list(cuis), read_only=True)
     except sqlite3.Error:
         kept = {}
-    finally:
-        con.close()
-    import json
-
     answers = []
-    for cui, (fetched_at, found, body) in kept.items():
-        if not found:
-            answers.append({"cui": cui, "checked_at": fetched_at, "found": False})
+    for cui in cuis:
+        if cui not in kept:
             continue
-        try:
-            item = json.loads(body)
-        except ValueError:
+        fetched_at, item = kept[cui]
+        if item is None:
+            answers.append({"cui": cui, "checked_at": fetched_at, "found": False})
             continue
         general = item.get("date_generale") or {}
         vat = item.get("inregistrare_scop_Tva") or {}

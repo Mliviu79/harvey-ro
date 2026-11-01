@@ -14,6 +14,15 @@ entry = "harvey.modules.original.dataforseo.capabilities"
 wraps = ["harvey.collectors.discover"]
 secrets = ["DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "DATAFORSEO_SANDBOX"]
 
+# A Google Business Profile's id ("cid:123", or the place id it was kept
+# by before): how a listing found here is known again. Not a legal
+# identity: two listings can be one business.
+[[identifiers]]
+name = "dataforseo.listing"
+numeric = false
+legal = false
+legacy = "external:dataforseo:"
+
 [cost]
 as_of = 2026-10-30
 free_tier = "$1 signup credit; free sandbox (DATAFORSEO_SANDBOX); $50 minimum deposit to go live"
