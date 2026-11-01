@@ -105,7 +105,7 @@ During setup or training, Harvey needs to know:
 5. **Who takes the meeting?** (the user, a sales team member, Harvey books and someone else shows up)
 6. **Any qualification before booking?** (company size, budget, specific need)
 
-These answers go into `harvey.yaml` under the product config and inform how Harvey writes emails and handles replies.
+These answers go into `harvey.local.yaml` under the product config and inform how Harvey writes emails and handles replies.
 
 ## Offer Timing in the Sequence
 

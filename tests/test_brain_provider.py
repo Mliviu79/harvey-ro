@@ -472,12 +472,14 @@ def test_setup_writes_the_selection(tmp_path, monkeypatch):
     monkeypatch.setattr(setup_mod, "CONFIG_FILE", config_file)
     wizard.config = dict(BASE)
     wizard._write_config()
-    assert yaml.safe_load(config_file.read_text())["brain"] == {"provider": "codex", "model": "gpt-5.5"}
+    local = tmp_path / "harvey.local.yaml"           # setup never writes harvey.yaml
+    assert not config_file.exists()
+    assert yaml.safe_load(local.read_text())["brain"] == {"provider": "codex", "model": "gpt-5.5"}
 
     # Re-running setup over a trained config updates the selection too.
     wizard.brain_config = BrainConfig()
     wizard._write_config()
-    assert yaml.safe_load(config_file.read_text())["brain"] == {"provider": "claude"}
+    assert yaml.safe_load(local.read_text())["brain"] == {"provider": "claude"}
 
 
 @pytest.mark.asyncio

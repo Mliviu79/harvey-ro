@@ -1,6 +1,7 @@
 """Interactive setup wizard — walks you through everything Harvey needs."""
 
 import asyncio
+import copy
 import getpass
 import logging
 import os
@@ -13,7 +14,10 @@ import yaml
 from pydantic import ValidationError
 
 from harvey.brain import Brain
-from harvey.config import BrainConfig, normalize_prospect_country
+from harvey.config import (
+    BrainConfig, ConfigError, local_config_file, normalize_prospect_country,
+    save_config_change, set_yaml_values,
+)
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.setup")
@@ -85,9 +89,15 @@ def _read_env_file() -> dict[str, str]:
 def _config_file() -> Path:
     """The config Harvey loads: harvey.local.yaml (what `harvey train` writes)
     wins over harvey.yaml when it exists, as in config._find_config_file.
-    Setup reads and writes this file, so its answers are the ones Harvey uses."""
-    local = CONFIG_FILE.with_name("harvey.local.yaml")
+    Setup reads this file; it saves to harvey.local.yaml (_save_file)."""
+    local = local_config_file(CONFIG_FILE)
     return local if local.exists() else CONFIG_FILE
+
+
+def _save_file() -> Path:
+    """Where setup saves: harvey.local.yaml, never the tracked harvey.yaml
+    (see config.save_config_change). Not created here."""
+    return local_config_file(CONFIG_FILE)
 
 
 def _current_precleared() -> dict:
@@ -99,6 +109,9 @@ def _current_precleared() -> dict:
     compliance = data.get("compliance") if isinstance(data, dict) else None
     section = compliance.get("precleared") if isinstance(compliance, dict) else None
     return section if isinstance(section, dict) else {}
+
+
+_MISSING = object()
 
 
 def _save_precleared(config: dict, answers: dict) -> None:
@@ -406,11 +419,11 @@ class SetupWizard:
 
             from harvey.trainer import Trainer
             trainer = Trainer(brain_config=self.brain_config)
-            self.config = await trainer.train(url, str(_config_file())) or {}
+            self.config = await trainer.train(url, str(_save_file())) or {}
 
             if self.config:
                 _print_harvey("Training complete! I've got a solid understanding")
-                _print_harvey("of your product now. Check harvey.yaml to review")
+                _print_harvey(f"of your product now. Check {_save_file().name} to review")
                 _print_harvey("what I learned — tweak anything that looks off.")
                 return
 
@@ -634,7 +647,7 @@ class SetupWizard:
             # Only touch the config to switch off a check that was on.
             self.precleared = {"enabled": False} if was_on else None
             _print_harvey("No problem. You can turn it on later under")
-            _print_harvey(f"compliance.precleared in {_config_file().name}.")
+            _print_harvey(f"compliance.precleared in {_save_file().name}.")
             return
 
         saved_country = str(current.get("sender_country") or "").strip().upper()
@@ -737,13 +750,15 @@ class SetupWizard:
         logger.info(f"Wrote {ENV_FILE}")
 
     def _write_config(self):
-        """Write harvey.yaml (only if we have manual config — trainer writes its own)."""
+        """Write harvey.local.yaml: the whole config when there is none at
+        all, else the behaviour settings into a copy of the one Harvey loads."""
         from harvey.trainer import brain_section
 
         config_file = _config_file()
         if self.config:
             self.config["brain"] = brain_section(self.brain_config)
         if self.config and not config_file.exists():
+            config_file = _save_file()
             if self.precleared:
                 _save_precleared(self.config, self.precleared)
             with open(config_file, "w", encoding="utf-8") as f:
@@ -751,27 +766,80 @@ class SetupWizard:
             logger.info(f"Wrote {config_file}")
             self.config_saved = True
         elif self.config:
-            # Config already exists (from trainer), update behavior settings only
+            # Config already exists (the template, or what training wrote):
+            # save the behaviour settings only, key by key, so the rest of
+            # the file and its comments stay.
             try:
-                existing = yaml.safe_load(read_user_text(config_file)) or {}
-                existing["usage"] = self.config.get("usage", existing.get("usage", {}))
-                existing["brain"] = self.config["brain"]
-                if "channels" in self.config:
-                    existing.setdefault("channels", {})
-                    if "email" in self.config["channels"]:
-                        existing["channels"].setdefault("email", {})
-                        existing["channels"]["email"]["max_daily_sends"] = (
-                            self.config["channels"]["email"].get("max_daily_sends", 50)
-                        )
-                if self.precleared:
-                    _save_precleared(existing, self.precleared)
-                text = yaml.dump(existing, default_flow_style=False, sort_keys=False)
-                with open(config_file, "w", encoding="utf-8") as f:
-                    f.write(text)
+                config_file = save_config_change(self._behaviour_edit, config_file)
+                logger.info(f"Wrote {config_file}")
                 self.config_saved = True
             except Exception as e:
-                _print_harvey(f"Couldn't save your settings to {config_file.name} ({e}).")
+                _print_harvey(f"Couldn't save your settings to {_save_file().name} ({e}).")
                 _print_harvey("Nothing in it was changed. Fix the file and re-run setup.")
+
+    def _behaviour_changes(self, existing: dict) -> list:
+        """The (key path, value) pairs setup saves over ``existing``: the
+        usage answers and Precleared answers one key at a time (other keys
+        there are kept), the brain section whole, the daily send limit."""
+        changes = []
+
+        def leaves(prefix, value):
+            if isinstance(value, dict) and value:
+                for k, v in value.items():
+                    leaves(prefix + (k,), v)
+            else:
+                changes.append((prefix, value))
+
+        leaves(("usage",), self.config.get("usage") or {})
+        changes.append((("brain",), self.config["brain"]))
+        email = (self.config.get("channels") or {}).get("email")
+        if isinstance(email, dict):
+            changes.append((("channels", "email", "max_daily_sends"),
+                            email.get("max_daily_sends", 50)))
+        if self.precleared:
+            leaves(("compliance", "precleared"), dict(self.precleared))
+
+        def current(keys):
+            node = existing
+            for k in keys:
+                if not isinstance(node, dict) or k not in node:
+                    return _MISSING
+                node = node[k]
+            return node
+        return [(k, v) for k, v in changes if current(k) != v]
+
+    def _behaviour_edit(self, data: bytes, name: str) -> bytes:
+        """Setup's settings laid over the config file's bytes: only the keys
+        that change are rewritten, unless the file is laid out in a way the
+        line edit can't follow, then the whole file is rewritten."""
+        bom = data.startswith(b"\xef\xbb\xbf")
+        raw = data.decode("utf-8-sig")
+        crlf = "\r\n" in raw
+        raw = raw.replace("\r\n", "\n")
+        existing = yaml.safe_load(raw) or {}
+        if not isinstance(existing, dict):
+            raise ConfigError(f"{name} isn't a YAML mapping")
+        changes = self._behaviour_changes(existing)
+        expected = copy.deepcopy(existing)
+        for keys, value in changes:
+            node = expected
+            for k in keys[:-1]:
+                if not isinstance(node.get(k), dict):
+                    node[k] = {}
+                node = node[k]
+            node[keys[-1]] = value
+        text = None
+        try:
+            edited = set_yaml_values(raw, changes)
+            if yaml.safe_load(edited) == expected:
+                text = edited
+        except yaml.YAMLError:
+            pass
+        if text is None:
+            text = yaml.dump(expected, default_flow_style=False, sort_keys=False)
+        if crlf:
+            text = text.replace("\n", "\r\n")
+        return (b"\xef\xbb\xbf" if bom else b"") + text.encode("utf-8")
 
     async def _print_summary(self):
         """Print final summary and next steps."""

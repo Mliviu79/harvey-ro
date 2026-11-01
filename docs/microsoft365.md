@@ -43,7 +43,7 @@ M365_CLIENT_ID=<Application (client) ID>
 M365_TENANT_ID=<Directory (tenant) ID>
 ```
 
-`harvey.yaml` (or `harvey.local.yaml`):
+`harvey.local.yaml` (a copy of `harvey.yaml`, if you don't have one yet):
 
 ```yaml
 persona:

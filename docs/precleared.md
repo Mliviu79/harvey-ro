@@ -12,8 +12,8 @@ Microsoft 365 or SMTP. Instantly campaigns and replies are never checked.
 
 ## Turning it on
 
-In `harvey.yaml`, or `harvey.local.yaml` if you trained Harvey (that file
-wins):
+In `harvey.local.yaml` (copy `harvey.yaml` to it first if you don't have
+one yet; `harvey setup` makes it for you):
 
 ```yaml
 compliance:

@@ -56,7 +56,7 @@ LOCKED_OUT = ("TrulyInbox locked this computer out for 15 minutes after rejected
               "Wait, then try again with a working key.")
 BAD_WORKSPACE_ID = "TRULYINBOX_WORKSPACE_ID must be the workspace's number. Fix it in .env."
 NO_ADDRESS = ("Harvey doesn't know which mailbox it sends from. Set persona.email in "
-              "harvey.yaml first.")
+              "harvey.local.yaml (a full copy of harvey.yaml) first.")
 NO_ANSWER = "TrulyInbox didn't answer. Try again in a minute."
 UNREADABLE = "TrulyInbox sent a reply Harvey couldn't read."
 

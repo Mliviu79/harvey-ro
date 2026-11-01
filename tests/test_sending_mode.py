@@ -23,6 +23,15 @@ from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 
 @pytest.fixture
 def yaml_file(tmp_path):
+    """An install's harvey.local.yaml: the file switches are written to."""
+    path = tmp_path / "harvey.local.yaml"
+    shutil.copy(PROJECT_ROOT / "harvey.yaml", path)
+    return path
+
+
+@pytest.fixture
+def template(tmp_path):
+    """A fresh clone: only the tracked harvey.yaml, no harvey.local.yaml yet."""
     path = tmp_path / "harvey.yaml"
     shutil.copy(PROJECT_ROOT / "harvey.yaml", path)
     return path
@@ -60,6 +69,28 @@ def test_a_file_it_cannot_change_safely_is_left_alone(tmp_path):
     with pytest.raises(ConfigError):
         set_require_approval(False, path)
     assert path.read_text() == "channels: {email: {provider: gmail}}\n"
+
+
+def test_a_fresh_clone_switches_in_harvey_local_yaml_not_the_template(template):
+    before = template.read_bytes()
+    written = set_require_approval(False, template)
+    local = template.with_name("harvey.local.yaml")
+    assert written == local
+    assert template.read_bytes() == before                         # what git has
+    assert load_config(str(local)).channels.email.require_approval is False
+    # Everything else, comments included, carried over: one line differs.
+    changed = [(a, b) for a, b in zip(before.decode().splitlines(), local.read_text().splitlines())
+               if a != b]
+    assert len(changed) == 1 and "require_approval: false" in changed[0][1]
+
+
+def test_a_loop_loaded_from_the_template_sees_the_switch(template):
+    """`harvey run` loaded harvey.yaml; the dashboard's first switch makes
+    harvey.local.yaml, and the loop reads that from then on."""
+    config = load_config(str(template))
+    set_require_approval(False, template)
+    assert refresh_sending_mode(config) is True
+    assert config.channels.email.require_approval is False
 
 
 def test_the_running_loop_picks_up_a_change(yaml_file):
@@ -155,7 +186,7 @@ def dash_yaml(client, yaml_file, monkeypatch):
 def test_the_dashboard_shows_the_mode(client, dash_yaml):
     asyncio.run(StateManager(str(client.db_path)).init_db())
     data = client.get("/api/sending-mode").json()
-    assert data["mode"] == "approval" and data["file"] == "harvey.yaml"
+    assert data["mode"] == "approval" and data["file"] == "harvey.local.yaml"
     assert "provider" in data and "your_domains" in data and data["held"] == 0
 
 
@@ -310,7 +341,8 @@ async def test_the_loop_noticing_off_brings_autopilot_rows_back(state, yaml_file
 def test_the_writer_keeps_a_symlinked_config_a_symlink(tmp_path, yaml_file):
     real = tmp_path / "real.yaml"
     real.write_bytes(yaml_file.read_bytes())
-    link = tmp_path / "harvey.local.yaml"
+    (tmp_path / "linked").mkdir()
+    link = tmp_path / "linked" / "harvey.local.yaml"
     link.symlink_to(real)
     set_require_approval(False, link)
     assert link.is_symlink()
@@ -370,3 +402,18 @@ def test_quoted_and_spelled_values_count_as_they_do_at_startup(yaml_file, writte
     config = load_config(str(yaml_file))
     config.channels.email.require_approval = not expected
     assert refresh_sending_mode(config) is True and config.channels.email.require_approval is expected
+
+
+def test_the_dashboard_switch_on_a_fresh_clone_leaves_the_template_alone(client, template, monkeypatch):
+    import harvey.dashboard as dash
+    from harvey.config import live_config_file
+    monkeypatch.setattr(dash, "_resolve_config_file", lambda: live_config_file(template))
+    asyncio.run(StateManager(str(client.db_path)).init_db())
+    before = template.read_bytes()
+    assert client.get("/api/sending-mode").json()["file"] == "harvey.yaml"
+    r = client.post("/api/sending-mode", json={"mode": "autopilot", "confirm": "autopilot"})
+    assert r.status_code == 200
+    assert template.read_bytes() == before
+    local = template.with_name("harvey.local.yaml")
+    assert load_config(str(local)).channels.email.require_approval is False
+    assert client.get("/api/sending-mode").json()["file"] == "harvey.local.yaml"

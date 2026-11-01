@@ -5,7 +5,7 @@ Claude Code skill can't be invoked directly. Instead the skill's
 instructions are read from the operator's skills folder and sent as a
 second, editing-only call over drafts that are already written.
 
-Off unless ``writer.humanizer: true`` is set in harvey.yaml; the skill
+Off unless ``writer.humanizer: true`` is set in the config; the skill
 being installed is not enough on its own.
 
 Fails open: no skill file, a failed call, or a rewrite that breaks a rule
@@ -38,7 +38,7 @@ META_PREFIXES = ("i can't", "i cannot", "as an ai", "sorry,", "here is", "here's
 
 
 def humanizer_enabled(config) -> bool:
-    """True only when the operator turned the pass on in harvey.yaml."""
+    """True only when the operator turned the pass on in the config."""
     return bool(getattr(getattr(config, "writer", None), "humanizer", False))
 
 

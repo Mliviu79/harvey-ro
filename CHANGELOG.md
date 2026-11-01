@@ -539,6 +539,26 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **`git pull` no longer refuses because Harvey changed `harvey.yaml`.**
+  Every config change now goes to `harvey.local.yaml`: `harvey setup`
+  (including the training it runs), the dashboard's sending switch and
+  `harvey train` with `harvey.yaml` as the output. On an install with no
+  `harvey.local.yaml` yet, the first change makes it as a copy of the
+  config in use, comments and all, so a `harvey.yaml` an older setup
+  edited carries over. A change that fails leaves no copy behind.
+  `harvey setup` now rewrites only the settings it asks about, so the
+  file's comments stay (it used to rewrite the whole file without them),
+  keeps usage settings it doesn't ask about, and swaps the file in whole. A running Harvey that loaded `harvey.yaml` reads
+  the switch and the do-not-contact list from the new file at once. The
+  tracked `harvey.yaml` stays the template a fresh clone reads until then.
+  If `git pull` still refuses over `harvey.yaml`, check that
+  `harvey.local.yaml` has your settings, then run
+  `git checkout -- harvey.yaml` once and pull again. Messages that said to
+  edit `harvey.yaml` now name `harvey.local.yaml`, and say to copy
+  `harvey.yaml` to it first on an install that has none: it is read instead
+  of `harvey.yaml`, not on top of it, and a `harvey.local.yaml` missing
+  required settings now says so when Harvey refuses to start.
+
 - **A combined title on a team card is a role, not another company.**
   "Owner and Lead Dentist", "Founder, Head of Growth" or "Fondator și
   Director Medical" no longer drops the person as someone quoted from

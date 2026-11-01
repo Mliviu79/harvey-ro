@@ -1,7 +1,7 @@
 """Tests for the optional Precleared step in `harvey setup`: off unless the
 user says yes, saved answers are the defaults when setup is re-run, the key is
 read with hidden input and never printed, and other settings are kept. No
-network: the step only writes harvey.yaml and .env."""
+network: the step only writes harvey.local.yaml and .env."""
 
 import os
 import shutil
@@ -27,7 +27,8 @@ def files(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, "CONFIG_FILE", config)
     monkeypatch.setattr(setup, "ENV_FILE", env)
     monkeypatch.delenv("PRECLEARED_API_KEY", raising=False)
-    return SimpleNamespace(config=config, env=env)
+    # Setup saves to harvey.local.yaml, made from harvey.yaml on the first write.
+    return SimpleNamespace(config=config, env=env, local=config.with_name("harvey.local.yaml"))
 
 
 def script(monkeypatch, yes_no, answers):
@@ -63,7 +64,7 @@ def saved(path) -> dict:
 
 
 def finish(wizard):
-    """Write .env and harvey.yaml the way the end of `harvey setup` does."""
+    """Write .env and the config the way the end of `harvey setup` does."""
     if not wizard.config:
         wizard.config = {"channels": {"email": {"max_daily_sends": 50}}}
     wizard._write_env()
@@ -79,7 +80,7 @@ def test_check_stays_off_unless_the_user_says_yes(files, monkeypatch):
     assert asked.yes_no == [("Turn on the cold-email check?", False)]
     assert asked.questions == []  # no country or key questions after a no
     assert wizard.precleared is None
-    assert saved(files.config)["enabled"] is False
+    assert saved(files.local)["enabled"] is False
     assert "PRECLEARED_API_KEY" not in files.env.read_text()
 
 
@@ -92,7 +93,7 @@ def test_yes_saves_the_settings_and_a_free_key(files, monkeypatch, capsys):
     key_question = asked.questions[-1]
     assert key_question.secret is True
     assert "Enter to skip" in key_question.prompt
-    assert saved(files.config) == {
+    assert saved(files.local) == {
         "enabled": True,
         "sender_country": "GB",
         "address_source": "unknown",
@@ -103,7 +104,7 @@ def test_yes_saves_the_settings_and_a_free_key(files, monkeypatch, capsys):
 
     # The saved config loads and switches the check on.
     client = PreclearedClient.from_config(
-        load_config(str(files.config)), SimpleNamespace(precleared_api_key=FAKE_KEY))
+        load_config(str(files.local)), SimpleNamespace(precleared_api_key=FAKE_KEY))
     assert (client.sender_country, client.prospect_country, client.api_key) == ("GB", "US", FAKE_KEY)
 
 
@@ -119,8 +120,8 @@ def test_rerunning_setup_keeps_a_check_that_is_on(files, monkeypatch):
     assert [q.default for q in asked.questions[:2]] == ["GB", "US"]
     assert "blank to skip" not in asked.questions[0].prompt  # Enter keeps GB
     assert "Enter keeps your current key" in asked.questions[2].prompt
-    assert saved(files.config)["enabled"] is True
-    assert saved(files.config)["prospect_country"] == "US"
+    assert saved(files.local)["enabled"] is True
+    assert saved(files.local)["prospect_country"] == "US"
     assert "PRECLEARED_API_KEY=existing_key" in files.env.read_text().splitlines()
 
 
@@ -131,8 +132,8 @@ def test_no_switches_off_a_check_that_was_on_and_keeps_its_settings(files, monke
     wizard._setup_compliance()
     finish(wizard)
 
-    assert saved(files.config)["enabled"] is False
-    assert saved(files.config)["sender_country"] == "US"
+    assert saved(files.local)["enabled"] is False
+    assert saved(files.local)["sender_country"] == "US"
 
 
 def test_sender_country_must_be_gb_or_us_and_blank_skips(files, monkeypatch, capsys):
@@ -144,7 +145,7 @@ def test_sender_country_must_be_gb_or_us_and_blank_skips(files, monkeypatch, cap
     assert len(asked.questions) == 2  # asked again after DE, then skipped: no key question
     assert "type GB or US" in capsys.readouterr().out
     assert wizard.precleared is None
-    assert saved(files.config)["enabled"] is False
+    assert saved(files.local)["enabled"] is False
 
 
 def test_prospect_country_is_checked_and_norway_stays_a_string(files, monkeypatch, capsys):
@@ -156,8 +157,8 @@ def test_prospect_country_is_checked_and_norway_stays_a_string(files, monkeypatc
 
     assert "not a valid prospect_country" in capsys.readouterr().out
     # YAML would read an unquoted NO as false; the saved value must stay "NO".
-    assert saved(files.config)["prospect_country"] == "NO"
-    assert load_config(str(files.config)).compliance.precleared.prospect_country == "NO"
+    assert saved(files.local)["prospect_country"] == "NO"
+    assert load_config(str(files.local)).compliance.precleared.prospect_country == "NO"
 
 
 def test_answering_no_to_the_prospect_country_does_not_pick_norway(files, monkeypatch):
@@ -169,8 +170,8 @@ def test_answering_no_to_the_prospect_country_does_not_pick_norway(files, monkey
     finish(wizard)
 
     assert asked.yes_no[1][1] is False  # Enter means not Norway
-    assert saved(files.config)["prospect_country"] == ""
-    assert saved(files.config)["enabled"] is True
+    assert saved(files.local)["prospect_country"] == ""
+    assert saved(files.local)["enabled"] is True
 
 
 def test_none_clears_a_saved_prospect_country(files, monkeypatch):
@@ -181,8 +182,8 @@ def test_none_clears_a_saved_prospect_country(files, monkeypatch):
     finish(wizard)
 
     assert "type none" in asked.questions[1].prompt
-    assert saved(files.config)["prospect_country"] == ""
-    assert saved(files.config)["enabled"] is True
+    assert saved(files.local)["prospect_country"] == ""
+    assert saved(files.local)["enabled"] is True
 
 
 @pytest.mark.parametrize("env_text", ["", 'PRECLEARED_API_KEY=""\n'])
@@ -197,7 +198,7 @@ def test_turning_it_on_without_a_key_leaves_a_placeholder(files, monkeypatch, ca
     assert any(line in ("PRECLEARED_API_KEY=", 'PRECLEARED_API_KEY=""')
                for line in files.env.read_text().splitlines())
     assert "10 checks a day" in capsys.readouterr().out
-    assert saved(files.config)["enabled"] is True
+    assert saved(files.local)["enabled"] is True
 
 
 def test_a_new_config_file_gets_the_check(tmp_path, monkeypatch):
@@ -210,7 +211,9 @@ def test_a_new_config_file_gets_the_check(tmp_path, monkeypatch):
     wizard._setup_compliance()
     finish(wizard)
 
-    assert saved(config) == {"enabled": True, "sender_country": "GB", "prospect_country": ""}
+    assert saved(config.with_name("harvey.local.yaml")) == {
+        "enabled": True, "sender_country": "GB", "prospect_country": ""}
+    assert not config.exists()
 
 
 @pytest.mark.asyncio
@@ -262,7 +265,101 @@ def test_saving_the_key_keeps_other_env_lines_and_stays_private(files, monkeypat
     assert FAKE_KEY not in caplog.text
 
 
-# ── setup saves to the file Harvey reads, and says when it couldn't ──
+# ── setup saves to harvey.local.yaml, and says when it couldn't ──
+
+
+def test_setup_leaves_the_tracked_template_alone(files, monkeypatch):
+    """No harvey.local.yaml yet: setup makes it from harvey.yaml, comments
+    included, and harvey.yaml stays byte for byte what git has."""
+    template = files.config.read_bytes()
+    script(monkeypatch, yes_no=[True], answers=["GB", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    finish(wizard)
+
+    assert files.config.read_bytes() == template
+    assert saved(files.local)["enabled"] is True
+    assert setup._config_file() == files.local          # read from now on
+
+
+def comments(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip().startswith("#")]
+
+
+def test_setup_keeps_the_comments_of_the_file_it_saves_to(files, monkeypatch):
+    """Setup rewrites only the keys it sets: every comment the template
+    carries is still in harvey.local.yaml, and the settings are saved."""
+    script(monkeypatch, yes_no=[True], answers=["GB", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    wizard.config = {
+        "usage": {"max_daily_claude_percent": 70, "heartbeat_interval_minutes": 20,
+                  "quiet_hours": {"start": "21:00", "end": "08:00", "timezone": "Europe/London"}},
+        "channels": {"email": {"max_daily_sends": 20}},
+    }
+    wizard._write_env()
+    wizard._write_config()
+
+    assert wizard.config_saved
+    assert comments(files.local.read_text()) == comments(files.config.read_text())
+    config = load_config(str(files.local))
+    assert config.usage.max_daily_claude_percent == 70
+    assert config.usage.quiet_hours.timezone == "Europe/London"
+    assert config.channels.email.max_daily_sends == 20
+    assert config.compliance.precleared.sender_country == "GB"
+    assert config.persona.company == load_config(str(files.config)).persona.company
+
+
+def test_setup_keeps_usage_settings_it_does_not_ask_about(files, monkeypatch):
+    data = yaml.safe_load(files.config.read_text())
+    data["usage"]["quiet_hours"]["weekdays_only"] = True
+    files.config.write_text(yaml.safe_dump(data, sort_keys=False))
+    script(monkeypatch, yes_no=[False], answers=[])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    wizard.config = {"usage": {"max_daily_claude_percent": 60}}
+    wizard._write_env()
+    wizard._write_config()
+
+    usage = yaml.safe_load(files.local.read_text())["usage"]
+    assert usage["max_daily_claude_percent"] == 60
+    assert usage["quiet_hours"]["weekdays_only"] is True
+
+
+def test_a_file_the_line_edit_cannot_follow_is_rewritten_whole(files, monkeypatch):
+    """Flow-style sections: the in-place edit can't place the keys, so the
+    whole file is written instead, with the same settings."""
+    files.config.write_text(
+        "# a comment\npersona: {name: A, company: Example Co, role: Owner, "
+        "email: a@example.com, tone: plain}\nproduct: {name: P, description: D}\n"
+        "icp: {titles: [Owner]}\nusage: {max_daily_claude_percent: 80}\n"
+        "channels: {email: {max_daily_sends: 50}}\n")
+    script(monkeypatch, yes_no=[False], answers=[])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    wizard.config = {"usage": {"max_daily_claude_percent": 55},
+                     "channels": {"email": {"max_daily_sends": 9}}}
+    wizard._write_env()
+    wizard._write_config()
+
+    data = yaml.safe_load(files.local.read_text())
+    assert data["usage"]["max_daily_claude_percent"] == 55
+    assert data["channels"]["email"]["max_daily_sends"] == 9
+    assert data["persona"]["company"] == "Example Co"
+
+
+def test_an_edited_template_carries_over_into_the_local_file(files, monkeypatch):
+    """An install an older setup wrote harvey.yaml for keeps those settings."""
+    set_precleared(files.config, enabled=True, sender_country="US", prospect_country="US")
+    edited = files.config.read_bytes()
+    script(monkeypatch, yes_no=[None], answers=["", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    finish(wizard)
+
+    assert files.config.read_bytes() == edited
+    assert saved(files.local)["sender_country"] == "US"
+    assert saved(files.local)["enabled"] is True
 
 @pytest.fixture
 def trained(files):
@@ -296,7 +393,7 @@ def test_rerunning_setup_after_harvey_train_offers_the_saved_answers(trained, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_local", [False, True])
-async def test_setup_trains_into_the_file_harvey_reads(files, monkeypatch, has_local):
+async def test_setup_trains_into_harvey_local_yaml(files, monkeypatch, has_local):
     if has_local:
         shutil.copy(files.config, files.config.with_name("harvey.local.yaml"))
     outputs = []
@@ -313,8 +410,8 @@ async def test_setup_trains_into_the_file_harvey_reads(files, monkeypatch, has_l
     script(monkeypatch, yes_no=[], answers=["url", "https://example.test"])
     await setup.SetupWizard()._setup_product()
 
-    name = "harvey.local.yaml" if has_local else "harvey.yaml"
-    assert outputs == [str(files.config.with_name(name))]
+    # Never the tracked template, with or without a harvey.local.yaml yet.
+    assert outputs == [str(files.local)]
 
 
 async def summary(wizard, monkeypatch, capsys) -> str:
@@ -339,7 +436,7 @@ async def test_summary_shows_whether_the_check_was_saved_on(files, monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_a_config_that_cannot_be_saved_is_reported_not_ticked(files, monkeypatch, capsys):
-    files.config.write_text("channels:\n")  # hand-edited: an empty channels section
+    files.config.write_text("channels: [\n")  # hand-edited into broken YAML
     script(monkeypatch, yes_no=[True], answers=["GB", "", ""])
     wizard = setup.SetupWizard()
     wizard._setup_compliance()
@@ -348,6 +445,7 @@ async def test_a_config_that_cannot_be_saved_is_reported_not_ticked(files, monke
     wizard._write_config()  # must not crash setup
 
     assert "Couldn't save" in capsys.readouterr().out
-    assert files.config.read_text() == "channels:\n"
+    assert files.config.read_text() == "channels: [\n"
+    assert not files.local.exists()            # a failed save leaves no copy
     out = await summary(wizard, monkeypatch, capsys)
     assert "– Cold-email check (Precleared)" in out

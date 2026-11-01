@@ -2148,7 +2148,7 @@ def preset_problem(preset: str, provider_key: str, config=None) -> str | None:
     if any("{role}" in tpl for tpl in preset_templates(spec)) and config is not None:
         from harvey.collectors.ats import role_keywords
         if not role_keywords(getattr(config, "icp", None)):
-            return (f"The {spec['label']} preset searches for roles, and harvey.yaml has "
+            return (f"The {spec['label']} preset searches for roles, and your config has "
                     "none: set icp.hiring_signals (or icp.titles).")
     return None
 

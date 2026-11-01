@@ -19,7 +19,7 @@ from harvey.brain import Brain
 from harvey.sending_mode import sync_sending_mode
 from harvey.config import (
     ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
-    compliance_notice, send_window_of,
+    compliance_notice, send_window_of, config_to_edit,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.modules import switches
@@ -280,7 +280,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     logger.info(
         f"Thinking with {brain.provider_label}"
         + (f" ({brain.model})" if brain.model else "")
-        + ". Change brain.provider in harvey.yaml to switch."
+        + f". Change brain.provider in {config_to_edit()} to switch."
     )
     for notice in (sending_notice(config), compliance_notice(config)):
         if notice:

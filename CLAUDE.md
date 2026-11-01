@@ -16,7 +16,7 @@ Start by checking what state things are in. Don't dump a wall of setup steps —
 1. Does `.venv/` exist? → If not, they need install
 2. Is `harvey` importable? → If not, dependencies need installing
 3. Does `.env` exist with real values? → If not, they need API keys
-4. Does `harvey.yaml` have real values (not "Your Company")? → If not, they need product training
+4. Does the config Harvey reads (`harvey.local.yaml`, else the `harvey.yaml` template) have real values (not "Your Company")? → If not, they need product training
 5. Does `data/harvey.db` exist? → If not, Harvey hasn't run yet
 
 ### Then introduce yourself based on what you find:
@@ -48,7 +48,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does it cost?"** → Just your Claude Max subscription (which you already have). The only paid integration is Instantly for sending emails (their cheapest plan works). Everything else — prospecting, email writing, reply handling — is included.
 
-- **"Can it use ChatGPT / Codex instead of Claude?"** → Yes, opt-in. Install Codex CLI 0.159.3 (`npm install -g @openai/codex@0.159.3`; other versions are refused), run `codex login` with ChatGPT, and set `brain: { provider: codex, model: gpt-5.5 }` in harvey.yaml (or choose codex in `harvey setup`, which suggests gpt-5.5, or `harvey train <url> --provider codex --model gpt-5.5`). gpt-5.5 is the verified text-only model; a blank model fails on current accounts because the live catalog hides it, and code-mode models are refused. Claude stays the default; Harvey never switches providers on its own. Each Codex call runs isolated with no tools — see "Using a ChatGPT plan instead (Codex)" in the README. macOS and Linux only; on Windows, Codex is refused, so use Claude. Don't edit the user's own `~/.codex` config to make it work.
+- **"Can it use ChatGPT / Codex instead of Claude?"** → Yes, opt-in. Install Codex CLI 0.159.3 (`npm install -g @openai/codex@0.159.3`; other versions are refused), run `codex login` with ChatGPT, and set `brain: { provider: codex, model: gpt-5.5 }` in harvey.local.yaml (or choose codex in `harvey setup`, which suggests gpt-5.5, or `harvey train <url> --provider codex --model gpt-5.5`). gpt-5.5 is the verified text-only model; a blank model fails on current accounts because the live catalog hides it, and code-mode models are refused. Claude stays the default; Harvey never switches providers on its own. Each Codex call runs isolated with no tools — see "Using a ChatGPT plan instead (Codex)" in the README. macOS and Linux only; on Windows, Codex is refused, so use Claude. Don't edit the user's own `~/.codex` config to make it work.
 
 - **"What's the dashboard?"** → Have the user run `harvey dashboard` in their own terminal and open the private link it prints (`http://127.0.0.1:5555/#token=…`; `harvey dashboard --url` prints it again). Don't read, print or repeat the token yourself: it unlocks the dashboard. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Campaigns, Outbox, Conversations, Activity, Usage, Settings. **Contacts** lists one row per distinct email or phone (a chain's shared phone once, with how many companies it reaches), filterable by kind (mobile for SMS), status, trust, source, place, website, signals and turnover; **People to search** lists people named with no contact yet; **Find contacts** (with **Search again** to force) runs the contact finder over the current filters, priced first, under a cap the user types (0: websites only); the backlog shows above the list. The Companies menu has it too. **Companies** sorts (newest, name, place, turnover, employees, contacts, last searched) and filters (the Contacts page's company filters plus activity/CAEN, has-contact and source) on the server, with page numbers and a page box; its panel shows every CUI, financial year, registry row, ANAF answer and taxpayer row on file (`harvey/companies.py`), "not loaded" when a register isn't. **Registry** browses the whole trade registry joined with its latest financials (`harvey/registry_view.py`, `/api/registry`): the registry source's manifest filters (plus status operating/all), sorts by name, turnover, employees, profit or registration date from a kept list, marks firms already in Harvey by CUI (or `onrc:<reg>` for a firm with none), shows a firm's financial years side by side with its registry, taxpayer and ANAF rows, and pulls the ticked firms (`regs`) or the filter through Discover's registry pull, counted first.
 
@@ -57,6 +57,8 @@ People will ask "how does this work?" — explain it simply:
 ---
 
 ## Setup Flow
+
+**Where settings go:** `harvey.yaml` is the tracked template; Harvey never writes it, and neither should you. Every change (training, `harvey setup`, the dashboard, your own edits) goes in `harvey.local.yaml`, which wins when present. Harvey makes it as a copy of `harvey.yaml` on its first save; before editing it by hand on an install that has none, copy `harvey.yaml` to `harvey.local.yaml` first (it is read instead of `harvey.yaml`, not on top of it, so a file with only the changed keys won't load). If `git pull` refuses over local changes to `harvey.yaml` (an older Harvey wrote it), make sure `harvey.local.yaml` holds those settings, then the user runs `git checkout -- harvey.yaml`.
 
 Walk through these steps conversationally. Ask one thing at a time. Don't overwhelm.
 
@@ -106,11 +108,11 @@ PRECLEARED_API_KEY=        # cold-email check before first sends (see Step 7)
 TRULYINBOX_API_KEY=        # warmup: set by 'harvey trulyinbox connect' (see Step 2b)
 ```
 
-**Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
+**Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.local.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
 
 **Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing is not viable from a locally-running agent — outbound port 25 is usually blocked, and Google Workspace / Microsoft 365 accept everything from an unknown IP). Without a verifier key, found emails are marked `guess` and are **never sent**.
 
-**Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). **Autopilot** (`channels.email.require_approval: false`) sends on its own, still inside the daily limit, quiet hours and opt-out rules, but holds any email that links to a domain that isn't the user's or quotes Harvey's own instructions (text from websites and replies can carry planted instructions). Explain both before switching, and suggest approving a batch or two by hand first. The user switches it in dashboard → Settings → Sending (turning it on there takes typing `autopilot`; turning it off is one click and works at once), or in the config file Harvey reads (`harvey.local.yaml` if trained, else `harvey.yaml`); a running Harvey picks it up next cycle. Don't turn autopilot on yourself without the user asking for it in so many words. If they send from a secondary domain, their main site goes in `channels.email.link_domains` (training adds the trained site automatically). On Instantly, approval mode means campaigns aren't deployed at all.
+**Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). **Autopilot** (`channels.email.require_approval: false`) sends on its own, still inside the daily limit, quiet hours and opt-out rules, but holds any email that links to a domain that isn't the user's or quotes Harvey's own instructions (text from websites and replies can carry planted instructions). Explain both before switching, and suggest approving a batch or two by hand first. The user switches it in dashboard → Settings → Sending (turning it on there takes typing `autopilot`; turning it off is one click and works at once), or in `harvey.local.yaml`; a running Harvey picks it up next cycle. Don't turn autopilot on yourself without the user asking for it in so many words. If they send from a secondary domain, their main site goes in `channels.email.link_domains` (training adds the trained site automatically). On Instantly, approval mode means campaigns aren't deployed at all.
 
 After getting the Instantly API key, test it:
 ```bash
@@ -157,10 +159,10 @@ This is the most important step. Harvey needs to know what it's selling.
 ```bash
 source .venv/bin/activate && python -m harvey.trainer https://their-website.com
 ```
-This generates: `harvey.yaml`, `skills/product_knowledge.md`, `skills/competitive_intel.md`
+This generates: `harvey.local.yaml`, `skills/product_knowledge.md`, `skills/competitive_intel.md`
 
 **Option B — Manual configuration:**
-Ask the user these questions and build `harvey.yaml` and `skills/product_knowledge.md`:
+Ask the user these questions and build `harvey.local.yaml` and `skills/product_knowledge.md`:
 - What's your company name?
 - What do you sell? (product/service name and one-line description)
 - What does it cost?
@@ -250,7 +252,7 @@ batch. Whatever any source saves feeds the contact finder.
 | **Serper** | ~$0.30-$1.00/1k searches, one per page of 10 | 2,500 free, no card | The easiest paid one to try. Pages until Google has no more. |
 
 Cities are geocoded automatically (cached forever, one lookup per city), or set
-`icp.geo_coordinates` in harvey.yaml to control the radius:
+`icp.geo_coordinates` in harvey.local.yaml to control the radius:
 `"Denver, CO": "39.7392,-104.9903,50"`. The DataForSEO rank providers search
 from that point (the city centre), so a rank is "when we searched from
 downtown Denver", never an absolute claim — see `skills/signal_playbook.md`.
@@ -281,7 +283,7 @@ serves; `--depth 30` keeps a rank search to three pages.
 
 ### Step 6: Behavior Settings
 
-These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want to customize:
+These go in `harvey.local.yaml` under `usage:`. Use sensible defaults unless they want to customize:
 - `max_daily_claude_percent`: 80 (how much of daily Claude quota to use)
 - `heartbeat_interval_minutes`: 15 (how often Harvey checks for work)
 - `quiet_hours`: 22:00-07:00 in their timezone
@@ -296,7 +298,7 @@ If they want it, ask one thing at a time:
 - Are all their prospects in one country? If so, set `prospect_country` to its two-letter code, quoted (for example `"US"`). Otherwise leave it empty.
 - Would they like a free key? Without one Precleared allows 10 checks a day; a free key from https://precleared.dev/get-key allows 25. It goes in `.env` as `PRECLEARED_API_KEY`.
 
-Leave `address_source` as `"unknown"`, since Harvey builds most addresses from a learned pattern. Save the settings under `compliance.precleared` in `harvey.local.yaml` if it exists (that file wins), otherwise in `harvey.yaml`. `harvey setup` asks the same questions.
+Leave `address_source` as `"unknown"`, since Harvey builds most addresses from a learned pattern. Save the settings under `compliance.precleared` in `harvey.local.yaml`. `harvey setup` asks the same questions.
 
 ### Step 8: Start Harvey
 
@@ -318,7 +320,7 @@ Users will come back with questions and tasks. Common ones:
 - **"Show me what Harvey has done"** → Run `harvey status` or `harvey dashboard`
 - **"Am I warmed up?" / "Why am I landing in spam?"** → Run `harvey warmup`. Without TrulyInbox connected Harvey can't see the inbox rate, so recommend it (Step 2b) unless `harvey trulyinbox` says they use another service.
 - **"The emails aren't good"** → Edit `skills/email_frameworks.md` and `prompts/writer.md`. Show them the current rules and help them adjust.
-- **"Harvey isn't finding the right people"** → Check the ICP config in `harvey.yaml`. Adjust industries, titles, company_size, geography.
+- **"Harvey isn't finding the right people"** → Check the ICP config in `harvey.local.yaml`. Adjust industries, titles, company_size, geography.
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Harvey on a different product"** → `harvey train <new-url>`
 - **"How do I see the database?"** → It's at `data/harvey.db`. They can open it with any SQLite tool, or ask you to query it.

@@ -1572,7 +1572,7 @@ _quota_clients: dict = {}
 
 
 def _active_brain():
-    """The brain config harvey.yaml selects (None if unreadable)."""
+    """The brain config the config file selects (None if unreadable)."""
     try:
         from harvey.config import load_brain_config
         return load_brain_config()
@@ -2410,9 +2410,8 @@ async def set_sending_mode(request: Request):
         return _refuse('expected {"mode": "approval"} or {"mode": "autopilot", "confirm": "autopilot"}', 400)
     if mode == "autopilot" and body.get("confirm") != "autopilot":
         return _refuse('Type "autopilot" to confirm: Harvey will send email without asking you.', 400)
-    path = _resolve_config_file()
     try:
-        set_require_approval(mode == "approval", path)
+        path = set_require_approval(mode == "approval", _resolve_config_file())
     except ConfigError as e:
         return _refuse(str(e), 409)
     state = _state()

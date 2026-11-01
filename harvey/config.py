@@ -482,8 +482,8 @@ def compliance_notice(config) -> str:
         return ""
     return (
         "Cold emails are going out without " + " or ".join(missing) + ". US law "
-        "(CAN-SPAM) requires both in every cold email. Set them in harvey.yaml "
-        "(or harvey.local.yaml if you trained Harvey)."
+        "(CAN-SPAM) requires both in every cold email. Set them in harvey.local.yaml "
+        "(a copy of harvey.yaml, if you don't have one yet)."
     )
 
 
@@ -681,7 +681,7 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
     except FileNotFoundError:
         raise ConfigFileNotFoundError(
             f"Config file not found: {config_path}. "
-            "Create one from harvey.yaml.example or run 'harvey setup'."
+            "Run 'harvey setup' to make one."
         )
     except yaml.YAMLError as e:
         raise ConfigError(f"Invalid YAML in {config_path}:\n  {e}")
@@ -706,8 +706,24 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         logger.error(
             f"Invalid configuration in {config_path}:\n{_format_validation_error(e)}\n"
             "Fix the fields above or re-run 'harvey setup'."
+            + _partial_local_hint(config_path, e)
         )
         raise
+
+
+def _partial_local_hint(config_path, error: ValidationError) -> str:
+    """harvey.local.yaml is read instead of harvey.yaml, not on top of it:
+    one written by hand with only the keys someone meant to change is
+    missing everything else. Say so, rather than leave a list of fields."""
+    path = Path(config_path)
+    if path.name != LOCAL_CONFIG or not path.with_name(TEMPLATE_CONFIG).exists():
+        return ""
+    if not any(err.get("type") == "missing" for err in error.errors()):
+        return ""
+    return (f"\n{LOCAL_CONFIG} is read instead of {TEMPLATE_CONFIG}, not on top of it, so it "
+            f"needs every setting. Copy your settings from {TEMPLATE_CONFIG} into it "
+            f"(or move {LOCAL_CONFIG} away and change any setting from the dashboard or "
+            f"'harvey setup': Harvey then makes it as a full copy).")
 
 
 def load_brain_config(config_path: str | None = None) -> BrainConfig:
@@ -824,51 +840,46 @@ def _with_approval_line(raw: str, word: str) -> list[str]:
 
 
 def set_require_approval(value: bool, path=None) -> Path:
-    """Write channels.email.require_approval into the config file Harvey
-    reads (harvey.local.yaml wins, as in load_config). Only that value
-    changes: the result must parse to the same settings apart from it, or
-    nothing is written and ConfigError says to set it by hand."""
+    """Write channels.email.require_approval into harvey.local.yaml (made
+    from the config Harvey reads when there is none yet, see
+    save_config_change). Only that value changes: the result must parse
+    to the same settings apart from it, or nothing is written and
+    ConfigError says to set it by hand. Returns the file written."""
     import copy
-    import shutil
-    path = Path(path or _find_config_file())
-    target = path.resolve()          # a symlinked config stays a symlink
-    data_bytes = target.read_bytes()
-    bom = data_bytes.startswith(b"\xef\xbb\xbf")
-    try:
-        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
-    except UnicodeDecodeError:
-        raise ConfigError(f"{path.name} isn't UTF-8, so it isn't rewritten. Set "
-                          f"channels.email.require_approval there by hand.")
-    try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as e:
-        raise ConfigError(f"Invalid YAML in {path.name}: {e}")
-    if _email_section(data) is None:
-        raise ConfigError(f"{path.name} has no channels.email section. Set "
-                          f"channels.email.require_approval there by hand.")
-    expected = copy.deepcopy(data)
-    _email_section(expected)["require_approval"] = bool(value)
     word = "true" if value else "false"
-    for new in _with_approval_line(raw, word):
+
+    def edit(data_bytes: bytes, name: str) -> bytes:
+        bom = data_bytes.startswith(b"\xef\xbb\xbf")
         try:
-            if yaml.safe_load(new) != expected:
+            raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+        except UnicodeDecodeError:
+            raise ConfigError(f"{name} isn't UTF-8, so it isn't rewritten. Set "
+                              f"channels.email.require_approval there by hand.")
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Invalid YAML in {name}: {e}")
+        if _email_section(data) is None:
+            raise ConfigError(f"{name} has no channels.email section. Set "
+                              f"channels.email.require_approval there by hand.")
+        expected = copy.deepcopy(data)
+        _email_section(expected)["require_approval"] = bool(value)
+        for new in _with_approval_line(raw, word):
+            try:
+                if yaml.safe_load(new) != expected:
+                    continue
+            except yaml.YAMLError:
                 continue
-        except yaml.YAMLError:
-            continue
-        HarveyConfig(**expected)          # still a valid config
-        if b"\r\n" in data_bytes:
-            new = new.replace("\n", "\r\n")
-        tmp = target.with_name(target.name + ".tmp")
-        try:
-            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
-            shutil.copymode(target, tmp)
-            os.replace(tmp, target)
-        finally:
-            tmp.unlink(missing_ok=True)
-        _mode_cache.pop(str(target), None)
-        return path
-    raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
-                      f"Set channels.email.require_approval: {word} there by hand.")
+            HarveyConfig(**expected)          # still a valid config
+            if b"\r\n" in data_bytes:
+                new = new.replace("\n", "\r\n")
+            return (b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8")
+        raise ConfigError(f"Couldn't change require_approval in {name} safely. "
+                          f"Set channels.email.require_approval: {word} there by hand.")
+
+    written = save_config_change(edit, path)
+    _mode_cache.pop(str(written.resolve()), None)
+    return written
 
 
 _mode_cache: dict[str, tuple[tuple, object]] = {}
@@ -885,7 +896,7 @@ def refresh_sending_mode(config, path=None) -> bool:
     if not path:
         return False
     try:
-        target = Path(path).resolve()
+        target = live_config_file(path).resolve()
         st = target.stat()
         # Not the mtime alone: a restore or `cp -p` keeps it while the file changes.
         stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
@@ -926,7 +937,7 @@ def live_do_not_contact(config) -> list[str]:
     if not path:
         return compliance.do_not_contact
     try:
-        target = Path(path).resolve()
+        target = live_config_file(path).resolve()
         st = target.stat()
         stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         cached = _dnc_cache.get(str(target))
@@ -959,6 +970,237 @@ def do_not_contact_from_file(path=None) -> list[str]:
     return ComplianceConfig(do_not_contact=raw).do_not_contact
 
 
+LOCAL_CONFIG = "harvey.local.yaml"
+TEMPLATE_CONFIG = "harvey.yaml"
+
+
+def local_config_file(path=None) -> Path:
+    """Where a change to the config at ``path`` (default: the one Harvey
+    loads) is saved: the harvey.local.yaml next to a harvey.yaml, any other
+    file itself. Nothing is created; writable_config_file does that."""
+    path = Path(path or _find_config_file())
+    return path.with_name(LOCAL_CONFIG) if path.name == TEMPLATE_CONFIG else path
+
+
+# ── Editing settings in place ─────────────────────────────────────────────
+#
+# A change saved by setup rewrites only the keys it sets, so the comments in
+# harvey.local.yaml (copied from the template) stay. Callers check that the
+# result parses to what they meant and fall back to a whole rewrite if not.
+
+_PLAIN_KEY_RE = re.compile(r"^(?P<ind>[ ]*)(?P<key>[A-Za-z_][\w-]*)[ \t]*:(?:[ \t]|$)")
+_INLINE_COMMENT_RE = re.compile(r"[ \t]+#[^'\"\n]*$")   # a note with no quotes in it
+
+
+def _significant(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _key_block(lines: list[str], lo: int, hi: int, key: str):
+    """The ``key:`` among lines[lo:hi] at their mapping's indent:
+    (key line, end of its block, indent), or (None, hi, indent) when it is
+    not there (indent None for an empty range). Trailing comments and blank
+    lines are left outside the block: they introduce what follows."""
+    body = None
+    for i in range(lo, hi):
+        if not _significant(lines[i]):
+            continue
+        n = _indent_of(lines[i])
+        if body is None:
+            body = n
+        if n != body:
+            continue
+        m = _PLAIN_KEY_RE.match(lines[i])
+        if not (m and m.group("key") == key):
+            continue
+        last = i
+        for j in range(i + 1, hi):
+            if not _significant(lines[j]):
+                continue
+            nj = _indent_of(lines[j])
+            if nj < body or (nj == body and not lines[j].lstrip().startswith("- ")):
+                break
+            last = j
+        return i, last + 1, body
+    last = lo - 1
+    for i in range(lo, hi):
+        if _significant(lines[i]):
+            last = i
+    return None, max(last + 1, lo), body
+
+
+def _dump_lines(key: str, value, indent: int) -> list[str]:
+    text = yaml.safe_dump({key: value}, default_flow_style=False, sort_keys=False,
+                          allow_unicode=True, width=1000)
+    return [" " * indent + line for line in text.rstrip("\n").split("\n")]
+
+
+def set_yaml_values(raw: str, changes) -> str:
+    """``raw`` with each ``(keys, value)`` in ``changes`` set: the block of
+    the key path ``keys`` (a tuple) is replaced by ``value``, or added at
+    the end of its parent, and every other line, comments included, stays.
+    Plain block-style YAML only; callers check the result parses as meant."""
+    lines = raw.split("\n")
+    for keys, value in changes:
+        lo, hi, parent = 0, len(lines), -2
+        for depth, key in enumerate(keys):
+            line, end, body = _key_block(lines, lo, hi, key)
+            if line is None:
+                nested = value
+                for k in reversed(keys[depth + 1:]):
+                    nested = {k: nested}
+                indent = body if body is not None else parent + 2
+                new = _dump_lines(key, nested, indent)
+                if depth == 0:
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+                    lines[len(lines):] = [""] + new + [""]
+                else:
+                    lines[end:end] = new
+                break
+            if depth == len(keys) - 1:
+                new = _dump_lines(key, value, body)
+                comment = _INLINE_COMMENT_RE.search(lines[line])
+                if end == line + 1 and len(new) == 1 and comment:
+                    new[0] += comment.group(0)   # a scalar keeps its note
+                lines[line:end] = new
+                break
+            lo, hi, parent = line + 1, end, body
+    return "\n".join(lines)
+
+
+def config_to_edit() -> str:
+    """How a message names the file to change a setting in by hand:
+    harvey.local.yaml, plus how to make it when there is none yet (it is
+    read instead of harvey.yaml, so a file with one key would not load)."""
+    try:
+        if Path(_find_config_file()).name == LOCAL_CONFIG:
+            return LOCAL_CONFIG
+    except ConfigError:
+        pass
+    return f"{LOCAL_CONFIG} (copy {TEMPLATE_CONFIG} to it first)"
+
+
+def live_config_file(path) -> Path:
+    """The file a config loaded from ``path`` reads now: a harvey.local.yaml
+    made next to it since (the first change saved from the dashboard or
+    setup) wins over the harvey.yaml it was loaded from."""
+    path = Path(path)
+    local = local_config_file(path)
+    return local if local != path and local.exists() else path
+
+
+def writable_config_file(path=None) -> Path:
+    """The file every config change is written to: harvey.local.yaml.
+
+    harvey.yaml is the tracked template; writing it would make ``git pull``
+    refuse to update. When there is no harvey.local.yaml next to ``path``
+    (default: the config Harvey loads) yet, it is made first as a byte copy
+    of ``path``, so the settings and comments in use carry over. A file
+    under any other name is written in place. To change settings, use
+    save_config_change: it makes the copy only once the change is good.
+    """
+    path = Path(path or _find_config_file())
+    local = local_config_file(path)
+    _refuse_dangling(local)
+    if local != path and not os.path.lexists(local) and path.exists():
+        _create_new(local, path.resolve().read_bytes(), mode_from=path.resolve())
+    return local
+
+
+def save_config_change(edit, path=None) -> Path:
+    """Save a change to the config at ``path`` (default: the one Harvey
+    loads) into harvey.local.yaml, never the tracked harvey.yaml.
+
+    ``edit(old_bytes, file_name)`` returns the new file's bytes; it reads
+    harvey.local.yaml when there is one, else the file at ``path``, so a
+    first change builds on the settings and comments in use. Whatever it
+    raises propagates, and nothing is written: a failed change leaves no
+    copy behind. The file is swapped in whole, so a crash never leaves half
+    a config, and a harvey.local.yaml someone else makes meanwhile is
+    edited, not replaced. Returns the file written.
+    """
+    path = Path(path or _find_config_file())
+    local = local_config_file(path)
+    for _ in range(5):
+        _refuse_dangling(local)
+        fresh = local != path and not os.path.lexists(local)
+        source = (path if fresh else local).resolve()   # a symlinked config stays a symlink
+        try:
+            old = source.read_bytes()
+        except FileNotFoundError:
+            raise ConfigError(f"{path.name} not found. Run 'harvey setup' to configure Harvey.")
+        new = edit(old, local.name)
+        if not fresh:
+            _replace_file(source, new)
+            return local
+        if _create_new(local, new, mode_from=source):
+            return local
+        # Someone made harvey.local.yaml meanwhile: apply the change to it.
+    raise ConfigError(f"{local.name} kept changing while Harvey saved to it. Try again.")
+
+
+def _refuse_dangling(local: Path) -> None:
+    """A harvey.local.yaml link to a missing file: reads skip it (they use
+    harvey.yaml), so a write through it would be lost, or fail half-way."""
+    if local.is_symlink() and not local.exists():
+        raise ConfigError(f"{local} is a link to a file that doesn't exist. "
+                          f"Fix the link or remove it, then try again.")
+
+
+def _temp_beside(target: Path) -> Path:
+    """A new, empty temp file next to ``target``, named like it, so the
+    .gitignore entry for harvey.local.yaml.* covers a leftover."""
+    import tempfile
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".", suffix=".tmp")
+    os.close(fd)
+    return Path(name)
+
+
+def _replace_file(target: Path, data: bytes) -> None:
+    """Swap ``target``'s content for ``data`` all at once, keeping its mode."""
+    import shutil
+    tmp = _temp_beside(target)
+    try:
+        tmp.write_bytes(data)
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _create_new(target: Path, data: bytes, mode_from: Path) -> bool:
+    """Make ``target`` with ``data`` and ``mode_from``'s permissions, all at
+    once: a crash never leaves half a file, and one made by someone else
+    meanwhile is kept. True when this call made it."""
+    import shutil
+    tmp = _temp_beside(target)
+    try:
+        tmp.write_bytes(data)
+        shutil.copymode(mode_from, tmp)
+        try:
+            os.link(tmp, target)             # refuses to replace anything
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            # Filesystems without hard links: exclusive create instead.
+            try:
+                with open(target, "xb") as f:
+                    f.write(data)
+            except FileExistsError:
+                return False
+            shutil.copymode(mode_from, target)
+            return True
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _find_config_file() -> str:
     """Search for Harvey's config.
 
@@ -966,13 +1208,15 @@ def _find_config_file() -> str:
     carry a real product configuration (trained on an actual company) while
     the tracked ``harvey.yaml`` stays an untrained template — nobody
     publishes their positioning, pricing, and prospect targeting by accident.
+    Harvey only ever writes harvey.local.yaml (writable_config_file).
     """
     candidates = [
-        Path.cwd() / "harvey.local.yaml",
-        PROJECT_ROOT / "harvey.local.yaml",
-        Path.cwd() / "harvey.yaml",
-        Path.cwd().parent / "harvey.yaml",
-        PROJECT_ROOT / "harvey.yaml",
+        Path.cwd() / LOCAL_CONFIG,
+        PROJECT_ROOT / LOCAL_CONFIG,
+        Path.cwd() / TEMPLATE_CONFIG,
+        Path.cwd().parent / LOCAL_CONFIG,
+        Path.cwd().parent / TEMPLATE_CONFIG,
+        PROJECT_ROOT / TEMPLATE_CONFIG,
     ]
     for path in candidates:
         if path.exists():
@@ -980,5 +1224,5 @@ def _find_config_file() -> str:
     raise ConfigFileNotFoundError(
         "harvey.yaml not found in "
         + ", ".join(str(p.parent) for p in candidates)
-        + ". Create one from harvey.yaml.example or run 'harvey setup'."
+        + ". Run 'harvey setup' to make one."
     )

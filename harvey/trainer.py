@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from harvey.brain import Brain
-from harvey.config import BrainConfig, load_brain_config
+from harvey.config import TEMPLATE_CONFIG, BrainConfig, load_brain_config, local_config_file
 from harvey.public_http import UnsafeURLError, public_http_client
 from harvey.state import StateManager
 
@@ -398,15 +398,16 @@ def _backup(path: Path, raw: str) -> Path:
 def write_trained_config(learned: dict, path: Path) -> dict:
     """Write a trained config to ``path`` without losing the operator's settings.
 
-    The base is ``path`` itself when it exists. On a first training it is the
-    harvey.yaml next to it (the template Harvey ships, with the provider and
+    A ``path`` named harvey.yaml (the tracked template) means the
+    harvey.local.yaml next to it. The base is ``path`` itself when it
+    exists. On a first training it is the harvey.yaml next to it (the template Harvey ships, with the provider and
     compliance blocks), never a config found elsewhere on disk. A base that
     has content but can't be read as YAML is backed up before it is
     replaced. The new file is swapped in whole, so a failed write never
     leaves a half-written config. Returns what was written.
     """
-    path = Path(path)
-    source = path if path.exists() else path.with_name("harvey.yaml")
+    path = local_config_file(path)      # never the tracked harvey.yaml
+    source = path if path.exists() else path.with_name(TEMPLATE_CONFIG)
     existing = None
     if source.exists():
         raw = read_user_text(source)
@@ -533,6 +534,7 @@ class Trainer:
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
+        config_path = local_config_file(config_path)
         guessed_email = config["persona"]["email"]
         config = write_trained_config(config, config_path)
 

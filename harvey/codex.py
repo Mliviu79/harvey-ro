@@ -81,10 +81,11 @@ _PLATFORM = sys.platform
 def require_supported_platform() -> None:
     if _PLATFORM == "darwin" or _PLATFORM.startswith("linux"):
         return
+    from harvey.config import config_to_edit
     raise CodexError(
         "Harvey's Codex provider supports macOS and Linux only; it isn't "
         "supported on Windows yet. Use the Claude provider there "
-        "(brain.provider: claude in harvey.yaml).",
+        f"(brain.provider: claude in {config_to_edit()}).",
         kind="setup",
     )
 
@@ -618,9 +619,10 @@ def attest_thread(response, requested_model: str) -> tuple[str, str]:
             or sandbox.get("networkAccess")):
         raise _isolation_error("the thread sandbox is not read-only without network")
     if requested_model and response.get("model") != requested_model:
+        from harvey.config import config_to_edit
         raise CodexError(
             f"Codex would not run the configured model '{requested_model}'. "
-            "Check brain.model in harvey.yaml.",
+            f"Check brain.model in {config_to_edit()}.",
             kind="setup",
         )
     thread_id = response["thread"].get("id")
@@ -739,10 +741,11 @@ def require_toolless_model(catalog: dict, model: str) -> None:
     if not model_tools_removable(entry):
         usable = [slug for slug, m in catalog.items() if model_tools_removable(m)]
         hint = f" Models that work: {', '.join(usable)}." if usable else ""
+        from harvey.config import config_to_edit
         raise CodexError(
             f"Codex model '{model}' always exposes tools that Harvey cannot "
             f"disable ({describe_model(entry)}), so Harvey won't send it "
-            f"prompts.{hint} Set brain.model in harvey.yaml.",
+            f"prompts.{hint} Set brain.model in {config_to_edit()}.",
             kind="isolation",
         )
 
@@ -764,11 +767,12 @@ def pick_default_model(catalog: dict) -> str:
     if not candidates:
         unlisted = _unlisted_toolless(catalog)
         if unlisted:
+            from harvey.config import config_to_edit
             raise CodexError(
                 "Codex lists no model whose tools can all be disabled, but these "
                 f"unlisted ones can: {', '.join(_safe_name(s) for s in unlisted)}. "
                 "Harvey won't pick an unlisted model on its own; to use one, set "
-                "brain.model in harvey.yaml.",
+                f"brain.model in {config_to_edit()}.",
                 kind="setup",
             )
         raise _isolation_error(
@@ -1420,9 +1424,10 @@ class CodexClient:
     def _default_model(self, catalog: dict) -> str:
         model = pick_default_model(catalog)
         if model != self._announced_default:
+            from harvey.config import config_to_edit
             logger.info(
                 f"Codex: using {model}, the first listed model whose tools can be "
-                "fully disabled. Set brain.model in harvey.yaml to choose another."
+                f"fully disabled. Set brain.model in {config_to_edit()} to choose another."
             )
             self._announced_default = model
         return model

@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from harvey.config import config_to_edit
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.analyst")
@@ -122,7 +123,7 @@ class Analyst:
             if optout_rate > 2:
                 insights.append(
                     f"URGENT: Opt-out rate is {optout_rate:.1f}% (>2% risks blacklisting). "
-                    "Pause sending, tighten ICP targeting in harvey.yaml, and reduce "
+                    f"Pause sending, tighten ICP targeting in {config_to_edit()}, and reduce "
                     "max_daily_sends until the list quality improves."
                 )
 
@@ -140,7 +141,7 @@ class Analyst:
             if objection_pct > 40:
                 insights.append(
                     f"ACTION: {objection_pct:.0f}% of replies are objections. Add the "
-                    "recurring objections to objection_responses in harvey.yaml and "
+                    f"recurring objections to objection_responses in {config_to_edit()} and "
                     "skills/objection_handling.md, or narrow targeting to better-fit accounts."
                 )
 
@@ -179,7 +180,7 @@ class Analyst:
             insights.append(
                 f"ACTION: Prospect pool is nearly empty ({total_new} new). Find contacts "
                 "for more companies (Contacts tab); if it keeps coming up dry, broaden "
-                "the ICP in harvey.yaml."
+                f"the ICP in {config_to_edit()}."
             )
 
         if not insights:
