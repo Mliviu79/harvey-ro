@@ -302,6 +302,10 @@ def _build(sources, target: Path, progress) -> dict:
             con.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?)",
                         (src.part, src.name or src.path.name, src.url, src.package, src.year,
                          src.published, src.licence, src.path.stat().st_size, kept))
+        say("current", None)
+        from harvey.modules.ro.mf_taxpayers import derived
+
+        derived.build(con)
         q = con.execute
         counts = {
             "rows": q("SELECT COUNT(*) FROM taxpayers").fetchone()[0],

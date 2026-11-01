@@ -18,6 +18,39 @@ secrets = []
 attribution = "ONRC open data, data.gov.ro (CC-BY 4.0)"
 terms_note = "ONRC open data from data.gov.ro, CC-BY 4.0: credit ONRC. Only a natural person's name and role are kept from the representatives file; a personal numeric code is never kept."
 
+# How Romanian firms are known: the tax code (CUI) and the trade register
+# number. Two different CUIs are two different firms. A registration number
+# is not that strict: one CUI can have several (an old, struck-off
+# registration and the current one), so two records with different numbers
+# may still be one firm and can be merged.
+[[identifiers]]
+name = "ro.cui"
+numeric = true
+legal = true
+
+[[identifiers]]
+name = "ro.onrc_reg"
+numeric = false
+legal = false
+
+# The registry file, read in place (never copied into harvey.db): the core
+# reaches it through the adapter, by CUI through the canonical row the load
+# builds (firm_by_cui), or by registration number for a firm with no CUI.
+[register]
+attach = "reg"
+file = "registry.db"
+keyed_by = "ro.cui"
+adapter = "harvey.modules.ro.onrc.queries"
+
+[[register.reads]]
+code = "ACTIVITY_CODE"
+
+[[register.reads]]
+code = "CONTACT_FOUND"
+
+[[register.reads]]
+code = "DECISION_MAKER_TITLE"
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0

@@ -285,6 +285,10 @@ def _build(sources, target: Path, progress, indicators: Path) -> dict:
         say("latest year per company")
         con.execute(LATEST)
         con.execute(FILL_LATEST)
+        say("current figures by company")
+        from harvey.modules.ro.mf_financials import derived
+
+        derived.build(con)
         counts = {
             "rows": con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0],
             "companies": con.execute("SELECT COUNT(*) FROM latest").fetchone()[0],

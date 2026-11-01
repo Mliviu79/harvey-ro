@@ -127,6 +127,13 @@ class Manifest:
     free_allowances: tuple[dict, ...] = ()
     # A market's: how its official registers usually write a name.
     registry_name_order: str = ""
+    # The identifier schemes it declares ([[identifiers]]: name, numeric,
+    # legal): how firms are known in its register.
+    identifiers: tuple[dict, ...] = ()
+    # A register module's file and how the core reads it ([register]:
+    # attach alias, file name in data/, the scheme its rows are keyed by,
+    # the adapter module, and the signals it reads, [[register.reads]]).
+    register: dict = field(default_factory=dict)
 
     def summary(self) -> dict:
         """The row ``harvey modules list`` prints."""
@@ -185,6 +192,81 @@ def _check_signals(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
                             f"number from 0 to 1, got {floor!r}")
         out.append({**SIGNAL_DEFAULTS, **sig})
     return tuple(out)
+
+
+_SCHEME = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
+_FILE = re.compile(r"^[a-z][a-z0-9_]*\.db$")
+
+
+def _check_identifiers(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(i, dict) for i in raw):
+        problems.append(f"{where}: [[identifiers]] must be an array of tables")
+        return ()
+    out, seen = [], set()
+    for ident in raw:
+        name = ident.get("name")
+        if not isinstance(name, str) or not _SCHEME.match(name):
+            problems.append(f"{where}: an identifier needs a dotted lower-case name "
+                            f"(market.key, like example.tax_id), got {name!r}")
+            continue
+        if name in seen:
+            problems.append(f"{where}: identifier {name} is declared twice")
+            continue
+        seen.add(name)
+        for flag in ("numeric", "legal"):
+            if not isinstance(ident.get(flag), bool):
+                problems.append(f"{where}: identifier {name} needs {flag} = true or false")
+        out.append({"name": name, "numeric": ident.get("numeric") is True,
+                    "legal": ident.get("legal") is True})
+    return tuple(out)
+
+
+def _check_register(raw, where: str, problems: list[str]) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        problems.append(f"{where}: [register] must be a table")
+        return {}
+    attach, file, keyed_by, adapter = (raw.get(k) for k in ("attach", "file", "keyed_by", "adapter"))
+    if not isinstance(attach, str) or not _ID.match(attach) or attach in ("main", "temp"):
+        problems.append(f"{where}: [register] attach must be a lower-case alias "
+                        f"(not main or temp), got {attach!r}")
+    if not isinstance(file, str) or not _FILE.match(file):
+        problems.append(f"{where}: [register] file must be a file name in data/ "
+                        f"ending in .db, got {file!r}")
+    if not isinstance(keyed_by, str) or not _SCHEME.match(keyed_by):
+        problems.append(f"{where}: [register] keyed_by must name an identifier scheme, "
+                        f"got {keyed_by!r}")
+    if not isinstance(adapter, str) or not _ENTRY.match(adapter):
+        problems.append(f"{where}: [register] adapter must be a dotted path inside the "
+                        f"harvey package, got {adapter!r}")
+    reads = raw.get("reads") or []
+    if not isinstance(reads, list) or not all(isinstance(r, dict) for r in reads):
+        problems.append(f"{where}: [[register.reads]] must be an array of tables")
+        reads = []
+    out_reads, seen = [], set()
+    for r in reads:
+        code = r.get("code")
+        if not isinstance(code, str) or not _CODE.match(code):
+            problems.append(f"{where}: a register read needs a signal code, got {code!r}")
+            continue
+        if code in seen:
+            problems.append(f"{where}: register read {code} is declared twice")
+            continue
+        seen.add(code)
+        absent = r.get("absent", "unknown")
+        if absent not in ABSENCE_VALUES:
+            problems.append(f"{where}: register read {code} absent must be one of "
+                            f"{', '.join(ABSENCE_VALUES)}, got {absent!r}")
+        precedence = r.get("precedence", 0)
+        if isinstance(precedence, bool) or not isinstance(precedence, int):
+            problems.append(f"{where}: register read {code} precedence must be a whole number")
+            precedence = 0
+        out_reads.append({"code": code, "absent": absent, "precedence": precedence})
+    return {"attach": attach, "file": file, "keyed_by": keyed_by, "adapter": adapter,
+            "reads": tuple(out_reads)}
 
 
 def _check_contact_kinds(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
@@ -461,6 +543,8 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         contact_kinds=_check_contact_kinds(raw.get("contact_kinds"), where, problems),
         free_allowances=_check_allowances(raw.get("free_allowances"), where, problems),
         registry_name_order=order if order in NAME_ORDERS else "",
+        identifiers=_check_identifiers(raw.get("identifiers"), where, problems),
+        register=_check_register(raw.get("register"), where, problems),
     )
 
 
@@ -539,6 +623,31 @@ def cross_check(manifests) -> list[str]:
                 if first is not m:
                     problems.append(f"{m.path}: {field_} {key!r} is already claimed "
                                     f"by {first.id} ({first.path})")
+    # Identifier schemes are named once; a register's alias is its own, its
+    # key a declared scheme, and what it reads a signal some module declares.
+    schemes: dict[str, Manifest] = {}
+    for m in manifests:
+        for ident in m.identifiers:
+            first = schemes.setdefault(ident["name"], m)
+            if first is not m:
+                problems.append(f"{m.path}: identifier {ident['name']!r} is already declared "
+                                f"by {first.id} ({first.path})")
+    aliases: dict[str, Manifest] = {}
+    for m in manifests:
+        if not m.register:
+            continue
+        alias = m.register.get("attach")
+        first = aliases.setdefault(alias, m)
+        if first is not m:
+            problems.append(f"{m.path}: register alias {alias!r} is already used by "
+                            f"{first.id} ({first.path})")
+        if m.register.get("keyed_by") not in schemes:
+            problems.append(f"{m.path}: register keyed_by {m.register.get('keyed_by')!r} "
+                            "is not an identifier any module declares")
+        for r in m.register.get("reads", ()):
+            if r["code"] not in owner:
+                problems.append(f"{m.path}: register reads {r['code']}, which no module "
+                                "declares in [[signals]]")
     # A capability's lane must be one a manifest declares, or its requests
     # would go out unpaced (lanes.wait refuses one it doesn't know).
     declared = {lane["id"] for m in manifests for lane in m.lanes}

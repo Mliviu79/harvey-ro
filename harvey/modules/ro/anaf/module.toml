@@ -20,6 +20,44 @@ secrets = []
 attribution = "ANAF, webservicesp.anaf.ro (public web service)"
 terms_note = "ANAF's free public web service (webservicesp.anaf.ro), no key: at most 100 CUIs a request and one request a second, and ANAF warns that overloading it is punished. Harvey sends one request every 1.1 s across everything it runs, retries only when ANAF is busy (HTTP 429 or 5xx), and keeps each answer for 30 days. Credit ANAF."
 
+# The kept answers, read in place by CUI. An answer saying ANAF doesn't
+# know the CUI is a checked answer; a CUI never asked is unknown.
+[register]
+attach = "anaf"
+file = "anaf.db"
+keyed_by = "ro.cui"
+adapter = "harvey.modules.ro.anaf.queries"
+
+[[register.reads]]
+code = "VAT_REGISTERED"
+
+[[register.reads]]
+code = "VAT_SINCE"
+
+[[register.reads]]
+code = "VAT_ON_CASH"
+
+[[register.reads]]
+code = "SPLIT_VAT"
+
+[[register.reads]]
+code = "FISCALLY_INACTIVE"
+
+[[register.reads]]
+code = "EFACTURA_REGISTERED"
+
+[[register.reads]]
+code = "REGISTRATION_STATUS"
+
+[[register.reads]]
+code = "LEGAL_FORM"
+
+[[register.reads]]
+code = "ADDRESS"
+
+[[register.reads]]
+code = "PHONE_NUMBER"
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0

@@ -2234,6 +2234,48 @@ def _switch_module(module_id: str, on: bool):
     asyncio.run(_switch())
 
 
+def cmd_doctor(args):
+    """Check a schema 25 database's kept values against a full recount."""
+    import sqlite3
+    from pathlib import Path
+
+    from harvey.overlay import recount, schema
+    from harvey.state import DB_PATH
+
+    path = Path(args.db or DB_PATH)
+    if not args.recount:
+        print("\n  Nothing to check: harvey doctor --recount compares every kept count "
+              "with a full recount.\n")
+        return
+    if not path.is_file():
+        print(f"\n  No database at {path}.\n")
+        sys.exit(1)
+    uri = f"file:{path}" + ("" if args.fix else "?mode=ro")
+    con = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        found = schema.version(con)
+        if found != schema.VERSION:
+            print(f"\n  {path} is schema {found}; the recount checks schema {schema.VERSION} "
+                  "(its kept counts). Nothing to do yet.\n")
+            sys.exit(2)
+        rows = recount.diff(con)
+        wrong = {k: v for k, v in rows.items() if v}
+        print()
+        for name, n in rows.items():
+            print(f"  {name:28} {n:>10,}")
+        print(f"\n  {'Every kept value matches the recount.' if not wrong else f'{sum(wrong.values()):,} rows differ.'}")
+        if wrong and args.fix:
+            recount.fix(con)
+            left = {k: v for k, v in recount.diff(con).items() if v}
+            print("  Fixed: every kept value written again from a full recount."
+                  if not left else f"  Still differing after the fix: {left}")
+        print()
+        if wrong and not args.fix:
+            sys.exit(1)
+    finally:
+        con.close()
+
+
 def cmd_duplicates(args):
     """Possible duplicates, as groups: companies that may be one, and the
     merges in force. Merge a group into one record, take companies out of a
@@ -2964,6 +3006,15 @@ def main():
                      help="With --separate: the rest of the group they are taken out of")
     sub.add_argument("--limit", type=int, default=50, help="How many groups to list (default 50)")
     sub.set_defaults(func=cmd_duplicates)
+
+    sub = subparsers.add_parser(
+        "doctor", help="Check the database: --recount compares kept counts with a full recount")
+    sub.add_argument("--recount", action="store_true",
+                     help="Count every kept value again from its rows and list what differs")
+    sub.add_argument("--fix", action="store_true",
+                     help="With --recount: write the recounted values where they differ")
+    sub.add_argument("--db", default="", help="The database to check (default: data/harvey.db)")
+    sub.set_defaults(func=cmd_doctor)
 
     sub = subparsers.add_parser(
         "retry-writes", help="Retry prospects the Writer couldn't write an email for")

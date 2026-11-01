@@ -19,6 +19,33 @@ secrets = []
 attribution = "Ministerul Finanțelor, data.gov.ro (CC-BY 4.0)"
 terms_note = "Ministry of Finance open data from data.gov.ro (Ministerul Finanțelor, data.gov.ro), CC-BY 4.0: credit the Ministry of Finance. Published once a year (June, corrected in July), so VAT and status can be months old: ANAF's check is newer and wins. Sole traders and family businesses (PFA, II, IF) are kept like every other legal form; a row whose tax code is a personal numeric code is never kept."
 
+# The taxpayer file, read in place: the load builds ``current`` (flags and
+# phone keyed by the CUI as an integer). Published once a year, so ANAF's
+# answer (newer) wins a tie on VAT, address and phone.
+[register]
+attach = "tax"
+file = "taxpayers.db"
+keyed_by = "ro.cui"
+adapter = "harvey.modules.ro.mf_taxpayers.queries"
+
+[[register.reads]]
+code = "HAS_EMPLOYEES_TAX"
+
+[[register.reads]]
+code = "MICRO_TAX_REGIME"
+
+[[register.reads]]
+code = "VAT_REGISTERED"
+precedence = 1
+
+[[register.reads]]
+code = "PHONE_NUMBER"
+precedence = 1
+
+[[register.reads]]
+code = "ADDRESS"
+precedence = 1
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0

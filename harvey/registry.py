@@ -345,6 +345,10 @@ def _build(files: dict[str, Path], dataset: onrc.Dataset, target: Path,
         _load_caen(con)
         say("search index")
         fill_search_index(con)
+        say("keys")
+        from harvey.modules.ro.onrc import derived
+
+        derived.build(con)
 
         counts = {
             "firms": con.execute("SELECT COUNT(*) FROM firms").fetchone()[0],

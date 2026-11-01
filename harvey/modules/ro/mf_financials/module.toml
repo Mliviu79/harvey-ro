@@ -18,6 +18,45 @@ secrets = []
 attribution = "Ministerul Finanțelor, data.gov.ro (CC-BY 4.0; OGL-ROU 1.0 before 2019)"
 terms_note = "Ministry of Finance open data from data.gov.ro (Ministerul Finanțelor, data.gov.ro), CC-BY 4.0 from 2019 and OGL-ROU 1.0 before: credit the Ministry of Finance. Companies only: sole traders and family businesses (PFA, II, IF) file no balance sheet."
 
+# The statements file, read in place: the load builds ``current`` (each
+# company's latest figures, keyed by the CUI as an integer) for the core's
+# reads and ranges.
+[register]
+attach = "fin"
+file = "financials.db"
+keyed_by = "ro.cui"
+adapter = "harvey.modules.ro.mf_financials.queries"
+
+[[register.reads]]
+code = "TURNOVER"
+
+[[register.reads]]
+code = "EMPLOYEES"
+
+[[register.reads]]
+code = "NET_RESULT"
+
+[[register.reads]]
+code = "EQUITY"
+
+[[register.reads]]
+code = "DEBTS"
+
+[[register.reads]]
+code = "TOTAL_ASSETS"
+
+[[register.reads]]
+code = "TURNOVER_GROWTH"
+
+[[register.reads]]
+code = "ACCOUNTS_FORM"
+
+# Whether a missing year is a "no" depends on the registry and the year's
+# release; until that is settled against today's counts it reads unknown.
+[[register.reads]]
+code = "FILED_ACCOUNTS"
+absent = "unknown"
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0
