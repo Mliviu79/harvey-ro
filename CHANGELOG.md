@@ -442,6 +442,10 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- `persona.linkedin` is optional and nothing reads it; training and setup
+  no longer write one (training used to invent a profile URL from your
+  domain). The reply handler's qualifying stage says what to find out
+  instead of naming BANT.
 - The Today page's "Find emails" step counts the companies the contact
   finder searched and shows it at work while a contact job runs; it read a
   column nothing has written since the prospecting stage went.

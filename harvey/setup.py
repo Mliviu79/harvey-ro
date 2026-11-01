@@ -501,7 +501,6 @@ class SetupWizard:
                 "company": company,
                 "role": persona_role,
                 "email": persona_email,
-                "linkedin": "",
                 "tone": "professional, consultative, confident",
             },
             "product": {

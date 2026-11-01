@@ -862,7 +862,6 @@ What prospects do instead of buying a solution like ours:
                 "company": company,
                 "role": "Business Development",
                 "email": f"harvey@{email_domain}",
-                "linkedin": f"linkedin.com/in/harvey-{email_domain.replace('.', '-')}",
                 "tone": tone,
             },
             "product": {

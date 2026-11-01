@@ -120,6 +120,12 @@ def test_a_config_from_before_linkedin_was_removed_still_loads(tmp_path):
     assert not hasattr(config.channels, "linkedin")
 
 
+def test_a_persona_needs_no_linkedin_profile():
+    persona = {k: v for k, v in MINIMAL["persona"].items() if k != "linkedin"}
+    config = HarveyConfig(**{**MINIMAL, "persona": persona})
+    assert config.persona.linkedin == ""
+
+
 def test_quiet_hours_defaults():
     q = QuietHoursConfig()
     assert q.start == "22:00"

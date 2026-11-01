@@ -14,7 +14,7 @@ from harvey.trainer import write_trained_config
 LEARNED = {
     "persona": {
         "name": "Harvey", "company": "Acme Roofing", "role": "Business Development",
-        "email": "harvey@acme.example", "linkedin": "linkedin.com/in/harvey-acme-com",
+        "email": "harvey@acme.example",
         "tone": "warm, direct",
     },
     "product": {

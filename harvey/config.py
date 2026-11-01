@@ -35,7 +35,7 @@ class PersonaConfig(BaseModel):
     company: str
     role: str
     email: str
-    linkedin: str
+    linkedin: str = ""  # the sender's own profile; optional, nothing reads it
     tone: str
 
 
