@@ -253,7 +253,7 @@ async def test_an_unsubscribe_seen_only_in_history_stops_the_follow_up(monkeypat
             assert request.url.params["startHistoryId"] == "1"
             return httpx.Response(200, json={"history": [added("stop")], "historyId": "2"})
         if path.endswith("/messages/stop"):
-            return httpx.Response(200, json=message("stop", "bob@beta.com", "unsubscribe"))
+            return httpx.Response(200, json=message("stop", "bob@beta.example", "unsubscribe"))
         return httpx.Response(200, json={})                  # cycle 1: an empty week
     p = transport_provider(monkeypatch, respond)
     harness.mail.get_replies = p.get_replies
@@ -320,9 +320,9 @@ async def test_the_handler_doesnt_confirm_when_a_reply_wasnt_handled(tmp_path, m
     from tests.test_outbox_native import FakeProvider, make_handler, seed_prospect
     state = StateManager(str(tmp_path / "u.db"))
     await state.init_db()
-    await seed_prospect(state, email="jo@acme.com", status="contacted")
+    await seed_prospect(state, email="jo@acme.example", status="contacted")
     provider_ = FakeProvider()
-    provider_.inbound = [InboundMessage(provider_id="x1", from_email="jo@acme.com",
+    provider_.inbound = [InboundMessage(provider_id="x1", from_email="jo@acme.example",
                                         subject="Re: hi", body="Tell me more")]
     confirmed = []
     provider_.confirm_read = lambda: confirmed.append(True)

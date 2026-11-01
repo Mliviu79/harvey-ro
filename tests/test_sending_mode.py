@@ -85,7 +85,7 @@ _n = iter(range(10**6))
 
 async def _row(state, status):
     from tests.test_outbox_native import seed_prospect, _now_iso
-    email = f"p{next(_n)}@acme.com"
+    email = f"p{next(_n)}@acme.example"
     pid = await seed_prospect(state, email=email, status="replied")
     return await state.add_outbox_item(prospect_id=pid, to_email=email,
                                        subject="s", body="Fine body. Question?", kind="reply",
@@ -189,9 +189,9 @@ async def test_each_autopilot_path_marks_what_it_queues(state, monkeypatch):
     pid = await seed_prospect(state, status="new")
     campaign = await seed_campaign(state, [pid])
     await make_sender(state, FakeProvider(), require_approval=False)._stage_campaign_native(campaign)
-    replier = await seed_prospect(state, email="r@acme.com", status="contacted")
+    replier = await seed_prospect(state, email="r@acme.example", status="contacted")
     provider = FakeProvider()
-    provider.inbound = [InboundMessage(provider_id="m1", from_email="r@acme.com",
+    provider.inbound = [InboundMessage(provider_id="m1", from_email="r@acme.example",
                                        subject="Re: hi", body="What does it cost?")]
     await make_handler(state, provider)._run_native()
     rows = await state.get_outbox()
@@ -234,7 +234,7 @@ def _render(func, mode, armed=False):
 
 
 MODE = {"mode": "approval", "provider": "gmail", "file": "harvey.local.yaml",
-        "your_domains": ["acme.com", "<b>x</b>"], "booking_page": "cal.com/sam/15", "held": 0}
+        "your_domains": ["acme.example", "<b>x</b>"], "booking_page": "cal.com/sam/15", "held": 0}
 
 
 def test_the_outbox_says_which_mode_and_offers_the_way_out():
@@ -249,7 +249,7 @@ def test_the_outbox_says_which_mode_and_offers_the_way_out():
 def test_settings_explains_both_and_asks_for_the_word():
     card = _render("sendingModeCard", MODE)
     assert "Sending mode: Approval" in card and "<b>Autopilot</b>: Harvey sends on its own" in card
-    assert "acme.com, &lt;b&gt;x&lt;/b&gt;" in card and "harvey.local.yaml" in card
+    assert "acme.example, &lt;b&gt;x&lt;/b&gt;" in card and "harvey.local.yaml" in card
     assert "Turn on autopilot…" in card and 'id="autopilot-go"' not in card
     armed = _render("sendingModeCard", MODE, armed=True)
     assert 'id="autopilot-confirm"' in armed and 'id="autopilot-go" disabled' in armed

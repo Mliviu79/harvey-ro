@@ -37,23 +37,23 @@ def collector(confirmed=None):
 
 def test_agency_detected_from_strong_credit():
     html = """<footer><p>© 2026 Acme Roofing.
-      Powered by <a href="https://rcmdigital.com">RCM Digital</a></p></footer>"""
-    got = collector().detect_agency(html, "acmeroofing.com")
+      Powered by <a href="https://qxldigital.example">QXL Digital</a></p></footer>"""
+    got = collector().detect_agency(html, "acmeroofing.example")
     assert got is not None
     name, conf, url = got
-    assert "RCM" in name and conf == 0.9 and "rcmdigital" in url
+    assert "QXL" in name and conf == 0.9 and "qxldigital" in url
 
 
 def test_agency_descriptive_anchor_scores_lower_but_records():
-    html = """<footer><a href="https://xyz.com">Roofing Website Design and Marketing</a></footer>"""
-    got = collector().detect_agency(html, "acme.com")
+    html = """<footer><a href="https://xyz.example">Roofing Website Design and Marketing</a></footer>"""
+    got = collector().detect_agency(html, "acme.example")
     assert got is not None and got[1] == 0.75
 
 
 def test_bare_link_is_not_recorded():
     """A bare footer link is usually the business's own second brand."""
-    html = """<footer><a href="https://someplace.com">Someplace</a></footer>"""
-    assert collector().detect_agency(html, "acme.com") is None
+    html = """<footer><a href="https://someplace.example">Someplace</a></footer>"""
+    assert collector().detect_agency(html, "acme.example") is None
 
 
 def test_benign_footer_links_ignored():
@@ -63,12 +63,12 @@ def test_benign_footer_links_ignored():
       <a href="https://gaf.com">GAF Certified</a>
       <a href="https://accessibe.com">Accessibility</a>
     </footer>"""
-    assert collector().detect_agency(html, "acme.com") is None
+    assert collector().detect_agency(html, "acme.example") is None
 
 
 def test_self_links_ignored():
-    html = """<footer>Powered by <a href="https://acme.com/about">Acme</a></footer>"""
-    assert collector().detect_agency(html, "acme.com") is None
+    html = """<footer>Powered by <a href="https://acme.example/about">Acme</a></footer>"""
+    assert collector().detect_agency(html, "acme.example") is None
 
 
 # ── people: real names vs page titles ──
@@ -169,12 +169,12 @@ async def test_only_confirmed_signals_are_collected(state, monkeypatch):
     assert not c.wants("INCUMBENT_AGENCY")   # proposed, never confirmed
 
     async def fake_get(url):
-        return '<html><link href="/wp-content/x.css"><footer>Powered by <a href="https://ag.com">Agency</a></footer></html>'
+        return '<html><link href="/wp-content/x.css"><footer>Powered by <a href="https://ag.example">Agency</a></footer></html>'
     c._get = fake_get
     c.known = state
 
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
-    obs = await c.profile_company(cid, "acme.com")
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
+    obs = await c.profile_company(cid, "acme.example")
     codes = {o["signal_code"] for o in obs}
     assert codes == {"TECH_STACK"}, "unconfirmed signals must not be collected"
 
@@ -208,11 +208,11 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
     cid = await state.add_company(Company(name="Denver, CO | HOA Management Firm",
                                           domain="managementharbor.example"))
     keep = await state.add_company(Company(name="Birch Management", domain="birchmgt.example"))
-    derived = await state.add_company(Company(name="Grow With Us", domain="growwithus.us"))
+    derived = await state.add_company(Company(name="Thrive With Us", domain="thrivewithus.example"))
     pages = {
         "managementharbor.example": '<meta property="og:site_name" content="Management Harbor">',
         "birchmgt.example": "<title>Denver HOA | Birch Management Group</title>",
-        "growwithus.us": '<meta property="og:site_name" content="Grow Community Management">',
+        "thrivewithus.example": '<meta property="og:site_name" content="Thrive Community Management">',
     }
 
     async def fake_resolve(self, domain):
@@ -226,27 +226,27 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
     await runs.profile(state, [{"id": cid, "name": "Denver, CO | HOA Management Firm",
                       "domain": "managementharbor.example"},
                      {"id": keep, "name": "Birch Management", "domain": "birchmgt.example"},
-                     {"id": derived, "name": "Grow With Us", "domain": "growwithus.us"}],
+                     {"id": derived, "name": "Thrive With Us", "domain": "thrivewithus.example"}],
                        {"TECH_STACK"})
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         names = dict(db.execute("SELECT domain, name FROM companies"))
     assert names["managementharbor.example"] == "Management Harbor"
     assert names["birchmgt.example"] == "Birch Management"   # already right: untouched
-    assert names["growwithus.us"] == "Grow Community Management"   # was domain-derived
+    assert names["thrivewithus.example"] == "Thrive Community Management"   # was domain-derived
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("current,domain,homepage,expected", [
-    ("Roofing Services in Denver", "kettlemanroofing.example", "Kettleman Roofing", "Kettleman Roofing"),
-    ("Plumbing Services in Austin", "acmeplumbing.com", "Acme Plumbing", "Acme Plumbing"),
-    ("Contact Us", "contactcraft.com", "ContactCraft", "ContactCraft"),
+    ("Roofing Services in Denver", "brindlewickroofing.example", "Brindlewick Roofing", "Brindlewick Roofing"),
+    ("Plumbing Services in Austin", "acmeplumbing.example", "Acme Plumbing", "Acme Plumbing"),
+    ("Contact Us", "contactloom.example", "ContactLoom", "ContactLoom"),
     ("Birch Management", "birchmgt.example", "Birch Management Group", "Birch Management"),
-    ("NVCM", "nvcmnet.com", "NVCM Group", "NVCM"),
-    ("Northvale Association of Community Managers", "nacm.org",
-     "Northvale Association of Community Managers Group", "Northvale Association of Community Managers"),
-    ("Grow With Us", "growwithus.us", "Grow Community Management", "Grow Community Management"),
-    ("Roofing Services in Denver", "kettlemanroofing.example", "", "Roofing Services in Denver"),
+    ("QVCM", "qvcmnet.example", "QVCM Group", "QVCM"),
+    ("Vellmora Association of Community Managers", "vacm.example",
+     "Vellmora Association of Community Managers Group", "Vellmora Association of Community Managers"),
+    ("Thrive With Us", "thrivewithus.example", "Thrive Community Management", "Thrive Community Management"),
+    ("Roofing Services in Denver", "brindlewickroofing.example", "", "Roofing Services in Denver"),
 ])
 async def test_profile_repairs_weak_names_and_retains_brands(
         state, monkeypatch, current, domain, homepage, expected):
@@ -275,8 +275,8 @@ async def test_profile_repairs_weak_names_and_retains_brands(
 async def test_profile_uses_homepage_brand_over_service_location_title(
         state, monkeypatch, industry, use_fallback):
     from harvey.collectors.discover import name_from_domain
-    domain = f"kettleman{industry.lower()}.com"
-    brand = f"Kettleman {industry}"
+    domain = f"brindlewick{industry.lower()}.example"
+    brand = f"Brindlewick {industry}"
     label = f"{industry} Services in Denver"
     current = name_from_domain(domain) if use_fallback else label
     cid = await state.add_company(Company(name=current, domain=domain))

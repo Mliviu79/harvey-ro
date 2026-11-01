@@ -30,7 +30,7 @@ from harvey.textio import read_user_text
 
 
 def _normalize_start_url(url: str) -> str:
-    """Accept 'acmecorp.com' as well as 'https://acmecorp.com'."""
+    """Accept 'acmecorp.example' as well as 'https://acmecorp.example'."""
     url = url.strip()
     if url and not urlparse(url).scheme:
         url = f"https://{url}"
@@ -853,7 +853,7 @@ What prospects do instead of buying a solution like ours:
         company = product_info.get("company_name", "Your Company")
         product = product_info.get("product_name", "Your Product")
         tone = product_info.get("tone", "professional, consultative, confident")
-        # "www.acme.com" should yield harvey@acme.com, not harvey@www.acme.com
+        # "www.acme.example" should yield harvey@acme.example, not harvey@www.acme.example
         email_domain = domain.removeprefix("www.")
 
         return {
@@ -914,8 +914,8 @@ def main():
         print("Usage: python -m harvey.trainer <website-url> [max-pages]")
         print("")
         print("Examples:")
-        print("  python -m harvey.trainer https://acmecorp.com")
-        print("  python -m harvey.trainer https://acmecorp.com 200")
+        print("  python -m harvey.trainer https://acmecorp.example")
+        print("  python -m harvey.trainer https://acmecorp.example 200")
         print("")
         print("For deep JS-rendered crawling, add to .env:")
         print("  CLOUDFLARE_ACCOUNT_ID=your_account_id")

@@ -147,7 +147,7 @@ FALLBACK_SITE_PATHS = ("/about", "/about-us", "/team", "/our-team", "/contact", 
 RO_FALLBACK_SITE_PATHS = ("/echipa", "/despre-noi", "/medici", "/contact")
 CAREERS_PATHS = ("/careers", "/jobs", "/join-us", "/employment", "/hiring",
                  "/about/careers", "/careers/")
-# A homepage link to the careers page beats guessing paths: careers.acme.com
+# A homepage link to the careers page beats guessing paths: careers.acme.example
 # and /company/jobs are as common as /careers. Whole path segments and whole
 # anchors only: "/scheduling/hiring-marketplaces" is a product page.
 _CAREERS_HOST = re.compile(r"^(careers?|jobs|join)\.", re.I)
@@ -432,7 +432,7 @@ class _ProgramClaims:
         finds the cohort."""
         name = _domain_name(domain) if domain else ""
         # The name as written on the page may have spaces or hyphens ("Acme Corp"
-        # for acmecorp.com): any separators between its letters.
+        # for acmecorp.example): any separators between its letters.
         spelled = r"[\s.-]?".join(re.escape(ch) for ch in _alnum(name)) if len(_alnum(name)) >= 3 else ""
         subject = rf"(?:{_SELF_SUBJECT}" + (rf"|{spelled}\b" if spelled else "") + r")"
         claim_re = re.compile(rf"^{_FOUNDED_PREFIX}{subject},?(?:{self.body}|{self.later}{self.extra})", re.I)
@@ -487,7 +487,7 @@ def _alnum(text: str) -> str:
 
 
 def _domain_name(domain: str) -> str:
-    """The registrable name: app.acme.com and acme.co.uk are both "acme"."""
+    """The registrable name: "acme" for app.acme.example, "example" for example.co.uk."""
     parts = [p for p in domain.lower().strip(".").split(".") if p]
     if len(parts) >= 3 and parts[-2] in _SECOND_LEVEL and len(parts[-1]) == 2:
         return parts[-3]
@@ -502,7 +502,7 @@ def _is_their_yc_page(slug: str, domain: str) -> bool:
         return False
     if name == label:
         return True
-    # getacme.com / acmehq.com and the slug "acme", nothing looser.
+    # getacme.example / acmehq.example and the slug "acme", nothing looser.
     core = lambda t: _SUFFIXES.sub("", _PREFIXES.sub("", t))
     return min(len(core(name)), len(core(label))) >= 4 and core(name) == core(label)
 
@@ -591,9 +591,9 @@ def _cohort_finder(prog: str):
     return find
 
 
-# Two shapes seen on real About pages: founders who are alumni ("Permutive
+# Two shapes seen on About pages: founders who are alumni ("Acme
 # was founded in 2014 by A and B, alumni of Entrepreneur First") and a
-# timeline line ("DigitalOcean founded, joins the TechStars Accelerator").
+# timeline line ("Acme founded, joins the TechStars Accelerator").
 _ACC_EXTRA = (
     r"|\s+(?:was\s+)?founded(?:\s+in\s+\d{{4}})?(?:\s+by\s+[^.]{{0,80}}?)?,?\s+(?:(?:both|all)\s+)?"
     r"(?:alumni|alums?|graduates)\s+of\s+(?:the\s+)?{prog}\b"
@@ -800,7 +800,7 @@ def funding_round(html: str, domain: str = "", url: str = "") -> dict | None:
         return None
     name = _alnum(_domain_name(domain)) if domain else ""
     spelled = r"[\s.-]?".join(re.escape(ch) for ch in name) if len(name) >= 3 else ""
-    spelled = spelled and rf"{spelled}(?:\.[a-z]{{2,6}})?"     # "Context.dev has raised"
+    spelled = spelled and rf"{spelled}(?:\.[a-z]{{2,6}})?"     # "Acme.test has raised"
     subject = r"(?:we(?:['’]ve)?|the company|our company" + (rf"|{spelled}\b" if spelled else "") + r")"
     raised = re.compile(
         rf"^{_LEAD_IN}{_ANNOUNCE}?{subject},?(?:\s+(?:has|have|had|just|now|recently|officially|successfully"

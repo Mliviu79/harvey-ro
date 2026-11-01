@@ -38,7 +38,7 @@ async def state():
         yield sm
 
 
-def _programs(html, domain="acme.com"):
+def _programs(html, domain="acme.example"):
     return [(p, c) for p, c, _ in accelerators(html, domain=domain)]
 
 
@@ -51,7 +51,7 @@ def _programs(html, domain="acme.com"):
     ("<p>We went through Techstars Boulder 2023.</p>", [("Techstars", "2023")]),
     ("<footer>Backed by Antler</footer>", [("Antler", "")]),
     ("<p>We're an Entrepreneur First company.</p>", [("Entrepreneur First", "")]),
-    ("<p>Acme is backed by South Park Commons and General Catalyst.</p>", [("South Park Commons", "")]),
+    ("<p>Acme is backed by South Park Commons and Example Ventures.</p>", [("South Park Commons", "")]),
     ("<p>We are backed by 500 Global.</p>", [("500 Global", "")]),
     ("<p>We were part of 500 Startups.</p>", [("500 Global", "")]),
     ("<p>We're backed by Neo.</p>", [("Neo", "")]),
@@ -96,26 +96,26 @@ def test_mentions_that_arent_backing(html):
 
 def test_customer_case_studies_dont_count():
     html = "<p>Foo, a Techstars company, cut costs 40% with Acme.</p>"
-    assert _programs(html, domain="acme.com") == []
-    assert _programs(html, domain="foo.com") == [("Techstars", "")]
+    assert _programs(html, domain="acme.example") == []
+    assert _programs(html, domain="foo.example") == [("Techstars", "")]
 
 
-# ── real phrasings, from live sites ──
+# ── phrasings sites use ──
 
 
 def test_a_backed_by_logo_wall():
-    """codos.ai: a "Backed by" label over the program's logo."""
+    """A "Backed by" label over the program's logo."""
     html = ('<div><span class="label">Backed by</span>'
             '<img class="lp-logo" src="/assets/logo/speedrun.svg" alt="a16z Speedrun"></div>')
-    assert _programs(html, domain="codos.ai") == [("a16z speedrun", "")]
+    assert _programs(html, domain="acme.example") == [("a16z speedrun", "")]
 
 
 def test_an_investor_logo_list():
-    """interhuman.ai/about: logos linked to the investors' sites."""
+    """An About page's logos linked to the investors' sites."""
     html = ('<section><h2 class="sr-only">Investor and partner logos</h2><ul>'
-            '<li><a href="https://psv.tech" aria-label="PSV Tech"><img alt="PSV Tech"></a></li>'
+            '<li><a href="https://northpeak.example" aria-label="Northpeak Capital"><img alt="Northpeak Capital"></a></li>'
             '<li><a href="https://www.antler.co" aria-label="Antler"><img alt="Antler"></a></li></ul></section>')
-    assert _programs(html, domain="interhuman.ai") == [("Antler", "")]
+    assert _programs(html, domain="acme.example") == [("Antler", "")]
 
 
 @pytest.mark.parametrize("html", [
@@ -128,22 +128,22 @@ def test_logos_under_other_headings_dont_count(html):
 
 
 def test_founders_who_are_alumni():
-    """permutive.com/about."""
-    html = ("<p>Permutive was founded in 2014 by Joe Root and Tim Spratt, alumni of Entrepreneur "
+    """An About page."""
+    html = ("<p>Acme was founded in 2014 by Jane Doe and John Roe, alumni of Entrepreneur "
             "First and Y Combinator, with a bold vision.</p>")
-    assert _programs(html, domain="permutive.com") == [("Entrepreneur First", "")]
+    assert _programs(html, domain="acme.example") == [("Entrepreneur First", "")]
 
 
 def test_a_timeline_line():
-    """digitalocean.com/about."""
-    html = "<li>DigitalOcean founded, joins the TechStars Accelerator Program</li>"
-    assert _programs(html, domain="digitalocean.com") == [("Techstars", "")]
+    """A timeline on an About page."""
+    html = "<li>Acme founded, joins the TechStars Accelerator Program</li>"
+    assert _programs(html, domain="acme.example") == [("Techstars", "")]
 
 
 def test_the_yc_detector_is_unchanged():
     from harvey.collectors.profile import yc_backed
-    assert yc_backed("<p>Acme is backed by Y Combinator (W22).</p>", domain="acme.com") == ("W22", 0.9)
-    assert yc_backed("<p>We're backed by Techstars.</p>", domain="acme.com") is None
+    assert yc_backed("<p>Acme is backed by Y Combinator (W22).</p>", domain="acme.example") == ("W22", 0.9)
+    assert yc_backed("<p>We're backed by Techstars.</p>", domain="acme.example") is None
 
 
 # ── funding rounds ──
@@ -160,7 +160,7 @@ def test_the_yc_detector_is_unchanged():
     ("<p>The company raised a Series C on January 14, 2026.</p>", "Series C", "", "2026-01-14"),
 ])
 def test_a_company_announcing_its_own_raise(html, round_, amount, when):
-    got = funding_round(html, domain="acme.com")
+    got = funding_round(html, domain="acme.example")
     assert got is not None
     assert (got["round"], got["amount"], got["date"]) == (round_, amount, when)
 
@@ -188,43 +188,43 @@ def test_a_company_announcing_its_own_raise(html, round_, amount, when):
     "<p>We closed our first enterprise deal.</p>",
 ])
 def test_raising_talk_that_isnt_their_own_raise(html):
-    assert funding_round(html, domain="acme.com") is None
+    assert funding_round(html, domain="acme.example") is None
 
 
 def test_the_date_comes_from_the_page_when_the_sentence_has_none():
     html = ('<script type="application/ld+json">{"@type":"BlogPosting",'
             '"datePublished":"2026-02-10T09:00:00Z"}</script>'
             "<h1>Acme raises $9M seed</h1>")
-    assert funding_round(html, domain="acme.com")["date"] == "2026-02-10"
+    assert funding_round(html, domain="acme.example")["date"] == "2026-02-10"
     meta = '<meta property="article:published_time" content="2025-11-03T10:00:00+00:00"><p>We raised a $1M seed.</p>'
-    assert funding_round(meta, domain="acme.com", url="https://acme.com/blog/seed")["date"] == "2025-11-03"
+    assert funding_round(meta, domain="acme.example", url="https://acme.example/blog/seed")["date"] == "2025-11-03"
     timed = '<time datetime="2025-06-01">June 1</time><p>We raised our Series A.</p>'
-    assert funding_round(timed, domain="acme.com", url="https://acme.com/news/series-a")["date"] == "2025-06-01"
-    url = funding_round("<p>We raised our seed round.</p>", domain="acme.com",
-                        url="https://acme.com/blog/2024/05/our-seed")
+    assert funding_round(timed, domain="acme.example", url="https://acme.example/news/series-a")["date"] == "2025-06-01"
+    url = funding_round("<p>We raised our seed round.</p>", domain="acme.example",
+                        url="https://acme.example/blog/2024/05/our-seed")
     assert url["date"] == "2024-05"
 
 
 def test_a_listing_page_full_of_dates_gives_no_page_date():
     html = ('<time datetime="2025-06-01"></time><time datetime="2023-01-09"></time>'
             "<p>We raised our Series A.</p>")
-    assert funding_round(html, domain="acme.com")["date"] == ""
+    assert funding_round(html, domain="acme.example")["date"] == ""
 
 
 def test_the_page_date_goes_to_the_raise_the_page_is_about():
-    """default.com: a seed post that links to the later Series A."""
+    """A seed post that links to the later Series A."""
     html = ("<title>Announcing Our $6.6m Seed Round</title>"
             '<meta property="article:published_time" content="2025-07-16">'
             "<h1>Announcing Our $6.6m Seed Round</h1>"
-            "<p>Today, we're launching our new product and announcing our Series A led by 8VC.</p>")
-    got = funding_round(html, domain="default.com", url="https://www.default.com/post/announcing-our-seed-round")
+            "<p>Today, we're launching our new product and announcing our Series A led by Example Ventures.</p>")
+    got = funding_round(html, domain="acme.example", url="https://www.acme.example/post/announcing-our-seed-round")
     assert (got["round"], got["amount"], got["date"]) == ("Seed", "$6.6M", "2025-07-16")
 
 
 def test_the_name_with_its_tld_is_the_company():
-    """context.dev: "Context.dev has raised a $9M seed round"."""
-    got = funding_round("<p>Context.dev has raised a $9M seed round, led by General Catalyst.</p>",
-                        domain="context.dev")
+    """A name written with its TLD: "Quillmail.test has raised a $9M seed round"."""
+    got = funding_round("<p>Quillmail.test has raised a $9M seed round, led by Example Ventures.</p>",
+                        domain="quillmail.test")
     assert (got["round"], got["amount"]) == ("Seed", "$9M")
 
 
@@ -232,7 +232,7 @@ def test_the_newest_round_on_a_page_wins():
     html = ("<p>We raised a $2M seed round in 2021.</p>"
             "<p>In May 2024 we raised a $15M Series A.</p>"
             "<p>We raised a $15M Series A in May 2024.</p>")
-    got = funding_round(html, domain="acme.com")
+    got = funding_round(html, domain="acme.example")
     assert (got["round"], got["date"]) == ("Series A", "2024-05")
 
 
@@ -311,14 +311,14 @@ def test_accelerators_and_funding_news_are_not_prospects(domain):
     assert is_junk(domain)
 
 
-@pytest.mark.parametrize("domain", ["neon.tech", "acme.com", "antlerfoods.com", "pioneerplumbing.com"])
+@pytest.mark.parametrize("domain", ["neon.example", "acme.example", "antlerfoods.example", "pioneerplumbing.example"])
 def test_lookalikes_are_still_prospects(domain):
     assert not is_junk(domain)
 
 
 def test_an_accelerator_preset_hit_is_evidence():
     from harvey.collectors.discover import Business, _observations
-    biz = Business(name="Acme", domain="acme.com", source_url="https://acme.com/about", provider="serper")
+    biz = Business(name="Acme", domain="acme.example", source_url="https://acme.example/about", provider="serper")
     q = build_queries(_config(), preset="accelerator")[0]
     [hit] = [r for r in _observations(biz, "c1", {"ACCELERATOR"}, "r1", query=q)
              if r["signal_code"] == "ACCELERATOR"]
@@ -379,16 +379,16 @@ async def test_profiling_records_the_program(state):
     await state.set_signal_status("ACCELERATOR", "confirmed")
     c, _ = _collector(state, "<h1>Acme</h1><p>Acme (Techstars '24) builds billing.</p>")
     c.confirmed = await state.confirmed_signal_codes()
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
-    [obs] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "ACCELERATOR"]
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
+    [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "ACCELERATOR"]
     assert (obs["value_num"], obs["value_text"]) == (1, "Techstars 2024")
     await state.add_observations([obs])
     assert await state.accelerator(cid) == "Techstars 2024"
 
     c2, _ = _collector(state, "<h1>Plain</h1><p>Family-run since 1987.</p>")
     c2.confirmed = c.confirmed
-    plain = await state.add_company(Company(name="Plain", domain="plain.com"))
-    [no] = [o for o in await c2.profile_company(plain, "plain.com") if o["signal_code"] == "ACCELERATOR"]
+    plain = await state.add_company(Company(name="Plain", domain="plain.example"))
+    [no] = [o for o in await c2.profile_company(plain, "plain.example") if o["signal_code"] == "ACCELERATOR"]
     assert no["value_num"] == 0
 
 
@@ -396,16 +396,16 @@ async def test_profiling_records_the_program(state):
 async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
     await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
-    cid = await state.add_company(Company(name="Acme", domain="acme.com",
-                                          source_url="https://acme.com/blog/series-a"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example",
+                                          source_url="https://acme.example/blog/series-a"))
     post = ('<meta property="article:published_time" content="2026-05-02T08:00:00Z">'
             "<h1>Acme raises $14M Series A</h1>" + _PAD)
     c, fetched = _collector(state, "<h1>Acme</h1><p>Billing.</p>",
-                            pages={"https://acme.com/blog/series-a": post})
+                            pages={"https://acme.example/blog/series-a": post})
     c.confirmed = await state.confirmed_signal_codes()
-    [obs] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "FUNDING_ROUND"]
+    [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_num"] == 1 and obs["value_text"] == "Series A · $14M · 2026-05-02"
-    assert obs["evidence_url"] == "https://acme.com/blog/series-a"
+    assert obs["evidence_url"] == "https://acme.example/blog/series-a"
     await state.add_observations([obs])
     assert await state.funding_round(cid) == {"round": "Series A", "amount": "$14M", "date": "2026-05-02"}
 
@@ -414,11 +414,11 @@ async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
 async def test_a_hit_on_someone_elses_site_isnt_read(state):
     await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
-    cid = await state.add_company(Company(name="Acme", domain="acme.com",
+    cid = await state.add_company(Company(name="Acme", domain="acme.example",
                                           source_url="https://news.example.com/acme-raises"))
     c, fetched = _collector(state, "<h1>Acme</h1><p>Billing.</p>")
     c.confirmed = await state.confirmed_signal_codes()
-    [obs] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "FUNDING_ROUND"]
+    [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_num"] == 0
     assert not [u for u in fetched if "example.com" in u]
 
@@ -427,11 +427,11 @@ async def test_a_hit_on_someone_elses_site_isnt_read(state):
 async def test_the_press_page_is_checked(state):
     await sync_vocabulary(state)
     await state.set_signal_status("FUNDING_ROUND", "confirmed")
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     press = "<h2>Acme raises $6M seed round (February 2026)</h2>" + _PAD
-    c, _ = _collector(state, "<h1>Acme</h1><p>Billing.</p>", pages={"https://acme.com/press": press})
+    c, _ = _collector(state, "<h1>Acme</h1><p>Billing.</p>", pages={"https://acme.example/press": press})
     c.confirmed = await state.confirmed_signal_codes()
-    [obs] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "FUNDING_ROUND"]
+    [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_text"] == "Seed · $6M · 2026-02"
 
 
@@ -573,7 +573,7 @@ def test_the_playbook_covers_accelerators_and_raises():
     "<p>We raised the bar for 2026.</p>",
 ])
 def test_money_that_isnt_a_raise(html):
-    assert funding_round(html, domain="acme.com") is None
+    assert funding_round(html, domain="acme.example") is None
 
 
 @pytest.mark.parametrize("html,round_,amount,when", [
@@ -584,30 +584,30 @@ def test_money_that_isnt_a_raise(html):
     ("<p>We raised a Series B extension of $20M.</p>", "Series B", "$20M", ""),
     ("<p>We are hiring! We raised $20M Series B in 2025.</p>", "Series B", "$20M", "2025"),
     ("<p>We raised $12M to expand in 2099.</p>", "", "$12M", ""),           # a future year isn't the raise's date
-    ("<h1>Teton.ai Raises $20 Million to Reinvent Elderly Care</h1>", "", "$20M", ""),   # live: teton.ai
+    ("<h1>Quillmail.test Raises $20 Million to Reinvent Elderly Care</h1>", "", "$20M", ""),
 ])
 def test_raise_details_from_the_right_clause(html, round_, amount, when):
-    got = funding_round(html, domain="teton.ai" if "Teton" in html else "acme.com")
+    got = funding_round(html, domain="quillmail.test" if "Quillmail" in html else "acme.example")
     assert got is not None and (got["round"], got["amount"], got["date"]) == (round_, amount, when)
 
 
 @pytest.mark.parametrize("html,url", [
     ('<script type="application/ld+json">{"@type":"WebPage","datePublished":"2026-06-01T00:00:00+00:00"}</script>'
-     "<p>We raised a $10M Series A led by Sequoia.</p>", "https://acme.com/about"),        # Yoast on About
-    ('<p>We raised a $10M Series A led by Sequoia.</p><div>Latest post <time datetime="2026-10-01">Oct 1</time></div>',
-     "https://acme.com/"),
-    ('<meta name="date" content="2026-10-20"><p>We raised a $8M seed round led by X.</p>', "https://acme.com/careers"),
+     "<p>We raised a $10M Series A led by Example Ventures.</p>", "https://acme.example/about"),        # Yoast on About
+    ('<p>We raised a $10M Series A led by Example Ventures.</p><div>Latest post <time datetime="2026-10-01">Oct 1</time></div>',
+     "https://acme.example/"),
+    ('<meta name="date" content="2026-10-20"><p>We raised a $8M seed round led by X.</p>', "https://acme.example/careers"),
 ])
 def test_page_dates_only_on_article_pages(html, url):
-    assert funding_round(html, domain="acme.com", url=url)["date"] == ""
+    assert funding_round(html, domain="acme.example", url=url)["date"] == ""
 
 
 def test_an_article_type_in_structured_data_is_an_article():
     html = ('<script type="application/ld+json">{"@type":"NewsArticle","datePublished":"2026-06-01"}</script>'
-            "<p>We raised a $10M Series A led by Sequoia.</p>")
-    assert funding_round(html, domain="acme.com", url="https://acme.com/acme-series-a")["date"] == "2026-06-01"
-    assert funding_round("<p>We raised a $8M seed round.</p>", domain="acme.com",
-                         url="https://acme.com/blog/2026/10/hello")["date"] == "2026-10"
+            "<p>We raised a $10M Series A led by Example Ventures.</p>")
+    assert funding_round(html, domain="acme.example", url="https://acme.example/acme-series-a")["date"] == "2026-06-01"
+    assert funding_round("<p>We raised a $8M seed round.</p>", domain="acme.example",
+                         url="https://acme.example/blog/2026/10/hello")["date"] == "2026-10"
 
 
 @pytest.mark.parametrize("html", [
@@ -633,7 +633,7 @@ def test_reviewed_accelerator_lookalikes(html):
 @pytest.mark.parametrize("html,expected", [
     ("<p>We are an Entrepreneur First company.</p>", [("Entrepreneur First", "")]),
     ("<p>We joined Plug and Play Silicon Valley 2023.</p>", [("Plug and Play", "2023")]),
-    ("<p>We're backed by Neo and Sequoia.</p>", [("Neo", "")]),
+    ("<p>We're backed by Neo and Example Ventures.</p>", [("Neo", "")]),
 ])
 def test_reviewed_accelerator_claims_still_count(html, expected):
     assert _programs(html) == expected
@@ -663,12 +663,12 @@ async def test_only_a_recent_raise_brings_the_playbook(state, text, playbook):
 async def test_a_profile_that_finds_nothing_supersedes_an_accelerator_search_hit(state):
     await sync_vocabulary(state)
     await state.set_signal_status("ACCELERATOR", "confirmed")
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     await state.add_observation(company_id=cid, signal_code="ACCELERATOR", collector="discover",
                                 value_num=1, confidence=0.6, observed_at="2026-01-01T00:00:00")
     c, _ = _collector(state, "<h1>Acme</h1><p>Billing.</p>")
     c.confirmed = await state.confirmed_signal_codes()
-    [no] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "ACCELERATOR"]
+    [no] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "ACCELERATOR"]
     assert no["value_num"] == 0
     await state.add_observations([no])
     assert await state.accelerator(cid) is None

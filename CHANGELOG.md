@@ -372,6 +372,74 @@ minor versions can still change behaviour.
   day is ignored, and switching the check off clears it. (from #57 by
   gabrielaoimevbore-beep)
 
+- **Send by hand from the dashboard, and a live status panel.** With no
+  mailbox connected (or email turned off), each campaign's first email has an
+  **Open in Gmail** button that fills in a compose window in the account
+  Harvey sends as, and a **Mark as sent** box. Harvey never sends to someone
+  marked sent by hand, even if a mailbox is connected later, and only offers
+  it for people it could still email (not opted out, replied, bounced, or
+  already queued by Harvey). The Today tab gains a panel showing each pipeline
+  step, what's running, and what to do next.
+
+- **Outbox review: see what a draft is based on, and edit it.** Each pending
+  draft now shows its campaign, the company (name, clickable website,
+  description), the contact and how they were found, email status and score,
+  tech / agency / hiring / ads / booking signals, and the Writer's notes, so
+  every claim can be checked against what Harvey actually found. **Edit** (or
+  `E`) turns subject and body into fields; Save rewrites the draft only while
+  it is still `pending_review` and never approves it. An edit the sender
+  would block (merge tags, HTML, banned phrases) is refused on save with the
+  reason; a reply keeps its subject so it stays in the thread; every edit is
+  logged with what it replaced. While editing, the shortcuts and Approve all
+  can't act on the unedited draft. `POST /api/outbox/{id}/edit` backs it.
+
+- **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
+  send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
+  for domains whose mail lives in Exchange Online (which no longer accepts
+  passwords over IMAP). Signs in once with OAuth + PKCE (`harvey microsoft
+  auth`; no client secret, no stored password), drafts then sends so the
+  Message-ID is known, threads replies with `createReply`, reads the last 7
+  days of the inbox without marking anything read, refuses to act as any
+  mailbox other than `persona.email`, and holds sending when the inbox can't
+  be read. See [docs/microsoft365.md](docs/microsoft365.md).
+- **Optional per-recipient compliance check (Precleared).** Set
+  `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
+  have each new recipient checked before the first cold email against UK
+  PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
+  verdict but `ok_to_email` fails that outbox item with the rule and the next
+  step. If the check can't be made because of Precleared (daily allowance or
+  rate limit, a bad key, network down, an unreadable answer), new addresses
+  wait for a later cycle while email to people already cleared, and replies,
+  still go out; if it fails for one address, only that email is moved back
+  six hours (failures at two different domains with no answer in between
+  hold new addresses too), and an address whose check timed out or got an
+  answer Harvey can't read is moved back as well, so it can't keep the
+  others waiting. One check per address, cached for 30 days; changing the
+  sender country, address source or product description triggers a fresh
+  check. The receipt id is logged with each send. Native providers only. Off
+  by default.
+- **`harvey setup` offers the Precleared check** (from #46 by
+  gabrielaoimevbore-beep). A new optional last step
+  asks whether to turn the check on, where your business is based (GB or US)
+  and, if your prospects are all in one country, which one (answering "no"
+  there asks before saving it as Norway's code). It then offers a
+  free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
+  instead of 10). Off unless you say yes. Re-running setup offers your saved
+  answers as the defaults, so pressing Enter never switches the check off. The
+  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
+  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
+  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
+  take effect; if it can't save the file it says so instead of ticking the
+  summary.
+- **Cohort builder pagination and CSV export.** The cohort table on the
+  Signals tab used to stop at the first 50 matches with no way to see the
+  rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
+  Export CSV button downloads the whole cohort. `POST /api/cohort` accepts
+  `offset` and `limit` (default 50, max 200) and orders by name so pages never
+  overlap; `GET /api/cohort.csv?require=...&exclude=...` returns every match.
+  Counts and exports include every match; pages use a stable name/id SQL order.
+  CSV downloads carry dashboard authorization and escape spreadsheet formulas.
+
 ### Changed
 
 - The Today page's "Find emails" step counts the companies the contact
@@ -473,7 +541,7 @@ minor versions can still change behaviour.
   another organisation; "Founder at Quillnest", "Partner, Example Law LLP",
   "Owner and Lead Dentist, Bluefinch Dental" and any title's "at Another
   Clinic" still do. A branch is not another organisation: "Associate
-  Dentist at Port Ellery" or "at Our Northvale Office" keeps the person.
+  Dentist at Port Ellery" or "at Our Vellmora Office" keeps the person.
 - A site read that looked for a raise (`FUNDING_ROUND`) no longer drops the
   contact and team pages it read afterwards from what it returns.
 
@@ -721,76 +789,6 @@ minor versions can still change behaviour.
 - Isolate Claude calls from personal instructions and hooks, and fix Claude CLI
   installation in Docker. Thanks to @EICCIO-Advisors for the private report.
 
-### Added
-
-- **Send by hand from the dashboard, and a live status panel.** With no
-  mailbox connected (or email turned off), each campaign's first email has an
-  **Open in Gmail** button that fills in a compose window in the account
-  Harvey sends as, and a **Mark as sent** box. Harvey never sends to someone
-  marked sent by hand, even if a mailbox is connected later, and only offers
-  it for people it could still email (not opted out, replied, bounced, or
-  already queued by Harvey). The Today tab gains a panel showing each pipeline
-  step, what's running, and what to do next.
-
-- **Outbox review: see what a draft is based on, and edit it.** Each pending
-  draft now shows its campaign, the company (name, clickable website,
-  description), the contact and how they were found, email status and score,
-  tech / agency / hiring / ads / booking signals, and the Writer's notes, so
-  every claim can be checked against what Harvey actually found. **Edit** (or
-  `E`) turns subject and body into fields; Save rewrites the draft only while
-  it is still `pending_review` and never approves it. An edit the sender
-  would block (merge tags, HTML, banned phrases) is refused on save with the
-  reason; a reply keeps its subject so it stays in the thread; every edit is
-  logged with what it replaced. While editing, the shortcuts and Approve all
-  can't act on the unedited draft. `POST /api/outbox/{id}/edit` backs it.
-
-- **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
-  send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
-  for domains whose mail lives in Exchange Online (which no longer accepts
-  passwords over IMAP). Signs in once with OAuth + PKCE (`harvey microsoft
-  auth`; no client secret, no stored password), drafts then sends so the
-  Message-ID is known, threads replies with `createReply`, reads the last 7
-  days of the inbox without marking anything read, refuses to act as any
-  mailbox other than `persona.email`, and holds sending when the inbox can't
-  be read. See [docs/microsoft365.md](docs/microsoft365.md).
-- **Optional per-recipient compliance check (Precleared).** Set
-  `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
-  have each new recipient checked before the first cold email against UK
-  PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
-  verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made because of Precleared (daily allowance or
-  rate limit, a bad key, network down, an unreadable answer), new addresses
-  wait for a later cycle while email to people already cleared, and replies,
-  still go out; if it fails for one address, only that email is moved back
-  six hours (failures at two different domains with no answer in between
-  hold new addresses too), and an address whose check timed out or got an
-  answer Harvey can't read is moved back as well, so it can't keep the
-  others waiting. One check per address, cached for 30 days; changing the
-  sender country, address source or product description triggers a fresh
-  check. The receipt id is logged with each send. Native providers only. Off
-  by default.
-- **`harvey setup` offers the Precleared check** (from #46 by
-  gabrielaoimevbore-beep). A new optional last step
-  asks whether to turn the check on, where your business is based (GB or US)
-  and, if your prospects are all in one country, which one (answering "no"
-  there asks before saving it as Norway's code). It then offers a
-  free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
-  instead of 10). Off unless you say yes. Re-running setup offers your saved
-  answers as the defaults, so pressing Enter never switches the check off. The
-  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
-  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
-  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
-  take effect; if it can't save the file it says so instead of ticking the
-  summary.
-- **Cohort builder pagination and CSV export.** The cohort table on the
-  Signals tab used to stop at the first 50 matches with no way to see the
-  rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
-  Export CSV button downloads the whole cohort. `POST /api/cohort` accepts
-  `offset` and `limit` (default 50, max 200) and orders by name so pages never
-  overlap; `GET /api/cohort.csv?require=...&exclude=...` returns every match.
-  Counts and exports include every match; pages use a stable name/id SQL order.
-  CSV downloads carry dashboard authorization and escape spreadsheet formulas.
-
 ### Removed
 
 - **The old prospecting code the contact finder replaced.** Nothing called it
@@ -819,6 +817,17 @@ minor versions can still change behaviour.
   JavaScript-only sites is reached over CDP (`BROWSER_CDP_URL`, and the
   Docker Chromium at `BROWSER_CDP_FALLBACK_URL`, which stays). LinkedIn
   addresses a company's own site links to are still kept as contacts.
+- **The Scout agent's prompt and skills, and real-looking names in tests.**
+  `prompts/scout.md` and the three skills only Scout loaded
+  (`prospecting_tactics`, `lead_qualification`, `account_navigation`) are
+  gone, with Scout's row in the skill map. `sales_methodology` no longer
+  plans LinkedIn touches between emails: Harvey writes email only, and the
+  skill now says so. The Hunter module's description says what it does (a
+  domain's address pattern, and a verification fallback). Test and
+  documentation data that could belong to real businesses now uses
+  reserved example names (`acme.example`, `.test`, `<name>.example.ro`),
+  phone numbers no subscriber can hold (`0268 000 1xx`, US 555-01xx) and
+  `exemplu.fictiv.*` free-mail addresses; a test now fails on any other.
 
 ## [0.3.0] — 2026-10-13
 

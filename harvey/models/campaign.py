@@ -21,7 +21,7 @@ class EmailStep(BaseModel):
 class Campaign(BaseModel):
     id: str
     name: str = ""
-    channel: str = "email"  # email/linkedin
+    channel: str = "email"  # Harvey sends email only
     instantly_campaign_id: str = ""
     sequence: list[EmailStep] = Field(default_factory=list)
     status: str = "draft"  # draft/active/paused/completed

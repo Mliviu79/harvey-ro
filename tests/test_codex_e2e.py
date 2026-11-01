@@ -172,7 +172,7 @@ def harvey(monkeypatch, tmp_path):
     return Harness(monkeypatch, tmp_path)
 
 
-async def _open_thread(state, email="jane@acme.com"):
+async def _open_thread(state, email="jane@acme.example"):
     pid = await seed_prospect(state, email=email, status="contacted")
     convo = Conversation(id="", prospect_id=pid, channel="email",
                          thread=[Message(sender="harvey", content="Hi Jane, quick question?")])
@@ -180,12 +180,12 @@ async def _open_thread(state, email="jane@acme.com"):
     return pid, convo.id
 
 
-def _reply(body, provider_id="in-1", email="jane@acme.com"):
+def _reply(body, provider_id="in-1", email="jane@acme.example"):
     return InboundMessage(provider_id=provider_id, from_email=email,
                           subject="Re: quick question", body=body, message_id=f"<{provider_id}@x>")
 
 
-async def _approved_item(state, email="bob@beta.com"):
+async def _approved_item(state, email="bob@beta.example"):
     pid = await seed_prospect(state, email=email, status="contacted")
     return await state.add_outbox_item(
         prospect_id=pid, to_email=email, subject="following up",
@@ -228,7 +228,7 @@ async def test_approved_email_is_delivered_once_across_cycles(harvey):
     await harvey.state.init_db()
     await _approved_item(harvey.state)
     await harvey.run_cycles(3)
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]
     assert len(await harvey.state.get_outbox(status="sent")) == 1
     assert await harvey.state.get_usage_today("codex") == 0  # sending needs no model
 
@@ -236,12 +236,12 @@ async def test_approved_email_is_delivered_once_across_cycles(harvey):
 @pytest.mark.asyncio
 async def test_writer_drafts_through_codex_and_waits_for_approval(harvey):
     await harvey.state.init_db()
-    await seed_prospect(harvey.state, email="jane@acme.com", status="new")
+    await seed_prospect(harvey.state, email="jane@acme.example", status="new")
     # One cycle: the writer drafts, then (send phase, after it) the sender
     # stages the drafts for approval. Nothing is sent.
     await harvey.run_cycles(1)
     drafts = await harvey.state.get_outbox(status="pending_review")
-    assert drafts and all(d["to_email"] == "jane@acme.com" for d in drafts)
+    assert drafts and all(d["to_email"] == "jane@acme.example" for d in drafts)
     assert harvey.mail.sent == []
     assert await harvey.state.get_usage_today("codex") >= 1
 
@@ -273,7 +273,7 @@ async def test_expired_login_pauses_everything_and_recovers_after_renewal(harvey
     renewed = auth.read_bytes()
     await harvey.run_cycles(1)
     assert await harvey.state.is_reply_processed("in-1")
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]
     assert (await harvey.status())["status"] == "ok"
     assert renewed != before and auth.read_bytes() == renewed  # Harvey never wrote it
 
@@ -427,7 +427,7 @@ async def test_pre_codex_database_migrates_and_runs_on_codex(monkeypatch, tmp_pa
 
     rows = await harvey.state.usage_by_provider(days=36500)
     assert [(r["provider"], r["calls"]) for r in rows] == [("claude", 1)]
-    old_prospect = await harvey.state.get_prospect_by_email("old@legacy.com")
+    old_prospect = await harvey.state.get_prospect_by_email("old@legacy.example")
     assert old_prospect is not None and old_prospect.status == "contacted"
 
     _, convo_id = await _open_thread(harvey.state)
@@ -518,7 +518,7 @@ async def test_instantly_path_leaves_the_reply_unprocessed_when_the_brain_is_dow
 
     class Instantly:
         async def get_replies(self, campaign_id):
-            return [{"uuid": "r-1", "lead_email": "jane@acme.com",
+            return [{"uuid": "r-1", "lead_email": "jane@acme.example",
                      "body": "Could you share pricing details?"}]
 
         async def send_reply(self, *a):
@@ -526,7 +526,7 @@ async def test_instantly_path_leaves_the_reply_unprocessed_when_the_brain_is_dow
 
     handler.instantly = Instantly()
     with pytest.raises(BrainUnavailable):
-        await handler._handle_reply({"uuid": "r-1", "lead_email": "jane@acme.com",
+        await handler._handle_reply({"uuid": "r-1", "lead_email": "jane@acme.example",
                                      "body": "Could you share pricing details?"}, campaign)
     assert not await state.is_reply_processed("r-1")
     convo = await state.get_conversation(convo_id)
@@ -594,7 +594,7 @@ async def test_instantly_reply_survives_an_outage_while_drafting(harvey):
 
     class Instantly:
         async def get_replies(self, campaign_id):
-            return [{"uuid": "r-1", "lead_email": "jane@acme.com",
+            return [{"uuid": "r-1", "lead_email": "jane@acme.example",
                      "body": "Could you share pricing details?"}]
 
         async def send_reply(self, reply_uuid, body):
@@ -638,7 +638,7 @@ async def test_rejected_model_never_sends_queued_mail(monkeypatch, tmp_path):
     assert not [e for e in harvey.entries() if "prompt_chars" in e]
     # Caught by the heartbeat preflight, before any agent ran: the mailbox
     # wasn't even read (the prospect isn't marked as having replied).
-    jane = await harvey.state.get_prospect_by_email("jane@acme.com")
+    jane = await harvey.state.get_prospect_by_email("jane@acme.example")
     assert jane.status == "contacted"
 
 
@@ -658,7 +658,7 @@ async def test_outage_during_the_handler_holds_queued_sends_until_recovery(harve
 
     await harvey.run_cycles(3, between={1: after_outage})
     assert seen == {"sent": [], "processed": False}
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]  # once, after recovery
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]  # once, after recovery
     assert await harvey.state.is_reply_processed("in-1")
 
 
@@ -667,9 +667,9 @@ async def test_a_reply_cancels_its_due_follow_up_before_the_send_phase(harvey):
     """Stop-on-reply beats the outbox drain in the same cycle, even when the
     reply starts a new conversation (none was open before)."""
     await harvey.state.init_db()
-    pid = await seed_prospect(harvey.state, email="jane@acme.com", status="contacted")
+    pid = await seed_prospect(harvey.state, email="jane@acme.example", status="contacted")
     await harvey.state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="following up",
+        prospect_id=pid, to_email="jane@acme.example", subject="following up",
         body="Hi Jane, any thoughts?", send_at=_now_iso(), status="approved",
         campaign_id="c-1", step=2)
     harvey.mail.inbound = [_reply("Could you share pricing details?")]
@@ -755,7 +755,7 @@ async def test_mailbox_error_holds_sends_until_replies_can_be_read(monkeypatch, 
 
     await harvey.run_cycles(3, between={1: after_failure})
     assert seen["sent"] == []
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]  # once, after recovery
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]  # once, after recovery
     assert len(await harvey.state.get_outbox(status="sent")) == 1
 
 
@@ -780,7 +780,7 @@ async def test_timed_out_reply_handling_holds_sends(harvey, monkeypatch):
 
     await harvey.run_cycles(2, between={1: after_timeout})
     assert seen["sent"] == []
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]
 
 
 @pytest.mark.asyncio
@@ -808,4 +808,4 @@ async def test_a_message_that_fails_to_process_holds_that_cycles_sends(harvey, m
 
     await harvey.run_cycles(2, between={1: after_first})
     assert seen["sent"] == []
-    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.com"]
+    assert [m["to"] for m in harvey.mail.sent] == ["bob@beta.example"]

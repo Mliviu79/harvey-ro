@@ -46,7 +46,7 @@ async def _status(state, item_id):
     return row["status"], row.get("error") or ""
 
 
-async def _company(state, domain="acme.com"):
+async def _company(state, domain="acme.example"):
     return await state.add_company(Company(name="Acme", domain=domain))
 
 
@@ -62,11 +62,11 @@ async def _company(state, domain="acme.com"):
 ])
 async def test_any_reply_stops_colleagues(state, body, intent):
     cid = await _company(state)
-    ann = await _person(state, "ann@acme.com", cid)
-    bob = await _person(state, "bob@acme.com", cid)
-    queued = await _queued(state, bob, "bob@acme.com")
-    waiting = await _queued(state, bob, "bob@acme.com", status="pending_review", step=3)
-    await _reply(state, "ann@acme.com", body, intent)
+    ann = await _person(state, "ann@acme.example", cid)
+    bob = await _person(state, "bob@acme.example", cid)
+    queued = await _queued(state, bob, "bob@acme.example")
+    waiting = await _queued(state, bob, "bob@acme.example", status="pending_review", step=3)
+    await _reply(state, "ann@acme.example", body, intent)
     for item in (queued, waiting):
         status, error = await _status(state, item)
         assert status == "cancelled" and COLLEAGUE_REPLIED in error
@@ -75,46 +75,46 @@ async def test_any_reply_stops_colleagues(state, body, intent):
 
 @pytest.mark.asyncio
 async def test_other_companies_and_replies_to_colleagues_are_untouched(state):
-    acme, other = await _company(state), await _company(state, "other.com")
-    await _person(state, "ann@acme.com", acme)
-    bob = await _person(state, "bob@acme.com", acme)
-    cat = await _person(state, "cat@other.com", other)
-    answer = await _queued(state, bob, "bob@acme.com", kind="reply", step=1)
-    elsewhere = await _queued(state, cat, "cat@other.com")
-    await _reply(state, "ann@acme.com")
+    acme, other = await _company(state), await _company(state, "other.example")
+    await _person(state, "ann@acme.example", acme)
+    bob = await _person(state, "bob@acme.example", acme)
+    cat = await _person(state, "cat@other.example", other)
+    answer = await _queued(state, bob, "bob@acme.example", kind="reply", step=1)
+    elsewhere = await _queued(state, cat, "cat@other.example")
+    await _reply(state, "ann@acme.example")
     assert (await _status(state, answer))[0] == "approved"     # Bob wrote to us himself
     assert (await _status(state, elsewhere))[0] == "approved"
 
 
 @pytest.mark.asyncio
 async def test_without_a_company_the_email_domain_decides(state):
-    await _person(state, "ann@acme.com")
-    bob = await _person(state, "bob@acme.com")
-    queued = await _queued(state, bob, "bob@acme.com")
-    await _reply(state, "ann@acme.com")
+    await _person(state, "ann@acme.example")
+    bob = await _person(state, "bob@acme.example")
+    queued = await _queued(state, bob, "bob@acme.example")
+    await _reply(state, "ann@acme.example")
     assert (await _status(state, queued))[0] == "cancelled"
 
 
 @pytest.mark.asyncio
 async def test_a_shared_free_mail_domain_is_not_a_company(state):
-    await _person(state, "ann@gmail.com")
-    bob = await _person(state, "bob@gmail.com")
-    queued = await _queued(state, bob, "bob@gmail.com")
-    await _reply(state, "ann@gmail.com")
+    await _person(state, "exemplu.fictiv.0001@gmail.com")
+    bob = await _person(state, "exemplu.fictiv.0002@gmail.com")
+    queued = await _queued(state, bob, "exemplu.fictiv.0002@gmail.com")
+    await _reply(state, "exemplu.fictiv.0001@gmail.com")
     assert (await _status(state, queued))[0] == "approved"
 
 
 @pytest.mark.asyncio
 async def test_a_bounce_does_not_stop_colleagues(state):
     cid = await _company(state)
-    ann = await _person(state, "ann@acme.com", cid)
-    bob = await _person(state, "bob@acme.com", cid)
-    sent = await _queued(state, ann, "ann@acme.com", step=1)
+    ann = await _person(state, "ann@acme.example", cid)
+    bob = await _person(state, "bob@acme.example", cid)
+    sent = await _queued(state, ann, "ann@acme.example", step=1)
     await state.update_outbox_item(sent, status="sent", message_id="<m1@x>")
-    queued = await _queued(state, bob, "bob@acme.com")
+    queued = await _queued(state, bob, "bob@acme.example")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="b1", from_email="mailer-daemon@acme.com", subject="Undeliverable",
+        provider_id="b1", from_email="mailer-daemon@acme.example", subject="Undeliverable",
         body="Delivery failed", is_bounce=True, in_reply_to="<m1@x>",
     )]
     await make_handler(state, provider)._run_native()
@@ -127,10 +127,10 @@ async def test_a_bounce_does_not_stop_colleagues(state):
 @pytest.mark.asyncio
 async def test_the_drain_cancels_a_colleague_s_follow_up(state):
     cid = await _company(state)
-    ann = await _person(state, "ann@acme.com", cid, status="replied")
-    bob = await _person(state, "bob@acme.com", cid)
+    ann = await _person(state, "ann@acme.example", cid, status="replied")
+    bob = await _person(state, "bob@acme.example", cid)
     await state.stop_company(ann)
-    queued = await _queued(state, bob, "bob@acme.com")
+    queued = await _queued(state, bob, "bob@acme.example")
     provider = FakeProvider()
     await make_sender(state, provider)._drain_due()
     assert provider.sent == []
@@ -141,14 +141,14 @@ async def test_the_drain_cancels_a_colleague_s_follow_up(state):
 @pytest.mark.asyncio
 async def test_a_new_campaign_skips_people_whose_colleague_replied(state):
     cid = await _company(state)
-    ann = await _person(state, "ann@acme.com", cid, status="lost")
+    ann = await _person(state, "ann@acme.example", cid, status="lost")
     await state.stop_company(ann)
-    bob = await _person(state, "bob@acme.com", cid, status="new")
-    dee = await _person(state, "dee@else.com", status="new")
+    bob = await _person(state, "bob@acme.example", cid, status="new")
+    dee = await _person(state, "dee@else.example", status="new")
     campaign = await seed_campaign(state, [bob, dee])
     await make_sender(state, FakeProvider())._stage_campaign_native(campaign)
     staged = {r["to_email"] for r in await state.get_outbox()}
-    assert staged == {"dee@else.com"}
+    assert staged == {"dee@else.example"}
 
 
 # ── review: only real colleagues, only real answers ──
@@ -156,11 +156,11 @@ async def test_a_new_campaign_skips_people_whose_colleague_replied(state):
 
 @pytest.mark.asyncio
 async def test_two_companies_on_one_mail_domain_are_not_colleagues(state):
-    a, b = await _company(state, "annroofing.com"), await _company(state, "bobplumbing.com")
-    await _person(state, "ann@acme.com", a)
-    bob = await _person(state, "bob@acme.com", b)
-    queued = await _queued(state, bob, "bob@acme.com")
-    await _reply(state, "ann@acme.com")
+    a, b = await _company(state, "annroofing.example"), await _company(state, "bobplumbing.example")
+    await _person(state, "ann@acme.example", a)
+    bob = await _person(state, "bob@acme.example", b)
+    queued = await _queued(state, bob, "bob@acme.example")
+    await _reply(state, "ann@acme.example")
     assert (await _status(state, queued))[0] == "approved"
 
 
@@ -176,16 +176,16 @@ async def test_isp_and_regional_mailboxes_are_not_a_company(state, domain):
 
 @pytest.mark.asyncio
 async def test_one_side_without_a_company_matches_only_that_company_s_domain(state):
-    acme = await _company(state, "acme.com")
-    await _person(state, "ann@acme.com", acme)
-    bob = await _person(state, "bob@acme.com")                 # no company on file
-    queued = await _queued(state, bob, "bob@acme.com")
-    other = await _company(state, "agency.com")               # their mail isn't on their domain
-    cat = await _person(state, "cat@shared.net", other)
-    dan = await _person(state, "dan@shared.net")
-    dans = await _queued(state, dan, "dan@shared.net")
-    await _reply(state, "ann@acme.com")
-    await _reply(state, "cat@shared.net")
+    acme = await _company(state, "acme.example")
+    await _person(state, "ann@acme.example", acme)
+    bob = await _person(state, "bob@acme.example")                 # no company on file
+    queued = await _queued(state, bob, "bob@acme.example")
+    other = await _company(state, "agency.example")               # their mail isn't on their domain
+    cat = await _person(state, "cat@shared.example", other)
+    dan = await _person(state, "dan@shared.example")
+    dans = await _queued(state, dan, "dan@shared.example")
+    await _reply(state, "ann@acme.example")
+    await _reply(state, "cat@shared.example")
     assert (await _status(state, queued))[0] == "cancelled"
     assert (await _status(state, dans))[0] == "approved"
     assert cat
@@ -208,10 +208,10 @@ async def test_an_address_with_no_domain_matches_nobody(state):
 ])
 async def test_an_out_of_office_or_a_referral_does_not_stop_the_company(state, intent, body):
     cid = await _company(state)
-    await _person(state, "ann@acme.com", cid)
-    bob = await _person(state, "bob@acme.com", cid)
-    queued = await _queued(state, bob, "bob@acme.com")
-    await _reply(state, "ann@acme.com", body, intent)
+    await _person(state, "ann@acme.example", cid)
+    bob = await _person(state, "bob@acme.example", cid)
+    queued = await _queued(state, bob, "bob@acme.example")
+    await _reply(state, "ann@acme.example", body, intent)
     assert (await _status(state, queued))[0] == "approved"
     assert await state.colleague_who_replied(bob) is None
 
@@ -219,8 +219,8 @@ async def test_an_out_of_office_or_a_referral_does_not_stop_the_company(state, i
 @pytest.mark.asyncio
 async def test_the_writer_skips_and_doesn_t_count_people_whose_company_answered(state):
     cid = await _company(state)
-    ann = await _person(state, "ann@acme.com", cid)
-    await _person(state, "bob@acme.com", cid, status="new")
+    ann = await _person(state, "ann@acme.example", cid)
+    await _person(state, "bob@acme.example", cid, status="new")
     assert await state.count_writable_prospects() == 1
     await state.stop_company(ann)
     assert await state.count_writable_prospects() == 0

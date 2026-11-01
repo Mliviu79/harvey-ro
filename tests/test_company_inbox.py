@@ -10,7 +10,7 @@ from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 
 
 def inbox(**kw):
-    base = dict(email="info@acme.com", company="Acme Roofing", title="General inbox",
+    base = dict(email="info@acme.example", company="Acme Roofing", title="General inbox",
                 source=COMPANY_INBOX_SOURCE)
     return Prospect(**{**base, **kw})
 
@@ -65,7 +65,7 @@ async def test_published_address_grading(monkeypatch, graded, expected):
 
     monkeypatch.setattr(ef, "get_mx_host", mx)
     monkeypatch.setattr(ef, "_verify_candidate", check)
-    assert await ef.verify_published_address("info@acme.com") == expected
+    assert await ef.verify_published_address("info@acme.example") == expected
 
 
 @pytest.mark.asyncio
@@ -74,7 +74,7 @@ async def test_published_address_without_mail_server_is_invalid(monkeypatch):
         return None
 
     monkeypatch.setattr(ef, "get_mx_host", no_mx)
-    assert await ef.verify_published_address("info@acme.com") == "invalid"
+    assert await ef.verify_published_address("info@acme.example") == "invalid"
 
 
 @pytest.mark.parametrize("deliverable, expected", [(True, "valid"), ("false", "unknown"), (None, "unknown")])
@@ -100,7 +100,7 @@ async def test_reoon_role_account_needs_a_real_deliverable_flag(monkeypatch, del
             return Resp()
 
     monkeypatch.setattr(ef.httpx, "AsyncClient", Client)
-    verdict = await ef.verify_reoon("info@acme.com", "key")
+    verdict = await ef.verify_reoon("info@acme.example", "key")
     assert verdict["status"] == expected
 
 

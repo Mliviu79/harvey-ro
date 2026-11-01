@@ -145,7 +145,7 @@ def _cfg(email="sam@mysend.test", booking="https://cal.com/sam/15", domains=()):
 @pytest.mark.parametrize("text,domains", [
     ("Book here: https://cal.com/sam/15", ["cal.com"]),
     ("see www.Example.co.uk/page.", ["example.co.uk"]),
-    ("our site acme.io or acme.com/pricing", ["acme.io", "acme.com"]),
+    ("our site acme.test or acme.example/pricing", ["acme.test", "acme.example"]),
     ("write to bob@evil.example", ["evil.example"]),
     ("HTTP://Sub.Evil.Example:8080/x?y=1", ["sub.evil.example"]),
     ("Node.js, e.g. this, i.e. that, v2.5 and $3.50, see report.pdf", []),
@@ -211,8 +211,8 @@ def test_the_subject_is_checked_too():
 
 
 def test_your_trained_site_and_no_persona_email():
-    cfg = _cfg(email="", domains=["acme.com"])
-    assert autopilot_review("hi", "More at acme.com/roofing", cfg) == []
+    cfg = _cfg(email="", domains=["acme.example"])
+    assert autopilot_review("hi", "More at acme.example/roofing", cfg) == []
     assert autopilot_review("hi", "More at evil.example/x", cfg)
 
 
@@ -249,7 +249,7 @@ async def test_autopilot_mail_with_a_foreign_link_goes_back_to_the_outbox():
         await state.init_db()
         pid = await seed_prospect(state, status="replied")
         bad = await state.add_outbox_item(
-            prospect_id=pid, to_email="jane@acme.com", subject="Re: hi", kind="reply",
+            prospect_id=pid, to_email="jane@acme.example", subject="Re: hi", kind="reply",
             body="Sure, the details are at http://evil.example/x", send_at=_now_iso(), status="approved")
         provider = FakeProvider()
         sender = make_sender(state, provider, require_approval=False)
@@ -283,7 +283,7 @@ async def test_on_instantly_a_reply_with_a_foreign_link_goes_to_you(state, monke
         return {"ok": True}
     handler.instantly.send_reply = send_reply
     monkeypatch.setattr(handler, "_classify_intent", lambda *a: _async("question"))
-    await handler._process_reply("jane@acme.com", "What does it cost?", "u1")
+    await handler._process_reply("jane@acme.example", "What does it cost?", "u1")
     assert sent == []
     assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
 
@@ -364,9 +364,9 @@ def test_lookalike_closing_tags_are_defused_too(fake):
 async def test_approve_all_leaves_held_emails_for_one_by_one(state):
     from tests.test_outbox_native import seed_prospect, _now_iso
     pid = await seed_prospect(state, status="replied")
-    ok = await state.add_outbox_item(prospect_id=pid, to_email="jane@acme.com", subject="a", kind="reply",
+    ok = await state.add_outbox_item(prospect_id=pid, to_email="jane@acme.example", subject="a", kind="reply",
                                      body="fine", send_at=_now_iso(), status="pending_review")
-    held = await state.add_outbox_item(prospect_id=pid, to_email="jane@acme.com", subject="b", kind="reply",
+    held = await state.add_outbox_item(prospect_id=pid, to_email="jane@acme.example", subject="b", kind="reply",
                                        body="x", send_at=_now_iso(), status="pending_review")
     await state.update_outbox_item(held, error="held for your review: links to evil.example")
     assert await state.approve_outbox() == 1
@@ -390,18 +390,18 @@ async def test_instantly_leads_whose_fields_carry_a_foreign_link_are_left_out(st
 def test_training_on_your_site_marks_its_domain_as_yours():
     from harvey.trainer import merge_trained_config
     learned = {"persona": {"company": "Acme"},
-               "channels": {"email": {"provider": "instantly", "link_domains": ["acme.com"]}}}
+               "channels": {"email": {"provider": "instantly", "link_domains": ["acme.example"]}}}
     fresh = merge_trained_config(learned, None)
-    assert fresh["channels"]["email"]["link_domains"] == ["acme.com"]
-    existing = {"persona": {"company": "Acme", "email": "s@send-acme.com"},
+    assert fresh["channels"]["email"]["link_domains"] == ["acme.example"]
+    existing = {"persona": {"company": "Acme", "email": "s@send-acme.example"},
                 "channels": {"email": {"provider": "gmail", "link_domains": ["blog.test"]}}}
     merged = merge_trained_config(learned, existing)
-    assert merged["channels"]["email"] == {"provider": "gmail", "link_domains": ["blog.test", "acme.com"]}
+    assert merged["channels"]["email"] == {"provider": "gmail", "link_domains": ["blog.test", "acme.example"]}
     again = merge_trained_config(learned, merged)          # retraining doesn't duplicate it
-    assert again["channels"]["email"]["link_domains"] == ["blog.test", "acme.com"]
+    assert again["channels"]["email"]["link_domains"] == ["blog.test", "acme.example"]
     bare = merge_trained_config(learned, {"persona": {"company": "Acme", "email": "s@a.com"},
                                           "channels": {"email": {"provider": "smtp"}}})
-    assert bare["channels"]["email"]["link_domains"] == ["acme.com"]
+    assert bare["channels"]["email"]["link_domains"] == ["acme.example"]
 
 
 def test_dashboard_approve_all_says_what_it_left(client):

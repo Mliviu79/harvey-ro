@@ -42,11 +42,11 @@ async def test_approving_a_week_late_sends_step_one_only(state):
 async def test_a_follow_up_whose_first_email_never_went_out_waits(state):
     pid = await seed_prospect(state, status="queued")
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s1", body="One. Question?",
+        prospect_id=pid, to_email="jane@acme.example", subject="s1", body="One. Question?",
         send_at=(_now() + timedelta(days=1)).isoformat(), status="approved",
         campaign_id="c1", step=1)
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s2", body="Two. Question?",
+        prospect_id=pid, to_email="jane@acme.example", subject="s2", body="Two. Question?",
         send_at=(_now() - timedelta(minutes=1)).isoformat(), status="approved",
         campaign_id="c1", step=2)
     provider = FakeProvider()
@@ -54,7 +54,7 @@ async def test_a_follow_up_whose_first_email_never_went_out_waits(state):
     assert provider.sent == []
 
 
-async def _sequence(state, pid, step, status, send_at, campaign="c1", to="jane@acme.com"):
+async def _sequence(state, pid, step, status, send_at, campaign="c1", to="jane@acme.example"):
     return await state.add_outbox_item(
         prospect_id=pid, to_email=to, subject=f"s{step}", body=f"Step {step}. Question?",
         send_at=send_at.isoformat(), status=status, campaign_id=campaign, step=step)
@@ -119,22 +119,22 @@ async def test_a_follow_up_to_an_email_that_never_went_out_is_cancelled(state, p
 async def test_a_page_of_waiting_follow_ups_never_holds_up_a_reply_or_new_email(state, first):
     # 30 follow-ups older than everything else, all waiting on their step 1.
     for n in range(30):
-        pid = await seed_prospect(state, email=f"p{n}@acme.com", status="contacted")
+        pid = await seed_prospect(state, email=f"p{n}@acme.example", status="contacted")
         one = await _sequence(state, pid, 1,
                               "approved" if first == "just sent" else "pending_review",
-                              _now() - timedelta(days=9), to=f"p{n}@acme.com")
+                              _now() - timedelta(days=9), to=f"p{n}@acme.example")
         if first == "just sent":
             await _sent(state, one, _now() - timedelta(hours=1))
-        await _sequence(state, pid, 2, "approved", _now() - timedelta(days=6), to=f"p{n}@acme.com")
-    warm = await seed_prospect(state, email="bob@beta.com", status="replied")
+        await _sequence(state, pid, 2, "approved", _now() - timedelta(days=6), to=f"p{n}@acme.example")
+    warm = await seed_prospect(state, email="bob@beta.example", status="replied")
     await state.add_outbox_item(
-        prospect_id=warm, to_email="bob@beta.com", subject="Re: hi", body="Tuesday works.",
+        prospect_id=warm, to_email="bob@beta.example", subject="Re: hi", body="Tuesday works.",
         send_at=_now().isoformat(), status="approved", kind="reply")
-    fresh = await seed_prospect(state, email="ann@gamma.com", status="queued")
+    fresh = await seed_prospect(state, email="ann@gamma.example", status="queued")
     await _sequence(state, fresh, 1, "approved", _now() - timedelta(minutes=1),
-                    campaign="c2", to="ann@gamma.com")
+                    campaign="c2", to="ann@gamma.example")
 
     provider = FakeProvider()
     for _ in range(2):  # the first cycle may reschedule; nothing waits twice
         await make_sender(state, provider)._drain_due()
-    assert {m["to"] for m in provider.sent} == {"bob@beta.com", "ann@gamma.com"}
+    assert {m["to"] for m in provider.sent} == {"bob@beta.example", "ann@gamma.example"}

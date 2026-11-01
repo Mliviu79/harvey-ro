@@ -42,7 +42,7 @@ async def test_init_db_creates_parent_dirs(tmp_path):
 
 @pytest.mark.asyncio
 async def test_get_company_by_id(state):
-    cid = await state.add_company(Company(name="Acme", domain="acme.com", location="NYC"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example", location="NYC"))
     fetched = await state.get_company(cid)
     assert fetched is not None
     assert fetched.id == cid
@@ -57,8 +57,8 @@ async def test_get_company_missing_returns_none(state):
 
 @pytest.mark.asyncio
 async def test_add_company_same_id_is_ignored(state):
-    c1 = Company(id="fixed-id", name="First", domain="first.com")
-    c2 = Company(id="fixed-id", name="Second", domain="second.com")
+    c1 = Company(id="fixed-id", name="First", domain="first.example")
+    c2 = Company(id="fixed-id", name="Second", domain="second.example")
     await state.add_company(c1)
     await state.add_company(c2)  # INSERT OR IGNORE — must not raise
     fetched = await state.get_company("fixed-id")
@@ -67,7 +67,7 @@ async def test_add_company_same_id_is_ignored(state):
 
 @pytest.mark.asyncio
 async def test_add_company_generates_id_when_missing(state):
-    c = Company(name="NoId", domain="noid.com")
+    c = Company(name="NoId", domain="noid.example")
     cid = await state.add_company(c)
     assert cid
     assert c.id == cid

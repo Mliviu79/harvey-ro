@@ -40,25 +40,25 @@ class Env:
 
 
 def test_build_email_patterns():
-    assert build_email("{f}.{l}", "Jane", "Doe", "acme.com") == "jane.doe@acme.com"
-    assert build_email("{fi}{l}", "Jane", "Doe", "acme.com") == "jdoe@acme.com"
-    assert build_email("{f}", "Jane", "Doe", "acme.com") == "jane@acme.com"
-    assert build_email("{f}.{l}", "", "Doe", "acme.com") == ""
-    assert build_email("nonexistent", "Jane", "Doe", "acme.com") == ""
+    assert build_email("{f}.{l}", "Jane", "Doe", "acme.example") == "jane.doe@acme.example"
+    assert build_email("{fi}{l}", "Jane", "Doe", "acme.example") == "jdoe@acme.example"
+    assert build_email("{f}", "Jane", "Doe", "acme.example") == "jane@acme.example"
+    assert build_email("{f}.{l}", "", "Doe", "acme.example") == ""
+    assert build_email("nonexistent", "Jane", "Doe", "acme.example") == ""
 
 
 def test_generate_patterns_dedup_and_order():
-    patterns = generate_patterns("Jane", "Doe", "acme.com")
-    assert patterns[0] == "jane.doe@acme.com"   # most common first
-    assert "jdoe@acme.com" in patterns
+    patterns = generate_patterns("Jane", "Doe", "acme.example")
+    assert patterns[0] == "jane.doe@acme.example"   # most common first
+    assert "jdoe@acme.example" in patterns
     assert len(patterns) == len(set(patterns))
 
 
 def test_infer_pattern_from_email():
-    assert infer_pattern_from_email("jane.doe@acme.com", "Jane", "Doe") == "{f}.{l}"
-    assert infer_pattern_from_email("jdoe@acme.com", "Jane", "Doe") == "{fi}{l}"
-    assert infer_pattern_from_email("janedoe@acme.com", "Jane", "Doe") == "{f}{l}"
-    assert infer_pattern_from_email("random@acme.com", "Jane", "Doe") is None
+    assert infer_pattern_from_email("jane.doe@acme.example", "Jane", "Doe") == "{f}.{l}"
+    assert infer_pattern_from_email("jdoe@acme.example", "Jane", "Doe") == "{fi}{l}"
+    assert infer_pattern_from_email("janedoe@acme.example", "Jane", "Doe") == "{f}{l}"
+    assert infer_pattern_from_email("random@acme.example", "Jane", "Doe") is None
 
 
 def test_translate_hunter_pattern():
@@ -72,9 +72,9 @@ def test_translate_hunter_pattern():
 
 def test_classify_mx():
     assert classify_mx("aspmx.l.google.com") == "google"
-    assert classify_mx("acme-com.mail.protection.outlook.com") == "microsoft"
+    assert classify_mx("acme-example.mail.protection.outlook.com") == "microsoft"
     assert classify_mx("mx.pphosted.com") == "gateway"
-    assert classify_mx("mail.smallco.com") == "other"
+    assert classify_mx("mail.smallco.example") == "other"
     assert classify_mx("") == "none"
 
 
@@ -96,8 +96,8 @@ def test_status_from_verdict():
 @pytest.mark.asyncio
 async def test_derive_pattern_from_known_email(state):
     pattern, source, conf = await derive_pattern(
-        "acme.com",
-        known_emails=[("john.smith@acme.com", "John", "Smith")],
+        "acme.example",
+        known_emails=[("john.smith@acme.example", "John", "Smith")],
     )
     assert pattern == "{f}.{l}"
     assert source == "known_email"
@@ -107,10 +107,10 @@ async def test_derive_pattern_from_known_email(state):
 @pytest.mark.asyncio
 async def test_derive_pattern_uses_cache(state):
     await state.save_email_pattern(
-        "acme.com", pattern="{fi}{l}", source="scraped_mailto", confidence=0.85
+        "acme.example", pattern="{fi}{l}", source="scraped_mailto", confidence=0.85
     )
     pattern, source, conf = await derive_pattern(
-        "acme.com", cached=await state.get_email_pattern("acme.com"))
+        "acme.example", cached=await state.get_email_pattern("acme.example"))
     assert pattern == "{fi}{l}"
     assert source == "scraped_mailto"
 
@@ -118,7 +118,7 @@ async def test_derive_pattern_uses_cache(state):
 @pytest.mark.asyncio
 async def test_derive_pattern_default_no_signal(state, monkeypatch):
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
-    pattern, source, conf = await derive_pattern("unknown-co.com")
+    pattern, source, conf = await derive_pattern("unknown-co.example")
     assert pattern == "{f}.{l}"
     assert source == "default"
     assert conf < 0.5
@@ -132,7 +132,7 @@ async def test_find_email_no_mx_is_invalid(state, monkeypatch):
     async def no_mx(domain):
         return None
     monkeypatch.setattr(ef, "get_mx_host", no_mx)
-    result = await find_email("Jane", "Doe", "acme.com")
+    result = await find_email("Jane", "Doe", "acme.example")
     assert result.status == "invalid"
     assert result.mx_type == "none"
 
@@ -144,13 +144,13 @@ async def test_find_email_verify_false_is_guess(state, monkeypatch):
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
 
-    result = await find_email("Jane", "Doe", "acme.com", verify=False)
+    result = await find_email("Jane", "Doe", "acme.example", verify=False)
     assert result.status == "guess"
-    assert result.email == "jane.doe@acme.com"
+    assert result.email == "jane.doe@acme.example"
     assert result.mx_type == "google"
     # Pattern still learned (and kept) even without verification
-    await ingest.learned_pattern(state, "acme.com", result.learned)
-    cached = await state.get_email_pattern("acme.com")
+    await ingest.learned_pattern(state, "acme.example", result.learned)
+    cached = await state.get_email_pattern("acme.example")
     assert cached["mx_type"] == "google"
 
 
@@ -166,7 +166,7 @@ async def test_find_email_verified_via_reoon(state, monkeypatch):
     monkeypatch.setattr(ef, "verify_reoon", fake_reoon)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(reoon="k")
+        "Jane", "Doe", "acme.example", env=Env(reoon="k")
     )
     assert result.status == "verified"
     assert result.verified and result.sendable
@@ -184,13 +184,13 @@ async def test_find_email_catch_all_is_risky(state, monkeypatch):
     monkeypatch.setattr(ef, "verify_zerobounce", fake_zb)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(zerobounce="k")
+        "Jane", "Doe", "acme.example", env=Env(zerobounce="k")
     )
     assert result.status == "risky"
     assert not result.sendable   # verified-only by default
     # catch-all flag learned, and kept
-    await ingest.learned_pattern(state, "acme.com", result.learned)
-    cached = await state.get_email_pattern("acme.com")
+    await ingest.learned_pattern(state, "acme.example", result.learned)
+    cached = await state.get_email_pattern("acme.example")
     assert cached["is_catch_all"] == 1
 
 
@@ -206,7 +206,7 @@ async def test_find_email_invalid_from_provider(state, monkeypatch):
     monkeypatch.setattr(ef, "verify_reoon", fake_reoon)
 
     result = await find_email(
-        "Jane", "Doe", "acme.com", env=Env(reoon="k")
+        "Jane", "Doe", "acme.example", env=Env(reoon="k")
     )
     assert result.status == "invalid"
 
@@ -219,7 +219,7 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
     monkeypatch.setattr(ef, "get_mx_host", google_mx)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
     # No verifier keys configured at all → nothing can confirm.
-    result = await find_email("Jane", "Doe", "acme.com", env=Env())
+    result = await find_email("Jane", "Doe", "acme.example", env=Env())
     assert result.status == "guess"
     assert not result.verified
 
@@ -254,8 +254,8 @@ async def test_derive_pattern_spends_and_respects_hunter_budget(state, monkeypat
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", fake_hunter)
     allowance = ingest.Allowance(state)
-    _, source, _ = await derive_pattern("first-co.com", budget=allowance)
+    _, source, _ = await derive_pattern("first-co.example", budget=allowance)
     assert source == "hunter_domain_search"
-    _, source, _ = await derive_pattern("second-co.com", budget=allowance)
+    _, source, _ = await derive_pattern("second-co.example", budget=allowance)
     assert source == "default"
-    assert calls == ["first-co.com"]
+    assert calls == ["first-co.example"]

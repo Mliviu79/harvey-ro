@@ -144,7 +144,7 @@ def test_digits_that_are_not_phones(text):
     ("0268-00-01-01", "+40268000101"),
     ("0268.00.01.01", "+40268000101"),
     ("0740-00-01-02", "+40740000102"),
-    ("0740-12-11-20", "+40740121120"),
+    ("0268-01-01-20", "+40268010120"),
 ])
 def test_two_digit_groups_are_not_dates(written, expected):
     assert numbers(f"<p>Tel: {written}</p>") == [expected]
@@ -240,29 +240,29 @@ def test_phone_region():
     assert phone_region("Brașov, Romania") == "RO"
     assert phone_region("Brasov", _config("RO")) == "RO"
     assert phone_region("Brasov", _config(geography=["Brașov, Romania"])) == "RO"
-    assert phone_region("Brasov", None, "clinica.ro") == "RO"
+    assert phone_region("Brasov", None, "clinica.example.ro") == "RO"
     assert phone_region("Denver, CO") == "US"
-    assert phone_region("Brasov", None, "clinic.io") is None
+    assert phone_region("Brasov", None, "clinic.example.io") is None
     assert phone_region("", None, "") is None
 
 
 @pytest.mark.parametrize("location", ["Brașov", "Brașov, Județul Brașov", ""])
 def test_a_country_domain_beats_the_config(location):
     us = _config(geography=["Denver, CO, United States"])
-    assert phone_region(location, us, "clinica.ro") == "RO"
-    assert phone_region(location, _config("US"), "clinica.ro") == "RO"
+    assert phone_region(location, us, "clinica.example.ro") == "RO"
+    assert phone_region(location, _config("US"), "clinica.example.ro") == "RO"
 
 
 def test_a_certain_location_beats_the_config_but_not_a_country_domain():
-    assert phone_region("Brașov, Romania", _config("US"), "clinic.com") == "RO"
-    assert phone_region("Denver, Colorado", _config("RO"), "clinic.com") == "US"
-    assert phone_region("Denver, Colorado", _config("US"), "clinica.ro") == "RO"
+    assert phone_region("Brașov, Romania", _config("US"), "clinic.example.com") == "RO"
+    assert phone_region("Denver, Colorado", _config("RO"), "clinic.example.com") == "US"
+    assert phone_region("Denver, Colorado", _config("US"), "clinica.example.ro") == "RO"
 
 
 def test_config_then_an_uncertain_location():
     # "CO" is Colorado or Colombia: only a guess, so the config wins it.
-    assert phone_region("Denver, CO", _config("RO"), "clinic.com") == "RO"
-    assert phone_region("Denver, CO", None, "clinic.com") == "US"
+    assert phone_region("Denver, CO", _config("RO"), "clinic.example.com") == "RO"
+    assert phone_region("Denver, CO", None, "clinic.example.com") == "US"
 
 
 def test_stored_listing_phone_formats():
@@ -408,8 +408,8 @@ def test_trailing_fax_note_does_not_label_the_next_number():
 
 def test_country_tld_beats_a_county_code_location():
     # (A Romanian domain is what this reads: no .ro name is reserved for examples.)
-    assert phone_region("Sibiu, SB", None, "clinica-exemplu.ro") == "RO"
-    assert phone_region("Constanța, CT", None, "clinica-exemplu.ro") == "RO"
+    assert phone_region("Sibiu, SB", None, "clinica-exemplu.example.ro") == "RO"
+    assert phone_region("Constanța, CT", None, "clinica-exemplu.example.ro") == "RO"
 
 
 def test_hostile_markup_is_read_in_linear_time():

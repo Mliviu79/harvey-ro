@@ -384,14 +384,14 @@ def test_trainer_uses_and_writes_back_the_selection(tmp_path, monkeypatch):
                         lambda: BrainConfig(provider="codex", model="gpt-5.5"))
     trainer = trainer_mod.Trainer()
     assert trainer.brain.provider == "codex" and trainer.brain.model == "gpt-5.5"
-    built = trainer._build_config({"product_name": "W"}, {}, {}, "acme.com")
+    built = trainer._build_config({"product_name": "W"}, {}, {}, "acme.example")
     assert built["brain"] == {"provider": "codex", "model": "gpt-5.5"}
     # The written config loads back with the same selection.
     assert HarveyConfig(**built).brain == BrainConfig(provider="codex", model="gpt-5.5")
 
     explicit = trainer_mod.Trainer(brain_config=BrainConfig())
     assert explicit.brain.provider == "claude"
-    assert explicit._build_config({}, {}, {}, "acme.com")["brain"] == {"provider": "claude"}
+    assert explicit._build_config({}, {}, {}, "acme.example")["brain"] == {"provider": "claude"}
 
 
 def test_cli_train_flags_select_the_provider(monkeypatch):
@@ -412,7 +412,7 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     monkeypatch.setattr(config_mod, "load_brain_config",
                         lambda: BrainConfig(provider="claude", model="claude-opus-4-8"))
 
-    args = type("A", (), {"url": "acme.com", "max_pages": 5, "provider": "codex",
+    args = type("A", (), {"url": "acme.example", "max_pages": 5, "provider": "codex",
                           "model": None, "reasoning_effort": "low"})()
     cli.cmd_train(args)
     # Switching provider never carries the other provider's model along.

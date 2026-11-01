@@ -12,7 +12,7 @@
    "industry": "",
    "location": "Denver, Colorado",
    "merged_into": "",
-   "name": "Northvale Roofing Company",
+   "name": "Vellmora Roofing Company",
    "notes": "",
    "phone": "+13035550199",
    "profile_checked_at": false,
@@ -30,13 +30,13 @@
    "created_at": true,
    "cui": "",
    "description": "",
-   "domain": "kettlemanroofing.example",
+   "domain": "brindlewickroofing.example",
    "external_id": "",
    "id": "C2",
    "industry": "",
    "location": "",
    "merged_into": "",
-   "name": "Kettleman",
+   "name": "Brindlewick",
    "notes": "",
    "phone": "",
    "profile_checked_at": false,
@@ -46,7 +46,7 @@
    "source_url": "",
    "tech_stack_json": "[]",
    "updated_at": true,
-   "website": "https://www.kettlemanroofing.example/"
+   "website": "https://www.brindlewickroofing.example/"
   },
   {
    "address": "",
@@ -89,7 +89,7 @@
    "created_at": true,
    "kind": "name",
    "source": "manual",
-   "value": "northvale roofing@denver"
+   "value": "vellmora roofing@denver"
   },
   {
    "company_id": "C2",
@@ -97,7 +97,7 @@
    "created_at": true,
    "kind": "domain",
    "source": "manual",
-   "value": "kettlemanroofing.example"
+   "value": "brindlewickroofing.example"
   },
   {
    "company_id": "C2",
@@ -105,7 +105,7 @@
    "created_at": true,
    "kind": "name",
    "source": "discover:scavio_search",
-   "value": "kettleman roofing@denver"
+   "value": "brindlewick roofing@denver"
   },
   {
    "company_id": "C3",
@@ -133,7 +133,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R1",
@@ -145,7 +145,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R1",
@@ -157,7 +157,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R1",
@@ -205,7 +205,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R2",
@@ -217,7 +217,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R2",
@@ -229,7 +229,7 @@
    "collector": "discover",
    "company_id": "C2",
    "confidence": 1.0,
-   "evidence_url": "https://www.kettlemanroofing.example/",
+   "evidence_url": "https://www.brindlewickroofing.example/",
    "observed_at": true,
    "prospect_id": "",
    "run_id": "R2",

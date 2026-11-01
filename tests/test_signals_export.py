@@ -56,7 +56,7 @@ async def test_company_signals_roundtrip(state):
     """The columns an earlier version filled still load (nothing writes
     them now: what a site read learns is an observation)."""
     cid = await state.add_company(Company(
-        name="Acme", domain="acme.com",
+        name="Acme", domain="acme.example",
         tech_stack=["Shopify"], signals=[{"type": "hiring", "detail": "Head of Growth"}],
     ))
     fetched = await state.get_company(cid)
@@ -71,7 +71,7 @@ async def test_legacy_company_rows_parse(state):
     async with aiosqlite.connect(state.db_path) as db:
         await db.execute(
             "INSERT INTO companies (id, name, domain, tech_stack_json, signals_json) "
-            "VALUES ('c1', 'Old Co', 'old.com', '', 'not-json')"
+            "VALUES ('c1', 'Old Co', 'old.example', '', 'not-json')"
         )
         await db.commit()
     company = await state.get_company("c1")
@@ -93,7 +93,7 @@ async def _seed_prospects(state):
     for name, estatus, score, status in specs:
         await state.add_prospect(Prospect(
             first_name=name, last_name="Test", title="VP Marketing",
-            email=(f"{name.lower()}@acme.com" if estatus else ""),
+            email=(f"{name.lower()}@acme.example" if estatus else ""),
             email_status=estatus, email_verified=(estatus == "verified"),
             score=score, status=status, company="Acme",
             personalization_notes="Signal: hiring Growth Lead",
@@ -135,7 +135,7 @@ async def test_export_csv_shape(state, tmp_path):
     lines = text.strip().splitlines()
     header = lines[0].split(",")
     assert header == CSV_COLUMNS
-    assert any("ada@acme.com" in line for line in lines[1:])
+    assert any("ada@acme.example" in line for line in lines[1:])
     # Personalization/signal text survives export
     assert any("Signal: hiring Growth Lead" in line for line in lines[1:])
 

@@ -55,7 +55,7 @@ GREENHOUSE = {"departments": [
     ]},
     {"id": 0, "name": "No Department", "parent_id": None, "child_ids": [], "jobs": [
         {"id": 13, "title": "Sales Development Representative", "location": {"name": "Austin, TX"},
-         "absolute_url": "https://acme.com/careers?gh_jid=13",
+         "absolute_url": "https://acme.example/careers?gh_jid=13",
          "first_published": "2026-10-10T09:00:00-04:00"},
         # Listed under two departments: counted once.
         {"id": 11, "title": "Head of Growth", "location": {"name": "New York, NY"},
@@ -105,7 +105,7 @@ WORKABLE = {"name": "Acme", "description": None, "jobs": [
     ('<a href="https://acme.workable.com">Careers</a>', "workable", "acme"),
 ])
 def test_boards_are_found_from_links_and_embeds(html, ats, token):
-    board = detect_board(html, "acme.com")
+    board = detect_board(html, "acme.example")
     assert board is not None and (board.ats, board.token) == (ats, token)
 
 
@@ -120,14 +120,14 @@ def test_boards_are_found_from_links_and_embeds(html, ats, token):
     '<a href="https://jobs.ashbyhq.com/api/x">x</a>',
 ])
 def test_no_board_without_a_real_board_link(html):
-    assert detect_board(html, "acme.com") is None
+    assert detect_board(html, "acme.example") is None
 
 
 def test_the_companys_own_board_wins_over_a_customers():
     html = ('<a href="https://jobs.lever.co/bigcustomer">Customer story</a>'
             '<a href="https://jobs.lever.co/bigcustomer/1">x</a>'
             '<a href="https://boards.greenhouse.io/acmehq">Careers</a>')
-    board = detect_board(html, "acme.com")
+    board = detect_board(html, "acme.example")
     assert (board.ats, board.token) == ("greenhouse", "acmehq")
 
 
@@ -279,9 +279,9 @@ HOME = "<html><body>" + "x" * 600 + "<a href='/careers'>Careers</a></body></html
 @pytest.mark.asyncio
 async def test_profile_reads_the_board_linked_from_the_homepage():
     home = HOME.replace("/careers", "https://boards.greenhouse.io/acme")
-    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.com": home},
+    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.example": home},
                    {"https://boards-api.greenhouse.io/v1/boards/acme/departments": GREENHOUSE})
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     hiring = [o for o in obs if o["signal_code"] == "HIRING_ROLE"]
     assert [o["value_text"] for o in hiring] == [
         "Head of Growth · Marketing · New York, NY · posted 2026-10-01"]
@@ -292,39 +292,39 @@ async def test_profile_reads_the_board_linked_from_the_homepage():
     # One feed request; no careers-page crawl once the homepage named the board.
     feed_calls = [u for u in c.requested if "greenhouse" in u]
     assert feed_calls == ["https://boards-api.greenhouse.io/v1/boards/acme/departments"]
-    assert not any("/careers" in u or "/jobs" in u for u in c.requested if "acme.com" in u)
+    assert not any("/careers" in u or "/jobs" in u for u in c.requested if "acme.example" in u)
 
 
 @pytest.mark.asyncio
 async def test_profile_finds_the_board_on_the_careers_page():
     careers = "<html>" + "y" * 600 + '<a href="https://jobs.ashbyhq.com/acme">See roles</a></html>'
-    c = _collector({"HIRING_ROLE"}, {"https://acme.com": HOME, "https://acme.com/careers": careers},
+    c = _collector({"HIRING_ROLE"}, {"https://acme.example": HOME, "https://acme.example/careers": careers},
                    {"https://api.ashbyhq.com/posting-api/job-board/acme": ASHBY},
                    keywords=["growth marketing manager"])
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     assert [o["value_text"] for o in obs] == ["Growth Marketing Manager · Marketing · London · posted 2026-10-05"]
     assert not any(o["signal_code"] == "OPEN_ROLES" for o in obs)      # not confirmed
 
 
 @pytest.mark.asyncio
 async def test_profile_follows_the_homepages_own_careers_link():
-    home = HOME.replace("/careers", "https://careers.acme.com/open-roles")
+    home = HOME.replace("/careers", "https://careers.acme.example/open-roles")
     careers = "<html>" + "y" * 600 + '<a href="https://jobs.lever.co/acme">Roles</a></html>'
-    c = _collector({"HIRING_ROLE"}, {"https://acme.com": home,
-                                     "https://careers.acme.com/open-roles": careers},
+    c = _collector({"HIRING_ROLE"}, {"https://acme.example": home,
+                                     "https://careers.acme.example/open-roles": careers},
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER},
                    keywords=["vp marketing"])
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     assert [o["value_text"] for o in obs] == ["VP of Marketing · Marketing · San Francisco, CA · posted 2026-09-21"]
 
 
 @pytest.mark.asyncio
 async def test_a_board_with_no_matching_role_records_only_the_count():
     home = HOME.replace("/careers", "https://jobs.lever.co/acme")
-    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.com": home},
+    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.example": home},
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER},
                    keywords=["chief of staff"])
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     assert [(o["signal_code"], o["value_num"]) for o in obs] == [("OPEN_ROLES", 2), ("HIRING_ROLE", 0)]
 
 
@@ -333,9 +333,9 @@ async def test_matched_roles_are_capped():
     many = [{"id": str(i), "text": f"Growth Lead {i}", "categories": {},
              "hostedUrl": f"https://jobs.lever.co/acme/{i}"} for i in range(20)]
     home = HOME.replace("/careers", "https://jobs.lever.co/acme")
-    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.com": home},
+    c = _collector({"HIRING_ROLE", "OPEN_ROLES"}, {"https://acme.example": home},
                    {"https://api.lever.co/v0/postings/acme?mode=json": many}, keywords=["growth"])
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     assert len([o for o in obs if o["signal_code"] == "HIRING_ROLE"]) == 5
     assert [o["value_num"] for o in obs if o["signal_code"] == "OPEN_ROLES"] == [20]
 
@@ -345,17 +345,17 @@ async def test_a_dead_board_falls_back_to_reading_the_careers_page():
     careers = ("<html>" + "y" * 600 + '<a href="https://jobs.lever.co/acme">Roles</a>'
                "<h3>Sales Manager</h3></html>")
     c = _collector({"HIRING_ROLE", "OPEN_ROLES"},
-                   {"https://acme.com": HOME, "https://acme.com/careers": careers}, {})
-    obs = await c.profile_company("c1", "acme.com")
+                   {"https://acme.example": HOME, "https://acme.example/careers": careers}, {})
+    obs = await c.profile_company("c1", "acme.example")
     assert [(o["signal_code"], o["value_text"]) for o in obs] == [("HIRING_ROLE", "Sales Manager")]
 
 
 @pytest.mark.asyncio
 async def test_no_feed_request_unless_a_hiring_signal_is_confirmed():
     home = HOME.replace("/careers", "https://jobs.lever.co/acme")
-    c = _collector({"TECH_STACK"}, {"https://acme.com": home},
+    c = _collector({"TECH_STACK"}, {"https://acme.example": home},
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER})
-    await c.profile_company("c1", "acme.com")
+    await c.profile_company("c1", "acme.example")
     assert not any("lever" in u for u in c.requested)
 
 
@@ -445,7 +445,7 @@ class _OneHit(DiscoveryProvider):
 @pytest.mark.asyncio
 async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeypatch,
                                                                   claim_provider):
-    claim_provider(_OneHit("careers.acme.com"))
+    claim_provider(_OneHit("careers.acme.example"))
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
     await sync_vocabulary(state)
@@ -453,13 +453,13 @@ async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeyp
     q = build_queries(_config(), preset="hiring")[0]
     report = await run_discovery(state, _config(), "fake", [q])
     assert report.new_companies == 1, report.errors
-    assert await state.get_company_by_domain("acme.com") is not None
-    assert await state.get_company_by_domain("careers.acme.com") is None
+    assert await state.get_company_by_domain("acme.example") is not None
+    assert await state.get_company_by_domain("careers.acme.example") is None
 
 
 def test_a_hiring_preset_hit_is_not_itself_a_hiring_signal():
     q = DiscoveryQuery(term="x", preset="hiring")
-    biz = Business(name="Acme", domain="acme.com", provider="fake")
+    biz = Business(name="Acme", domain="acme.example", provider="fake")
     codes = {r["signal_code"] for r in _observations(biz, "c1", {"HIRING_ROLE", "FOUND_IN_SERP"}, "r1", query=q)}
     assert codes == {"FOUND_IN_SERP"}       # the feed confirms the role, not the search snippet
 
@@ -469,13 +469,13 @@ async def test_a_product_page_about_hiring_is_not_the_careers_page():
     home = ("<html>" + "x" * 600 + '<a href="/scheduling/hiring-marketplaces">For hiring teams</a>'
             '<a href="/company/careers">Work here</a></html>')
     page = "<html>" + "y" * 600 + '<a href="https://jobs.lever.co/acme">Roles</a></html>'
-    c = _collector({"OPEN_ROLES"}, {"https://acme.com": home,
-                                    "https://acme.com/scheduling/hiring-marketplaces": page,
-                                    "https://acme.com/company/careers": page},
+    c = _collector({"OPEN_ROLES"}, {"https://acme.example": home,
+                                    "https://acme.example/scheduling/hiring-marketplaces": page,
+                                    "https://acme.example/company/careers": page},
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER})
-    await c.profile_company("c1", "acme.com")
-    assert "https://acme.com/company/careers" in c.requested
-    assert "https://acme.com/scheduling/hiring-marketplaces" not in c.requested
+    await c.profile_company("c1", "acme.example")
+    assert "https://acme.example/company/careers" in c.requested
+    assert "https://acme.example/scheduling/hiring-marketplaces" not in c.requested
 
 
 # ── review fixes ──
@@ -483,10 +483,10 @@ async def test_a_product_page_about_hiring_is_not_the_careers_page():
 @pytest.mark.asyncio
 async def test_a_board_with_no_matching_role_says_not_hiring():
     home = HOME.replace("/careers", "https://jobs.lever.co/acme")
-    c = _collector({"HIRING_ROLE"}, {"https://acme.com": home},
+    c = _collector({"HIRING_ROLE"}, {"https://acme.example": home},
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER},
                    keywords=["chief of staff"])
-    obs = await c.profile_company("c1", "acme.com")
+    obs = await c.profile_company("c1", "acme.example")
     assert [(o["signal_code"], o["value_num"], o["value_text"]) for o in obs] == [("HIRING_ROLE", 0, "")]
     assert obs[0]["evidence_url"] == "https://jobs.lever.co/acme"
 
@@ -494,7 +494,7 @@ async def test_a_board_with_no_matching_role_says_not_hiring():
 @pytest.mark.asyncio
 async def test_a_closed_role_stops_being_current(state):
     await sync_vocabulary(state)
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     await state.add_observations([{
         "company_id": cid, "signal_code": "HIRING_ROLE", "collector": "profile",
         "value_text": "Head of Growth · Marketing", "observed_at": "2026-09-01 10:00:00"}], run_id="r1")
@@ -516,8 +516,8 @@ async def test_a_failing_board_read_keeps_the_other_signals(monkeypatch):
         raise RecursionError("deep")
 
     monkeypatch.setattr(P, "read_board", boom)
-    c = _collector({"HIRING_ROLE", "OPEN_ROLES", "TECH_STACK"}, {"https://acme.com": home}, {})
-    obs = await c.profile_company("c1", "acme.com")
+    c = _collector({"HIRING_ROLE", "OPEN_ROLES", "TECH_STACK"}, {"https://acme.example": home}, {})
+    obs = await c.profile_company("c1", "acme.example")
     assert [o["signal_code"] for o in obs] == ["TECH_STACK"]
 
 
@@ -537,7 +537,7 @@ async def test_deeply_nested_json_reads_as_none(monkeypatch):
 
 
 def test_encoded_tokens_are_decoded_once():
-    board = detect_board('<a href="https://jobs.ashbyhq.com/Acme%20Inc">Jobs</a>', "acme.com")
+    board = detect_board('<a href="https://jobs.ashbyhq.com/Acme%20Inc">Jobs</a>', "acme.example")
     assert board.token == "Acme Inc"
     assert feed_url(board) == "https://api.ashbyhq.com/posting-api/job-board/Acme%20Inc"
 
@@ -550,21 +550,21 @@ def test_encoded_tokens_are_decoded_once():
     "<p>Write to careers@acme.workable.com</p>",
 ])
 def test_asset_names_and_emails_are_not_boards(html):
-    assert detect_board(html, "acme.com") is None
+    assert detect_board(html, "acme.example") is None
 
 
 def test_greenhouse_job_app_embed_is_a_board():
     html = '<iframe src="https://boards.greenhouse.io/embed/job_app?for=acme&token=123"></iframe>'
-    assert detect_board(html, "acme.com") == Board("greenhouse", "acme")
+    assert detect_board(html, "acme.example") == Board("greenhouse", "acme")
 
 
 def test_a_page_listing_many_boards_is_nobodys():
     html = ('<a href="https://jobs.lever.co/portco1">1</a>'
             '<a href="https://boards.greenhouse.io/portco2">2</a>'
             '<a href="https://jobs.ashbyhq.com/portco3">3</a>')
-    assert detect_board(html, "bigvc.com") is None
+    assert detect_board(html, "bigvc.example") is None
     # ...unless one of them is named like the site.
-    assert detect_board(html + '<a href="https://jobs.lever.co/bigvc">us</a>', "bigvc.com") == Board("lever", "bigvc")
+    assert detect_board(html + '<a href="https://jobs.lever.co/bigvc">us</a>', "bigvc.example") == Board("lever", "bigvc")
     # Two boards is still a choice (a customer story plus their own).
     assert detect_board(html.split("<a href=\"https://jobs.ashbyhq")[0], "x.com") is not None
 

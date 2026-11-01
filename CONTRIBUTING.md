@@ -27,8 +27,13 @@ issue:**
 - Write fixtures by hand with fictional businesses and people. Use the reserved
   names wherever the code accepts them: `example.com`, `example.net`,
   `example.org`, and the `.example`, `.test` and `.invalid` top-level domains.
-  `acme.com`-style placeholders are fine. Invented people get generic invented
+  `acme.example`-style placeholders are fine. Invented people get generic invented
   names.
+- Phone numbers come from blocks nobody is given: Romanian ones with a
+  subscriber part starting with 0 (`0268 000 101`, `0722 000 102`), US ones
+  in 555-0100 to 555-0199. A free-mail address (Gmail, Yahoo and the like) is
+  `exemplu.fictiv.0001@gmail.com`-style. `tests/test_fictional_data.py` checks
+  both.
 - When a test needs markup that broke on a real site, rebuild the structure that
   broke (a `<br>` inside a span, a sentence shape, a schema.org block) with
   fictional content. Don't trim a copy of the real page.

@@ -299,9 +299,9 @@ async def test_recipient_country_does_not_promote_a_stored_zone_to_evidence(stat
 
 @pytest.mark.asyncio
 async def test_recipient_country_reads_the_location_and_the_cached_coordinates(state):
-    austin = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
+    austin = await seed_at(state, "Austin, TX", "jane@tx-acme.example")
     berlin = await seed_at(state, "Berlin, DE", "lena@de-acme.example")
-    nowhere = await seed_at(state, "", "sam@nowhere-acme.com")
+    nowhere = await seed_at(state, "", "sam@nowhere-acme.example")
     assert await recipient_country(state, await state.get_prospect(austin)) == "US"
     assert await recipient_country(state, await state.get_prospect(berlin)) == ""
     await state.set_setting("geo:berlin, de", "52.52,13.40")
@@ -457,8 +457,8 @@ def test_which_configs_send_through_quiet_hours():
 
 @pytest.mark.asyncio
 async def test_staged_emails_land_in_each_recipients_office_hours(state, monkeypatch):
-    ny = await seed_at(state, "New York, NY", "jane@ny-acme.com", status="new")
-    oslo = await seed_at(state, "Oslo, Norway", "kari@oslo-acme.no", status="new")
+    ny = await seed_at(state, "New York, NY", "jane@ny-acme.example", status="new")
+    oslo = await seed_at(state, "Oslo, Norway", "kari@oslo-acme.example", status="new")
     campaign = await seed_campaign(state, [ny, oslo])  # step 2 waits 3 days
     pin_now(monkeypatch, WED_0200)
     await window_sender(state, FakeProvider(), monkeypatch)._stage_campaign_native(campaign)
@@ -477,7 +477,7 @@ async def test_staged_emails_land_in_each_recipients_office_hours(state, monkeyp
 
 @pytest.mark.asyncio
 async def test_unknown_location_uses_the_quiet_hours_timezone(state, monkeypatch):
-    pid = await seed_at(state, "", "sam@nowhere-acme.com", status="new")
+    pid = await seed_at(state, "", "sam@nowhere-acme.example", status="new")
     campaign = await seed_campaign(state, [pid])
     pin_now(monkeypatch, WED_0200)
     await window_sender(state, FakeProvider(), monkeypatch,
@@ -489,7 +489,7 @@ async def test_unknown_location_uses_the_quiet_hours_timezone(state, monkeypatch
 
 @pytest.mark.asyncio
 async def test_one_zone_for_everyone_without_recipient_timezone(state, monkeypatch):
-    pid = await seed_at(state, "New York, NY", "jane@ny-acme.com", status="new")
+    pid = await seed_at(state, "New York, NY", "jane@ny-acme.example", status="new")
     campaign = await seed_campaign(state, [pid])
     pin_now(monkeypatch, WED_0200)
     one_zone = SendWindowConfig(recipient_timezone=False)
@@ -501,7 +501,7 @@ async def test_one_zone_for_everyone_without_recipient_timezone(state, monkeypat
 
 @pytest.mark.asyncio
 async def test_without_a_window_staging_is_unchanged(state, monkeypatch):
-    pid = await seed_at(state, "New York, NY", "jane@ny-acme.com", status="new")
+    pid = await seed_at(state, "New York, NY", "jane@ny-acme.example", status="new")
     campaign = await seed_campaign(state, [pid])
     pin_now(monkeypatch, WED_0200)
     await make_sender(state, FakeProvider())._stage_campaign_native(campaign)
@@ -513,17 +513,17 @@ async def test_without_a_window_staging_is_unchanged(state, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_due_cold_email_waits_for_its_window_and_replies_go(state, monkeypatch):
-    ny = await seed_at(state, "New York, NY", "jane@ny-acme.com")
-    tokyo = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.jp")
-    replied = await seed_at(state, "New York, NY", "bob@ny-other.com", status="replied")
-    waits = await approved(state, ny, "jane@ny-acme.com")
-    await approved(state, tokyo, "aiko@tokyo-acme.jp")
-    await approved(state, replied, "bob@ny-other.com", kind="reply")
+    ny = await seed_at(state, "New York, NY", "jane@ny-acme.example")
+    tokyo = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.example")
+    replied = await seed_at(state, "New York, NY", "bob@ny-other.example", status="replied")
+    waits = await approved(state, ny, "jane@ny-acme.example")
+    await approved(state, tokyo, "aiko@tokyo-acme.example")
+    await approved(state, replied, "bob@ny-other.example", kind="reply")
     provider = FakeProvider()
     pin_now(monkeypatch, WED_0200)  # 22:00 on Tuesday in New York, 11:00 in Tokyo
     await window_sender(state, provider, monkeypatch)._drain_due()
 
-    assert sorted(m["to"] for m in provider.sent) == ["aiko@tokyo-acme.jp", "bob@ny-other.com"]
+    assert sorted(m["to"] for m in provider.sent) == ["aiko@tokyo-acme.example", "bob@ny-other.example"]
     row = await outbox_row(state, waits)
     assert row["status"] == "approved"
     moved = datetime.fromisoformat(row["send_at"])
@@ -533,12 +533,12 @@ async def test_due_cold_email_waits_for_its_window_and_replies_go(state, monkeyp
 
 @pytest.mark.asyncio
 async def test_follow_up_ready_time_moves_into_the_window(state, monkeypatch):
-    pid = await seed_at(state, "New York, NY", "jane@ny-acme.com", status="contacted")
+    pid = await seed_at(state, "New York, NY", "jane@ny-acme.example", status="contacted")
     campaign = await seed_campaign(state, [pid])  # step 2: 3 days after step 1
-    first = await approved(state, pid, "jane@ny-acme.com", step=1, campaign=campaign.id)
+    first = await approved(state, pid, "jane@ny-acme.example", step=1, campaign=campaign.id)
     # Step 1 went out on Sunday 18 October at 18:30 New York time.
     await state.update_outbox_item(first, status="sent", sent_at="2026-10-18T22:30:00")
-    second = await approved(state, pid, "jane@ny-acme.com", step=2, campaign=campaign.id)
+    second = await approved(state, pid, "jane@ny-acme.example", step=2, campaign=campaign.id)
     provider = FakeProvider()
     pin_now(monkeypatch, WED_0200)
     await window_sender(state, provider, monkeypatch)._drain_due()
@@ -566,8 +566,8 @@ def precleared_mock(calls, body):
 
 @pytest.mark.asyncio
 async def test_precleared_country_sets_the_zone_when_nothing_else_does(state, monkeypatch):
-    pid = await seed_at(state, "", "kate@uk-acme.co.uk")
-    item = await approved(state, pid, "kate@uk-acme.co.uk")
+    pid = await seed_at(state, "", "kate@uk-acme.example.co.uk")
+    item = await approved(state, pid, "kate@uk-acme.example.co.uk")
     calls = []
     provider = FakeProvider()
     sender = window_sender(state, provider, monkeypatch, operator_zone="Asia/Tokyo")
@@ -584,7 +584,7 @@ async def test_precleared_country_sets_the_zone_when_nothing_else_does(state, mo
     # Later that morning in London it goes, on the cached verdict.
     pin_now(monkeypatch, datetime(2026, 10, 21, 9, 0))
     await sender._drain_due()
-    assert [m["to"] for m in provider.sent] == ["kate@uk-acme.co.uk"]
+    assert [m["to"] for m in provider.sent] == ["kate@uk-acme.example.co.uk"]
     assert len(calls) == 1
 
 
@@ -653,10 +653,10 @@ async def test_a_state_code_that_is_also_a_country_still_gets_the_state_window(s
 async def test_precleared_keeps_the_country_with_the_cached_verdict(state):
     calls = []
     client = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, OK_GB))
-    first = await client.clear("kate@uk-acme.co.uk", state)
-    again = await client.clear("kate@uk-acme.co.uk", state)
+    first = await client.clear("kate@uk-acme.example.co.uk", state)
+    again = await client.clear("kate@uk-acme.example.co.uk", state)
     assert first.country == again.country == "GB" and len(calls) == 1
-    cached = json.loads(await state.get_setting(SETTINGS_PREFIX + "kate@uk-acme.co.uk"))
+    cached = json.loads(await state.get_setting(SETTINGS_PREFIX + "kate@uk-acme.example.co.uk"))
     assert cached["country"] == "GB"
     odd = PreclearedClient(sender_country="GB", transport=precleared_mock(
         [], {**OK_GB, "facts": {"recipient_country": "Great Britain"}}))
@@ -674,21 +674,21 @@ def checked_sender(state, provider, calls, body=OK_GB, **client):
 
 @pytest.mark.asyncio
 async def test_sender_passes_the_company_country_to_precleared(state):
-    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
-    await approved(state, pid, "jane@tx-acme.com")
+    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.example")
+    await approved(state, pid, "jane@tx-acme.example")
     calls, provider = [], FakeProvider()
     ok_us = {**OK_GB, "facts": {"recipient_country": "US"}}
     # Even with a default configured, a country Harvey is sure of goes instead.
     await checked_sender(state, provider, calls, ok_us, prospect_country="GB")._drain_due()
-    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.com"]
+    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.example"]
     assert calls[0]["recipient_country"] == "US"
     assert "default_recipient_country" not in calls[0]
 
 
 @pytest.mark.asyncio
 async def test_sender_falls_back_to_prospect_country_as_the_default(state):
-    pid = await seed_at(state, "", "kate@uk-acme.co.uk")
-    await approved(state, pid, "kate@uk-acme.co.uk")
+    pid = await seed_at(state, "", "kate@uk-acme.example.co.uk")
+    await approved(state, pid, "kate@uk-acme.example.co.uk")
     calls = []
     await checked_sender(state, FakeProvider(), calls, prospect_country="GB")._drain_due()
     assert calls[0]["default_recipient_country"] == "GB"
@@ -719,8 +719,8 @@ async def test_sender_settles_a_state_code_by_the_cached_coordinates(state):
 
 @pytest.mark.asyncio
 async def test_country_lookup_failure_does_not_stop_the_drain(state, monkeypatch):
-    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
-    await approved(state, pid, "jane@tx-acme.com")
+    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.example")
+    await approved(state, pid, "jane@tx-acme.example")
     calls, provider = [], FakeProvider()
     sender = checked_sender(state, provider, calls)
 
@@ -729,7 +729,7 @@ async def test_country_lookup_failure_does_not_stop_the_drain(state, monkeypatch
     monkeypatch.setattr(sender_mod, "recipient_country", boom)
     await sender._drain_due()
     # The check still runs, without a country, and the email still sends.
-    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.com"]
+    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.example"]
     assert len(calls) == 1 and "recipient_country" not in calls[0]
 
 
@@ -793,8 +793,8 @@ def _patch_heartbeat(monkeypatch, cfg, state, calls, stop):
 @pytest.mark.asyncio
 async def test_quiet_hours_read_replies_then_send_what_is_due(state, monkeypatch):
     cfg = HarveyConfig(**BASE, channels={"email": {"provider": "gmail", "send_window": {}}})
-    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.jp")
-    await approved(state, pid, "aiko@tokyo-acme.jp")
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.example")
+    await approved(state, pid, "aiko@tokyo-acme.example")
     calls, stop = [], asyncio.Event()
     main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
     await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
@@ -813,8 +813,8 @@ async def test_quiet_hours_with_nothing_due_do_nothing(state, monkeypatch):
 @pytest.mark.asyncio
 async def test_without_recipient_zones_quiet_hours_hold_everything(state, monkeypatch):
     cfg = HarveyConfig(**BASE, channels={"email": {"provider": "gmail"}})
-    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.jp")
-    await approved(state, pid, "aiko@tokyo-acme.jp")
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.example")
+    await approved(state, pid, "aiko@tokyo-acme.example")
     calls, stop = [], asyncio.Event()
     main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
     await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
@@ -991,8 +991,8 @@ async def test_existing_prospects_get_an_empty_zone_on_upgrade(tmp_path):
 @pytest.mark.parametrize("quiet", [True, False])
 async def test_email_module_off_writes_sends_and_reads_nothing(state, monkeypatch, quiet):
     cfg = HarveyConfig(**BASE, channels={"email": {"provider": "gmail", "send_window": {}}})
-    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.jp")
-    await approved(state, pid, "aiko@tokyo-acme.jp")
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo-acme.example")
+    await approved(state, pid, "aiko@tokyo-acme.example")
     await switches.set_enabled(state, switches.EMAIL_MODULE, False)
     calls, stop = [], asyncio.Event()
     main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)

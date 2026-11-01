@@ -659,15 +659,15 @@ _OWNER_WORD = (r"(?P<title>(?i:co-?owner|owner|co-?founder|founder|proprietor|pr
 _ADJ = r"(?:(?:our|the|its|current|proud|longtime|second[- ]generation|third[- ]generation|" \
        r"original|today'?s?|new)\s+)*"
 _PROSE = (
-    # "founded by (attorney) Colin Garrity", "started by Dr. Ann Lee"
+    # "founded by (attorney) Colin Quellan", "started by Dr. Ann Lee"
     (re.compile(rf"(?i:\b(?:founded|started|established|launched|opened|created)\s+(?:in\s+\d{{4}}\s+)?by)\s+"
                 rf"(?:(?i:attorney|dentist|our\s+founder|owner|president)\s+)?{_NAME_RE}"), "Founder"),
-    # "owned and operated by Gary Pruitt"
+    # "owned and operated by Gary Thistlewood"
     (re.compile(rf"(?i:\b(?:owned\s+and\s+operated|owned|operated)\s+(?:today\s+)?by)\s+"
                 rf"(?!(?i:president|owner|ceo|founder)\b){_NAME_RE}"), "Owner"),
     # "with second-generation owner Dale Whitlock", "Led today by President
     # Ilan Brooks". The title must follow words that make it this business's
-    # ("our", "by", "with"...): "KTR President Vic Hale", "Acme CEO Sarah
+    # ("our", "by", "with"...): "QTR President Vic Orrin", "Acme CEO Sarah
     # Connor" and "President Alma Reyes visited" are someone else's. No comma:
     # "Founder, Birchwood Realty" under a testimonial names a company.
     (re.compile(rf"(?i:\b(?:by|with|as|our|its|current|proud|longtime|(?:second|third|fourth)[- ]generation|"
@@ -765,7 +765,7 @@ def people_from_prose(html: str, domain: str, site_name: str = "", url: str = ""
                     continue
                 add(groups["name"], title, sentence)
 
-    # "I founded the Fairbanks Law Firm" on a bio page: the person is the one
+    # "I founded the Ambervale Law Firm" on a bio page: the person is the one
     # the page is about, named in its <title> or first heading.
     sentences = _sentences(html)
     listed = {}
@@ -1019,7 +1019,7 @@ _JUNK_DOMAINS = ("example.com", "example.org", "domain.com", "email.com", "yourd
 _JUNK_TLDS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".js", ".css")
 # Obfuscations people use to hide an address from scrapers:
 #   name [at] domain [dot] com, name(at)domain.com, name AT domain DOT com
-# "name [at] domain [dot] com", "lou (at) acme (dot) com": only a bracketed
+# "name [at] domain [dot] com", "lou (at) acme (dot) example": only a bracketed
 # "at", never the word in prose ("our office at Main dot Street"), and only
 # a real top-level domain. "example" and "test" are reserved (RFC 2606):
 # no real site's address ends in them, and fictional data in tests can.

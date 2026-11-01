@@ -171,7 +171,7 @@ async def test_transport_second_page_unsubscribe_precedes_send(monkeypatch, tmp_
         if path.endswith('/messages/old'):
             return httpx.Response(200, json=message('old'))
         if path.endswith('/messages/stop'):
-            return httpx.Response(200, json=message('stop', 'bob@beta.com', 'unsubscribe'))
+            return httpx.Response(200, json=message('stop', 'bob@beta.example', 'unsubscribe'))
         if request.url.params.get('pageToken') == 'next':
             return httpx.Response(200, json={'messages': [{'id': 'stop'}]})
         return httpx.Response(200, json={

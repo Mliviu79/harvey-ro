@@ -24,55 +24,55 @@ async def state():
 
 @pytest.mark.asyncio
 async def test_add_and_get_company(state):
-    company = Company(name="Acme", domain="acme.com", industry="SaaS")
+    company = Company(name="Acme", domain="acme.example", industry="SaaS")
     company_id = await state.add_company(company)
     assert company_id
 
-    fetched = await state.get_company_by_domain("acme.com")
+    fetched = await state.get_company_by_domain("acme.example")
     assert fetched is not None
     assert fetched.name == "Acme"
 
 
 @pytest.mark.asyncio
 async def test_company_exists(state):
-    company = Company(name="Acme", domain="acme.com")
+    company = Company(name="Acme", domain="acme.example")
     await state.add_company(company)
-    assert await state.company_exists("acme.com")
-    assert not await state.company_exists("notreal.com")
+    assert await state.company_exists("acme.example")
+    assert not await state.company_exists("notreal.example")
 
 
 @pytest.mark.asyncio
 async def test_add_and_get_prospect(state):
     p = Prospect(
-        first_name="Jane", last_name="Doe", email="jane@acme.com",
+        first_name="Jane", last_name="Doe", email="jane@acme.example",
         title="VP Sales", status="new",
     )
     prospect_id = await state.add_prospect(p)
     assert prospect_id
 
-    assert await state.prospect_exists(email="jane@acme.com")
-    assert not await state.prospect_exists(email="nobody@acme.com")
+    assert await state.prospect_exists(email="jane@acme.example")
+    assert not await state.prospect_exists(email="nobody@acme.example")
 
 
 @pytest.mark.asyncio
 async def test_get_prospect_by_email(state):
     p = Prospect(
-        first_name="Jane", last_name="Doe", email="jane@acme.com",
+        first_name="Jane", last_name="Doe", email="jane@acme.example",
         title="VP Sales",
     )
     await state.add_prospect(p)
 
-    found = await state.get_prospect_by_email("jane@acme.com")
+    found = await state.get_prospect_by_email("jane@acme.example")
     assert found is not None
     assert found.first_name == "Jane"
 
-    not_found = await state.get_prospect_by_email("nobody@acme.com")
+    not_found = await state.get_prospect_by_email("nobody@acme.example")
     assert not_found is None
 
 
 @pytest.mark.asyncio
 async def test_prospect_status_update(state):
-    p = Prospect(first_name="Jane", last_name="Doe", email="jane@acme.com", title="VP")
+    p = Prospect(first_name="Jane", last_name="Doe", email="jane@acme.example", title="VP")
     pid = await state.add_prospect(p)
     await state.update_prospect_status(pid, "contacted")
 
@@ -103,11 +103,11 @@ async def test_reply_deduplication(state):
 
 @pytest.mark.asyncio
 async def test_contacts_for_company(state):
-    company = Company(name="Acme", domain="acme.com")
+    company = Company(name="Acme", domain="acme.example")
     cid = await state.add_company(company)
 
-    p1 = Prospect(first_name="Jane", last_name="Doe", email="jane@acme.com", title="VP", company_id=cid)
-    p2 = Prospect(first_name="John", last_name="Doe", email="john@acme.com", title="Dir", company_id=cid)
+    p1 = Prospect(first_name="Jane", last_name="Doe", email="jane@acme.example", title="VP", company_id=cid)
+    p2 = Prospect(first_name="John", last_name="Doe", email="john@acme.example", title="Dir", company_id=cid)
     await state.add_prospect(p1)
     await state.add_prospect(p2)
 

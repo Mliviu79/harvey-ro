@@ -502,7 +502,7 @@ class Listing(D.DiscoveryProvider):
         return True
 
     async def fetch(self, client, env, query):
-        return [D.Business(name="Northvale Roofing Company", phone="+13035550199",
+        return [D.Business(name="Vellmora Roofing Company", phone="+13035550199",
                            location="Denver, Colorado", rating=self.rating,
                            external_id="fake_maps:1", source_url="https://maps.example/1",
                            provider=self.key)]
@@ -513,7 +513,7 @@ async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monke
                                                                    claim_provider):
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: EnvConfig())
     survivor = (await state.save_company(Company(
-        name="Northvale Roofing Company", phone="+13035550199", location="Denver, Colorado",
+        name="Vellmora Roofing Company", phone="+13035550199", location="Denver, Colorado",
         source="manual", source_url="https://maps.example/1"))).company_id
     await state.add_observation("REVIEW_COUNT", company_id=survivor, value_num=3)
     query = [D.DiscoveryQuery(term="roofer", location="Denver, CO")]
@@ -549,7 +549,7 @@ async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(
     another, then the listing found again: its facts are the listing's."""
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: EnvConfig())
     middle = (await state.save_company(Company(
-        name="Northvale Roofing Company", phone="+13035550199", location="Denver, Colorado",
+        name="Vellmora Roofing Company", phone="+13035550199", location="Denver, Colorado",
         source="manual"))).company_id
     top = (await state.save_company(Company(
         name="Westridge Holdings", domain="westridge.example", location="Boulder, Colorado",

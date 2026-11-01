@@ -445,7 +445,7 @@ def autopilot_review(subject: str, body: str, config, root=None, recipient: str 
     Two things a planted instruction would try: point the reader somewhere
     that isn't yours, or get Harvey to quote its own instructions back.
     ``recipient``'s own domain is fine to mention to them ("saw
-    joesroofing.com"): it's theirs."""
+    joesroofing.example"): it's theirs."""
     from harvey.paths import PROJECT_ROOT
     reasons: list[str] = []
     text = f"{subject or ''}\n{body or ''}"

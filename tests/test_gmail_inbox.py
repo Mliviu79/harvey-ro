@@ -73,7 +73,7 @@ async def test_heartbeat_does_not_send_until_gmail_recovers(monkeypatch, tmp_pat
         seen['sent'] = list(harvey.mail.sent)
     await harvey.run_cycles(2, between={1: after_failure})
     assert seen['sent'] == []
-    assert [m['to'] for m in harvey.mail.sent] == ['bob@beta.com']
+    assert [m['to'] for m in harvey.mail.sent] == ['bob@beta.example']
 
 
 @pytest.mark.asyncio
@@ -135,7 +135,7 @@ async def test_second_page_opt_out_cancels_approved_send(monkeypatch, tmp_path):
     await _approved_item(harvey.state)
     gmail = provider([
         {'messages': [{'id': 'old'}], 'nextPageToken': 'next'}, message('old'),
-        {'messages': [{'id': 'stop'}]}, message('stop', 'bob@beta.com', 'unsubscribe'),
+        {'messages': [{'id': 'stop'}]}, message('stop', 'bob@beta.example', 'unsubscribe'),
     ])
     # Already handled newest mail must not hide an older opt-out forever.
     await harvey.state.mark_reply_processed('old')

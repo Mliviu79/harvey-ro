@@ -98,7 +98,7 @@ Encode these findings:
 - **No open/click tracking on cold email.** Tracking pixels cost 8-12%
   inbox placement. Plain text, no pixels, at most one link (zero in email 1).
 - **Small sharp lists beat blasts.** Segments of ≤50 reply ~5.8% vs ~2.1%
-  for 1,000+. This is why Scout personalizes per prospect and sends in small
+  for 1,000+. This is why Harvey personalizes per prospect and sends in small
   batches.
 
 The order of impact is: **deliverability > list quality/relevance > copy.**

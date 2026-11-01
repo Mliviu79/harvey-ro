@@ -2,9 +2,9 @@
 
 The single biggest lever on cold-email reply rates is *relevance at the
 moment of need*. Emails that reference a real, current signal get **5-18%
-replies vs 1-3%** for generic ICP-matched outreach. Scout attaches signals
-to prospects (in `personalization_notes` and on the company record); this
-playbook says how to turn each signal into a first line that earns a reply.
+replies vs 1-3%** for generic ICP-matched outreach. Harvey attaches signals
+to prospects (a brief of the company's in the prospect's notes, and on the
+company record); this playbook says how to turn each signal into a first line that earns a reply.
 
 ## The core rule
 

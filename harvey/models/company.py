@@ -20,7 +20,7 @@ class Company(BaseModel):
     company_size: str = ""
     location: str = ""
     phone: str = ""
-    source: str = ""          # how we found them: google_dork, linkedin, company_scrape
+    source: str = ""          # how we found them: the source that saved it (osm, serper, onrc...)
     source_url: str = ""      # specific URL where we found the info
     # Provider-stable identity ("dataforseo:ChIJ...", "osm:node/123"). The
     # dedup key for businesses that have no website — which are precisely the

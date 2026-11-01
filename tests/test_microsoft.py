@@ -125,7 +125,7 @@ async def test_refresh_token_rotates_and_is_saved(graph):
 
 @pytest.mark.asyncio
 async def test_new_email_is_drafted_then_sent_as_plain_text(graph):
-    result = await provider(graph).send_email("jane@acme.com", "booking", "Hi Jane.")
+    result = await provider(graph).send_email("jane@acme.example", "booking", "Hi Jane.")
 
     assert result.ok
     assert result.message_id == "<draft1@sender.example>"  # bounces match on this
@@ -137,14 +137,14 @@ async def test_new_email_is_drafted_then_sent_as_plain_text(graph):
     [draft] = [json.loads(r.content) for r in graph.requests
                if r.method == "POST" and r.url.path == "/v1.0/me/messages"]
     assert draft["body"] == {"contentType": "Text", "content": "Hi Jane."}
-    assert draft["toRecipients"] == [{"emailAddress": {"address": "jane@acme.com"}}]
+    assert draft["toRecipients"] == [{"emailAddress": {"address": "jane@acme.example"}}]
 
 
 @pytest.mark.asyncio
 async def test_reply_is_threaded_with_create_reply(graph):
     result = await provider(graph).send_email(
-        "jane@acme.com", "Re: booking", "Tuesday works.",
-        thread_ref="AAMk-their-message", in_reply_to="<r1@acme.com>",
+        "jane@acme.example", "Re: booking", "Tuesday works.",
+        thread_ref="AAMk-their-message", in_reply_to="<r1@acme.example>",
     )
 
     assert result.ok and result.message_id == "<reply1@sender.example>"
@@ -156,14 +156,14 @@ async def test_reply_is_threaded_with_create_reply(graph):
     ]
     [patch] = [json.loads(r.content) for r in graph.requests if r.method == "PATCH"]
     assert patch["body"]["content"] == "Tuesday works."
-    assert patch["toRecipients"][0]["emailAddress"]["address"] == "jane@acme.com"
+    assert patch["toRecipients"][0]["emailAddress"]["address"] == "jane@acme.example"
 
 
 @pytest.mark.asyncio
 async def test_reply_to_a_deleted_message_is_sent_unthreaded(graph):
     graph.fail[("POST", "/createReply")] = 404
     result = await provider(graph).send_email(
-        "jane@acme.com", "Re: booking", "Tuesday works.", thread_ref="gone",
+        "jane@acme.example", "Re: booking", "Tuesday works.", thread_ref="gone",
     )
 
     assert result.ok
@@ -173,7 +173,7 @@ async def test_reply_to_a_deleted_message_is_sent_unthreaded(graph):
 @pytest.mark.asyncio
 async def test_failed_send_deletes_the_draft(graph):
     graph.fail[("POST", "/send")] = 500
-    result = await provider(graph).send_email("jane@acme.com", "booking", "Hi.")
+    result = await provider(graph).send_email("jane@acme.example", "booking", "Hi.")
 
     assert not result.ok
     assert ("DELETE", "/v1.0/me/messages/draft1") in graph.calls()
@@ -183,9 +183,9 @@ async def test_failed_send_deletes_the_draft(graph):
 async def test_inbox_is_read_without_changing_it(graph):
     graph.inbox = [
         {"id": "m1", "subject": "Re: booking",
-         "from": {"emailAddress": {"address": "Jane@Acme.com"}},
+         "from": {"emailAddress": {"address": "Jane@Acme.example"}},
          "body": {"contentType": "text", "content": "Sounds good."},
-         "internetMessageId": "<r1@acme.com>", "conversationId": "c1",
+         "internetMessageId": "<r1@acme.example>", "conversationId": "c1",
          "receivedDateTime": "2026-10-14T15:00:00Z",
          "internetMessageHeaders": [{"name": "In-Reply-To", "value": "<draft1@sender.example>"}]},
         {"id": "m2", "subject": "Undeliverable: booking",
@@ -199,7 +199,7 @@ async def test_inbox_is_read_without_changing_it(graph):
 
     assert [m.provider_id for m in replies] == ["m1", "m2"]  # own mail skipped
     jane, bounce = replies
-    assert jane.from_email == "jane@acme.com"
+    assert jane.from_email == "jane@acme.example"
     assert jane.body == "Sounds good."
     assert jane.thread_ref == "m1"           # what createReply needs
     assert jane.in_reply_to == "<draft1@sender.example>"
@@ -268,7 +268,7 @@ async def test_wrong_account_is_refused(graph):
 
     p = MicrosoftProvider(config=C(), env=Env(), transport=httpx.MockTransport(graph))
     # The fake Graph says the token belongs to owner@sender.example
-    result = await p.send_email("jane@acme.com", "booking", "Hi.")
+    result = await p.send_email("jane@acme.example", "booking", "Hi.")
     assert not result.ok and "you@sender.example" in result.error
     assert ("POST", "/v1.0/me/messages") not in graph.calls()
     with pytest.raises(GraphError, match="signed in as owner@sender.example"):
@@ -351,7 +351,7 @@ async def test_malformed_first_page_raises(graph, response):
     {"value": None},
     {"value": [message(50), "not a message"]},
     {"value": [{**message(50), "id": None}]},
-    {"value": [{**message(50), "from": "jane@acme.com"}]},
+    {"value": [{**message(50), "from": "jane@acme.example"}]},
     {"value": [{**message(50), "from": {"emailAddress": {"address": 7}}}]},
     {"value": [{**message(50), "body": "text"}]},
     {"value": [{**message(50), "internetMessageHeaders": {"In-Reply-To": "x"}}]},
@@ -478,7 +478,7 @@ async def test_malformed_draft_response_fails_the_send(graph):
         return graph(request)
 
     p = MicrosoftProvider(config=None, env=Env(), transport=httpx.MockTransport(bad_draft))
-    result = await p.send_email("jane@acme.com", "booking", "Hi.")
+    result = await p.send_email("jane@acme.example", "booking", "Hi.")
     assert not result.ok and "malformed JSON" in result.error
     assert not any(path.endswith("/send") for _, path in graph.calls())
 
@@ -505,9 +505,9 @@ async def _handler_with_prospect(tmp_path, graph):
 
     state = StateManager(os.path.join(tmp_path, "t.db"))
     await state.init_db()
-    pid = await seed_prospect(state, email="jane@acme.com", status="contacted")
+    pid = await seed_prospect(state, email="jane@acme.example", status="contacted")
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s2", body="b",
+        prospect_id=pid, to_email="jane@acme.example", subject="s2", body="b",
         send_at=_now_iso(), status="approved", campaign_id="c1", step=2,
     )
     return state, pid, make_handler(state, provider(graph))
@@ -516,7 +516,7 @@ async def _handler_with_prospect(tmp_path, graph):
 @pytest.mark.asyncio
 async def test_unsubscribe_on_a_later_page_is_honored(graph, tmp_path):
     graph.inbox = [message(i) for i in range(60)]
-    graph.inbox[55] = message(55, sender="Jane@Acme.com", body="Please unsubscribe me.")
+    graph.inbox[55] = message(55, sender="Jane@Acme.example", body="Please unsubscribe me.")
     state, pid, handler = await _handler_with_prospect(tmp_path, graph)
 
     assert await handler.run() is True
@@ -533,7 +533,7 @@ async def test_unsubscribe_on_a_later_page_is_honored(graph, tmp_path):
 ], ids=["outage", "not-json", "bad-value"])
 async def test_bad_later_page_holds_sends_and_handles_nothing(graph, tmp_path, override):
     graph.inbox = [message(i) for i in range(60)]
-    graph.inbox[3] = message(3, sender="jane@acme.com", body="Please unsubscribe me.")
+    graph.inbox[3] = message(3, sender="jane@acme.example", body="Please unsubscribe me.")
     graph.pages[2] = override
     state, pid, handler = await _handler_with_prospect(tmp_path, graph)
 

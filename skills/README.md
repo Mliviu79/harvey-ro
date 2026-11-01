@@ -8,27 +8,21 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 
 ## Skill → Agent Mapping
 
-| Skill | Scout | Writer | Handler | Sender |
-|-------|-------|--------|---------|--------|
-| `prospecting_tactics.md` | x | | | |
-| `lead_qualification.md` | x | | | |
-| `account_navigation.md` | x | | | |
-| `signal_playbook.md` | x | x | | |
-| `email_frameworks.md` | | x | | x |
-| `sales_methodology.md` | | x | x | |
-| `offer_strategy.md` | | x | x | |
-| `objection_handling.md` | | | x | |
-| `product_knowledge.md` | x | x | x | x |
-| `competitive_intel.md` | | x | x | |
-| `selling_to_startups.md` | | x* | x* | |
+| Skill | Writer | Handler | Sender |
+|-------|--------|---------|--------|
+| `signal_playbook.md` | x | | |
+| `email_frameworks.md` | x | | x |
+| `sales_methodology.md` | x | x | |
+| `offer_strategy.md` | x | x | |
+| `objection_handling.md` | | x | |
+| `product_knowledge.md` | x | x | x |
+| `competitive_intel.md` | x | x | |
+| `selling_to_startups.md` | x* | x* | |
 
 \* Only for prospects whose company is a startup by its own site's account (the `YC_BACKED` or `ACCELERATOR` signal, or a `FUNDING_ROUND` from the last 18 months), not loaded for everyone.
 
 ## Built-in Skills
 
-- **`prospecting_tactics.md`** — Google dorking queries, company website scraping, trigger events, referral mining
-- **`lead_qualification.md`** — BANT screening, ICP scoring, MEDDIC framework, disqualification criteria
-- **`account_navigation.md`** — Multi-contact handling, entry point strategy, multi-threading rules
 - **`selling_to_startups.md`** — Writing to early-stage founders: who reads, timing around a YC or accelerator batch and Demo Day, writing to companies that just raised (and when a raise is too old to mention), what not to do, handling their replies. Used automatically for YC-backed, accelerator-backed and recently funded prospects.
 - **`signal_playbook.md`** — Turning buying signals (hiring, tech stack, funding) into the email's first line; which signal wins when there are several; using a job posting as the hook without guessing or implying inside knowledge
 - **`email_frameworks.md`** — Cold email copywriting rules, banned AI patterns, 2026 reply-rate data (length, offer CTAs, cadence, no tracking), 5 frameworks (AIDA, PAS, BAB, QVC, 3Ps)

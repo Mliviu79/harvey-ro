@@ -14,7 +14,7 @@ from harvey.trainer import write_trained_config
 LEARNED = {
     "persona": {
         "name": "Harvey", "company": "Acme Roofing", "role": "Business Development",
-        "email": "harvey@acme.com", "linkedin": "linkedin.com/in/harvey-acme-com",
+        "email": "harvey@acme.example", "linkedin": "linkedin.com/in/harvey-acme-com",
         "tone": "warm, direct",
     },
     "product": {
@@ -40,7 +40,7 @@ LEARNED = {
 TUNED = {
     "persona": {
         "name": "Ethan", "company": "Old Co", "role": "Founder",
-        "email": "ethan@oldco.com", "linkedin": "linkedin.com/in/ethan", "tone": "casual",
+        "email": "ethan@oldco.example", "linkedin": "linkedin.com/in/ethan", "tone": "casual",
     },
     "product": {
         "name": "OldBot", "description": "Old", "pricing": "$1",
@@ -180,7 +180,7 @@ def test_a_real_sender_with_a_blank_company_is_kept(tmp_path):
     path = tmp_path / "harvey.local.yaml"
     write(path, {**TUNED, "persona": {**TUNED["persona"], "company": ""}})
     out = write_trained_config(LEARNED, path)
-    assert out["persona"]["email"] == "ethan@oldco.com"
+    assert out["persona"]["email"] == "ethan@oldco.example"
     assert out["persona"]["company"] == "Acme Roofing"
 
 

@@ -10,7 +10,7 @@ dates, prices, postal codes and order or invoice numbers are not phone
 numbers.
 
 Without a country (``region`` None) only numbers written with their
-international prefix (+40 or 0040) can be read, since "0268 123 456"
+international prefix (+40 or 0040) can be read, since "0268 000 123"
 means nothing without one.
 """
 
@@ -35,8 +35,8 @@ _TYPES = {
 
 @dataclass(frozen=True)
 class PhoneHit:
-    number: str     # E.164: "+40268123456"
-    display: str    # international format: "+40 268 123 456"
+    number: str     # E.164: "+40268000123"
+    display: str    # international format: "+40 268 000 123"
     type: str       # mobile | landline | other
     source: str     # tel_link | schema | page_text
 
@@ -92,8 +92,8 @@ def _international(raw: str) -> bool:
 
 def _written_whole(raw: str, number) -> bool:
     """A national number counts only with its trunk prefix as dialled
-    ("0268 123 456", not "268123456" — an order or account number), or
-    with its country code ("40 268 123 456", "1 303 555 0123")."""
+    ("0268 000 123", not "268000123" — an order or account number), or
+    with its country code ("40 268 000 123", "1 303 555 0123")."""
     if _international(raw):
         return True
     digits = _digits(raw)
@@ -155,7 +155,7 @@ _NOT_PHONES = [
     re.compile(r"\bRO\s?\d{2,10}\b"),                                   # RO12345678
     re.compile(r"(?i)[$€£]\s?\d[\d.,]*"),                              # $1,250
     # Only the number written against the currency, at most one thousands
-    # group: "0268 412 345 250 lei" keeps its phone.
+    # group: "0268 000 101 250 lei" keeps its phone.
     re.compile(r"(?i)\b\d{1,3}(?:[.,]\d{3})?(?:[.,]\d{1,2})?\s?"
                r"(?:lei|ron|eur|euro|usd|gbp|dollars?)\b"),             # 1.250 lei
     re.compile(r"(?i)\b(?:cod\s+po[sș]tal|zip(?:\s+code)?|postcode|postal\s+code)"
@@ -163,8 +163,8 @@ _NOT_PHONES = [
 ]
 
 # Dates: yyyy-mm-dd, and dd.mm.yyyy / d.m.yy. A real year and month, and
-# not one link of a longer digit chain, so "0268-41-23-46" and
-# "0740-12-11-20" (2-2-2 groups) stay phones.
+# not one link of a longer digit chain, so "0268-00-01-01" and
+# "0268-01-01-20" (2-2-2 groups) stay phones.
 _DATES = [
     re.compile(r"\b(?:19|20)\d{2}([./-])(?:0?[1-9]|1[0-2])\1(?:0?[1-9]|[12]\d|3[01])\b"
                r"(?![./-]\d)"),
@@ -181,7 +181,7 @@ _FAX_GAP = re.compile(r"(?i)\d|tel|phone|mobil|gsm|call|apel|sun[aă]")
 FAX_LABEL_CHARS = 30
 # "Tel/Fax", "Tel./Fax", "Telefon - fax": a phone that takes faxes too.
 _TEL_AND = re.compile(r"(?i)\b(?:tel(?:efon)?|phone)\.?\s*(?:/|&|-|–|,|și|si|and|or|sau)\s*$")
-# "0268 412 353 (fax)", "0268 412 353 - fax": the label after the number.
+# "0268 000 153 (fax)", "0268 000 153 - fax": the label after the number.
 _FAX_AFTER = re.compile(r"(?i)^[^\S\n]*(?:\(\s*(?:tele)?fax\b|[-–—][^\S\n]*(?:tele)?fax\b)")
 # "Fax: A / B": B is in the same list as A.
 _LIST_GAP = re.compile(r"[^\S\n]*[/,;][^\S\n]*\Z")
@@ -316,7 +316,7 @@ def _masked(text: str) -> str:
         text = pattern.sub(lambda m: " " * len(m.group(0)), text)
 
     def date(m):
-        # "0740-12-11-20" is a phone: a date is never a link of a longer chain.
+        # "0268-01-01-20" is a phone: a date is never a link of a longer chain.
         before = m.string[max(0, m.start() - 2):m.start()]
         if len(before) == 2 and before[0].isdigit() and before[1] == m.group(1):
             return m.group(0)
@@ -451,7 +451,7 @@ def phone_region(location: str = "", config=None, domain: str = "") -> str | Non
     every ``icp.geography`` entry is in; the location's uncertain reading.
     None when nothing says.
 
-    The domain beats the rest: a clinica.ro found while harvey.yaml still
+    The domain beats the rest: a clinica.example.ro found while harvey.yaml still
     says "United States" is Romanian, and so is one whose location ends in
     a county code that reads as a country ("Sibiu, SB")."""
     from harvey.send_window import _prospect_country, country_code, country_for, icp_country

@@ -30,7 +30,7 @@ def _now_iso():
 
 async def _approved(state, pid, kind="sequence", body="A short, plain note. Question?"):
     return await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="hello there",
+        prospect_id=pid, to_email="jane@acme.example", subject="hello there",
         body=body, send_at=_now_iso(), status="approved",
         campaign_id="c1" if kind == "sequence" else "", step=2, kind=kind,
     )
@@ -105,13 +105,13 @@ async def test_old_configs_without_a_compliance_section_still_send(state):
 
 
 def test_the_gate_refuses_cold_email_missing_its_configured_address():
-    ok = pre_send_check("jane@acme.com", "hello there", "A note. Question?",
+    ok = pre_send_check("jane@acme.example", "hello there", "A note. Question?",
                         postal_address=ADDRESS)
     assert not ok and any("postal address" in r for r in ok.reasons)
-    assert pre_send_check("jane@acme.com", "hello there",
+    assert pre_send_check("jane@acme.example", "hello there",
                           "A note. Question?\n\n" + ADDRESS, postal_address=ADDRESS)
     # Replies never need it.
-    assert pre_send_check("jane@acme.com", "hello there", "Sure, Tuesday works.",
+    assert pre_send_check("jane@acme.example", "hello there", "Sure, Tuesday works.",
                           kind="reply", postal_address=ADDRESS)
 
 
@@ -190,7 +190,7 @@ async def _reply(state, body, intent="interested"):
     pid = await seed_prospect(state, status="contacted")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com", subject="Re: hello there", body=body)]
+        provider_id="in1", from_email="jane@acme.example", subject="Re: hello there", body=body)]
     handler = make_handler(state, provider, intent=intent)
     handler.config.compliance = ComplianceConfig(postal_address=ADDRESS)
     handler.brain = RecordingBrain(intent)
@@ -279,12 +279,12 @@ async def _reply_after_sending(state, body, sent_bodies=(), intent="interested",
     pid = await seed_prospect(state, status="contacted")
     for n, sent in enumerate(sent_bodies, start=1):
         oid = await state.add_outbox_item(
-            prospect_id=pid, to_email="jane@acme.com", subject="hello there",
+            prospect_id=pid, to_email="jane@acme.example", subject="hello there",
             body=sent, send_at=_now_iso(), status="approved", campaign_id="c1", step=n)
         await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com", subject="Re: hello there", body=body)]
+        provider_id="in1", from_email="jane@acme.example", subject="Re: hello there", body=body)]
     handler = make_handler(state, provider, intent=intent)
     handler.config.compliance = ComplianceConfig(postal_address=ADDRESS, opt_out_line=line)
     handler.brain = RecordingBrain(intent)
@@ -380,7 +380,7 @@ async def test_a_short_address_mentioned_in_the_body_still_gets_the_footer(state
 
 def test_opt_out_line_must_be_recognisable_and_link_free():
     import pydantic
-    for bad in ("To unsubscribe, visit https://acme.com/u", "Click here to leave",
+    for bad in ("To unsubscribe, visit https://acme.example/u", "Click here to leave",
                 "Thanks for reading!"):
         with pytest.raises(pydantic.ValidationError):
             ComplianceConfig(opt_out_line=bad)
@@ -472,7 +472,7 @@ async def test_campaign_text_counts_as_ours_without_an_outbox_row(state):
              json.dumps([pid])))
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in1", from_email="jane@acme.example", subject="Re: hi",
         body="Yes let's talk.\n\nOn Tue Harvey wrote:\n> Hi Jane, we help attorney offices grow.\n> " + old)]
     handler = make_handler(state, provider, intent="interested")
     handler.config.compliance = ComplianceConfig(opt_out_line="Reply no thanks to stop.")
@@ -509,7 +509,7 @@ async def test_opt_outs_with_signatures_or_wrapped_lines_are_caught(state, body)
 
 def test_opt_out_line_must_ask_for_a_reply_harvey_catches():
     import pydantic
-    for bad in ('Reply "pass" and I\'ll stop.', "To opt out email optout@acme.com"):
+    for bad in ('Reply "pass" and I\'ll stop.', "To opt out email optout@acme.example"):
         with pytest.raises(pydantic.ValidationError):
             ComplianceConfig(opt_out_line=bad)
     for good in (LINE, "Reply STOP to opt out.", "Not a fit? Just reply with unsubscribe.",
@@ -553,7 +553,7 @@ async def test_template_lines_with_merge_tags_are_recognised_when_quoted(state):
              json.dumps([pid])))
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in1", from_email="jane@acme.example", subject="Re: hi",
         body="Yes please.\n\nOn Tue Harvey wrote:\n> We help Acme attorney offices grow.")]
     handler = make_handler(state, provider, intent="interested")
     handler.brain = RecordingBrain("interested")

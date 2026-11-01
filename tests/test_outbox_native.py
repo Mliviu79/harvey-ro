@@ -114,7 +114,7 @@ def make_handler(state, provider, intent="question"):
     return handler
 
 
-async def seed_prospect(state, email="jane@acme.com", status="new", estatus="verified"):
+async def seed_prospect(state, email="jane@acme.example", status="new", estatus="verified"):
     return await state.add_prospect(Prospect(
         first_name="Jane", last_name="Doe", title="VP", company="Acme",
         email=email, email_status=estatus, email_verified=(estatus == "verified"),
@@ -140,22 +140,22 @@ async def seed_campaign(state, prospect_ids):
 
 def test_gate_blocks_bad_content():
     p = Prospect(first_name="J", last_name="D", title="VP",
-                 email="jane@acme.com", email_status="verified")
-    ok = pre_send_check("jane@acme.com", "hello", "Short and fine. Question?", p)
+                 email="jane@acme.example", email_status="verified")
+    ok = pre_send_check("jane@acme.example", "hello", "Short and fine. Question?", p)
     assert ok.ok
 
-    bad = pre_send_check("jane@acme.com", "hello", "Hi {{first_name}}, act now!", p)
+    bad = pre_send_check("jane@acme.example", "hello", "Hi {{first_name}}, act now!", p)
     assert not bad.ok
     assert any("merge" in r for r in bad.reasons)
     assert any("banned" in r for r in bad.reasons)
 
     guess = Prospect(first_name="J", last_name="D", title="VP",
-                     email="jane@acme.com", email_status="guess")
-    blocked = pre_send_check("jane@acme.com", "hello", "Fine body.", guess)
+                     email="jane@acme.example", email_status="guess")
+    blocked = pre_send_check("jane@acme.example", "hello", "Fine body.", guess)
     assert not blocked.ok
 
     # Replies to someone who emailed us are exempt from the status gate
-    reply_ok = pre_send_check("jane@acme.com", "Re: hi", "Thanks!", guess, kind="reply")
+    reply_ok = pre_send_check("jane@acme.example", "Re: hi", "Thanks!", guess, kind="reply")
     assert reply_ok.ok
 
 
@@ -169,7 +169,7 @@ def test_gate_link_and_html_limits():
 def test_bounce_detection():
     assert looks_like_bounce("mailer-daemon@googlemail.com", "anything")
     assert looks_like_bounce("mx@x.com", "Delivery Status Notification (Failure)")
-    assert not looks_like_bounce("jane@acme.com", "Re: your note")
+    assert not looks_like_bounce("jane@acme.example", "Re: your note")
 
 
 # ── staging ──
@@ -200,7 +200,7 @@ async def test_stage_campaign_renders_and_respects_approval(state):
 
 @pytest.mark.asyncio
 async def test_stage_skips_unverified(state):
-    pid = await seed_prospect(state, email="guess@acme.com", estatus="guess")
+    pid = await seed_prospect(state, email="guess@acme.example", estatus="guess")
     await seed_campaign(state, [pid])
     sender = make_sender(state, FakeProvider())
     await sender._run_native()
@@ -221,7 +221,7 @@ async def test_drain_sends_approved_due_items(state):
 
     sent = await state.get_outbox(status="sent")
     assert len(sent) == 1                     # step 1 due now; step 2 in 3 days
-    assert provider.sent[0]["to"] == "jane@acme.com"
+    assert provider.sent[0]["to"] == "jane@acme.example"
     assert provider.sent[0]["subject"] == "hi Jane"
     prospect = await state.get_prospect(pid)
     assert prospect.status == "contacted"
@@ -246,7 +246,7 @@ async def test_drain_respects_kill_switch(state):
 async def test_drain_gate_failure_marks_failed(state):
     pid = await seed_prospect(state)
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com",
+        prospect_id=pid, to_email="jane@acme.example",
         subject="hello", body="Unrendered {{first_name}} tag",
         send_at=_now_iso(), status="approved", campaign_id="c1", step=1,
     )
@@ -263,7 +263,7 @@ async def test_drain_gate_failure_marks_failed(state):
 async def test_send_failure_recorded(state):
     pid = await seed_prospect(state)
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com",
+        prospect_id=pid, to_email="jane@acme.example",
         subject="hello", body="Fine body. Question?",
         send_at=_now_iso(), status="approved", campaign_id="c1", step=1,
     )
@@ -282,12 +282,12 @@ async def test_send_failure_recorded(state):
 async def test_reply_cancels_pending_outbox(state):
     pid = await seed_prospect(state, status="contacted")
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s2",
+        prospect_id=pid, to_email="jane@acme.example", subject="s2",
         body="b", send_at=_now_iso(), status="approved", campaign_id="c1", step=2,
     )
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com",
+        provider_id="in1", from_email="jane@acme.example",
         subject="Re: hi", body="unsubscribe please",
     )]
     handler = make_handler(state, provider)
@@ -323,13 +323,13 @@ async def test_an_opt_out_records_why(state, body, intent, rule, matched):
     pid = await seed_prospect(state, status="contacted")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in4", from_email="jane@acme.com", subject="Re: hi", body=body,
+        provider_id="in4", from_email="jane@acme.example", subject="Re: hi", body=body,
     )]
     await make_handler(state, provider, intent=intent)._run_native()
 
     assert (await state.get_prospect(pid)).status == "opted_out"
     [d] = await _logged(state, "opt_out")
-    assert d["prospect_id"] == pid and d["prospect_email"] == "jane@acme.com"
+    assert d["prospect_id"] == pid and d["prospect_email"] == "jane@acme.example"
     assert (d["rule"], d["matched"]) == (rule, matched)
     assert d["message"] == body
     assert d["why"]
@@ -356,7 +356,7 @@ async def test_reply_after_opt_out_keeps_them_opted_out(state, body):
     pid = await seed_prospect(state, status="opted_out")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in2", from_email="jane@acme.com", subject="Re: hi", body=body,
+        provider_id="in2", from_email="jane@acme.example", subject="Re: hi", body=body,
     )]
     handler = make_handler(state, provider)
     handler.brain = RefusingBrain()
@@ -377,7 +377,7 @@ async def test_complaint_after_opt_out_still_reaches_a_human(state):
     pid = await seed_prospect(state, status="opted_out")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in3", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in3", from_email="jane@acme.example", subject="Re: hi",
         body="I told you to stop. I'm reporting you for spam.",
     )]
     handler = make_handler(state, provider)
@@ -408,7 +408,7 @@ async def test_bounce_marks_invalid_and_kill_switch(state):
     pid = await seed_prospect(state, status="contacted")
     # A sent item whose message-id the bounce references
     item_id = await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s",
+        prospect_id=pid, to_email="jane@acme.example", subject="s",
         body="b", send_at=_now_iso(), status="approved", campaign_id="c1", step=1,
     )
     await state.update_outbox_item(
@@ -417,7 +417,7 @@ async def test_bounce_marks_invalid_and_kill_switch(state):
     # Ten more sent items so the kill-switch minimum-sample rule is met
     for i in range(10):
         oid = await state.add_outbox_item(
-            prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
+            prospect_id=pid, to_email="jane@acme.example", subject="s", body="b",
             send_at=_now_iso(), status="approved", campaign_id=f"c{i+2}", step=1,
         )
         await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
@@ -442,7 +442,7 @@ async def test_inbound_dedup(state):
     await seed_prospect(state, status="contacted")
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in1", from_email="jane@acme.com",
+        provider_id="in1", from_email="jane@acme.example",
         subject="Re: hi", body="we're all set thanks",
     )]
     handler = make_handler(state, provider, intent="not_interested")
@@ -462,7 +462,7 @@ async def test_after_an_undo_their_next_reply_is_handled_normally(state):
 
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in5", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in5", from_email="jane@acme.example", subject="Re: hi",
         body="Sorry, wrong button earlier. What does it cost?",
     )]
     await make_handler(state, provider)._run_native()
@@ -479,7 +479,7 @@ async def test_on_autopilot_the_first_reply_after_an_undo_still_waits(state, mon
 
     provider = FakeProvider()
     provider.inbound = [InboundMessage(
-        provider_id="in6", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in6", from_email="jane@acme.example", subject="Re: hi",
         body="Sorry, wrong button. What does it cost?",
     )]
     await make_handler(state, provider)._run_native()
@@ -487,7 +487,7 @@ async def test_on_autopilot_the_first_reply_after_an_undo_still_waits(state, mon
 
     # Only the first one: after that, autopilot is autopilot again.
     provider.inbound = [InboundMessage(
-        provider_id="in7", from_email="jane@acme.com", subject="Re: hi",
+        provider_id="in7", from_email="jane@acme.example", subject="Re: hi",
         body="And is there a contract?",
     )]
     await make_handler(state, provider)._run_native()
@@ -510,7 +510,7 @@ async def test_on_instantly_the_first_reply_after_an_undo_goes_to_you(state, mon
         sent.append(body)
         return {"ok": True}
     handler.instantly.send_reply = send_reply
-    await handler._process_reply("jane@acme.com", "Sorry, wrong button. What does it cost?", "u1")
+    await handler._process_reply("jane@acme.example", "Sorry, wrong button. What does it cost?", "u1")
 
     assert sent == []
     assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]

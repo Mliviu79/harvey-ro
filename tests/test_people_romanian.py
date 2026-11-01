@@ -265,8 +265,8 @@ def test_cabinet_label_on_english_site_scores_only_whole():
 # ── addresses ──
 
 def test_obfuscated_ro_and_eu_addresses_decode():
-    html = "<p>Scrieți-ne: receptie [at] clinicaexemplu [dot] ro sau info (at) exemplu (dot) eu</p>"
-    assert people.emails_on_page(html) == ["receptie@clinicaexemplu.ro", "info@exemplu.eu"]
+    html = "<p>Scrieți-ne: receptie [at] clinicaexemplu [dot] example [dot] ro sau info (at) exemplu (dot) example (dot) eu</p>"
+    assert people.emails_on_page(html) == ["receptie@clinicaexemplu.example.ro", "info@exemplu.example.eu"]
 
 
 @pytest.mark.parametrize("first, last, expected", [

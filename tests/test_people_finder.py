@@ -172,14 +172,14 @@ def test_founder_named_by_first_name_is_matched_to_the_listed_person():
      "ridgelineroofing.test", ("Ilan", "Brooks"), "President"),
     ("Today, it remains a family-owned business with second-generation owner Dale Whitlock at the helm.",
      "whitlockheating.test", ("Dale", "Whitlock"), "Owner"),
-    ("Garrity Law Firm was founded by Colin Garrity, a family law attorney.",
-     "garritylaw.test", ("Colin", "Garrity"), "Founder"),
-    ("Founded by attorney Colin Garrity, the firm focuses on divorce.",
-     "garritylaw.test", ("Colin", "Garrity"), "Founder"),
+    ("Quellan Law Firm was founded by Colin Quellan, a family law attorney.",
+     "quellanlaw.test", ("Colin", "Quellan"), "Founder"),
+    ("Founded by attorney Colin Quellan, the firm focuses on divorce.",
+     "quellanlaw.test", ("Colin", "Quellan"), "Founder"),
     ("Ines Varga started Countwise in March 2017, building it alone.",
      "countwise.test", ("Ines", "Varga"), "Founder"),
-    ("We are proudly owned and operated by Gary Pruitt since 1998.",
-     "pruittplumbing.test", ("Gary", "Pruitt"), "Owner"),
+    ("We are proudly owned and operated by Gary Thistlewood since 1998.",
+     "thistlewoodplumbing.test", ("Gary", "Thistlewood"), "Owner"),
     ("Welcome to Hollis Family Dental, the office of Dr. Maren Hollis Pryor.",
      "hollisfamilydental.test", ("Maren", "Pryor"), "Owner"),
 ])
@@ -200,11 +200,11 @@ def test_sentences_that_name_no_owner(sentence):
 
 
 def test_first_person_founder_on_a_bio_page():
-    html = ("<title>Attorney Neil Fairbanks | Fairbanks Law Firm, PLLC</title>"
+    html = ("<title>Attorney Neil Ambervale | Ambervale Law Firm, PLLC</title>"
             "<p>I am committed to protecting the rights of my neighbors. "
-            "I founded the Fairbanks Law Firm, PLLC, in 2011.</p>")
+            "I founded the Ambervale Law Firm, PLLC, in 2011.</p>")
     found = people.people_from_prose(html, "fairbankslaw.test")
-    assert names(found) == [("Neil", "Fairbanks")] and found[0]["title"] == "Founder"
+    assert names(found) == [("Neil", "Ambervale")] and found[0]["title"] == "Founder"
 
 
 # ── schema.org ──
@@ -225,7 +225,7 @@ def test_schema_employee_keeps_its_job_title_and_a_blog_author_is_ignored():
        "founder": {"@id": "#kim"}},
       {"@type": "Person", "@id": "#kim", "name": "Kim Ortiz"},
       {"@type": "Article", "author": {"@type": "Person", "name": "Petra Lund"}},
-      {"@type": "Person", "name": "Prairie Heritage Roofing"}
+      {"@type": "Person", "name": "Fernhollow Heritage Roofing"}
     ]}</script>"""
     found = people.people_from_schema(html)
     assert names(found) == [("Kim", "Ortiz"), ("Dana", "Cole")]
@@ -260,7 +260,7 @@ SMITH = "smithandsonsroofing.test"
     "<p>\"Best roofer in town.\"</p><p>Rick Davis, Owner, Davis Bakery</p>",
     "<div class='slide'><p>“Fantastic work.”</p><p>Rick Davis</p><p>Owner</p></div>",
     "<div class='gr'><span>Karen White</span><span>Local Guide</span><p>Great owner!</p></div>",
-    "<p>We are proud partners of KTR. Learn more from KTR President Vic Hale.</p>",
+    "<p>We are proud partners of QTR. Learn more from QTR President Vic Orrin.</p>",
     "<p>We worked with Acme CEO Sarah Connor on the new HQ.</p>",
     "<p>President Alma Reyes visited our town.</p>",
     "<p>Principal Mary Alcott of Maplewood Elementary thanks us.</p>",
@@ -287,7 +287,7 @@ def test_former_owners_are_not_owner_titles(title):
 
 def test_the_real_president_outranks_false_positives():
     html = ("<p>“Great job.”</p><p>Rick Davis</p><p>Owner</p>"
-            "<p>Learn more from KTR President Vic Hale.</p>"
+            "<p>Learn more from QTR President Vic Orrin.</p>"
             "<h3>Ilan Brooks</h3><p>President</p>")
     found = people.find_people([(f"https://{SMITH}/about", html)], SMITH)
     assert names(found)[0] == ("Ilan", "Brooks")
@@ -300,9 +300,9 @@ def test_owner_from_the_office_of_dr():
 
 
 def test_owners_rank_ahead_of_staff():
-    pages = [("https://acme.com/team",
+    pages = [("https://acme.example/team",
               "<h3>Sam Lee</h3><p>Office Manager</p><h3>Pat Kim</h3><p>Owner</p>")]
-    assert names(people.find_people(pages, "acme.com"))[0] == ("Pat", "Kim")
+    assert names(people.find_people(pages, "acme.example"))[0] == ("Pat", "Kim")
 
 
 # ── which pages to read ──
@@ -312,7 +312,7 @@ HOME = """
   <a href="/">Home</a> <a href="#main">Skip</a> <a href="tel:5551234">Call</a>
   <a href="/services/roof-repair/">Roof Repair</a>
   <a href="/about-us/">About</a>
-  <a href="https://www.acme.com/meet-the-dentists.html">Meet the Dentists</a>
+  <a href="https://www.acme.example/meet-the-dentists.html">Meet the Dentists</a>
   <a href="/contact/">Contact</a>
   <a href="https://facebook.com/acme">Facebook</a>
   <a href="/brochure.pdf">Our team (PDF)</a>
@@ -321,11 +321,11 @@ HOME = """
 
 
 def test_menu_links_are_scored_and_stay_on_the_site():
-    links = people.menu_links(HOME, "https://www.acme.com/", limit=5)
+    links = people.menu_links(HOME, "https://www.acme.example/", limit=5)
     assert links == [
-        "https://www.acme.com/meet-the-dentists.html",
-        "https://www.acme.com/about-us/",
-        "https://www.acme.com/contact/",
+        "https://www.acme.example/meet-the-dentists.html",
+        "https://www.acme.example/about-us/",
+        "https://www.acme.example/contact/",
     ]
 
 
@@ -333,13 +333,13 @@ def test_practice_area_pages_are_not_people_pages():
     html = """<a href="/adoption-lawyer-riverton/">Adoption</a>
       <a href="/child-custody-lawyer-riverton/">Child Custody</a>
       <a href="/about-us/">About Us</a><a href="/our-attorneys/">Our Attorneys</a>"""
-    assert people.menu_links(html, "https://garritylaw.test/") == [
-        "https://garritylaw.test/our-attorneys/", "https://garritylaw.test/about-us/"]
+    assert people.menu_links(html, "https://quellanlaw.test/") == [
+        "https://quellanlaw.test/our-attorneys/", "https://quellanlaw.test/about-us/"]
 
 
 def test_menu_links_respect_the_limit():
     many = "".join(f'<a href="/team/person-{i}/">Person {i}</a>' for i in range(20))
-    assert len(people.menu_links(many, "https://acme.com", limit=5)) == 5
+    assert len(people.menu_links(many, "https://acme.example", limit=5)) == 5
 
 
 # ── addresses on a page ──
@@ -354,12 +354,12 @@ def test_obfuscated_addresses_are_decoded():
       <a href="/cdn-cgi/l/email-protection#{_cf('gil@harrowroofing.test')}">email</a>
       <span class="__cf_email__" data-cfemail="{_cf('info@harrowroofing.test')}">[email&#160;protected]</span>
       <a href="mailto:%20Tess@MarloweMarketingCo.test?subject=Hi">Tess</a>
-      <p>Write to office [at] acme [dot] com or jane(at)acme.com</p>
+      <p>Write to office [at] acme [dot] example or jane(at)acme.example</p>
       <p>you@example.com user@domain.com logo@2x.png</p>
     """
     assert set(people.emails_on_page(html)) == {
         "rashby@ashbykerr.test", "gil@harrowroofing.test", "info@harrowroofing.test",
-        "tess@marlowemarketingco.test", "office@acme.com", "jane@acme.com",
+        "tess@marlowemarketingco.test", "office@acme.example", "jane@acme.example",
     }
 
 
@@ -370,7 +370,7 @@ def test_schema_org_email_is_read():
 
 
 @pytest.mark.parametrize("html", [
-    '<div data-name="Gus" data-website="acme.com"></div>',
+    '<div data-name="Gus" data-website="acme.example"></div>',
     '<span data-u="tracking" data-d="googletagmanager.com"></span>',
     '<img data-src="a.png" data-user="x" data-domain="y.com">',
     "<p>Meet us at our office at Main dot Street</p>",
@@ -383,8 +383,8 @@ def test_no_address_is_invented(html):
 
 
 def test_a_mailto_element_with_user_and_domain_attributes_is_decoded():
-    html = '<a href="#" class="email-link" data-user="lou" data-domain="acme.com">Email</a>'
-    assert people.emails_on_page(html) == ["lou@acme.com"]
+    html = '<a href="#" class="email-link" data-user="lou" data-domain="acme.example">Email</a>'
+    assert people.emails_on_page(html) == ["lou@acme.example"]
 
 
 ADVERSARIAL = {
@@ -409,7 +409,7 @@ def test_nested_testimonials_are_bounded():
     html = "<div class='testimonial'>" * 2000 + "x" + "</div>" * 2000
     start = time.monotonic()
     people.drop_quoted(html)
-    people.find_people([("https://acme.com", html)], "acme.com")
+    people.find_people([("https://acme.example", html)], "acme.example")
     assert time.monotonic() - start < 1.0
 
 
@@ -427,8 +427,8 @@ def test_whole_page_is_scanned_not_just_the_top():
     "Director Medical", "Owner of Harborline Dental", "Owner and Lead Dentist at Harborline Dental",
     "Fondator, Medic Primar", "Founder, President of Harborline Dental",
     # A branch of the practice, not another organisation.
-    "Associate Dentist at Port Ellery", "Lead Dentist at Our Northvale Office",
-    "Owner and Lead Dentist at Our Northvale Office", "Medic la Brașov",
+    "Associate Dentist at Port Ellery", "Lead Dentist at Our Vellmora Office",
+    "Owner and Lead Dentist at Our Vellmora Office", "Medic la Brașov",
 ])
 def test_a_combined_role_is_not_another_organisation(title):
     assert not people.title_names_other_org(title, "harborlinedental.example", "Harborline Dental")

@@ -32,15 +32,15 @@ async def state():
 
 @pytest.mark.asyncio
 async def test_a_new_company_needs_profiling(state):
-    await state.add_company(Company(name="Baker", domain="baker.com"))
+    await state.add_company(Company(name="Baker", domain="baker.example"))
     pending = await state.companies_needing_profile()
-    assert [c["domain"] for c in pending] == ["baker.com"]
+    assert [c["domain"] for c in pending] == ["baker.example"]
     assert await state.count_companies_needing_profile() == 1
 
 
 @pytest.mark.asyncio
 async def test_a_profiled_company_drops_out(state):
-    cid = await state.add_company(Company(name="Baker", domain="baker.com"))
+    cid = await state.add_company(Company(name="Baker", domain="baker.example"))
     await state.add_observation("TECH_STACK", company_id=cid,
                                 collector="profile", value_text="wordpress")
     assert await state.count_companies_needing_profile() == 0
@@ -48,7 +48,7 @@ async def test_a_profiled_company_drops_out(state):
 
 @pytest.mark.asyncio
 async def test_a_company_read_through_the_browser_drops_out_too(state):
-    cid = await state.add_company(Company(name="Baker", domain="baker.com"))
+    cid = await state.add_company(Company(name="Baker", domain="baker.example"))
     await state.add_observation("TECH_STACK", company_id=cid,
                                 collector="profile:browser", value_text="wix")
     assert await state.count_companies_needing_profile() == 0
@@ -58,7 +58,7 @@ async def test_a_company_read_through_the_browser_drops_out_too(state):
 async def test_a_stale_profile_comes_back_round(state):
     """Re-reading on a schedule is what makes 'they dropped their agency'
     visible. A company profiled last year is not done forever."""
-    cid = await state.add_company(Company(name="Baker", domain="baker.com"))
+    cid = await state.add_company(Company(name="Baker", domain="baker.example"))
     await state.add_observation("TECH_STACK", company_id=cid, collector="profile",
                                 value_text="wordpress",
                                 observed_at="2020-01-01 00:00:00")
@@ -69,7 +69,7 @@ async def test_a_stale_profile_comes_back_round(state):
 @pytest.mark.asyncio
 async def test_discovery_observations_do_not_count_as_a_profile(state):
     """DISCOVER writes observations too. Only PROFILE's own count."""
-    cid = await state.add_company(Company(name="Baker", domain="baker.com"))
+    cid = await state.add_company(Company(name="Baker", domain="baker.example"))
     await state.add_observation("SERP_RANK", company_id=cid,
                                 collector="discover", value_num=14)
     assert await state.count_companies_needing_profile() == 1
@@ -87,7 +87,7 @@ async def test_websiteless_companies_are_never_queued_for_profiling(state):
 
 @pytest.mark.asyncio
 async def test_state_summary_reports_the_profiling_backlog(state):
-    await state.add_company(Company(name="Baker", domain="baker.com"))
+    await state.add_company(Company(name="Baker", domain="baker.example"))
     summary = await state.get_state_summary()
     assert summary["unprofiled"] == 1
 

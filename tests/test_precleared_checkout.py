@@ -35,11 +35,11 @@ async def test_malformed_https_link_uses_fallback(state, url):
 @pytest.mark.asyncio
 async def test_402_holds_sequences_allows_reply_then_recovers_next_cycle(state):
     first = await seed_prospect(state)
-    second = await seed_prospect(state, email="sam@beta.com")
-    reply = await seed_prospect(state, email="ann@gamma.com", status="replied")
+    second = await seed_prospect(state, email="sam@beta.example")
+    reply = await seed_prospect(state, email="ann@gamma.example", status="replied")
     await queue(state, first)
-    await queue(state, second, to="sam@beta.com")
-    await queue(state, reply, kind="reply", to="ann@gamma.com")
+    await queue(state, second, to="sam@beta.example")
+    await queue(state, reply, kind="reply", to="ann@gamma.example")
     calls = []
     def limited(request):
         calls.append(request)
@@ -48,13 +48,13 @@ async def test_402_holds_sequences_allows_reply_then_recovers_next_cycle(state):
     sender = with_check(make_sender(state, provider), httpx.MockTransport(limited), api_key="pc_test_review")
     await sender._drain_due()
     assert len(calls) == 1
-    assert [m["to"] for m in provider.sent] == ["ann@gamma.com"]
+    assert [m["to"] for m in provider.sent] == ["ann@gamma.example"]
     assert len(await state.get_outbox(status="approved")) == 2
     assert not await state.get_outbox(status="failed")
-    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.com") == ""
+    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.example") == ""
     sender.precleared._transport = httpx.MockTransport(lambda r: httpx.Response(200, json=OK_BODY))
     await sender._drain_due()
-    assert sorted(m["to"] for m in provider.sent) == ["ann@gamma.com", "jane@acme.com", "sam@beta.com"]
+    assert sorted(m["to"] for m in provider.sent) == ["ann@gamma.example", "jane@acme.example", "sam@beta.example"]
     assert not await state.get_outbox(status="approved")
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ def test_config_from_dict():
             "name": "Harvey",
             "company": "Acme",
             "role": "BDR",
-            "email": "harvey@acme.com",
+            "email": "harvey@acme.example",
             "linkedin": "",
             "tone": "professional",
         },

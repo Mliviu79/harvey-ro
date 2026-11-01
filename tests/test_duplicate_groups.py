@@ -222,11 +222,11 @@ async def test_a_chain_phone_on_300_firms_proposes_nothing(state):
         for n in range(300):
             await batch.add_company(Company(name=f"Farmacia {n} Exemplu SRL", cui=str(91000000 + n),
                                             location=f"{TOWNS[n % 8]}, Romania",
-                                            phone="+40213000000"))
+                                            phone="+40210000300"))
     assert _rows(state.db_path, "SELECT COUNT(*) FROM company_ids WHERE kind = 'phone' "
-                                "AND value = '+40213000000'") == [(300,)]
+                                "AND value = '+40210000300'") == [(300,)]
     saved = await state.save_company(Company(name="Farmacia Exemplu", location="Deva, Romania",
-                                             phone="+40213000000", external_id="osm:node/1"))
+                                             phone="+40210000300", external_id="osm:node/1"))
     assert saved.created and saved.match.company_id is None and not saved.match.others
     assert await _scan(state) == (0, 0)
     assert await _groups(state) == []

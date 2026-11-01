@@ -47,7 +47,7 @@ def _now_iso(**delta):
 
 async def _approved(state, pid, kind, step=1, campaign="c1"):
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com",
+        prospect_id=pid, to_email="jane@acme.example",
         subject="hello there", body="A short, plain note. Question?", send_at=_now_iso(),
         status="approved", campaign_id=campaign if kind == "sequence" else "", step=step, kind=kind)
 
@@ -63,24 +63,24 @@ def _ramped_sender(state, provider, monkeypatch, days_in, **ramp):
 
 @pytest.mark.asyncio
 async def test_while_warming_cold_email_waits_but_replies_go(state, monkeypatch):
-    cold = await seed_prospect(state, email="jane@acme.com", status="queued")
+    cold = await seed_prospect(state, email="jane@acme.example", status="queued")
     await _approved(state, cold, "sequence")
-    warm = await seed_prospect(state, email="bob@acme.com", status="replied")
+    warm = await seed_prospect(state, email="bob@acme.example", status="replied")
     await state.add_outbox_item(
-        prospect_id=warm, to_email="bob@acme.com", subject="Re: hi",
+        prospect_id=warm, to_email="bob@acme.example", subject="Re: hi",
         body="Sure, Tuesday works.", send_at=_now_iso(), status="approved", kind="reply")
     provider = FakeProvider()
     await _ramped_sender(state, provider, monkeypatch, days_in=3, min_days=14)._drain_due()
-    assert [m["to"] for m in provider.sent] == ["bob@acme.com"]
+    assert [m["to"] for m in provider.sent] == ["bob@acme.example"]
     assert len(await state.get_outbox(status="approved")) == 1  # the cold one waits
 
 
 @pytest.mark.asyncio
 async def test_after_warming_cold_email_is_capped_at_todays_ramp(state, monkeypatch):
     for n in range(4):
-        pid = await seed_prospect(state, email=f"p{n}@acme.com", status="queued")
+        pid = await seed_prospect(state, email=f"p{n}@acme.example", status="queued")
         await state.add_outbox_item(
-            prospect_id=pid, to_email=f"p{n}@acme.com", subject="hello there",
+            prospect_id=pid, to_email=f"p{n}@acme.example", subject="hello there",
             body="A short, plain note. Question?", send_at=_now_iso(), status="approved",
             campaign_id="c1", step=1)
     provider = FakeProvider()
@@ -97,7 +97,7 @@ async def test_the_ramp_leaves_instantly_alone(state, monkeypatch):
     from harvey.agents.sender import Sender
     from harvey.config import EnvConfig
     from harvey.models.campaign import Campaign, EmailStep
-    ids = [await seed_prospect(state, email=f"p{n}@acme.com", status="queued") for n in range(6)]
+    ids = [await seed_prospect(state, email=f"p{n}@acme.example", status="queued") for n in range(6)]
     warm_start = (date.today() - timedelta(days=14)).isoformat()
     config = SimpleNamespace(channels=SimpleNamespace(email=EmailChannelConfig(
         provider="instantly", require_approval=False, max_daily_sends=50,
@@ -169,8 +169,8 @@ def test_warmup_check_reports_progress():
 
 
 @pytest.mark.parametrize("domain, ok", [
-    ("acme.com", True), ("mail.acme.co.uk", True),
-    ("acme", False), ("acme.com/../x", False), ("-acme.com", False), ("", False),
+    ("acme.example", True), ("mail.example.co.uk", True),
+    ("acme", False), ("acme.example/../x", False), ("-acme.example", False), ("", False),
 ])
 def test_only_real_domain_names_are_checked(domain, ok):
     assert bool(d.DOMAIN_RE.match(domain)) is ok

@@ -12,7 +12,7 @@
    "industry": "",
    "location": "Denver, Colorado",
    "merged_into": "",
-   "name": "Northvale Roofing Company",
+   "name": "Vellmora Roofing Company",
    "notes": "",
    "phone": "+13035550199",
    "profile_checked_at": false,
@@ -30,13 +30,13 @@
    "created_at": true,
    "cui": "",
    "description": "",
-   "domain": "kettlemanroofing.example",
+   "domain": "brindlewickroofing.example",
    "external_id": "",
    "id": "C2",
    "industry": "",
    "location": "",
    "merged_into": "",
-   "name": "Kettleman",
+   "name": "Brindlewick",
    "notes": "",
    "phone": "",
    "profile_checked_at": false,
@@ -113,7 +113,7 @@
    "created_at": true,
    "kind": "name",
    "source": "manual",
-   "value": "northvale roofing@denver"
+   "value": "vellmora roofing@denver"
   },
   {
    "company_id": "C2",
@@ -121,7 +121,7 @@
    "created_at": true,
    "kind": "domain",
    "source": "manual",
-   "value": "kettlemanroofing.example"
+   "value": "brindlewickroofing.example"
   },
   {
    "company_id": "C3",

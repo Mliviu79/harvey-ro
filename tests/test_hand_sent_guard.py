@@ -21,7 +21,7 @@ def _now_iso():
 
 async def _approved(state, pid, step, campaign_id="c1"):
     await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="hello there",
+        prospect_id=pid, to_email="jane@acme.example", subject="hello there",
         body="A short, plain note. Question?", send_at=_now_iso(),
         status="approved", campaign_id=campaign_id, step=step,
     )
@@ -81,7 +81,7 @@ async def test_restore_reschedules_from_now_keeping_the_gaps(state):
     old = datetime(2026, 1, 1)
     for step, days in ((1, 0), (2, 3)):
         await state.add_outbox_item(
-            prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
+            prospect_id=pid, to_email="jane@acme.example", subject="s", body="b",
             send_at=(old + timedelta(days=days)).isoformat(), status="approved",
             campaign_id="c1", step=step)
     await state.cancel_pending_outbox_for_prospect(pid, reason="sent_by_hand")

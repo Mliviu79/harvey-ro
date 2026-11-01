@@ -124,7 +124,7 @@ CREATE TABLE prospects (
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     , email_status TEXT DEFAULT '');
-INSERT INTO "prospects" VALUES('5a3c0bac997f','','Old','Lead','old@legacy.com',1,'',0,'','CTO','','','','','contacted',0,'','Legacy','','','2026-10-13T17:12:16.602805','2026-10-13T17:12:16.603130','verified');
+INSERT INTO "prospects" VALUES('5a3c0bac997f','','Old','Lead','old@legacy.example',1,'',0,'','CTO','','','','','contacted',0,'','Legacy','','','2026-10-13T17:12:16.602805','2026-10-13T17:12:16.603130','verified');
 CREATE TABLE runs (
         id TEXT PRIMARY KEY,
         stage TEXT DEFAULT '',

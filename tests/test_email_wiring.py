@@ -21,7 +21,7 @@ async def state():
 @pytest.mark.asyncio
 async def test_prospect_email_status_roundtrips(state):
     p = Prospect(
-        first_name="Jane", last_name="Doe", email="jane.doe@acme.com",
+        first_name="Jane", last_name="Doe", email="jane.doe@acme.example",
         title="VP Sales", email_status="verified", email_verified=True,
     )
     pid = await state.add_prospect(p)
@@ -35,13 +35,13 @@ async def test_update_prospect_email(state):
     p = Prospect(first_name="Jane", last_name="Doe", title="VP", email_status="guess")
     pid = await state.add_prospect(p)
 
-    await state.update_prospect_email(pid, "jane@acme.com", "verified")
+    await state.update_prospect_email(pid, "jane@acme.example", "verified")
     fetched = await state.get_prospect(pid)
-    assert fetched.email == "jane@acme.com"
+    assert fetched.email == "jane@acme.example"
     assert fetched.email_status == "verified"
     assert fetched.email_verified is True
 
-    await state.update_prospect_email(pid, "jane@acme.com", "invalid")
+    await state.update_prospect_email(pid, "jane@acme.example", "invalid")
     fetched = await state.get_prospect(pid)
     assert fetched.email_status == "invalid"
     assert fetched.email_verified is False
@@ -49,23 +49,23 @@ async def test_update_prospect_email(state):
 
 @pytest.mark.asyncio
 async def test_save_email_pattern_keeps_highest_confidence(state):
-    await state.save_email_pattern("acme.com", pattern="{f}.{l}", source="default", confidence=0.3)
-    await state.save_email_pattern("acme.com", pattern="{fi}{l}", source="hunter", confidence=0.9)
-    cached = await state.get_email_pattern("acme.com")
+    await state.save_email_pattern("acme.example", pattern="{f}.{l}", source="default", confidence=0.3)
+    await state.save_email_pattern("acme.example", pattern="{fi}{l}", source="hunter", confidence=0.9)
+    cached = await state.get_email_pattern("acme.example")
     assert cached["pattern"] == "{fi}{l}"
     assert cached["confidence"] == 0.9
 
     # A lower-confidence write must not clobber the better pattern
-    await state.save_email_pattern("acme.com", pattern="{f}", source="default", confidence=0.2)
-    cached = await state.get_email_pattern("acme.com")
+    await state.save_email_pattern("acme.example", pattern="{f}", source="default", confidence=0.2)
+    cached = await state.get_email_pattern("acme.example")
     assert cached["pattern"] == "{fi}{l}"
 
 
 @pytest.mark.asyncio
 async def test_save_email_pattern_updates_catch_all_independently(state):
-    await state.save_email_pattern("acme.com", pattern="{f}.{l}", confidence=0.6, mx_type="google")
-    await state.save_email_pattern("acme.com", is_catch_all=1)
-    cached = await state.get_email_pattern("acme.com")
+    await state.save_email_pattern("acme.example", pattern="{f}.{l}", confidence=0.6, mx_type="google")
+    await state.save_email_pattern("acme.example", is_catch_all=1)
+    cached = await state.get_email_pattern("acme.example")
     assert cached["is_catch_all"] == 1
     assert cached["pattern"] == "{f}.{l}"   # unchanged
     assert cached["mx_type"] == "google"
@@ -80,7 +80,7 @@ async def test_migration_downgrades_legacy_verified(state):
         await db.execute(
             "INSERT INTO prospects (id, first_name, last_name, email, "
             "email_verified, email_status, title, status) "
-            "VALUES ('leg1','Old','Row','old@acme.com',1,'guess','VP','new')"
+            "VALUES ('leg1','Old','Row','old@acme.example',1,'guess','VP','new')"
         )
         await db.commit()
     p = await state.get_prospect("leg1")
@@ -109,7 +109,7 @@ async def test_sender_only_sends_verified(state, monkeypatch):
     for name, status in [("Ver", "verified"), ("Gue", "guess"), ("Ris", "risky")]:
         p = Prospect(
             first_name=name, last_name="X", title="VP",
-            email=f"{name.lower()}@acme.com", email_status=status,
+            email=f"{name.lower()}@acme.example", email_status=status,
             email_verified=(status == "verified"), status="new",
         )
         ids[status] = await state.add_prospect(p)

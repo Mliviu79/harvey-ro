@@ -105,7 +105,7 @@ def test_the_english_site_is_read_through_its_own_menu():
     # card ("Owner and Lead Dentist", a role, not another practice).
     people = [(p.first_name, p.last_name, p.fields.get("owner")) for p in draft.people]
     assert people[0] == ("Maren", "Calloway", True)
-    assert {p[:2] for p in people} == {("Maren", "Calloway"), ("Lena", "Brightwater"),
+    assert {p[:2] for p in people} == {("Maren", "Calloway"), ("Lena", "Calderwyn"),
                                         ("Theo", "Ashgrove")}
     [owner] = [f for f in draft.facts if f.code == "LIKELY_OWNER"]
     assert owner.value_num == 1 and owner.value_text.startswith("Maren Calloway — ")
@@ -253,7 +253,7 @@ def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
         "Maren Calloway", "Owner and Lead Dentist")
     assert _addresses(db, cid) == [
         # Published on the site: theirs as it is, no check spent.
-        ("Lena Brightwater", "lena@harborlinedental.example", "unchecked", "confirmed"),
+        ("Lena Calderwyn", "lena@harborlinedental.example", "unchecked", "confirmed"),
         ("Maren Calloway", "maren@harborlinedental.example", "unchecked", "confirmed"),
         # Built the way the site spells addresses; no verifier confirmed
         # it, so a guess, and no surer than likely.
@@ -654,12 +654,12 @@ def test_with_no_cap_published_addresses_are_still_linked_to_their_people(tmp_pa
 
     cid, free, linked, searched = run(go())
     assert linked == [
-        ("Lena Brightwater", "lena@harborlinedental.example", "unchecked", "confirmed"),
+        ("Lena Calderwyn", "lena@harborlinedental.example", "unchecked", "confirmed"),
         ("Maren Calloway", "maren@harborlinedental.example", "unchecked", "confirmed"),
     ]
     assert "address" not in free.steps
     # Theo has no address of his own: not marked searched, left for a cap.
-    assert searched == [("Lena Brightwater", "found"), ("Maren Calloway", "found")]
+    assert searched == [("Lena Calderwyn", "found"), ("Maren Calloway", "found")]
     # The capped run builds his, and links the others once.
     assert _addresses(db, cid) == linked + [
         ("Theo Ashgrove", "theo@harborlinedental.example", "guess", "likely")]
@@ -688,7 +688,7 @@ def test_with_no_cap_a_guess_on_file_is_never_linked_as_published(tmp_path, no_n
         return cid
 
     cid = run(go())
-    assert [a[0] for a in _addresses(db, cid)] == ["Lena Brightwater", "Maren Calloway"]
+    assert [a[0] for a in _addresses(db, cid)] == ["Lena Calderwyn", "Maren Calloway"]
 
 
 def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_not_at_all(
@@ -709,7 +709,7 @@ def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_n
     assert {a[3] for a in _addresses(db, cid)} == {"likely"} and len(_addresses(db, cid)) == 2
     db.unlink()
     # A site that may be another business's (neither its name nor its town).
-    cid, found = run(go("unconfirmed", "QUILLNEST LOGISTICS", "Northvale"))
+    cid, found = run(go("unconfirmed", "QUILLNEST LOGISTICS", "Vellmora"))
     assert found.trust == "unconfirmed" and _addresses(db, cid) == []
 
 

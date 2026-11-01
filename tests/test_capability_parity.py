@@ -172,9 +172,9 @@ def run_discovery():
 # ── Recorded answers (invented businesses, example domains) ──
 
 DFS_LISTINGS = {"status_code": 20000, "cost": 0.0132, "tasks": [{"status_code": 20000, "result": [{"items": [
-    {"title": "Northvale Roofing Company", "category": "Roofing contractor",
+    {"title": "Vellmora Roofing Company", "category": "Roofing contractor",
      "place_id": "ChIJnorth1", "cid": "1001", "phone": "+13035550199",
-     "url": "https://www.northvaleroofing.example/", "domain": "northvaleroofing.example",
+     "url": "https://www.vellmoraroofing.example/", "domain": "vellmoraroofing.example",
      "address": "1400 Example Row", "address_info": {"city": "Denver", "region": "Colorado"},
      "is_claimed": True, "rating": {"value": 4.4, "votes_count": 512},
      "check_url": "https://maps.example/?cid=1001"},
@@ -187,23 +187,23 @@ DFS_LISTINGS = {"status_code": 20000, "cost": 0.0132, "tasks": [{"status_code": 
 ]}]}]}
 
 DFS_SERP = {"status_code": 20000, "cost": 0.006, "tasks": [{"status_code": 20000, "result": [{"items": [
-    {"type": "local_pack", "rank_group": 1, "title": "Kettleman Roofing",
-     "domain": "kettlemanroofing.example", "url": "https://kettlemanroofing.example/",
+    {"type": "local_pack", "rank_group": 1, "title": "Brindlewick Roofing",
+     "domain": "brindlewickroofing.example", "url": "https://brindlewickroofing.example/",
      "phone": "+15550100411", "rating": {"value": 4.8, "votes_count": 90}},
     {"type": "local_pack", "rank_group": 2, "title": "Pack Only Roofing", "cid": "77",
      "phone": "+15550100422"},
     {"type": "organic", "rank_group": 1, "domain": "yelp.com",
      "url": "https://yelp.com/denver", "title": "Best Roofers"},
-    {"type": "organic", "rank_group": 14, "domain": "kettlemanroofing.example",
-     "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing | Denver"},
-    {"type": "organic", "rank_group": 17, "domain": "northvaleroofing.example",
-     "url": "https://www.northvaleroofing.example/roofs", "title": "Northvale Roofing Company"},
+    {"type": "organic", "rank_group": 14, "domain": "brindlewickroofing.example",
+     "url": "https://brindlewickroofing.example/", "title": "Brindlewick Roofing | Denver"},
+    {"type": "organic", "rank_group": 17, "domain": "vellmoraroofing.example",
+     "url": "https://www.vellmoraroofing.example/roofs", "title": "Vellmora Roofing Company"},
 ]}]}]}
 
 DFS_MAPS = {"status_code": 20000, "cost": 0.002, "tasks": [{"status_code": 20000, "result": [{"items": [
-    {"type": "maps_search", "rank_group": 1, "title": "Northvale Roofing Company",
-     "place_id": "ChIJnorth1", "cid": "1001", "domain": "northvaleroofing.example",
-     "url": "https://www.northvaleroofing.example/", "phone": "+13035550199",
+    {"type": "maps_search", "rank_group": 1, "title": "Vellmora Roofing Company",
+     "place_id": "ChIJnorth1", "cid": "1001", "domain": "vellmoraroofing.example",
+     "url": "https://www.vellmoraroofing.example/", "phone": "+13035550199",
      "category": "Roofing contractor", "is_claimed": True,
      "address_info": {"city": "Denver", "region": "Colorado"},
      "rating": {"value": 4.5, "votes_count": 515}},
@@ -214,13 +214,13 @@ DFS_MAPS = {"status_code": 20000, "cost": 0.002, "tasks": [{"status_code": 20000
 ]}]}]}
 
 SERPER = {"organic": [
-    {"title": "Kettleman Roofing", "link": "https://www.kettlemanroofing.example/", "position": 3},
+    {"title": "Brindlewick Roofing", "link": "https://www.brindlewickroofing.example/", "position": 3},
     {"title": "Angi", "link": "https://www.angi.com/companylist/denver/roofing", "position": 4},
     {"title": "Brightpath Labs - backed by Y Combinator",
      "link": "https://brightpathlabs.example/about", "position": 5},
     {"title": "Careers at Lumenhaus", "link": "https://jobs.lever.co/lumenhaus.example/123",
      "position": 6},
-    {"title": "Northvale Roofing Company", "link": "https://northvaleroofing.example/", "position": 8},
+    {"title": "Vellmora Roofing Company", "link": "https://vellmoraroofing.example/", "position": 8},
 ]}
 
 TINYFISH = {"query": "roofer Denver, CO", "results": [
@@ -240,8 +240,8 @@ OVERPASS = {"elements": [
 ]}
 
 SCAVIO_MAPS = {"local_results": [
-    {"position": 1, "title": "Kettleman Roofing", "place_id": "ChIJkettle",
-     "website": "https://www.kettlemanroofing.example/?utm_source=gbp",
+    {"position": 1, "title": "Brindlewick Roofing", "place_id": "ChIJkettle",
+     "website": "https://www.brindlewickroofing.example/?utm_source=gbp",
      "phone": "(303) 555-0199", "address": "12 Grant St, Denver, CO 80203",
      "type": "Roofing contractor", "rating": 4.9, "reviews": 409},
     {"position": 2, "title": "No Site Roofing", "place_id": "ChIJnosite2",
@@ -249,7 +249,7 @@ SCAVIO_MAPS = {"local_results": [
 ], "credits_used": 1}
 
 SCAVIO_SEARCH = {"organic_results": [
-    {"position": 1, "title": "Kettleman Roofing | Denver", "link": "https://www.kettlemanroofing.example/"},
+    {"position": 1, "title": "Brindlewick Roofing | Denver", "link": "https://www.brindlewickroofing.example/"},
     {"position": 2, "title": "Summit Roofing", "link": "https://summitroofing.example/"},
 ], "credits_used": 1, "pagination": {"current": 1}}
 
@@ -292,9 +292,9 @@ async def test_discovery_search(state, monkeypatch, provider):
     recorded(monkeypatch, provider_handler)
     # On file before the run: the same business by phone and name in its
     # town (merged automatically), and one by domain (the same record).
-    await state.save_company(Company(name="Northvale Roofing Company", phone="+13035550199",
+    await state.save_company(Company(name="Vellmora Roofing Company", phone="+13035550199",
                                      location="Denver, Colorado", source="manual"))
-    await state.add_company(Company(name="Kettleman", domain="kettlemanroofing.example",
+    await state.add_company(Company(name="Brindlewick", domain="brindlewickroofing.example",
                                     source="manual"))
     term = "roofer"
     queries = [D.DiscoveryQuery(term=term, **DENVER), D.DiscoveryQuery(term=term, **DENVER)]

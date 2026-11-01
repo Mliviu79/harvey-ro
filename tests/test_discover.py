@@ -105,8 +105,8 @@ def biz(**kw):
     "yelp.com", "www.yellowpages.com", "angi.com", "homeadvisor.com",
     "facebook.com", "linkedin.com", "thumbtack.com", "houzz.com",
     "en.wikipedia.org", "reddit.com", "indeed.com",
-    "miami.edu", "ufhealth.org", "umiamihealth.org",
-    "somehospital.com", "mysite.wordpress.com", "shop.shopify.com",
+    "example.edu", "examplehealth.org", "uexamplehealth.org",
+    "somehospital.example", "mysite.wordpress.com", "shop.shopify.com",
     "192.168.1.1", "localhost",
 ])
 def test_directories_and_institutions_are_junk(domain):
@@ -114,8 +114,8 @@ def test_directories_and_institutions_are_junk(domain):
 
 
 @pytest.mark.parametrize("domain", [
-    "kettlemanroofing.example", "northvaleroofing.example", "sandpiperexteriors.com",
-    "quarrylaneroofing.com", "smith-and-sons.co.uk", "acme.dental",
+    "brindlewickroofing.example", "vellmoraroofing.example", "wrenfieldexteriors.example",
+    "tallowbrookroofing.example", "smith-and-sons.example.co.uk", "acme.example.dental",
 ])
 def test_real_businesses_survive_the_filter(domain):
     assert not D.is_junk(domain)
@@ -125,10 +125,10 @@ def test_listicle_titles_are_junk_even_with_a_clean_domain():
     assert D.is_junk("", "10 Best Roofers in Denver")
     assert D.is_junk("example.com", "Top Roofing Contractors in Dallas")
     assert D.is_junk("example.com", "Roofer Directory")
-    assert not D.is_junk("example.com", "Northvale Roofing Company")
+    assert not D.is_junk("example.com", "Vellmora Roofing Company")
     assert D.is_junk("example.net", "Ohio HOA Management Company List")
     assert D.is_junk("example.com", "List of Plumbers in Austin")
-    assert not D.is_junk("example.com", "Northvale Management")
+    assert not D.is_junk("example.com", "Vellmora Management")
 
 
 def test_normalize_domain_is_the_entity_key():
@@ -222,7 +222,7 @@ async def test_nothing_runs_until_signals_are_confirmed(state, config, register)
 @pytest.mark.asyncio
 async def test_rerun_finds_everyone_already_known(state, config, register):
     batch = [
-        biz(name="Northvale Roofing", domain="northvaleroofing.example"),
+        biz(name="Vellmora Roofing", domain="vellmoraroofing.example"),
         biz(name="No Site Roofing", external_id="osm:node/1", has_website=False),
     ]
     register(FakeProvider([list(batch), list(batch)]))
@@ -255,7 +255,7 @@ async def test_websiteless_businesses_are_kept_and_deduped(state, config, regist
 @pytest.mark.asyncio
 async def test_duplicates_within_one_run_are_collapsed(state, config, register):
     register(FakeProvider([[
-        biz(domain="northvale.com"), biz(domain="northvale.com"), biz(domain="other.com"),
+        biz(domain="vellmora.example"), biz(domain="vellmora.example"), biz(domain="other.example"),
     ]]))
     report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
@@ -266,7 +266,7 @@ async def test_duplicates_within_one_run_are_collapsed(state, config, register):
 @pytest.mark.asyncio
 async def test_junk_is_counted_not_silently_dropped(state, config, register):
     register(FakeProvider([[
-        biz(domain="yelp.com"), biz(domain="angi.com"), biz(domain="real.com"),
+        biz(domain="yelp.com"), biz(domain="angi.com"), biz(domain="real.example"),
     ]]))
     report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
@@ -280,7 +280,7 @@ async def test_junk_is_counted_not_silently_dropped(state, config, register):
 @pytest.mark.asyncio
 async def test_every_fact_becomes_an_observation(state, config, register):
     register(FakeProvider([[biz(
-        name="Northvale", domain="northvale.com", rank=14, rating=4.6,
+        name="Vellmora", domain="vellmora.example", rank=14, rating=4.6,
         review_count=88, is_claimed=False, has_website=True,
     )]]))
     await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
@@ -301,7 +301,7 @@ async def test_unconfirmed_signals_are_not_recorded(state, config, register):
     """The confirmation gate has to hold inside the collector, not just in
     the UI that sets it."""
     await state.set_signal_status("REVIEW_RATING", "rejected")
-    register(FakeProvider([[biz(domain="northvale.com", rating=4.6, review_count=88)]]))
+    register(FakeProvider([[biz(domain="vellmora.example", rating=4.6, review_count=88)]]))
     await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
     codes = {o["signal_code"] for o in await state.get_observations()}
@@ -350,9 +350,9 @@ DFS_LISTINGS = {
     "cost": 0.0132,
     "tasks": [{"status_code": 20000, "result": [{"items": [
         {
-            "title": "Northvale Roofing Company", "category": "Roofing contractor",
+            "title": "Vellmora Roofing Company", "category": "Roofing contractor",
             "place_id": "ChIJabc123", "phone": "+15550100199",
-            "url": "https://www.northvaleroofing.example/", "domain": "northvaleroofing.example",
+            "url": "https://www.vellmoraroofing.example/", "domain": "vellmoraroofing.example",
             "address": "1400 Example Row, Raleigh, NC",
             "address_info": {"city": "Raleigh", "region": "North Carolina"},
             "is_claimed": True,
@@ -378,15 +378,15 @@ DFS_SERP = {
          "position": "left", "domain": "yelp.com",
          "url": "https://yelp.com/denver", "title": "Best Roofers"},
         {"type": "organic", "rank_group": 14, "rank_absolute": 18,
-         "position": "left", "domain": "kettlemanroofing.example",
-         "url": "https://kettlemanroofing.example/", "title": "Kettleman Roofing"},
+         "position": "left", "domain": "brindlewickroofing.example",
+         "url": "https://brindlewickroofing.example/", "title": "Brindlewick Roofing"},
         {"type": "paid", "rank_group": 1, "domain": "ads.example.com"},
         {"type": "people_also_ask", "rank_group": 2},
     ]}]}],
 }
 
 SERPER_RESPONSE = {"organic": [
-    {"title": "Kettleman Roofing", "link": "https://www.kettlemanroofing.example/",
+    {"title": "Brindlewick Roofing", "link": "https://www.brindlewickroofing.example/",
      "position": 3},
     {"title": "Angi", "link": "https://www.angi.com/companylist/denver/roofing",
      "position": 4},
@@ -453,13 +453,13 @@ async def test_dataforseo_listings_adapter():
     assert seen["auth"].startswith("Basic ")
     assert provider.last_cost == pytest.approx(0.0132)
 
-    northvale, nosite = out
-    assert northvale.domain == "northvaleroofing.example"
-    assert northvale.phone == "+15550100199"
-    assert northvale.location == "Raleigh, North Carolina"
-    assert northvale.rating == 4.4 and northvale.review_count == 512
-    assert northvale.has_website is True
-    assert northvale.external_id == "dataforseo:ChIJabc123"
+    vellmora, nosite = out
+    assert vellmora.domain == "vellmoraroofing.example"
+    assert vellmora.phone == "+15550100199"
+    assert vellmora.location == "Raleigh, North Carolina"
+    assert vellmora.rating == 4.4 and vellmora.review_count == 512
+    assert vellmora.has_website is True
+    assert vellmora.external_id == "dataforseo:ChIJabc123"
 
     # The websiteless record is the valuable one — it must survive intact.
     assert nosite.domain == "" and nosite.has_website is False
@@ -478,7 +478,7 @@ async def test_dataforseo_serp_adapter_reads_rank_group_not_position():
             D.DiscoveryQuery(term="roofer", location="Denver", depth=30))
 
     assert [b.rank for b in out] == [1, 14], "paid and PAA rows must be dropped"
-    assert out[1].domain == "kettlemanroofing.example"
+    assert out[1].domain == "brindlewickroofing.example"
 
 
 @pytest.mark.asyncio
@@ -487,7 +487,7 @@ async def test_serper_adapter():
     async with _client(lambda r: httpx.Response(200, json=SERPER_RESPONSE)) as client:
         out = await provider.fetch(client, {"serper_api_key": "k"},
                                    D.DiscoveryQuery(term="roofer", location="Denver"))
-    assert out[0].domain == "kettlemanroofing.example" and out[0].rank == 3
+    assert out[0].domain == "brindlewickroofing.example" and out[0].rank == 3
     # Junk filtering happens in the run, so the adapter still returns Angi.
     assert out[1].domain == "angi.com"
 
@@ -515,8 +515,8 @@ async def test_scavio_maps_adapter():
     provider = D.ScavioMaps()
     seen = []
     payload = {"local_results": [
-        {"position": 1, "title": "Kettleman Roofing", "place_id": "ChIJabc123",
-         "website": "https://www.kettlemanroofing.example/?utm_source=gbp",
+        {"position": 1, "title": "Brindlewick Roofing", "place_id": "ChIJabc123",
+         "website": "https://www.brindlewickroofing.example/?utm_source=gbp",
          "phone": "(303) 555-0199", "address": "12 Grant St, Denver, CO 80203",
          "type": "Roofing contractor", "rating": 4.9, "reviews": 409},
         {"position": 2, "title": "No Site Roofing", "place_id": "ChIJxyz789",
@@ -542,15 +542,15 @@ async def test_scavio_maps_adapter():
     assert len(seen) == 1, "a short page is the last page"
     assert provider.last_cost == pytest.approx(0.01)
 
-    kettleman, nosite = out
-    assert kettleman.domain == "kettlemanroofing.example"
-    assert kettleman.phone == "(303) 555-0199"
-    assert kettleman.category == "Roofing contractor"
-    assert kettleman.rating == 4.9 and kettleman.review_count == 409
-    assert kettleman.external_id == "gmaps:ChIJabc123"
+    brindlewick, nosite = out
+    assert brindlewick.domain == "brindlewickroofing.example"
+    assert brindlewick.phone == "(303) 555-0199"
+    assert brindlewick.category == "Roofing contractor"
+    assert brindlewick.rating == 4.9 and brindlewick.review_count == 409
+    assert brindlewick.external_id == "gmaps:ChIJabc123"
     # A Maps list position is not an organic rank; recording it as one would
     # pollute SERP_RANK. Claimed status is unknown, not False.
-    assert kettleman.rank is None and kettleman.is_claimed is None
+    assert brindlewick.rank is None and brindlewick.is_claimed is None
     assert nosite.domain == "" and nosite.has_website is False
     assert nosite.identity() == "gmaps:ChIJxyz789"
 
@@ -943,7 +943,7 @@ async def test_overpass_falls_over_to_the_next_mirror(monkeypatch, status):
             return httpx.Response(status, text="")
         return httpx.Response(200, json={"elements": [{
             "type": "node", "id": 42,
-            "tags": {"name": "Sandpiper Exteriors", "craft": "roofer",
+            "tags": {"name": "Wrenfield Exteriors", "craft": "roofer",
                      "phone": "+15550100288", "addr:city": "Denver"},
         }]})
 
@@ -952,7 +952,7 @@ async def test_overpass_falls_over_to_the_next_mirror(monkeypatch, status):
         out = await provider.fetch(client, {}, D.DiscoveryQuery(
             term="roofer", coordinate="39.7,-104.9,40"))
     assert len(out) == 1
-    assert out[0].name == "Sandpiper Exteriors"
+    assert out[0].name == "Wrenfield Exteriors"
     assert out[0].external_id == "osm:node/42"
     assert out[0].has_website is False
 
@@ -1122,17 +1122,17 @@ async def test_an_unmappable_term_is_reported_not_silently_skipped(
 # ── business names: SERP titles are page titles, not names ──
 
 @pytest.mark.parametrize("title,domain,expected", [
-    ("Northvale Property Management: HOA Management Company in ...", "northvaleproperty.com",
-     "Northvale Property Management"),
-    ("Home Page - NVCM | Community Association Management", "nvcmnet.com", "NVCM"),
-    ("Northvale Association of Community Managers", "nacm.org",
-     "Northvale Association of Community Managers"),
-    ("Brightwater Texas: Texas HOA Property Management Company", "brightwatertexas.com",
-     "Brightwater Texas"),
+    ("Vellmora Property Management: HOA Management Company in ...", "vellmoraproperty.example",
+     "Vellmora Property Management"),
+    ("Home Page - QVCM | Community Association Management", "qvcmnet.example", "QVCM"),
+    ("Vellmora Association of Community Managers", "vacm.example",
+     "Vellmora Association of Community Managers"),
+    ("Calderwyn Texas: Texas HOA Property Management Company", "calderwyntexas.example",
+     "Calderwyn Texas"),
     # No segment names the business → fall back to the domain, split sensibly.
     ("Denver, CO | HOA Management Firm", "managementharbor.example", "Management Harbor"),
-    ("Texas HOA management", "kqresidential.com", "KQ Residential"),
-    ("Great Texas Community Management Begins Here", "growwithus.us", "Grow With Us"),
+    ("Texas HOA management", "zqresidential.example", "ZQ Residential"),
+    ("Great Texas Community Management Begins Here", "thrivewithus.example", "Thrive With Us"),
 ])
 def test_business_name_from_serp_title(title, domain, expected):
     assert D.business_name(title, domain) == expected
@@ -1145,29 +1145,29 @@ def test_generic_words_alone_never_match_the_domain():
 
 
 def test_site_name_prefers_og_then_title_and_needs_domain_backing():
-    og = '<meta property="og:site_name" content="Grow Community Management" />'
-    assert D.site_name_from_html(og, "growwithus.us") == "Grow Community Management"
-    title = "<title>Lumen Association Management - HOA Company in TX &amp; CO</title>"
-    assert D.site_name_from_html(title, "lumenam.com") == "Lumen Association Management"
+    og = '<meta property="og:site_name" content="Thrive Community Management" />'
+    assert D.site_name_from_html(og, "thrivewithus.example") == "Thrive Community Management"
+    title = "<title>Quillon Association Management - HOA Company in TX &amp; CO</title>"
+    assert D.site_name_from_html(title, "quillonam.example") == "Quillon Association Management"
     both = ('<meta property="og:site_name" content="Management Harbor">'
             "<title>The Management Harbor: Community Management</title>")
     assert D.site_name_from_html(both, "managementharbor.example") == "The Management Harbor"
     assert D.site_name_from_html("<title>Attention Required! | Cloudflare</title>",
-                                 "lumenam.com") == ""
+                                 "quillonam.example") == ""
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('provider', ['serper', 'dataforseo_serp', 'scavio_search'])
 async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, monkeypatch):
     title = 'Top 10 Roofing Companies in Denver'
-    domain = 'milehighguide.com'
+    domain = 'milehighguide.example'
     assert D.is_junk(domain, title)
     item = {'title': title, 'link': f'https://{domain}/roofers',
             'url': f'https://{domain}/roofers', 'domain': domain,
             'position': 1, 'rank_group': 1, 'type': 'organic'}
-    valid = dict(item, title='Kettleman Roofing | Denver',
-                 domain='kettlemanroofing.example', link='https://kettlemanroofing.example',
-                 url='https://kettlemanroofing.example', position=2, rank_group=2)
+    valid = dict(item, title='Brindlewick Roofing | Denver',
+                 domain='brindlewickroofing.example', link='https://brindlewickroofing.example',
+                 url='https://brindlewickroofing.example', position=2, rank_group=2)
     payload = ({'organic': [item, valid]} if provider == 'serper' else
                {'organic_results': [item, valid]} if provider == 'scavio_search' else
                {'status_code': 20000, 'tasks': [{'status_code': 20000,
@@ -1192,22 +1192,22 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     import sqlite3
     with closing(sqlite3.connect(state.db_path)) as db:
         assert db.execute("SELECT domain, name FROM companies").fetchall() == [
-            ("kettlemanroofing.example", "Kettleman Roofing")]
+            ("brindlewickroofing.example", "Brindlewick Roofing")]
 
 
 @pytest.mark.parametrize('title,domain,expected', [
-    ('Contact Us | ContactCraft', 'contactcraft.com', 'ContactCraft'),
-    ('Craft | ContactCraft', 'contactcraft.com', 'ContactCraft'),
-    ('Roofing Services in Denver | Kettleman Roofing', 'kettlemanroofing.example', 'Kettleman Roofing'),
-    ('Plumbing Services in Austin | Acme Plumbing', 'acmeplumbing.com', 'Acme Plumbing'),
+    ('Contact Us | ContactLoom', 'contactloom.example', 'ContactLoom'),
+    ('Loom | ContactLoom', 'contactloom.example', 'ContactLoom'),
+    ('Roofing Services in Denver | Brindlewick Roofing', 'brindlewickroofing.example', 'Brindlewick Roofing'),
+    ('Plumbing Services in Austin | Acme Plumbing', 'acmeplumbing.example', 'Acme Plumbing'),
 ])
 def test_brand_wins_over_generic_service_segment(title, domain, expected):
     assert D.business_name(title, domain) == expected
 
 
 @pytest.mark.parametrize("service,brand,domain", [
-    ("Landscaping", "Kettleman Landscaping", "kettlemanlandscaping.com"),
-    ("Electrical", "Kettleman Electrical", "kettlemanelectrical.com"),
+    ("Landscaping", "Brindlewick Landscaping", "brindlewicklandscaping.example"),
+    ("Electrical", "Brindlewick Electrical", "brindlewickelectrical.example"),
 ])
 def test_service_location_labels_do_not_establish_brand_identity(service, brand, domain):
     label = f"{service} Services in Denver"
@@ -1219,9 +1219,9 @@ def test_service_location_labels_do_not_establish_brand_identity(service, brand,
 
 
 def test_homepage_prefers_stronger_brand_over_longer_partial_match():
-    html = ('<meta property="og:site_name" content="Kettleman Landscaping">'
+    html = ('<meta property="og:site_name" content="Brindlewick Landscaping">'
             '<title>Landscaping Professionals</title>')
-    assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
+    assert D.site_name_from_html(html, "brindlewicklandscaping.example") == "Brindlewick Landscaping"
 
 
 # --- CLI startup key guard -------------------------------------------

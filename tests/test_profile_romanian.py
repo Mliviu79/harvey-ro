@@ -119,7 +119,7 @@ def test_english_cards_need_no_honorific():
     html = """<div><h3>Dale Whitlock</h3><p>Owner</p>
       <h3>Maria Lopez</h3><p>Office Manager</p>
       <h3>Dr. Sam Reed</h3><p>Dentist</p></div>"""
-    people = collector().detect_people(html, domain="acme.com")
+    people = collector().detect_people(html, domain="acme.example")
     assert [(p["first_name"], p["last_name"], p["title"]) for p in people] == [
         ("Dale", "Whitlock", "Owner"), ("Maria", "Lopez", "Office Manager"),
         ("Sam", "Reed", "Dentist")]
@@ -172,14 +172,14 @@ async def team_requests(state, domain):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_english_fallback_paths_when_the_menu_links_nowhere(state):  # noqa: F811
-    assert await team_requests(state, "acme.com") == list(FALLBACK_SITE_PATHS)
+    assert await team_requests(state, "acme.example") == list(FALLBACK_SITE_PATHS)
 
 
 @pytest.mark.asyncio
 async def test_romanian_fallback_paths_go_first(state):  # noqa: F811
     # Ten requests in all, the homepage's among them. (This test and the next
     # read a .ro domain's Romanian paths: no .ro name is reserved for examples.)
-    assert await team_requests(state, "clinica-exemplu.ro") \
+    assert await team_requests(state, "clinica-exemplu.example.ro") \
         == ["/echipa", "/despre-noi", "/medici", "/contact", "/about", "/about-us", "/team",
             "/our-team", "/contact-us"][:MAX_SITE_FETCHES - 1]
 
@@ -196,12 +196,12 @@ async def test_romanian_team_page_is_read_with_the_contact_page(state):  # noqa:
              "/medici": f"<html>{pad}<h3>Dr. Ana Pop</h3><p>Medic primar</p></html>"}
 
     async def fake_fetch(url):
-        return url, pages.get(url.split("clinica-exemplu.ro", 1)[1].rstrip("/"), "")
+        return url, pages.get(url.split("clinica-exemplu.example.ro", 1)[1].rstrip("/"), "")
     c._fetch = fake_fetch
-    cid = await state.add_company(Company(name="Exemplu", domain="clinica-exemplu.ro"))
-    obs = await c.profile_company(cid, "clinica-exemplu.ro")
+    cid = await state.add_company(Company(name="Exemplu", domain="clinica-exemplu.example.ro"))
+    obs = await c.profile_company(cid, "clinica-exemplu.example.ro")
     assert [(o["value_text"], o["evidence_url"]) for o in obs if o["signal_code"] == "CONTACT_FOUND"] \
-        == [("Ana Pop — Medic primar", "https://clinica-exemplu.ro/medici")]
+        == [("Ana Pop — Medic primar", "https://clinica-exemplu.example.ro/medici")]
     read = [url for url, _ in c.pages_read[cid]]
-    assert read == ["https://clinica-exemplu.ro", "https://clinica-exemplu.ro/medici",
-                    "https://clinica-exemplu.ro/contact"]
+    assert read == ["https://clinica-exemplu.example.ro", "https://clinica-exemplu.example.ro/medici",
+                    "https://clinica-exemplu.example.ro/contact"]

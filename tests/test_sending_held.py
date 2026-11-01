@@ -156,7 +156,7 @@ async def test_gmail_says_which_sign_in_problem_it_is(monkeypatch, stored, statu
 
 
 def test_a_reply_that_couldnt_be_handled_is_worded_as_that():
-    reason = "a reply from ann@gmail.com couldn't be handled (KeyError: 'signature' not authorized pages)"
+    reason = "a reply from exemplu.fictiv.0001@gmail.com couldn't be handled (KeyError: 'signature' not authorized pages)"
     title, detail = held_message({"reason": reason, "since": "2026-10-24T08:00:00"}, waiting=1)
     assert "couldn't handle a reply" in title
     assert "harvey gmail auth" not in detail and "more mail" not in detail

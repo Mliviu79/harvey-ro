@@ -29,9 +29,9 @@ def test_role_or_junk_addresses_teach_nothing(local):
 
 def test_an_address_tied_to_a_named_person_beats_guessing():
     known, pattern, conf = ef.site_email_evidence(
-        ["nvale@acme.com", "info@acme.com", "dana@other.com"],
-        [("Nora", "Vale")], "acme.com")
-    assert known == [("nvale@acme.com", "Nora", "Vale")]
+        ["nvale@acme.example", "info@acme.example", "dana@other.example"],
+        [("Nora", "Vale")], "acme.example")
+    assert known == [("nvale@acme.example", "Nora", "Vale")]
     assert pattern == "{fi}{l}" and conf >= 0.9
 
 
@@ -46,14 +46,14 @@ def test_a_named_surname_disambiguates_an_untied_address():
     # Nobody named Jake Smith, but Amy Smith works there: jsmith@ is an
     # initial plus a surname, not a first name.
     known, pattern, conf = ef.site_email_evidence(
-        ["jsmith@acme.com"], [("Amy", "Smith"), ("Nora", "Vale")], "acme.com")
+        ["jsmith@acme.example"], [("Amy", "Smith"), ("Nora", "Vale")], "acme.example")
     assert known == [] and pattern == "{fi}{l}" and conf < 0.9
 
 
-@pytest.mark.parametrize("address, pattern", [("jsmith@acme.com", "{fi}{l}"), ("smith@acme.com", "{l}")])
+@pytest.mark.parametrize("address, pattern", [("jsmith@acme.example", "{fi}{l}"), ("smith@acme.example", "{l}")])
 def test_an_address_two_named_people_could_own_is_format_evidence_only(address, pattern):
     known, learned, _ = ef.site_email_evidence(
-        [address], [("John", "Smith"), ("Jane", "Smith")], "acme.com")
+        [address], [("John", "Smith"), ("Jane", "Smith")], "acme.example")
     assert known == [] and learned == pattern
 
 
@@ -68,11 +68,11 @@ async def test_never_guess_an_address_another_named_person_could_own(monkeypatch
     monkeypatch.setattr(ef, "get_mx_host", mx)
     monkeypatch.setattr(ef, "_verify_candidate", verified)
     st = PatternState({"pattern": "{fi}{l}", "source": "site_address", "confidence": 0.9})
-    result = await ef.find_email("Jane", "Smith", "acme.com", cached=st.cached,
+    result = await ef.find_email("Jane", "Smith", "acme.example", cached=st.cached,
                                  other_people=[("John", "Smith")])
     assert result.email == "" and result.status != "verified"
     st = PatternState({"pattern": "{l}", "source": "site_address", "confidence": 0.9})
-    result = await ef.find_email("Jane", "Smith", "acme.com", cached=st.cached,
+    result = await ef.find_email("Jane", "Smith", "acme.example", cached=st.cached,
                                  other_people=[("John", "Smith")])
     assert result.email == ""
 
@@ -85,8 +85,8 @@ async def test_another_persons_published_address_is_never_this_persons_guess(mon
     monkeypatch.setattr(ef, "get_mx_host", mx)
     st = PatternState({"pattern": "{f}", "source": "site_address", "confidence": 0.9})
     result = await ef.find_email(
-        "Nora", "Quist", "acme.com", verify=False, cached=st.cached, other_people=[("Nora", "Vale")],
-        known_emails=[("nora@acme.com", "Nora", "Vale")])
+        "Nora", "Quist", "acme.example", verify=False, cached=st.cached, other_people=[("Nora", "Vale")],
+        known_emails=[("nora@acme.example", "Nora", "Vale")])
     assert result.email == ""
 
 
@@ -117,7 +117,7 @@ class PatternState:
 async def test_a_cached_default_does_not_block_a_known_address():
     st = PatternState({"pattern": "{f}.{l}", "source": "default", "confidence": 0.3})
     pattern, source, _ = await ef.derive_pattern(
-        "acme.com", known_emails=[("nvale@acme.com", "Nora", "Vale")], cached=st.cached)
+        "acme.example", known_emails=[("nvale@acme.example", "Nora", "Vale")], cached=st.cached)
     assert (pattern, source) == ("{fi}{l}", "known_email")
 
 
@@ -132,8 +132,8 @@ async def test_a_cached_default_does_not_block_hunter(monkeypatch):
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
     st = PatternState({"pattern": "{f}.{l}", "source": "default", "confidence": 0.3})
-    assert (await ef.derive_pattern("acme.com", cached=st.cached))[0] == "{fi}{l}"
-    assert calls == ["acme.com"]
+    assert (await ef.derive_pattern("acme.example", cached=st.cached))[0] == "{fi}{l}"
+    assert calls == ["acme.example"]
 
 
 @pytest.mark.asyncio
@@ -146,11 +146,11 @@ async def test_hunter_is_not_asked_twice_about_a_domain_it_had_no_pattern_for(mo
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
-    first = await ef.derive_pattern("acme.com", cached=None)
-    assert first[1] == "default_after_hunter" and calls == ["acme.com"]
+    first = await ef.derive_pattern("acme.example", cached=None)
+    assert first[1] == "default_after_hunter" and calls == ["acme.example"]
     st = PatternState({"pattern": first[0], "source": first[1], "confidence": first[2]})
-    await ef.derive_pattern("acme.com", cached=st.cached)
-    assert calls == ["acme.com"]
+    await ef.derive_pattern("acme.example", cached=st.cached)
+    assert calls == ["acme.example"]
 
 
 @pytest.mark.asyncio
@@ -164,11 +164,11 @@ async def test_a_low_confidence_site_guess_still_gets_one_hunter_lookup(monkeypa
     monkeypatch.setattr(ef, "_hunter_domain_pattern", hunter)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
     cached = {"pattern": "{fi}{l}", "source": "site_address_guess", "confidence": 0.6}
-    pattern, source, conf = await ef.derive_pattern("acme.com", cached=cached)
-    assert calls == ["acme.com"] and pattern == "{fi}{l}" and source.endswith("_after_hunter")
-    await ef.derive_pattern("acme.com", cached=(
+    pattern, source, conf = await ef.derive_pattern("acme.example", cached=cached)
+    assert calls == ["acme.example"] and pattern == "{fi}{l}" and source.endswith("_after_hunter")
+    await ef.derive_pattern("acme.example", cached=(
         {"pattern": pattern, "source": source, "confidence": conf}))
-    assert calls == ["acme.com"]
+    assert calls == ["acme.example"]
 
 
 @pytest.mark.asyncio
@@ -178,7 +178,7 @@ async def test_a_hunter_outage_is_not_remembered_as_no_pattern(monkeypatch):
 
     monkeypatch.setattr(ef, "_hunter_domain_pattern", down)
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "k")
-    _, source, _ = await ef.derive_pattern("acme.com", cached=None)
+    _, source, _ = await ef.derive_pattern("acme.example", cached=None)
     assert source == "default"      # asked again next time
 
 
@@ -203,14 +203,14 @@ async def test_hunter_errors_are_transient(monkeypatch, status):
 
     monkeypatch.setattr(ef.httpx, "AsyncClient", Client)
     with pytest.raises(ef.HunterUnavailable):
-        await ef._hunter_domain_pattern("acme.com", "k")
+        await ef._hunter_domain_pattern("acme.example", "k")
 
 
 @pytest.mark.asyncio
 async def test_a_small_business_with_no_evidence_defaults_to_first_name(monkeypatch):
     monkeypatch.setattr(ef, "_hunter_api_key", lambda env: "")
     pattern, source, conf = await ef.derive_pattern(
-        "acme.com", cached=None, default_pattern=ef.SMALL_BUSINESS_PATTERN)
+        "acme.example", cached=None, default_pattern=ef.SMALL_BUSINESS_PATTERN)
     assert (pattern, source) == ("{f}", "default") and conf < 0.5
 
 

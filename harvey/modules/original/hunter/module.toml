@@ -1,8 +1,8 @@
-# Hunter.io: a domain's address pattern and the people it knows there, plus
-# a verification fallback. Searches are counted against a monthly cap.
+# Hunter.io: a domain's email address pattern, plus a verification
+# fallback. Searches are counted against a monthly cap.
 id = "hunter"
 name = "Hunter"
-description = "A domain's address pattern and the people Hunter knows there."
+description = "Looks up a domain's email address pattern, and checks an address when the other verifiers can't."
 set = "original"
 kind = "enricher"
 version = "0.3.0"

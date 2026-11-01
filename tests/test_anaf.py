@@ -41,7 +41,7 @@ A, B, C = cui("9100001"), cui("9100002"), cui("9100003")
 
 
 def answer(number: str, *, vat=True, inactive=False, cash=False, split=False, efactura=True,
-           phone="0268 100 200", form="SOCIETATE CU RASPUNDERE LIMITATA",
+           phone="0268 000 210", form="SOCIETATE CU RASPUNDERE LIMITATA",
            status="INREGISTRAT din data 01.03.2015", fiscal_street="Str. Exemplu"):
     """One invented company as ANAF's v9 answers for it."""
     return {
@@ -136,13 +136,13 @@ def test_an_answer_becomes_facts_and_phones():
     assert ("EFACTURA_REGISTERED", 1.0, "") in got
     assert ("REGISTRATION_STATUS", None, "INREGISTRAT") in got  # the date left out
     assert ("LEGAL_FORM", None, "SOCIETATE CU RASPUNDERE LIMITATA") in got
-    assert ("PHONE_NUMBER", None, "+40268100200") in got
+    assert ("PHONE_NUMBER", None, "+40268000210") in got
     addresses = [f.value_text for f in facts if f.code == "ADDRESS"]
     assert addresses == ["Str. Exemplu 1, Mun. Braşov, BRAŞOV, 500001"]   # one: the same place
     assert all(f.record == "c1" and f.collector == "anaf" and f.source_url == service.API_URL
                for f in facts)
     assert [(c.kind, c.value, c.display) for c in contacts] == [
-        ("phone", "+40268100200", "+40 268 100 200")]
+        ("phone", "+40268000210", "+40 268 000 210")]
 
 
 def test_an_inactive_company_and_a_fiscal_domicile_elsewhere():
@@ -155,8 +155,8 @@ def test_an_inactive_company_and_a_fiscal_domicile_elsewhere():
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("0268 100 200 / 0722 100 200", ["+40268100200", "+40722100200"]),
-    ("268100200", ["+40268100200"]),           # the trunk 0 left out
+    ("0268 000 210 / 0722 000 210", ["+40268000210", "+40722000210"]),
+    ("268000210", ["+40268000210"]),           # the trunk 0 left out
     ("0", []), ("", []), ("12345", []),
 ])
 def test_a_register_phone_field(raw, expected):
@@ -374,10 +374,10 @@ def readings(state, code):
 @pytest.mark.asyncio
 async def test_a_check_records_confirmed_facts_only_when_they_change(state, monkeypatch):
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
-    b = await state.add_company(Company(name="EXEMPLU B SRL", cui=B, phone="0268 999 999",
+    b = await state.add_company(Company(name="EXEMPLU B SRL", cui=B, phone="0268 000 990",
                                         source="registry:onrc"))
     asked = []
-    stub_anaf(monkeypatch, {A: answer(A), B: answer(B, phone="0722 100 200")}, asked)
+    stub_anaf(monkeypatch, {A: answer(A), B: answer(B, phone="0722 000 210")}, asked)
     for code in ("FISCALLY_INACTIVE", "VAT_REGISTERED", "PHONE_NUMBER", "ADDRESS"):
         await state.set_signal_status(code, "confirmed")
 
@@ -388,10 +388,10 @@ async def test_a_check_records_confirmed_facts_only_when_they_change(state, monk
     assert sorted(readings(state, "FISCALLY_INACTIVE")) == sorted([(a, 0.0, "", "anaf"),
                                                                    (b, 0.0, "", "anaf")])
     # A phone fills only a company that has none.
-    assert (await state.get_company(a)).phone == "+40 268 100 200"
-    assert (await state.get_company(b)).phone == "0268 999 999"
+    assert (await state.get_company(a)).phone == "+40 268 000 210"
+    assert (await state.get_company(b)).phone == "0268 000 990"
     assert first["phones_set"] == 1
-    assert {r[2] for r in readings(state, "PHONE_NUMBER")} == {"+40268100200", "+40722100200"}
+    assert {r[2] for r in readings(state, "PHONE_NUMBER")} == {"+40268000210", "+40722000210"}
 
     # Asked again with nothing changed: nothing new is written.
     service.keep(service.CACHE_PATH, {}, set())
@@ -512,7 +512,7 @@ async def test_a_registry_pull_hands_each_saved_batch_to_the_follow_up(state, mo
 def _fixture_answer(i: int, number: str):
     """A varied invented answer: inactive or not, VAT or not, a fiscal
     domicile elsewhere, no phone, or a phone several companies share."""
-    phone = "" if i % 6 == 0 else "0268 100 200" if i % 13 == 0 else f"0722 {100 + i:03d} 200"
+    phone = "" if i % 6 == 0 else "0268 000 210" if i % 13 == 0 else f"0722 000 {i:03d}"
     return answer(number, vat=i % 3 != 0, inactive=i % 5 == 0, cash=i % 4 == 0,
                   phone=phone, fiscal_street="Str. Fiscală" if i % 4 == 1 else "Str. Exemplu")
 
@@ -525,7 +525,7 @@ async def _fixture(sm, n=230):
     for i in range(n):
         number = cui(str(9300000 + i))
         await sm.add_company(Company(name=f"EXEMPLU {i} SRL", cui=number,
-                                     phone="0268 999 000" if i % 7 == 0 else "",
+                                     phone="0268 000 900" if i % 7 == 0 else "",
                                      location="Brașov, Brașov, Romania",
                                      source="registry:onrc"))
         if i % 11:
@@ -990,10 +990,10 @@ def test_a_company_panel_shows_findings_official_first(client, monkeypatch, tmp_
         for code in ("PHONE_NUMBER", "ADDRESS", "VAT_REGISTERED"):
             await sm.set_signal_status(code, "confirmed")
         await sm.add_observations([
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40722100200",
+            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40722000210",
              "module": "phones", "capability": "site_phones", "collector": "profile",
              "observed_at": "2026-10-01 10:00:00"},
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268100200",
+            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268000210",
              "module": "anaf", "capability": "company_check", "collector": "anaf",
              "observed_at": "2026-09-01 10:00:00"},
             {"company_id": cid, "signal_code": "ADDRESS", "value_text": "Str. Exemplu 1",
@@ -1006,10 +1006,10 @@ def test_a_company_panel_shows_findings_official_first(client, monkeypatch, tmp_
     cid = asyncio.run(setup())
     data = client.get(f"/api/companies/{cid}").json()
     phones = data["findings"]["phones"]
-    assert [p["value"] for p in phones] == ["+40268100200", "+40722100200"]   # official first
+    assert [p["value"] for p in phones] == ["+40268000210", "+40722000210"]   # official first
     assert phones[0]["official"] and phones[0]["sources"][0]["name"] == "ANAF – date firmă"
-    assert phones[0]["display"] == "+40 268 100 200"
-    assert data["other_phones"][0] in ("+40 268 100 200", "+40268100200")
+    assert phones[0]["display"] == "+40 268 000 210"
+    assert data["other_phones"][0] in ("+40 268 000 210", "+40268000210")
     addresses = [a["value"] for a in data["findings"]["addresses"]]
     assert set(addresses) == {"Str. Exemplu 1", "Str. Veche 2"}     # ANAF's and the registry's
     assert all(a["official"] for a in data["findings"]["addresses"])
@@ -1026,7 +1026,7 @@ def test_a_finding_lists_its_official_sources_newest_first(client, tmp_path):
         cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
         await sm.set_signal_status("PHONE_NUMBER", "confirmed")
         await sm.add_observations([
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268100200",
+            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268000210",
              "module": module, "capability": "x", "collector": module, "observed_at": when}
             for module, when in (("phones", "2026-10-20 10:00:00"),
                                  ("anaf", "2026-09-01 10:00:00"),

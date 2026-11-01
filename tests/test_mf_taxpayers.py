@@ -36,13 +36,13 @@ ROWS = [
     # An SRL: VAT, employer, micro-enterprise tax, a landline.
     line(cod_fiscal="90000014", denumire="EXEMPLU ALFA SRL", tip_unitate="Sediu central",
          tip_contrib="PJ", localitate="Mun. Braşov", strada="Str. Exemplu", nr="1",
-         data_inregistrare="01.03.2015", telefon="0268100200", tva="DA", cod_postal="500001",
+         data_inregistrare="01.03.2015", telefon="0268000210", tva="DA", cod_postal="500001",
          data_stare="01.03.2015 10:00:00", stare="INREGISTRAT", judet="BRAŞOV", imp100="NU ",
          imp120="DA ", cont480="DA ", imp602="DA ", bloc="A1", ap="3"),
     # A PFA: kept like any other legal form, its address and phone included.
     line(cod_fiscal="90000022", denumire="POPESCU EXEMPLU PFA", tip_unitate="Sediu central",
          tip_contrib="PF", localitate="Sat Exemplu", strada="Str. Câmpului", nr="9",
-         telefon="0722100200 / 0268 100 300", tva="NU", stare="INREGISTRAT", judet="BRAŞOV",
+         telefon="0722000210 / 0268 000 310", tva="NU", stare="INREGISTRAT", judet="BRAŞOV",
          imp100="NU ", imp120="NU ", cont480="NU ", imp602="NU "),
     # A tax code that is a personal numeric code: never kept.
     line(cod_fiscal="1900101123456", denumire="NUME PERSOANA", tip_contrib="PF",
@@ -100,7 +100,7 @@ def test_a_file_is_read_by_column_name(files):
     assert alfa["registered"] == "2015-03-01" and alfa["status_date"] == "2015-03-01"
     pfa = rows["90000022"]
     assert pfa["contributor_type"] == "PF" and pfa["street"] == "Str. Câmpului"
-    assert pfa["phone"] == "0722100200 / 0268 100 300"
+    assert pfa["phone"] == "0722000210 / 0268 000 310"
     assert rows["90000030"]["struck_off"] == "2025-06-15"
 
 
@@ -108,7 +108,7 @@ def test_an_older_layout_with_dates_and_other_names_is_read(tmp_path):
     header = "cod_fiscal,nume,loc,str,nr,tel,cp,judet,tva,stare,imp_120,imp_480,imp_602"
     path = tmp_path / "old.csv"
     path.write_bytes((header + "\r\n90000014,EXEMPLU ALFA SRL,Mun. Braşov,Str. Exemplu,1,"
-                      "0268100200,500001,BRAŞOV,01.02.2019,INREGISTRAT,01.01.2018,,01.05.2016\r\n")
+                      "0268000210,500001,BRAŞOV,01.02.2019,INREGISTRAT,01.01.2018,,01.05.2016\r\n")
                      .encode("cp1250"))
     (row,) = store.read_file(path)
     assert row["vat"] == 1 and row["vat_since"] == "2019-02-01"
@@ -266,16 +266,16 @@ def test_a_lookup_gives_facts_dated_the_day_the_file_was_published(db):
         con.close()
     got = {(f.code, f.value_num, f.value_text) for f in facts}
     assert {("VAT_REGISTERED", 1.0, ""), ("HAS_EMPLOYEES_TAX", 1.0, ""),
-            ("MICRO_TAX_REGIME", 1.0, ""), ("PHONE_NUMBER", None, "+40268100200")} <= got
+            ("MICRO_TAX_REGIME", 1.0, ""), ("PHONE_NUMBER", None, "+40268000210")} <= got
     # The file's STARE is the record's last event, not a state: ANAF alone
     # writes REGISTRATION_STATUS, so a status filter means one thing.
     assert not any(f.code == "REGISTRATION_STATUS" for f in facts)
     assert {f.observed_at for f in facts} == {"2026-07-23 00:00:00"}
     assert all(f.source_url.startswith("https://data.gov.ro/") for f in facts)
-    assert [c.display for c in contacts] == ["+40 268 100 200"]
+    assert [c.display for c in contacts] == ["+40 268 000 210"]
     # A sole trader's address and phones are kept.
     assert any(f.code == "ADDRESS" and "Str. Câmpului" in f.value_text for f in pfa)
-    assert [c.value for c in pfa_phones] == ["+40722100200", "+40268100300"]
+    assert [c.value for c in pfa_phones] == ["+40722000210", "+40268000310"]
     assert ("HAS_EMPLOYEES_TAX", 0.0, "") in {(f.code, f.value_num, f.value_text) for f in pfa}
 
 
@@ -300,8 +300,8 @@ async def test_companies_on_file_get_readings_once_and_a_phone(state):
     first = await runs.lookup_by_id(state)
     assert first["companies"] == 2
     assert "MICRO_TAX_REGIME" in first["unconfirmed"]["mf_taxpayers"]
-    assert (await state.get_company(a)).phone == "+40 268 100 200"
-    assert (await state.get_company(pfa)).phone == "+40 722 100 200"
+    assert (await state.get_company(a)).phone == "+40 268 000 210"
+    assert (await state.get_company(pfa)).phone == "+40 722 000 210"
     with sqlite3.connect(state.db_path) as con:
         rows = con.execute("SELECT signal_code, module, observed_at FROM observations "
                            "WHERE company_id = ? ORDER BY signal_code", (pfa,)).fetchall()

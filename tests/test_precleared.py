@@ -78,7 +78,7 @@ def with_check(sender, transport, api_key=""):
     return sender
 
 
-async def queue(state, pid, step=1, kind="sequence", to="jane@acme.com", campaign="c1"):
+async def queue(state, pid, step=1, kind="sequence", to="jane@acme.example", campaign="c1"):
     return await state.add_outbox_item(
         prospect_id=pid, to_email=to, subject="hello",
         body="Fine body. Question?", send_at=_now_iso(), status="approved",
@@ -189,14 +189,14 @@ def test_from_config_reads_prospect_country():
 async def test_prospect_country_is_sent_as_a_fallback_only_when_set(state):
     calls = []
     without = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
-    await without.clear("jane@acme.com", state)
+    await without.clear("jane@acme.example", state)
     assert "default_recipient_country" not in calls[0]["json"]
     assert "recipient_country" not in calls[0]["json"]
 
     with_country = PreclearedClient(
         "US", prospect_country="US", transport=mock_precleared(calls, OK_BODY),
     )
-    await with_country.clear("john@acme.com", state)
+    await with_country.clear("john@acme.example", state)
     assert calls[1]["json"]["default_recipient_country"] == "US"
     assert "recipient_country" not in calls[1]["json"]
 
@@ -206,12 +206,12 @@ async def test_setting_prospect_country_forces_a_fresh_check_then_caches(state):
     # A verdict cached before the setting existed was decided without the
     # fallback country, so it must not be reused once the setting is on.
     calls = []
-    await PreclearedClient("US", transport=mock_precleared(calls, OK_BODY)).clear("jane@acme.com", state)
+    await PreclearedClient("US", transport=mock_precleared(calls, OK_BODY)).clear("jane@acme.example", state)
     with_country = PreclearedClient(
         "US", prospect_country="US", transport=mock_precleared(calls, OK_BODY),
     )
-    await with_country.clear("jane@acme.com", state)
-    await with_country.clear("jane@acme.com", state)
+    await with_country.clear("jane@acme.example", state)
+    await with_country.clear("jane@acme.example", state)
     assert len(calls) == 2
     assert calls[1]["json"]["default_recipient_country"] == "US"
 
@@ -252,11 +252,11 @@ FOUND_GB = {**OK_BODY, "facts": {"recipient_country": "GB", "country_source": "d
 async def test_confident_country_is_sent_as_recipient_country(state):
     calls = []
     client = PreclearedClient("GB", prospect_country="GB", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state, country="US")
+    await client.clear("jane@acme.example", state, country="US")
     assert calls[0]["json"]["recipient_country"] == "US"
     # Never both: the default is for when nobody knows the country.
     assert "default_recipient_country" not in calls[0]["json"]
-    await client.clear("john@acme.com", state, country="us")
+    await client.clear("john@acme.example", state, country="us")
     assert calls[1]["json"]["recipient_country"] == "US"
 
 
@@ -287,10 +287,10 @@ def test_icp_country_is_the_default_when_prospect_country_is_unset():
 async def test_icp_country_is_sent_as_the_default(state):
     calls = []
     client = PreclearedClient("US", default_country="US", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.example", state)
     assert calls[0]["json"]["default_recipient_country"] == "US"
     assert "recipient_country" not in calls[0]["json"]
-    await client.clear("john@acme.com", state, country="GB")
+    await client.clear("john@acme.example", state, country="GB")
     assert calls[1]["json"]["recipient_country"] == "GB"
     assert "default_recipient_country" not in calls[1]["json"]
 
@@ -314,9 +314,9 @@ def test_country_changes_the_fingerprint_only_when_set():
 async def test_a_verdict_cached_without_a_country_is_kept_when_there_is_still_none(state):
     calls = []
     client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state)
-    await client.clear("jane@acme.com", state)
-    assert (await client.clear("jane@acme.com", state, country="")).cached
+    await client.clear("jane@acme.example", state)
+    await client.clear("jane@acme.example", state)
+    assert (await client.clear("jane@acme.example", state, country="")).cached
     assert len(calls) == 1
 
 
@@ -326,9 +326,9 @@ async def test_a_new_confident_country_forces_one_fresh_check_then_caches(state)
     # one more check, then cached again.
     calls = []
     client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state)
-    await client.clear("jane@acme.com", state, country="GB")
-    await client.clear("jane@acme.com", state, country="GB")
+    await client.clear("jane@acme.example", state)
+    await client.clear("jane@acme.example", state, country="GB")
+    await client.clear("jane@acme.example", state, country="GB")
     assert len(calls) == 2
     assert calls[1]["json"]["recipient_country"] == "GB"
 
@@ -339,12 +339,12 @@ async def test_a_verdict_precleared_decided_for_the_same_country_is_kept(state):
     # itself: Harvey now knowing the same one asks the same question.
     calls = []
     client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
-    await client.clear("jane@acme.com", state)
-    again = await client.clear("jane@acme.com", state, country="GB")
+    await client.clear("jane@acme.example", state)
+    again = await client.clear("jane@acme.example", state, country="GB")
     assert again.cached and again.country == "GB" and len(calls) == 1
-    assert await client.known_country("jane@acme.com", state, "GB") == "GB"
+    assert await client.known_country("jane@acme.example", state, "GB") == "GB"
     # A different country is a different question.
-    await client.clear("jane@acme.com", state, country="IE")
+    await client.clear("jane@acme.example", state, country="IE")
     assert len(calls) == 2
 
 
@@ -353,10 +353,10 @@ async def test_known_country_uses_the_same_fingerprint_as_clear(state):
     calls = []
     found_us = {**OK_BODY, "facts": {"recipient_country": "US"}}
     client = PreclearedClient("GB", transport=mock_precleared(calls, found_us))
-    await client.clear("jane@acme.com", state, country="US")
-    assert await client.known_country("jane@acme.com", state, "US") == "US"
-    assert await client.known_country("jane@acme.com", state) == ""   # a different question
-    assert await client.known_country("jane@acme.com", state, "GB") == ""
+    await client.clear("jane@acme.example", state, country="US")
+    assert await client.known_country("jane@acme.example", state, "US") == "US"
+    assert await client.known_country("jane@acme.example", state) == ""   # a different question
+    assert await client.known_country("jane@acme.example", state, "GB") == ""
     assert len(calls) == 1
 
 
@@ -365,10 +365,10 @@ async def test_known_country_uses_the_same_fingerprint_as_clear(state):
 async def test_bad_country_values_are_dropped_not_raised(state, bad):
     calls = []
     client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
-    assert (await client.clear("jane@acme.com", state, country=bad)).allowed
+    assert (await client.clear("jane@acme.example", state, country=bad)).allowed
     assert "recipient_country" not in calls[0]["json"]
     # Treated as no country throughout, so the cached verdict is found.
-    assert await client.known_country("jane@acme.com", state, bad) == "GB"
+    assert await client.known_country("jane@acme.example", state, bad) == "GB"
 
 
 # ── the company's and person's names ──
@@ -378,10 +378,10 @@ async def test_bad_country_values_are_dropped_not_raised(state, bad):
 async def test_names_are_sent_when_harvey_has_them(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state, company="Acme Widgets Ltd", name="Jane Doe")
+    await client.clear("jane@acme.example", state, company="Acme Widgets Ltd", name="Jane Doe")
     assert calls[0]["json"]["company_name"] == "Acme Widgets Ltd"
     assert calls[0]["json"]["recipient_name"] == "Jane Doe"
-    await client.clear("john@acme.com", state)
+    await client.clear("john@acme.example", state)
     assert "company_name" not in calls[1]["json"] and "recipient_name" not in calls[1]["json"]
 
 
@@ -389,10 +389,10 @@ async def test_names_are_sent_when_harvey_has_them(state):
 async def test_names_are_tidied_and_cut_to_precleareds_limits(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("a@acme.com", state, company="  Acme \n Widgets\tLtd ", name=" Jane   Doe ")
+    await client.clear("a@acme.example", state, company="  Acme \n Widgets\tLtd ", name=" Jane   Doe ")
     assert calls[0]["json"]["company_name"] == "Acme Widgets Ltd"
     assert calls[0]["json"]["recipient_name"] == "Jane Doe"
-    await client.clear("b@acme.com", state, company="C" * 300, name="N" * 300)
+    await client.clear("b@acme.example", state, company="C" * 300, name="N" * 300)
     assert calls[1]["json"]["company_name"] == "C" * 160
     assert calls[1]["json"]["recipient_name"] == "N" * 120
 
@@ -402,7 +402,7 @@ async def test_names_are_tidied_and_cut_to_precleareds_limits(state):
 async def test_empty_or_odd_names_are_left_out(state, bad):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
-    assert (await client.clear("jane@acme.com", state, company=bad, name=bad)).allowed
+    assert (await client.clear("jane@acme.example", state, company=bad, name=bad)).allowed
     assert "company_name" not in calls[0]["json"] and "recipient_name" not in calls[0]["json"]
 
 
@@ -422,8 +422,8 @@ async def test_a_cached_ok_without_names_stands_when_the_names_arrive(state):
     # already allows the email isn't worth a second check.
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
-    await client.clear("jane@acme.com", state)
-    again = await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
+    await client.clear("jane@acme.example", state)
+    again = await client.clear("jane@acme.example", state, company="Acme", name="Jane Doe")
     assert again.allowed and again.cached and len(calls) == 1
 
 
@@ -431,16 +431,16 @@ async def test_a_cached_ok_without_names_stands_when_the_names_arrive(state):
 async def test_a_cached_hold_without_names_is_asked_again_once_with_them(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, CONSENT_BODY))
-    await client.clear("jane@acme.com", state)
-    await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
+    await client.clear("jane@acme.example", state)
+    await client.clear("jane@acme.example", state, company="Acme", name="Jane Doe")
     assert len(calls) == 2
     assert calls[1]["json"]["company_name"] == "Acme"
     assert calls[1]["json"]["recipient_name"] == "Jane Doe"
     # Then cached under the names, so the rest of the sequence costs nothing.
-    assert (await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")).cached
+    assert (await client.clear("jane@acme.example", state, company="Acme", name="Jane Doe")).cached
     assert len(calls) == 2
     # Different names are a different question.
-    await client.clear("jane@acme.com", state, company="Acme", name="John Roe")
+    await client.clear("jane@acme.example", state, company="Acme", name="John Roe")
     assert len(calls) == 3
 
 
@@ -448,10 +448,10 @@ async def test_a_cached_hold_without_names_is_asked_again_once_with_them(state):
 async def test_a_verdict_with_names_keeps_the_country_precleared_found(state):
     calls = []
     client = PreclearedClient("GB", transport=mock_precleared(calls, FOUND_GB))
-    await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
-    assert await client.known_country("jane@acme.com", state, company="Acme", name="Jane Doe") == "GB"
+    await client.clear("jane@acme.example", state, company="Acme", name="Jane Doe")
+    assert await client.known_country("jane@acme.example", state, company="Acme", name="Jane Doe") == "GB"
     # Harvey later sure of the same country: the same question, still cached.
-    again = await client.clear("jane@acme.com", state, country="GB", company="Acme", name="Jane Doe")
+    again = await client.clear("jane@acme.example", state, country="GB", company="Acme", name="Jane Doe")
     assert again.cached and len(calls) == 1
 
 
@@ -530,7 +530,7 @@ async def test_ok_verdict_sends_and_logs_the_receipt(state):
 
     assert len(provider.sent) == 1
     assert calls[0]["json"] == {
-        "recipient_email": "jane@acme.com",
+        "recipient_email": "jane@acme.example",
         "sender_country": "GB",
         "address_source": "unknown",
         "existing_customer": False,
@@ -585,7 +585,7 @@ async def test_one_check_per_address(state):
 
     assert len(provider.sent) == 2
     assert len(calls) == 1
-    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.com")
+    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.example")
 
 
 @pytest.mark.asyncio
@@ -612,11 +612,11 @@ async def test_blocked_verdict_is_remembered_for_later_steps(state):
 @pytest.mark.asyncio
 async def test_daily_limit_holds_cold_email_but_replies_still_go(state):
     pid = await seed_prospect(state)
-    other = await seed_prospect(state, email="sam@beta.com")
+    other = await seed_prospect(state, email="sam@beta.example")
     await queue(state, pid)
-    await queue(state, other, to="sam@beta.com")
-    reply_pid = await seed_prospect(state, email="ann@gamma.com", status="replied")
-    await queue(state, reply_pid, kind="reply", to="ann@gamma.com")
+    await queue(state, other, to="sam@beta.example")
+    reply_pid = await seed_prospect(state, email="ann@gamma.example", status="replied")
+    await queue(state, reply_pid, kind="reply", to="ann@gamma.example")
     calls = []
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_precleared(calls, status=429))
@@ -625,12 +625,12 @@ async def test_daily_limit_holds_cold_email_but_replies_still_go(state):
 
     # One failed call pauses the check for the rest of the cycle.
     assert len(calls) == 1
-    assert [m["to"] for m in provider.sent] == ["ann@gamma.com"]
+    assert [m["to"] for m in provider.sent] == ["ann@gamma.example"]
     assert await state.get_outbox(status="failed") == []
     waiting = await state.get_outbox(status="approved")
-    assert sorted(i["to_email"] for i in waiting) == ["jane@acme.com", "sam@beta.com"]
+    assert sorted(i["to_email"] for i in waiting) == ["jane@acme.example", "sam@beta.example"]
     # Nothing cached, so the next cycle asks again.
-    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.com") == ""
+    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.example") == ""
 
 
 @pytest.mark.asyncio
@@ -734,9 +734,9 @@ async def test_malformed_response_holds_cold_email_and_reply_still_sends(state, 
 
     assert [m["to"] for m in provider.sent] == ["reply@example.com"]
     assert await state.get_outbox(status="failed") == []
-    assert [i["to_email"] for i in await state.get_outbox(status="approved")] == ["jane@acme.com"]
+    assert [i["to_email"] for i in await state.get_outbox(status="approved")] == ["jane@acme.example"]
     # Nothing cached from a malformed answer, so the next cycle asks again.
-    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.com") == ""
+    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.example") == ""
 
 
 @pytest.mark.asyncio

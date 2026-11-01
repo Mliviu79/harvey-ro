@@ -24,7 +24,7 @@ def _now_iso():
 
 async def _approved(state, pid, step=2):
     return await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="hello there",
+        prospect_id=pid, to_email="jane@acme.example", subject="hello there",
         body="A short, plain note. Question?", send_at=_now_iso(),
         status="approved", campaign_id="c1", step=step,
     )
@@ -239,7 +239,7 @@ async def test_reject_never_touches_mail_already_sending_or_sent(state):
     sent = await _approved(state, pid, step=3)
     await state.update_outbox_item(sent, status="sent")
     pending = await state.add_outbox_item(
-        prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
+        prospect_id=pid, to_email="jane@acme.example", subject="s", body="b",
         send_at=_now_iso(), campaign_id="c1", step=4)
     assert await state.reject_outbox_item(sending) == 0
     assert await state.reject_outbox_item(sent) == 0

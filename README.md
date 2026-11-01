@@ -527,15 +527,9 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 **`objection_handling.md`** — The **LAARC** loop (Listen → Acknowledge → Assess → Respond → Confirm) with worked responses across the four objection families: budget, authority, need, timing. The framing throughout is that you are not "overcoming" an objection, you are finding out what the actual concern is.
 
-**`lead_qualification.md`** — **BANT** for the first screen, ICP scoring 1–10 for prioritization, **MEDDIC** for anything complex. Includes explicit disqualification criteria, which matter more than the qualification ones.
-
 **`sales_methodology.md`** — The operating philosophy: the ABC loop, how a conversation should flow across stages, tone calibration, and the ethical lines Harvey does not cross.
 
 **`offer_strategy.md`** — The offer ladder by engagement level, and the rule that governs it: *never lead with an offer, never pitch in a cold email.* First contact exists to start a conversation. Offers come out only after genuine interest.
-
-**`prospecting_tactics.md`** — Search operators, company-website mining, trigger events, referral paths. Finding people without paying for a database.
-
-**`account_navigation.md`** — Companies versus contacts, multi-threading rules, which door to knock on first when a company has several.
 
 **Generated for your product by `harvey train <url>`:**
 
@@ -546,20 +540,17 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 ### Which agent gets which
 
-Defined in `harvey/brain.py` — edit the map to change it. No agent loads the Scout column now (the prospecting agent that did was replaced by the contact finder); it stays in the map until it's decided what those skills are for.
+Defined in `harvey/brain.py` — edit the map to change it.
 
-| Skill | Scout | Writer | Handler | Sender |
-|---|:-:|:-:|:-:|:-:|
-| `prospecting_tactics` | ● | | | |
-| `lead_qualification` | ● | | | |
-| `account_navigation` | ● | | | |
-| `signal_playbook` | ● | ● | | |
-| `email_frameworks` | | ● | | ● |
-| `sales_methodology` | | ● | ● | |
-| `offer_strategy` | | ● | ● | |
-| `objection_handling` | | | ● | |
-| `product_knowledge` | ● | ● | ● | ● |
-| `competitive_intel` | | ● | ● | |
+| Skill | Writer | Handler | Sender |
+|---|:-:|:-:|:-:|
+| `signal_playbook` | ● | | |
+| `email_frameworks` | ● | | ● |
+| `sales_methodology` | ● | ● | |
+| `offer_strategy` | ● | ● | |
+| `objection_handling` | | ● | |
+| `product_knowledge` | ● | ● | ● |
+| `competitive_intel` | ● | ● | |
 
 Adding a skill: write the file, add its name to `skill_map` in `harvey/brain.py`. That's the whole process.
 
@@ -1042,7 +1033,7 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
 
-1. Buy a **dedicated sending domain** (`getacme.com`, not `acme.com`).
+1. Buy a **dedicated sending domain** (`getacme.example`, not `acme.example`).
 2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you. `harvey warmup` checks them, plus domain age, blocklists, your warmup progress and bounce rate, and ends with READY / NOT READY. It only reads public DNS and Harvey's own records.
 3. **Warm up for 2–4 weeks** before real volume, and keep warmup running after. We recommend [TrulyInbox](https://trulyinbox.com/?via=harvey); see [Warmup with TrulyInbox](#warmup-with-trulyinbox).
 4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target. Set `channels.email.warmup.start_date` and Harvey does this for you (Gmail, Microsoft, SMTP; Instantly has its own warmup): no cold email for `min_days`, then a cold-email cap that climbs by `daily_increase` a day. Replies always go out.

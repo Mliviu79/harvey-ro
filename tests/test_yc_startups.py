@@ -49,7 +49,7 @@ async def state():
     ("<p>We're Y Combinator alumni (W19).</p>", "W19"),
 ])
 def test_a_company_saying_its_yc_backed(html, batch):
-    got = yc_backed(html, domain="acme.com")
+    got = yc_backed(html, domain="acme.example")
     assert got is not None
     assert got[0] == batch and 0 < got[1] <= 1
 
@@ -79,8 +79,8 @@ async def test_the_profile_collector_records_it(state):
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
 
-    pages = {"acme.com": "<h1>Acme</h1><p>Acme (YC W24) builds billing.</p>",
-             "plain.com": "<h1>Plain</h1><p>Family-run since 1987.</p>"}
+    pages = {"acme.example": "<h1>Acme</h1><p>Acme (YC W24) builds billing.</p>",
+             "plain.example": "<h1>Plain</h1><p>Family-run since 1987.</p>"}
 
     async def resolve(self, domain):
         return f"https://{domain}", pages[domain]
@@ -89,10 +89,10 @@ async def test_the_profile_collector_records_it(state):
     async def get(url):
         return ""
     c._get = get
-    acme = await state.add_company(Company(name="Acme", domain="acme.com"))
-    plain = await state.add_company(Company(name="Plain", domain="plain.com"))
-    [yes] = [o for o in await c.profile_company(acme, "acme.com") if o["signal_code"] == "YC_BACKED"]
-    [no] = [o for o in await c.profile_company(plain, "plain.com") if o["signal_code"] == "YC_BACKED"]
+    acme = await state.add_company(Company(name="Acme", domain="acme.example"))
+    plain = await state.add_company(Company(name="Plain", domain="plain.example"))
+    [yes] = [o for o in await c.profile_company(acme, "acme.example") if o["signal_code"] == "YC_BACKED"]
+    [no] = [o for o in await c.profile_company(plain, "plain.example") if o["signal_code"] == "YC_BACKED"]
     assert (yes["value_num"], yes["value_text"]) == (1, "W24")
     assert no["value_num"] == 0            # checked, not YC: a finding too
 
@@ -251,28 +251,28 @@ def test_the_dashboard_estimate_takes_the_preset(monkeypatch):
         dash._discovery_queries({"provider": "osm", "preset": "yc"}, _config())
 
 
-# ── what real YC company sites look like (checked against live homepages) ──
+# ── how YC company sites tend to say it ──
 
 
 def test_a_yc_page_in_their_structured_data_counts():
-    """Resend and Airbyte list their YC page in JSON-LD sameAs, not as a link."""
+    """Some sites list their YC page in JSON-LD sameAs, not as a link."""
     html = ('<script type="application/ld+json">{"@type":"Organization","sameAs":'
-            '["https://github.com/resend","https://www.ycombinator.com/companies/resend"]}</script>')
-    assert yc_backed(html, domain="resend.com") == ("", 0.95)
+            '["https://github.com/quillmail","https://www.ycombinator.com/companies/quillmail"]}</script>')
+    assert yc_backed(html, domain="quillmail.example") == ("", 0.95)
 
 
 def test_someone_elses_yc_page_doesnt_make_them_yc():
     """A customer logo linking to that customer's YC page isn't backing."""
     html = '<a href="https://www.ycombinator.com/companies/acme">Acme, our customer</a>'
-    assert yc_backed(html, domain="billingtool.com") is None
-    assert yc_backed(html, domain="acme.io") == ("", 0.95)
-    assert yc_backed(html, domain="getacme.com") == ("", 0.95)        # slug inside the name
+    assert yc_backed(html, domain="billingtool.example") is None
+    assert yc_backed(html, domain="acme.test") == ("", 0.95)
+    assert yc_backed(html, domain="getacme.example") == ("", 0.95)        # slug inside the name
 
 
 @pytest.mark.parametrize("html", [
-    '<span>Powering a quarter of the last YC batch to 40% of the Forbes AI 50.</span>',  # Mintlify
-    '<a href="/customers/ycombinator">Y Combinator</a>',                                  # PostHog
-    '<a href="/company/ycombinator-startup-promotion">YC deal</a>',                       # Airbyte
+    '<span>Powering a quarter of the last YC batch to 40% of the top AI 50.</span>',
+    '<a href="/customers/ycombinator">Y Combinator</a>',
+    '<a href="/company/ycombinator-startup-promotion">YC deal</a>',
 ])
 def test_real_ways_sites_mention_yc_without_being_backed(html):
     assert yc_backed(html, domain="example.com") is None
@@ -297,16 +297,16 @@ async def test_the_about_page_is_checked_when_the_homepage_is_silent(state):
                     + "<p>We build billing for teams that ship fast.</p>" * 12)
         return ""
     c._get = get
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
-    [yes] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "YC_BACKED"]
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
+    [yes] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "YC_BACKED"]
     assert (yes["value_num"], yes["value_text"]) == (1, "W21")
-    assert yes["evidence_url"] == "https://acme.com/about"
+    assert yes["evidence_url"] == "https://acme.example/about"
 
 
 def test_an_encoded_apostrophe_isnt_a_batch():
-    """posthog.com/about: "Y Combinator&#x27;s W20 batch" read as X27."""
-    html = "<p>PostHog was hatched in Y Combinator&#x27;s W20 batch.</p><p>Y Combinator&#x27;s best</p>"
-    assert yc_backed(html, domain="posthog.com") == ("W20", 0.9)
+    """An About page's "Y Combinator&#x27;s W20 batch" read as X27."""
+    html = "<p>Acme was hatched in Y Combinator&#x27;s W20 batch.</p><p>Y Combinator&#x27;s best</p>"
+    assert yc_backed(html, domain="acme.example") == ("W20", 0.9)
 
 
 # ── the preset's hit is evidence, and profiling doesn't erase it ──
@@ -314,13 +314,13 @@ def test_an_encoded_apostrophe_isnt_a_batch():
 
 def test_a_preset_hit_records_that_the_search_matched():
     from harvey.collectors.discover import Business, _observations
-    biz = Business(name="Acme", domain="acme.com", source_url="https://acme.com/blog/raise", provider="serper")
+    biz = Business(name="Acme", domain="acme.example", source_url="https://acme.example/blog/raise", provider="serper")
     yc = build_queries(_config(), preset="yc")[0]
     plain = build_queries(_config())[0]
     rows = _observations(biz, "c1", {"YC_BACKED", "FOUND_IN_SERP"}, "r1", query=yc)
     [hit] = [r for r in rows if r["signal_code"] == "YC_BACKED"]
     assert hit["value_num"] == 1 and hit["confidence"] < 0.9
-    assert hit["evidence_url"] == "https://acme.com/blog/raise"
+    assert hit["evidence_url"] == "https://acme.example/blog/raise"
     assert not [r for r in _observations(biz, "c1", {"YC_BACKED"}, "r1", query=plain)
                 if r["signal_code"] == "YC_BACKED"]
     assert not _observations(biz, "c1", set(), "r1", query=yc)            # unconfirmed: nothing
@@ -330,9 +330,9 @@ def test_a_preset_hit_records_that_the_search_matched():
 async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
     await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
-    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="discover",
-                                value_num=1, confidence=0.7, evidence_url="https://acme.com/blog/raise")
+                                value_num=1, confidence=0.7, evidence_url="https://acme.example/blog/raise")
     c = ProfileCollector.__new__(ProfileCollector)
     c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
 
@@ -343,7 +343,7 @@ async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
     async def get(url):
         return ""
     c._get = get
-    obs = await c.profile_company(cid, "acme.com")
+    obs = await c.profile_company(cid, "acme.example")
     assert not [o for o in obs if o["signal_code"] == "YC_BACKED"]   # silent pages aren't a "no"
     assert await state.yc_batch(cid) == ""
 
@@ -353,7 +353,7 @@ async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
 
 @pytest.mark.parametrize("html", [
     "<p>Trusted by 300 YC-backed startups and the Fortune 500.</p>",
-    "<p>Used by YC alumni at Stripe, Ramp and Brex.</p>",
+    "<p>Used by YC alumni at Lindenly, Quorra and Brisko.</p>",
     "<p>Built for a YC company like yours.</p>",
     "<p>We're part of the YC Startup School community.</p>",
     "<p>We went through YC Startup School in 2022.</p>",
@@ -365,7 +365,7 @@ async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
     "<p>YC founders using our plan W20 get 50% off.</p>",
 ])
 def test_customer_and_marketing_lines_arent_backing(html):
-    assert yc_backed(html, domain="vendor.com") is None
+    assert yc_backed(html, domain="vendor.example") is None
 
 
 @pytest.mark.parametrize("html,batch", [
@@ -376,18 +376,18 @@ def test_customer_and_marketing_lines_arent_backing(html):
     ("<p>Acme is a Y Combinator company (W22).</p>", "W22"),
 ])
 def test_more_real_ways_to_say_it(html, batch):
-    got = yc_backed(html, domain="acme.com")
+    got = yc_backed(html, domain="acme.example")
     assert got is not None and got[0] == batch
 
 
 @pytest.mark.parametrize("slug,domain,ours", [
     ("stripe", "", False),               # no domain to compare: not theirs
-    ("air", "airtable.com", False),      # too short to be a match
-    ("acme", "app.acme.com", True),      # the registrable name, not "app"
-    ("acme", "acme.co.uk", True),
-    ("acme", "getacme.com", True),
-    ("acmehq", "acme.com", True),
-    ("airtable", "airbnb.com", False),
+    ("air", "airloom.example", False),   # too short to be a match
+    ("acme", "app.acme.example", True),      # the registrable name, not "app"
+    ("example", "example.co.uk", True),
+    ("acme", "getacme.example", True),
+    ("acmehq", "acme.example", True),
+    ("airloom", "airnest.example", False),
 ])
 def test_matching_a_yc_page_to_its_company(slug, domain, ours):
     from harvey.collectors.profile import _is_their_yc_page
@@ -397,7 +397,7 @@ def test_matching_a_yc_page_to_its_company(slug, domain, ours):
 @pytest.mark.parametrize("domain,junk", [
     ("workatastartup.com", True), ("startupschool.org", True), ("yclist.com", True),
     ("ycdb.co", True), ("seedtable.com", True), ("github.com", True),
-    ("acme.github.io", False), ("angelcity.com", False),
+    ("acme.github.io", False), ("angelcity.example", False),
 ])
 def test_yc_lists_are_junk_and_github_pages_arent(domain, junk):
     assert is_junk(domain) is junk
@@ -413,7 +413,7 @@ def test_the_preset_excludes_ycs_own_sites():
 async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
     await sync_vocabulary(state)
     await state.set_signal_status("YC_BACKED", "confirmed")
-    cid = await state.add_company(Company(name="Vendor", domain="vendor.com"))
+    cid = await state.add_company(Company(name="Vendor", domain="vendor.example"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="profile",
                                 value_num=1, observed_at="2026-01-01T00:00:00")
     c = ProfileCollector.__new__(ProfileCollector)
@@ -426,7 +426,7 @@ async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
     async def get(url):
         return ""
     c._get = get
-    [no] = [o for o in await c.profile_company(cid, "vendor.com") if o["signal_code"] == "YC_BACKED"]
+    [no] = [o for o in await c.profile_company(cid, "vendor.example") if o["signal_code"] == "YC_BACKED"]
     assert no["value_num"] == 0
     await state.add_observations([no])
     assert await state.yc_batch(cid) is None
@@ -470,18 +470,18 @@ async def test_a_mixed_batch_doesnt_get_founder_framing(state):
 
 
 @pytest.mark.parametrize("html,domain", [
-    ("<p>Smart, independent teams love it, backed by Y Combinator alumni.</p>", "art.com"),
-    ("<p>Most went through Y Combinator and use it every day.</p>", "ever.com"),
-    ("<p>Teams at Linear and Ramp are YC alumni.</p>", "linear.app"),
-    ("<p>Notion is backed by Y Combinator? No, but Stripe is.</p>", "stripe.com"),
-    ("<p>We sponsored the YC W24 batch dinner.</p>", "acme.com"),
-    ("<p>Our team previously founded a YC-funded startup.</p>", "acme.com"),
-    ("<p>We're hiring ex-YC alumni.</p>", "acme.com"),
-    ("<h3>YC W24 recap</h3>", "acme.com"),
-    ("<h3>YC-backed jobs</h3>", "acme.com"),
-    ("<h3>YC alumni</h3>", "acme.com"),
-    ("<p>Our podcast with YC alumni</p>", "acme.com"),
-    ("<p>We believe in Y Combinator's mission.</p>", "acme.com"),
+    ("<p>Smart, independent teams love it, backed by Y Combinator alumni.</p>", "art.example"),
+    ("<p>Most went through Y Combinator and use it every day.</p>", "ever.example"),
+    ("<p>Teams at Lindenly and Quorra are YC alumni.</p>", "lindenly.example"),
+    ("<p>Brisko is backed by Y Combinator? No, but Quorra is.</p>", "quorra.example"),
+    ("<p>We sponsored the YC W24 batch dinner.</p>", "acme.example"),
+    ("<p>Our team previously founded a YC-funded startup.</p>", "acme.example"),
+    ("<p>We're hiring ex-YC alumni.</p>", "acme.example"),
+    ("<h3>YC W24 recap</h3>", "acme.example"),
+    ("<h3>YC-backed jobs</h3>", "acme.example"),
+    ("<h3>YC alumni</h3>", "acme.example"),
+    ("<p>Our podcast with YC alumni</p>", "acme.example"),
+    ("<p>We believe in Y Combinator's mission.</p>", "acme.example"),
 ])
 def test_mentions_that_arent_the_company_saying_it(html, domain):
     assert yc_backed(html, domain=domain) is None
@@ -497,22 +497,22 @@ def test_mentions_that_arent_the_company_saying_it(html, domain):
     ("<p>We were incubated at Y Combinator.</p>", ""),
 ])
 def test_claims_with_other_words_nearby_still_count(html, batch):
-    got = yc_backed(html, domain="acme.com")
+    got = yc_backed(html, domain="acme.example")
     assert got is not None and got[0] == batch
 
 
-@pytest.mark.parametrize("slug,domain", [("open", "openapp.com"), ("labs", "labsinc.com")])
+@pytest.mark.parametrize("slug,domain", [("open", "openapp.example"), ("labs", "labsinc.example")])
 def test_generic_slugs_dont_match_by_stripping_affixes(slug, domain):
     from harvey.collectors.profile import _is_their_yc_page
     assert _is_their_yc_page(slug, domain) is False
 
 
 @pytest.mark.parametrize("html,domain,yes", [
-    ("<p>Acme Corp was founded in 2021 and is backed by Y Combinator, General Catalyst and others.</p>",
-     "acmecorp.com", True),
-    ("<p>Founded in 2021, the company is backed by Y Combinator and General Catalyst.</p>", "acme.com", True),
-    ("<p>Acme helps teams at companies that are backed by Y Combinator.</p>", "acme.com", False),
-    ("<p>Acme works with startups which are funded by YC.</p>", "acme.com", False),
+    ("<p>Acme Corp was founded in 2021 and is backed by Y Combinator, Example Ventures and others.</p>",
+     "acmecorp.example", True),
+    ("<p>Founded in 2021, the company is backed by Y Combinator and Example Ventures.</p>", "acme.example", True),
+    ("<p>Acme helps teams at companies that are backed by Y Combinator.</p>", "acme.example", False),
+    ("<p>Acme works with startups which are funded by YC.</p>", "acme.example", False),
 ])
 def test_third_person_claims_about_the_company(html, domain, yes):
     assert (yc_backed(html, domain=domain) is not None) is yes

@@ -41,7 +41,7 @@ def test_campaign_sequence_json_round_trip():
 
 
 def test_company_defaults():
-    c = Company(name="Acme", domain="acme.com")
+    c = Company(name="Acme", domain="acme.example")
     assert c.website == ""
     assert c.industry == ""
 

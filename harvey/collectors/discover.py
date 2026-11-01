@@ -47,8 +47,8 @@ TIMEOUT = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=10.0)
 # ── Junk filtering ────────────────────────────────────────────────────
 # Discovery fills a database with directories, hospital systems, media and
 # lead-gen middlemen unless you filter hard. Match PATTERNS, not a literal
-# list: a literal list is exactly how `whatclinic.com` and `ufhealth.org` get
-# through on the first run.
+# list: a literal list is exactly how a clinic directory or a university
+# health system gets through on the first run.
 
 # Anchored on a dot boundary, not the string start: SERP results arrive as
 # `en.wikipedia.org` and `m.facebook.com` at least as often as bare domains,
@@ -139,7 +139,7 @@ def normalize_domain(url_or_domain: str) -> str:
 
 # ── Business names ────────────────────────────────────────────────────
 # SERP providers return a page TITLE, not a business name: "Denver, CO | HOA
-# Management Firm", "Home Page - NVCM | Community Association Management".
+# Management Firm", "Home Page - QVCM | Community Association Management".
 # Stored as-is it lands in an email as "...at Denver, CO | HOA Management
 # Firm". The business is the title segment that shares a DISTINCTIVE word with
 # the domain — "management" matches managementharbor.example but says nothing.
@@ -176,7 +176,7 @@ def _segment_matches_domain(segment: str, stem: str) -> bool:
     distinctive = [w for w in words if w not in _GENERIC_NAME_WORDS]
     if any(len(w) >= 3 and w in stem for w in distinctive):
         return True
-    # "Northvale Association of Community Managers" ↔ nacm.org
+    # "Vellmora Association of Community Managers" ↔ vacm.example
     initials = "".join(w[0] for w in words if w not in ("of", "the", "and", "&"))
     return len(initials) >= 3 and stem.startswith(initials)
 
@@ -194,7 +194,7 @@ _SPLIT_WORDS = sorted((w for w in _GENERIC_NAME_WORDS | {"with", "your"}
 
 
 def _split_stem(stem: str) -> list[str]:
-    """managementharbor → [management, harbor]; kqresidential → [kq, residential]."""
+    """managementharbor → [management, harbor]; zqresidential → [zq, residential]."""
     parts, buf, i = [], "", 0
     while i < len(stem):
         word = next((w for w in _SPLIT_WORDS if stem.startswith(w, i)), "")
@@ -2116,13 +2116,13 @@ def preset_templates(spec: dict) -> tuple[str, ...]:
     """A preset's search templates: one ``term``, or several ``terms``."""
     return tuple(spec.get("terms") or (spec["term"],))
 
-# A hit on careers.acme.com is acme.com's careers page.
+# A hit on careers.acme.example is acme.example's careers page.
 _CAREERS_HOST = re.compile(r"^(careers|jobs|join|work|apply|hiring)\.", re.I)
 _SECOND_LEVEL_SUFFIX = {"co", "com", "org", "net", "ac", "gov", "edu", "ltd", "plc", "or", "ne", "go"}
 
 
 def company_host(domain: str) -> str:
-    """careers.acme.com → acme.com. Never down to a public suffix: jobs.co.uk
+    """careers.acme.example → acme.example. Never down to a public suffix: jobs.co.uk
     stays jobs.co.uk (and is junk), not co.uk."""
     stripped = _CAREERS_HOST.sub("", domain)
     labels = stripped.split(".")
@@ -2315,7 +2315,7 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     (junk dropped and counted in ``counts``, each keyed by its position),
     the facts each result gives, and what the search really cost.
     ``host`` rewrites a result's domain before the junk check (a preset's
-    careers.acme.com is acme.com). A failure is the draft's ``failed``,
+    careers.acme.example is acme.example). A failure is the draft's ``failed``,
     with ``stop`` set when the provider can take no more this run.
     ``paused`` (async, true when the kill switch is on) is read between
     pages; ``counts["available"]`` is what the source said it holds, and
