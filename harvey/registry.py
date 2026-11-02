@@ -34,6 +34,7 @@ under the same identity, fill-gaps and confirmation rules as any source.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -44,6 +45,8 @@ from pathlib import Path
 
 from harvey.collectors import onrc
 from harvey.paths import PROJECT_ROOT
+
+logger = logging.getLogger("harvey.registry")
 
 REGISTRY_PATH = PROJECT_ROOT / "data" / "registry.db"
 # 3: sole traders' and family businesses' registered offices are kept.
@@ -239,11 +242,26 @@ def build(files: dict[str, Path], dataset: onrc.Dataset, target: Path = REGISTRY
             raise RegistryBusy(f"another load of {target} is running; try again "
                                "when it has finished")
         try:
-            return _build(files, dataset, target, progress)
+            meta = _build(files, dataset, target, progress)
         finally:
             _unlock(lock)
+        _refile(target)
+        return meta
     finally:
         lock.close()
+
+
+def _refile(target: Path) -> None:
+    """The financial statements' ``filed`` built again from this load (its
+    noes are the registry's operating firms that didn't file), when
+    financials.db is beside it. The registry's own derived tables were
+    built by the load (derived.build)."""
+    from harvey.modules.ro.mf_financials import derived as fin_derived
+
+    try:
+        fin_derived.refile(target.with_name("financials.db"), target)
+    except sqlite3.Error as e:
+        logger.warning("registry: filed accounts not rebuilt in financials.db: %s", e)
 
 
 def _build(files: dict[str, Path], dataset: onrc.Dataset, target: Path,

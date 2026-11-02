@@ -2,10 +2,10 @@
 verification (verify.py), on a small schema 24 database made of fictional
 firms, people and contacts (example.com addresses, invented numbers)."""
 
-import asyncio
 import hashlib
 import os
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -17,8 +17,7 @@ import pytest
 
 from harvey.overlay import migrate, recount, schema, triggers, verify
 from harvey.registers import Adapter
-from harvey.signals import sync_vocabulary
-from harvey.state import StateManager
+from tests import v24 as old_schema
 
 def _t(day: int, hour: int = 10) -> str:
     return f"2026-01-{day:02d} {hour:02d}:00:00"
@@ -54,9 +53,7 @@ L1, L2, L3 = "bbbb00000001", "bbbb00000002", "bbbb00000003"
 
 def build_v24(path: Path) -> None:
     """A schema 24 database as the app leaves it, then fictional rows."""
-    sm = StateManager(str(path))
-    asyncio.run(sm.init_db())
-    asyncio.run(sync_vocabulary(sm))
+    old_schema.build(path)
     con = sqlite3.connect(path)
     con.execute("INSERT OR IGNORE INTO contact_kinds (kind, label) VALUES ('contact_form', 'Form')")
     for code in ("TECH_STACK", "RUNNING_GOOGLE_ADS", "SERP_RANK", "PHONE_NUMBER", "VAT_REGISTERED",
@@ -361,7 +358,7 @@ def test_the_upgrade_keeps_what_harvey_added_and_leaves_the_register_copies(v24,
     # Sources, outreach, legacy ids.
     assert one("SELECT COUNT(*) FROM firm_source") == 4
     assert one("SELECT firm FROM firm_source WHERE ref = 'node/101'") == l1
-    assert one("SELECT firm FROM prospects WHERE id = 'p1'") == r5
+    assert one("SELECT company_id FROM prospects WHERE id = 'p1'") == r5
     assert one("SELECT firm FROM locations") == l1
     assert one("SELECT COUNT(*) FROM jobs") == 2
     assert dict(q("SELECT uuid, firm FROM legacy_id")) == {R4: r4, L2: l2}
@@ -528,11 +525,65 @@ def test_verification_fails_on_a_wrong_output(v24, tmp_path):
     assert vat["by cause"] == {"no loaded module reads it": 1} and not vat["passed"]
 
 
-def test_place_lines_split_into_locality_and_county():
-    assert migrate.place_parts("Brașov, Brașov, Romania") == ("Brașov", "Brașov")
-    assert migrate.place_parts("Denver, CO") == ("Denver", "CO")
-    assert migrate.place_parts("Codlea") == ("Codlea", "")
-    assert migrate.place_parts("") == ("", "")
+def test_place_lines_split_into_locality_county_and_country():
+    assert migrate.place_parts("Brașov, Brașov, Romania") == ("Brașov", "Brașov", "Romania")
+    assert migrate.place_parts("Denver, CO") == ("Denver", "CO", "")
+    assert migrate.place_parts("Codlea") == ("Codlea", "", "")
+    assert migrate.place_parts("") == ("", "", "")
+
+
+def test_verification_counts_every_copied_table_and_column(v24, tmp_path):
+    src = tmp_path / "harvey.db"
+    shutil.copy(v24, src)
+    con = sqlite3.connect(src)
+    con.executemany("INSERT INTO processed_replies (reply_id) VALUES (?)", [("r1",), ("r2",)])
+    con.commit()
+    con.close()
+    dst = tmp_path / "harvey.db.v25"
+    _run(src, dst)
+    counts = verify.report(dst, src, sections=("counts",), adapters=[])["counts"]
+    assert counts["copied: processed_replies"] == {"old": 2, "new": 2, "rule": "equal",
+                                                   "passed": True}
+    assert counts["columns copied"]["passed"]
+    con = sqlite3.connect(dst)
+    con.execute("DELETE FROM processed_replies WHERE reply_id = 'r2'")
+    con.execute("ALTER TABLE outbox RENAME COLUMN approved_by TO approver")
+    con.commit()
+    con.close()
+    rep = verify.report(dst, src, sections=("counts",), adapters=[])
+    assert "counts: copied: processed_replies: differs" in rep["failures"]
+    assert any(f.startswith("counts: columns copied: not copied: outbox.approved_by")
+               for f in rep["failures"])
+
+
+def test_a_place_lines_country_and_legacy_columns_are_kept(v24, tmp_path):
+    src = tmp_path / "harvey.db"
+    shutil.copy(v24, src)
+    con = sqlite3.connect(src)
+    con.execute("UPDATE companies SET location = 'Toronto, Ontario, Canada', "
+                "tech_stack_json = '[\"Shopify\"]' WHERE id = ?", (L1,))
+    # A preset search's hit (collector "discover", no module) and a
+    # registry-collected fact with no module named.
+    con.executemany("INSERT INTO observations (id, company_id, signal_code, collector, value_num, "
+                    "value_text, observed_at) VALUES (?, ?, ?, ?, ?, ?, '2026-01-01 00:00:00')",
+                    [("ob-yc", L1, "YC_BACKED", "discover", 1, ""),
+                     ("ob-reg", L1, "CONTACT_FOUND", "registry", None, "Ion Exemplu")])
+    con.commit()
+    con.close()
+    dst = tmp_path / "harvey.db.v25"
+    _run(src, dst)
+    con = _con(dst)
+    firm = _firm(con, L1)
+    assert con.execute("SELECT locality, county, country FROM local_firm WHERE firm = ?",
+                       (firm,)).fetchone() == ("Toronto", "Ontario", "Canada")
+    assert con.execute("SELECT kind, value FROM migration_note WHERE firm = ? AND kind LIKE "
+                       "'legacy%'", (firm,)).fetchall() == [("legacy tech stack", '["Shopify"]')]
+    kept = con.execute("SELECT s.code, m.name, c.name FROM obs o JOIN signal s ON s.id = o.signal "
+                       "JOIN module m ON m.id = o.module LEFT JOIN capability c "
+                       "ON c.id = o.capability WHERE o.firm = ? AND s.code IN "
+                       "('YC_BACKED', 'CONTACT_FOUND')", (firm,)).fetchall()
+    assert kept == [("YC_BACKED", "startups", schema.SEARCH_HIT)]     # the register's stays there
+    con.close()
 
 
 def test_a_source_written_to_during_the_run_is_refused(tmp_path):

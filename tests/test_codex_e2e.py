@@ -419,26 +419,6 @@ def _load_pre_codex_db(path: Path):
 
 
 @pytest.mark.asyncio
-async def test_pre_codex_database_migrates_and_runs_on_codex(monkeypatch, tmp_path):
-    db = tmp_path / "old.db"
-    _load_pre_codex_db(db)
-    harvey = Harness(monkeypatch, tmp_path, db=db)
-    await harvey.state.init_db()
-
-    rows = await harvey.state.usage_by_provider(days=36500)
-    assert [(r["provider"], r["calls"]) for r in rows] == [("claude", 1)]
-    old_prospect = await harvey.state.get_prospect_by_email("old@legacy.example")
-    assert old_prospect is not None and old_prospect.status == "contacted"
-
-    _, convo_id = await _open_thread(harvey.state)
-    harvey.mail.inbound = [_reply("Could you share pricing details?")]
-    await harvey.run_cycles(1)
-    assert await harvey.state.is_reply_processed("in-1")
-    rows = {r["provider"]: r["calls"] for r in await harvey.state.usage_by_provider(days=36500)}
-    assert rows == {"claude": 1, "codex": 2}
-
-
-@pytest.mark.asyncio
 async def test_switching_providers_keeps_counters_and_budgets_separate(monkeypatch, tmp_path):
     harvey = Harness(monkeypatch, tmp_path, provider="claude", model="")
     await harvey.state.init_db()

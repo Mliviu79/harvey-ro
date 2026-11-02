@@ -1358,3 +1358,14 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .job-kind { font-weight: 600; }
 .job-detail { color: var(--text-2); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
 .job-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* The database upgrade screen */
+#upgrade-screen { background: var(--bg); }
+.upgrade-card { max-width: 720px; width: 100%; }
+.upgrade-card table { margin: var(--sp-3) 0; }
+.upgrade-stages { list-style: none; padding: 0; margin: var(--sp-3) 0; }
+.upgrade-stage { display: flex; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.upgrade-stage.running { font-weight: 600; }
+.upgrade-stage.failed, .upgrade-stage.stopped { color: var(--bad); }
+.upgrade-stage.todo { color: var(--text-2); }
+#old-files-note { align-items: center; justify-content: space-between; flex-wrap: wrap; }

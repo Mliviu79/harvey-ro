@@ -6,6 +6,7 @@ resumable and re-observation a time series instead of a duplicate.
 """
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -14,6 +15,9 @@ import pytest_asyncio
 from harvey.models import Company
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+
+# Web signals are the web-marketing module's (off as shipped).
+pytestmark = pytest.mark.modules_on("web_marketing")
 
 
 @pytest_asyncio.fixture
@@ -41,27 +45,21 @@ async def test_a_new_company_needs_profiling(state):
 @pytest.mark.asyncio
 async def test_a_profiled_company_drops_out(state):
     cid = await state.add_company(Company(name="Baker", domain="baker.example"))
-    await state.add_observation("TECH_STACK", company_id=cid,
-                                collector="profile", value_text="wordpress")
+    await state.mark_company_profiled(cid)
     assert await state.count_companies_needing_profile() == 0
 
 
 @pytest.mark.asyncio
-async def test_a_company_read_through_the_browser_drops_out_too(state):
-    cid = await state.add_company(Company(name="Baker", domain="baker.example"))
-    await state.add_observation("TECH_STACK", company_id=cid,
-                                collector="profile:browser", value_text="wix")
-    assert await state.count_companies_needing_profile() == 0
-
-
 @pytest.mark.asyncio
 async def test_a_stale_profile_comes_back_round(state):
     """Re-reading on a schedule is what makes 'they dropped their agency'
     visible. A company profiled last year is not done forever."""
     cid = await state.add_company(Company(name="Baker", domain="baker.example"))
-    await state.add_observation("TECH_STACK", company_id=cid, collector="profile",
-                                value_text="wordpress",
-                                observed_at="2020-01-01 00:00:00")
+    await state.mark_company_profiled(cid)
+    con = sqlite3.connect(state.db_path)
+    con.execute("UPDATE firm SET profiled_at = strftime('%s', '2020-01-01')")
+    con.commit()
+    con.close()
     assert await state.count_companies_needing_profile(stale_days=90) == 1
     assert await state.count_companies_needing_profile(stale_days=99999) == 0
 

@@ -55,24 +55,6 @@ async def test_get_company_missing_returns_none(state):
     assert await state.get_company_by_domain("nope.example") is None
 
 
-@pytest.mark.asyncio
-async def test_add_company_same_id_is_ignored(state):
-    c1 = Company(id="fixed-id", name="First", domain="first.example")
-    c2 = Company(id="fixed-id", name="Second", domain="second.example")
-    await state.add_company(c1)
-    await state.add_company(c2)  # INSERT OR IGNORE — must not raise
-    fetched = await state.get_company("fixed-id")
-    assert fetched.name == "First"  # original row preserved
-
-
-@pytest.mark.asyncio
-async def test_add_company_generates_id_when_missing(state):
-    c = Company(name="NoId", domain="noid.example")
-    cid = await state.add_company(c)
-    assert cid
-    assert c.id == cid
-
-
 # ── Prospects ──
 
 @pytest.mark.asyncio

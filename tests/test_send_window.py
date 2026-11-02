@@ -33,7 +33,7 @@ from harvey.send_window import (
     START_SPREAD, country_for, icp_country, in_window, next_send_time, recipient_country,
     recipient_zone, zone_country, zone_for,
 )
-from harvey.state import MIGRATIONS, StateManager
+from harvey.state import StateManager
 from tests.test_outbox_native import FakeProvider, make_sender, seed_campaign
 
 BASE = {
@@ -970,22 +970,6 @@ def _utc_now_iso():
 
 
 # ── Storage ──
-
-@pytest.mark.asyncio
-async def test_existing_prospects_get_an_empty_zone_on_upgrade(tmp_path):
-    db_path = str(tmp_path / "old.db")
-    async with aiosqlite.connect(db_path) as db:
-        for script in MIGRATIONS[:13]:  # a database from before v14
-            await db.executescript(script)
-        await db.execute("PRAGMA user_version = 13")
-        await db.execute("INSERT INTO prospects (id, email, first_name) VALUES ('p1', 'a@b.co', 'A')")
-        await db.commit()
-    sm = StateManager(db_path)
-    await sm.init_db()
-    assert (await sm.get_prospect("p1")).timezone == ""
-    await sm.set_prospect_timezone("p1", "Europe/Oslo")
-    assert (await sm.get_prospect("p1")).timezone == "Europe/Oslo"
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quiet", [True, False])

@@ -52,31 +52,19 @@ def test_detect_tech_no_false_positives_on_plain_page():
 
 
 @pytest.mark.asyncio
-async def test_company_signals_roundtrip(state):
-    """The columns an earlier version filled still load (nothing writes
-    them now: what a site read learns is an observation)."""
+async def test_the_legacy_company_columns_are_not_kept(state):
+    """The tech stack and signals columns a much earlier version filled
+    aren't kept on the slim database (what a site read learns is an
+    observation; the upgrade keeps old values as migration notes)."""
     cid = await state.add_company(Company(
         name="Acme", domain="acme.example",
         tech_stack=["Shopify"], signals=[{"type": "hiring", "detail": "Head of Growth"}],
     ))
     fetched = await state.get_company(cid)
-    assert fetched.tech_stack == ["Shopify"]
-    assert fetched.signals[0]["detail"] == "Head of Growth"
-
-
-@pytest.mark.asyncio
-async def test_legacy_company_rows_parse(state):
-    """Rows written before v5 (empty JSON columns) must still load."""
-    import aiosqlite
-    async with aiosqlite.connect(state.db_path) as db:
-        await db.execute(
-            "INSERT INTO companies (id, name, domain, tech_stack_json, signals_json) "
-            "VALUES ('c1', 'Old Co', 'old.example', '', 'not-json')"
-        )
-        await db.commit()
-    company = await state.get_company("c1")
-    assert company.tech_stack == []
-    assert company.signals == []
+    assert fetched.tech_stack == [] and fetched.signals == []
+    await state.add_observation("TECH_STACK", company_id=cid, value_text="Shopify")
+    assert [o["value_text"] for o in
+            await state.get_observations(company_id=cid, signal_code="TECH_STACK")] == ["Shopify"]
 
 
 # ── export ──

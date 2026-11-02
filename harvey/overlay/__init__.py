@@ -16,9 +16,9 @@ merges with undo, sources, web signals and outreach.
 - store.py: Harvey's writes (the StateManager's, by the same names): firms
   found or pulled, contacts and evidence, people, searches, web signals,
   merges and undo, removing a firm.
-- reads.py: Harvey's reads (the pages', the CLI's, the agents'), in the
-  shapes schema 24's reads give them.
+- reads.py: Harvey's reads (the pages', the CLI's, the agents').
+- migrate.py, verify.py: the upgrade from schema 24 (harvey/upgrade.py runs
+  them).
 
-The StateManager writes through store.py and reads through reads.py when
-the database it opens is schema 25, and keeps schema 24's paths otherwise.
+The StateManager writes through store.py and reads through reads.py.
 """

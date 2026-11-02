@@ -62,6 +62,9 @@ LONG_SECONDS = 3600
 # From this many firms a list sorts by name through the registry's own
 # order (its ids), not by reading every name.
 NAME_ORDER_FROM = 200_000
+# A cohort this big or smaller is sorted by name at once and kept; a bigger
+# one is read off the name index a page at a time.
+COHORT_SORTED_MAX = 20_000
 
 
 def _iso(ts) -> str | None:
@@ -135,7 +138,7 @@ def recount_register_tally(path, codes=None) -> int:
         rows = Reader(con, attached).count_registers(codes)
         con.execute("BEGIN IMMEDIATE")
         con.executemany("INSERT OR REPLACE INTO register_tally (signal, module, mark, loaded, "
-                        "n_true, n_false, at) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                        "n_true, n_false, at, n_values) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         con.execute("COMMIT")
         return len(rows)
     finally:
@@ -208,7 +211,11 @@ class Reader:
         # registry search answers): the one whose adapter resolves filters.
         self.directory = next((a for a in self.registers
                                if type(a).resolve is not regs_mod.Adapter.resolve), None)
-        self.key_scheme = self.directory.keyed_by if self.directory else ""
+        # The firm's key (a tax code): the directory's, else the one legal
+        # scheme, so a key on file still shows with no register loaded.
+        legal = [sc.name for sc in self.schemes.by_id.values() if sc.legal]
+        self.key_scheme = self.directory.keyed_by if self.directory else \
+            (legal[0] if len(legal) == 1 else "")
         self._enabled = set(enabled) if enabled is not None else None
         self._signal_ids: dict[str, int] | None = None
         # Each live firm's register key, as far as known (key_of), and the
@@ -726,7 +733,51 @@ class Reader:
             page = self._figure_page(code, way, limit, offset)
             if page is not None:
                 return total, page, "index"
+        if sort in ("name", "place") and self.orders_current():
+            return total, [r[0] for r in self.x(f"overlay.firms.by_{sort}{asc}",
+                                                (limit, offset))], "index"
         return None
+
+    def orders_current(self) -> bool:
+        """Whether the firms' kept name and place positions belong to the
+        directory register's current load (overlay/orders.py)."""
+        if not hasattr(self, "_orders_ok"):
+            from harvey.overlay import orders
+
+            self._orders_ok = orders.current(self.con, self.registers)
+        return self._orders_ok
+
+    def order_values(self, ids, sort: str) -> dict[int, float | None]:
+        """{firm: its kept name or place position}."""
+        col = 1 if sort == "name" else 2
+        return {r[0]: r[col] for r in self._by_ids("overlay.read.orders", list(ids))}
+
+    def by_order(self, ids, sort: str, asc: bool = False) -> list[int]:
+        """``ids`` in the kept name or place order (highest first unless
+        ``asc``; a firm with no position lowest, ties by id): a few
+        thousand sorted by their positions, more read off the index whole."""
+        if len(ids) > NAME_ORDER_FROM:
+            wanted = ids if isinstance(ids, (set, frozenset)) else set(ids)
+            name = f"overlay.read.walk_by_{sort}" + (".asc" if asc else "")
+            return [r[0] for r in self.x(name) if r[0] in wanted]
+        values = self.order_values(ids, sort)
+        return sorted(ids, key=lambda i: (values.get(i) is not None, values.get(i) or 0, i),
+                      reverse=not asc)
+
+    def walk_order(self, s: FirmSet, sort: str, offset: int, limit: int | None) -> list[int]:
+        """A page of the firms in ``s`` (any set, a negative one too) in the
+        kept order, lowest first, read off the index until it is full."""
+        out, skipped = [], 0
+        for (i,) in self.x(f"overlay.read.walk_by_{sort}.asc"):
+            if (i in s.ids) == s.neg:
+                continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            out.append(i)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
 
     def _walk_count(self, args) -> int:
         key = ("walk_count", args, self._main_file())
@@ -792,6 +843,8 @@ class Reader:
         searched) has the firms with one first, the rest after, newest
         first. Ids follow creation (a firm's id is given in the order firms
         are made), so newest first is highest id first."""
+        if sort in ("name", "place") and self.orders_current():
+            return Ordered(array("q", self.by_order(ids, sort)))
         newest = sorted(ids, reverse=True)
         if sort == "created":
             return Ordered(array("q", newest))
@@ -988,8 +1041,8 @@ class Reader:
                 "domain": r["domain"] or "", "website": r["website"] or "",
                 "industry": (local[6] if local and local[6] else "") or card.get("industry", ""),
                 "company_size": "",
-                "location": (", ".join(p for p in (local[3], local[2]) if p) if local
-                             else card.get("location", "")),
+                "location": (", ".join(p for p in (local[3], local[2], local[10]) if p)
+                             if local else card.get("location", "")),
                 "address": (local[4] if local and local[4] else "") or card.get("address", ""),
                 "phone": main_phone,
                 "source": srcs[0][1] if srcs else "",
@@ -1232,6 +1285,12 @@ class Reader:
         rows = [{**dict(zip(names, r)), "company_id": str(fid)} for r in cur.fetchall()]
         return sorted(rows, key=lambda r: -(r.get("score") or 0))
 
+    def prospect_rows(self) -> list[dict]:
+        """Every prospect as its row, newest first (the Contacts page)."""
+        cur = self.x("overlay.read.prospect_rows")
+        names = [c[0] for c in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
+
     def prospects_by_id(self, ids) -> dict[str, dict]:
         """{prospect id: the outbox's fields of it, ``firm`` its record}."""
         out = {}
@@ -1240,6 +1299,11 @@ class Reader:
             names = [c[0] for c in cur.description]
             out.update({r[0]: dict(zip(names, r)) for r in cur.fetchall()})
         return out
+
+    def ranked(self, code: str, phrase: str) -> list[str]:
+        """The records currently ranked (or in the pack) for a search phrase
+        by a rank signal (keyed by the phrase)."""
+        return [str(f) for f, in self.x("overlay.read.ranked", (code, phrase))]
 
     def run_last_at(self, run_id: str) -> int | None:
         """When a run last recorded a reading (unix seconds), or None."""
@@ -1395,7 +1459,7 @@ class Reader:
                 "id": oid, "company_id": str(fid), "signal_code": sig, "value_num": num,
                 "value_text": text or "", "confidence": conf,
                 "collector": "discover" if ops.get((module, cap)) == "query"
-                             else named.get((module, sig), ""),
+                             or cap == schema.SEARCH_HIT else named.get((module, sig), ""),
                 "module": module or "", "capability": cap or "", "evidence_url": url or "",
                 "run_id": run or "", "observed_at": _db_time(at)})
         if latest_only:
@@ -1945,8 +2009,17 @@ class Reader:
         plain = sort in ("", "first_seen")
         many = False
         if unfiltered and self.directory is not None:
-            named = self.register_count("CONTACT_FOUND", self.directory.module)
-            many = named is not None and named[0] > cap
+            named = self.register_count("CONTACT_FOUND", self.directory.module, values=True)
+            if named is not None:
+                many = named[1] > cap + len(linked)
+            elif hasattr(self.directory, "people_held_upto"):
+                # Not counted for this load yet: counted up to the cap (and
+                # the few a linked person or a merge may take away), which
+                # stops early when there are more.
+                own = self.schemes.named(self.directory.keyed_by)
+                if own is not None:
+                    bound = cap + 1 + len(linked) + 10 * len(self._merged()) + 100
+                    many = self.directory.people_held_upto(self.con, own.id, bound) >= bound
         words = [contacts.fold(w) for w in (f.q or "")[:200].split()[:8]]
         counted = None
         if not many and plain and not words and not f.source and firms is not None:
@@ -1967,7 +2040,9 @@ class Reader:
         found = self._people_of(sorted(own_firms, reverse=True), linked, f.source, words,
                                 part="persons")
         admins = 0
-        for batch in self._batches(walk, 5000):
+        # (Small batches first: a page usually fills from the newest few
+        # hundred firms.)
+        for batch in self._batches(walk, 5000, first=min(5000, max(500, 4 * need))):
             more_ = self._people_of(batch, linked, f.source, words, part="admins")
             found += more_
             admins += len(more_)
@@ -2034,13 +2109,15 @@ class Reader:
             at += len(ids)
 
     @staticmethod
-    def _batches(it, size):
-        batch = []
+    def _batches(it, size, first=None):
+        """``it`` in lists of ``size``; with ``first``, the first list that
+        long and each next one four times longer, up to ``size``."""
+        batch, now = [], first or size
         for x in it:
             batch.append(x)
-            if len(batch) >= size:
+            if len(batch) >= now:
                 yield batch
-                batch = []
+                batch, now = [], min(size, now * 4)
         if batch:
             yield batch
 
@@ -2196,9 +2273,11 @@ class Reader:
         return {sig["code"] for m in self.manifests for sig in m.signals
                 if sig.get("absence") == "false"}
 
-    def register_count(self, code: str, module: str) -> tuple[int, int] | None:
+    def register_count(self, code: str, module: str, values: bool = False
+                       ) -> tuple[int, int] | None:
         """(true, false) over the live firms a register reads ``code`` for,
-        counted for its current load mark; None when not counted for it."""
+        counted for its current load mark; None when not counted for it.
+        ``values``: (true, how many values those firms hold) instead."""
         a = self.regs.get(module)
         sid, mid = self.signal_id(code), self.module_id(module)
         if a is None or sid is None or mid is None:
@@ -2206,7 +2285,22 @@ class Reader:
         row = self.x("overlay.read.register_tally_of", (sid, mid)).fetchone()
         if row is None or row[4] is None or row[0] != (a.marks(self.con) or ""):
             return None
+        if values:
+            return (row[2] or 0, row[5]) if row[5] is not None else None
         return row[2] or 0, row[3] or 0
+
+    def register_tally_stale(self) -> bool:
+        """Whether a loaded register's signals aren't counted for its
+        current load mark (just after the upgrade, a reload or a merge):
+        the worker queues the count then."""
+        for a in self.registers:
+            mid = self.module_id(a.module)
+            if mid is None or not a.by_signal:
+                continue
+            if not self.one("SELECT 1 FROM register_tally WHERE module = ? AND mark = ? "
+                            "AND at IS NOT NULL LIMIT 1", (mid, a.marks(self.con) or "")):
+                return True
+        return False
 
     def count_registers(self, codes=None) -> list[tuple]:
         """Every (signal, module) a loaded register reads, counted true /
@@ -2224,20 +2318,28 @@ class Reader:
                 if sid is None or mid is None:
                     continue
                 per: dict[int, bool] = {}
+                values = 0
                 for (c, scheme), read in a.by_signal.items():
                     if c != code:
                         continue
                     s = self.schemes.named(scheme or a.keyed_by)
                     if s is None:
                         continue
+                    # (A record's rows come together: its values counted once each.)
+                    record, seen = None, set()
                     for firm, value, date in a.held_values(self.con, code, s.id, scheme):
                         yes = self._truth(read, value)
                         per[firm] = per.get(firm, False) or yes
+                        if firm != record:
+                            record, seen = firm, set()
+                        if yes and value not in seen:
+                            seen.add(value)
+                            values += 1
                 lives: dict[int, bool] = {}
                 for firm, live in self.live_of(per).items():
                     lives[live] = lives.get(live, False) or per[firm]
                 n_true = sum(1 for v in lives.values() if v)
-                out.append((sid, mid, mark, 1, n_true, len(lives) - n_true, now))
+                out.append((sid, mid, mark, 1, n_true, len(lives) - n_true, now, values))
         return out
 
     @staticmethod
@@ -2393,10 +2495,19 @@ class Reader:
         s = self.schemes.named(scheme)
         if s is None:
             return set(self.all_live())
-        key = ("unkeyed", scheme, self.marks())
+        # (Which firms hold which keys only changes with the identity mark.)
+        key = ("unkeyed", scheme, *self.held_mark())
         hit = SETS.get(key, ())
         if hit is None:
             hit = {r[0] for r in self.x("overlay.read.unkeyed", (s.id,))}
+            # (A survivor whose merged record holds one is keyed: a few.)
+            merged = self._merged()
+            survivors = hit & set(merged.values())
+            if survivors:
+                keyed = {merged[m] for m, sc, _ in self._by_ids(
+                    "overlay.firms.idents", [m for m in merged if merged[m] in survivors])
+                         if sc == s.id}
+                hit -= keyed
             SETS.put(key, (), hit, LONG_SECONDS)
         return hit
 
@@ -2426,7 +2537,12 @@ class Reader:
         """The live firms of records that exist (a register statement's
         firm_ident rows): a merged record stands for its survivor."""
         merged = self._merged()
-        return {merged.get(r, r) for r in records}
+        out = set(records)
+        gone = out & merged.keys()
+        if gone:
+            out -= gone
+            out |= {merged[r] for r in gone}
+        return out
 
     def _in_range(self, value, low, high, ranged, a, code) -> bool:
         if not ranged:
@@ -2568,8 +2684,19 @@ class Reader:
                self._main_file())
         mark = self.marks()
         order = ORDERINGS.get(key, mark)
-        if order is None:
-            chosen = reduce(lambda a, b: a | b, (sets[v] for v in wanted))
+        chosen = reduce(lambda a, b: a | b, (sets[v] for v in wanted))
+        if order is None and self.orders_current():
+            # By name through the kept positions: a set of a few thousand
+            # sorted by them, a bigger one (or one held by what it leaves
+            # out) read off the index a page at a time.
+            if chosen.neg or len(chosen.ids) > COHORT_SORTED_MAX:
+                page = self.walk_order(chosen, "name", int(offset),
+                                       None if limit is None else int(limit))
+                order = None
+            else:
+                order = array("q", self.by_order(chosen.ids, "name", asc=True))
+                ORDERINGS.put(key, mark, order)
+        if order is None and not self.orders_current():
             ids = list(self.resolve(chosen))
             if len(ids) > NAME_ORDER_FROM:
                 # (The registry's own order: its names are upper case.)
@@ -2579,7 +2706,8 @@ class Reader:
                 order = array("q", sorted(ids, key=lambda i: ((names.get(i) or "").lower(),
                                                                str(i))))
             ORDERINGS.put(key, mark, order)
-        page = list(order[offset:] if limit is None else order[offset:offset + int(limit)])
+        if order is not None:
+            page = list(order[offset:] if limit is None else order[offset:offset + int(limit)])
         verdict_of = {}
         for v in wanted:
             s = sets[v]
@@ -2658,15 +2786,24 @@ class Reader:
         if email:
             rows = self.firm_rows(email)
             with_both = sum(1 for i in email if i in rows and (rows[i]["n_phone"] or i in extra))
+        # People: Harvey's own, and the people the register names at the
+        # firms in Harvey (counted per load mark), the ones Harvey took up
+        # from it once.
         people = t.get("people", 0)
-        named = self.register_count("CONTACT_FOUND", self.directory.module) \
+        named = self.register_count("CONTACT_FOUND", self.directory.module, values=True) \
             if self.directory else None
+        if named is not None:
+            src = self.one("SELECT id FROM source WHERE name = ?", (self.directory.module,))
+            taken = self.one("SELECT COUNT(*) FROM person WHERE source = ?", (src,)) if src else 0
+            people += named[1] - (taken or 0)
         activity = self.register_count("ACTIVITY_CODE", self.directory.module) \
             if self.directory else None
         return {"companies": t.get("firms", 0), "with_phone": phones,
                 "with_email": len(email), "with_both": with_both,
                 "people": people, "people_firms": named[0] if named else None,
-                "with_activity": activity[0] if activity else None}
+                "with_activity": activity[0] if activity else None,
+                # The register's counts wait for their job (shown as such, never 0).
+                "counting": self.directory is not None and (named is None or activity is None)}
 
     def backlog(self, finder_capability=("contact_finder", "find_contacts"),
                 site=("website", "read_site"), since=None) -> dict:
@@ -2847,6 +2984,392 @@ class Reader:
                              if a["name_en"] or a["name"]), "")
         return row["location"], activity, readings
 
+
+    # ── The contact finder's reads of one company (finder.py) ──
+
+    def finder_company(self, cid) -> dict | None:
+        """finder.company_row on the overlay: the live firm's id, name,
+        domain, website and its trust ("" for a site a register declares),
+        place, CUI, main phone and where it was found; None for a record
+        merged into another, or none."""
+        fid = self.fid(cid)
+        if fid is None or self.live(fid) != fid:
+            return None
+        rows = self.company_rows([fid])
+        if not rows:
+            return None
+        r = rows[0]
+        trust = self.one("SELECT website_trust FROM firm WHERE id = ?", (fid,))
+        out = {k: r.get(k) or "" for k in ("id", "name", "domain", "website", "location", "cui",
+                                           "phone", "source_url", "source", "company_size")}
+        out["website_trust"] = TRUST_NAMES.get(trust, "") if trust is not None else ""
+        return out
+
+    def _group_links(self, cid) -> tuple[list[int], list, dict]:
+        """(the live firm's records, their links, the linked contacts' rows)."""
+        fid = self.live(cid)
+        if fid is None:
+            return [], [], {}
+        group = self.members([fid])[fid]
+        links = list(self._by_ids("overlay.read.links_of_firms", group))
+        rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows",
+                                              list({l[1] for l in links}))}
+        return group, links, rows
+
+    def finder_on_file(self, cid) -> set[str]:
+        """The phones and emails on file for a company, lower case."""
+        _, links, rows = self._group_links(cid)
+        return {rows[l[1]][2].lower() for l in links
+                if l[1] in rows and rows[l[1]][11] in (PHONE, EMAIL)}
+
+    def finder_has_contact(self, cid) -> bool:
+        fid = self.live(cid)
+        return bool(fid is not None and self.one(
+            "SELECT n_contacts FROM firm WHERE id = ?", (fid,)))
+
+    def searched_targets(self, ids, *, person: bool, module: str, capability: str,
+                         cutoff=None, looked_for: str = "") -> set[int]:
+        """Which of these records (``person``: persons) the module's
+        capability searched since ``cutoff`` (an error is no search; with
+        ``looked_for``, only a search that looked for that word)."""
+        from harvey.overlay.store import unix
+
+        mid, cap = self.module_id(module), self.capability_id(module, capability)
+        if mid is None or cap is None or not ids:
+            return set()
+        bit = 0
+        if looked_for:
+            bit = self.one("SELECT bit FROM looked_for WHERE name = ?", (looked_for,))
+            if bit is None:
+                return set()
+        at = unix(cutoff) or 0
+        out = set()
+        for chunk in chunks(ids):
+            out |= {r[0] for r in self.x("overlay.read.searched_targets", (
+                json.dumps(chunk), int(person), mid, cap, at, bit, bit))}
+        return out
+
+    def finder_searched(self, cid, module: str, capability: str, cutoff=None,
+                        looked_for: str = "") -> bool:
+        """finder.searched for a company: one of its records searched."""
+        fid = self.live(cid)
+        if fid is None:
+            return False
+        return bool(self.searched_targets(self.members([fid])[fid], person=False, module=module,
+                                          capability=capability, cutoff=cutoff,
+                                          looked_for=looked_for))
+
+    def finder_named(self, cid) -> list[dict]:
+        """Everyone named at a company (its records' people), in id order."""
+        fid = self.live(cid)
+        if fid is None:
+            return []
+        rows = self._by_ids("overlay.read.people_of", self.members([fid])[fid])
+        return sorted(({"id": pid, "name": name, "role": role or "", "source": source or ""}
+                       for firm, pid, name, norm, role, source, first in rows),
+                      key=lambda p: p["id"])
+
+    def finder_people(self, cid, module: str, capability: str, cutoff=None,
+                      limit: int = 3) -> list[dict]:
+        """The people at a company reached by no contact of their own and
+        not searched by the module's capability since ``cutoff``, in id
+        order, at most ``limit`` (-1: all)."""
+        group, links, _ = self._group_links(cid)
+        named = self.finder_named(cid)
+        reached = {l[3] for l in links if l[3]}
+        searched = self.searched_targets([p["id"] for p in named], person=True, module=module,
+                                         capability=capability, cutoff=cutoff)
+        out = [p for p in named if p["id"] not in reached and p["id"] not in searched]
+        return out if limit < 0 else out[:limit]
+
+    def finder_linked_emails(self, cid) -> set[tuple[int, str]]:
+        """(person, address) for every email linked to a person at the company."""
+        _, links, rows = self._group_links(cid)
+        return {(l[3], rows[l[1]][2].lower()) for l in links
+                if l[3] and l[1] in rows and rows[l[1]][11] == EMAIL}
+
+    def finder_emails_at(self, cid, domain: str, built=("", "")) -> list[str]:
+        """The addresses a source published for a company at ``domain``: not
+        a guess, not invalid, and found by something other than the address
+        check that builds them (``built``: its (module, capability))."""
+        _, links, rows = self._group_links(cid)
+        bad = {schema.CONTACT_STATUS["guess"], schema.CONTACT_STATUS["invalid"]}
+        wanted = [(l[0], l[1]) for l in links if l[1] in rows and rows[l[1]][11] == EMAIL
+                  and rows[l[1]][2].lower().endswith("@" + domain.lower())
+                  and rows[l[1]][5] not in bad]
+        published = set()
+        for contact, source, capability in self._by_ids("overlay.read.evidence_caps",
+                                                        [list(w) for w in wanted], 500):
+            if (source or "", capability or "") != tuple(built):
+                published.add(contact)
+        return list(dict.fromkeys(rows[c][2] for _, c in wanted if c in published))
+
+    def finder_sources(self, cid) -> set[str]:
+        """Every source that found the company's records."""
+        fid = self.live(cid)
+        if fid is None:
+            return set()
+        return {r[1] for r in self._by_ids("overlay.read.sources_of", self.members([fid])[fid])}
+
+    def finder_employees(self, cid):
+        """The company's latest employee count from the register that reads
+        it, or None."""
+        fid = self.live(cid)
+        if fid is None:
+            return None
+        return (self.figures([fid]).get(fid) or {}).get("employees")
+
+    def companies_needing_prospects(self, limit: int, module: str, capability: str,
+                                    cutoff=None) -> list[dict]:
+        """StateManager.companies_needing_prospects on the overlay: live
+        firms with a domain, no prospect on any of their records, and not
+        searched by the module's capability since ``cutoff``; never
+        searched first, then the longest ago."""
+        ids = [r[0] for r in self.x("overlay.read.with_domain_ids")]
+        if not ids:
+            return []
+        groups = self.members(ids)
+        live_of = {m: f for f, g in groups.items() for m in g}
+        with_prospect = {live_of[r[0]] for r in self._by_ids("overlay.read.prospects_of",
+                                                             list(live_of))}
+        done = {live_of[r] for r in self.searched_targets(list(live_of), person=False,
+                                                          module=module, capability=capability,
+                                                          cutoff=cutoff)}
+        last: dict[int, int] = {}
+        mid, cap = self.module_id(module), self.capability_id(module, capability)
+        if mid is not None and cap is not None:
+            for chunk in chunks(list(live_of)):
+                for target, at in self.x("overlay.read.last_searched",
+                                         (json.dumps(chunk), mid, cap)):
+                    f = live_of[target]
+                    last[f] = max(last.get(f, 0), at or 0)
+        wanted = [f for f in ids if f not in with_prospect and f not in done]
+        wanted.sort(key=lambda f: (f in last, last.get(f, 0), f))
+        cards = {int(r["id"]): r for r in self.company_rows(wanted[:int(limit)])}
+        return [{"id": str(f), "name": cards[f]["name"], "domain": cards[f]["domain"],
+                 "industry": cards[f]["industry"]} for f in wanted[:int(limit)] if f in cards]
+
+    def labels(self, ids) -> dict[str, str]:
+        """{company id: its name, else its domain, else its id} (job labels),
+        read for the names alone (no enrichment)."""
+        fids = {str(i): self.fid(i) for i in dict.fromkeys(ids)}
+        found = [f for f in fids.values() if f is not None]
+        rows = self.firm_rows(found)
+        names = self.sort_keys(found, "name") if found else {}
+        out = {}
+        for cid, fid in fids.items():
+            if fid is None or fid not in rows:
+                continue
+            out[cid] = names.get(fid) or rows[fid]["domain"] or cid
+        return out
+
+    # ── Duplicates: the review list and the merges in force ──
+
+    def duplicate_sides(self, ids) -> dict[str, dict]:
+        """{company id: the side the duplicates panel shows}: its record
+        (name, CUI, place, address, phone, domain, website, first source,
+        the firm it is merged into, when it was added), its phones, the
+        domains, listing ids and emails it is known by, its sources and how
+        many places it has."""
+        ids = [int(i) for i in dict.fromkeys(ids) if str(i).isdigit()]
+        if not ids:
+            return {}
+        cards = {int(r["id"]): r for r in self.company_rows(ids)}
+        groups = self.members(ids)
+        records = [m for g in groups.values() for m in g]
+        lives = self.live_of(ids)
+        idents = self.idents(records)
+        keys: dict[int, list] = {}
+        for firm, kind, value in self._by_ids("overlay.read.keys_of", records):
+            keys.setdefault(firm, []).append((kind, value))
+        places = dict(self._by_ids("overlay.read.places_count", records))
+        sources: dict[int, list] = {}
+        for firm, name, ref, first, last in self._by_ids("overlay.read.sources_of", records):
+            sources.setdefault(firm, []).append((first or 0, name))
+        phones = self.phones(groups)
+        out = {}
+        for i in ids:
+            card = cards.get(i)
+            if card is None:
+                continue
+            group = groups[i]
+            domains = [card["domain"]] if card["domain"] else []
+            emails, listings = [], []
+            for m in group:
+                for kind, value in keys.get(m, []):
+                    if kind == schema.FIRM_KEY["domain"] and value not in domains:
+                        domains.append(value)
+                    elif kind == schema.FIRM_KEY["email"] and value not in emails:
+                        emails.append(value)
+                for scheme, key in idents.get(m, []):
+                    s = self.schemes.named(scheme)
+                    if s is not None and s.kind == "external" and f"{s.prefix}{key}" not in listings:
+                        listings.append(f"{s.prefix}{key}")
+            srcs = [n for _, n in sorted(s for m in group for s in sources.get(m, []))]
+            live = lives.get(i, i)
+            out[str(i)] = {
+                "id": str(i), "name": card["name"], "cui": card["cui"],
+                "location": card["location"], "address": card["address"],
+                "phone": card["phone"], "domain": card["domain"], "website": card["website"],
+                "source": card["source"], "merged_into": str(live) if live != i else "",
+                "created_at": card["created_at"],
+                "phones": [p["value"] for p in phones.get(i, [])], "domains": domains,
+                "listings": listings, "emails": emails,
+                "sources": list(dict.fromkeys(srcs)),
+                "locations": sum(places.get(m, 0) for m in group)}
+        return out
+
+    @staticmethod
+    def _reasons(text) -> list:
+        try:
+            out = json.loads(text or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return out if isinstance(out, list) else []
+
+    def duplicates(self, status: str = "pending", limit: int = 100) -> list[dict]:
+        """StateManager.duplicates on the overlay: pairs on the review list
+        with ``status``, most likely first, each side as the panel shows it."""
+        pairs = [dict(zip(("company_a", "company_b", "score", "reasons", "status", "created_at",
+                           "decided_at"), r))
+                 for r in self.x("overlay.read.candidates", (status, int(limit)))]
+        sides = self.duplicate_sides({x for p in pairs for x in (p["company_a"], p["company_b"])})
+        out = []
+        for p in pairs:
+            a, b = str(p["company_a"]), str(p["company_b"])
+            out.append({**p, "company_a": a, "company_b": b, "reasons": self._reasons(p["reasons"]),
+                        "created_at": _db_time(p["created_at"]),
+                        "decided_at": _db_time(p["decided_at"]),
+                        "a": sides.get(a), "b": sides.get(b)})
+        return out
+
+    def _firm_identity(self, live_ids) -> dict[str, tuple | None]:
+        """{live firm: the firm it legally is (resolver.identity over its
+        records' legal keys), or None}."""
+        from harvey import resolver
+
+        legal = set(self.schemes.legal_kinds())
+        out = {}
+        for f, idents in self.group_idents(list(live_ids)).items():
+            ids: dict[str, set[str]] = {}
+            for scheme, key in idents:
+                s = self.schemes.named(scheme)
+                if s is None:
+                    continue
+                for kind, value in self.schemes.kinds_of(s.id, key):
+                    if kind in legal:
+                        ids.setdefault(kind, set()).add(value)
+            out[str(f)] = resolver.identity(ids) if ids else None
+        return out
+
+    def duplicate_groups_found(self) -> list[dict]:
+        """resolver.groups on the overlay: every pending pair followed to the
+        live firms it stands for now (gone when they are one since a merge,
+        or a person said they differ, or they are two firms), joined into
+        connected groups, most likely first, then largest."""
+        rows = self.x("overlay.read.candidates_open").fetchall()
+        if not rows:
+            return []
+        live = {str(k): str(v) for k, v in self.live_of({x for r in rows for x in r[:2]}).items()}
+        apart = {frozenset((live[str(a)], live[str(b)])) for a, b, _, _, status in rows
+                 if status == "separate" and str(a) in live and str(b) in live}
+        edges: dict[frozenset, dict] = {}
+        for a, b, score, reasons, status in rows:
+            if status != "pending":
+                continue
+            a, b = live.get(str(a), ""), live.get(str(b), "")
+            key = frozenset((a, b))
+            if not a or not b or a == b or key in apart:
+                continue
+            lo, hi = sorted((a, b), key=int)
+            edge = edges.setdefault(key, {"a": lo, "b": hi, "score": 0.0, "reasons": []})
+            if (score or 0) > edge["score"]:
+                edge["score"] = round(score or 0, 2)
+            for r in self._reasons(reasons):
+                if r not in edge["reasons"]:
+                    edge["reasons"].append(r)
+        if not edges:
+            return []
+        firm = self._firm_identity({int(x) for key in edges for x in key})
+        parent: dict[str, str] = {}
+
+        def root(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        kept = []
+        for edge in edges.values():
+            fa, fb = firm.get(edge["a"]), firm.get(edge["b"])
+            if fa and fb and fa != fb:
+                continue
+            kept.append(edge)
+            parent[root(edge["a"])] = root(edge["b"])
+        out: dict[str, dict] = {}
+        for edge in kept:
+            group = out.setdefault(root(edge["a"]), {"members": set(), "pairs": [], "score": 0.0})
+            group["members"].update((edge["a"], edge["b"]))
+            group["pairs"].append(edge)
+            group["score"] = max(group["score"], edge["score"])
+        result = []
+        for group in out.values():
+            group["members"] = sorted(group["members"], key=int)
+            group["pairs"].sort(key=lambda e: (-e["score"], int(e["a"]), int(e["b"])))
+            result.append(group)
+        result.sort(key=lambda g: (-g["score"], -len(g["members"]), int(g["members"][0])))
+        return result
+
+    def count_duplicates(self) -> int:
+        return len(self.duplicate_groups_found())
+
+    def duplicate_groups(self, limit: int = 100) -> tuple[int, list[dict]]:
+        """StateManager.duplicate_groups on the overlay: (how many groups,
+        the first ``limit``), each member as the panel shows it, the record
+        to keep and, per member, whether it is another firm than the
+        group's (``conflict``)."""
+        from harvey.overlay.store import Store
+
+        found = self.duplicate_groups_found()
+        shown = found[:max(1, limit)]
+        ids = [cid for g in shown for cid in g["members"]]
+        sides = self.duplicate_sides(ids)
+        firm = self._firm_identity({int(i) for i in ids})
+        store = Store(self.con, manifests=self.manifests, registers=self.registers)
+        for group in shown:
+            order = store.keeper_order(group["members"])
+            keeper = order[0] if order else group["members"][0]
+            group["keeper"] = keeper
+            reasons: list[dict] = []
+            for pair in group["pairs"]:
+                for r in pair["reasons"]:
+                    if r.get("code") not in {x.get("code") for x in reasons}:
+                        reasons.append(r)
+            group["reasons"] = reasons
+            group["key"] = ",".join(group["members"])
+            members = order + [m for m in group["members"] if m not in order]
+            anchor = firm.get(keeper) or next(
+                (firm[cid] for cid in members if firm.get(cid)), None)
+            group["members"] = [
+                {**(sides.get(cid) or {"id": cid}), "keeper": cid == keeper,
+                 "conflict": bool(firm.get(cid) and anchor and firm[cid] != anchor)}
+                for cid in members]
+        return len(found), shown
+
+    def merges(self, limit: int = 50) -> list[dict]:
+        """StateManager.merges on the overlay: merges in force, newest first,
+        both sides as the panel shows them."""
+        rows = [dict(zip(("id", "survivor", "merged", "score", "reasons", "decided_by",
+                          "created_at", "group_id"), r))
+                for r in self.x("overlay.read.merges", (int(limit),))]
+        sides = self.duplicate_sides({x for r in rows for x in (r["survivor"], r["merged"])})
+        for r in rows:
+            r["survivor"], r["merged"] = str(r["survivor"]), str(r["merged"])
+            r["reasons"] = self._reasons(r["reasons"])
+            r["created_at"] = _db_time(r["created_at"])
+            r["group_id"] = r["group_id"] or 0
+            r["a"], r["b"] = sides.get(r["survivor"]), sides.get(r["merged"])
+        return rows
 
 def version(path) -> int:
     """The schema version of the database at ``path`` (0: none there)."""

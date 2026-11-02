@@ -34,6 +34,8 @@ value_type = "text"
 collector = "profile"
 cost_note = "free (careers page or public job-board feed)"
 cardinality = "many"
+# Each read records every open role: a role a later read leaves out is closed.
+whole_set = true
 
 [[signals]]
 code = "OPEN_ROLES"

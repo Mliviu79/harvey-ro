@@ -435,7 +435,7 @@ async def test_remove_is_refused_for_a_firm_in_a_merge_or_named_by_outreach(stat
             await state.remove_company(cid)
         assert e.value.code == "merged"
     con = _con(state)
-    con.execute("INSERT INTO prospects (id, firm, email) VALUES ('p1', ?, 'ana@example.com')",
+    con.execute("INSERT INTO prospects (id, company_id, email) VALUES ('p1', ?, 'ana@example.com')",
                 (int(c),))
     con.close()
     with pytest.raises(RemoveRefused) as e:
@@ -712,8 +712,175 @@ async def test_company_and_its_history_read_on_the_overlay(state):
                                    "module": "startups", "capability": "startup_claims",
                                    "collector": "profile"}])
     assert await state.search_hit(a, "YC_BACKED") is False
-    # Reads schema 25 has no version of yet say so.
-    from harvey.state import NotOnOverlay
 
-    with pytest.raises(NotOnOverlay):
-        await state.duplicate_groups()
+
+# ── The Email module's prospects, the audience and the contact finder ──
+
+@pytest.mark.asyncio
+async def test_prospects_are_made_read_and_stopped_on_the_overlay(state, monkeypatch, tmp_path):
+    from harvey import export
+    from harvey.agents.audience import Audience
+    from harvey.models.prospect import Prospect
+
+    a, _ = await _listing(state, _hit(name="Exemplu Unu", n=101, domain="unu.example.com"))
+    await state.add_contacts(a, [
+        contacts.Found("email", "ana@unu.example.com", source="website", capability="read_site",
+                       person="Ana Exemplu", role="owner", trust="confirmed",
+                       status="verified"),
+        contacts.Found("email", "dan@unu.example.com", source="website", capability="read_site",
+                       person="Dan Exemplu", trust="likely", status="verified")])
+    # The audience makes prospects of the addresses the Writer can use.
+    assert await Audience(state).run() == 2
+    assert await Audience(state).run() == 0
+    made = await state.get_prospects_by_status("new")
+    assert {p.company_id for p in made} == {a} and {p.email for p in made} == {
+        "ana@unu.example.com", "dan@unu.example.com"}
+    ana = next(p for p in made if p.email.startswith("ana"))
+    dan = next(p for p in made if p.email.startswith("dan"))
+    assert (await state.get_prospect(ana.id)).company_id == a
+    # A reply from one stops the sequence to the other, a colleague at the firm.
+    item = await state.add_outbox_item(prospect_id=dan.id, to_email=dan.email, subject="s",
+                                       body="b", send_at="2026-01-01 09:00:00")
+    assert item
+    assert await state.stop_company(ana.id) == 1
+    assert await state.colleague_who_replied(dan.id) == "Ana Exemplu"
+    # The Contacts page and the export read the firm's record.
+    import harvey.dashboard as dash
+
+    monkeypatch.setattr(dash, "DB_PATH", tmp_path / "harvey.db")
+    page = await dash.get_prospects(limit=10, q="exemplu unu")
+    assert page["total"] == 2 and page["counts"]["all"] == 2
+    assert {r["company_name"] for r in page["prospects"]} == {"Exemplu Unu"}
+    assert (await dash.get_prospects(limit=10, q="nimeni"))["total"] == 0
+    rows = await export.collect_prospects(state, include_all=True)
+    assert {r["location"] for r in rows} == {"Brașov, Romania"}     # as the listing wrote it
+    # A prospect made by hand for the firm lands on it too.
+    pid = await ingest.prospect(state, Prospect(company_id=a, first_name="Ion",
+                                                last_name="Exemplu", email="ion@unu.example.com"))
+    assert (await state.get_prospect(pid)).company_id == a
+    assert await state.companies_needing_prospects() == []
+    assert _clean(state) == {}
+
+
+@pytest.mark.asyncio
+async def test_companies_needing_prospects_on_the_overlay(state):
+    a, _ = await _listing(state, _hit(name="Exemplu Unu", n=111, domain="unu.example.com"))
+    b, _ = await _listing(state, _hit(name="Exemplu Doi", n=112, domain="doi.example.com"))
+    await _listing(state, _hit(name="Exemplu Trei", n=113))            # no domain
+    found = await state.companies_needing_prospects()
+    assert sorted(r["id"] for r in found) == sorted([a, b])
+    await state.record_search("company", a, "people", "find_people", outcome="nothing")
+    # Searched once (no refresh age): left out; the other stays first.
+    assert [r["id"] for r in await state.companies_needing_prospects()] == [b]
+    assert {r["id"] for r in await state.companies_needing_prospects(
+        since="2000-01-01 00:00:00")} == {b}
+
+
+@pytest.mark.asyncio
+async def test_the_contact_finder_reads_a_company_on_the_overlay(state):
+    from harvey import finder
+    from harvey.modules import job_kinds
+
+    a, _ = await _listing(state, _hit(name="Exemplu Unu", phone="+40700000121", n=121,
+                                      domain="unu.example.com"))
+    row = await finder.company_row(state, a)
+    assert (row["id"], row["name"], row["domain"]) == (a, "Exemplu Unu", "unu.example.com")
+    assert await finder._on_file(state, a) == {"+40700000121"}
+    await state.add_contacts(a, [
+        contacts.Found("email", "office@unu.example.com", source="website",
+                       capability="read_site", trust="confirmed"),
+        contacts.Found("email", "ana@unu.example.com", source="website", capability="read_site",
+                       person="Ana Exemplu", trust="confirmed"),
+        contacts.Found("email", "dan.exemplu@unu.example.com", source=finder.EMAIL[0],
+                       capability=finder.EMAIL[1], person="Dan Exemplu", trust="likely",
+                       status="guess")])
+    await state.add_people(a, [("Ion Exemplu", "administrator")], source="website")
+    people = await finder._people_to_search(state, a, None)
+    assert [p["name"] for p in people] == ["Ion Exemplu"]
+    assert {p["name"] for p in await finder._named_at(state, a)} == {
+        "Ana Exemplu", "Dan Exemplu", "Ion Exemplu"}
+    linked = await finder._linked_emails(state, a)
+    assert {e for _, e in linked} == {"ana@unu.example.com", "dan.exemplu@unu.example.com"}
+    # What the site published, not the address a check built.
+    assert sorted(await finder._emails_at(state, a, "unu.example.com")) == [
+        "ana@unu.example.com", "office@unu.example.com"]
+    assert await finder.small_company(state, row) is False
+    assert not await finder.company_searched(state, a, *finder.SITE, looked_for=finder.SITE_WANTS)
+    await state.record_search("company", a, *finder.SITE, outcome="found",
+                              looked_for="phone,email,contact_form,social,people,owner")
+    assert await finder.company_searched(state, a, *finder.SITE, looked_for=finder.SITE_WANTS)
+    person = next(p["id"] for p in await finder._named_at(state, a) if p["name"] == "Ion Exemplu")
+    await state.record_search("person", person, *finder.EMAIL, outcome="nothing", origin=a)
+    assert await finder._people_to_search(state, a, None) == []
+    assert (await job_kinds._company_to_read(state, a))["domain"] == "unu.example.com"
+    assert await job_kinds._labels(state, [a, "999999"]) == {a: "Exemplu Unu"}
+    assert _clean(state) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_by_identifier_reads_only_sources_with_contacts(state, monkeypatch):
+    from harvey.modules import api
+
+    _, saved = await _pull(state, _firm(1))
+    asked = []
+
+    def fake(module, cap):
+        async def run(inp, ctx):
+            asked.append(module)
+            rows = inp.extra["batch"]
+            return api.Draft(
+                facts=[api.Fact("VAT_REGISTERED", value_num=1, record=r["key"]) for r in rows],
+                contacts=[api.Contact("phone", "+40700000131", record=r["key"]) for r in rows])
+        return run
+    caps = [(type("M", (), {"id": m})(), {"id": c, "batch": 10, "outputs": out}, "cui")
+            for m, c, out in (("mf_financials", "statements_lookup", {"facts": ["TURNOVER"]}),
+                              ("mf_taxpayers", "taxpayer_lookup",
+                               {"ids": ["phone"], "facts": ["VAT_REGISTERED"]}))]
+    monkeypatch.setattr(runs, "id_lookups", lambda enabled: caps)
+    monkeypatch.setattr(runs, "_wanted", lambda cap, confirmed: True)
+    monkeypatch.setattr(api, "capability", fake)
+    found = await runs.lookup_by_id(state)
+    # Financial figures are read in place: that source isn't read at all.
+    assert asked == ["mf_taxpayers"] and found["observations"] == 0
+    assert found["companies"] == 1
+    assert _one(state, "SELECT n_phone FROM firm WHERE id = ?", int(saved[0])) == 1
+    assert _clean(state) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_whole_set_read_closes_what_it_left_out(state):
+    """HIRING_ROLE (whole_set): each read records every open role, so a role
+    a later read leaves out stops being current; history keeps it."""
+    cid = await state.add_company(Company(name="Roles Exemplu", domain="roles.example"))
+    await state.add_observations([
+        {"company_id": cid, "signal_code": "HIRING_ROLE", "value_text": "Estimator",
+         "observed_at": "2026-09-01 10:00:00"},
+        {"company_id": cid, "signal_code": "HIRING_ROLE", "value_text": "Foreman",
+         "observed_at": "2026-09-01 10:00:00"}])
+    await state.add_observations([
+        {"company_id": cid, "signal_code": "HIRING_ROLE", "value_text": "Foreman",
+         "observed_at": "2026-10-01 10:00:00"}])
+    current = {(r["key"], r["value_num"]) for r in await state.read("readings_of", cid)
+               if r["signal_code"] == "HIRING_ROLE"}
+    assert current == {("Estimator", 0), ("Foreman", None)}
+    history = await state.get_observations(company_id=cid, signal_code="HIRING_ROLE")
+    assert sorted(o["value_text"] for o in history) == ["", "Estimator", "Foreman"]
+    # A signal that isn't a whole set keeps every value current.
+    await state.add_observations([
+        {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40700000101",
+         "observed_at": "2026-09-01 10:00:00"},
+        {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40700000102",
+         "observed_at": "2026-10-01 10:00:00"}])
+    assert len([r for r in await state.read("readings_of", cid)
+                if r["signal_code"] == "PHONE_NUMBER" and r["value_num"] != 0]) == 2
+    assert _clean(state) == {}
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_signal_code_is_refused_and_nothing_written(state):
+    cid = await state.add_company(Company(name="Cod Exemplu", domain="cod.example"))
+    with pytest.raises(ValueError, match="unknown signal_code 'NOT_A_SIGNAL'"):
+        await state.add_observations([
+            {"company_id": cid, "signal_code": "TECH_STACK", "value_text": "WordPress"},
+            {"company_id": cid, "signal_code": "NOT_A_SIGNAL", "value_text": "x"}])
+    assert _one(state, "SELECT COUNT(*) FROM obs") == 0

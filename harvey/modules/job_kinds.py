@@ -33,6 +33,7 @@ logger = logging.getLogger("harvey.jobs")
 
 SITE_LANE = "website"          # the website reader's module
 DUPLICATES_LANE = "duplicates"  # the resolver's look for duplicates on file
+COUNTS_LANE = "counts"          # the registers' signals counted over the firms in Harvey
 CONTACTS_LANE = "contacts"     # the contact finder, one company per job
 REGISTRY_LANE = "onrc"
 
@@ -287,14 +288,10 @@ async def _company_to_read(state, company_id: str) -> dict | None:
 
     from harvey.state import LIVE_COMPANY
 
-    async with state._connect() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT c.id, c.name, c.domain, c.location, c.source_url FROM companies c "
-                f"WHERE c.id = ? AND COALESCE(c.domain, '') != '' AND {LIVE_COMPANY}",
-                (company_id,)) as cur:
-            row = await cur.fetchone()
-    return dict(row) if row else None
+    row = await state.read("finder_company", company_id)
+    if row is None or not row["domain"]:
+        return None
+    return {k: row[k] for k in ("id", "name", "domain", "location", "source_url")}
 
 
 @jobs.kind("site_read")
@@ -340,6 +337,29 @@ async def run_duplicates_scan(ctx) -> dict:
     return {"duplicates": done}
 
 
+# ── The registers' signals counted over the firms in Harvey (schema 25) ──
+
+async def enqueue_register_counts(state, *, batch_id: str = "", parent_id: str = "") -> str:
+    """Queue one count of every register signal over the firms in Harvey
+    for the registers' current loads (what the Signals page, the landing
+    page and the People page read), after a register or the firms in
+    Harvey changed. "" while one waits already."""
+    try:
+        return await jobs.enqueue(state, "register_counts", COUNTS_LANE, {},
+                                  dedupe_key="register_counts",
+                                  label="Count the register signals", batch_id=batch_id,
+                                  parent_id=parent_id)
+    except jobs.Duplicate:
+        return ""
+
+
+@jobs.kind("register_counts")
+async def run_register_counts(ctx) -> dict:
+    await ctx.say("Counting the register signals over the companies on file")
+    n = await ctx.state.recount_register_tally()
+    return {"counted": n}
+
+
 # ── The trade registry (the onrc module) ──
 
 @jobs.kind("registry_load")
@@ -350,7 +370,11 @@ async def run_registry_load(ctx) -> dict:
     meta = await ensure_registry(Path(p["path"]), Path(p["data_dir"]), p.get("dataset") or "latest",
                                  with_people=p.get("with_people", True),
                                  force=bool(p.get("force")), say=ctx.say)
-    return {"registry": meta}
+    placed = await ctx.state.refresh_orders()
+    if placed:
+        await ctx.say(f"  {placed:,} companies placed in the registry's name and place order")
+    await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
+    return {"registry": meta, "placed": placed}
 
 
 def _filters(p: dict):
@@ -424,6 +448,8 @@ async def run_registry_pull(ctx) -> dict:
         do_not_contact=live_do_not_contact(config) if config is not None else None,
         progress=progress, area=p.get("area") or "", follow_up=saved)
     queued = finding = 0
+    if saved.ids and not dry_run:
+        await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
     if saved.ids and not dry_run and not report.errors:
         # The contact finder follows the checks (their phones are on file
         # by then, so no search is paid for a firm they already reach).
@@ -487,6 +513,8 @@ async def run_source_sync(ctx) -> dict:
     out = {"module": module, "unchanged": bool(values.get("unchanged")),
            "offline": values.get("offline") or "", "downloaded": values.get("downloaded") or [],
            "values": {k: v for k, v in values.items() if k != "progress"}}
+    if not values.get("unchanged"):
+        await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
     if p.get("lookup", True) and not (p.get("auto") and values.get("unchanged")):
         found = await lookup_by_id(ctx.state, progress=lambda done, total: ctx.say_soon(
             f"    companies on file: {done:,} of {total:,}..."))
@@ -753,14 +781,7 @@ async def _labels(state, company_ids) -> dict[str, str]:
     """Each company's name (or domain), for its job's label."""
     out: dict[str, str] = {}
     ids = list(company_ids)
-    async with state._connect() as db:
-        for at in range(0, len(ids), 500):
-            part = ids[at:at + 500]
-            async with db.execute(
-                    "SELECT id, COALESCE(NULLIF(name, ''), domain, id) FROM companies "
-                    f"WHERE id IN ({','.join('?' * len(part))})", part) as cur:
-                out.update({r[0]: r[1] for r in await cur.fetchall()})
-    return out
+    return await state.read("labels", ids)
 
 
 async def enqueue_find_contacts(state, company_ids, *, batch_id: str = "", parent_id: str = "",

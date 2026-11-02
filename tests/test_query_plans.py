@@ -13,11 +13,6 @@ sort of a set the statement doesn't bound, and on a join order other than
 the one it spells. A statement that reads many rows on purpose (a range,
 a recount job) says which tables and why (``scans``).
 
-Today's pages (schema 24) are driven through the dashboard with every
-statement they run traced and explained the same way; the scans and sorts
-they do today are the allow-list below, which later work shrinks to empty
-(an entry that no longer happens fails too, so the list only gets shorter).
-
 All data is fictional; the statistics are row counts only.
 """
 
@@ -600,61 +595,7 @@ def test_registry_resolve_gives_canonical_keys(files):
                                                 ("ro.onrc_reg", "J08/3/2015")]
 
 
-# ── Today's pages (schema 24) ──
-
-PAGES = {
-    "today": ("GET", "/api/today", None),
-    "live-status": ("GET", "/api/live-status", None),
-    "overview": ("GET", "/api/overview", None),
-    "signals": ("GET", "/api/signals", None),
-    "cohort.efactura": ("POST", "/api/cohort", {"require": ["EFACTURA_REGISTERED"]}),
-    "cohort.turnover": ("POST", "/api/cohort",
-                        {"ranges": [{"code": "TURNOVER", "min": 1000000}]}),
-    "companies": ("GET", "/api/companies?limit=50", None),
-    "companies.offset": ("GET", "/api/companies?limit=50&offset=2", None),
-    "companies.county": ("GET", "/api/companies?county=Bra%C8%99ov&limit=50", None),
-    "companies.no_contact": ("GET", "/api/companies?contact=none&limit=50", None),
-    "companies.search": ("GET", "/api/companies?search=exemplu&limit=50", None),
-    "companies.turnover": ("GET", "/api/companies?sort=turnover&limit=50", None),
-    "companies.panel": ("GET", "/api/companies/{firm}", None),
-    "contacts": ("GET", "/api/contacts?limit=50", None),
-    "contacts.by_companies": ("GET", "/api/contacts?sort=companies&limit=50", None),
-    "contacts.mobile_county": ("GET", "/api/contacts?kind=phone&contact=mobile&county=Bra%C8%99ov",
-                               None),
-    "people": ("GET", "/api/contacts?view=people&limit=50", None),
-    "finder.backlog": ("GET", "/api/contacts/finder", None),
-    "registry": ("GET", "/api/registry?limit=50", None),
-    "duplicates": ("GET", "/api/duplicates", None),
-    "jobs": ("GET", "/api/jobs", None),
-    "activity": ("GET", "/api/activity", None),
-    "outbox": ("GET", "/api/outbox", None),
-}
-
-# What today's pages scan or sort that the rules forbid, page by page:
-# the list later work shrinks to empty (on the real database these are the
-# pages that take seconds).
-KNOWN_V24: dict[str, set[str]] = {
-    "today": {"scan:companies", "scan:observations"},
-    "live-status": {"scan:companies"},
-    "overview": {"scan:companies", "scan:company_activities"},
-    "signals": {"scan:companies", "scan:observations", "sort"},
-    "cohort.efactura": {"scan:companies", "sort"},
-    "cohort.turnover": {"scan:companies", "sort"},
-    "companies": {"scan:companies", "sort"},
-    "companies.offset": {"scan:companies"},
-    "companies.county": {"scan:companies", "sort"},
-    "companies.no_contact": {"scan:companies", "scan:company_contacts", "sort"},
-    "companies.search": {"scan:companies", "sort"},
-    "companies.turnover": {"scan:companies", "sort"},
-    "companies.panel": {"sort"},
-    "contacts": {"scan:company_contacts", "scan:contacts"},
-    "contacts.by_companies": {"scan:company_contacts", "scan:contacts", "sort"},
-    "contacts.mobile_county": {"scan:company_contacts", "scan:contacts", "sort"},
-    "people": {"scan:contacts", "scan:people"},
-    "finder.backlog": {"scan:companies"},
-    "registry": {"scan:companies"},
-}
-
+# ── Tracing a page's statements (tests/test_overlay_reads.py) ──
 
 class Tracer:
     """Every SELECT any connection runs (with its parameters filled in),
@@ -681,100 +622,6 @@ class Tracer:
 
         con.set_trace_callback(trace)
         return con
-
-
-def _seed_v24(path: Path) -> dict:
-    from harvey.models import Company
-    from harvey.signals import sync_vocabulary
-    from harvey.state import StateManager
-
-    async def go():
-        s = StateManager(str(path))
-        await s.init_db()
-        await sync_vocabulary(s)
-        for code in ("EFACTURA_REGISTERED", "TURNOVER", "PHONE_NUMBER"):
-            await s.set_signal_status(code, "confirmed")
-        ids = []
-        for i, (name, cui) in enumerate((("ALFA EXEMPLU SRL", "1000004"),
-                                         ("BETA EXEMPLU SRL", "1000012"))):
-            ids.append(await s.add_company(Company(
-                name=name, cui=cui, location="Brașov, Brașov, Romania",
-                address=f"Str. Exemplului nr. {i + 1}", source="registry:onrc",
-                external_id=f"onrc:J08/{i + 1}/2015",
-                website="https://alfa.example.com" if i == 0 else "")))
-        await s.add_observations([{"company_id": ids[0], "signal_code": "TURNOVER",
-                                   "value_num": 250000.0, "value_text": "2024"}])
-        return {"firm": ids[0]}
-
-    return asyncio.run(go())
-
-
-def _explain_traced(tracer: Tracer) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    cons: dict = {}
-    for page, rows in tracer.seen.items():
-        found = out.setdefault(page, set())
-        for opened, attached, sql in rows:
-            key = (repr(opened), attached)
-            if key not in cons:
-                args, kwargs = opened
-                con = tracer.real(*args, **kwargs)
-                for stmt in attached:
-                    try:
-                        con.execute(stmt)
-                    except sqlite3.Error:
-                        pass
-                cons[key] = con
-            try:
-                plan = explain(cons[key], sql)
-            except sqlite3.Error:
-                continue            # a statement of a temporary table gone since
-            found |= findings(sql, plan, con=cons[key])
-    for con in cons.values():
-        con.close()
-    return out
-
-
-def test_todays_pages_scan_only_what_is_known(files, tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    import harvey.dashboard as dash
-    from harvey import companies, registry, registry_view
-    from harvey.modules.ro.anaf import service as anaf
-    from harvey.modules.ro.mf_financials import store as fin
-    from harvey.modules.ro.mf_taxpayers import store as tax
-
-    db = tmp_path / "harvey.db"
-    ids = _seed_v24(db)
-    monkeypatch.setattr(dash, "DB_PATH", db)
-    monkeypatch.setattr(fin, "FINANCIALS_PATH", files / "financials.db")
-    monkeypatch.setattr(tax, "TAXPAYERS_PATH", files / "taxpayers.db")
-    monkeypatch.setattr(anaf, "CACHE_PATH", files / "anaf.db")
-    monkeypatch.setattr(registry, "REGISTRY_PATH", files / "registry.db")
-    monkeypatch.setattr(registry_view, "WARM_FIRMS", 10**9)    # no background warm-up
-    companies.SNAPSHOTS.clear()
-    companies.RANKINGS.clear()
-    tracer = Tracer()
-    monkeypatch.setattr(sqlite3, "connect", tracer.connect)
-    token = dash.token_store.get()
-    client = TestClient(dash.app, base_url="http://127.0.0.1:5555",
-                        headers={"Authorization": f"Bearer {token}"})
-    for page, (method, url, body) in PAGES.items():
-        tracer.page = page
-        r = client.request(method, url.format(**ids), json=body)
-        assert r.status_code < 500, (page, r.status_code, r.text[:300])
-    tracer.page = ""
-    monkeypatch.setattr(sqlite3, "connect", tracer.real)
-    companies.SNAPSHOTS.clear()
-    companies.RANKINGS.clear()
-    found = {p: f for p, f in _explain_traced(tracer).items() if f}
-    assert set(PAGES) <= set(tracer.seen) | {"jobs", "outbox"}, sorted(set(PAGES) - set(tracer.seen))
-    new = {p: sorted(f - KNOWN_V24.get(p, set())) for p, f in found.items()
-           if f - KNOWN_V24.get(p, set())}
-    gone = {p: sorted(k - found.get(p, set())) for p, k in KNOWN_V24.items()
-            if k - found.get(p, set())}
-    assert new == {}, f"new scans or sorts (fix them; never add here): {new}"
-    assert gone == {}, f"no longer happen: remove from KNOWN_V24: {gone}"
 
 
 # ── No SQL in the dashboard outside named statements ──

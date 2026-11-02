@@ -34,14 +34,6 @@ async def test_add_and_get_company(state):
 
 
 @pytest.mark.asyncio
-async def test_company_exists(state):
-    company = Company(name="Acme", domain="acme.example")
-    await state.add_company(company)
-    assert await state.company_exists("acme.example")
-    assert not await state.company_exists("notreal.example")
-
-
-@pytest.mark.asyncio
 async def test_add_and_get_prospect(state):
     p = Prospect(
         first_name="Jane", last_name="Doe", email="jane@acme.example",

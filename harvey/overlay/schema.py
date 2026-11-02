@@ -16,6 +16,10 @@ from __future__ import annotations
 import sqlite3
 
 VERSION = 25
+# The capability an observation is kept under when a search's hit gave it
+# and the row names no capability (schema 24's collector "discover"): so
+# a later site read can tell it from its own "not stated".
+SEARCH_HIT = "search_hit"
 
 # ── Enums (stored as integers) ──
 
@@ -104,7 +108,10 @@ CREATE TABLE firm (
   profiled_at INTEGER, last_search_at INTEGER, finder_at INTEGER,
   n_contacts INTEGER NOT NULL DEFAULT 0, n_email INTEGER NOT NULL DEFAULT 0,
   n_phone INTEGER NOT NULL DEFAULT 0, n_mobile INTEGER NOT NULL DEFAULT 0,
-  best_trust INTEGER, n_people INTEGER NOT NULL DEFAULT 0
+  best_trust INTEGER, n_people INTEGER NOT NULL DEFAULT 0,
+  -- where it falls in the directory register's name and place orders
+  -- (overlay/orders.py: refreshed per load of the register)
+  name_order REAL, place_order REAL
 );
 CREATE UNIQUE INDEX firm_domain ON firm(domain) WHERE domain IS NOT NULL;
 CREATE INDEX firm_merged       ON firm(live) WHERE live != 0;
@@ -117,6 +124,8 @@ CREATE INDEX firm_with_site    ON firm(site_read_deep, created DESC, id DESC)
 CREATE INDEX firm_profiled     ON firm(profiled_at) WHERE live = 0;
 CREATE INDEX firm_searched     ON firm(last_search_at DESC, id DESC)
                                   WHERE live = 0 AND last_search_at IS NOT NULL;
+CREATE INDEX firm_by_name      ON firm(name_order DESC, id DESC) WHERE live = 0;
+CREATE INDEX firm_by_place     ON firm(place_order DESC, id DESC) WHERE live = 0;
 
 -- key has no type affinity: an integer for a numeric scheme, text otherwise.
 CREATE TABLE firm_ident (
@@ -137,7 +146,8 @@ CREATE TABLE revision (name TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE local_firm (
   firm INTEGER PRIMARY KEY, name TEXT, county TEXT, locality TEXT, address TEXT,
   phone TEXT, industry TEXT, description TEXT, source_url TEXT,
-  gone INTEGER                              -- set when the register it came from no longer has it
+  gone INTEGER,                             -- set when the register it came from no longer has it
+  country TEXT                              -- as the place line named it (a recipient's time zone)
 );
 CREATE INDEX local_firm_place ON local_firm(county, locality);
 CREATE VIRTUAL TABLE local_fts USING fts5(name, industry, locality, county,
@@ -265,16 +275,17 @@ CREATE TABLE tally (name TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE signal_tally (signal INTEGER PRIMARY KEY, n_true INTEGER NOT NULL,
                            n_checked INTEGER NOT NULL);
 -- Register signals counted over the firms in Harvey, per load mark (a job
--- recounts them; at NULL means stale).
+-- recounts them; at NULL means stale). n_values: how many values the firms
+-- hold in all (each once per record: the people a register names).
 CREATE TABLE register_tally (signal INTEGER NOT NULL, module INTEGER NOT NULL, mark TEXT NOT NULL,
-  loaded INTEGER NOT NULL, n_true INTEGER, n_false INTEGER, at INTEGER,
+  loaded INTEGER NOT NULL, n_true INTEGER, n_false INTEGER, at INTEGER, n_values INTEGER,
   PRIMARY KEY (signal, module));
 """
 
 # The tables kept from schema 24, unchanged but for integer firm ids.
 OUTREACH = """
 CREATE TABLE prospects (
-  id TEXT PRIMARY KEY, firm INTEGER, first_name TEXT DEFAULT '', last_name TEXT DEFAULT '',
+  id TEXT PRIMARY KEY, company_id INTEGER, first_name TEXT DEFAULT '', last_name TEXT DEFAULT '',
   email TEXT DEFAULT '', email_verified INTEGER DEFAULT 0, phone TEXT DEFAULT '',
   phone_verified INTEGER DEFAULT 0, linkedin_url TEXT DEFAULT '', title TEXT DEFAULT '',
   seniority TEXT DEFAULT '', department TEXT DEFAULT '', source TEXT DEFAULT '',
@@ -284,7 +295,7 @@ CREATE TABLE prospects (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, email_status TEXT DEFAULT '',
   timezone TEXT DEFAULT ''
 );
-CREATE INDEX idx_prospects_firm ON prospects(firm);
+CREATE INDEX idx_prospects_company_id ON prospects(company_id);
 CREATE INDEX idx_prospects_status ON prospects(status);
 CREATE UNIQUE INDEX uq_prospects_email ON prospects(email) WHERE email != '';
 CREATE UNIQUE INDEX uq_prospects_linkedin ON prospects(linkedin_url) WHERE linkedin_url != '';
@@ -515,6 +526,41 @@ def create(con: sqlite3.Connection, *, triggers: bool = True) -> None:
         from harvey.overlay import triggers as kept
 
         kept.install(con)
+
+
+_SHAPE: dict[str, set[str]] | None = None
+
+
+def missing(con: sqlite3.Connection) -> list[str]:
+    """What this release's schema has that the open database lacks
+    (tables, ``table.column``): a file made by an earlier build of schema
+    25, which no version number tells apart."""
+    global _SHAPE
+    if _SHAPE is None:
+        mem = sqlite3.connect(":memory:")
+        try:
+            create(mem, triggers=False)
+            _SHAPE = _columns(mem)
+        finally:
+            mem.close()
+    have = _columns(con)
+    out = []
+    for table, cols in sorted(_SHAPE.items()):
+        if table not in have:
+            out.append(table)
+        else:
+            out += [f"{table}.{c}" for c in sorted(cols - have[table])]
+    return out
+
+
+def _columns(con: sqlite3.Connection) -> dict[str, set[str]]:
+    rows = con.execute("SELECT name, sql FROM main.sqlite_master WHERE type = 'table' "
+                       "AND name NOT LIKE 'sqlite!_%' ESCAPE '!'").fetchall()
+    virtual = [n for n, sql in rows if (sql or "").upper().startswith("CREATE VIRTUAL")]
+    # (Virtual tables and their shadow tables are the module's business.)
+    tables = [n for n, _ in rows if n not in virtual
+              and not any(n.startswith(v + "_") for v in virtual)]
+    return {t: {r[1] for r in con.execute(f"PRAGMA main.table_info(\"{t}\")")} for t in tables}
 
 
 def install_guards(con: sqlite3.Connection) -> None:

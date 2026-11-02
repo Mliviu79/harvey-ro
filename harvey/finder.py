@@ -53,7 +53,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-import aiosqlite
 
 from harvey import contacts, resolver
 from harvey.modules import api, ingest
@@ -74,33 +73,15 @@ EMAIL = ("email_verify", "find_email")
 # or two administrators; more is a big company whose site lists its people.
 MAX_PEOPLE_PER_COMPANY = 3
 
-LIVE = "COALESCE(c.merged_into, '') = ''"
-NO_CONTACT = "NOT EXISTS (SELECT 1 FROM company_contacts cc WHERE cc.company_id = c.id)"
-HAS_SITE = "(COALESCE(c.domain, '') != '' OR COALESCE(c.website, '') != '')"
-
-
 # ── Searches ──
 
-def _not_searched(module: str, capability: str, since: str | None,
-                  target_sql: str = "c.id", target: str = "company",
-                  looked_for: str = "") -> tuple[str, list]:
-    return (contacts.not_searched(target_sql, target, looked_for),
-            [module, capability, contacts.search_cutoff(module, capability, since)])
-
-
-def _site_not_read(since: str | None = None) -> tuple[str, list]:
-    return _not_searched(*SITE, since, looked_for=SITE_WANTS)
-
-
-async def searched(db, target: str, target_id, module: str, capability: str,
-                   since: str | None = None, looked_for: str = "") -> bool:
-    """Was the record searched by the module's capability (since the
-    cutoff: a forced run's start, else the capability's refresh age; one
-    that looked for ``looked_for`` when given)?"""
-    cond, args = _not_searched(module, capability, since, "?", target, looked_for)
-    async with db.execute(f"SELECT {cond}", (str(target_id), *args)) as cur:
-        (fresh,) = await cur.fetchone()
-    return not fresh
+async def company_searched(state, company_id, module: str, capability: str,
+                           since: str | None = None, looked_for: str = "") -> bool:
+    """Was the company searched by the module's capability (any of its
+    records; since the cutoff: a forced run's start, else the capability's
+    refresh age; one that looked for ``looked_for`` when given)?"""
+    return await state.read("finder_searched", company_id, module, capability,
+                            contacts.search_cutoff(module, capability, since), looked_for)
 
 
 # ── The searches a website lookup can go through ──
@@ -254,15 +235,7 @@ def judge(company: dict, on_file: set[str], score: int, *, floor: str = "unconfi
 # ── One company ──
 
 async def company_row(state, company_id: str) -> dict | None:
-    async with state._connect() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT c.id, c.name, c.domain, c.website, c.website_trust, c.location, c.cui, "
-                "c.phone, c.source_url, c.source, c.company_size "
-                f"FROM companies c WHERE c.id = ? AND {LIVE}",
-                (company_id,)) as cur:
-            row = await cur.fetchone()
-    return dict(row) if row else None
+    return await state.read("finder_company", company_id)
 
 
 def market_country(company: dict) -> str:
@@ -286,24 +259,17 @@ def market_country(company: dict) -> str:
 
 async def _on_file(state, company_id: str) -> set[str]:
     """The phones and emails on file for a company (to confirm a site by)."""
-    async with state._connect() as db:
-        async with db.execute(
-                "SELECT ct.value FROM company_contacts l JOIN contacts ct ON ct.id = l.contact_id "
-                "WHERE l.company_id = ? AND ct.kind IN ('phone', 'email')", (company_id,)) as cur:
-            return {r[0].lower() for r in await cur.fetchall()}
+    return await state.read("finder_on_file", company_id)
 
 
 async def _people_to_search(state, company_id: str, since: str | None,
                             limit: int = MAX_PEOPLE_PER_COMPANY) -> list[dict]:
-    cond, args = _not_searched(*EMAIL, since, "CAST(p.id AS TEXT)", "person")
-    async with state._connect() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                "SELECT p.id, p.name, p.role, p.source FROM people p WHERE p.company_id = ? "
-                "AND NOT EXISTS (SELECT 1 FROM company_contacts l WHERE l.person_id = p.id "
-                f"AND l.person_id != 0) AND {cond} ORDER BY p.id LIMIT ?",
-                (company_id, *args, limit)) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    # (Schema 25 keeps the people a register names in the register: the
+    # ones the finder works on become Harvey's own, so their searches
+    # are recorded.)
+    await state.name_register_people(company_id)
+    return await state.read("finder_people", company_id, *EMAIL,
+                            contacts.search_cutoff(*EMAIL, since), limit)
 
 
 split_name = contacts.split_name
@@ -365,10 +331,9 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
     enabled = await switches.enabled_ids(state)
     confirmed = set(await state.confirmed_signal_codes())
     domain, floor = site_of(company)
-    async with state._connect() as db:
-        site_done = bool(domain) and await searched(db, "company", company_id, *SITE, since,
-                                                    looked_for=SITE_WANTS)
-        had_contact = await _has_contact(db, company_id)
+    site_done = bool(domain) and await company_searched(state, company_id, *SITE, since,
+                                                        looked_for=SITE_WANTS)
+    had_contact = await state.read("finder_has_contact", company_id)
 
     if domain and not site_done:
         on_file = await _on_file(state, company_id)
@@ -406,12 +371,6 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
             found=out.contacts, cost=out.cost, batch_id=batch_id,
             detail="; ".join(out.steps + out.skipped))
     return out
-
-
-async def _has_contact(db, company_id: str) -> bool:
-    async with db.execute("SELECT 1 FROM company_contacts WHERE company_id = ? LIMIT 1",
-                          (company_id,)) as cur:
-        return await cur.fetchone() is not None
 
 
 def _reader(state, confirmed, config):
@@ -495,9 +454,8 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
     town = (company.get("location") or "").split(",")[0].strip()
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for s in available:
-            async with state._connect() as db:
-                if await searched(db, "company", company_id, s.module, s.capability, since):
-                    continue
+            if await company_searched(state, company_id, s.module, s.capability, since):
+                continue
             if background and await asyncio.to_thread(lanes.held, s.module):
                 # (It said it can take no more for now: out of credit, a
                 # spent quota, a refused key.)
@@ -781,13 +739,7 @@ def _own_address(known, orders) -> tuple[str, str]:
 
 async def _linked_emails(state, company_id: str) -> set[tuple[int, str]]:
     """(person id, address) for every email linked to a person at the company."""
-    async with state._connect() as db:
-        async with db.execute(
-                "SELECT l.person_id, LOWER(ct.value) FROM company_contacts l "
-                "JOIN contacts ct ON ct.id = l.contact_id "
-                "WHERE l.company_id = ? AND l.person_id != 0 AND ct.kind = 'email'",
-                (company_id,)) as cur:
-            return {(r[0], r[1]) for r in await cur.fetchall()}
+    return await state.read("finder_linked_emails", company_id)
 
 
 async def _emails_at(state, company_id: str, domain: str) -> list[str]:
@@ -797,15 +749,7 @@ async def _emails_at(state, company_id: str, domain: str) -> list[str]:
     nor is one a check found invalid or that stays a guess: learning from
     those would pass a guess off as published, or teach the next check a
     pattern nobody confirmed."""
-    async with state._connect() as db:
-        async with db.execute(
-                "SELECT DISTINCT ct.value FROM company_contacts l "
-                "JOIN contacts ct ON ct.id = l.contact_id "
-                "WHERE l.company_id = ? AND ct.kind = 'email' AND ct.value LIKE ? "
-                "AND COALESCE(ct.status, '') NOT IN ('guess', 'invalid') "
-                "AND NOT (COALESCE(l.capability, '') = ? AND COALESCE(l.source, '') = ?)",
-                (company_id, f"%@{domain}", EMAIL[1], EMAIL[0])) as cur:
-            return [r[0] for r in await cur.fetchall()]
+    return await state.read("finder_emails_at", company_id, domain, EMAIL)
 
 
 # A company this size or smaller is "small" (first@ before first.last@).
@@ -835,29 +779,16 @@ async def small_company(state, company: dict, config=None) -> bool:
         return True
     if (company.get("source") or "") in LOCAL_BUSINESS_SOURCES:
         return True
-    marks = ",".join("?" * len(LOCAL_BUSINESS_SOURCES))
-    async with state._connect() as db:
-        async with db.execute(
-                f"SELECT 1 FROM company_sources WHERE company_id = ? AND source IN ({marks}) "
-                "LIMIT 1", (company["id"], *LOCAL_BUSINESS_SOURCES)) as cur:
-            if await cur.fetchone():
-                return True
-        async with db.execute(
-                "SELECT value_num FROM observations WHERE company_id = ? "
-                "AND signal_code = 'EMPLOYEES' AND value_num IS NOT NULL "
-                # (One reading per financial year, the year in value_text.)
-                "ORDER BY value_text DESC, observed_at DESC LIMIT 1", (company["id"],)) as cur:
-            row = await cur.fetchone()
-    return row is not None and row[0] <= SMALL_COMPANY_MAX
+    if await state.read("finder_sources", company["id"]) & set(LOCAL_BUSINESS_SOURCES):
+        return True
+    employees = await state.read("finder_employees", company["id"])
+    return employees is not None and employees <= SMALL_COMPANY_MAX
 
 
 async def _named_at(state, company_id: str) -> list[dict]:
     """Everyone named at a company (to confirm a name's order by)."""
-    async with state._connect() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id, name, source FROM people WHERE company_id = ?",
-                              (company_id,)) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    return [{k: p[k] for k in ("id", "name", "source")}
+            for p in await state.read("finder_named", company_id)]
 
 
 def _official(source: str) -> bool:
@@ -921,51 +852,16 @@ async def backlog(state, fresh: bool = False) -> dict:
     BACKLOG_CACHE_SECONDS (``fresh`` counts again)."""
     import time
 
-    if await state.is_overlay():
-        key = str(state.db_path)
-        kept = _counted.get(key)
-        if fresh or kept is None or time.monotonic() - kept[0] > BACKLOG_CACHE_SECONDS:
-            kept = (time.monotonic(), await state.read("backlog", FINDER, SITE))
-            _counted[key] = kept
-        out = dict(kept[1])
-        looked = out.pop("looked")
-        out["jobs"] = await state.jobs_waiting("find_contacts")
-        out["background_search"] = await background_status(state, looked)
-        return out
-    site_cond, site_args = _site_not_read()
-    finder_cond, finder_args = _not_searched(*FINDER, None)
     key = str(state.db_path)
     kept = _counted.get(key)
-    async with state._connect() as db:
-        if fresh or kept is None or time.monotonic() - kept[0] > BACKLOG_CACHE_SECONDS:
-            async with db.execute(
-                    f"SELECT COUNT(*), SUM({HAS_SITE} AND {site_cond}), SUM(NOT ({finder_cond})), "
-                    f"SUM(NOT {HAS_SITE} AND COALESCE(c.name, '') != '') "
-                    f"FROM companies c WHERE {LIVE} AND {NO_CONTACT}",
-                    (*site_args, *finder_args)) as cur:
-                kept = (time.monotonic(), await cur.fetchone())
-            _counted[key] = kept
-        total, free, searched_, no_site = kept[1]
-        async with db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(found), 0), COALESCE(SUM(cost), 0) FROM searches "
-                "WHERE target = 'company' AND module = ? AND capability = ? "
-                "AND searched_at >= datetime('now', '-1 day')", FINDER) as cur:
-            day, day_found, day_cost = await cur.fetchone()
-        async with db.execute(
-                "SELECT status, COUNT(*) FROM jobs WHERE kind = 'find_contacts' "
-                "AND status IN ('queued', 'running', 'paused') GROUP BY status") as cur:
-            waiting = {s: n for s, n in await cur.fetchall()}
-        async with db.execute(
-                "SELECT module, COUNT(*), COALESCE(SUM(found), 0) FROM searches "
-                "WHERE target = 'company' AND looked_for = 'website' "
-                "AND searched_at >= datetime('now', '-1 day') GROUP BY module") as cur:
-            looked = {m: (n, f) for m, n, f in await cur.fetchall()}
-    return {"without_contact": total or 0, "site_to_read": free or 0,
-            "searched": searched_ or 0, "last_day": {"companies": day or 0,
-                                                     "found": day_found or 0,
-                                                     "cost": round(day_cost or 0.0, 4)},
-            "jobs": waiting, "no_website": no_site or 0,
-            "background_search": await background_status(state, looked)}
+    if fresh or kept is None or time.monotonic() - kept[0] > BACKLOG_CACHE_SECONDS:
+        kept = (time.monotonic(), await state.read("backlog", FINDER, SITE))
+        _counted[key] = kept
+    out = dict(kept[1])
+    looked = out.pop("looked")
+    out["jobs"] = await state.jobs_waiting("find_contacts")
+    out["background_search"] = await background_status(state, looked)
+    return out
 
 
 async def background_status(state, looked: dict | None = None) -> dict:
@@ -991,14 +887,6 @@ async def background_status(state, looked: dict | None = None) -> dict:
     return {"on": on, "share": share, "searchers": out}
 
 
-# A site the finder read before it followed the site's menu: its read
-# looked for emails (on the homepage and the first team or contact path
-# that answered) but not for the owner (SITE_WANTS).
-SHALLOW_READ = ("EXISTS (SELECT 1 FROM searches s WHERE s.target = 'company' "
-                "AND s.target_id = c.id AND s.module = 'website' AND s.capability = 'read_site' "
-                "AND s.outcome != 'error' AND (',' || s.looked_for || ',') LIKE '%,email,%')")
-
-
 async def next_free(state, limit: int) -> list[str]:
     """The free work the background takes next, newest first: companies
     with no contact and a website not read for its emails yet; then, once
@@ -1007,26 +895,7 @@ async def next_free(state, limit: int) -> list[str]:
     deeper read (menu, people, owner, pattern) once. Walks the companies
     with a domain or a website (their indexes), never the whole table: on
     a registry most companies have neither."""
-    if await state.is_overlay():
-        return await state.read("next_free", int(limit))
-    site_cond, site_args = _site_not_read()
-    out: list[str] = []
-    async with state._connect() as db:
-        for extra in (NO_CONTACT, f"NOT {NO_CONTACT} AND {SHALLOW_READ}"):
-            if len(out) >= limit:
-                break
-            rest = f"{LIVE} AND {extra} AND {site_cond}"
-            async with db.execute(
-                    "SELECT id FROM ("
-                    f"SELECT c.id, c.created_at, c.rowid AS r FROM companies c "
-                    f"WHERE c.domain > '' AND {rest} "
-                    "UNION ALL "
-                    f"SELECT c.id, c.created_at, c.rowid FROM companies c "
-                    f"WHERE c.website != '' AND COALESCE(c.domain, '') = '' AND {rest}) "
-                    "ORDER BY created_at DESC, r DESC LIMIT ?",
-                    (*site_args, *site_args, int(limit) - len(out))) as cur:
-                out += [r[0] for r in await cur.fetchall()]
-    return out
+    return await state.read("next_free", int(limit))
 
 
 async def next_paid(state, limit: int, available: list[Searcher] | None = None) -> list[str]:
@@ -1041,28 +910,10 @@ async def next_paid(state, limit: int, available: list[Searcher] | None = None) 
         available = searchers(await switches.enabled_ids(state), _env())
     if not available:
         return []
-    if await state.is_overlay():
-        return await state.read("next_paid", int(limit), available)
-    conds, args = [], []
-    for s in available:
-        cond, cond_args = _not_searched(s.module, s.capability, None)
-        conds.append(cond)
-        args += cond_args
-    async with state._connect() as db:
-        async with db.execute(
-                f"SELECT c.id FROM companies c WHERE {LIVE} AND NOT {HAS_SITE} AND {NO_CONTACT} "
-                f"AND COALESCE(c.name, '') != '' AND ({' OR '.join(conds)}) "
-                "ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?",
-                (*args, int(limit))) as cur:
-            return [r[0] for r in await cur.fetchall()]
+    return await state.read("next_paid", int(limit), available)
 
 
 # ── A selection (the Contacts and Companies pages' Find contacts) ──
-
-# Company ids per query when a selection is given as ids (well under any
-# SQLite build's limit on parameters).
-IDS_PER_QUERY = 500
-
 
 async def select(state, f: contacts.ContactFilter | None = None, *, ids=None,
                  force: bool = False, limit: int = 1000,
@@ -1073,39 +924,8 @@ async def select(state, f: contacts.ContactFilter | None = None, *, ids=None,
     ``force``), with whether each has a website, up to ``limit``. Given
     ``ids``, only those, in pieces of IDS_PER_QUERY."""
     f = f or contacts.ContactFilter()
-    if await state.is_overlay():
-        return await state.read("select", f, None if ids is None else list(ids), force,
-                                int(limit))
-    with_sql, params = (f.cohort if f.cohort is not None else ("", []))
-    conds, args = contacts.company_conditions(f, possible=True)
-    if not force:
-        conds.append(NO_CONTACT)
-    for word in (f.q or "")[:200].split()[:8]:
-        conds.append(f"{contacts.sql_name_norm('c.name')} LIKE ? ESCAPE '\\'")
-        args.append(contacts.like(contacts.fold(word)))
-    pieces: list[list[str] | None] = [None]
-    if ids is not None:
-        ids = list(dict.fromkeys(i for i in ids if i))
-        pieces = [ids[at:at + IDS_PER_QUERY] for at in range(0, len(ids), IDS_PER_QUERY)]
-    out: list[dict] = []
-    async with state._connect() as db:
-        if attach_figures:
-            from harvey.modules.ro.mf_financials import store as fin_store
-
-            await db.execute("ATTACH DATABASE ? AS fin",
-                             (f"file:{fin_store.FINANCIALS_PATH}?mode=ro",))
-        for piece in pieces:
-            if len(out) >= limit:
-                break
-            where, where_args = list(conds), list(args)
-            if piece is not None:
-                where.append(f"c.id IN ({','.join('?' * len(piece))})")
-                where_args += piece
-            sql = (f"{with_sql}SELECT c.id, {HAS_SITE} AS site FROM companies c WHERE "
-                   + " AND ".join(where) + " ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?")
-            async with db.execute(sql, (*params, *where_args, int(limit) - len(out))) as cur:
-                out += [{"id": r[0], "site": bool(r[1])} for r in await cur.fetchall()]
-    return out
+    return await state.read("select", f, None if ids is None else list(ids), force,
+                            int(limit))
 
 
 def estimate(selected: list[dict], enabled, env: dict) -> dict:

@@ -715,40 +715,79 @@ Appearance has three states: `auto` follows your OS and is the default, or pick 
 
 ## How the data is stored
 
-SQLite at `data/harvey.db`. One idea drives the schema:
-
-> **Every fact is a row, never a column.**
-
-Not `companies.has_agency`. Not `companies.rank`. A row in `observations`:
-
-```
-observations(company_id, prospect_id, collector, signal_code,
-             value_num, value_text, confidence, evidence_url, observed_at, run_id)
-```
-
-Four things fall out of that, none of which you get from columns:
-
-1. **A new signal needs no migration.** A collector invents a code and it works.
-2. **History is free.** The same signal observed quarterly *is* a time series — and "they dropped their agency last quarter" is a far better trigger than any static fact.
-3. **Confidence and provenance travel with the fact** instead of being lost on overwrite. *"We think their agency is X, 0.9 confidence, here's the URL."*
-4. **A cohort is a query.** Set intersection happens in SQL, not in application code over a capped fetch.
-
-The vocabulary is governed: a database trigger rejects any `signal_code` not in the `signal_codes` table, so a typo fails loudly instead of quietly inventing a junk signal.
-
-Other tables: `companies`, `prospects`, `campaigns`, `conversations`, `outbox`, `actions`, `runs`, `usage_events`, `email_patterns`, `settings`, `feedback`.
-
-### Contacts, people, places, sources and searches
-
-Harvey's job is finding ways to reach companies, so contacts have tables of their own (`harvey/contacts.py`):
+SQLite at `data/harvey.db`, and it holds **Harvey's own work only**: the
+companies you pulled in or worked on, their contacts and the evidence for
+each, the people Harvey found, searches, sources, merges, web signals, and
+the email side (prospects, campaigns, outbox, conversations). The public
+registers are not copied into it. Each register module reads its own file
+in place (`data/registry.db`, `data/financials.db`, `data/taxpayers.db`,
+`data/anaf.db`), through the indexes its load builds there, so a register
+fact (turnover, VAT, an activity) is the register's current value, dated by
+the register, and reloading a register changes what the pages show without
+a write to `harvey.db`. On a full install that is about 1 GB instead of
+16 GB, and every page answers in well under a second.
 
 | Table | One row per |
 |---|---|
-| `contacts` | distinct contact: `(kind, value)` is unique, an email lowercased, a phone in E.164 with its `line_type` (mobile, fixed, voip, toll_free, unknown, from the numbering plan: an SMS audience is the mobiles), its `status` (an email's verified / risky / guess / invalid / unchecked, a phone's valid / invalid) and `do_not_contact` (an opt-out) |
-| `company_contacts` | link between a company and a contact, optionally through a person and at a place, one per source that gave it (a phone a site published and ANAF confirmed is two links), with the source and capability that found it, the page it was on, and `trust`: confirmed, likely or unconfirmed. Many to many: a pharmacy chain's hundred companies can share one phone and one email, and that is one contact linked a hundred times, not a duplicate and not a merge. A contact is never thrown away because its match is unproven: it is kept with its trust and source, and you filter on them. |
-| `people` | person named at a company (an administrator from the registry, a team page's member), with their role |
+| `firm` | company in Harvey, with an integer id; a merged record points at the one it was merged into (`live`), and kept counts (contacts, people, searches) the triggers maintain |
+| `firm_ident` | identifier of a firm: a CUI, a registration number, a listing's id. A firm a register knows is described by the register (name, place, activities, administrators) |
+| `local_firm` | description of a firm no register describes (a listing) |
+| `obs`, `reading` | web signal history (a reading kept only when the value changes) and the current reading per firm and signal |
+
+**Every fact is a row, never a column.** A signal is a code in the governed
+vocabulary (`signal`), and a module declares how it reads it: stored (a web
+signal Harvey observed) or read from a register. A new signal needs no
+migration, history is kept on change, confidence and provenance travel with
+the fact, and a cohort is a set query over readings and registers.
+
+Kept values (counts per firm, per signal, totals) are maintained by
+triggers; `harvey doctor --recount` compares every one of them with a full
+recount (`--fix` writes them again).
+
+### Upgrading from the old database
+
+A `harvey.db` from before (schema 24, with copies of the registers inside)
+is never opened by the new code: the dashboard shows an upgrade screen
+instead of the pages, and the worker and `harvey run` wait. The upgrade
+(dashboard button, or `harvey upgrade`):
+
+1. builds each register's indexes in its own file (the trade registry
+   first: the financial statements' "filed accounts" read it), then
+2. rewrites `anaf.db` compressed (every answer kept, each one checked to
+   read back the same),
+3. moves Harvey's own data into a new `harvey.db.v25`,
+4. verifies it against the old file (every kept count, the firm, contact,
+   link, search and merge counts, each signal's counts, a few list filters,
+   and every ANAF answer by hash), and only if that passes
+5. switches: the new files take the live names and the old ones are kept as
+   `harvey.db.v24` and `anaf.db.old`.
+
+It takes about half an hour on a full install and needs at least 30 GB
+free (the new files take about 3 GB). It can be stopped and resumed: each
+step picks up where it stopped, a switch cut short included (`harvey.db` is
+never missing meanwhile, and Harvey creates no new one while it waits). If
+Harvey wrote to the old file after it was migrated, the switch refuses and
+the next run migrates and verifies it again. Nothing is deleted on its own: once you're
+happy, **Delete old files** (dashboard, typed confirmation) or
+`harvey upgrade --delete-old` frees the space. In Docker on WSL the free
+space check must see the Windows drive: set `HARVEY_HOST_DRIVE_SOURCE=/mnt/c`
+in `.env`. A database older than schema 24 is first opened once by the
+Harvey release before this one. `harvey upgrade --data DIR --out OUT` is a
+dry run on a copy: it writes only into `OUT`, reads the sources as files
+that don't change, and refuses a folder Harvey is running on.
+
+### Contacts, people, places, sources and searches
+
+Harvey's job is finding ways to reach companies, so contacts have tables of their own:
+
+| Table | One row per |
+|---|---|
+| `contact` | distinct contact: `(kind, value)` is unique, an email lowercased, a phone in E.164 with its line type (mobile, fixed, voip, toll free, unknown, from the numbering plan: an SMS audience is the mobiles), its status (an email's verified / risky / guess / invalid / unchecked, a phone's valid / invalid) and do-not-contact (an opt-out) |
+| `link`, `link_evidence` | a contact reached for a company (one link per record found for and contact), and each source that gave it: optionally through a person and at a place, with the source and capability that found it, the page it was on, and its trust (confirmed, likely or unconfirmed). Many to many: a pharmacy chain's hundred companies can share one phone and one email, and that is one contact linked a hundred times, not a duplicate and not a merge. A contact is never thrown away because its match is unproven: it is kept with its trust and source, and you filter on them. |
+| `person` | person Harvey found or acted on at a company (a team page's member; a register's administrator once the finder works on them). The register's administrators are read from the register |
 | `locations` | place of a company: a listing that matched a company on file (by its website or phone) is one of its branches, with its own address and phone |
-| `company_sources` | source a company was found in (one company, many sources; `companies.source` stays the first) |
-| `searches` | search of a record (a company, a person) by a module's capability: what it looked for, when, what it found, what it cost |
+| `firm_source` | source a company was found in (one company, many sources), every registry pull included |
+| `search` | search of a record (a company, a person) by a module's capability: what it looked for, when, what it found, what it cost |
 
 The kinds of contact are an open list: modules declare them in their manifests (`[[contact_kinds]]`; core declares email, phone, contact_form, linkedin, facebook, instagram and whatsapp) and a trigger refuses any kind nobody declared, so a new channel is a new module. A social profile is only kept when the company's own website links to it: Harvey never reads LinkedIn, Facebook or Instagram.
 
@@ -921,6 +960,9 @@ harvey caps list             # every module's capabilities: inputs, outputs, cos
 harvey duplicates            # possible duplicates, as groups, and merges;
                              # --merge KEEP A B..., --separate A B... [--from C D...],
                              # --undo MERGED, --undo-group MERGED, --scan
+harvey upgrade               # upgrade an old harvey.db to the slim database (--check reports only,
+                             # --delete-old deletes the old files it kept)
+harvey doctor --recount      # every kept count against a full recount (--fix writes them again)
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens
@@ -1118,7 +1160,11 @@ harvey/
 ├── brain.py             # Claude/Codex provider selection + skills + usage
 ├── claude_runtime.py    # Isolated Claude CLI calls (safe mode, no tools, clean dir)
 ├── codex.py             # Isolated Codex subscription runtime
-├── state.py             # SQLite schema, migrations, observations, cohorts
+├── state.py             # the StateManager: Harvey's reads and writes, cohorts
+├── overlay/             # harvey.db's schema, kept-count triggers, writes, page reads,
+│                        #   and the upgrade from the old database (migrate, verify)
+├── upgrade.py           # the upgrade the dashboard and harvey upgrade run
+├── registers.py         # register modules read in place (adapters, derived tables)
 ├── signals.py           # the 23-signal catalog Harvey proposes
 ├── finder.py            # the contact finder (one company per job)
 ├── gate.py              # deterministic pre-send checks

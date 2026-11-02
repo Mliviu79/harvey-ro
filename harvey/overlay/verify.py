@@ -35,7 +35,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from harvey.overlay import recount, schema
+from harvey.overlay import orders, recount, schema
 from harvey.overlay.migrate import _uri, unix
 
 STATES = ("true", "false", "unknown")
@@ -129,7 +129,9 @@ def counts(con, register_modules) -> dict:
         "prospects": ("SELECT COUNT(*) FROM old.prospects", "SELECT COUNT(*) FROM prospects"),
         "locations": ("SELECT COUNT(*) FROM old.locations", "SELECT COUNT(*) FROM locations"),
         "jobs": ("SELECT COUNT(*) FROM old.jobs", "SELECT COUNT(*) FROM jobs"),
-        "settings": ("SELECT COUNT(*) FROM old.settings", "SELECT COUNT(*) FROM settings"),
+        # (Less the register orders' load mark, which the upgrade writes.)
+        "settings": ("SELECT COUNT(*) FROM old.settings",
+                     f"SELECT COUNT(*) FROM settings WHERE key != '{orders.MARK_KEY}'"),
         "Harvey-found email and domain keys": (
             "SELECT COUNT(*) FROM old.company_ids WHERE kind IN ('email', 'domain')",
             f"SELECT COUNT(*) FROM firm_key WHERE kind IN ({schema.FIRM_KEY['email']}, "
@@ -139,7 +141,24 @@ def counts(con, register_modules) -> dict:
             "AND (website != '' OR domain != '')",
             "SELECT COUNT(*) FROM firm WHERE live = 0 AND (website IS NOT NULL OR domain IS NOT NULL)"),
     }
-    out = {}
+    # The email and bookkeeping tables, copied as they are.
+    from harvey.overlay.migrate import COPIED
+
+    lost = []
+    old_cols = new_cols = 0
+    for table in COPIED:
+        before = [r[1] for r in con.execute(f"PRAGMA old.table_info({table})")]
+        if not before:
+            continue
+        after = {r[1] for r in con.execute(f"PRAGMA main.table_info({table})")}
+        old_cols, new_cols = old_cols + len(before), new_cols + sum(c in after for c in before)
+        lost += [f"{table}.{c}" for c in before if c not in after]
+        if table not in ("jobs", "settings"):       # (counted above)
+            rows[f"copied: {table}"] = (f"SELECT COUNT(*) FROM old.{table}",
+                                        f"SELECT COUNT(*) FROM main.{table}")
+    out = {"columns copied": {"old": old_cols, "new": new_cols, "rule": "equal",
+                              "passed": not lost,
+                              "failures": [f"not copied: {', '.join(lost)}"] if lost else []}}
     for name, (a, b) in rows.items():
         old, new = _q(con, a), _q(con, b)
         rule = COUNT_RULES.get(name, "equal")
@@ -503,7 +522,7 @@ def checked_firms(con, module: str, code: str | None = None) -> set:
 def filters(con, adapters, *, county: str = "", county_name: str = "", words: str = "",
             activity: str = "", old_search: str = "") -> dict:
     """Totals of list filters, old and new. Old: schema 24's company
-    conditions (contacts.company_conditions: the place line, the activity
+    conditions (as schema 24 read them: the place line, the activity
     table, the search index). New: the overlay's kept columns, and for
     register filters the register's own search (its canonical rows) mapped
     through firm_ident, plus firms described locally."""

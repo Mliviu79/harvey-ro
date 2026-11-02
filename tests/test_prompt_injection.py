@@ -292,9 +292,18 @@ async def _async(v):
     return v
 
 
-def test_outbox_rows_remember_who_approved_them():
-    from harvey.state import MIGRATIONS
-    assert "approved_by" in MIGRATIONS[12]  # v13
+@pytest.mark.asyncio
+async def test_outbox_rows_remember_who_approved_them(state):
+    pid = await state.add_prospect(Prospect(email="jane@acme.example", first_name="Jane",
+                                            email_status="verified"))
+    queued = dict(prospect_id=pid, to_email="jane@acme.example", subject="hello",
+                  body="A short note.", send_at="2026-01-01T00:00:00")
+    auto = await state.add_outbox_item(**queued, campaign_id="c1", status="approved",
+                                       approved_by="autopilot")
+    mine = await state.add_outbox_item(**queued, campaign_id="c2", status="pending_review")
+    assert await state.approve_outbox(mine) == 1
+    assert (await state.get_outbox_item(auto))["approved_by"] == "autopilot"
+    assert (await state.get_outbox_item(mine))["approved_by"] == "you"
 
 
 @pytest.mark.asyncio

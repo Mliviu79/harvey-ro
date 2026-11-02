@@ -187,6 +187,8 @@ def _check_signals(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
             problems.append(f"{where}: signal {code} has value_type "
                             f"{sig.get('value_type')!r}; it must be one of "
                             f"{', '.join(VALUE_TYPES)}")
+        if not isinstance(sig.get("whole_set", False), bool):
+            problems.append(f"{where}: signal {code} whole_set must be true or false")
         floor = sig.get("confidence_floor", 0.0)
         if isinstance(floor, bool) or not isinstance(floor, (int, float)) \
                 or not 0 <= floor <= 1:

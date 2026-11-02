@@ -30,9 +30,11 @@ financials.db attached read-only.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
-from harvey.registers import build_derived, mark_built
+from harvey.registers import attach_read_only, build_derived, mark_built
 
 FIGURES = ("turnover", "employees", "net_result", "debts", "equity", "total_assets",
            "turnover_growth")
@@ -178,6 +180,37 @@ def build_filed(con, dst: str = "main", registry: tuple[str, str] | None = None)
     yes, no = con.execute(f"SELECT COALESCE(SUM(filed), 0), COALESCE(SUM(filed = 0), 0) "
                           f"FROM {dst}.filed").fetchone()
     return {"filed_yes": yes, "filed_no": no, "filed_from": mark}
+
+
+def refile(path: Path, registry: Path) -> dict | None:
+    """Build ``filed`` again in financials.db at ``path`` from the trade
+    registry at ``registry`` (after either file is loaded again: a no
+    comes from the registry's operating firms). None when either file is
+    missing or financials.db has no ``current`` yet."""
+    path, registry = Path(path), Path(registry)
+    if not path.is_file() or not registry.is_file():
+        return None
+    con = sqlite3.connect(f"file:{quote(path.resolve().as_posix())}", uri=True,
+                          isolation_level=None, timeout=60)
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'current'").fetchone():
+            return None
+        attach_read_only(con, "regf", registry)
+        if not con.execute("SELECT 1 FROM regf.sqlite_master WHERE name = 'firm_by_cui'"
+                           ).fetchone():
+            return None
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            counts = build_filed(con, "main", ("regf", "regf"))
+            con.execute("ANALYZE main.filed")
+            con.execute("COMMIT")
+        except BaseException:
+            if con.in_transaction:
+                con.execute("ROLLBACK")
+            raise
+        return counts
+    finally:
+        con.close()
 
 
 def reindex(path: Path, target: Path | None = None, registry: Path | None = None,

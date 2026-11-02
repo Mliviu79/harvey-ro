@@ -1,8 +1,7 @@
 """Harvey's writes on the overlay (schema 25).
 
-The same writes the StateManager and CompanyBatch make on schema 24, by
-the same names (ingest, the contact finder and the runs call them without
-knowing the schema): a firm found or pulled, the gaps of one on file, its
+The writes the StateManager and its Batch make, by the same names (ingest,
+the contact finder and the runs call them): a firm found or pulled, the gaps of one on file, its
 contacts and the evidence for each, people, searches, sources, places, web
 signals, merges and their undo, and removing a firm from Harvey. They run
 on one connection inside the caller's transaction (``call`` opens one per
@@ -139,7 +138,7 @@ def connect(path, *, data_dir=None) -> tuple[sqlite3.Connection, list]:
 # Store methods that only read: run without taking the write lock.
 READS = frozenset({"match_company", "companies_with_id", "held", "signal_codes",
                    "keeper_order", "observed", "module_readings", "module_readings_of",
-                   "dictionaries_stale", "match_records"})
+                   "dictionaries_stale", "match_records", "scan_candidates", "unknown_pairs"})
 
 
 def call(path, method: str, *args, **kwargs):
@@ -164,7 +163,7 @@ def call(path, method: str, *args, **kwargs):
 
 class Batch:
     """A Store on one connection and one transaction (StateManager.batch()
-    on the overlay), its methods awaited like CompanyBatch's: each runs in
+    on the overlay), its methods awaited: each runs in
     a worker thread, one at a time."""
 
     def __init__(self, store: "Store"):
@@ -240,6 +239,19 @@ class Store:
         marks = ",".join(str(i) for i in ids)
         return self.one(f"SELECT 1 FROM firm_ident WHERE firm = ? AND scheme IN ({marks}) "
                         f"LIMIT 1", (fid,)) is not None
+
+    def _reorder(self, *fids) -> None:
+        """Take these firms' places in the name and place orders again
+        (overlay/orders.py), while the kept ones belong to the register's
+        current load (a reload refreshes every firm)."""
+        from harvey.overlay import orders
+
+        if not fids:
+            return
+        if getattr(self, "_orders_ok", None) is None:
+            self._orders_ok = orders.current(self.con, self.registers)
+        if self._orders_ok:
+            orders.refresh(self.con, self.registers, self.schemes, [f for f in fids if f])
 
     # Dictionaries
 
@@ -437,12 +449,12 @@ class Store:
                              [(s, k, fid, now) for s, k in keys])
         described = bool({s for s, _ in keys} & self.schemes.register_ids())
         if not described:
-            locality, county, _ = place_parts(company.location or "")
+            locality, county, country = place_parts(company.location or "")
             self.x("INSERT INTO local_firm (firm, name, county, locality, address, phone, industry, "
-                   "description, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   "description, source_url, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (fid, company.name or None, county or None, locality or None,
                     company.address or None, company.phone or None, company.industry or None,
-                    company.description or None, company.source_url or None))
+                    company.description or None, company.source_url or None, country or None))
             self._name_key(fid, company.name, company.location, source)
         if company.source:
             self.add_company_source(str(fid), company.source, company.external_id or "",
@@ -453,6 +465,7 @@ class Store:
             self._contact(fid, contacts.Found(
                 "phone", company.phone, source=company.source or "", trust="confirmed",
                 region=phone_region(company.location or "", None, domain or "")))
+        self._reorder(fid)
         return fid, True
 
     def _name_key(self, fid: int, name: str, location: str, source: int | None) -> None:
@@ -490,6 +503,7 @@ class Store:
                     self.x("INSERT INTO firm_ident (scheme, key, firm, since) VALUES (?, ?, ?, ?)",
                            (*key, record, now))
                     added.append(kind)
+                    self._reorder(record)
                     continue
                 mine, theirs = self.live(record), self.live(holder)
                 if key[0] in legal and mine != theirs:
@@ -497,6 +511,7 @@ class Store:
                         try:
                             merges.merge(self.con, theirs, mine, reasons=json.dumps(
                                 [{"code": kind, "value": value}]), decided_by="auto")
+                            self._reorder(theirs)
                             continue
                         except merges.MergeRefused:
                             pass
@@ -579,10 +594,10 @@ class Store:
                 if "cui" in self._add_keys(fid, [("cui", resolver.cui_key(value))]):
                     changed.append(column)
             elif column == "location" and local:
-                locality, county, _ = place_parts(value)
-                if self.x("UPDATE local_firm SET locality = ?, county = ? WHERE firm = ? "
-                          "AND locality IS NULL AND county IS NULL",
-                          (locality or None, county or None, fid)).rowcount:
+                locality, county, country = place_parts(value)
+                if self.x("UPDATE local_firm SET locality = ?, county = ?, country = ? "
+                          "WHERE firm = ? AND locality IS NULL AND county IS NULL",
+                          (locality or None, county or None, country or None, fid)).rowcount:
                     changed.append(column)
             elif column in LOCAL_COLUMNS and local:
                 only_empty = "" if column == "address" else f" AND {column} IS NULL"
@@ -593,10 +608,12 @@ class Store:
             name, locality, county = self.x("SELECT name, locality, county FROM local_firm "
                                             "WHERE firm = ?", (fid,)).fetchone()
             self._name_key(fid, name, ", ".join(p for p in (locality, county) if p), None)
+            self._reorder(fid)
         return changed
 
     def _place(self, fid: int) -> str:
-        row = self.x("SELECT locality, county FROM local_firm WHERE firm = ?", (fid,)).fetchone()
+        row = self.x("SELECT locality, county, country FROM local_firm WHERE firm = ?",
+                     (fid,)).fetchone()
         return ", ".join(p for p in (row or ()) if p)
 
     def _has_phone(self, live: int) -> bool:
@@ -664,7 +681,8 @@ class Store:
             self.x("UPDATE firm SET display_name = ? WHERE id = ?", (name, fid))
         group = self._group(fid)
         self.x(f"UPDATE prospects SET company = ?, updated_at = CURRENT_TIMESTAMP "
-               f"WHERE firm IN ({','.join('?' * len(group))})", (name, *group))
+               f"WHERE company_id IN ({','.join('?' * len(group))})", (name, *group))
+        self._reorder(fid)
 
     # ── Contacts, people, places, sources ──
 
@@ -839,41 +857,93 @@ class Store:
         only where its module stores the signal (declares it, or returns it
         from a capability; a register's facts are read from the register,
         never stored), on the record it was found for. A row naming no
-        module goes to the module declaring the signal. A phone, a named person or a contact form is also a contact
-        record, whatever is stored. How many readings were taken (a
-        repeat of the current value moves only when it was last seen)."""
+        module goes to the module declaring the signal (one that several
+        declare is logged and not kept). A code the vocabulary doesn't have
+        raises ValueError. A phone, a named person or a contact form is
+        also a contact record, whatever is stored. How many readings were
+        taken (a repeat of the current value moves only when it was last
+        seen)."""
         from harvey.overlay.migrate import collector_modules
 
         self._vocabulary()
         collectors = collector_modules(self.manifests)
+        rows = list(rows or ())
+        # A code the vocabulary doesn't have is a typo: it fails loudly
+        # (before anything is written) rather than vanish.
+        unknown = sorted({r.get("signal_code") or "" for r in rows} - set(self._signals))
+        declared = {sig["code"] for m in self.manifests for sig in m.signals}
+        if unknown and set(unknown) <= declared:
+            # Declared, the vocabulary not written yet (a new database): as proposed.
+            schema.sync_signals(self.con, (), self.manifests)
+            self._signals = self._stored = None
+            self._vocabulary()
+            unknown = sorted({r.get("signal_code") or "" for r in rows} - set(self._signals))
+        if unknown:
+            raise ValueError(f"unknown signal_code {', '.join(map(repr, unknown))}: not in "
+                             "the signal vocabulary")
+        whole = {sig["code"] for m in self.manifests for sig in m.signals if sig.get("whole_set")}
+        reads: dict[tuple, list] = {}
         kept = 0
-        for r in rows or ():
-            found = self._signals.get(r.get("signal_code") or "")
+        for r in rows:
+            found = self._signals[r.get("signal_code") or ""]
             record = self._record(r.get("company_id"), r.get("origin_company_id"))
-            if found is None or record is None:
+            if record is None:
                 continue
             sig, keyed = found
             stored = self._stored.get(sig, set())
             declaring = self._declaring.get(sig, set())
-            name = r.get("module") or collectors.get(r.get("collector") or "") or ""
+            name = r.get("module") or ""
+            if not name:
+                # The collector's module, when it stores this signal ("discover"
+                # names a search module, not the one a preset's fact belongs to).
+                guess = collectors.get(r.get("collector") or "")
+                gid = self.one("SELECT id FROM module WHERE name = ?", (guess,)) if guess else None
+                if gid is not None and (gid in stored or self.one(
+                        "SELECT 1 FROM signal_source WHERE signal = ? AND module = ? AND how = 1",
+                        (sig, gid))):
+                    name = guess
             module = self.one("SELECT id FROM module WHERE name = ?", (name,)) if name else (
                 next(iter(declaring)) if len(declaring) == 1 else None)
+            if module is None and not name and len(declaring) > 1:
+                logger.warning("%s observation not kept: %d modules declare it and the row "
+                               "names none", r.get("signal_code"), len(declaring))
             if module not in stored:
                 continue
             text = r.get("value_text") or ""
-            cap = r.get("capability") or ""
+            cap = r.get("capability") or (schema.SEARCH_HIT if r.get("collector") == "discover"
+                                          else "")
             mod_name = name or self.one("SELECT name FROM module WHERE id = ?", (module,))
+            at = unix(r.get("observed_at")) or int(time.time())
             self.x("INSERT INTO obs (firm, signal, key, num, text, confidence, module, capability, "
                    "run, evidence_url, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (record, sig, text if keyed else "", r.get("value_num"), text or None,
                     float(r.get("confidence", 1.0)), module,
                     self.capability(mod_name, cap) if cap else None,
                     schema.batch_id(self.con, r.get("run_id") or run_id),
-                    r.get("evidence_url") or None,
-                    unix(r.get("observed_at")) or int(time.time())))
+                    r.get("evidence_url") or None, at))
             kept += 1
+            if r.get("signal_code") in whole:
+                # (The newest read in the rows is the whole set.)
+                read = reads.setdefault((record, sig), [at, set(), module])
+                if at > read[0]:
+                    read[:] = [at, set(), module]
+                if at == read[0]:
+                    read[1].add(text if keyed else "")
+        self._close_left_out(reads)
         self._contacts_from_observations(rows or ())
         return kept
+
+    def _close_left_out(self, reads: dict) -> None:
+        """A read of a whole-set signal (each read records the whole current
+        set: open roles, a site's stack) closes the values it left out: an
+        observation of 0 at the read's time, so they stop being current as
+        schema 24's newest-rows reading had it, and history keeps them."""
+        for (record, sig), (at, keys, module) in reads.items():
+            for (key,) in self.x("SELECT key FROM reading WHERE firm = ? AND signal = ? "
+                                 "AND positive = 1 AND at < ?", (record, sig, at)).fetchall():
+                if key not in keys:
+                    self.x("INSERT INTO obs (firm, signal, key, num, text, confidence, module, "
+                           "at) VALUES (?, ?, ?, 0, '', 1.0, ?, ?)", (record, sig, key, module, at))
 
     def _contacts_from_observations(self, rows) -> None:
         """contacts.from_observations on the overlay."""
@@ -988,6 +1058,7 @@ class Store:
                         [replace(f, record="") for f in found], company_id=saved[0],
                         origin=saved[0], run_id=run_id, confirmed=set(confirmed)), run_id)
             self._register_phones(regions)
+            self._reorder(*regions)
         return out
 
     def _pulled(self, record, run_id: str, match=None) -> tuple[str, bool, bool, bool]:
@@ -1114,14 +1185,16 @@ class Store:
             raise resolver.MergeRefused("already_merged")
         return fid
 
-    def _merge(self, keep: int, merged: int, decided_by: str, grp: int | None = None) -> int:
+    def _merge(self, keep: int, merged: int, decided_by: str, grp: int | None = None,
+               score: float | None = None, reasons: str | None = None) -> int:
         row = self.x("SELECT score, reasons FROM match_candidate WHERE (a = ? AND b = ?) "
                      "OR (a = ? AND b = ?)", (keep, merged, merged, keep)).fetchone()
+        if reasons is None:
+            score, reasons = (row[0], row[1]) if row else (None, None)
         place = self._branch(keep, merged)
         try:
-            mid = merges.merge(self.con, keep, merged, score=row[0] if row else None,
-                               reasons=(row[1] if row else None) or "[]", decided_by=decided_by,
-                               grp=grp)
+            mid = merges.merge(self.con, keep, merged, score=score,
+                               reasons=reasons or "[]", decided_by=decided_by, grp=grp)
         except merges.MergeRefused as e:
             raise self._refused(e) from e
         if place is not None:
@@ -1132,6 +1205,7 @@ class Store:
                               (keep, *place, now, now)).lastrowid
             self.x("UPDATE merge SET location = ? WHERE id = ?", (location, mid))
         self._decide(keep, merged, "merged")
+        self._reorder(keep)
         return mid
 
     def _branch(self, keep: int, merged: int) -> tuple[str, str, str, str] | None:
@@ -1236,9 +1310,10 @@ class Store:
         if row is None:
             raise resolver.MergeRefused("not_merged")
         try:
-            merges.undo(self.con, row[0])
+            back = merges.undo(self.con, row[0])
         except merges.MergeRefused as e:
             raise self._refused(e) from e
+        self._reorder(row[1], *back)
         # An undo says the merge was wrong, not that they are two
         # companies: the pair goes back on the list.
         self._decide(row[1], fid, "pending")
@@ -1262,6 +1337,189 @@ class Store:
         return [self.undo_merge(m) for (m,) in self.x(
             "SELECT merged FROM merge WHERE grp = ? AND undone_at IS NULL ORDER BY id DESC",
             (grp,)).fetchall()]
+
+    # ── Looking for duplicates among the firms on file ──
+    #
+    # Two firms with different legal keys (tax codes) are never one, so
+    # every pair the scan can make has a firm with no legal key on one side
+    # (a listing, a firm known by its registration number only): the scan
+    # starts from those (a few hundred), and counts each of their keys'
+    # holders among every firm in Harvey, under resolver.scan's rules.
+
+    def _loose(self) -> list[int]:
+        """Live firms with no key of a legal scheme on any of their records."""
+        from harvey.queries import sql
+
+        legal = sorted(self.schemes.legal_ids())
+        if not legal:
+            return [r[0] for r in self.x("SELECT id FROM firm WHERE live = 0")]
+        out = None
+        for scheme in legal:
+            found = {r[0] for r in self.x(sql("overlay.read.unkeyed"), (scheme,))}
+            out = found if out is None else out & found
+        return sorted(out or ())
+
+    def _identity(self, live: int) -> tuple[str, str] | None:
+        ids: dict[str, set[str]] = {}
+        legal = set(self.schemes.legal_kinds())
+        for kind, values in resolver._overlay_keys(self.con, self.schemes, live).items():
+            if kind in legal:
+                ids[kind] = values
+        return resolver.identity(ids) if ids else None
+
+    def _key_holders(self, kind: str, value: str) -> set[int]:
+        """The live firms holding one key (a name in its town: Harvey's own
+        name keys and the register's name index, over the firms in Harvey)."""
+        from harvey.overlay.schema import FIRM_KEY
+        from harvey.queries import sql
+
+        if kind == "name":
+            records = {r[0] for r in self.x(sql("overlay.resolve.key"), (FIRM_KEY["name"], value))}
+            key, _, town = value.rpartition("@")
+            for adapter in self.registers:
+                if not hasattr(adapter, "key_holders"):
+                    continue
+                try:
+                    reg_ids = adapter.key_holders(self.con, key, town)
+                except Exception as e:
+                    logger.debug("name holders not read from %s: %s", adapter.module, e)
+                    continue
+                if not reg_ids or len(reg_ids) > 50:
+                    continue
+                for scheme_name, k in adapter.keys_of_ids(self.con, reg_ids):
+                    scheme = self.schemes.named(scheme_name)
+                    if scheme is not None:
+                        records |= {r[0] for r in self.x(sql("overlay.resolve.ident"),
+                                                         (scheme.id, k))}
+        else:
+            records = resolver._overlay_holders(self.con, self.schemes, kind, value, {}, ())
+        return {self.live(r) for r in records} - {None}
+
+    def _scan_keys(self, live: int) -> list[tuple[str, str]]:
+        """A loose firm's keys a duplicate can share: its phones, emails,
+        domains and its name in its town."""
+        from harvey.overlay.reads import Reader
+
+        keys = resolver._overlay_keys(self.con, self.schemes, live)
+        out = [(k, v) for k in ("domain", "email", "name") for v in sorted(keys.get(k, ()))]
+        group = self._group(live)
+        out += [("phone", r[0]) for r in self.x(
+            f"SELECT DISTINCT c.value FROM link l JOIN contact c ON c.id = l.contact "
+            f"WHERE l.firm IN ({','.join('?' * len(group))}) AND c.kind = ?",
+            (*group, schema.PHONE))]
+        row = (Reader(self.con, self.registers, manifests=self.manifests)
+               .company_rows([live]) or [None])[0]
+        if row is not None:
+            name, town = resolver.name_key(row["name"]), resolver.locality_key(row["location"])
+            if name and town and ("name", f"{name}@{town}") not in out:
+                out.append(("name", f"{name}@{town}"))
+        return out
+
+    def scan_candidates(self) -> list[tuple[float, str, str, list[dict]]]:
+        """resolver.scan_candidates on the overlay: the pairs on file that
+        score REVIEW or more, (score, a, b, reasons), most likely first.
+        Reads only."""
+        shared: dict = {}
+        flags: dict = {}
+        firm: dict = {}
+        identity: dict[int, tuple | None] = {}
+        seen: set[tuple[str, str]] = set()
+        for live in self._loose():
+            for kind, value in self._scan_keys(live):
+                if (kind, value) in seen:
+                    continue
+                seen.add((kind, value))
+                holders = self._key_holders(kind, value)
+                if len(holders) < 2:
+                    continue
+                for h in holders:
+                    if h not in identity:
+                        identity[h] = self._identity(h)
+                resolver.scan_key(kind, value, {str(h): identity[h] for h in holders},
+                                  shared, flags, firm)
+        keys = {cid: resolver._overlay_keys(self.con, self.schemes, int(cid))
+                for cid in {x for pair in shared for x in pair}}
+        return resolver.scored_pairs(shared, flags, firm, keys, legal=self.schemes.legal_kinds())
+
+    def unknown_pairs(self, scored) -> list:
+        """resolver.unknown_pairs on the overlay."""
+        known = {frozenset((str(a), str(b))): status for a, b, status in self.x(
+            "SELECT a, b, status FROM match_candidate")}
+        return [row for row in scored
+                if frozenset(row[1:3]) not in known
+                or (row[0] >= resolver.ATTACH and known[frozenset(row[1:3])] == "pending")]
+
+    def apply_scan(self, scored) -> dict:
+        """resolver.apply_scan on the overlay: each pair followed to the
+        live firms it stands for now, merged (ATTACH or more) or put up for
+        review; pairs a person decided are left alone."""
+        merged = review = 0
+        for score, a, b, reasons in scored:
+            a, b = self.live(a), self.live(b)
+            if a is None or b is None or a == b or merges.legal_conflict(self.con, a, b):
+                continue
+            status = self.one("SELECT status FROM match_candidate WHERE (a = ? AND b = ?) "
+                              "OR (a = ? AND b = ?)", (a, b, b, a))
+            if status == "separate":
+                continue
+            undone = self.one("SELECT 1 FROM merge WHERE undone_at IS NOT NULL AND "
+                              "((survivor = ?1 AND merged = ?2) OR (survivor = ?2 AND merged = ?1)) "
+                              "LIMIT 1", (a, b)) is not None
+            order = self.keeper_order((a, b))
+            if len(order) != 2:
+                continue
+            keep, other = int(order[0]), int(order[1])
+            if score < resolver.ATTACH or undone:
+                review += self._candidate(keep, other, score, reasons)
+                continue
+            try:
+                self._merge(keep, other, "auto", score=score, reasons=json.dumps(reasons))
+                merged += 1
+            except resolver.MergeRefused:
+                continue
+        return {"merged": merged, "review": review}
+
+    # ── People a register names, when Harvey acts on them ──
+
+    def name_register_people(self, company_id) -> int:
+        """The people the register names at a firm (its administrators), as
+        Harvey's own people at the live firm, each name once across its
+        records: what the contact finder searches and records searches of.
+        How many were new."""
+        live = self.live(company_id)
+        if live is None:
+            return 0
+        from harvey import registers as regs_mod
+
+        directory = next((a for a in self.registers if hasattr(a, "people")
+                          and type(a).resolve is not regs_mod.Adapter.resolve), None)
+        if directory is None:
+            return 0
+        group = self._group(live)
+        marks = ",".join("?" * len(group))
+        idents = self.x(f"SELECT scheme, key FROM firm_ident WHERE firm IN ({marks})",
+                        group).fetchall()
+        named: list[tuple[str, str]] = []
+        for scheme_id, key in idents:
+            s = self.schemes.by_id.get(scheme_id)
+            if s is None or s.name not in (directory.keyed_by, *(sc for _, sc in directory.by_signal
+                                                                if sc)):
+                continue
+            named = directory.people(self.con, [key], s.name).get(key) or []
+            if named:
+                break
+        if not named:
+            return 0
+        have = {r[0] for r in self.x(f"SELECT name_norm FROM person WHERE firm IN ({marks})",
+                                     group)}
+        added = 0
+        for name, role in named:
+            norm = contacts.name_norm(name)
+            if norm and norm not in have:
+                self._person(live, name, role, directory.module)
+                have.add(norm)
+                added += 1
+        return added
 
     # ── Removing a firm from Harvey ──
 
@@ -1322,7 +1580,7 @@ class Store:
                     "SELECT 1 FROM merge_member WHERE firm = ? LIMIT 1",
                     (fid, fid, fid, fid, fid)):
             raise RemoveRefused("merged")
-        if self.one("SELECT 1 FROM prospects WHERE firm = ? LIMIT 1", (fid,)):
+        if self.one("SELECT 1 FROM prospects WHERE company_id = ? LIMIT 1", (fid,)):
             raise RemoveRefused("has_prospects")
         registers = self._register_sources()
         kept = self._harvey_work(fid, registers)

@@ -132,6 +132,16 @@ queries.statement(
     "CROSS JOIN {alias}.firms f CROSS JOIN {alias}.administrators a "
     "WHERE f.reg = j.value AND a.firm_id = f.id)",
     params=('["J08/1/2015"]',), module=MODULE, drives="j", bounded=True)
+# How many people (each name once per firm) the registry names at the
+# firms in Harvey with a CUI, counted up to a bound: whether the People
+# page's count passes its cap, read before the register's counts are kept.
+queries.statement(
+    "onrc.people_held_upto",
+    "SELECT COUNT(*) FROM (SELECT DISTINCT fi.firm, a.first_name, a.last_name "
+    "FROM firm_ident fi CROSS JOIN {derived}.firm_by_cui b CROSS JOIN {alias}.administrators a "
+    "WHERE fi.scheme = ? AND b.cui = fi.key AND a.firm_id = b.firm_id LIMIT ?)",
+    params=(1, 100001), module=MODULE, drives="fi",
+    scans={"firm_ident": "firms in Harvey walked only until the bound (the page's cap) is met"})
 # The registry id alone (its names' order) by CUI or registration number:
 # what sorts every firm in Harvey by name without reading the names.
 queries.statement(
@@ -151,6 +161,50 @@ queries.statement(
     scans={"firm_ident": "every CUI in Harvey, once per kept ordering of every firm by name"})
 queries.statement(
     "onrc.name_of_id", "SELECT name FROM {alias}.firms WHERE id = ?", params=(1,), module=MODULE)
+# Each firm's place in the registry's orders (overlay/orders.py): its row's
+# id (the names' order) and its place line's rank, for every firm in Harvey
+# by CUI or registration number, or for some (a list of firm ids).
+_PLACE = ("LEFT JOIN {derived}.place_rank p ON p.locality = COALESCE(f.locality, '') "
+          "AND p.county = COALESCE(f.county, '')")
+queries.statement(
+    "onrc.order.all",
+    "SELECT fi.firm, f.id, p.rank FROM firm_ident fi CROSS JOIN {derived}.firm_by_cui b "
+    f"CROSS JOIN {{alias}}.firms f {_PLACE} WHERE fi.scheme = ? AND b.cui = fi.key "
+    "AND f.id = b.firm_id",
+    params=(1,), module=MODULE, drives="fi",
+    scans={"firm_ident": "every CUI in Harvey, once per registry load (a job)"})
+queries.statement(
+    f"onrc.order.all@{REG}",
+    f"SELECT fi.firm, f.id, p.rank FROM firm_ident fi CROSS JOIN {{alias}}.firms f {_PLACE} "
+    "WHERE fi.scheme = ? AND f.reg = fi.key",
+    params=(1,), module=MODULE, drives="fi",
+    scans={"firm_ident": "every registration number in Harvey, once per registry load (a job)"})
+queries.statement(
+    "onrc.order.some",
+    "SELECT fi.firm, f.id, p.rank FROM json_each(?) j CROSS JOIN firm_ident fi "
+    f"CROSS JOIN {{derived}}.firm_by_cui b CROSS JOIN {{alias}}.firms f {_PLACE} "
+    "WHERE fi.firm = j.value AND fi.scheme = ? AND b.cui = fi.key AND f.id = b.firm_id",
+    params=("[1, 2]", 1), module=MODULE, drives="j")
+queries.statement(
+    f"onrc.order.some@{REG}",
+    "SELECT fi.firm, f.id, p.rank FROM json_each(?) j CROSS JOIN firm_ident fi "
+    f"CROSS JOIN {{alias}}.firms f {_PLACE} WHERE fi.firm = j.value AND fi.scheme = ? "
+    "AND f.reg = fi.key",
+    params=("[1, 2]", 1), module=MODULE, drives="j")
+queries.statement("onrc.order.max_id", "SELECT MAX(id) FROM {alias}.firms", module=MODULE)
+queries.statement(
+    "onrc.order.name_from",
+    "SELECT id, name FROM {alias}.firms WHERE id >= ? ORDER BY id LIMIT 1",
+    params=(1,), module=MODULE)
+queries.statement(
+    "onrc.order.place_from",
+    "SELECT rank, line FROM {derived}.place_rank WHERE line >= ? ORDER BY line LIMIT 1",
+    params=("Brașov",), module=MODULE)
+queries.statement(
+    "onrc.order.place_last", "SELECT MAX(rank) FROM {derived}.place_rank", module=MODULE)
+queries.statement(
+    "onrc.order.ready",
+    "SELECT COUNT(*) FROM {derived}.sqlite_master WHERE name = 'place_rank'", module=MODULE)
 queries.statement(
     "onrc.name_key.version",
     "SELECT version FROM {derived}.derived_meta WHERE name = 'name_key'", module=MODULE)
@@ -270,6 +324,11 @@ class Adapter(Base):
         return sum(con.execute(self.sql(name), (json.dumps(chunk),)).fetchone()[0]
                    for chunk in chunks(keys, 50_000))
 
+    def people_held_upto(self, con, scheme_id: int, bound: int) -> int:
+        """How many people the registry names at the firms in Harvey with a
+        CUI (``scheme_id``: the scheme's id), counted only up to ``bound``."""
+        return con.execute(self.sql("people_held_upto"), (scheme_id, int(bound))).fetchone()[0]
+
     def name_order(self, con, keys, scheme: str = "ro.cui") -> dict:
         """{key: its registry id}: the registry's ids follow its names'
         alphabetical order, so sorting by id sorts by name."""
@@ -283,6 +342,54 @@ class Adapter(Base):
         """(record, registry id) for every record in Harvey with a CUI the
         registry has, in its names' order (the CUI scheme's id given)."""
         return sorted(con.execute(self.sql("order.held"), (scheme_id,)), key=lambda r: r[1])
+
+    # Places in the registry's orders (overlay/orders.py)
+
+    def order_schemes(self) -> tuple[str, ...]:
+        """The schemes positions are read by, the one that wins last."""
+        return (REG, "ro.cui")
+
+    def order_sql(self, scheme: str, some: bool = False) -> str:
+        """(record, registry id, place rank) for every record in Harvey keyed
+        by ``scheme`` (param: its id), or (``some``) for a list of firm ids
+        (params: the list as JSON, the scheme's id)."""
+        name = "order.some" if some else "order.all"
+        return self.sql(name if scheme == "ro.cui" else f"{name}@{REG}")
+
+    def can_order(self, con) -> bool:
+        try:
+            return bool(con.execute(self.sql("order.ready")).fetchone()[0])
+        except sqlite3.Error:
+            return False
+
+    def name_position(self, con, name: str) -> float:
+        """Where ``name`` falls among the registry's names: half a step
+        before the first registry id whose name sorts at or after it (the
+        load sorts names by onrc._fold)."""
+        from harvey.collectors.onrc import _fold
+
+        key = _fold(name or "")
+        top = con.execute(self.sql("order.max_id")).fetchone()[0] or 0
+        lo, hi = 1, top + 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            row = con.execute(self.sql("order.name_from"), (mid,)).fetchone()
+            if row is None:
+                hi = mid
+            elif _fold(row[1] or "") < key:
+                lo = row[0] + 1
+            else:
+                hi = mid
+        return lo - 0.5
+
+    def place_position(self, con, locality: str, county: str) -> float:
+        """Where a place line falls among the registry's: its rank when the
+        registry has it, else half a step before the next."""
+        line = place(locality, county)
+        row = con.execute(self.sql("order.place_from"), (line,)).fetchone()
+        if row is None:
+            return (con.execute(self.sql("order.place_last")).fetchone()[0] or 0) + 0.5
+        return float(row[0]) if row[1] == line else row[0] - 0.5
 
     def name_of_id(self, con, registry_id: int) -> str:
         row = con.execute(self.sql("name_of_id"), (registry_id,)).fetchone()
@@ -338,6 +445,14 @@ class Adapter(Base):
         """Registry ids of operating firms with this name key in this town.
         Raises registers.Stale when the index was built by other rules."""
         from harvey import name_keys
+
+        return self.key_holders(con, name_keys.name_key(name), name_keys.locality_key(location))
+
+    def key_holders(self, con, key: str, town: str) -> list[int]:
+        """Registry ids of operating firms with this name key (already a
+        key: resolver.name_key) in this town key. Raises registers.Stale as
+        name_holders does."""
+        from harvey import name_keys
         from harvey.registers import Stale
 
         row = None
@@ -349,7 +464,6 @@ class Adapter(Base):
             raise Stale(f"the registry's name index was built by rules "
                         f"{row[0] if row else 'unknown'}, the code's are {name_keys.version()}: "
                         "reindex the registry")
-        key, town = name_keys.name_key(name), name_keys.locality_key(location)
         if not key:
             return []
         return [r[0] for r in con.execute(self.sql("name_key.holders"), (key, town))]

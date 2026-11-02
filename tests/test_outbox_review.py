@@ -179,7 +179,7 @@ def test_every_open_role_shows_and_unlabelled_signals_keep_their_code(client):
     state, _ = asyncio.run(_seed(client.db_path))
 
     async def more():
-        cid = (await dash.query_db("SELECT id FROM companies"))[0]["id"]
+        cid = (await dash.query_db("SELECT company_id FROM prospects"))[0]["company_id"]
         await state.add_observations([
             {"company_id": cid, "signal_code": "HIRING_ROLE", "value_text": "Roofing estimator",
              "run_id": "r1"},
@@ -187,7 +187,7 @@ def test_every_open_role_shows_and_unlabelled_signals_keep_their_code(client):
              "run_id": "r1"},
         ])
         async with aiosqlite.connect(client.db_path) as db:
-            await db.execute("UPDATE signal_codes SET label = '' WHERE code = 'TECH_STACK'")
+            await db.execute("UPDATE signal SET label = '' WHERE code = 'TECH_STACK'")
             await db.commit()
     asyncio.run(more())
     signals = client.get("/api/outbox").json()["pending"][0]["context"]["signals"]
@@ -222,7 +222,7 @@ def test_a_closed_role_shows_as_not_hiring_to_the_reviewer(client):
     state, _ = asyncio.run(_seed(client.db_path))
 
     async def more():
-        cid = (await dash.query_db("SELECT id FROM companies"))[0]["id"]
+        cid = (await dash.query_db("SELECT company_id FROM prospects"))[0]["company_id"]
         await state.add_observations([
             {"company_id": cid, "signal_code": "HIRING_ROLE", "value_text": "Head of Growth",
              "run_id": "r1", "observed_at": "2026-09-01 10:00:00"},

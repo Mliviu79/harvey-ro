@@ -593,7 +593,7 @@ def cmd_contacts(args):
         require = [c.strip().upper() for c in args.require.split(",") if c.strip()]
         exclude = [c.strip().upper() for c in args.exclude.split(",") if c.strip()]
         if require or exclude:
-            f.cohort = state._verdict_sql(require, exclude, [], 0.0)
+            f.signals = (tuple(require), tuple(exclude))
         selected = await finder.select(state, f, force=args.force, limit=args.limit)
         if not selected:
             print("\n  Nothing to search: every company that matches has a contact "
@@ -2287,6 +2287,103 @@ def cmd_doctor(args):
         con.close()
 
 
+def _gb(n) -> str:
+    return f"{(n or 0) / 1e9:.1f} GB"
+
+
+def _print_upgrade_status(s: dict) -> None:
+    est = s.get("estimate") or {}
+    sizes = est.get("sizes") or {}
+    if s.get("switch_pending"):
+        print("\n  The upgrade's switch was cut short: harvey upgrade finishes it (Harvey "
+              "waits until then).")
+    elif s.get("needed"):
+        print(f"\n  harvey.db is schema {s['schema']}: it needs the upgrade to the slim database.")
+    elif s["schema"] == 25:
+        print("\n  harvey.db is upgraded (schema 25).")
+    if est:
+        print(f"  Reads: harvey.db {_gb(sizes.get('harvey'))}, anaf.db {_gb(sizes.get('anaf'))}; "
+              f"about {max(1, est['seconds'] // 60)} minutes.")
+        free = est.get("free_bytes")
+        print(f"  New files: about {_gb(est['need_bytes'])}; it starts only with at least "
+              f"{_gb(est['floor_bytes'])} free. Free now: "
+              + (_gb(free) if free is not None else "unknown"))
+        if est.get("free_error"):
+            print(f"  Free space can't be checked: {est['free_error']}")
+    for st in s["stages"]:
+        if st.get("state", "todo") == "todo":
+            continue
+        took = f" ({st['seconds']} s)" if st.get("seconds") else ""
+        print(f"    {st['id']:<11} {st['state']}{took}")
+    v = s.get("verification")
+    if v:
+        print(f"  Verification: {'passed' if v.get('passed') else 'FAILED'}"
+              + (f" ({len(v.get('failures') or [])} differences)" if not v.get("passed") else ""))
+        for line in (v.get("failures") or [])[:20]:
+            print(f"    {line}")
+    if s.get("error"):
+        print(f"  Stopped: {s['error']}")
+    if s.get("old_files"):
+        total = sum(f["bytes"] for f in s["old_files"])
+        print(f"  Old files kept: {', '.join(f['name'] for f in s['old_files'])} ({_gb(total)}); "
+              "harvey upgrade --delete-old deletes them.")
+    print()
+
+
+def cmd_upgrade(args):
+    """Upgrade harvey.db to the slim schema 25 (harvey/upgrade.py)."""
+    import time
+
+    from harvey import upgrade
+
+    layout = upgrade.Layout(Path(args.data) if args.data else upgrade.DATA_DIR,
+                            Path(args.out) if args.out else None)
+    if args.delete_old:
+        s = upgrade.status(layout)
+        if not s["old_files"]:
+            print("\n  No old files to delete.\n")
+            return
+        total = sum(f["bytes"] for f in s["old_files"])
+        names = ", ".join(f["name"] for f in s["old_files"])
+        if not args.yes:
+            typed = input(f"\n  Delete {names} ({_gb(total)})? Type delete to confirm: ")
+            if typed.strip().lower() != "delete":
+                print("  Nothing deleted.\n")
+                return
+        try:
+            freed = upgrade.delete_old(layout)
+        except upgrade.Refused as e:
+            print(f"\n  {e}\n")
+            sys.exit(2)
+        print(f"\n  Deleted {names}: {_gb(freed)} freed.\n")
+        return
+    s = upgrade.status(layout)
+    if args.check:
+        _print_upgrade_status(s)
+        return
+    if not s["needed"] and not layout.out:
+        _print_upgrade_status(s)
+        return
+    if s["running"]:
+        print("\n  An upgrade is already running (the dashboard's, or another terminal's).\n")
+        sys.exit(2)
+    _print_upgrade_status(s)
+    if not args.yes:
+        typed = input("  Stop Harvey (harvey run, harvey worker) first. Start the upgrade? [y/N] ")
+        if typed.strip().lower() not in ("y", "yes"):
+            print("  Not started.\n")
+            return
+    started = time.monotonic()
+    try:
+        s = upgrade.run(layout, say=lambda line: print(f"  {line}", flush=True))
+    except upgrade.Refused as e:
+        print(f"\n  {e}\n")
+        _print_upgrade_status(upgrade.status(layout))
+        sys.exit(1)
+    print(f"\n  Done in {time.monotonic() - started:.0f} s.")
+    _print_upgrade_status(s)
+
+
 _REMOVE_REFUSED = {
     "not_found": "no such company",
     "merged": "it is part of a merge (in force or undone); its history needs it",
@@ -3120,6 +3217,20 @@ def main():
                           "or show the status (default)")
     sub.set_defaults(func=cmd_trulyinbox)
 
+    # harvey upgrade
+    sub = subparsers.add_parser(
+        "upgrade", help="Upgrade harvey.db to the slim database (registers read in place)")
+    sub.add_argument("--check", action="store_true", help="Only report what it would do")
+    sub.add_argument("--delete-old", action="store_true",
+                     help="Delete the old files the upgrade kept (harvey.db.v24, anaf.db.old)")
+    sub.add_argument("--yes", action="store_true", help="Don't ask before starting or deleting")
+    sub.add_argument("--data", help="The data folder (default: data/)")
+    sub.add_argument("--out", help="Write every new file here and leave the data folder "
+                                   "untouched: a dry run on a copy of the data folder (read "
+                                   "as unchanging, so refused while Harvey runs on it; "
+                                   "nothing is switched)")
+    sub.set_defaults(func=cmd_upgrade)
+
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")
     sub.add_argument("--days", type=int, default=30, help="Breakdown window (default: 30)")
@@ -3149,7 +3260,9 @@ def main():
         from harvey.config import ConfigError
         from harvey.modules.switches import ModuleOff
 
-        if isinstance(e, ModuleOff):
+        from harvey.state import UpgradeNeeded
+
+        if isinstance(e, (ModuleOff, UpgradeNeeded)):
             print(f"\n  {e}\n")
             sys.exit(2)
         if isinstance(e, ConfigError):

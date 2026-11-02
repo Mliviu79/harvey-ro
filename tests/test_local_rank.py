@@ -20,6 +20,9 @@ from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
+# Ads are a web-marketing signal (the module ships off).
+pytestmark = pytest.mark.modules_on("web_marketing")
+
 ENV = {"dataforseo_login": "u", "dataforseo_password": "p"}
 REAL_CLIENT = httpx.AsyncClient
 
@@ -511,18 +514,6 @@ async def test_a_better_rank_later_in_the_same_run_wins(state, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unphrased_legacy_ranks_give_way_to_phrased_ones(state):
-    cid = await state.add_company(Company(name="Old", domain="old.example"))
-    await state.add_observation("SERP_RANK", company_id=cid, collector="discover",
-                                value_num=15, observed_at="2026-01-01 00:00:00")
-    # Before any phrased rank exists the legacy row still counts.
-    assert await _in_range(state) == 1
-    await state.add_observation("SERP_RANK", company_id=cid, collector="discover",
-                                value_num=2, value_text="roofer Denver, CO")
-    assert await _in_range(state) == 0
-
-
-@pytest.mark.asyncio
 async def test_dropping_out_of_the_results_clears_the_rank(state, monkeypatch):
     await _run(state, monkeypatch, [[_organic(14), _pack(2)]])
     company = await state.get_company_by_domain("brindlewickroofing.example")
@@ -571,7 +562,7 @@ async def test_pack_and_maps_resolve_to_one_websiteless_company(state, monkeypat
     import sqlite3
     from contextlib import closing
     with closing(sqlite3.connect(state.db_path)) as db:
-        names = [r[0] for r in db.execute("SELECT name FROM companies")]
+        names = [r[0] for r in db.execute("SELECT name FROM local_firm")]
     assert names.count("Bob's Roof Fix") == 1, names
 
 
@@ -584,11 +575,3 @@ async def test_a_place_id_keyed_company_is_found_by_its_alias(state, monkeypatch
     assert report.known_companies == 1 and report.new_companies == 1
 
 
-@pytest.mark.asyncio
-async def test_range_respects_confidence_like_require(state):
-    cid = await state.add_company(Company(name="Neg", domain="neg.example"))
-    await state.add_observation("SERP_RANK", company_id=cid, collector="discover",
-                                value_num=15, value_text="roofer Denver", confidence=-1)
-    req, _ = await state.cohort_companies(["SERP_RANK"], [])
-    assert req == 0
-    assert await _in_range(state) == 0

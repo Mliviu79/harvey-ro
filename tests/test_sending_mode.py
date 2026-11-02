@@ -17,7 +17,7 @@ import pytest_asyncio
 
 from harvey.config import ConfigError, load_config, refresh_sending_mode, set_require_approval
 from harvey.paths import PROJECT_ROOT
-from harvey.state import MIGRATIONS, StateManager
+from harvey.state import StateManager
 from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 
 
@@ -136,22 +136,6 @@ async def test_autopilot_rows_are_marked_as_such(state):
     item = await state.get_outbox_item(auto)
     assert item["status"] == "pending_review" and "autopilot" in item["error"]
     assert (await state.get_outbox_item(waiting))["status"] == "approved"   # yours stays
-
-
-@pytest.mark.asyncio
-async def test_rows_approved_before_the_upgrade_count_as_approved(tmp_path):
-    db = tmp_path / "old.db"
-    conn = sqlite3.connect(db)
-    for script in MIGRATIONS[:12]:
-        conn.executescript(script)
-    conn.execute("INSERT INTO outbox (id, prospect_id, kind, step, to_email, subject, body, status, send_at) "
-                 "VALUES ('o1', 'p', 'sequence', 2, 'a@x.test', 's', 'b', 'approved', '2026-11-01T09:00:00')")
-    conn.execute("PRAGMA user_version = 12")
-    conn.commit()
-    conn.close()
-    s = StateManager(str(db))
-    await s.init_db()
-    assert (await s.get_outbox_item("o1"))["approved_by"] == "earlier"
 
 
 # ── sending respects the mode ──

@@ -2,15 +2,14 @@
 
 Each scenario drives one source, search or enricher through Harvey's own
 entry points with recorded (invented) answers in place of the network, then
-dumps every table it can touch. The dump is compared with one recorded from
-the code as it was before the capability wrappers and core ingest, so a
-wrapper that drops a field, reorders a write or adds one fails here.
+dumps every table it can touch. The dump is compared with a recorded one, so
+a wrapper that drops a field, reorders a write or adds one fails here.
 
-The dump leaves out what can't be the same twice (generated ids, which are
-renamed in order of appearance; timestamps, kept only as set or not) and
-the provenance columns observations gained with the wrappers (module,
-capability, origin_company_id). A missing recording is printed and the test
-skipped, so a new scenario is recorded by running it once.
+The recordings are of the slim database (schema 25). The dump leaves out
+what can't be the same twice (generated text ids, which are renamed in
+order of appearance; timestamps, kept only as set or not). A missing
+recording is printed and the test skipped, so a new scenario is recorded by
+running it once.
 
 Every company, person, address and number here is invented.
 """
@@ -36,14 +35,12 @@ from harvey.state import StateManager
 pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
 
 GOLDEN = Path(__file__).parent / "fixtures" / "parity"
-# Columns added with the wrappers: provenance, not what was found. (A
-# company's website_trust and website_source are the contact finder's, and
-# no run recorded here finds a website that way.)
-NEW_COLUMNS = {"observations": {"module", "capability", "origin_company_id"},
-               "companies": {"website_trust", "website_source"}}
-TABLES = ("companies", "company_ids", "company_activities", "observations", "prospects",
-          "match_candidates", "company_merges", "company_merge_moves", "email_patterns",
-          "runs", "settings")
+TABLES = ("firm", "firm_ident", "local_firm", "firm_source", "firm_key", "obs", "reading",
+          "contact", "link", "link_evidence", "person", "search", "locations", "prospects",
+          "match_candidate", "merge", "merge_member", "email_patterns", "runs", "settings")
+# Columns that hold a moment: kept only as set or not.
+TIME_COLUMNS = {"at", "since", "checked_at", "first_seen", "last_seen", "created", "searched_at",
+                "profiled_at", "observed_at", "send_at"}
 # Rows that are about the install, not the run (vocabulary and module bookkeeping).
 SETTING_SKIP = re.compile(r"^(signals?\.|modules?\.|ui\.|vocabulary|caen_)")
 
@@ -59,7 +56,7 @@ def dump(db_path: str) -> dict:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     ids: dict[str, str] = {}
-    for table, prefix in (("companies", "C"), ("prospects", "P"), ("runs", "R")):
+    for table, prefix in (("prospects", "P"), ("runs", "R")):
         for (value,) in con.execute(f"SELECT id FROM {table} ORDER BY rowid"):
             ids.setdefault(value, f"{prefix}{len([k for k in ids.values() if k[0] == prefix]) + 1}")
 
@@ -73,15 +70,18 @@ def dump(db_path: str) -> dict:
     out = {}
     for table in TABLES:
         cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
-        skip = NEW_COLUMNS.get(table, set()) | ({"id"} if table == "observations" else set())
+        skip = {"id"} if table in ("obs", "link_evidence") else set()
         rows = []
-        for row in con.execute(f"SELECT * FROM {table} ORDER BY rowid"):
+        rowid = con.execute("SELECT sql NOT LIKE '%WITHOUT ROWID%' FROM sqlite_master "
+                            "WHERE name = ?", (table,)).fetchone()[0]
+        order = "rowid" if rowid else ", ".join(str(i + 1) for i in range(len(cols)))
+        for row in con.execute(f"SELECT * FROM {table} ORDER BY {order}"):
             item = {}
             for col in cols:
                 if col in skip:
                     continue
                 value = row[col]
-                if col.endswith("_at") or col in ("observed_at", "send_at"):
+                if col.endswith("_at") or col in TIME_COLUMNS:
                     value = value is not None and value != ""
                 item[col] = clean(value)
             if table == "settings" and SETTING_SKIP.match(item.get("key", "")):

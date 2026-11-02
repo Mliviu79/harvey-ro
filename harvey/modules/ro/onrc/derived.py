@@ -5,6 +5,9 @@
   firm Harvey means is the operating row, else the newest registration,
   else the highest registration number (stable across reloads, unlike the
   row ids). Keyed by the CUI as an integer.
+- ``place_rank``: every place line the registry has (onrc.queries.place:
+  "Town, County, Romania"), ranked in sorted order: where a firm falls when
+  firms are sorted by place (overlay/orders.py).
 - ``name_key``: operating firms by the resolver's name key and town key
   (harvey.name_keys, the resolver's keys), for matching a record by name and
   town without reading the whole registry. Built by code, so the version
@@ -22,7 +25,10 @@ from pathlib import Path
 
 from harvey.registers import build_derived, mark_built
 
-TABLES = ("firm_by_cui", "name_key")
+TABLES = ("firm_by_cui", "name_key", "place_rank")
+# The rules place lines are written by (onrc.queries.place): a change of
+# them marks place_rank stale.
+PLACE_VERSION = "1"
 # DD/MM/YYYY (sometimes with a time) as YYYYMMDD, for "newest registration".
 REGISTERED = ("CASE WHEN length(f.registered) >= 10 THEN substr(f.registered, 7, 4) "
               "|| substr(f.registered, 4, 2) || substr(f.registered, 1, 2) ELSE '' END")
@@ -59,9 +65,27 @@ def build(con, src: str = "main", dst: str = "main") -> dict:
             FROM {src}.firms f WHERE f.operating = 1)
         WHERE k != '' ORDER BY 1, 2, 3""")
     mark_built(con, dst, "name_key", name_keys.version())
+
+    from harvey.modules.ro.onrc.queries import place
+
+    con.create_function("harvey_place_line", 2, lambda loc, cty: place(loc, cty),
+                        deterministic=True)
+    con.execute(f"DROP TABLE IF EXISTS {dst}.place_rank")
+    con.execute(f"CREATE TABLE {dst}.place_rank (locality TEXT NOT NULL, county TEXT NOT NULL, "
+                "line TEXT NOT NULL, rank INTEGER NOT NULL, PRIMARY KEY (locality, county)) "
+                "WITHOUT ROWID")
+    con.execute(f"""
+        INSERT INTO {dst}.place_rank (locality, county, line, rank)
+        SELECT locality, county, line, DENSE_RANK() OVER (ORDER BY line) FROM (
+            SELECT locality, county, harvey_place_line(locality, county) AS line FROM (
+                SELECT DISTINCT COALESCE(f.locality, '') AS locality,
+                       COALESCE(f.county, '') AS county FROM {src}.firms f))""")
+    con.execute(f"CREATE INDEX {dst}.place_rank_line ON place_rank(line, rank)")
+    mark_built(con, dst, "place_rank", PLACE_VERSION)
     q = con.execute
     return {"firm_by_cui": q(f"SELECT COUNT(*) FROM {dst}.firm_by_cui").fetchone()[0],
             "name_key": q(f"SELECT COUNT(*) FROM {dst}.name_key").fetchone()[0],
+            "place_rank": q(f"SELECT COUNT(*) FROM {dst}.place_rank").fetchone()[0],
             "cui_not_keyable": skipped}
 
 

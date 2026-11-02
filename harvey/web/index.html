@@ -73,6 +73,12 @@
   </div>
 </div>
 
+<!-- Shown instead of the pages while harvey.db waits for the upgrade to the slim database. -->
+<div id="upgrade-screen"
+     style="display:none;position:fixed;inset:0;z-index:999;align-items:flex-start;justify-content:center;padding:24px;overflow:auto">
+  <div class="card upgrade-card" id="upgrade-body" role="region" aria-live="polite"></div>
+</div>
+
 <header class="topbar">
   <div class="brand">
     <span class="mark" aria-hidden="true">H<i>RO</i></span>
@@ -134,6 +140,9 @@
 
 <main class="content">
 <div class="content-inner">
+
+<!-- The files the database upgrade kept aside, until the user deletes them. -->
+<div id="old-files-note" class="banner wait" hidden></div>
 
 <!-- Overview: the landing page -->
 <div id="overview" class="section active">

@@ -53,6 +53,8 @@ value_type = "text"
 collector = "profile"
 cost_note = "free (homepage HTML)"
 cardinality = "many"
+# Each read records the whole stack: an earlier one is no longer current.
+whole_set = true
 
 [[signals]]
 code = "NO_SCHEMA_MARKUP"

@@ -26,7 +26,7 @@ from harvey.collectors import discover as D
 from harvey.models import Company
 from harvey.modules import api, runs, switches
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
-from harvey.state import MIGRATIONS, StateManager
+from harvey.state import StateManager
 
 WEB = Path(dash.__file__).resolve().parent / "web"
 CATALOG = {s["code"]: s for s in SIGNAL_CATALOG}
@@ -96,33 +96,6 @@ def test_a_module_whose_requirement_is_off_is_off():
 
 
 # ── The vocabulary from the manifests ──
-
-
-@pytest.mark.asyncio
-async def test_migration_adds_the_vocabulary_columns(state):
-    assert (await _rows(state, "PRAGMA user_version"))[0][0] == len(MIGRATIONS) >= 18
-    cols = {r[1] for r in await _rows(state, "PRAGMA table_info(signal_codes)")}
-    assert {"module", "subject", "unit", "cardinality", "keyed_by", "absence",
-            "when_known", "available"} <= cols
-
-
-@pytest.mark.asyncio
-async def test_parity_old_catalog_rows_equal_the_new_ones(state, tmp_path):
-    """The rows the old catalog seeding wrote are the rows the manifests write."""
-    old = StateManager(str(tmp_path / "old.db"))
-    await old.init_db()
-    for sig in SIGNAL_CATALOG:   # what seeding from the catalog did
-        await old.upsert_signal_code(
-            sig["code"], label=sig["label"], description=sig["description"],
-            category=sig["category"], value_type=sig["value_type"],
-            collector=sig["collector"], cost_note=sig["cost_note"],
-            confidence_floor=sig.get("confidence_floor", 0.0))
-    assert await sync_vocabulary(state) == len(SIGNAL_CATALOG) + len(MODULE_ONLY)
-    marks = ",".join("?" * len(SIGNAL_CATALOG))
-    sql = (f"SELECT {', '.join(OLD_COLUMNS)} FROM signal_codes "
-           f"WHERE code IN ({marks}) ORDER BY code")
-    codes = [s["code"] for s in SIGNAL_CATALOG]
-    assert await _rows(state, sql, codes) == await _rows(old, sql, codes)
 
 
 @pytest.mark.asyncio
@@ -226,53 +199,6 @@ async def test_an_unknown_module_is_refused(state):
 
 
 # ── Meeting modules for the first time ──
-
-
-def _v17_db(path: Path, *, confirmed=(), settings=(), companies=0):
-    conn = sqlite3.connect(path)
-    for script in MIGRATIONS[:17]:
-        conn.executescript(script)
-    conn.execute("PRAGMA user_version = 17")
-    for code in CATALOG:
-        conn.execute("INSERT INTO signal_codes (code, status) VALUES (?, ?)",
-                     (code, "confirmed" if code in confirmed else "proposed"))
-    for key, value in settings:
-        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
-    for i in range(companies):
-        conn.execute("INSERT INTO companies (id, name) VALUES (?, ?)", (f"c{i}", f"Exemplu {i}"))
-    conn.commit()
-    conn.close()
-
-
-@pytest.mark.asyncio
-async def test_an_upgrade_keeps_working_modules_on(tmp_path, monkeypatch, keyed_module):
-    """A keyed module's key is set and HIRING_ROLE was confirmed: both modules
-    ship off, and stay on here. The old Email switch moves over, and its old
-    key stays for an older Harvey started on the same database."""
-    monkeypatch.setattr(switches, "present_env_keys",
-                        lambda: {KEYED_SECRET, "SERPER_API_KEY"})
-    path = tmp_path / "old.db"
-    _v17_db(path, confirmed=("HIRING_ROLE",), settings=[("ui.module.email", "on")])
-    sm = StateManager(str(path))
-    await sm.init_db()
-    stored = await sm.settings_with_prefix("modules.")
-    assert stored == {f"modules.{KEYED}.enabled": "on", "modules.hiring.enabled": "on",
-                      "modules.email_outreach.enabled": "on"}
-    assert await sm.get_setting("ui.module.email") == "on"
-    on = await switches.enabled_ids(sm)
-    assert {KEYED, "hiring", "email_outreach"} <= on
-    assert not on & {"startups", "web_marketing"}
-
-
-@pytest.mark.asyncio
-async def test_an_upgrade_with_no_key_set_takes_the_default(tmp_path, monkeypatch, keyed_module):
-    monkeypatch.setattr(switches, "present_env_keys", lambda: {"SERPER_API_KEY"})
-    path = tmp_path / "old.db"
-    _v17_db(path, companies=1, settings=[("ui.module.email", "")])
-    sm = StateManager(str(path))
-    await sm.init_db()
-    assert await sm.settings_with_prefix("modules.") == {}
-    assert KEYED not in await switches.enabled_ids(sm)
 
 
 @pytest.mark.asyncio
@@ -617,15 +543,6 @@ console.log(JSON.stringify({row, hidden: fields.map(f => f.hidden)}));
 # ── Upgrades keep what was running; opening a database changes nothing else ──
 
 
-def _v17_with(path: Path, *statements):
-    _v17_db(path)
-    conn = sqlite3.connect(path)
-    for sql, params in statements:
-        conn.execute(sql, params)
-    conn.commit()
-    conn.close()
-
-
 SCOUT_TRACES = {
     "web_marketing": ("INSERT INTO companies (id, name, domain, tech_stack_json) VALUES (?, ?, ?, ?)",
                       ("c2", "Exemplu Tech", "tech.example.com", '["HubSpot"]')),
@@ -633,37 +550,6 @@ SCOUT_TRACES = {
                ("c3", "Exemplu Hiring", "jobs.example.com",
                 '[{"type": "hiring", "detail": "Engineer", "found_at": "2026-01-01"}]')),
 }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("module_id", sorted(SCOUT_TRACES))
-async def test_an_upgrade_keeps_the_scout_parts_the_install_has_data_from(tmp_path, monkeypatch,
-                                                                          module_id):
-    """Scout's tech detection and careers scan ran with no switch before
-    modules existed. An install with data from one
-    keeps it on; one without (an install that only used OSM) takes the
-    default, off."""
-    monkeypatch.setattr(switches, "present_env_keys", lambda: set())
-    path = tmp_path / "old.db"
-    _v17_with(path, SCOUT_TRACES[module_id])
-    sm = StateManager(str(path))
-    await sm.init_db()
-    on = await switches.enabled_ids(sm)
-    assert module_id in on
-    assert not (set(SCOUT_TRACES) - {module_id}) & on
-
-
-@pytest.mark.asyncio
-async def test_an_upgrade_with_only_job_board_contacts_keeps_hiring(tmp_path, monkeypatch):
-    monkeypatch.setattr(switches, "present_env_keys", lambda: set())
-    path = tmp_path / "old.db"
-    _v17_with(path,
-              ("INSERT INTO companies (id, name, source) VALUES (?, ?, ?)", ("c1", "Exemplu", "osm")),
-              ("INSERT INTO prospects (id, first_name, last_name, company, source) "
-               "VALUES (?, ?, ?, ?, ?)", ("p1", "Ana", "Pop", "Exemplu", "job_board")))
-    sm = StateManager(str(path))
-    await sm.init_db()
-    assert "hiring" in await switches.enabled_ids(sm)
 
 
 def test_the_upgrade_rule_needs_one_key_not_every_alternative():
@@ -687,31 +573,6 @@ async def test_a_switch_saved_for_a_removed_module_is_ignored(state):
     assert await switches.enabled_ids(state) == before
     with pytest.raises(switches.SwitchRefused, match="no module 'linkedin'"):
         await switches.set_enabled(state, "linkedin", True)
-
-
-@pytest.mark.asyncio
-async def test_opening_an_old_database_reads_env_key_names_only(tmp_path, monkeypatch,
-                                                                keyed_module):
-    """A port Harvey can't parse in .env used to stop the database opening
-    (the upgrade loaded .env through config); and the upgrade wrote .env
-    into the process environment. Only names are read now."""
-    import os
-
-    import harvey.config as config
-
-    env = tmp_path / ".env"
-    env.write_text(f"SMTP_PORT=smtp\n{KEYED_SECRET}=fictional-key\n")
-    monkeypatch.setattr(switches, "ENV_FILE", env)
-    monkeypatch.setenv("SMTP_PORT", "smtp")
-    monkeypatch.delenv(KEYED_SECRET, raising=False)
-    monkeypatch.setattr(config, "load_env", lambda: pytest.fail("the upgrade loaded .env"))
-    path = tmp_path / "old.db"
-    _v17_db(path, companies=1)
-    sm = StateManager(str(path))
-    await sm.init_db()
-    assert (await _rows(sm, "PRAGMA user_version"))[0][0] == len(MIGRATIONS)
-    assert KEYED in await switches.enabled_ids(sm)
-    assert KEYED_SECRET not in os.environ
 
 
 # ── Packs in data/modules: a broken one is left out, never fatal ──
@@ -744,14 +605,9 @@ async def test_a_broken_pack_is_left_out_and_said_so(packs, tmp_path, monkeypatc
     problems = "\n".join(switches.pack_problems())
     assert "market_yy" in problems and "TECH_STACK is already declared" in problems
 
-    # An old database still opens and upgrades: the upgrade reads the
-    # shipped manifests only.
-    monkeypatch.setattr(switches, "present_env_keys", lambda: set())
-    path = tmp_path / "old.db"
-    _v17_db(path, companies=1)
-    sm = StateManager(str(path))
+    # A database still opens: its vocabulary is the shipped manifests'.
+    sm = StateManager(str(tmp_path / "harvey.db"))
     await sm.init_db()
-    assert (await _rows(sm, "PRAGMA user_version"))[0][0] == len(MIGRATIONS)
     assert await sync_vocabulary(sm) == len(CATALOG) + len(MODULE_ONLY)
 
 

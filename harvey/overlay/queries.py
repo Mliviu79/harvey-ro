@@ -131,7 +131,7 @@ statement("overlay.read.members",
           params=_IDS, drives="j")
 statement("overlay.read.locals",
           f"SELECT l.firm, l.name, l.county, l.locality, l.address, l.phone, l.industry, "
-          f"l.description, l.source_url, l.gone FROM {_J} CROSS JOIN local_firm l "
+          f"l.description, l.source_url, l.gone, l.country FROM {_J} CROSS JOIN local_firm l "
           "WHERE l.firm = j.value", params=_IDS, drives="j")
 # Every firm no register describes (a few hundred listings): place filters
 # match them in Python as schema 24's place line did.
@@ -166,8 +166,8 @@ statement("overlay.read.persons",
           "CROSS JOIN person p LEFT JOIN source s ON s.id = p.source WHERE p.id = j.value",
           params=_IDS, drives="j")
 statement("overlay.read.prospects_of",
-          f"SELECT p.firm, p.first_name, p.last_name, p.title, p.email, p.email_status, p.phone, "
-          f"p.score, p.status, p.created_at FROM {_J} CROSS JOIN prospects p WHERE p.firm = j.value",
+          f"SELECT p.company_id, p.first_name, p.last_name, p.title, p.email, p.email_status, p.phone, "
+          f"p.score, p.status, p.created_at FROM {_J} CROSS JOIN prospects p WHERE p.company_id = j.value",
           params=_IDS, drives="j")
 statement("overlay.read.searches_of",
           "SELECT s.id, s.is_person, s.target, m.name, c.name, s.looked_for, s.at, s.outcome, "
@@ -364,11 +364,12 @@ statement("overlay.read.searched_by",
           "AND s.target = j.value AND s.module = ? AND s.capability = ? AND s.at >= ? "
           "AND s.outcome != 0", params=("[1, 2]", 1, 1, 0), drives="j")
 statement("overlay.read.prospect_emails",
-          "SELECT p.firm, p.email, f.domain FROM prospects p LEFT JOIN firm f ON f.id = p.firm "
+          "SELECT p.company_id, p.email, f.domain FROM prospects p "
+          "LEFT JOIN firm f ON f.id = p.company_id "
           "WHERE p.email != '' AND COALESCE(p.email_status, '') != 'invalid' "
           "AND p.status IS NOT 'opted_out'")
 statement("overlay.read.prospect_phones",
-          "SELECT DISTINCT firm FROM prospects WHERE phone != ''")
+          "SELECT DISTINCT company_id FROM prospects WHERE phone != ''")
 statement("overlay.read.local_phones",
           "SELECT firm FROM local_firm WHERE phone IS NOT NULL AND phone != ''")
 statement("overlay.read.with_phone",
@@ -409,20 +410,26 @@ statement("overlay.read.obs_of_signal",
 # when a run last recorded a reading.
 statement("overlay.read.company_prospects",
           "SELECT p.* FROM (SELECT ? AS id UNION ALL SELECT id FROM firm WHERE live = ? "
-          "AND live != 0) g CROSS JOIN prospects p WHERE p.firm = g.id",
+          "AND live != 0) g CROSS JOIN prospects p WHERE p.company_id = g.id",
           params=(1, 1))
 statement("overlay.read.prospects_by_id",
           f"SELECT p.id, p.first_name, p.last_name, p.title, p.source, p.email_status, p.score, "
-          f"p.personalization_notes, p.firm FROM {_J} CROSS JOIN prospects p WHERE p.id = j.value",
+          f"p.personalization_notes, p.company_id AS firm FROM {_J} CROSS JOIN prospects p "
+          "WHERE p.id = j.value",
           params=('["p1"]',), drives="j")
 statement("overlay.read.run_last_at",
           "SELECT MAX(o.at) FROM batch b CROSS JOIN obs o WHERE b.ref = ? AND o.run = b.id",
           params=("run-1",), drives="b")
+statement("overlay.read.ranked",
+          "SELECT r.firm FROM signal s CROSS JOIN reading r WHERE s.code = ? AND r.signal = s.id "
+          "AND r.positive = 1 AND r.key = ?",
+          params=("SERP_RANK", "dentist"), drives="s",
+          scans={"reading": "a rank signal's positive readings: one per firm and phrase ranked"})
 statement("overlay.read.checked", "SELECT firm FROM firm_signal WHERE signal = ?", params=(1,))
 statement("overlay.read.tally_signal",
           "SELECT n_true, n_checked FROM signal_tally WHERE signal = ?", params=(1,))
 statement("overlay.read.register_tally_of",
-          "SELECT mark, loaded, n_true, n_false, at FROM register_tally "
+          "SELECT mark, loaded, n_true, n_false, at, n_values FROM register_tally "
           "WHERE signal = ? AND module = ?", params=(1, 1))
 statement("overlay.read.firm_rows",
           f"SELECT f.id, f.live, f.created, f.display_name, f.website, f.domain, "
@@ -471,10 +478,9 @@ statement("overlay.read.prospected_emails",
 statement("overlay.read.person_firms", "SELECT DISTINCT firm FROM person")
 statement("overlay.read.unkeyed",
           "SELECT f.id FROM firm f WHERE f.live = 0 AND NOT EXISTS (SELECT 1 FROM firm_ident fi "
-          "WHERE fi.firm IN (f.id, (SELECT m.id FROM firm m WHERE m.live = f.id AND m.live != 0)) "
-          "AND fi.scheme = ?)", params=(1,),
-          scans={"firm": "the firms with no key of a register's scheme (a few hundred): every "
-                         "firm probed once per kept set"})
+          "WHERE fi.firm = f.id AND fi.scheme = ?)", params=(1,),
+          scans={"firm": "the firms with no key of a register's scheme on their own record (a "
+                         "few hundred): every firm probed once per kept set"})
 # Live firms with no domain of their own whose merged record has one (the
 # domain is a key, kept on one record only): a few.
 statement("overlay.read.domain_by_member",
@@ -485,3 +491,76 @@ statement("overlay.read.marks",
           "SELECT (SELECT MAX(id) FROM firm), (SELECT MAX(id) FROM search), "
           "(SELECT MAX(id) FROM obs), (SELECT MAX(id) FROM person), "
           "(SELECT MAX(id) FROM contact), (SELECT MAX(id) FROM merge)")
+
+# The contact finder's reads of one company: which of these records (or
+# persons) a module's capability searched since a cutoff (a search that
+# looked for a word: its bit in looked_for), and each link's evidence with
+# its capability.
+statement("overlay.read.searched_targets",
+          f"SELECT DISTINCT s.target FROM {_J} CROSS JOIN search s WHERE s.is_person = ? "
+          "AND s.target = j.value AND s.module = ? AND s.capability = ? AND s.at >= ? "
+          "AND s.outcome != 0 AND (s.looked_for & ?) = ?",
+          params=("[1, 2]", 0, 1, 1, 0, 0, 0), drives="j")
+statement("overlay.read.evidence_caps",
+          f"SELECT e.contact, s.name, c.name FROM {_J} CROSS JOIN link_evidence e "
+          "CROSS JOIN source s LEFT JOIN capability c ON c.id = e.capability "
+          "WHERE e.firm = json_extract(j.value, '$[0]') AND e.contact = json_extract(j.value, '$[1]') "
+          "AND s.id = e.source", params=("[[1, 2]]",), drives="j")
+
+# Duplicates: the review list (a few hundred pairs at most), the merges in
+# force, and what a side shows (the keys Harvey found, its places).
+statement("overlay.read.candidates",
+          "SELECT a, b, score, reasons, status, at, decided_at FROM match_candidate "
+          "WHERE status = ? ORDER BY score DESC, at DESC LIMIT ?",
+          params=("pending", 100), bounded=True)
+statement("overlay.read.candidates_open",
+          "SELECT a, b, score, reasons, status FROM match_candidate "
+          "WHERE status IN ('pending', 'separate')")
+statement("overlay.read.candidates_all", "SELECT a, b, status FROM match_candidate")
+statement("overlay.read.merges",
+          "SELECT id, survivor, merged, score, reasons, decided_by, at, grp FROM merge "
+          "WHERE undone_at IS NULL ORDER BY id DESC LIMIT ?", params=(50,))
+statement("overlay.read.undone_between",
+          "SELECT 1 FROM merge WHERE undone_at IS NOT NULL AND ((survivor = ?1 AND merged = ?2) "
+          "OR (survivor = ?2 AND merged = ?1)) LIMIT 1", params=(1, 2))
+statement("overlay.read.keys_of",
+          f"SELECT k.firm, k.kind, k.value FROM {_J} CROSS JOIN firm_key k WHERE k.firm = j.value",
+          params=_IDS, drives="j")
+statement("overlay.read.places_count",
+          f"SELECT l.firm, COUNT(*) FROM {_J} CROSS JOIN locations l WHERE l.firm = j.value "
+          "GROUP BY l.firm", params=_IDS, drives="j", bounded=True)
+# Firms with a domain of their own (a few thousand: the site index's part
+# with a domain), and when a module's capability last searched each record.
+statement("overlay.read.with_domain_ids",
+          "SELECT id FROM firm INDEXED BY firm_with_site WHERE live = 0 "
+          "AND (website IS NOT NULL OR domain IS NOT NULL) AND domain IS NOT NULL",
+          scans={"firm": "the site index's firms (website or domain): ~11k of 1.8M"})
+statement("overlay.read.last_searched",
+          f"SELECT s.target, MAX(s.at) FROM {_J} CROSS JOIN search s WHERE s.is_person = 0 "
+          "AND s.target = j.value AND s.module = ? AND s.capability = ? GROUP BY s.target",
+          params=("[1, 2]", 1, 1), drives="j", bounded=True)
+# Every firm by its kept place in the directory register's name and place
+# orders (overlay/orders.py), a page at a time or walked whole (a set too
+# big to sort, filtered as it is read), and those positions by firm.
+for _col, _name in (("name_order", "name"), ("place_order", "place")):
+    statement(f"overlay.firms.by_{_name}",
+              f"SELECT id FROM firm WHERE live = 0 ORDER BY {_col} DESC, id DESC "
+              "LIMIT ? OFFSET ?", params=_PAGE)
+    statement(f"overlay.firms.by_{_name}.asc",
+              f"SELECT id FROM firm WHERE live = 0 ORDER BY {_col} ASC, id ASC "
+              "LIMIT ? OFFSET ?", params=_PAGE)
+    statement(f"overlay.read.walk_by_{_name}",
+              f"SELECT id FROM firm WHERE live = 0 ORDER BY {_col} DESC, id DESC",
+              scans={"firm": "a set of most firms in this order, read in it and filtered "
+                             "(no sort of a million rows)"})
+    statement(f"overlay.read.walk_by_{_name}.asc",
+              f"SELECT id FROM firm WHERE live = 0 ORDER BY {_col} ASC, id ASC",
+              scans={"firm": "a set of most firms in this order, read in it and filtered "
+                             "until the page is full"})
+statement("overlay.read.orders",
+          f"SELECT f.id, f.name_order, f.place_order FROM {_J} CROSS JOIN firm f "
+          "WHERE f.id = j.value", params=_IDS, drives="j")
+# (The Email module's prospects: thousands at most, every one, sorted.)
+statement("overlay.read.prospect_rows",
+          "SELECT * FROM prospects ORDER BY created_at DESC, rowid DESC", bounded=True,
+          scans={"prospects": "the Email module's prospects (thousands at most), every one"})

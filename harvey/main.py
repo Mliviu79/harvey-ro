@@ -288,6 +288,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             logger.warning(notice)
             logger.warning("=" * 60)
 
+    # Never on a database waiting for the upgrade: wait for it instead.
+    if not await state.wait_until_upgraded(stop_event):
+        return
     await state.init_db()
     logger.info("Database initialized.")
 

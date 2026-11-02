@@ -93,8 +93,11 @@ async def collect_prospects(
         db.row_factory = aiosqlite.Row
         async with db.execute(sql, params) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
-        async with db.execute("SELECT id, phone, location FROM companies") as cursor:
-            companies = {r["id"]: dict(r) for r in await cursor.fetchall()}
+    # The company is a firm, described by its record.
+    for r in rows:
+        r["company_id"] = "" if r.get("company_id") is None else str(r["company_id"])
+    firms = list(dict.fromkeys(r["company_id"] for r in rows if r["company_id"].isdigit()))
+    companies = {c["id"]: c for c in await state.read("company_rows", firms)} if firms else {}
 
     if not include_all:
         # A list for another sequencer is still contact: leave out anyone on
@@ -133,9 +136,6 @@ async def collect_prospects(
 # and, if picked anyway, is exported without its address.
 _EMAIL_STATUS_RANK = {"verified": 0, "risky": 1, "guess": 2}
 
-_ID_CHUNK = 900
-
-
 async def collect_companies(state: StateManager, config=None,
                             ids: list[str] | None = None) -> list[dict]:
     """One export-ready dict per company, with its best contact if any.
@@ -145,60 +145,7 @@ async def collect_companies(state: StateManager, config=None,
     compliance.do_not_contact is left out, and an opted-out prospect or an
     address on that list is never the contact shown.
     """
-    import aiosqlite
-
-    # With ids, only those rows are read (in chunks, under SQLite's
-    # variable limit): a one-company export doesn't load the whole database.
-    chunks = [None] if ids is None else [
-        ids[i:i + _ID_CHUNK] for i in range(0, len(ids), _ID_CHUNK)]
-    companies: list[dict] = []
-    prospects: list[dict] = []
-    site_phones: dict[str, list[str]] = {}
-    phone_rows: list = []
-    if await state.is_overlay():
-        companies, prospects, site_phones = await _overlay_rows(state, ids)
-        chunks = []
-    async with aiosqlite.connect(state.db_path) as db:
-        db.row_factory = aiosqlite.Row
-        for chunk in chunks:
-            if chunk is not None and not chunk:
-                continue
-            only, params = "", ()
-            if chunk is not None:
-                only, params = f" IN ({','.join('?' for _ in chunk)})", tuple(chunk)
-            async with db.execute(
-                # A merged company's facts are its survivor's: exported once.
-                "SELECT * FROM companies WHERE COALESCE(merged_into, '') = ''"
-                + (f" AND id{only}" if only else "")
-                + " ORDER BY name COLLATE NOCASE, created_at", params,
-            ) as cursor:
-                companies += [dict(r) for r in await cursor.fetchall()]
-            async with db.execute(
-                "SELECT * FROM prospects WHERE company_id != '' AND status IS NOT ?"
-                + (f" AND company_id{only}" if only else ""),
-                ("opted_out", *params),
-            ) as cursor:
-                prospects += [dict(r) for r in await cursor.fetchall()]
-            async with db.execute(
-                "SELECT company_id, value_text FROM observations "
-                "WHERE signal_code = 'PHONE_NUMBER' AND value_text != ''"
-                + (f" AND company_id{only}" if only else "")
-                + " ORDER BY observed_at, rowid", params,
-            ) as cursor:
-                phone_rows += list(await cursor.fetchall())
-            # Every number any source gave (a listing's, a merged record's).
-            async with db.execute(
-                "SELECT company_id, value AS value_text FROM company_ids WHERE kind = 'phone'"
-                + (f" AND company_id{only}" if only else "")
-                + " ORDER BY created_at, rowid", params,
-            ) as cursor:
-                phone_rows += list(await cursor.fetchall())
-    if len(chunks) > 1:
-        companies.sort(key=lambda c: ((c.get("name") or "").casefold(), c.get("created_at") or ""))
-    for r in phone_rows:
-        numbers = site_phones.setdefault(r["company_id"], [])
-        if r["value_text"] not in numbers:
-            numbers.append(r["value_text"])
+    companies, prospects, site_phones = await _overlay_rows(state, ids)
 
     entries = _do_not_contact(config)
     by_company: dict[str, list[dict]] = {}
@@ -398,26 +345,9 @@ async def source_notes(state: StateManager, ids: list[str]) -> list[str]:
     """The credit each source whose data these companies carry asks for
     (a manifest's ``attribution``): an open dataset's licence travels with
     every export of it."""
-    import aiosqlite
-
     from harvey.modules import switches
 
-    found: set[str] = set()
-    if await state.is_overlay():
-        found = set(await state.read("modules_of", ids))
-        return [m.attribution for m in switches.manifests() if m.id in found and m.attribution]
-    async with aiosqlite.connect(state.db_path) as db:
-        for i in range(0, len(ids), _ID_CHUNK):
-            chunk = ids[i:i + _ID_CHUNK]
-            marks = ",".join("?" * len(chunk))
-            async with db.execute(
-                    f"SELECT DISTINCT module FROM observations WHERE company_id IN ({marks}) "
-                    "AND COALESCE(module, '') != ''", chunk) as cursor:
-                found |= {r[0] for r in await cursor.fetchall()}
-            async with db.execute(
-                    f"SELECT DISTINCT source FROM companies WHERE id IN ({marks}) "
-                    "AND source LIKE 'registry:%'", chunk) as cursor:
-                found |= {r[0].split(":", 1)[1] for r in await cursor.fetchall()}
+    found = set(await state.read("modules_of", ids))
     return [m.attribution for m in switches.manifests() if m.id in found and m.attribution]
 
 
@@ -437,29 +367,10 @@ async def latest_year_figures(state: StateManager, ids: list[str],
     (within a year, the one written last). A figure missing that year is
     left out rather than taken from another year, so a row never puts one
     year's turnover beside another year's headcount."""
-    import aiosqlite
-
     codes = tuple(codes)
-    years: dict[str, dict[str, dict[str, float]]] = {}
     if not codes:
         return {}
-    if await state.is_overlay():
-        return await state.read("year_figures", list(ids), list(codes))
-    async with aiosqlite.connect(state.db_path) as db:
-        for i in range(0, len(ids), _ID_CHUNK):
-            chunk = ids[i:i + _ID_CHUNK]
-            marks = ",".join("?" * len(chunk))
-            async with db.execute(
-                    f"SELECT company_id, signal_code, value_num, value_text FROM observations "
-                    f"WHERE company_id IN ({marks}) "
-                    f"AND signal_code IN ({','.join('?' * len(codes))}) "
-                    "AND value_num IS NOT NULL ORDER BY observed_at, rowid",
-                    [*chunk, *codes]) as cursor:
-                for company_id, code, value, year in await cursor.fetchall():
-                    if str(year or "").isdigit():
-                        years.setdefault(company_id, {}).setdefault(year, {})[code] = value
-    return {cid: (max(by_year, key=int), by_year[max(by_year, key=int)])
-            for cid, by_year in years.items()}
+    return await state.read("year_figures", list(ids), list(codes))
 
 
 async def export_companies_csv(

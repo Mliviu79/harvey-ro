@@ -942,11 +942,13 @@ async function loadOverview() {
       '<div class="stat-note">' + escHtml(note) + '</div>' +
     '</div>';
   statsEl.innerHTML = '<div class="stat-strip">' +
-    tile(t('ov.companies'), total, t('ov.companies_note', {n: ov.with_activity || 0}), null, 'companies') +
+    // Right after the upgrade or a register load, the register's counts
+    // wait for their job: say so rather than show 0.
+    tile(t('ov.companies'), total, ov.counting && ov.with_activity == null ? t('ov.counting') : t('ov.companies_note', {n: ov.with_activity || 0}), null, 'companies') +
     tile(t('ov.with_phone'), ov.with_phone || 0, t('ov.share', {p: pct(ov.with_phone || 0)}), bar(ov.with_phone || 0), 'phone') +
     tile(t('ov.with_email'), ov.with_email || 0, t('ov.share', {p: pct(ov.with_email || 0)}), bar(ov.with_email || 0), 'mail') +
     tile(t('ov.contacts'), ov.contacts || 0, t('ov.contacts_note'), null, 'contacts') +
-    tile(t('ov.people'), ov.people || 0, t('ov.people_note'), null, 'layers') +
+    tile(t('ov.people'), ov.people || 0, ov.counting ? t('ov.people_counting') : t('ov.people_note'), null, 'layers') +
   '</div>';
 
   renderOverviewSending(ov.sending);
@@ -5597,7 +5599,7 @@ function jobRow(j, buttons) {
 // A lane is a module's (or the contact search's): its name in the viewer's
 // language when the page knows it, else the module's own.
 function laneName(l) {
-  return own({contacts: 1}, l.lane) ? tServer('q.lane.' + l.lane, l.name)
+  return own({contacts: 1, counts: 1}, l.lane) ? tServer('q.lane.' + l.lane, l.name)
                                     : tServer('module.' + l.lane + '.name', l.name);
 }
 
@@ -5684,11 +5686,160 @@ async function loadQueueCount() {
 
 // ── Init & live refresh ──
 
+// ── Database upgrade: shown instead of the pages while harvey.db is the old schema ──
+//
+// /api/upgrade says whether harvey.db needs the upgrade, whether one is
+// running, each stage and the verification. Every other API call answers
+// 409 until the switch, so no page is drawn under this screen.
+
+let _upgrade = null, _upgradeTimer = null, _upgradeShown = false;
+
+function gb(n) { return fmtN(Math.round((n || 0) / 1e8) / 10) + ' GB'; }
+
+async function checkUpgrade() {
+  const s = await api('/api/upgrade');
+  if (!s) return false;
+  _upgrade = s;
+  renderOldFiles(s);
+  if (s.needed || s.running || (_upgradeShown && s.switched)) {
+    showUpgrade(s);
+    return true;
+  }
+  return false;
+}
+
+function showUpgrade(s) {
+  _upgradeShown = true;
+  const el = document.getElementById('upgrade-screen');
+  if (!el) return;
+  el.style.display = 'flex';
+  document.getElementById('upgrade-body').innerHTML = upgradeHtml(s);
+  clearTimeout(_upgradeTimer);
+  if (s.running || s.needed) _upgradeTimer = setTimeout(checkUpgrade, s.running ? 2000 : 15000);
+}
+
+function upgradeStage(st) {
+  const p = st.progress || {};
+  let extra = '';
+  if (st.state === 'running') {
+    if (p.step) extra = t('upgrade.step', {step: escHtml(p.step), at: p.at || '?', of: p.of || '?'});
+    else if (p.section) extra = t('upgrade.section', {section: escHtml(p.section), at: p.at, of: p.of});
+    else if (p.rows) extra = t('upgrade.rows', {n: p.rows});
+  } else if (st.seconds) {
+    extra = t('upgrade.took', {n: Math.max(1, Math.round(st.seconds))});
+  }
+  return '<li class="upgrade-stage ' + escHtml(st.state || 'todo') + '"><span>' +
+    escHtml(t('upgrade.stage.' + st.id)) + '</span><span class="soft">' +
+    escHtml(t('upgrade.state.' + (st.state || 'todo'))) + (extra ? ' · ' + extra : '') +
+    '</span></li>';
+}
+
+// A verification count's name in the page's language (the server's own
+// name when this release has no translation of it).
+function upgradeCountLabel(k) {
+  const label = t('upgrade.count.' + k);
+  return label === 'upgrade.count.' + k ? k : label;
+}
+
+function upgradeVerification(v) {
+  if (!v) return '';
+  let h = '<h3>' + escHtml(v.passed ? t('upgrade.verified') : t('upgrade.not_verified')) + '</h3>';
+  const rows = Object.entries(v.counts || {});
+  if (rows.length) {
+    h += '<table class="data compact"><thead><tr><th></th><th>' + escHtml(t('upgrade.old')) +
+      '</th><th>' + escHtml(t('upgrade.new')) + '</th></tr></thead><tbody>' +
+      rows.map(([k, r]) => '<tr><td>' + escHtml(upgradeCountLabel(k)) + '</td><td>' + fmtN(r.old ?? 0) +
+        '</td><td>' + fmtN(r.new ?? 0) + '</td></tr>').join('') + '</tbody></table>';
+  }
+  const parts = ['stored', 'registers', 'filters'].filter(k => v[k]);
+  if (parts.length) {
+    h += '<p class="soft">' + parts.map(k => escHtml(t('upgrade.checks.' + k,
+      {passed: v[k].passed, n: v[k].checked}))).join(' · ') + '</p>';
+  }
+  if (v.failures && v.failures.length) {
+    h += '<ul class="soft">' + v.failures.slice(0, 20).map(f => '<li>' + escHtml(f) + '</li>').join('') + '</ul>';
+  }
+  return h;
+}
+
+function upgradeHtml(s) {
+  const e = s.estimate || {}, sizes = e.sizes || {};
+  let h = '<h2>' + escHtml(t('upgrade.title')) + '</h2>';
+  if (s.switched && !s.needed) {
+    h += '<p class="lede">' + escHtml(t('upgrade.done')) + '</p>' + upgradeVerification(s.verification);
+    h += '<button class="btn btn-primary" onclick="location.reload()">' + escHtml(t('upgrade.open')) + '</button>';
+    return h;
+  }
+  if (s.switch_pending) h += '<p class="banner wait">' + escHtml(t('upgrade.switch_pending')) + '</p>';
+  h += '<p class="lede">' + t('upgrade.what') + '</p>';
+  h += '<p class="lede">' + t('upgrade.steps') + '</p>';
+  if (e.sizes) {
+    h += '<table class="data compact"><tbody>' +
+      '<tr><td>' + escHtml(t('upgrade.sizes')) + '</td><td>harvey.db ' + gb(sizes.harvey) +
+      (sizes.anaf ? ', anaf.db ' + gb(sizes.anaf) : '') + '</td></tr>' +
+      '<tr><td>' + escHtml(t('upgrade.time')) + '</td><td>' +
+      escHtml(t('upgrade.minutes', {n: Math.max(1, Math.round((e.seconds || 0) / 60))})) + '</td></tr>' +
+      '<tr><td>' + escHtml(t('upgrade.need')) + '</td><td>' +
+      escHtml(t('upgrade.need_value', {need: gb(e.need_bytes), floor: gb(e.floor_bytes)})) + '</td></tr>' +
+      '<tr><td>' + escHtml(t('upgrade.free')) + '</td><td>' +
+      (e.free_bytes != null ? gb(e.free_bytes) : escHtml(t('upgrade.free_unknown'))) + '</td></tr>' +
+      '</tbody></table>';
+  }
+  if (e.free_error) h += '<p class="banner wait">' + t('upgrade.free_error') + '</p>';
+  else if (e.free_bytes != null && e.free_bytes < e.floor_bytes) {
+    h += '<p class="banner wait">' + escHtml(t('upgrade.too_little', {floor: gb(e.floor_bytes)})) + '</p>';
+  }
+  const started = s.stages.some(st => st.state && st.state !== 'todo');
+  if (started || s.running) h += '<ol class="upgrade-stages">' + s.stages.map(upgradeStage).join('') + '</ol>';
+  if (s.error && !s.running) h += '<p class="banner wait">' + escHtml(t('upgrade.stopped', {why: s.error})) + '</p>';
+  h += upgradeVerification(s.verification);
+  if (s.running) {
+    h += '<p class="soft">' + escHtml(t('upgrade.running')) + '</p>';
+  } else {
+    const blocked = !s.switch_pending && (!!e.free_error || (e.free_bytes != null && e.free_bytes < e.floor_bytes));
+    h += '<button class="btn btn-primary" id="upgrade-start" onclick="startUpgrade()"' +
+      (blocked ? ' disabled' : '') + '>' + escHtml(t(started ? 'upgrade.resume' : 'upgrade.start')) + '</button>';
+  }
+  return h;
+}
+
+async function startUpgrade() {
+  const btn = document.getElementById('upgrade-start');
+  if (btn) btn.disabled = true;
+  const r = await api('/api/upgrade/start', {method: 'POST'});
+  if (r && r.success === false) showToast(r.message || r.detail || t('upgrade.not_started'), 'error');
+  setTimeout(checkUpgrade, 800);
+}
+
+function renderOldFiles(s) {
+  const el = document.getElementById('old-files-note');
+  if (!el) return;
+  const files = (s && !s.needed && s.old_files) || [];
+  if (!files.length) { el.hidden = true; return; }
+  const total = files.reduce((a, f) => a + f.bytes, 0);
+  el.hidden = false;
+  el.innerHTML = '<span>' + escHtml(t('upgrade.old_files', {names: files.map(f => f.name).join(', '), size: gb(total)})) +
+    '</span> <button class="btn btn-sm" onclick="deleteOldFiles()">' + escHtml(t('upgrade.delete')) + '</button>';
+}
+
+async function deleteOldFiles() {
+  const word = t('upgrade.delete_word');
+  const typed = prompt(t('upgrade.delete_prompt', {word: word}));
+  if (typed == null) return;
+  if (typed.trim().toLowerCase() !== word) { showToast(t('upgrade.delete_mismatch', {word: word}), 'error'); return; }
+  const r = await api('/api/upgrade/delete-old', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({confirm: typed.trim().toLowerCase()})});
+  if (r && r.success !== false) showToast(t('upgrade.deleted', {size: gb(r.freed)}), 'success');
+  else showToast((r && (r.message || r.detail)) || t('upgrade.not_deleted'), 'error');
+  checkUpgrade();
+}
+
 async function init() {
   applyI18n();
   switchLangButtons();
   applyTheme(currentTheme());
   _co.limit = _ct.limit = loadPageSize();
+  if (await checkUpgrade()) return;
   await loadModules();
   let tab = 'overview';
   try { tab = sessionStorage.getItem('harvey-tab') || 'overview'; } catch { /* ignore */ }
@@ -5707,25 +5858,26 @@ function switchLangButtons() {
 
 init();
 
-// Agent status: quick poll (not while locked: it would only be refused)
-setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
+// Agent status: quick poll (not while locked, nor under the upgrade screen:
+// it would only be refused)
+setInterval(() => { if (!_locked && !_upgradeShown) loadHarveyStatus(); }, 8000);
 
 // The Queue badge (running + waiting) stays live from any tab; the Queue
 // page itself refreshes faster while it is open.
 setInterval(() => {
-  if (document.hidden || _locked) return;
+  if (document.hidden || _locked || _upgradeShown) return;
   if (currentTab === 'queue') loadQueue(); else loadQueueCount();
 }, 5000);
 
 // Live status panel: refreshed while the Today tab is open and visible.
 setInterval(() => {
-  if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
+  if (!document.hidden && !_locked && !_upgradeShown && currentTab === 'today') loadLiveStatus();
 }, 10000);
 
 // Email-module nav counts stay live wherever you are, so "something needs
 // me" is visible from any tab without polling that tab's contents.
 setInterval(async () => {
-  if (document.hidden || _locked || !_modules.email || currentTab === 'today') return;
+  if (document.hidden || _locked || _upgradeShown || !_modules.email || currentTab === 'today') return;
   const data = await api('/api/today');
   if (!data) return;
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
@@ -5736,7 +5888,7 @@ setInterval(async () => {
 // Outbox, settings and help are deliberately excluded — re-rendering the desk
 // under someone mid-decision loses their place, and settings may be mid-edit.
 setInterval(() => {
-  if (document.hidden || _locked || document.querySelector('.menu.open')) return;
+  if (document.hidden || _locked || _upgradeShown || document.querySelector('.menu.open')) return;
   switch (currentTab) {
     case 'overview': loadOverview(); break;
     case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;

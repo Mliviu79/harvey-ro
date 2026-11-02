@@ -12,8 +12,10 @@ upgrade cleanly in place.
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -168,15 +170,18 @@ def _email_domain(alias: str) -> str:
 
 
 def _colleagues(p: str, c: str) -> str:
-    """SQL: prospect ``c`` works with prospect ``p``. The same company; or,
-    when either has no company, the same email domain, never a shared one
-    and never one that isn't the known side's own company domain."""
+    """SQL: prospect ``c`` works with prospect ``p``. The same company (a
+    merged record's prospects are its survivor's); or, when either has no
+    company, the same email domain, never a shared one and never one that
+    isn't the known side's own company domain."""
     domain = _email_domain(p)
     free = ", ".join(f"'{d}'" for d in sorted(FREE_MAIL_DOMAINS))
-    own = ("(SELECT lower(co.domain) FROM companies co WHERE co.id = {x}.company_id)")
+    own = "(SELECT lower(co.domain) FROM firm co WHERE co.id = {x}.company_id)"
+    live = ("(SELECT CASE f.live WHEN 0 THEN f.id ELSE f.live END FROM firm f "
+            "WHERE f.id = {x}.company_id)")
     return (
         f"{c}.id != {p}.id AND ("
-        f"({p}.company_id != '' AND {c}.company_id = {p}.company_id) OR "
+        f"({p}.company_id != '' AND {live.format(x=c)} = {live.format(x=p)}) OR "
         f"(({p}.company_id = '' OR {c}.company_id = '') "
         f"AND instr({p}.email, '@') > 0 AND {domain} != '' AND {domain} NOT IN ({free}) "
         f"AND {_email_domain(c)} = {domain} "
@@ -282,1208 +287,15 @@ def _activity_matches(activity: dict, words: list[str]) -> bool:
 # released migrations — append new ones.
 
 
-# ── v21: contacts, people, places and sources (harvey/contacts.py) ──
-# Built from parts: a person's name_norm is the same expression everywhere.
-_PROSPECT_NAME = "TRIM(COALESCE(NEW.first_name, '') || ' ' || COALESCE(NEW.last_name, ''))"
-# The trade registry writes the family name first ("POPESCU ION"): a
-# prospect made from such a person is the same person, not a new one.
-_PROSPECT_NAME_REVERSED = ("TRIM(COALESCE(NEW.last_name, '') || ' ' || "
-                           "COALESCE(NEW.first_name, ''))")
-_EMAIL_STATUS = ("CASE WHEN {s} IN ('verified', 'risky', 'guess', 'invalid') "
-                 "THEN {s} ELSE 'unchecked' END")
-# A prospect becomes an email contact of its company, through its person
-# when it has a name. (The prospect triggers below, run for every insert
-# and every change of address, status or opt-out.)
-_PROSPECT_LINK = f"""
-        INSERT INTO people (company_id, name, name_norm, role, source, origin_company_id)
-        SELECT NEW.company_id, {_PROSPECT_NAME}, {contacts.sql_name_norm(_PROSPECT_NAME)},
-               COALESCE(NEW.title, ''), COALESCE(NEW.source, ''), NEW.company_id
-        WHERE COALESCE(NEW.company_id, '') != '' AND {contacts.sql_name_norm(_PROSPECT_NAME)} != ''
-          AND NOT EXISTS (SELECT 1 FROM people pr WHERE pr.company_id = NEW.company_id
-                          AND pr.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME_REVERSED)})
-        ON CONFLICT(company_id, name_norm) DO UPDATE SET last_seen = CURRENT_TIMESTAMP;
-        INSERT INTO company_contacts (company_id, contact_id, person_id, source, evidence_url,
-                                      trust, origin_company_id)
-        SELECT NEW.company_id, ct.id,
-               COALESCE((SELECT pe.id FROM people pe WHERE pe.company_id = NEW.company_id
-                         AND pe.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME)}
-                         AND pe.name_norm != ''),
-                        (SELECT pe.id FROM people pe WHERE pe.company_id = NEW.company_id
-                         AND pe.name_norm = {contacts.sql_name_norm(_PROSPECT_NAME_REVERSED)}
-                         AND pe.name_norm != ''), 0),
-               COALESCE(NEW.source, ''), COALESCE(NEW.source_url, ''),
-               CASE WHEN substr(NEW.email, instr(NEW.email, '@') + 1) =
-                         (SELECT c.domain FROM companies c WHERE c.id = NEW.company_id
-                          AND c.domain != '') THEN 'confirmed' ELSE 'likely' END,
-               NEW.company_id
-        FROM contacts ct
-        WHERE ct.kind = 'email' AND ct.value = NEW.email AND COALESCE(NEW.company_id, '') != ''
-        ON CONFLICT(company_id, contact_id, person_id, source) DO UPDATE SET last_seen = CURRENT_TIMESTAMP;"""
-_P_NAME = "TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))"
-_P_ORIGIN = ("COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'prospects' "
-             "AND mv.key1 = p.id), p.company_id)")
-
-_V21_CONTACTS = f"""
-    -- The kinds of contact, declared by modules ([[contact_kinds]] in their
-    -- manifests, synced by signals.sync_vocabulary). A contact's kind must
-    -- be one of them (trigger below): an open vocabulary, not a fixed list.
-    CREATE TABLE IF NOT EXISTS contact_kinds (
-        kind TEXT PRIMARY KEY,
-        label TEXT DEFAULT '',
-        channel TEXT DEFAULT '',
-        module TEXT DEFAULT '',
-        available INTEGER DEFAULT 1
-    );
-    INSERT OR IGNORE INTO contact_kinds (kind, label, channel, module) VALUES
-        ('email', 'Email', 'email', 'website'),
-        ('phone', 'Phone', 'phone', 'phones'),
-        ('contact_form', 'Contact form', 'web', 'website'),
-        ('linkedin', 'LinkedIn', 'social', 'website');
-
-    -- One row per distinct contact: an email lowercased, a phone in E.164
-    -- (line_type from the numbering plan: an SMS audience is the mobiles),
-    -- a URL. status: an email's verified | risky | guess | invalid |
-    -- unchecked, a phone's valid | invalid. Integer ids: there are millions
-    -- of rows between these tables.
-    CREATE TABLE IF NOT EXISTS contacts (
-        id INTEGER PRIMARY KEY,
-        kind TEXT NOT NULL,
-        value TEXT NOT NULL,
-        display TEXT DEFAULT '',
-        line_type TEXT DEFAULT '',
-        status TEXT DEFAULT '',
-        do_not_contact INTEGER DEFAULT 0,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (kind, value)
-    );
-    CREATE INDEX IF NOT EXISTS idx_contacts_kind ON contacts(kind, line_type, status);
-    CREATE INDEX IF NOT EXISTS idx_contacts_first_seen ON contacts(first_seen);
-    CREATE TRIGGER IF NOT EXISTS trg_contacts_kind_known
-    BEFORE INSERT ON contacts
-    FOR EACH ROW
-    WHEN NEW.kind NOT IN (SELECT kind FROM contact_kinds)
-    BEGIN
-        SELECT RAISE(ABORT, 'unknown contact kind: not in contact_kinds');
-    END;
-
-    -- Someone named at a company (a registry's administrator, a team
-    -- page's member): searched for an email or phone of their own.
-    CREATE TABLE IF NOT EXISTS people (
-        id INTEGER PRIMARY KEY,
-        company_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        name_norm TEXT NOT NULL,
-        role TEXT DEFAULT '',
-        source TEXT DEFAULT '',
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        origin_company_id TEXT DEFAULT '',
-        UNIQUE (company_id, name_norm)
-    );
-    CREATE INDEX IF NOT EXISTS idx_people_first_seen ON people(first_seen);
-
-    -- A company's places: a branch keeps its own address and phone.
-    CREATE TABLE IF NOT EXISTS locations (
-        id INTEGER PRIMARY KEY,
-        company_id TEXT NOT NULL,
-        name TEXT DEFAULT '',
-        address TEXT DEFAULT '',
-        locality TEXT DEFAULT '',
-        county TEXT DEFAULT '',
-        country TEXT DEFAULT '',
-        point TEXT DEFAULT '',
-        external_id TEXT DEFAULT '',
-        phone TEXT DEFAULT '',
-        source TEXT DEFAULT '',
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        origin_company_id TEXT DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS idx_locations_company ON locations(company_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_listing
-        ON locations(company_id, external_id) WHERE external_id != '';
-
-    -- Which companies a contact reaches: many to many (a chain's units can
-    -- share one phone). One link per source that gave it: a phone a site
-    -- published and ANAF confirmed is two links, each with its own source
-    -- and evidence. person_id and location_id are 0 for none, so the
-    -- unique key holds for a link without a person (NULLs never collide).
-    CREATE TABLE IF NOT EXISTS company_contacts (
-        id INTEGER PRIMARY KEY,
-        company_id TEXT NOT NULL,
-        contact_id INTEGER NOT NULL,
-        person_id INTEGER NOT NULL DEFAULT 0,
-        location_id INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL DEFAULT '',
-        capability TEXT DEFAULT '',
-        evidence_url TEXT DEFAULT '',
-        trust TEXT DEFAULT 'unconfirmed',
-        confidence REAL DEFAULT 1.0,
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        origin_company_id TEXT DEFAULT '',
-        UNIQUE (company_id, contact_id, person_id, source)
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_contacts_contact ON company_contacts(contact_id);
-    CREATE INDEX IF NOT EXISTS idx_company_contacts_person ON company_contacts(person_id)
-        WHERE person_id != 0;
-    CREATE INDEX IF NOT EXISTS idx_company_contacts_source ON company_contacts(source);
-
-    -- Every source a company was found in. companies.source stays the first.
-    CREATE TABLE IF NOT EXISTS company_sources (
-        company_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        ref TEXT NOT NULL DEFAULT '',
-        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        origin_company_id TEXT DEFAULT '',
-        PRIMARY KEY (company_id, source, ref)
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_sources_source ON company_sources(source);
-
-    -- Where each record was already searched: one row per search, so a
-    -- record searched by one module's capability isn't searched by it again
-    -- (unless forced, or older than the capability's refresh_days), and is
-    -- still searched by any other. target_id is a company's id or a
-    -- person's (as text). looked_for: website, people, email, phone (comma
-    -- separated). outcome: found | nothing | error (an error isn't a search
-    -- done: it is tried again).
-    CREATE TABLE IF NOT EXISTS searches (
-        id INTEGER PRIMARY KEY,
-        target TEXT NOT NULL,
-        target_id TEXT NOT NULL,
-        module TEXT NOT NULL,
-        capability TEXT NOT NULL DEFAULT '',
-        looked_for TEXT DEFAULT '',
-        searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        outcome TEXT DEFAULT '',
-        found INTEGER DEFAULT 0,
-        cost REAL DEFAULT 0,
-        batch_id TEXT DEFAULT '',
-        detail TEXT DEFAULT '',
-        origin_company_id TEXT DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS idx_searches_target
-        ON searches(target, target_id, module, capability, searched_at);
-
-    -- Backfill from what is on file. A row a past merge moved keeps the
-    -- company it was found for, so undoing that merge still sends it back.
-    CREATE TEMP TABLE v21_moved AS
-        SELECT mm.tbl, mm.key1, mm.key2, m.survivor, m.merged
-        FROM company_merge_moves mm JOIN company_merges m ON m.id = mm.merge_id
-        WHERE m.undone_at IS NULL
-          AND (mm.tbl = 'prospects' OR (mm.tbl = 'company_ids' AND mm.key1 IN ('phone', 'external')));
-    CREATE INDEX temp.v21_moved_ids ON v21_moved(tbl, key1, key2, survivor);
-
-    -- People: each CONTACT_FOUND ("Ana Pop — administrator"), once per company.
-    INSERT OR IGNORE INTO people (company_id, name, name_norm, role, source, first_seen,
-                                  last_seen, origin_company_id)
-    SELECT company_id, name, norm, role, src, MIN(seen), MAX(seen), origin FROM (
-        SELECT company_id, name, {contacts.sql_name_norm("name")} AS norm, role, src, seen, origin
-        FROM (
-            SELECT o.company_id,
-                   TRIM(CASE WHEN instr(o.value_text, ' — ') > 0
-                             THEN substr(o.value_text, 1, instr(o.value_text, ' — ') - 1)
-                             ELSE o.value_text END) AS name,
-                   CASE WHEN instr(o.value_text, ' — ') > 0
-                        THEN TRIM(substr(o.value_text, instr(o.value_text, ' — ') + 3))
-                        ELSE '' END AS role,
-                   COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')) AS src,
-                   o.observed_at AS seen,
-                   COALESCE(NULLIF(o.origin_company_id, ''), o.company_id) AS origin
-            FROM observations o
-            WHERE o.signal_code = 'CONTACT_FOUND' AND COALESCE(o.company_id, '') != ''
-              AND COALESCE(o.value_text, '') != ''))
-    WHERE norm != '' GROUP BY company_id, norm;
-
-    -- Phones: every PHONE_NUMBER and every phone key (a listing's, the
-    -- company's own column). Display and line type follow in Python.
-    INSERT OR IGNORE INTO contacts (kind, value, status, first_seen, last_seen)
-    SELECT 'phone', value, 'valid', MIN(seen), MAX(seen) FROM (
-        SELECT value_text AS value, observed_at AS seen FROM observations
-        WHERE signal_code = 'PHONE_NUMBER' AND COALESCE(company_id, '') != ''
-          AND value_text LIKE '+%'
-        UNION ALL
-        SELECT value, created_at FROM company_ids WHERE kind = 'phone')
-    GROUP BY value;
-    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, capability,
-        evidence_url, trust, confidence, first_seen, last_seen, origin_company_id)
-    SELECT o.company_id, ct.id, COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')),
-           COALESCE(o.capability, ''), COALESCE(o.evidence_url, ''),
-           CASE WHEN MAX(COALESCE(o.confidence, 1.0)) >= 0.9 THEN 'confirmed'
-                WHEN MAX(COALESCE(o.confidence, 1.0)) >= 0.6 THEN 'likely'
-                ELSE 'unconfirmed' END,
-           MAX(COALESCE(o.confidence, 1.0)), MIN(o.observed_at), MAX(o.observed_at),
-           COALESCE(NULLIF(o.origin_company_id, ''), o.company_id)
-    FROM observations o JOIN contacts ct ON ct.kind = 'phone' AND ct.value = o.value_text
-    WHERE o.signal_code = 'PHONE_NUMBER' AND COALESCE(o.company_id, '') != ''
-      AND o.value_text LIKE '+%'
-    GROUP BY o.company_id, ct.id, 3;
-    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, trust, confidence,
-        first_seen, last_seen, origin_company_id)
-    SELECT i.company_id, ct.id, COALESCE(i.source, ''), 'confirmed', COALESCE(i.confidence, 1.0),
-           i.created_at, i.created_at,
-           COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'company_ids'
-                     AND mv.key1 = 'phone' AND mv.key2 = i.value AND mv.survivor = i.company_id),
-                    i.company_id)
-    FROM company_ids i JOIN contacts ct ON ct.kind = 'phone' AND ct.value = i.value
-    WHERE i.kind = 'phone';
-
-    -- Contact forms a site has.
-    INSERT OR IGNORE INTO contacts (kind, value, display, first_seen, last_seen)
-    SELECT 'contact_form', TRIM(value_text), TRIM(value_text), MIN(observed_at), MAX(observed_at)
-    FROM observations
-    WHERE signal_code = 'CONTACT_FORM_URL' AND COALESCE(company_id, '') != ''
-      AND TRIM(COALESCE(value_text, '')) != ''
-    GROUP BY TRIM(value_text);
-    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, source, capability,
-        evidence_url, trust, confidence, first_seen, last_seen, origin_company_id)
-    SELECT o.company_id, ct.id, COALESCE(NULLIF(o.module, ''), COALESCE(o.collector, '')),
-           COALESCE(o.capability, ''), COALESCE(o.evidence_url, ''), 'confirmed',
-           MAX(COALESCE(o.confidence, 1.0)), MIN(o.observed_at), MAX(o.observed_at),
-           COALESCE(NULLIF(o.origin_company_id, ''), o.company_id)
-    FROM observations o
-    JOIN contacts ct ON ct.kind = 'contact_form' AND ct.value = TRIM(o.value_text)
-    WHERE o.signal_code = 'CONTACT_FORM_URL' AND COALESCE(o.company_id, '') != ''
-    GROUP BY o.company_id, ct.id, 3;
-
-    -- Emails (and LinkedIn addresses) of the prospects, through their person.
-    -- An opted-out address is do-not-contact.
-    INSERT OR IGNORE INTO contacts (kind, value, display, status, do_not_contact, first_seen,
-                                    last_seen)
-    SELECT 'email', email, email, {_EMAIL_STATUS.format(s="MAX(email_status)")},
-           MAX(status = 'opted_out'), MIN(created_at), MAX(updated_at)
-    FROM prospects WHERE email != '' AND instr(email, '@') > 1 GROUP BY email;
-    INSERT OR IGNORE INTO contacts (kind, value, display, first_seen, last_seen)
-    SELECT 'linkedin', TRIM(linkedin_url), TRIM(linkedin_url), MIN(created_at), MAX(updated_at)
-    FROM prospects WHERE TRIM(COALESCE(linkedin_url, '')) != '' GROUP BY TRIM(linkedin_url);
-    INSERT OR IGNORE INTO people (company_id, name, name_norm, role, source, first_seen,
-                                  last_seen, origin_company_id)
-    SELECT p.company_id, {_P_NAME}, {contacts.sql_name_norm(_P_NAME)}, COALESCE(p.title, ''),
-           COALESCE(p.source, ''), p.created_at, p.updated_at, {_P_ORIGIN}
-    FROM prospects p
-    WHERE COALESCE(p.company_id, '') != '' AND {contacts.sql_name_norm(_P_NAME)} != '';
-    INSERT OR IGNORE INTO company_contacts (company_id, contact_id, person_id, source,
-        evidence_url, trust, first_seen, last_seen, origin_company_id)
-    SELECT p.company_id, ct.id, COALESCE(pe.id, 0), COALESCE(p.source, ''),
-           COALESCE(p.source_url, ''),
-           CASE WHEN ct.kind = 'linkedin' OR (COALESCE(c.domain, '') != ''
-                     AND substr(p.email, instr(p.email, '@') + 1) = c.domain)
-                THEN 'confirmed' ELSE 'likely' END,
-           p.created_at, p.updated_at, {_P_ORIGIN}
-    FROM prospects p
-    JOIN contacts ct ON (ct.kind = 'email' AND ct.value = p.email AND p.email != '')
-                     OR (ct.kind = 'linkedin' AND ct.value = TRIM(p.linkedin_url)
-                         AND TRIM(COALESCE(p.linkedin_url, '')) != '')
-    LEFT JOIN companies c ON c.id = p.company_id
-    LEFT JOIN people pe ON pe.company_id = p.company_id
-         AND pe.name_norm = {contacts.sql_name_norm(_P_NAME)} AND pe.name_norm != ''
-    WHERE COALESCE(p.company_id, '') != '';
-
-    -- Sources: the company's own, every listing id it holds, and every
-    -- module that wrote a fact about it.
-    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
-                                           origin_company_id)
-    SELECT id, source, COALESCE(external_id, ''), created_at, updated_at, id
-    FROM companies WHERE COALESCE(source, '') != '';
-    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
-                                           origin_company_id)
-    SELECT i.company_id,
-           COALESCE(NULLIF(i.source, ''), substr(i.value, 1, instr(i.value, ':') - 1)),
-           i.value, i.created_at, i.created_at,
-           COALESCE((SELECT MIN(mv.merged) FROM v21_moved mv WHERE mv.tbl = 'company_ids'
-                     AND mv.key1 = 'external' AND mv.key2 = i.value
-                     AND mv.survivor = i.company_id), i.company_id)
-    FROM company_ids i
-    WHERE i.kind = 'external' AND (i.source != '' OR instr(i.value, ':') > 1);
-    -- (Not again for the source the company came from: a registry record's
-    -- "registry:onrc" is its onrc module.)
-    INSERT OR IGNORE INTO company_sources (company_id, source, ref, first_seen, last_seen,
-                                           origin_company_id)
-    SELECT company_id, module, '', first_seen, last_seen, origin FROM (
-        SELECT company_id, module, MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen,
-               CASE WHEN MIN(COALESCE(NULLIF(origin_company_id, ''), company_id))
-                       = MAX(COALESCE(NULLIF(origin_company_id, ''), company_id))
-                    THEN MIN(COALESCE(NULLIF(origin_company_id, ''), company_id))
-                    ELSE company_id END AS origin
-        FROM observations
-        WHERE COALESCE(module, '') != '' AND COALESCE(company_id, '') != ''
-        GROUP BY company_id, module) found
-    WHERE NOT EXISTS (SELECT 1 FROM company_sources s WHERE s.company_id = found.company_id
-                      AND (s.source = found.module OR s.source LIKE '%:' || found.module));
-    -- Searches already done: the contact backfill's and the site reads'
-    -- rotation marks, one search each (a site read looks for phones and a
-    -- contact form; the backfill for people and their emails).
-    INSERT INTO searches (target, target_id, module, capability, looked_for, searched_at,
-                          outcome, found, origin_company_id)
-    SELECT 'company', c.id, 'people', 'find_people', 'people,email', c.prospects_checked_at,
-           CASE WHEN EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
-                THEN 'found' ELSE 'nothing' END,
-           (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id), c.id
-    FROM companies c WHERE c.prospects_checked_at IS NOT NULL;
-    INSERT INTO searches (target, target_id, module, capability, looked_for, searched_at,
-                          outcome, origin_company_id)
-    SELECT 'company', c.id, 'website', 'read_site', 'phone,contact_form', c.profile_checked_at,
-           'nothing', c.id
-    FROM companies c WHERE c.profile_checked_at IS NOT NULL;
-    DROP TABLE temp.v21_moved;
-
-    -- From here on every prospect write keeps its contact in step: a new
-    -- address, a verifier's status, an opt-out (do-not-contact) and its undo.
-    CREATE TRIGGER IF NOT EXISTS trg_prospects_contact_insert
-    AFTER INSERT ON prospects
-    WHEN NEW.email != '' AND instr(NEW.email, '@') > 1
-    BEGIN
-        INSERT INTO contacts (kind, value, display, status, do_not_contact)
-        VALUES ('email', NEW.email, NEW.email, {_EMAIL_STATUS.format(s="NEW.email_status")},
-                NEW.status = 'opted_out')
-        ON CONFLICT(kind, value) DO UPDATE SET
-            status = CASE WHEN excluded.status != 'unchecked' THEN excluded.status
-                          ELSE contacts.status END,
-            do_not_contact = MAX(contacts.do_not_contact, excluded.do_not_contact),
-            last_seen = CURRENT_TIMESTAMP;{_PROSPECT_LINK}
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS trg_prospects_contact_update
-    AFTER UPDATE OF email, email_status, status ON prospects
-    WHEN NEW.email != '' AND instr(NEW.email, '@') > 1
-    BEGIN
-        INSERT INTO contacts (kind, value, display, status, do_not_contact)
-        VALUES ('email', NEW.email, NEW.email, {_EMAIL_STATUS.format(s="NEW.email_status")},
-                NEW.status = 'opted_out')
-        ON CONFLICT(kind, value) DO UPDATE SET
-            status = CASE WHEN excluded.status != 'unchecked' THEN excluded.status
-                          ELSE contacts.status END,
-            do_not_contact = CASE WHEN NEW.status = 'opted_out' THEN 1
-                                  WHEN OLD.status = 'opted_out' THEN 0
-                                  ELSE contacts.do_not_contact END,
-            last_seen = CURRENT_TIMESTAMP;{_PROSPECT_LINK}
-    END;
-"""
-
-MIGRATIONS: list[str] = [
-    # ── v1: base schema (idempotent, so pre-migration DBs adopt cleanly) ──
-    """
-    CREATE TABLE IF NOT EXISTS companies (
-        id TEXT PRIMARY KEY,
-        name TEXT DEFAULT '',
-        domain TEXT DEFAULT '',
-        website TEXT DEFAULT '',
-        description TEXT DEFAULT '',
-        industry TEXT DEFAULT '',
-        company_size TEXT DEFAULT '',
-        location TEXT DEFAULT '',
-        source TEXT DEFAULT '',
-        source_url TEXT DEFAULT '',
-        notes TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS prospects (
-        id TEXT PRIMARY KEY,
-        company_id TEXT DEFAULT '' REFERENCES companies(id),
-        first_name TEXT DEFAULT '',
-        last_name TEXT DEFAULT '',
-        email TEXT DEFAULT '',
-        email_verified INTEGER DEFAULT 0,
-        phone TEXT DEFAULT '',
-        phone_verified INTEGER DEFAULT 0,
-        linkedin_url TEXT DEFAULT '',
-        title TEXT DEFAULT '',
-        seniority TEXT DEFAULT '',
-        department TEXT DEFAULT '',
-        source TEXT DEFAULT '',
-        source_url TEXT DEFAULT '',
-        status TEXT DEFAULT 'new',
-        score INTEGER DEFAULT 0,
-        personalization_notes TEXT DEFAULT '',
-        company TEXT DEFAULT '',
-        industry TEXT DEFAULT '',
-        company_size TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS campaigns (
-        id TEXT PRIMARY KEY,
-        name TEXT DEFAULT '',
-        channel TEXT DEFAULT 'email',
-        instantly_campaign_id TEXT DEFAULT '',
-        sequence_json TEXT DEFAULT '[]',
-        prospect_ids_json TEXT DEFAULT '[]',
-        status TEXT DEFAULT 'draft',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS conversations (
-        id TEXT PRIMARY KEY,
-        prospect_id TEXT REFERENCES prospects(id),
-        campaign_id TEXT DEFAULT '',
-        channel TEXT DEFAULT 'email',
-        thread_json TEXT DEFAULT '[]',
-        intent TEXT DEFAULT '',
-        stage TEXT DEFAULT 'initial_outreach',
-        status TEXT DEFAULT 'open',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS feedback (
-        id TEXT PRIMARY KEY,
-        entity_type TEXT DEFAULT '',
-        entity_id TEXT DEFAULT '',
-        comment TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS actions (
-        id TEXT PRIMARY KEY,
-        action_type TEXT,
-        agent TEXT,
-        details_json TEXT DEFAULT '{}',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS usage_log (
-        id TEXT PRIMARY KEY,
-        date TEXT UNIQUE,
-        claude_calls INTEGER DEFAULT 0,
-        usage_percent REAL DEFAULT 0.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS processed_replies (
-        reply_id TEXT PRIMARY KEY,
-        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_companies_domain ON companies(domain);
-    CREATE INDEX IF NOT EXISTS idx_prospects_company_id ON prospects(company_id);
-    CREATE INDEX IF NOT EXISTS idx_prospects_status ON prospects(status);
-    CREATE INDEX IF NOT EXISTS idx_prospects_email ON prospects(email);
-    CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
-    CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
-    CREATE INDEX IF NOT EXISTS idx_feedback_entity ON feedback(entity_type, entity_id);
-    CREATE INDEX IF NOT EXISTS idx_usage_date ON usage_log(date);
-    """,
-    # ── v2: normalize identity keys, dedup, uniqueness, hot-path indexes ──
-    """
-    -- Normalize emails/domains so uniqueness is case-insensitive going forward.
-    UPDATE prospects SET email = LOWER(TRIM(email)) WHERE email != LOWER(TRIM(email));
-    UPDATE companies SET domain = LOWER(TRIM(domain)) WHERE domain != LOWER(TRIM(domain));
-
-    -- Dedup existing rows (keep the earliest) so unique indexes can be built.
-    DELETE FROM prospects WHERE email != '' AND rowid NOT IN (
-        SELECT MIN(rowid) FROM prospects WHERE email != '' GROUP BY email
-    );
-    DELETE FROM prospects WHERE linkedin_url != '' AND rowid NOT IN (
-        SELECT MIN(rowid) FROM prospects WHERE linkedin_url != '' GROUP BY linkedin_url
-    );
-    DELETE FROM companies WHERE domain != '' AND rowid NOT IN (
-        SELECT MIN(rowid) FROM companies WHERE domain != '' GROUP BY domain
-    );
-
-    -- Enforce uniqueness at the DB level (partial: blank values allowed).
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_prospects_email
-        ON prospects(email) WHERE email != '';
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_prospects_linkedin
-        ON prospects(linkedin_url) WHERE linkedin_url != '';
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_domain
-        ON companies(domain) WHERE domain != '';
-
-    -- Hot-path indexes: campaign stats subqueries, reply handling, dedup checks.
-    CREATE INDEX IF NOT EXISTS idx_conversations_campaign_id ON conversations(campaign_id);
-    CREATE INDEX IF NOT EXISTS idx_conversations_prospect_id ON conversations(prospect_id);
-    CREATE INDEX IF NOT EXISTS idx_conversations_intent ON conversations(intent);
-    CREATE INDEX IF NOT EXISTS idx_prospects_name_company
-        ON prospects(LOWER(first_name), LOWER(last_name), LOWER(company));
-    CREATE INDEX IF NOT EXISTS idx_prospects_status_updated ON prospects(status, updated_at);
-    CREATE INDEX IF NOT EXISTS idx_actions_created_at ON actions(created_at);
-    """,
-    # ── v3: per-call usage accounting (tokens, cost, attribution) ──
-    """
-    CREATE TABLE IF NOT EXISTS usage_events (
-        id TEXT PRIMARY KEY,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        agent TEXT DEFAULT '',
-        task TEXT DEFAULT '',
-        session_id TEXT DEFAULT '',
-        request_key TEXT DEFAULT '',
-        model TEXT DEFAULT '',
-        input_tokens INTEGER DEFAULT 0,
-        output_tokens INTEGER DEFAULT 0,
-        cache_read_tokens INTEGER DEFAULT 0,
-        cache_creation_tokens INTEGER DEFAULT 0,
-        cost_usd REAL DEFAULT 0.0,
-        duration_ms INTEGER DEFAULT 0,
-        num_turns INTEGER DEFAULT 0,
-        is_error INTEGER DEFAULT 0,
-        source TEXT DEFAULT 'result_json'
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);
-    CREATE INDEX IF NOT EXISTS idx_usage_events_agent ON usage_events(agent);
-    CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id);
-    -- Transcript-backfilled rows carry a request_key; uniqueness makes
-    -- reconciliation idempotent (INSERT OR IGNORE).
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_events_request
-        ON usage_events(request_key) WHERE request_key != '';
-    """,
-    # ── v4: honest email statuses + per-domain pattern cache ──
-    """
-    -- verified: a provider confirmed the mailbox exists
-    -- risky:    catch-all / accept-all domain — sendable only in low volume
-    -- guess:    pattern guess, never verified — never auto-sent
-    -- invalid:  provider said undeliverable
-    ALTER TABLE prospects ADD COLUMN email_status TEXT DEFAULT '';
-
-    -- Backfill: the old email_verified flag over-reported (pattern guesses
-    -- at any MX-bearing domain were marked verified), so every existing
-    -- address is downgraded to an honest 'guess' and must re-verify.
-    UPDATE prospects SET email_status = 'guess', email_verified = 0
-        WHERE email != '';
-
-    CREATE TABLE IF NOT EXISTS email_patterns (
-        domain TEXT PRIMARY KEY,
-        pattern TEXT DEFAULT '',
-        source TEXT DEFAULT '',
-        confidence REAL DEFAULT 0.0,
-        mx_type TEXT DEFAULT '',
-        is_catch_all INTEGER DEFAULT -1,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """,
-    # ── v5: buying signals on companies (tech stack, hiring, etc.) ──
-    """
-    ALTER TABLE companies ADD COLUMN tech_stack_json TEXT DEFAULT '[]';
-    ALTER TABLE companies ADD COLUMN signals_json TEXT DEFAULT '[]';
-    """,
-    # ── v6: outbox (approval ladder + native sending) and settings KV ──
-    """
-    -- Every outgoing email becomes an outbox row first. Status ladder:
-    --   pending_review -> approved -> sent
-    --   (or rejected / cancelled / failed)
-    -- The unique index on (campaign_id, prospect_id, step) is the
-    -- double-send guard: retries and re-stages physically cannot
-    -- duplicate a send.
-    CREATE TABLE IF NOT EXISTS outbox (
-        id TEXT PRIMARY KEY,
-        campaign_id TEXT DEFAULT '',
-        prospect_id TEXT DEFAULT '',
-        conversation_id TEXT DEFAULT '',
-        step INTEGER DEFAULT 1,
-        kind TEXT DEFAULT 'sequence',
-        to_email TEXT DEFAULT '',
-        subject TEXT DEFAULT '',
-        body TEXT DEFAULT '',
-        status TEXT DEFAULT 'pending_review',
-        send_at TIMESTAMP,
-        sent_at TIMESTAMP,
-        provider TEXT DEFAULT '',
-        message_id TEXT DEFAULT '',
-        thread_ref TEXT DEFAULT '',
-        in_reply_to TEXT DEFAULT '',
-        error TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_outbox_campaign_step
-        ON outbox(campaign_id, prospect_id, step)
-        WHERE campaign_id != '' AND kind = 'sequence';
-    CREATE INDEX IF NOT EXISTS idx_outbox_status_send_at ON outbox(status, send_at);
-    CREATE INDEX IF NOT EXISTS idx_outbox_prospect ON outbox(prospect_id);
-
-    -- Simple key/value store for operational flags (kill switch, counters).
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT DEFAULT '',
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """,
-    # ── v7: observation model — every fact is a row, never a column ──
-    """
-    -- The governed vocabulary. A collector may only emit a code that exists
-    -- here (enforced by the observations FK), so a typo fails loudly instead
-    -- of quietly inventing a junk signal. `status` is the user-confirmation
-    -- gate: Harvey PROPOSES signals, the user confirms which ones to
-    -- prospect against, and only confirmed signals get collected.
-    CREATE TABLE IF NOT EXISTS signal_codes (
-        code TEXT PRIMARY KEY,
-        label TEXT DEFAULT '',
-        description TEXT DEFAULT '',
-        category TEXT DEFAULT '',
-        value_type TEXT DEFAULT 'text',
-        collector TEXT DEFAULT '',
-        cost_note TEXT DEFAULT '',
-        status TEXT DEFAULT 'proposed',
-        confidence_floor REAL DEFAULT 0.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- One row per fact. Confidence and provenance travel WITH the fact, and
-    -- re-observing the same signal over time is a free time series.
-    CREATE TABLE IF NOT EXISTS observations (
-        id TEXT PRIMARY KEY,
-        company_id TEXT DEFAULT '',
-        prospect_id TEXT DEFAULT '',
-        signal_code TEXT NOT NULL,
-        collector TEXT DEFAULT '',
-        value_num REAL,
-        value_text TEXT DEFAULT '',
-        confidence REAL DEFAULT 1.0,
-        evidence_url TEXT DEFAULT '',
-        observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        run_id TEXT DEFAULT ''
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_obs_company ON observations(company_id);
-    CREATE INDEX IF NOT EXISTS idx_obs_signal ON observations(signal_code);
-    CREATE INDEX IF NOT EXISTS idx_obs_company_signal
-        ON observations(company_id, signal_code, observed_at);
-    CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id);
-
-    -- The governed-vocabulary guarantee. A trigger (not a foreign key) so it
-    -- holds regardless of the per-connection foreign_keys pragma, and applies
-    -- only here: the legacy tables default several id columns to '' and would
-    -- break under blanket FK enforcement.
-    CREATE TRIGGER IF NOT EXISTS trg_observations_signal_known
-    BEFORE INSERT ON observations
-    FOR EACH ROW
-    WHEN NEW.signal_code NOT IN (SELECT code FROM signal_codes)
-    BEGIN
-        SELECT RAISE(ABORT, 'unknown signal_code: not in signal_codes vocabulary');
-    END;
-
-    -- A log of what ran, when, how much it produced and cost. Purely a
-    -- record: spend is capped inside the collector, never here.
-    CREATE TABLE IF NOT EXISTS runs (
-        id TEXT PRIMARY KEY,
-        stage TEXT DEFAULT '',
-        status TEXT DEFAULT 'running',
-        provider TEXT DEFAULT '',
-        records INTEGER DEFAULT 0,
-        cost_usd REAL DEFAULT 0.0,
-        params_json TEXT DEFAULT '{}',
-        error TEXT DEFAULT '',
-        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_runs_stage_started ON runs(stage, started_at);
-    """,
-    # ── v8: discovery — entity resolution for businesses without a website ──
-    """
-    -- The best prospect for anyone selling websites is a business that has
-    -- none, so `domain` cannot be the only identity key. `external_id` holds
-    -- the provider's stable id ("dataforseo:ChIJ...", "osm:node/123") and is
-    -- what dedups a re-run for those records.
-    ALTER TABLE companies ADD COLUMN external_id TEXT DEFAULT '';
-    ALTER TABLE companies ADD COLUMN phone TEXT DEFAULT '';
-
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_external
-        ON companies(external_id) WHERE external_id != '';
-    """,
-
-    # ── v9: track prospect-backfill attempts on known companies ──
-    """
-    -- Without this, a company that gets scraped for contacts and comes up
-    -- empty (no team page, site blocked, etc.) is indistinguishable from one
-    -- never attempted, so the backfill pass would retry the same handful of
-    -- companies forever instead of rotating through the rest.
-    ALTER TABLE companies ADD COLUMN prospects_checked_at TIMESTAMP DEFAULT NULL;
-    """,
-
-    # ── v10: same fix, for the profile collector ──
-    """
-    -- The profile collector only ever wrote an observation on a SUCCESSFUL
-    -- fetch; an unreachable site produced zero rows despite the code's own
-    -- comment claiming "a failure IS an observation." Staleness was judged
-    -- purely from observations, so an unreachable company never looked
-    -- checked and the same handful got retried every cycle forever.
-    -- Backfill from existing observations so already-profiled companies
-    -- aren't treated as unchecked just because this column is new.
-    ALTER TABLE companies ADD COLUMN profile_checked_at TIMESTAMP DEFAULT NULL;
-
-    UPDATE companies SET profile_checked_at = (
-        SELECT MAX(observed_at) FROM observations
-        WHERE observations.company_id = companies.id
-          AND observations.collector = 'profile'
-    ) WHERE id IN (
-        SELECT DISTINCT company_id FROM observations WHERE collector = 'profile'
-    );
-    """,
-    # ── v11: which subscription each call ran on (claude | codex) ──
-    """
-    -- Every row before this migration was a Claude call.
-    ALTER TABLE usage_events ADD COLUMN provider TEXT DEFAULT 'claude';
-    CREATE INDEX IF NOT EXISTS idx_usage_events_provider ON usage_events(provider);
-
-    -- claude_calls keeps meaning Claude calls; Codex calls count separately
-    -- so one subscription's budget never consumes the other's.
-    ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
-    """,
-    # ── v12: look actions up by type (opt-out history, undone opt-outs) ──
-    """
-    CREATE INDEX IF NOT EXISTS idx_actions_type_created ON actions(action_type, created_at);
-    """,
-    # ── v13: who approved an outbox row: 'you' (a human), 'autopilot',
-    # 'earlier' (approved before this was recorded), '' (not approved) ──
-    """
-    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
-    UPDATE outbox SET approved_by = 'earlier' WHERE status IN ('approved', 'sending');
-    """,
-    # ── v14: each recipient's time zone, for the send window ──
-    """
-    -- An IANA name such as 'Europe/Oslo', worked out once from what Harvey
-    -- knows about the recipient. Empty until then.
-    ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
-    """,
-    # ── v15: companies from a trade registry ──
-    """
-    -- A registry company is identified by its tax code (CUI in Romania),
-    -- which the tax authority and the registry share: the key that later
-    -- joins a company found on a map to the same company in the registry.
-    -- `address` is the registered office (street and number), as filed.
-    ALTER TABLE companies ADD COLUMN cui TEXT DEFAULT '';
-    ALTER TABLE companies ADD COLUMN address TEXT DEFAULT '';
-
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_cui
-        ON companies(cui) WHERE cui != '';
-    """,
-    # ── v16: what each company does, in codes and in words, searchable ──
-    """
-    -- The CAEN nomenclature, every revision (0 and 1 still describe old
-    -- registrations). Seeded at init from harvey/caen.py, which reads the
-    -- shipped CSV, so the file stays the one source.
-    CREATE TABLE IF NOT EXISTS caen_classes (
-        code TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        name_ro TEXT DEFAULT '',
-        name_en TEXT DEFAULT '',
-        keywords TEXT DEFAULT '',
-        PRIMARY KEY (code, version)
-    );
-
-    -- Every class a company is authorised for (all of them, not only the
-    -- ones an import asked for). Describes the company; observations stay
-    -- the provenance.
-    CREATE TABLE IF NOT EXISTS company_activities (
-        company_id TEXT NOT NULL,
-        code TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        source TEXT NOT NULL DEFAULT '',
-        confidence REAL DEFAULT 1.0,
-        PRIMARY KEY (company_id, code, version, source)
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_activities_code
-        ON company_activities(code, version);
-
-    -- Local full-text search over name, activities (codes, Romanian and
-    -- English names, everyday words, plus the industry/category any source
-    -- gave) and place. Accent-insensitive. company_search_ids gives each
-    -- company a stable integer rowid, so one company's row is replaced by
-    -- rowid instead of scanning the index for its text id.
-    CREATE TABLE IF NOT EXISTS company_search_ids (
-        rid INTEGER PRIMARY KEY,
-        company_id TEXT NOT NULL UNIQUE
-    );
-    CREATE VIRTUAL TABLE IF NOT EXISTS company_search USING fts5(
-        company_id UNINDEXED, name, activity, place,
-        tokenize = 'unicode61 remove_diacritics 2'
-    );
-    CREATE VIEW IF NOT EXISTS company_search_source AS
-    SELECT c.id AS company_id,
-           COALESCE(c.name, '') AS name,
-           TRIM(COALESCE((
-               SELECT group_concat(DISTINCT a.code || ' ' || COALESCE(k.name_ro, '')
-                      || ' ' || COALESCE(k.name_en, '') || ' ' || COALESCE(k.keywords, ''))
-               FROM company_activities a
-               LEFT JOIN caen_classes k ON k.code = a.code AND k.version = a.version
-               WHERE a.company_id = c.id), '') || ' ' || COALESCE(c.industry, '')) AS activity,
-           TRIM(COALESCE(c.location, '') || ' ' || COALESCE(c.address, '')) AS place
-    FROM companies c;
-
-    -- Backfill (before the triggers, so each row is written once):
-    -- activities already observed, then the index for every company on
-    -- file. Class names arrive with the seeding that follows this
-    -- migration, which rebuilds the index once more.
-    INSERT OR IGNORE INTO company_activities (company_id, code, version, source, confidence)
-        SELECT company_id,
-               substr(value_text, 1, instr(value_text, '/') - 1),
-               CAST(substr(value_text, instr(value_text, '/') + 1) AS INTEGER),
-               COALESCE(NULLIF(collector, ''), 'observation'),
-               MAX(COALESCE(confidence, 1.0))
-        FROM observations
-        WHERE signal_code = 'ACTIVITY_CODE' AND COALESCE(company_id, '') != ''
-          AND instr(value_text, '/') > 1
-        GROUP BY 1, 2, 3, 4;
-    INSERT OR IGNORE INTO company_search_ids (company_id) SELECT id FROM companies;
-    DELETE FROM company_search;
-    INSERT INTO company_search (rowid, company_id, name, activity, place)
-        SELECT i.rid, s.company_id, s.name, s.activity, s.place
-        FROM company_search_source s
-        JOIN company_search_ids i ON i.company_id = s.company_id;
-
-    -- Every write path goes through these, so the index can't drift.
-    CREATE TRIGGER IF NOT EXISTS trg_company_search_insert
-    AFTER INSERT ON companies
-    BEGIN
-        INSERT OR IGNORE INTO company_search_ids (company_id) VALUES (NEW.id);
-        DELETE FROM company_search WHERE rowid =
-            (SELECT rid FROM company_search_ids WHERE company_id = NEW.id);
-        INSERT INTO company_search (rowid, company_id, name, activity, place)
-            SELECT i.rid, s.company_id, s.name, s.activity, s.place
-            FROM company_search_source s
-            JOIN company_search_ids i ON i.company_id = s.company_id
-            WHERE s.company_id = NEW.id;
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS trg_company_search_update
-    AFTER UPDATE OF name, industry, location, address ON companies
-    BEGIN
-        INSERT OR IGNORE INTO company_search_ids (company_id) VALUES (NEW.id);
-        DELETE FROM company_search WHERE rowid =
-            (SELECT rid FROM company_search_ids WHERE company_id = NEW.id);
-        INSERT INTO company_search (rowid, company_id, name, activity, place)
-            SELECT i.rid, s.company_id, s.name, s.activity, s.place
-            FROM company_search_source s
-            JOIN company_search_ids i ON i.company_id = s.company_id
-            WHERE s.company_id = NEW.id;
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS trg_company_search_delete
-    AFTER DELETE ON companies
-    BEGIN
-        DELETE FROM company_search WHERE rowid =
-            (SELECT rid FROM company_search_ids WHERE company_id = OLD.id);
-        DELETE FROM company_search_ids WHERE company_id = OLD.id;
-        DELETE FROM company_activities WHERE company_id = OLD.id;
-    END;
-
-    -- A company's activities change a row at a time (hundreds for some
-    -- companies), so these only mark it; the writer reindexes each marked
-    -- company once when it is done (StateManager._flush_company_search).
-    CREATE TABLE IF NOT EXISTS company_search_dirty (
-        company_id TEXT PRIMARY KEY
-    );
-
-    CREATE TRIGGER IF NOT EXISTS trg_company_activities_insert
-    AFTER INSERT ON company_activities
-    BEGIN
-        INSERT OR IGNORE INTO company_search_dirty (company_id) VALUES (NEW.company_id);
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS trg_company_activities_delete
-    AFTER DELETE ON company_activities
-    BEGIN
-        INSERT OR IGNORE INTO company_search_dirty (company_id) VALUES (OLD.company_id);
-    END;
-
-    -- An ACTIVITY_CODE observation ("8623/3") is also an activity of the
-    -- company, whichever collector wrote it.
-    CREATE TRIGGER IF NOT EXISTS trg_observations_activity
-    AFTER INSERT ON observations
-    WHEN NEW.signal_code = 'ACTIVITY_CODE' AND COALESCE(NEW.company_id, '') != ''
-         AND instr(NEW.value_text, '/') > 1
-    BEGIN
-        INSERT OR IGNORE INTO company_activities
-            (company_id, code, version, source, confidence)
-        VALUES (NEW.company_id,
-                substr(NEW.value_text, 1, instr(NEW.value_text, '/') - 1),
-                CAST(substr(NEW.value_text, instr(NEW.value_text, '/') + 1) AS INTEGER),
-                COALESCE(NULLIF(NEW.collector, ''), 'observation'),
-                COALESCE(NEW.confidence, 1.0));
-    END;
-    """,
-    # ── v17: one way to tell whether two records are the same company ──
-    """
-    -- Every key a company is known by, from every source (harvey/resolver.py):
-    -- cui, reg (registration number), external (a listing's id), domain,
-    -- phone (E.164), name ("<name without legal form>@<town>"). Keys add
-    -- up: an old phone stays beside a new one.
-    CREATE TABLE IF NOT EXISTS company_ids (
-        company_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        value TEXT NOT NULL,
-        source TEXT DEFAULT '',
-        confidence REAL DEFAULT 1.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (kind, value, company_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_ids_company ON company_ids(company_id);
-
-    -- "Is B the same company as A?": pending until a person answers
-    -- (merged | separate). Merges at high confidence are recorded here too.
-    CREATE TABLE IF NOT EXISTS match_candidates (
-        company_a TEXT NOT NULL,
-        company_b TEXT NOT NULL,
-        score REAL DEFAULT 0,
-        reasons_json TEXT DEFAULT '[]',
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        decided_at TIMESTAMP DEFAULT NULL,
-        PRIMARY KEY (company_a, company_b)
-    );
-    CREATE INDEX IF NOT EXISTS idx_match_candidates_status ON match_candidates(status);
-
-    -- A merged company keeps its row, pointing at the one it joined.
-    ALTER TABLE companies ADD COLUMN merged_into TEXT DEFAULT '';
-    CREATE INDEX IF NOT EXISTS idx_companies_merged ON companies(merged_into)
-        WHERE merged_into != '';
-
-    -- Each merge, and every row it moved, so an undo is exact.
-    CREATE TABLE IF NOT EXISTS company_merges (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        survivor TEXT NOT NULL,
-        merged TEXT NOT NULL,
-        score REAL,
-        reasons_json TEXT DEFAULT '[]',
-        decided_by TEXT DEFAULT '',
-        filled_json TEXT DEFAULT '{}',
-        moved_json TEXT DEFAULT '{}',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        undone_at TIMESTAMP DEFAULT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_merges_merged ON company_merges(merged);
-    CREATE TABLE IF NOT EXISTS company_merge_moves (
-        merge_id INTEGER NOT NULL,
-        tbl TEXT NOT NULL,
-        key1 TEXT NOT NULL,
-        key2 TEXT DEFAULT '',
-        key3 TEXT DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS idx_company_merge_moves ON company_merge_moves(merge_id, tbl, key1);
-
-    -- A merged company leaves the search index (its facts are the survivor's).
-    DROP VIEW IF EXISTS company_search_source;
-    CREATE VIEW company_search_source AS
-    SELECT c.id AS company_id,
-           COALESCE(c.name, '') AS name,
-           TRIM(COALESCE((
-               SELECT group_concat(DISTINCT a.code || ' ' || COALESCE(k.name_ro, '')
-                      || ' ' || COALESCE(k.name_en, '') || ' ' || COALESCE(k.keywords, ''))
-               FROM company_activities a
-               LEFT JOIN caen_classes k ON k.code = a.code AND k.version = a.version
-               WHERE a.company_id = c.id), '') || ' ' || COALESCE(c.industry, '')) AS activity,
-           TRIM(COALESCE(c.location, '') || ' ' || COALESCE(c.address, '')) AS place
-    FROM companies c
-    WHERE COALESCE(c.merged_into, '') = '';
-
-    -- Backfill what plain SQL can read; the rest (domain, phone and name
-    -- keys need Python) follows the migration (_backfill_company_ids).
-    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source)
-        SELECT id, 'external', external_id, source FROM companies WHERE external_id != '';
-    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source)
-        SELECT id, 'reg', substr(external_id, 6), source FROM companies
-        WHERE external_id LIKE 'onrc:_%';
-    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
-        SELECT company_id, 'phone', value_text, collector, MAX(confidence)
-        FROM observations
-        WHERE signal_code = 'PHONE_NUMBER' AND COALESCE(company_id, '') != ''
-          AND value_text LIKE '+%'
-        GROUP BY company_id, value_text;
-
-    -- A phone a site publishes is also a key of its company.
-    CREATE TRIGGER IF NOT EXISTS trg_observations_phone
-    AFTER INSERT ON observations
-    WHEN NEW.signal_code = 'PHONE_NUMBER' AND COALESCE(NEW.company_id, '') != ''
-         AND NEW.value_text LIKE '+%'
-    BEGIN
-        INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
-        VALUES (NEW.company_id, 'phone', NEW.value_text,
-                COALESCE(NEW.collector, ''), COALESCE(NEW.confidence, 1.0));
-    END;
-    """,
-    # ── v18: the vocabulary comes from module manifests ──
-    """
-    -- Filled from each signal's manifest declaration by
-    -- signals.sync_vocabulary(). `available` is 0 while the declaring
-    -- module is off: the signal is hidden and never collected, and its
-    -- observations stay (the insert trigger still knows the code).
-    ALTER TABLE signal_codes ADD COLUMN module TEXT DEFAULT '';
-    ALTER TABLE signal_codes ADD COLUMN subject TEXT DEFAULT 'company';
-    ALTER TABLE signal_codes ADD COLUMN unit TEXT DEFAULT '';
-    ALTER TABLE signal_codes ADD COLUMN cardinality TEXT DEFAULT 'one';
-    ALTER TABLE signal_codes ADD COLUMN keyed_by TEXT DEFAULT '';
-    ALTER TABLE signal_codes ADD COLUMN absence TEXT DEFAULT 'unknown';
-    ALTER TABLE signal_codes ADD COLUMN when_known TEXT DEFAULT 'enrich';
-    ALTER TABLE signal_codes ADD COLUMN available INTEGER DEFAULT 1;
-
-    -- Rank reads key on keyed_by from here on; the next sync writes the
-    -- same from the manifests.
-    UPDATE signal_codes SET keyed_by = 'phrase'
-        WHERE code IN ('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK');
-    """,
-    # ── v19: where each fact came from (harvey/modules/ingest.py) ──
-    """
-    -- The module and capability that found the fact, and the company it was
-    -- found for before any merge (a listing's own record, the company a site
-    -- was read for). Undoing a merge sends back every fact whose origin is
-    -- the merged company. Empty on rows from before.
-    ALTER TABLE observations ADD COLUMN module TEXT DEFAULT '';
-    ALTER TABLE observations ADD COLUMN capability TEXT DEFAULT '';
-    ALTER TABLE observations ADD COLUMN origin_company_id TEXT DEFAULT '';
-    CREATE INDEX IF NOT EXISTS idx_obs_origin ON observations(origin_company_id)
-        WHERE origin_company_id != '';
-    """,
-    # ── v20: background jobs (harvey/modules/jobs.py, harvey/modules/worker.py) ──
-    """
-    -- What one click (or one command) asked for: the jobs it became share
-    -- its id, and a paid batch's cap is what its jobs reserve from.
-    CREATE TABLE IF NOT EXISTS job_batches (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        label TEXT DEFAULT '',
-        params_json TEXT DEFAULT '{}',
-        max_spend REAL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- One unit of work on one lane. A lane runs its jobs in order; lanes
-    -- run side by side. progress_json keeps what a stopped job resumes
-    -- from (a search's page cursor); result_json what it did.
-    CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        lane TEXT NOT NULL,
-        module TEXT DEFAULT '',
-        capability TEXT DEFAULT '',
-        label TEXT DEFAULT '',
-        params_json TEXT DEFAULT '{}',
-        dedupe_key TEXT,
-        status TEXT NOT NULL DEFAULT 'queued',
-        progress_json TEXT DEFAULT '{}',
-        result_json TEXT DEFAULT '{}',
-        est_cost REAL DEFAULT 0.0,
-        reserved REAL DEFAULT 0.0,
-        actual_cost REAL DEFAULT 0.0,
-        attempts INTEGER DEFAULT 0,
-        not_before TIMESTAMP,
-        error TEXT DEFAULT '',
-        paused_reason TEXT DEFAULT '',
-        stop_requested TEXT DEFAULT '',
-        batch_id TEXT DEFAULT '',
-        parent_id TEXT DEFAULT '',
-        worker TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        started_at TIMESTAMP,
-        finished_at TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    -- The same work can't wait twice: unique while it is still to finish.
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key)
-        WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'running', 'paused');
-    CREATE INDEX IF NOT EXISTS idx_jobs_lane ON jobs(lane, status, created_at);
-    CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-
-    -- The one worker allowed to run jobs on this database: whoever holds a
-    -- lease whose heartbeat is fresh.
-    CREATE TABLE IF NOT EXISTS worker_lease (
-        name TEXT PRIMARY KEY,
-        owner TEXT NOT NULL,
-        pid INTEGER DEFAULT 0,
-        host TEXT DEFAULT '',
-        heartbeat_at REAL NOT NULL,
-        started_at REAL NOT NULL
-    );
-    """,
-    # ── v21: contacts, people, places and sources ──
-    _V21_CONTACTS,
-    # ── v22: the website the contact finder found, and how sure it is ──
-    """
-    -- A website the contact finder found by searching the company's name and
-    -- town: confirmed (its pages name the company's CUI, or a phone or email
-    -- already on file), likely (name and town match) or unconfirmed.
-    -- website_source is the search module it came from. '' for a website a
-    -- source gave with the company itself.
-    ALTER TABLE companies ADD COLUMN website_trust TEXT DEFAULT '';
-    ALTER TABLE companies ADD COLUMN website_source TEXT DEFAULT '';
-    -- The finder's free backlog: companies with a website to read.
-    CREATE INDEX IF NOT EXISTS idx_companies_website ON companies(website)
-        WHERE website != '';
-    -- The finder takes the newest companies first.
-    CREATE INDEX IF NOT EXISTS idx_companies_created ON companies(created_at);
-    CREATE INDEX IF NOT EXISTS idx_searches_batch ON searches(batch_id) WHERE batch_id != '';
-    """,
-    # ── v23: the Companies page's sorts ──
-    """
-    -- One index per column the Companies page sorts by, on live companies
-    -- only (written exactly as the page's condition, so SQLite uses them).
-    -- Each holds the sort key and the rowid: a page, and a jump half a
-    -- million rows deep, walks the index without reading the table
-    -- (harvey/companies.py). The sorts by a figure (turnover, contacts,
-    -- last searched) are ranked from the tables that hold them instead.
-    CREATE INDEX IF NOT EXISTS idx_companies_live_created ON companies(created_at)
-        WHERE COALESCE(merged_into, '') = '';
-    CREATE INDEX IF NOT EXISTS idx_companies_live_name ON companies(name)
-        WHERE COALESCE(merged_into, '') = '';
-    CREATE INDEX IF NOT EXISTS idx_companies_live_place ON companies(location)
-        WHERE COALESCE(merged_into, '') = '';
-    """,
-    # ── v24: groups of duplicates, and email as a key ──
-    """
-    -- The merges one "same company" on a group made share its first
-    -- merge's id, so the whole group can be undone at once (0: on its own).
-    ALTER TABLE company_merges ADD COLUMN group_id INTEGER DEFAULT 0;
-    CREATE INDEX IF NOT EXISTS idx_company_merges_group ON company_merges(group_id)
-        WHERE group_id != 0;
-    CREATE INDEX IF NOT EXISTS idx_company_merges_survivor ON company_merges(survivor);
-    -- An email linked to a company is one of its keys, like a phone. Every
-    -- address is recorded; the resolver leaves out free-mail ones (anyone's
-    -- gmail.com box) and one many companies share when it scores.
-    CREATE TRIGGER IF NOT EXISTS trg_company_contacts_email
-    AFTER INSERT ON company_contacts
-    WHEN COALESCE(NEW.company_id, '') != ''
-         AND (SELECT kind FROM contacts WHERE id = NEW.contact_id) = 'email'
-    BEGIN
-        INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
-        SELECT NEW.company_id, 'email', value, COALESCE(NEW.source, ''),
-               COALESCE(NEW.confidence, 1.0)
-        FROM contacts WHERE id = NEW.contact_id;
-    END;
-    INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence)
-        SELECT l.company_id, 'email', ct.value, COALESCE(MIN(l.source), ''), MAX(l.confidence)
-        FROM contacts ct JOIN company_contacts l ON l.contact_id = ct.id
-        WHERE ct.kind = 'email' AND COALESCE(l.company_id, '') != ''
-        GROUP BY l.company_id, ct.value;
-    """,
-]
-
 # Pairs a look for duplicates merges or queues per write transaction.
 SCAN_WRITE_BATCH = 200
 
 # Live companies: not merged into another (SQL, on companies aliased "c").
 LIVE_COMPANY = "COALESCE(c.merged_into, '') = ''"
 
-# Settings key: fingerprint of the CAEN nomenclature loaded into caen_classes.
-CAEN_REFERENCE_KEY = "caen_reference"
-
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 
-# When a company was last profiled: the newer of the explicit check stamp
-# (set on every attempt, reachable or not) and its latest profile observation
-# (written by any path, including ones that never stamp the column).
-_LAST_PROFILED_JOIN = """LEFT JOIN (
-                       SELECT company_id, MAX(observed_at) AS last_seen
-                       FROM observations WHERE collector LIKE 'profile%'
-                       GROUP BY company_id
-                   ) p ON p.company_id = c.id"""
-_LAST_PROFILED = (
-    "(CASE WHEN p.last_seen IS NULL OR c.profile_checked_at > p.last_seen"
-    " THEN c.profile_checked_at ELSE p.last_seen END)"
-)
-
-# Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
-_COMPANY_FILL_COLUMNS = frozenset({
-    "name", "domain", "website", "industry", "location", "phone",
-    "cui", "address",
-})
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
     "sequence_json", "prospect_ids_json", "status",
@@ -1494,251 +306,7 @@ _CONVERSATION_COLUMNS = frozenset({
 })
 
 
-# ── Company writes shared by StateManager and CompanyBatch ──
-# Each takes an open connection and never commits: the caller decides
-# whether that is one write or a few thousand.
-
-def _company_from_row(row) -> Company:
-    d = dict(row)
-    for json_col, field in (("tech_stack_json", "tech_stack"), ("signals_json", "signals")):
-        raw = d.pop(json_col, None)
-        try:
-            parsed = json.loads(raw) if raw else []
-        except (json.JSONDecodeError, TypeError):
-            parsed = []
-        d[field] = parsed if isinstance(parsed, list) else []
-    return Company(**d)
-
-
-async def _company_by(db, column: str, value: str) -> Company | None:
-    if column not in ("cui", "domain", "external_id") or not value:
-        return None
-    # "!= ''" lets SQLite use the partial unique indexes on cui and
-    # external_id (WHERE ... != ''); "= ?" alone can't, and scans the table.
-    async with db.execute(f"SELECT * FROM companies WHERE {column} = ? AND {column} != ''",
-                          (value,)) as cur:
-        row = await cur.fetchone()
-        if not row:
-            return None
-        names = [c[0] for c in cur.description]
-    found = dict(zip(names, row))
-    if found.get("merged_into"):
-        # A merged record stands for the company it joined.
-        survivor = await resolver.live_id(db, found["id"])
-        async with db.execute("SELECT * FROM companies WHERE id = ?", (survivor,)) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return None
-        found = dict(zip(names, row))
-    return _company_from_row(found)
-
-
-async def _insert_company(db, company: Company) -> str:
-    if not company.id:
-        company.id = _new_id()
-    company.domain = _norm(company.domain)
-    cursor = await db.execute(
-        """INSERT OR IGNORE INTO companies
-           (id, name, domain, website, description, industry,
-            company_size, location, phone, source, source_url,
-            external_id, cui, address, notes, tech_stack_json,
-            signals_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            company.id, company.name, company.domain, company.website,
-            company.description, company.industry, company.company_size,
-            company.location, company.phone, company.source,
-            company.source_url, company.external_id, company.cui,
-            company.address, company.notes,
-            json.dumps(company.tech_stack), json.dumps(company.signals),
-            company.created_at.isoformat(),
-            company.updated_at.isoformat(),
-        ),
-    )
-    if cursor.rowcount:
-        await resolver.register(db, company.id, resolver.identifiers(company), company.source)
-        await contacts.add_source(db, company.id, company.source, company.external_id)
-        await _company_phone_contact(db, company.id, company.phone, company.source,
-                                     company.location, company.domain)
-    else:
-        # Uniqueness conflict: hand back the existing record's id.
-        for column, value in (("cui", company.cui),
-                              ("domain", company.domain),
-                              ("external_id", company.external_id)):
-            if not value:
-                continue
-            async with db.execute(
-                f"SELECT id FROM companies WHERE {column} = ? AND {column} != ''", (value,)
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    company.id = await resolver.live_id(db, row[0]) or row[0]
-                    break
-    return company.id
-
-
-async def _fill_company_fields(db, company_id: str, fields: dict) -> list[str]:
-    changed = []
-    for column, value in fields.items():
-        if column not in _COMPANY_FILL_COLUMNS:
-            raise ValueError(f"not a fillable company column: {column}")
-        if not value:
-            continue
-        if column == "domain":
-            value = _norm(value)
-            # Another company already owns it: two records for one
-            # site is a merge for a person to make, not this call.
-            async with db.execute(
-                "SELECT 1 FROM companies WHERE domain = ? AND id != ?",
-                (value, company_id),
-            ) as cur:
-                if await cur.fetchone():
-                    continue
-        if column == "cui":
-            async with db.execute(
-                "SELECT 1 FROM companies WHERE cui = ? AND cui != '' AND id != ?",
-                (value, company_id),
-            ) as cur:
-                if await cur.fetchone():
-                    continue
-        only_empty = "" if column == "address" else \
-            f" AND COALESCE(TRIM({column}), '') = ''"
-        cursor = await db.execute(
-            f"UPDATE companies SET {column} = ?, updated_at = CURRENT_TIMESTAMP "
-            f"WHERE id = ? AND COALESCE({column}, '') != ?{only_empty}",
-            (value, company_id, value),
-        )
-        if cursor.rowcount:
-            changed.append(column)
-    if changed:
-        await resolver.register_company(db, company_id)
-    if "phone" in changed:
-        await _company_phone_contact(db, company_id, fields["phone"])
-    return changed
-
-
-async def _fill_company_phones(db, phones: dict[str, str]) -> list[str]:
-    """_fill_company_fields(db, id, {"phone": ...}) for many companies, a
-    statement for the lot: each company with no phone gets its own, its
-    keys are registered and the number is also its phone contact. The ids
-    whose phone was set, in the order given."""
-    phones = {cid: phone for cid, phone in phones.items() if cid and phone}
-    ids = list(phones)
-    rows: dict[str, dict] = {}
-    for at in range(0, len(ids), 900):
-        chunk = ids[at:at + 900]
-        async with db.execute(
-            "SELECT id, name, cui, external_id, domain, phone, location, source FROM companies "
-            f"WHERE id IN ({','.join('?' * len(chunk))}) AND COALESCE(TRIM(phone), '') = ''",
-            chunk,
-        ) as cur:
-            names = [c[0] for c in cur.description]
-            rows.update({r[0]: dict(zip(names, r)) for r in await cur.fetchall()})
-    empty = [cid for cid in ids if cid in rows]
-    if not empty:
-        return []
-    await db.executemany(
-        "UPDATE companies SET phone = ?, updated_at = CURRENT_TIMESTAMP "
-        "WHERE id = ? AND COALESCE(TRIM(phone), '') = ''", [(phones[cid], cid) for cid in empty])
-    keys = []
-    for cid in empty:
-        row = {**rows[cid], "phone": phones[cid]}
-        keys += [(cid, kind, value, row.get("source") or "", 1.0)
-                 for kind, value in resolver.identifiers(row)]
-    if keys:
-        await db.executemany(
-            "INSERT OR IGNORE INTO company_ids (company_id, kind, value, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?)", keys)
-    from harvey.collectors.phones import phone_region
-
-    await contacts.add_many(db, [
-        (cid, contacts.Found("phone", phones[cid], source=rows[cid].get("source") or "",
-                             trust="confirmed",
-                             region=phone_region(rows[cid].get("location") or "", None,
-                                                 rows[cid].get("domain") or "")), "")
-        for cid in empty])
-    return empty
-
-
-async def _company_phone_contact(db, company_id: str, phone: str, source: str = "",
-                                 location: str | None = None, domain: str | None = None) -> None:
-    """The company's own phone column is also a phone contact of it (read
-    in its country); one that doesn't parse stays in the column only."""
-    if not phone:
-        return
-    from harvey.collectors.phones import phone_region
-
-    if location is None or not source:
-        async with db.execute("SELECT location, domain, source FROM companies WHERE id = ?",
-                              (company_id,)) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            return
-        location, domain, source = location or row[0], domain or row[1], source or row[2]
-    await contacts.add(db, company_id, contacts.Found(
-        "phone", phone, source=source or "", trust="confirmed",
-        region=phone_region(location or "", None, domain or "")))
-
-
-async def _set_company_activities(db, company_id: str, classes, source: str,
-                                  confidence: float = 1.0) -> int:
-    wanted = list(dict.fromkeys((str(c).zfill(4), int(v)) for c, v in classes))
-    async with db.execute(
-        "SELECT code, version FROM company_activities "
-        "WHERE company_id = ? AND source = ?", (company_id, source),
-    ) as cur:
-        have = {(r[0], r[1]) for r in await cur.fetchall()}
-    gone = have - set(wanted)
-    fresh = [pair for pair in wanted if pair not in have]
-    if gone:
-        await db.executemany(
-            "DELETE FROM company_activities WHERE company_id = ? AND code = ? "
-            "AND version = ? AND source = ?",
-            [(company_id, c, v, source) for c, v in gone])
-    if fresh:
-        await db.executemany(
-            "INSERT OR IGNORE INTO company_activities "
-            "(company_id, code, version, source, confidence) VALUES (?, ?, ?, ?, ?)",
-            [(company_id, c, v, source, confidence) for c, v in fresh])
-    return len(fresh)
-
-
-async def _insert_observations(db, rows: list[dict], run_id: str = "") -> int:
-    if not rows:
-        return 0
-    payload = [
-        (
-            _new_id(), r.get("company_id", ""), r.get("prospect_id", ""),
-            r["signal_code"], r.get("collector", ""), r.get("value_num"),
-            r.get("value_text", ""), float(r.get("confidence", 1.0)),
-            r.get("evidence_url", ""), r.get("observed_at"),
-            r.get("run_id", run_id), r.get("module", ""), r.get("capability", ""),
-            r.get("origin_company_id", ""),
-        )
-        for r in rows
-    ]
-    await db.executemany(
-        """INSERT INTO observations
-               (id, company_id, prospect_id, signal_code, collector,
-                value_num, value_text, confidence, evidence_url,
-                observed_at, run_id, module, capability, origin_company_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)""",
-        payload,
-    )
-    # A phone, a named person or a contact form is also a contact record.
-    await contacts.from_observations(db, rows)
-    return len(payload)
-
-
-async def _add_contacts(db, company_id: str, found: list, origin: str = "") -> int:
-    """Save each contact (contacts.Found) and link it to the company; how
-    many were kept (a phone that doesn't parse isn't)."""
-    kept = 0
-    for item in found:
-        kept += await contacts.add(db, company_id, item, origin) is not None
-    return kept
-
+# ── Company writes ──
 
 class Resolution:
     """What saving a company did: ``company_id`` is the record to write its
@@ -1762,407 +330,87 @@ class Resolution:
         return self.merged_from or self.match.origin or self.company_id
 
 
-def _own_keys(company: Company, match: "resolver.Match") -> list[tuple[str, str]]:
-    """The keys a matched record gains: those it doesn't hold yet, less a
-    domain the caller dropped from the record (one another company holds)."""
-    return [(kind, value) for kind, value in match.new_ids
-            if kind != "domain" or value == company.domain]
+class UpgradeNeeded(RuntimeError):
+    """The database is an older schema: harvey upgrade (or the dashboard's
+    upgrade screen) brings it to schema 25 first."""
+
+    def __init__(self, version: int):
+        self.version = version
+        if version:
+            super().__init__(f"harvey.db is schema {version}: run harvey upgrade (or open the "
+                             "dashboard) to upgrade it to the slim database first")
+        else:
+            super().__init__("the upgrade's switch to the slim database is unfinished: run "
+                             "harvey upgrade (or open the dashboard) to finish it")
 
 
-async def _save_company(db, company: Company, match: "resolver.Match",
-                        extra_ids=()) -> Resolution:
-    """Record a company the way ``match`` (resolver.match) found it:
-    - the same record (same CUI, listing id or domain): its keys are added
-      to that record, nothing else changes;
-    - the same company by other evidence (ATTACH or more): saved, then
-      merged into the one on file, which can be undone;
-    - a possible match (REVIEW to ATTACH): saved as a new company, and the
-      pair goes to the review list;
-    - otherwise: a new company."""
-    if match.attach and match.same_record:
-        await resolver.register(db, match.company_id, _own_keys(company, match), company.source)
-        return Resolution(match.company_id, False, match)
-    company.id = company.id or _new_id()
-    fresh = company.id
-    company_id = await _insert_company(db, company)
-    if company_id != fresh:
-        # A uniqueness conflict the match didn't see: that record it is.
-        return Resolution(company_id, False, match)
-    if extra_ids:
-        await resolver.register(db, company_id,
-                                [("external", x) for x in extra_ids if x], company.source)
-    if match.attach:
+def _open_or_create(path: str, overlay_schema) -> int:
+    """The file's schema version, creating schema 25 in a new empty file
+    (WAL, so readers never block the writer). Two processes starting on a
+    new file at once: one creates it, the other waits for it."""
+    con = sqlite3.connect(path, isolation_level=None, timeout=BUSY_TIMEOUT_SECONDS)
+    try:
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        if version and version != overlay_schema.VERSION:
+            return version      # an older schema: never touched here
         try:
-            await resolver.merge(db, match.company_id, company_id, score=match.score,
-                                 reasons=match.reasons, decided_by="auto")
-            return Resolution(match.company_id, False, match, merged_from=company_id)
-        except resolver.MergeRefused:
-            return Resolution(company_id, True, match)
-    if match.review:
-        await resolver.add_candidate(db, match.company_id, company_id, match.score,
-                                     match.reasons)
-    for other, score, reasons in match.others:
-        await resolver.add_candidate(db, other, company_id, score, reasons)
-    return Resolution(company_id, True, match)
+            con.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass    # another process is setting the new file up right now
+        con.execute("PRAGMA synchronous=NORMAL")
+        if version:
+            return version
+        try:
+            overlay_schema.create(con)
+        except (ValueError, sqlite3.OperationalError):
+            # Created by another process meanwhile (or being created).
+            for _ in range(int(MIGRATION_TIMEOUT_SECONDS * 10)):
+                version = con.execute("PRAGMA user_version").fetchone()[0]
+                if version:
+                    return version
+                time.sleep(0.1)
+            raise
+        return overlay_schema.VERSION
+    finally:
+        con.close()
 
 
-class CompanyBatch:
-    """Company writes on one shared connection (StateManager.batch()).
-
-    The same rules as the StateManager methods of the same names, without a
-    connection and a commit each: a registry import saving thousands of
-    companies spends its time on the writes, not on opening the database.
-    Reads see the batch's own uncommitted writes."""
-
-    def __init__(self, db):
-        self.db = db
-
-    async def get_company_by_cui(self, cui: str) -> Company | None:
-        return await _company_by(self.db, "cui", (cui or "").strip())
-
-    async def get_company_by_external_id(self, external_id: str) -> Company | None:
-        return await _company_by(self.db, "external_id", external_id)
-
-    async def get_company_by_domain(self, domain: str) -> Company | None:
-        return await _company_by(self.db, "domain", _norm(domain))
-
-    async def add_company(self, company: Company) -> str:
-        return await _insert_company(self.db, company)
-
-    async def match_company(self, company: Company, extra_ids=(),
-                            declared_domain: bool = False) -> "resolver.Match":
-        return await resolver.match(self.db, company, extra_ids, declared_domain)
-
-    async def save_company(self, company: Company, match: "resolver.Match | None" = None,
-                           extra_ids=()) -> Resolution:
-        if match is None:
-            match = await resolver.match(self.db, company, extra_ids)
-        return await _save_company(self.db, company, match, extra_ids)
-
-    async def register_ids(self, company_id: str, company: Company,
-                           match: "resolver.Match") -> None:
-        """Add the keys ``company`` brought that the matched record lacks."""
-        keys = _own_keys(company, match)
-        if keys:
-            await resolver.register(self.db, company_id, keys, company.source)
-
-    async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
-        return await _fill_company_fields(self.db, company_id, fields)
-
-    async def set_company_activities(self, company_id: str, classes, source: str,
-                                     confidence: float = 1.0) -> int:
-        return await _set_company_activities(self.db, company_id, classes, source,
-                                             confidence)
-
-    async def observed(self, company_id: str, evidence_url: str) -> set[tuple[str, str]]:
-        """(signal_code, value_text) already recorded for the company from
-        this evidence (one registry dataset): what a re-import must not add
-        again."""
-        async with self.db.execute(
-            "SELECT signal_code, value_text FROM observations "
-            "WHERE company_id = ? AND evidence_url = ?", (company_id, evidence_url),
-        ) as cur:
-            return {(r[0], r[1]) for r in await cur.fetchall()}
-
-    async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
-        return await _insert_observations(self.db, rows, run_id)
-
-    async def add_contacts(self, company_id: str, found: list, origin: str = "") -> int:
-        return await _add_contacts(self.db, company_id, found, origin)
-
-    async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
-                         source: str = "", origin: str = "") -> None:
-        for name, role in people:
-            await contacts.add_person(self.db, company_id, name, role, source, origin)
-
-    async def add_location(self, company_id: str, **place) -> int:
-        return await contacts.add_location(self.db, company_id, **place)
-
-    async def add_company_source(self, company_id: str, source: str, ref: str = "",
-                                 origin: str = "") -> None:
-        await contacts.add_source(self.db, company_id, source, ref, origin)
-
-    async def add_contact_list(self, items) -> int:
-        """Contacts of many companies at once: (company_id, contacts.Found,
-        origin) each (contacts.add_many)."""
-        return await contacts.add_many(self.db, items)
-
-    async def fill_company_phones(self, phones: dict[str, str]) -> list[str]:
-        """``fill_company_fields(id, phone=...)`` for many companies: each
-        one with no phone gets its own. The ids whose phone was set."""
-        return await _fill_company_phones(self.db, phones)
-
-    async def module_readings_of(self, company_ids, module: str
-                                 ) -> dict[str, tuple[dict[str, tuple], set[tuple[str, str]]]]:
-        """``module_readings`` for many companies, read together: {id:
-        (latest, ever)}, a company with none holding empty ones."""
-        out: dict[str, tuple[dict[str, tuple], set[tuple[str, str]]]] = {
-            cid: ({}, set()) for cid in company_ids}
-        ids = list(out)
-        for at in range(0, len(ids), 900):
-            chunk = ids[at:at + 900]
-            async with self.db.execute(
-                "SELECT company_id, signal_code, value_num, value_text FROM observations "
-                f"WHERE company_id IN ({','.join('?' * len(chunk))}) AND module = ? "
-                "ORDER BY company_id, observed_at, rowid", (*chunk, module),
-            ) as cur:
-                for cid, code, num, text in await cur.fetchall():
-                    latest, ever = out[cid]
-                    latest[code] = (num, text or "")
-                    ever.add((code, text or ""))
-        return out
-
-    async def module_readings(self, company_id: str, module: str
-                              ) -> tuple[dict[str, tuple], set[tuple[str, str]]]:
-        """What ``module`` has recorded for the company: its latest
-        (value_num, value_text) per signal, and every (signal, value_text)
-        it ever recorded. What a repeated check compares its answer with."""
-        latest: dict[str, tuple] = {}
-        ever: set[tuple[str, str]] = set()
-        async with self.db.execute(
-            "SELECT signal_code, value_num, value_text FROM observations "
-            "WHERE company_id = ? AND module = ? ORDER BY observed_at, rowid",
-            (company_id, module),
-        ) as cur:
-            for code, num, text in await cur.fetchall():
-                latest[code] = (num, text or "")
-                ever.add((code, text or ""))
-        return latest, ever
+class EarlierBuild(RuntimeError):
+    """A schema 25 file made by an earlier build of the slim database: it
+    lacks tables or columns this release reads."""
 
 
-async def _backfill_company_ids(db) -> None:
-    """The keys v17's SQL can't read: domains (free-mail and directory ones
-    left out), phones in E.164 and names in their town, for every company
-    already on file."""
-    async with db.execute(
-        "SELECT id, name, cui, external_id, domain, phone, location, source FROM companies"
-    ) as cur:
-        names = [c[0] for c in cur.description]
-        while True:
-            rows = await cur.fetchmany(2000)
-            if not rows:
-                break
-            payload = []
-            for row in rows:
-                company = dict(zip(names, row))
-                payload += [(company["id"], kind, value, company.get("source") or "")
-                            for kind, value in resolver.identifiers(company)]
-            await db.executemany(
-                "INSERT OR IGNORE INTO company_ids (company_id, kind, value, source) "
-                "VALUES (?, ?, ?, ?)", payload)
+# The files whose shape was checked in this process: (path, inode, size of
+# the schema). A file is checked once, again when it is replaced.
+_SHAPES_CHECKED: set[tuple] = set()
 
 
-async def _resolve_on_file(db) -> None:
-    """v17's Python step: every company's keys, then the companies on file
-    matched against each other once (resolver.scan), so duplicates from
-    before the resolver merge or reach the review list like new ones."""
-    await _backfill_company_ids(db)
-    await resolver.scan(db)
-    await _flush_company_search(db)
-
-
-async def _flush_company_search(db) -> None:
-    """Reindex the companies whose activities changed, once each. Runs in
-    the writer's transaction, before its commit. Nothing to do (a batch
-    that changed no activity) costs one lookup; otherwise the marked
-    companies lead (CROSS JOIN keeps that order), so the work is theirs
-    alone, not a walk over every company on file."""
-    async with db.execute("SELECT EXISTS (SELECT 1 FROM company_search_dirty)") as cur:
-        if not (await cur.fetchone())[0]:
-            return
-    await db.execute(
-        "DELETE FROM company_search WHERE rowid IN (SELECT i.rid "
-        "FROM company_search_dirty d CROSS JOIN company_search_ids i "
-        "ON i.company_id = d.company_id)")
-    await db.execute(
-        "INSERT INTO company_search (rowid, company_id, name, activity, place) "
-        "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
-        "FROM company_search_dirty d "
-        "CROSS JOIN company_search_ids i ON i.company_id = d.company_id "
-        "CROSS JOIN company_search_source s ON s.company_id = d.company_id")
-    await db.execute("DELETE FROM company_search_dirty")
-
-
-def _statements(script: str):
-    """A migration script's statements, one at a time (a trigger's body,
-    semicolons and all, stays one statement)."""
-    pending = ""
-    for line in script.splitlines(keepends=True):
-        pending += line
-        if sqlite3.complete_statement(pending):
-            yield pending
-            pending = ""
-    if re.sub(r"--[^\n]*", "", pending).strip():
-        yield pending
-
-
-# What an install that predates modules has on file from the parts of the
-# old prospecting agent that ran with no switch: each module listed here stays on through the
-# upgrade when its query finds a row (switches.upgrade_enabled).
-_MODULE_TRACES = {
-    # Tools detected on a site.
-    "web_marketing": "SELECT 1 FROM companies WHERE COALESCE(tech_stack_json, '[]') "
-                     "NOT IN ('', '[]')",
-    # Open roles from a careers page, or contacts from the job-board sweep.
-    "hiring": "SELECT 1 FROM companies WHERE signals_json LIKE '%\"hiring\"%' "
-              "UNION ALL SELECT 1 FROM prospects WHERE source = 'job_board'",
-}
-
-
-async def _modules_first_seen(db) -> None:
-    """v18's Python step: the install meets modules. The old dashboard Email
-    switch becomes the email_outreach module's (the old key stays, so an
-    older Harvey started on this database still reads it). On an install
-    that already ran (it has a vocabulary or companies), modules that ship
-    off but were working stay on (switches.upgrade_enabled); a new install
-    takes the manifests' defaults. Only the shipped manifests count here: a
-    pack in data/modules can't stop the database from opening."""
-    from harvey.modules import switches
-
-    async with db.execute("SELECT value FROM settings WHERE key = ?",
-                          (switches.LEGACY_EMAIL_KEY,)) as cur:
-        row = await cur.fetchone()
-    if row is not None and row[0] == "on":
-        await db.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-            (switches.KEY.format(switches.EMAIL_MODULE), switches.ON))
-
-    async with db.execute("SELECT (SELECT COUNT(*) FROM signal_codes) "
-                          "+ (SELECT COUNT(*) FROM companies)") as cur:
-        (existing,) = await cur.fetchone()
-    if not existing:
+def _check_shape(path: str, overlay_schema) -> None:
+    try:
+        st = os.stat(path)
+    except OSError:
         return
-    async with db.execute("SELECT code FROM signal_codes WHERE status = 'confirmed'") as cur:
-        confirmed = {r[0] for r in await cur.fetchall()}
-    used = set()
-    for module_id, sql in _MODULE_TRACES.items():
-        async with db.execute(f"SELECT EXISTS ({sql})") as cur:
-            if (await cur.fetchone())[0]:
-                used.add(module_id)
-    kept = switches.upgrade_enabled(switches.shipped(), switches.present_env_keys(),
-                                    confirmed, used)
-    for module_id in kept:
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                         (switches.KEY.format(module_id), switches.ON))
-    if kept:
-        logger.info("Modules kept on from before the upgrade: %s", ", ".join(kept))
-
-
-async def _contacts_first_seen(db) -> None:
-    """v21's Python step: the phones its SQL backfilled get their display
-    form and line type, and a prospect's own phone (as typed) becomes a
-    contact of its person (parsing a number needs phonenumbers)."""
-    await contacts.backfill_phones(db)
-    await contacts.backfill_prospect_phones(db)
-
-
-# Python steps run right after a migration, in its transaction.
-_AFTER_MIGRATION = {17: _resolve_on_file, 18: _modules_first_seen, 21: _contacts_first_seen}
-
-
-_UPSERT_SIGNAL_CODE = """INSERT INTO signal_codes
-       (code, label, description, category, value_type,
-        collector, cost_note, confidence_floor, status,
-        module, subject, unit, cardinality, keyed_by, absence,
-        when_known, available)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'proposed'),
-           ?, ?, ?, ?, ?, ?, ?, ?)
-   ON CONFLICT(code) DO UPDATE SET
-       label = excluded.label,
-       description = excluded.description,
-       category = excluded.category,
-       value_type = excluded.value_type,
-       collector = excluded.collector,
-       cost_note = excluded.cost_note,
-       confidence_floor = excluded.confidence_floor,
-       status = COALESCE(?, signal_codes.status),
-       module = excluded.module,
-       subject = excluded.subject,
-       unit = excluded.unit,
-       cardinality = excluded.cardinality,
-       keyed_by = excluded.keyed_by,
-       absence = excluded.absence,
-       when_known = excluded.when_known,
-       available = excluded.available,
-       updated_at = CURRENT_TIMESTAMP"""
-
-
-def _signal_code_params(code: str, *, label: str = "", description: str = "",
-                        category: str = "", value_type: str = "text",
-                        collector: str = "", cost_note: str = "",
-                        confidence_floor: float = 0.0, status: str | None = None,
-                        module: str = "", subject: str = "company", unit: str = "",
-                        cardinality: str = "one", keyed_by: str = "",
-                        absence: str = "unknown", when_known: str = "enrich",
-                        available: bool = True) -> tuple:
-    return (code, label, description, category, value_type, collector,
-            cost_note, float(confidence_floor), status,
-            module, subject, unit, cardinality, keyed_by, absence, when_known,
-            1 if available else 0, status)
-
-
-_RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
-_YEAR_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'year')"
-
-
-def _current_cte(codes: int = 0) -> str:
-    """The current-reading CTEs (latest, ranked, positive, current_obs; see
-    StateManager). ``codes``: how many signal codes to read, as that many
-    ``?`` four times over (pass the codes four times): every CTE then reads
-    those signals' rows only, not every observation on file. The readings
-    are the same, since each is the newest row of its own company and code."""
-    marks = ",".join("?" * codes)
-    where_only = f" WHERE signal_code IN ({marks})" if codes else ""
-    and_only = f" AND o.signal_code IN ({marks})" if codes else ""
-    return f"""
-    WITH latest AS (
-        SELECT o.* FROM observations o
-        JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
-              FROM observations{where_only} GROUP BY company_id, signal_code) newest
-          ON newest.company_id = o.company_id
-         AND newest.signal_code = o.signal_code
-         AND newest.t = o.observed_at
-        WHERE o.signal_code NOT IN {_RANK_CODES}
-          AND o.signal_code NOT IN {_YEAR_CODES}{and_only}
-        UNION ALL
-        SELECT o.* FROM observations o
-        WHERE o.signal_code IN {_YEAR_CODES}{and_only}
-          AND o.rowid = (
-              SELECT n.rowid FROM observations n
-              WHERE n.company_id = o.company_id
-                AND n.signal_code = o.signal_code
-              ORDER BY CAST(n.value_text AS INTEGER) DESC, n.observed_at DESC,
-                       n.rowid DESC LIMIT 1)
-    ),
-    ranked AS (
-        SELECT o.* FROM observations o
-        WHERE o.signal_code IN {_RANK_CODES}{and_only}
-          AND o.rowid = (
-              SELECT n.rowid FROM observations n
-              WHERE n.company_id = o.company_id
-                AND n.signal_code = o.signal_code
-                AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
-              ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1)
-          AND NOT (COALESCE(o.value_text, '') = '' AND EXISTS (
-              SELECT 1 FROM observations p
-              WHERE p.company_id = o.company_id
-                AND p.signal_code = o.signal_code
-                AND COALESCE(p.value_text, '') != ''))
-    ),
-    positive AS (
-        SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
-        UNION ALL
-        SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
-    ),
-    current_obs AS (
-        SELECT * FROM latest UNION ALL SELECT * FROM ranked
-    )
-    """
+    con = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)
+    try:
+        key = (str(Path(path).resolve()), st.st_ino,
+               con.execute("PRAGMA schema_version").fetchone()[0])
+        if key in _SHAPES_CHECKED:
+            return
+        lacks = overlay_schema.missing(con)
+    finally:
+        con.close()
+    if lacks:
+        raise EarlierBuild(f"{Path(path).name} was made by an earlier build of the slim database "
+                           f"and lacks {', '.join(lacks[:8])}"
+                           + (f" and {len(lacks) - 8} more" if len(lacks) > 8 else "")
+                           + ": move it away, rename harvey.db.v24 back to harvey.db and run "
+                             "harvey upgrade again")
+    _SHAPES_CHECKED.add(key)
 
 
 class NotOnOverlay(RuntimeError):
-    """A read the upgraded database (schema 25) has no version of yet:
-    raised, never answered from tables it doesn't have."""
+    """A read the slim database (schema 25) has no version of: raised,
+    never answered from tables it doesn't have."""
 
 
 class StateManager:
@@ -2171,19 +419,6 @@ class StateManager:
         # The open database's schema version, read once (25: the overlay,
         # whose writes harvey/overlay/store.py makes).
         self._schema: int | None = None
-
-    async def _overlay(self) -> bool:
-        """Whether the database is the overlay (schema 25)."""
-        if self._schema is None:
-            from harvey.overlay import store
-
-            self._schema = await asyncio.to_thread(store.version, self.db_path)
-        return self._schema == 25
-
-    async def _v24_only(self, what: str) -> None:
-        """Raise NotOnOverlay on schema 25 for a read it has no version of."""
-        if await self._overlay():
-            raise NotOnOverlay(f"{what} isn't available on the upgraded database yet")
 
     async def _on_overlay(self, method: str, *args, **kwargs):
         """overlay.store's ``method`` in a write transaction of its own, in
@@ -2201,10 +436,8 @@ class StateManager:
 
     async def recount_register_tally(self, codes=None) -> int:
         """Count the register signals over the firms in Harvey for the
-        registers' current load marks (overlay.reads.recount_register_tally;
-        0 on schema 24, which keeps them as observations)."""
-        if not await self._overlay():
-            return 0
+        registers' current load marks (overlay.reads.recount_register_tally).
+        Returns how many rows were written."""
         from harvey.overlay import reads
 
         return await asyncio.to_thread(reads.recount_register_tally, self.db_path, codes)
@@ -2238,23 +471,12 @@ class StateManager:
 
     @asynccontextmanager
     async def batch(self):
-        """A CompanyBatch: many company writes on one connection, committed
-        once at the end (rolled back if the block raises), with the search
-        index refreshed once for every company touched. For importers that
-        save thousands of companies, where opening a connection and
+        """A store.Batch: many company writes on one connection, committed
+        once at the end (rolled back if the block raises). For importers
+        that save thousands of companies, where opening a connection and
         committing per call is most of the time."""
-        if await self._overlay():
-            async with self._overlay_batch() as batch:
-                yield batch
-            return
-        async with self._connect() as db:
-            try:
-                yield CompanyBatch(db)
-                await self._flush_company_search(db)
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
+        async with self._overlay_batch() as batch:
+            yield batch
 
     @asynccontextmanager
     async def _overlay_batch(self):
@@ -2274,112 +496,57 @@ class StateManager:
             await asyncio.to_thread(con.close)
 
     async def init_db(self):
-        """Create/upgrade the schema. Safe to call on every startup."""
+        """Create the database (schema 25) when there is none, and bring in
+        what modules declare. Safe to call on every startup. An older
+        schema is never changed here: it waits for the upgrade
+        (harvey/upgrade.py), and this raises UpgradeNeeded."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        # (A second process starting during an upgrade waits for it.)
-        async with self._connect(timeout=MIGRATION_TIMEOUT_SECONDS) as db:
-            # WAL is persistent in the DB file: readers (dashboard) never
-            # block the writer (agent) and vice versa.
+        from harvey import upgrade
+        from harvey.overlay import schema as overlay_schema
+        from harvey.overlay import store
+
+        # No new empty database in place of one the upgrade is switching.
+        if not Path(self.db_path).exists() and \
+                await asyncio.to_thread(upgrade.switch_pending, Path(self.db_path)):
+            raise UpgradeNeeded(0)
+        version = await asyncio.to_thread(_open_or_create, self.db_path, overlay_schema)
+        self._schema = version
+        if version != overlay_schema.VERSION:
+            raise UpgradeNeeded(version)
+        await asyncio.to_thread(_check_shape, self.db_path, overlay_schema)
+        # Only what modules declare is brought in (looked at first: most
+        # starts have nothing to write, and a page must not wait on a
+        # registry pull's write lock).
+        if await asyncio.to_thread(store.call, self.db_path, "dictionaries_stale"):
+            await self._on_overlay("sync_dictionaries")
+
+    async def needs_upgrade(self) -> bool:
+        """Whether the file is an older schema waiting for the upgrade, or
+        the upgrade's switch is unfinished beside it (read again each time:
+        the upgrade replaces the file)."""
+        from harvey import upgrade
+
+        return await asyncio.to_thread(upgrade.waiting, Path(self.db_path))
+
+    async def wait_until_upgraded(self, stop: asyncio.Event, poll: float = 10.0) -> bool:
+        """Wait while the database waits for the upgrade (a worker or the
+        heartbeat never runs on an older schema). False when ``stop`` was
+        set first."""
+        said = False
+        while await self.needs_upgrade():
+            if not said:
+                logger.warning("harvey.db needs the upgrade to the slim database (the "
+                               "dashboard's upgrade screen, or harvey upgrade): waiting for it.")
+                said = True
             try:
-                await db.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError:
-                # A new file another process is setting up at this moment
-                # (changing the mode needs it alone); it sets the same mode.
+                await asyncio.wait_for(stop.wait(), timeout=poll)
+                return False
+            except asyncio.TimeoutError:
                 pass
-            await db.execute("PRAGMA synchronous=NORMAL")
-
-            async with db.execute("PRAGMA user_version") as cursor:
-                (version,) = await cursor.fetchone()
-            self._schema = version
-            if version == 25:
-                # The overlay: its schema is created whole (overlay/schema.py)
-                # or by the upgrade; only what modules declare is brought in
-                # (looked at first: most starts have nothing to write, and
-                # a page must not wait on a registry pull's write lock).
-                from harvey.overlay import store
-
-                if await asyncio.to_thread(store.call, self.db_path, "dictionaries_stale"):
-                    await self._on_overlay("sync_dictionaries")
-                return
-
-            for target, script in enumerate(MIGRATIONS, start=1):
-                if version >= target:
-                    continue
-                # One write transaction per migration: its script, its
-                # Python step and the version stamp land together or not at
-                # all, so a start killed halfway never leaves an ALTER
-                # applied with the version unchanged. The version is read
-                # again under the lock: another process starting at the
-                # same time may have run it while this one waited.
-                # (Statement by statement: executescript commits first.)
-                await db.execute("BEGIN IMMEDIATE")
-                try:
-                    async with db.execute("PRAGMA user_version") as cursor:
-                        (version,) = await cursor.fetchone()
-                    if version < target:
-                        for statement in _statements(script):
-                            await db.execute(statement)
-                        if target in _AFTER_MIGRATION:
-                            await _AFTER_MIGRATION[target](db)
-                        await db.execute(f"PRAGMA user_version = {target}")
-                        version = target
-                    await db.commit()
-                except BaseException:
-                    await db.rollback()
-                    raise
-
-            await self._seed_caen(db)
-
-    async def _seed_caen(self, db) -> bool:
-        """Load the CAEN nomenclature into caen_classes when the shipped one
-        differs from what the database holds (first run, or an updated CSV),
-        then rebuild the search index so it reads the new names. True when
-        it changed anything."""
-        import hashlib
-
-        from harvey.caen import reference_rows
-
-        rows = reference_rows()
-        fingerprint = hashlib.sha256(json.dumps(rows).encode()).hexdigest()
-        async with db.execute(
-            "SELECT value FROM settings WHERE key = ?", (CAEN_REFERENCE_KEY,)
-        ) as cur:
-            row = await cur.fetchone()
-        if row and row[0] == fingerprint:
-            return False
-        await db.execute("DELETE FROM caen_classes")
-        await db.executemany(
-            "INSERT INTO caen_classes (code, version, name_ro, name_en, keywords) "
-            "VALUES (?, ?, ?, ?, ?)", rows)
-        await self._rebuild_company_search(db)
-        await db.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
-            "updated_at = CURRENT_TIMESTAMP", (CAEN_REFERENCE_KEY, fingerprint))
-        await db.commit()
-        return True
-
-    @staticmethod
-    async def _rebuild_company_search(db):
-        await db.execute(
-            "INSERT OR IGNORE INTO company_search_ids (company_id) SELECT id FROM companies")
-        await db.execute("DELETE FROM company_search")
-        await db.execute(
-            "INSERT INTO company_search (rowid, company_id, name, activity, place) "
-            "SELECT i.rid, s.company_id, s.name, s.activity, s.place "
-            "FROM company_search_source s "
-            "JOIN company_search_ids i ON i.company_id = s.company_id")
-        await db.execute("DELETE FROM company_search_dirty")
-
-    @staticmethod
-    async def _flush_company_search(db):
-        await _flush_company_search(db)
+        self._schema = None
+        return not stop.is_set()
 
     # ── Companies ──
-
-    @staticmethod
-    def _company_from_row(row: aiosqlite.Row) -> Company:
-        return _company_from_row(row)
 
     async def add_company(self, company: Company) -> str:
         """Insert a company, or return the id of the one already recorded.
@@ -2389,61 +556,24 @@ class StateManager:
         website still has to dedup across re-runs, and for anyone selling
         websites those are the best prospects on the list.
         """
-        if await self._overlay():
-            return await self._on_overlay("add_company", company)
-        async with self._connect() as db:
-            company_id = await _insert_company(db, company)
-            await db.commit()
-        return company_id
+        return await self._on_overlay("add_company", company)
 
     async def match_company(self, company: Company, extra_ids=(),
                             declared_domain: bool = False) -> "resolver.Match":
         """The company on file ``company`` is, if any (resolver.match)."""
-        if await self._overlay():
-            return await self._on_overlay("match_company", company, extra_ids, declared_domain)
-        async with self._connect() as db:
-            return await resolver.match(db, company, extra_ids, declared_domain)
+        return await self._on_overlay("match_company", company, extra_ids, declared_domain)
 
     async def save_company(self, company: Company, extra_ids=()) -> Resolution:
         """Save a company from an outside source through the resolver: the
         same company on file gets its keys (or is merged with it), a
         possible one goes to the review list (_save_company)."""
-        if await self._overlay():
-            return await self._on_overlay("save_company", company, None, extra_ids)
-        async with self._connect() as db:
-            # The match and the save in one write transaction: two saves of
-            # one business at once can't both find nothing and both insert.
-            await db.execute("BEGIN IMMEDIATE")
-            match = await resolver.match(db, company, extra_ids)
-            result = await _save_company(db, company, match, extra_ids)
-            await self._flush_company_search(db)
-            await db.commit()
-        return result
+        return await self._on_overlay("save_company", company, None, extra_ids)
 
     async def duplicates(self, status: str = "pending", limit: int = 100) -> list[dict]:
         """Pairs on the review list with ``status`` (pending | merged |
         separate), most likely first, each side as the panel shows it. The
         pending ones as the panel decides them are duplicate_groups."""
-        await self._v24_only("the duplicate review list")
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT company_a, company_b, score, reasons_json, status, created_at, "
-                "decided_at FROM match_candidates WHERE status = ? "
-                "ORDER BY score DESC, created_at DESC LIMIT ?", (status, limit)
-            ) as cur:
-                pairs = [dict(r) for r in await cur.fetchall()]
-            ids = list({cid for p in pairs for cid in (p["company_a"], p["company_b"])})
-            sides = await self._duplicate_sides(db, ids)
-        out = []
-        for p in pairs:
-            try:
-                reasons = json.loads(p.pop("reasons_json") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                reasons = []
-            out.append({**p, "reasons": reasons, "a": sides.get(p["company_a"]),
-                        "b": sides.get(p["company_b"])})
-        return out
+        return await self._read("duplicates", status, limit)
 
     async def duplicate_groups(self, limit: int = 100) -> tuple[int, list[dict]]:
         """(how many groups there are, the first ``limit``): the review list
@@ -2452,178 +582,38 @@ class StateManager:
         most) and, per member, whether it is another firm than the group's
         (``conflict``: a CUI other than the keeper's, or than the first
         member's when the keeper has none, so never merged with it)."""
-        await self._v24_only("the duplicate review list")
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            found = await resolver.groups(db)
-            shown = found[:max(1, limit)]
-            ids = [cid for g in shown for cid in g["members"]]
-            sides = await self._duplicate_sides(db, ids)
-            firm = await resolver._firms(db, ids)
-            for group in shown:
-                order = await resolver.keeper_order(db, group["members"])
-                keeper = order[0] if order else group["members"][0]
-                group["keeper"] = keeper
-                reasons: list[dict] = []
-                for pair in group["pairs"]:
-                    for r in pair["reasons"]:
-                        if r.get("code") not in {x.get("code") for x in reasons}:
-                            reasons.append(r)
-                group["reasons"] = reasons
-                group["key"] = ",".join(group["members"])
-                members = order + [m for m in group["members"] if m not in order]
-                # The firm the group merges into: the keeper's, or (a keeper
-                # without a CUI) the first member's that has one.
-                anchor = firm.get(keeper) or next(
-                    (firm[cid] for cid in members if firm.get(cid)), None)
-                group["members"] = [
-                    {**(sides.get(cid) or {"id": cid}), "keeper": cid == keeper,
-                     "conflict": bool(firm.get(cid) and anchor and firm[cid] != anchor)}
-                    for cid in members]
-        return len(found), shown
-
-    @staticmethod
-    async def _duplicate_sides(db, ids: list[str]) -> dict[str, dict]:
-        if not ids:
-            return {}
-        marks = ",".join("?" * len(ids))
-        async with db.execute(
-            f"SELECT id, name, cui, location, address, phone, domain, website, source, "
-            f"merged_into, created_at FROM companies WHERE id IN ({marks})", ids
-        ) as cur:
-            sides = {r["id"]: dict(r) for r in await cur.fetchall()}
-        async with db.execute(
-            f"SELECT company_id, kind, value, source FROM company_ids "
-            f"WHERE company_id IN ({marks}) AND +kind IN ('phone', 'domain', 'external', 'email') "
-            f"ORDER BY created_at, rowid", ids
-        ) as cur:
-            for r in await cur.fetchall():
-                side = sides.get(r["company_id"])
-                if side is None:
-                    continue
-                key = {"phone": "phones", "domain": "domains", "external": "listings",
-                       "email": "emails"}[r["kind"]]
-                if r["value"] not in side.setdefault(key, []):
-                    side[key].append(r["value"])
-                if r["source"] and r["source"] not in side.setdefault("sources", []):
-                    side["sources"].append(r["source"])
-        async with db.execute(
-            f"SELECT company_id, COUNT(*) FROM locations WHERE company_id IN ({marks}) "
-            f"GROUP BY company_id", ids
-        ) as cur:
-            for cid, n in await cur.fetchall():
-                if cid in sides:
-                    sides[cid]["locations"] = n
-        for side in sides.values():
-            side.setdefault("locations", 0)
-            for key in ("phones", "domains", "listings", "emails", "sources"):
-                side.setdefault(key, [])
-            if side.get("source") and side["source"] not in side["sources"]:
-                side["sources"].insert(0, side["source"])
-        return sides
+        return await self._read("duplicate_groups", limit)
 
     async def count_duplicates(self) -> int:
         """How many groups wait on the review list."""
-        await self._v24_only("the duplicate review list")
-        async with self._connect() as db:
-            return len(await resolver.groups(db))
+        return await self._read("count_duplicates")
 
     async def merge_companies(self, keep: str, merged: str, decided_by: str = "you") -> int:
         """Merge ``merged`` into ``keep`` (resolver.merge). Raises
         resolver.MergeRefused when it can't be done."""
-        if await self._overlay():
-            return await self._on_overlay("merge_companies", keep, merged, decided_by)
-        async with self._connect() as db:
-            # Checks and writes in one write transaction: a second merge of
-            # the same pair (a double click, or the other way round at the
-            # same moment) waits, then finds it merged and is refused.
-            await db.execute("BEGIN IMMEDIATE")
-            async with db.execute(
-                "SELECT score, reasons_json FROM match_candidates WHERE "
-                "(company_a = ? AND company_b = ?) OR (company_a = ? AND company_b = ?)",
-                (keep, merged, merged, keep)
-            ) as cur:
-                row = await cur.fetchone()
-            reasons = json.loads(row[1] or "[]") if row else []
-            merge_id = await resolver.merge(db, keep, merged, score=row[0] if row else None,
-                                            reasons=reasons, decided_by=decided_by)
-            await self._flush_company_search(db)
-            await db.commit()
-        return merge_id
+        return await self._on_overlay("merge_companies", keep, merged, decided_by)
 
     async def merge_pair(self, a: str, b: str) -> dict:
         """"Same company" on a review pair: the one with a CUI (the
         registry's record) survives; otherwise the older one."""
-        if await self._overlay():
-            return await self._on_overlay("merge_pair", a, b)
-        if a == b:
-            raise resolver.MergeRefused("same_company")
-        async with self._connect() as db:
-            async with db.execute("SELECT id FROM companies WHERE id IN (?, ?)", (a, b)) as cur:
-                if len(await cur.fetchall()) != 2:
-                    raise resolver.MergeRefused("not_found")
-            order = await resolver.keeper_order(db, (a, b))
-        if len(order) != 2:
-            raise resolver.MergeRefused("already_merged")
-        keep, merged = order
-        merge_id = await self.merge_companies(keep, merged)
-        return {"survivor": keep, "merged": merged, "merge_id": merge_id}
+        return await self._on_overlay("merge_pair", a, b)
 
     async def merge_group(self, keep: str, members, out=(), decided_by: str = "you") -> dict:
         """"Same company" on a group: every one of ``members`` merges into
         ``keep`` (resolver.merge_group), and each of ``out`` (taken out of
         the group by the person) is marked a different company from them,
         in one transaction. Raises resolver.MergeRefused."""
-        if await self._overlay():
-            return await self._on_overlay("merge_group", keep, members, out, decided_by)
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                done = await resolver.merge_group(db, keep, members, decided_by=decided_by)
-                if out:
-                    await resolver.separate(db, list(out), [keep])
-            except Exception:
-                await db.rollback()
-                raise
-            await self._flush_company_search(db)
-            await db.commit()
-        return done
+        return await self._on_overlay("merge_group", keep, members, out, decided_by)
 
     async def separate_group(self, out, rest=()) -> int:
         """Take ``out`` out of their group: each is a different company from
         every one of ``rest`` (or, with no ``rest``, they are all different
         from one another). Raises resolver.MergeRefused for an unknown company."""
-        if await self._overlay():
-            return await self._on_overlay("separate_group", out, rest)
-        ids = list(dict.fromkeys([*out, *rest]))
-        if len(ids) < 2:
-            raise resolver.MergeRefused("same_company")
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            marks = ",".join("?" * len(ids))
-            async with db.execute(f"SELECT COUNT(*) FROM companies WHERE id IN ({marks})",
-                                  ids) as cur:
-                if (await cur.fetchone())[0] != len(ids):
-                    await db.rollback()
-                    raise resolver.MergeRefused("not_found")
-            n = await resolver.separate(db, list(out), list(rest))
-            await db.commit()
-        return n
+        return await self._on_overlay("separate_group", out, rest)
 
     async def undo_group(self, company_id: str) -> list[dict]:
         """Undo the whole group merge ``company_id`` kept or joined."""
-        if await self._overlay():
-            return await self._on_overlay("undo_group", company_id)
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                done = await resolver.undo_group(db, company_id)
-            except Exception:
-                await db.rollback()
-                raise
-            await self._flush_company_search(db)
-            await db.commit()
-        return done
+        return await self._on_overlay("undo_group", company_id)
 
     async def scan_duplicates(self) -> dict:
         """Look for duplicates among every company on file (resolver.scan):
@@ -2632,77 +622,36 @@ class StateManager:
         import time
 
         started = time.monotonic()
-        async with self._connect() as db:
-            scored = await resolver.scan_candidates(db)
-            fresh = await resolver.unknown_pairs(db, scored)
-            found = time.monotonic()
-            done = {"merged": 0, "review": 0}
-            # A few hundred pairs per write transaction: other writers (an
-            # ANAF check saving its batches) wait a moment, not the whole pass.
-            for at in range(0, len(fresh), SCAN_WRITE_BATCH):
-                await db.execute("BEGIN IMMEDIATE")
-                try:
-                    part = await resolver.apply_scan(db, fresh[at:at + SCAN_WRITE_BATCH])
-                except Exception:
-                    await db.rollback()
-                    raise
-                await self._flush_company_search(db)
-                await db.commit()
-                done = {k: done[k] + part[k] for k in done}
+        from harvey.overlay import store
+
+        scored = await asyncio.to_thread(store.call, self.db_path, "scan_candidates")
+        fresh = await asyncio.to_thread(store.call, self.db_path, "unknown_pairs", scored)
+        found = time.monotonic()
+        done = {"merged": 0, "review": 0}
+        for at in range(0, len(fresh), SCAN_WRITE_BATCH):
+            part = await self._on_overlay("apply_scan", fresh[at:at + SCAN_WRITE_BATCH])
+            done = {k: done[k] + part[k] for k in done}
         return {**done, "pairs": len(scored), "read_s": round(found - started, 1),
                 "write_s": round(time.monotonic() - found, 1)}
 
     async def separate_companies(self, a: str, b: str) -> bool:
         """"Different companies": the pair leaves the review list for good.
         Raises resolver.MergeRefused for an unknown company or a pair of one."""
-        if await self._overlay():
-            return await self._on_overlay("separate_companies", a, b)
-        if a == b:
-            raise resolver.MergeRefused("same_company")
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            async with db.execute("SELECT COUNT(*) FROM companies WHERE id IN (?, ?)",
-                                  (a, b)) as cur:
-                if (await cur.fetchone())[0] != 2:
-                    await db.rollback()
-                    raise resolver.MergeRefused("not_found")
-            changed = await resolver.decide_candidate(db, a, b, "separate")
-            if not changed:
-                await db.execute(
-                    "INSERT OR IGNORE INTO match_candidates (company_a, company_b, status, "
-                    "decided_at) VALUES (?, ?, 'separate', CURRENT_TIMESTAMP)", (a, b))
-            await db.commit()
-        return True
+        return await self._on_overlay("separate_companies", a, b)
 
     async def undo_merge(self, merged: str) -> dict:
         """Undo the merge that took ``merged`` (resolver.undo)."""
-        if await self._overlay():
-            return await self._on_overlay("undo_merge", merged)
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")      # one undo at a time
-            result = await resolver.undo(db, merged)
-            await self._flush_company_search(db)
-            await db.commit()
-        return result
+        return await self._on_overlay("undo_merge", merged)
 
     async def remove_company(self, company_id: str) -> dict:
         """Remove a firm from Harvey (overlay.store.Store.remove_company):
         refused (store.RemoveRefused) for one in a merge or named by
-        outreach. Only the overlay keeps firms this way: on schema 24 the
-        company stays."""
-        if not await self._overlay():
-            from harvey.overlay.store import RemoveRefused
-
-            raise RemoveRefused("not_supported", "removing a company needs the upgraded database")
+        outreach."""
         return await self._on_overlay("remove_company", company_id)
-
-    async def is_overlay(self) -> bool:
-        """Whether the database is the overlay (schema 25)."""
-        return await self._overlay()
 
     async def pull_records(self, records, **kwargs) -> list[tuple[str, bool, bool, bool]]:
         """A register pull's records marked as Harvey's in one bulk write
-        (overlay.store.Store.pull; the overlay only)."""
+        (overlay.store.Store.pull)."""
         return await self._on_overlay("pull", records, **kwargs)
 
     async def match_records(self, records) -> tuple[int, list]:
@@ -2714,60 +663,32 @@ class StateManager:
 
     async def held_ids(self, scheme: str, keys) -> dict:
         """{key: the company holding it} for keys of an identifier scheme
-        (the overlay; {} on schema 24, which keeps them by kind)."""
-        if not await self._overlay():
-            return {}
+        (overlay.store.Store.held)."""
         return await self._on_overlay("held", scheme, list(keys))
+
+    async def refresh_orders(self) -> int:
+        """Every firm's place in the register's name and place orders, taken
+        again for its current load (overlay/orders.py)."""
+        from harvey.overlay import orders
+
+        return await asyncio.to_thread(orders.refresh_file, self.db_path)
+
+    async def name_register_people(self, company_id: str) -> int:
+        """The people a register names at a company kept as Harvey's own
+        (overlay.store.Store.name_register_people)."""
+        return await self._on_overlay("name_register_people", company_id)
 
     async def merges(self, limit: int = 50) -> list[dict]:
         """Merges still in force, newest first, both sides as the panel shows them."""
-        await self._v24_only("the merges list")
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT id, survivor, merged, score, reasons_json, decided_by, created_at, "
-                "group_id FROM company_merges WHERE undone_at IS NULL ORDER BY id DESC LIMIT ?",
-                (limit,)
-            ) as cur:
-                rows = [dict(r) for r in await cur.fetchall()]
-            sides = await self._duplicate_sides(
-                db, list({x for r in rows for x in (r["survivor"], r["merged"])}))
-        for r in rows:
-            try:
-                r["reasons"] = json.loads(r.pop("reasons_json") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                r["reasons"] = []
-            r["a"], r["b"] = sides.get(r["survivor"]), sides.get(r["merged"])
-        return rows
+        return await self._read("merges", limit)
 
     async def company_brief(self, company_id: str) -> list[str]:
         """Short true facts about a company for the Writer, from its record:
         where it is, what it does (its activity when no industry is on
         file), and the latest reading of the signals that make an email
         specific (company_brief_lines). [] for a company not on file."""
-        if await self._overlay():
-            found = await self._read("company_brief", company_id, list(BRIEF_CODES))
-            return company_brief_lines(*found) if found else []
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                    "SELECT location, industry FROM companies WHERE id = ?",
-                    (company_id,)) as cur:
-                company = await cur.fetchone()
-            if company is None:
-                return []
-            marks = ",".join("?" * len(BRIEF_CODES))
-            async with db.execute(
-                    "SELECT signal_code, value_num, value_text, observed_at FROM observations "
-                    f"WHERE company_id = ? AND signal_code IN ({marks}) "
-                    "ORDER BY observed_at DESC, rowid DESC", (company_id, *BRIEF_CODES)) as cur:
-                rows = [dict(r) for r in await cur.fetchall()]
-        activity = ""
-        if not (company["industry"] or "").strip():
-            classes = (await self.get_company_activities([company_id])).get(company_id) or []
-            activity = next((c["name_en"] or c["name"] for c in classes
-                             if c["name_en"] or c["name"]), "")
-        return company_brief_lines(company["location"] or "", activity, rows)
+        found = await self._read("company_brief", company_id, list(BRIEF_CODES))
+        return company_brief_lines(*found) if found else []
 
     async def _overlay_company(self, method: str, *args) -> Company | None:
         """A company as the overlay's reads describe it (reads.Reader's
@@ -2779,21 +700,10 @@ class StateManager:
         return Company(**fields)
 
     async def get_company(self, company_id: str) -> Company | None:
-        if await self._overlay():
-            return await self._overlay_company("company", company_id)
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM companies WHERE id = ?", (company_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return self._company_from_row(row) if row else None
+        return await self._overlay_company("company", company_id)
 
     async def get_company_by_domain(self, domain: str) -> Company | None:
-        if await self._overlay():
-            return await self._overlay_company("company_by", "domain", _norm(domain))
-        async with self._connect() as db:
-            return await _company_by(db, "domain", _norm(domain))
+        return await self._overlay_company("company_by", "domain", _norm(domain))
 
     async def get_company_by_external_id(self, external_id: str) -> Company | None:
         """Look a company up by its provider-stable id.
@@ -2803,20 +713,14 @@ class StateManager:
         """
         if not external_id:
             return None
-        if await self._overlay():
-            return await self._overlay_company("company_by", "external_id", external_id)
-        async with self._connect() as db:
-            return await _company_by(db, "external_id", external_id)
+        return await self._overlay_company("company_by", "external_id", external_id)
 
     async def get_company_by_cui(self, cui: str) -> Company | None:
         """Look a company up by its registry tax code (CUI)."""
         cui = (cui or "").strip()
         if not cui:
             return None
-        if await self._overlay():
-            return await self._overlay_company("company_by", "cui", cui)
-        async with self._connect() as db:
-            return await _company_by(db, "cui", cui)
+        return await self._overlay_company("company_by", "cui", cui)
 
     async def fill_company_fields(self, company_id: str, **fields) -> list[str]:
         """Set the given fields where the company has none yet, and always
@@ -2829,12 +733,7 @@ class StateManager:
         registry re-import is how a moved office reaches the record. Returns
         the columns changed.
         """
-        if await self._overlay():
-            return await self._on_overlay("fill_company_fields", company_id, **fields)
-        async with self._connect() as db:
-            changed = await _fill_company_fields(db, company_id, fields)
-            await db.commit()
-        return changed
+        return await self._on_overlay("fill_company_fields", company_id, **fields)
 
     # ── Company activities (CAEN) and local search ──
 
@@ -2846,13 +745,7 @@ class StateManager:
         removed (a re-import of a newer registry dataset drops a class the
         company gave up). Other sources' rows are left alone. Returns how
         many were added."""
-        if await self._overlay():
-            return 0
-        async with self._connect() as db:
-            added = await _set_company_activities(db, company_id, classes, source, confidence)
-            await self._flush_company_search(db)
-            await db.commit()
-        return added
+        return 0
 
     async def get_company_activities(self, company_ids) -> dict[str, list[dict]]:
         """company id -> [{code, version, revision, name, name_en, keywords,
@@ -2864,32 +757,8 @@ class StateManager:
         out: dict[str, list[dict]] = {i: [] for i in ids}
         if not ids:
             return out
-        if await self._overlay():
-            rows = await self._read("company_rows", [i for i in ids if str(i).isdigit()])
-            out.update({r["id"]: r["activities"] for r in rows})
-            return out
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            for start in range(0, len(ids), 500):
-                chunk = ids[start:start + 500]
-                marks = ",".join("?" * len(chunk))
-                async with db.execute(
-                    f"""SELECT a.company_id, a.code, a.version,
-                               MAX(a.confidence) AS confidence,
-                               COALESCE(k.name_ro, '') AS name,
-                               COALESCE(k.name_en, '') AS name_en,
-                               COALESCE(k.keywords, '') AS keywords
-                        FROM company_activities a
-                        LEFT JOIN caen_classes k
-                          ON k.code = a.code AND k.version = a.version
-                        WHERE a.company_id IN ({marks})
-                        GROUP BY a.company_id, a.code, a.version
-                        ORDER BY a.code, a.version DESC""", chunk,
-                ) as cur:
-                    for r in await cur.fetchall():
-                        row = dict(r)
-                        row["revision"] = revision_label(row["version"])
-                        out[row.pop("company_id")].append(row)
+        rows = await self._read("company_rows", [i for i in ids if str(i).isdigit()])
+        out.update({r["id"]: r["activities"] for r in rows})
         return out
 
     async def search_companies(
@@ -2898,9 +767,10 @@ class StateManager:
         """Companies on file matching every word of ``query``, best first,
         and how many match in all.
 
-        Searched locally (SQLite FTS5) over the name, the activities (CAEN
-        code, its Romanian and English names and everyday words, plus any
-        industry or map category a source gave) and the place. Accents
+        Searched locally: the directory register's word index (name,
+        activities, place) for the firms it describes, and Harvey's own
+        index (SQLite FTS5 over the name, the industry or map category a
+        source gave, and the place) for the firms no register describes. Accents
         don't matter, words of 3+ letters match as prefixes ("stomatolog"
         finds "stomatologică"), and a 4-digit code matches that class in
         every revision. Each company comes with its activities in words,
@@ -2910,35 +780,9 @@ class StateManager:
             return 0, []
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
-        if await self._overlay():
-            total, rows = await self._read("search_companies", query, limit, offset)
-            for r in rows:
-                r.pop("_inputs", None)
-            return total, rows
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT COUNT(*) FROM company_search WHERE company_search MATCH ?", (match,)
-            ) as cur:
-                (total,) = await cur.fetchone()
-            async with db.execute(
-                """SELECT c.id, c.name, c.cui, c.location, c.address, c.phone,
-                          c.website, c.domain, c.industry, c.source,
-                          bm25(company_search, 0.0, 4.0, 2.0, 1.0) AS score
-                   FROM company_search
-                   JOIN companies c ON c.id = company_search.company_id
-                   WHERE company_search MATCH ?
-                   ORDER BY score, c.name LIMIT ? OFFSET ?""",
-                (match, limit, offset),
-            ) as cur:
-                rows = [dict(r) for r in await cur.fetchall()]
-        activities = await self.get_company_activities([r["id"] for r in rows])
-        for row in rows:
-            acts = activities.get(row["id"], [])
-            for a in acts:
-                a["matched"] = _activity_matches(a, terms)
-            acts.sort(key=lambda a: not a["matched"])      # stable: keeps code order
-            row["activities"] = acts
+        total, rows = await self._read("search_companies", query, limit, offset)
+        for r in rows:
+            r.pop("_inputs", None)
         return total, rows
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
@@ -2951,13 +795,6 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return [self._prospect_from_row(r) for r in rows]
 
-    async def company_exists(self, domain: str) -> bool:
-        async with self._connect() as db:
-            async with db.execute(
-                "SELECT 1 FROM companies WHERE domain = ?", (_norm(domain),)
-            ) as cursor:
-                return bool(await cursor.fetchone())
-
     # ── Prospects (Contacts) ──
 
     @staticmethod
@@ -2967,6 +804,8 @@ class StateManager:
         d["phone_verified"] = bool(d.get("phone_verified", 0))
         d["email_status"] = d.get("email_status") or ""
         d["timezone"] = d.get("timezone") or ""
+        # (On schema 25 the company is the firm's integer id.)
+        d["company_id"] = "" if d.get("company_id") is None else str(d["company_id"])
         return Prospect(**d)
 
     async def add_prospect(self, prospect: Prospect) -> str:
@@ -3745,97 +1584,39 @@ class StateManager:
         another process lands before this reads or after it commits, never
         in between, so the availability written always matches the
         switches. Returns how many rows were written."""
-        if await self._overlay():
-            return await self._on_overlay("write_vocabulary", rows_for, settings_prefix)
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
-                    (len(settings_prefix), settings_prefix),
-                ) as cursor:
-                    settings = {k: v for k, v in await cursor.fetchall()}
-                rows = rows_for(settings)
-                for row in rows:
-                    await db.execute(_UPSERT_SIGNAL_CODE, _signal_code_params(**row))
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
-        return len(rows)
+        return await self._on_overlay("write_vocabulary", rows_for, settings_prefix)
 
     async def write_contact_kinds(self, rows_for, settings_prefix: str) -> None:
         """The contact kinds the manifests declare (contacts.sync_kinds), with
         the switches read in the same transaction (see write_vocabulary)."""
-        if await self._overlay():
-            return await self._on_overlay("write_contact_kinds", rows_for,
-                                          settings_prefix)
-        async with self._connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                async with db.execute(
-                    "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
-                    (len(settings_prefix), settings_prefix),
-                ) as cursor:
-                    settings = {k: v for k, v in await cursor.fetchall()}
-                await contacts.sync_kinds(db, rows_for(settings))
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
+        return await self._on_overlay("write_contact_kinds", rows_for,
+                                      settings_prefix)
 
     async def get_signal_codes(self, status: str | None = None,
                                available_only: bool = False) -> list[dict]:
         """The vocabulary. ``available_only`` leaves out the signals of
         modules that are off (hidden, never collected)."""
-        if await self._overlay():
-            rows = await self._read("signal_vocabulary", status)
-            rows = [r for r in rows if r["available"]] if available_only else rows
-            return sorted(rows, key=lambda r: (r.get("category") or "", r["code"]))
-        sql = "SELECT * FROM signal_codes"
-        where, params = [], []
-        if status:
-            where.append("status = ?")
-            params.append(status)
-        if available_only:
-            where.append("available = 1")
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY category, code"
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(sql, params) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
+        rows = await self._read("signal_vocabulary", status)
+        rows = [r for r in rows if r["available"]] if available_only else rows
+        return sorted(rows, key=lambda r: (r.get("category") or "", r["code"]))
 
     async def set_signal_status(self, code: str, status: str) -> bool:
         """Confirm / reject a proposed signal. Only confirmed signals are
         collected — Harvey proposes, the user decides."""
         if status not in ("proposed", "confirmed", "rejected"):
             raise ValueError(f"invalid signal status: {status}")
-        if await self._overlay():
-            return await self._on_overlay("set_signal_status", code, status)
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE signal_codes SET status = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE code = ?",
-                (status, code),
-            )
-            await db.commit()
-            return cursor.rowcount > 0
+        return await self._on_overlay("set_signal_status", code, status)
 
     async def confirmed_signal_codes(self) -> set[str]:
         """What collectors may collect: confirmed by a person, and declared
         by a module that is on."""
-        if await self._overlay():
-            from harvey.modules import switches
-            from harvey.signals import available_codes
+        from harvey.modules import switches
+        from harvey.signals import available_codes
 
-            stored = await self.settings_with_prefix(switches.PREFIX)
-            available = available_codes(stored)
-            return {c for c in await self._on_overlay("signal_codes", "confirmed")
-                    if c in available}
-        return {r["code"] for r in await self.get_signal_codes(status="confirmed",
-                                                                available_only=True)}
+        stored = await self.settings_with_prefix(switches.PREFIX)
+        available = available_codes(stored)
+        return {c for c in await self._on_overlay("signal_codes", "confirmed")
+                if c in available}
 
     # ── Observations (every fact is a row, never a column) ──
 
@@ -3860,77 +1641,31 @@ class StateManager:
         a typo must fail loudly rather than create a junk signal.
         ``module``, ``capability`` and ``origin_company_id`` say who found
         it and for which record, as ingest's rows do."""
-        if await self._overlay():
-            await self.add_observations([{
-                "company_id": company_id, "signal_code": signal_code, "collector": collector,
-                "value_num": value_num, "value_text": value_text, "confidence": confidence,
-                "evidence_url": evidence_url, "run_id": run_id, "observed_at": observed_at,
-                "module": module, "capability": capability,
-                "origin_company_id": origin_company_id}], run_id)
-            return ""
-        obs_id = _new_id()
-        async with self._connect() as db:
-            await db.execute(
-                """INSERT INTO observations
-                       (id, company_id, prospect_id, signal_code, collector,
-                        value_num, value_text, confidence, evidence_url,
-                        observed_at, run_id, module, capability, origin_company_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)""",
-                (obs_id, company_id, prospect_id, signal_code, collector,
-                 value_num, value_text, float(confidence), evidence_url,
-                 observed_at, run_id, module, capability, origin_company_id),
-            )
-            await contacts.from_observations(db, [{
-                "company_id": company_id, "signal_code": signal_code, "value_text": value_text,
-                "confidence": confidence, "evidence_url": evidence_url, "observed_at": observed_at,
-                "module": module, "collector": collector, "capability": capability,
-                "origin_company_id": origin_company_id}])
-            await self._flush_company_search(db)
-            await db.commit()
-        return obs_id
+        await self.add_observations([{
+            "company_id": company_id, "signal_code": signal_code, "collector": collector,
+            "value_num": value_num, "value_text": value_text, "confidence": confidence,
+            "evidence_url": evidence_url, "run_id": run_id, "observed_at": observed_at,
+            "module": module, "capability": capability,
+            "origin_company_id": origin_company_id}], run_id)
+        return ""
 
     async def add_contacts(self, company_id: str, found: list, origin: str = "") -> int:
         """Save contacts (contacts.Found) found for a company, linked to it."""
-        if await self._overlay():
-            return await self._on_overlay("add_contacts", company_id, found, origin)
-        if not found:
-            return 0
-        async with self._connect() as db:
-            kept = await _add_contacts(db, company_id, found, origin)
-            await db.commit()
-        return kept
+        return await self._on_overlay("add_contacts", company_id, found, origin)
 
     async def add_location(self, company_id: str, **place) -> int:
         """One of a company's places (contacts.add_location)."""
-        if await self._overlay():
-            return await self._on_overlay("add_location", company_id, **place)
-        async with self._connect() as db:
-            location_id = await contacts.add_location(db, company_id, **place)
-            await db.commit()
-        return location_id
+        return await self._on_overlay("add_location", company_id, **place)
 
     async def add_company_source(self, company_id: str, source: str, ref: str = "",
                                  origin: str = "") -> None:
-        if await self._overlay():
-            return await self._on_overlay("add_company_source", company_id, source, ref,
-                                          origin)
-        async with self._connect() as db:
-            await contacts.add_source(db, company_id, source, ref, origin)
-            await db.commit()
+        return await self._on_overlay("add_company_source", company_id, source, ref,
+                                      origin)
 
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         """Batch insert. Flushed per batch by callers — a long run that dies
         must not lose everything it observed."""
-        if await self._overlay():
-            return await self._on_overlay("add_observations", rows, run_id)
-        if not rows:
-            return 0
-        async with self._connect() as db:
-            added = await _insert_observations(db, rows, run_id)
-            await self._flush_company_search(db)
-            await db.commit()
-        return added
+        return await self._on_overlay("add_observations", rows, run_id)
 
     async def yc_batch(self, company_id: str) -> str | None:
         """The YC batch the company says it's in ("" when it doesn't say
@@ -3985,123 +1720,21 @@ class StateManager:
         latest_only: bool = False,
         limit: int = 500,
     ) -> list[dict]:
-        if await self._overlay():
-            if not company_id:
-                raise NotOnOverlay("observations of every company aren't available on the "
-                                   "upgraded database: ask for one company's")
-            return await self._read("observations", company_id, signal_code, latest_only, limit)
-        where, params = [], []
-        if company_id:
-            where.append("company_id = ?")
-            params.append(company_id)
-        if signal_code:
-            where.append("signal_code = ?")
-            params.append(signal_code)
-        sql = "SELECT * FROM observations"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        if latest_only:
-            # Newest observation per (company, signal) — the current view of
-            # the world, with history still on disk underneath.
-            sql = (
-                "SELECT * FROM (" + sql + " ORDER BY observed_at DESC) "
-                "GROUP BY company_id, signal_code"
-            )
-        else:
-            sql += " ORDER BY observed_at DESC"
-        sql += " LIMIT ?"
-        params.append(int(limit))
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(sql, params) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
-
-    # A boolean signal is recorded either way: "checked, not running ads" is a
-    # real finding, and a later flip from 0 to 1 is a real event. But a COHORT
-    # asks who *has* the signal, so it must read the value, not merely the
-    # presence of a row. Without this, "companies running Google Ads" silently
-    # means "companies we checked for Google Ads" — which is everyone.
-    #
-    # `latest` is the current view of the world (newest observation per company
-    # and signal, with history still on disk underneath). `positive` is the
-    # subset where the finding is actually true — value_num IS NULL covers text
-    # signals like INCUMBENT_AGENCY, where the row's existence IS the finding.
-    # Rank signals are different: a company has one rank PER SEARCH PHRASE
-    # (value_text), so "is it ranked" and "rank 11-30" read the newest row of
-    # each phrase — #4 for one search and #18 for another is in range on the
-    # second. Ties within one second (two searches in a run) go to the row
-    # written last. A search that no longer finds the company writes 0 for
-    # that phrase: checked, not ranked. Rows from before phrases were
-    # stored (empty value_text) stop counting once a phrased row exists.
-    # Which signals are rank signals is the manifests' keyed_by = "phrase".
-    #
-    # A yearly figure (keyed_by = "year": turnover, headcount) carries its
-    # financial year in value_text. Its current reading is the latest year
-    # on file for the company (within a year, the row written last: a
-    # revised dataset's reading over the first release's), so "turnover
-    # over 1M" compares the latest year by default. Older years stay as
-    # history, and a range can name one (``key``).
-    _RANK_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'phrase')"
-    _YEAR_CODES = "(SELECT code FROM signal_codes WHERE keyed_by = 'year')"
-    _CURRENT_CTE = _current_cte()
+        if not company_id:
+            raise NotOnOverlay("observations of every company aren't available on the "
+                               "upgraded database: ask for one company's")
+        return await self._read("observations", company_id, signal_code, latest_only, limit)
 
     async def signal_counts(self) -> list[dict]:
         """How many entities actually carry each signal — the cohort sizes."""
-        if await self._overlay():
-            return await self._read("signal_counts")
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                self._CURRENT_CTE + """
-                SELECT p.signal_code,
-                       COALESCE(sc.label, p.signal_code) AS label,
-                       sc.status AS status,
-                       COUNT(DISTINCT p.company_id) AS companies,
-                       COUNT(*) AS observations
-                FROM positive p
-                LEFT JOIN signal_codes sc ON sc.code = p.signal_code
-                GROUP BY p.signal_code
-                ORDER BY companies DESC"""
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
+        return await self._read("signal_counts")
 
     async def signal_states(self, codes: list[str]) -> dict[str, dict]:
         """Per signal, how many companies read true, false and unknown — the
         same reading a cohort condition "has it" makes (see cohort_verdicts)."""
         from harvey.signals import absence
 
-        if await self._overlay():
-            return await self._read("signal_states", list(codes))
-        async with self._connect() as db:
-            async with db.execute(f"SELECT COUNT(*) FROM companies c WHERE {LIVE_COMPANY}") as cursor:
-                total = (await cursor.fetchone())[0]
-            async with db.execute(
-                self._CURRENT_CTE + """,
-                per AS (
-                    SELECT company_id, signal_code, 1 AS checked, 0 AS found, 0 AS any_found
-                    FROM current_obs WHERE company_id != ''
-                    UNION ALL
-                    SELECT company_id, signal_code, 0, confidence >= 0, 1
-                    FROM positive WHERE company_id != ''
-                ),
-                per_company AS (
-                    SELECT p.signal_code, MAX(checked) AS checked, MAX(found) AS found,
-                           MAX(any_found) AS any_found
-                    FROM per p JOIN companies c ON c.id = p.company_id
-                    GROUP BY p.company_id, p.signal_code
-                )
-                SELECT signal_code, SUM(found), SUM(checked AND NOT any_found), SUM(any_found)
-                FROM per_company GROUP BY signal_code"""
-            ) as cursor:
-                seen = {row[0]: row[1:] for row in await cursor.fetchall()}
-        out = {}
-        for code in codes:
-            found, negative, any_found = seen.get(code, (0, 0, 0))
-            if absence(code) == "false":
-                negative = total - any_found
-            out[code] = {"true": found, "false": negative,
-                         "unknown": total - found - negative}
-        return out
+        return await self._read("signal_states", list(codes))
 
     async def cohort(
         self,
@@ -4124,43 +1757,11 @@ class StateManager:
         ``kind`` (a CUI): ``{"id", "name", "value"}``, one row per
         identifier, in company id order (then value), a company's rows
         together. Only ``company_ids`` when given."""
-        if await self._overlay():
-            return await self._on_overlay("companies_with_id", kind, company_ids)
-        sql = (f"SELECT c.id, c.name, i.value FROM company_ids i "
-               f"JOIN companies c ON c.id = i.company_id "
-               f"WHERE i.kind = ? AND i.value != '' AND {LIVE_COMPANY}")
-        args: list = [kind]
-        # Sorted before they are read 900 at a time, so the chunks follow
-        # one another in id order too: callers cut the rows into batches
-        # and jobs, and resume a check after the last id it saved.
-        ids = sorted(set(company_ids)) if company_ids is not None else None
-        if ids is not None and not ids:
-            return []
-        out: list[dict] = []
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            for start in range(0, len(ids) if ids is not None else 1, 900):
-                chunk = ids[start:start + 900] if ids is not None else None
-                query, params = sql, list(args)
-                if chunk is not None:
-                    # Read by company (its index), not by kind: "kind = ?"
-                    # alone would walk every CUI on file for each call.
-                    query = query.replace("i.kind = ?", "+i.kind = ?") + \
-                        f" AND i.company_id IN ({','.join('?' * len(chunk))})"
-                    params += chunk
-                async with db.execute(query + " ORDER BY c.id, i.value", params) as cursor:
-                    out += [dict(r) for r in await cursor.fetchall()]
-        return out
+        return await self._on_overlay("companies_with_id", kind, company_ids)
 
     async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
         """Companies currently ranked (or in the pack) for this search phrase."""
-        async with self._connect() as db:
-            async with db.execute(
-                self._CURRENT_CTE + " SELECT DISTINCT company_id FROM positive "
-                "WHERE signal_code = ? AND value_text = ? AND company_id != ''",
-                (code, phrase),
-            ) as cursor:
-                return {row[0] for row in await cursor.fetchall()}
+        return set(await self._read("ranked", code, phrase))
 
     async def cohort_companies(self, require: list[str], exclude: list[str],
                                offset: int = 0, limit: int | None = None,
@@ -4185,107 +1786,6 @@ class StateManager:
     # is left out of the three counts.
     VERDICTS = ("match", "possible", "no_match")
 
-    def _verdict_sql(self, require: list[str], exclude: list[str],
-                     ranges: list[dict], min_confidence: float) -> tuple[str, list]:
-        """(WITH clause ending in ``judged``: company columns plus ``verdict``,
-        its parameters)."""
-        from harvey.signals import absence
-
-        ctes: list[str] = []
-        params: list = []
-
-        def cte(sql: str, *args) -> str:
-            name = f"cond{len(ctes)}"
-            ctes.append(f"{name} AS ({sql})")
-            params.extend(args)
-            return f"c.id IN (SELECT company_id FROM {name})"
-
-        def readings(code: str, low=None, high=None, floor=None, key=None) -> str:
-            ranged = low is not None or high is not None
-            args: list = [code]
-            if key is not None:
-                # One year (or phrase) named: that key's newest reading.
-                sql = ("SELECT DISTINCT company_id FROM keyed "
-                       "WHERE signal_code = ? AND value_text = ? AND company_id != ''")
-                args.append(str(key))
-                sql += (" AND value_num IS NOT NULL" if ranged
-                        else " AND (value_num IS NULL OR value_num != 0)")
-            elif ranged:
-                # A number in range. 0 is "not found" for a rank, but a real
-                # figure for a yearly one (no turnover that year).
-                sql = ("SELECT DISTINCT company_id FROM current_obs "
-                       "WHERE signal_code = ? AND company_id != '' "
-                       "AND value_num IS NOT NULL "
-                       f"AND (value_num != 0 OR signal_code IN {self._YEAR_CODES})")
-            else:
-                sql = ("SELECT DISTINCT company_id FROM positive "
-                       "WHERE signal_code = ? AND company_id != ''")
-            if low is not None:
-                sql += " AND value_num >= ?"
-                args.append(float(low))
-            if high is not None:
-                sql += " AND value_num <= ?"
-                args.append(float(high))
-            if floor is not None:
-                sql += " AND confidence >= ?"
-                args.append(float(floor))
-            return cte(sql, *args)
-
-        def leaf(code: str, low=None, high=None, key=None) -> tuple[str, str]:
-            """(true, false) for "has a positive reading of code [in range]"
-            ([for that key: one financial year])."""
-            found = readings(code, low, high, floor=min_confidence, key=key)
-            any_found = readings(code, low, high, key=key)
-            if absence(code) == "false":
-                return found, f"NOT {any_found}"
-            if key is not None:
-                checked = cte("SELECT DISTINCT company_id FROM keyed WHERE signal_code = ? "
-                              "AND value_text = ? AND company_id != ''", code, str(key))
-            else:
-                checked = cte("SELECT DISTINCT company_id FROM current_obs "
-                              "WHERE signal_code = ? AND company_id != ''", code)
-            return found, f"({checked} AND NOT {any_found})"
-
-        trues, falses = [], []
-        for code in require:
-            t, f = leaf(code)
-            trues.append(t)
-            falses.append(f)
-        for code in exclude:
-            t, f = leaf(code)
-            trues.append(f)
-            falses.append(t)
-        for r in ranges:
-            t, f = leaf(r["code"], r.get("min"), r.get("max"), r.get("key"))
-            trues.append(t)
-            falses.append(f)
-        verdict = ("CASE WHEN " + " OR ".join(falses) + " THEN 'no_match' "
-                   "WHEN " + " AND ".join(trues) + " THEN 'match' "
-                   "ELSE 'possible' END")
-        keyed_codes = sorted({r["code"] for r in ranges if r.get("key") is not None})
-        if keyed_codes:
-            # Each key's newest reading, for the signals a range names a key
-            # of (a year). First, so its parameters come first.
-            marks = ",".join("?" * len(keyed_codes))
-            ctes.insert(0, f"""keyed AS (
-                SELECT o.* FROM observations o
-                WHERE o.signal_code IN ({marks}) AND o.rowid = (
-                    SELECT n.rowid FROM observations n
-                    WHERE n.company_id = o.company_id AND n.signal_code = o.signal_code
-                      AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
-                    ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1))""")
-            params[:0] = keyed_codes
-        ctes.append("judged AS (SELECT c.id, c.name, c.domain, c.website, c.industry, "
-                    f"c.location, {verdict} AS verdict FROM companies c WHERE {LIVE_COMPANY})")
-        # The matches alone, without judging every company: a leaf's true
-        # and false never hold together, so every condition true is exactly
-        # "match", and SQLite can start from the (small) sets of readings.
-        ctes.append(f"matched AS (SELECT c.id FROM companies c WHERE {LIVE_COMPANY} "
-                    f"AND {' AND '.join(trues)})")
-        codes = list(dict.fromkeys([*require, *exclude, *(r["code"] for r in ranges)]))
-        return (_current_cte(len(codes)).rstrip() + "".join(",\n    " + c for c in ctes) + "\n",
-                codes * 4 + params)
-
     async def cohort_verdicts(self, require: list[str], exclude: list[str],
                               ranges: list[dict] | None = None,
                               verdicts=("match",), offset: int = 0,
@@ -4308,32 +1808,9 @@ class StateManager:
         ranges = list(ranges or [])
         if not require and not exclude and not ranges:
             return counts, []
-        if await self._overlay():
-            return await self._read("cohort_verdicts", require, exclude, ranges,
-                                    verdicts=tuple(verdicts), offset=offset, limit=limit,
-                                    min_confidence=min_confidence)
-        wanted = [v for v in dict.fromkeys(verdicts) if v in self.VERDICTS]
-        sql, params = self._verdict_sql(require, exclude, ranges, min_confidence)
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            # One read snapshot: the counts and the page agree.
-            await db.execute("BEGIN")
-            async with db.execute(
-                sql + "SELECT verdict, COUNT(*) FROM judged GROUP BY verdict", params
-            ) as cursor:
-                for verdict, n in await cursor.fetchall():
-                    counts[verdict] = n
-            if not wanted:
-                return counts, []
-            page = (sql + "SELECT * FROM judged WHERE verdict IN "
-                    f"({','.join('?' for _ in wanted)}) "
-                    "ORDER BY LOWER(COALESCE(name, '')), id")
-            page_params = [*params, *wanted]
-            if limit is not None:
-                page += " LIMIT ? OFFSET ?"
-                page_params.extend([int(limit), int(offset)])
-            async with db.execute(page, page_params) as cursor:
-                return counts, [dict(row) for row in await cursor.fetchall()]
+        return await self._read("cohort_verdicts", require, exclude, ranges,
+                                verdicts=tuple(verdicts), offset=offset, limit=limit,
+                                min_confidence=min_confidence)
 
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90, ids=None
@@ -4354,93 +1831,25 @@ class StateManager:
         ``ids`` looks only at those companies (a search's results), so a
         run's handful isn't found by reading the whole backlog.
         """
-        if await self._overlay():
-            return await self._read("needing_profile", limit, stale_days,
-                                    None if ids is None else list(ids))
-        out: list[dict] = []
-        chunks = [None] if ids is None else [
-            list(ids)[i:i + 500] for i in range(0, len(list(ids)), 500)]
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            for chunk in chunks:
-                only = "" if chunk is None else f"AND c.id IN ({', '.join('?' * len(chunk))})"
-                async with db.execute(
-                    f"""SELECT c.id, c.name, c.domain, c.location, c.source_url
-                       FROM companies c
-                       {_LAST_PROFILED_JOIN}
-                       WHERE c.domain != '' AND {LIVE_COMPANY} {only}
-                         AND ({_LAST_PROFILED} IS NULL
-                              OR {_LAST_PROFILED} < datetime('now', ?))
-                       ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
-                       LIMIT ?""",
-                    (*(chunk or ()), f"-{int(stale_days)} days", int(limit)),
-                ) as cursor:
-                    out += [dict(r) for r in await cursor.fetchall()]
-        return out
+        return await self._read("needing_profile", limit, stale_days,
+                                None if ids is None else list(ids))
 
     async def count_companies_needing_profile(self, stale_days: int = 90) -> int:
-        if await self._overlay():
-            return await self._read("needs_profile", stale_days)
-        async with self._connect() as db:
-            async with db.execute(
-                f"""SELECT COUNT(*) FROM companies c
-                   {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != '' AND {LIVE_COMPANY}
-                     AND ({_LAST_PROFILED} IS NULL
-                          OR {_LAST_PROFILED} < datetime('now', ?))""",
-                (f"-{int(stale_days)} days",),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else 0
+        return await self._read("needs_profile", stale_days)
 
     async def mark_company_profiled(self, company_id: str):
         """Record that a profile pass looked at this company, whether or
         not it was reachable — advances the rotation regardless."""
-        if await self._overlay():
-            return await self._on_overlay("mark_company_profiled", company_id)
-        async with self._connect() as db:
-            await db.execute(
-                """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
-                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                (company_id,),
-            )
-            await db.commit()
+        return await self._on_overlay("mark_company_profiled", company_id)
 
     async def rename_company(self, company_id: str, name: str):
         """Set a company's name, and the copy each of its prospects carries."""
-        if await self._overlay():
-            return await self._on_overlay("rename_company", company_id, name)
-        async with self._connect() as db:
-            await db.execute(
-                "UPDATE companies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (name, company_id),
-            )
-            await db.execute(
-                "UPDATE prospects SET company = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE company_id = ?",
-                (name, company_id),
-            )
-            await resolver.register_company(db, company_id)
-            await db.commit()
+        return await self._on_overlay("rename_company", company_id, name)
 
     async def fill_company_phone(self, company_id: str, phone: str) -> bool:
         """Set a company's phone only when it has none: a listing's number
         is never overwritten by one read off the site. True when set."""
-        if await self._overlay():
-            return await self._on_overlay("fill_company_phone", company_id, phone)
-        if not company_id or not phone:
-            return False
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE companies SET phone = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND COALESCE(TRIM(phone), '') = ''",
-                (phone, company_id),
-            )
-            if cursor.rowcount:
-                await resolver.register_company(db, company_id)
-                await _company_phone_contact(db, company_id, phone)
-            await db.commit()
-            return cursor.rowcount > 0
+        return await self._on_overlay("fill_company_phone", company_id, phone)
 
     async def companies_needing_prospects(
         self, limit: int = 10, module: str = "people", capability: str = "find_people",
@@ -4461,24 +1870,9 @@ class StateManager:
         company not searched since then. Never-searched companies first,
         then the longest ago, so the whole backlog rotates.
         """
-        await self._v24_only("companies needing prospects")
         cutoff = contacts.search_cutoff(module, capability, since)
-        last = ("(SELECT MAX(s.searched_at) FROM searches s WHERE s.target = 'company' "
-                "AND s.target_id = c.id AND s.module = ? AND s.capability = ?)")
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                f"""SELECT c.id, c.name, c.domain, c.industry
-                   FROM companies c
-                   WHERE c.domain != '' AND {LIVE_COMPANY}
-                     AND NOT EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id)
-                     AND {contacts.not_searched("c.id")}
-                   ORDER BY {last} IS NOT NULL, {last}
-                   LIMIT ?""",
-                (module, capability, cutoff, module, capability, module, capability,
-                 int(limit)),
-            ) as cursor:
-                return [dict(r) for r in await cursor.fetchall()]
+        return await self._read("companies_needing_prospects", limit, module, capability,
+                                cutoff)
 
     async def email_audience(self, limit: int = 200) -> list[dict]:
         """Email contacts the Email module can write to and has no prospect
@@ -4486,41 +1880,14 @@ class StateManager:
         do-not-contact, reaching a live company with trust confirmed or
         likely. Each comes with one link (through a person first, then the
         best trust): its company, person and source. Oldest first."""
-        if await self._overlay():
-            return await self._read("email_audience", limit)
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT ct.id AS contact_id, ct.value AS email, ct.status, l.company_id,
-                          l.source, l.evidence_url, l.trust, COALESCE(p.name, '') AS person,
-                          COALESCE(p.role, '') AS role, COALESCE(p.source, '') AS person_source,
-                          c.name AS company, COALESCE(c.industry, '') AS industry,
-                          COALESCE(c.domain, '') AS domain
-                   FROM contacts ct
-                   JOIN company_contacts l ON l.id = (
-                       SELECT l2.id FROM company_contacts l2
-                       JOIN companies c2 ON c2.id = l2.company_id
-                       WHERE l2.contact_id = ct.id AND l2.trust IN ('confirmed', 'likely')
-                         AND COALESCE(c2.merged_into, '') = ''
-                       ORDER BY l2.person_id = 0, l2.trust != 'confirmed', l2.id LIMIT 1)
-                   JOIN companies c ON c.id = l.company_id
-                   LEFT JOIN people p ON p.id = l.person_id AND l.person_id != 0
-                   WHERE ct.kind = 'email' AND ct.do_not_contact = 0
-                     AND ct.status IN ('verified', 'risky', 'unchecked')
-                     AND NOT EXISTS (SELECT 1 FROM prospects pr WHERE pr.email = ct.value)
-                   ORDER BY ct.status = 'unchecked', ct.id LIMIT ?""", (int(limit),)) as cur:
-                return [dict(r) for r in await cur.fetchall()]
+        return await self._read("email_audience", limit)
 
     async def record_search(self, target: str, target_id, module: str, capability: str,
                             **done) -> None:
         """A search done for a record (contacts.record_search), whatever it
         found."""
-        if await self._overlay():
-            return await self._on_overlay("record_search", target, target_id, module,
-                                          capability, **done)
-        async with self._connect() as db:
-            await contacts.record_search(db, target, target_id, module, capability, **done)
-            await db.commit()
+        return await self._on_overlay("record_search", target, target_id, module,
+                                      capability, **done)
 
     async def set_found_website(self, company_id: str, website: str, *, domain: str = "",
                                 trust: str = "unconfirmed", source: str = "") -> bool:
@@ -4529,45 +1896,15 @@ class StateManager:
         company's key only when ``domain`` is given (a confirmed match) and
         no other company holds it. False when the company has a website
         already: a found one never replaces it."""
-        if await self._overlay():
-            return await self._on_overlay("set_found_website", company_id, website,
-                                          domain=domain, trust=trust, source=source)
-        async with self._connect() as db:
-            if domain:
-                async with db.execute("SELECT 1 FROM companies WHERE domain = ? AND id != ? "
-                                      "LIMIT 1", (domain, company_id)) as cur:
-                    if await cur.fetchone():
-                        domain = ""
-            cur = await db.execute(
-                "UPDATE companies SET website = ?, website_trust = ?, website_source = ?, "
-                "domain = CASE WHEN ? != '' AND COALESCE(domain, '') = '' THEN ? ELSE domain END, "
-                "updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND COALESCE(website, '') = '' AND COALESCE(domain, '') = ''",
-                (website, trust, source, domain, domain, company_id))
-            changed = cur.rowcount > 0
-            if changed and domain:
-                await resolver.register(db, company_id, [("domain", domain)], source=source)
-            await db.commit()
-        return changed
+        return await self._on_overlay("set_found_website", company_id, website,
+                                      domain=domain, trust=trust, source=source)
 
     async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
                          source: str = "", origin: str = "") -> int:
         """People named at a company ((name, role) pairs), each kept once
         by name; a second mention fills a missing role. How many were new."""
-        if await self._overlay():
-            return await self._on_overlay("add_people", company_id, people, source=source,
-                                          origin=origin)
-        async with self._connect() as db:
-            async with db.execute("SELECT COUNT(*) FROM people WHERE company_id = ?",
-                                  (company_id,)) as cur:
-                (before,) = await cur.fetchone()
-            for name, role in people:
-                await contacts.add_person(db, company_id, name, role, source, origin)
-            async with db.execute("SELECT COUNT(*) FROM people WHERE company_id = ?",
-                                  (company_id,)) as cur:
-                (after,) = await cur.fetchone()
-            await db.commit()
-        return after - before
+        return await self._on_overlay("add_people", company_id, people, source=source,
+                                      origin=origin)
 
     # ── Run log (what ran, when, what it produced and cost) ──
 

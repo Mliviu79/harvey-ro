@@ -7,6 +7,36 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Changed
+
+- **A slim database: harvey.db keeps Harvey's own work, the registers are
+  read in place.** The firms you pulled or worked on, their contacts and
+  evidence, people, searches, sources, merges, web signals and the email
+  side stay in `harvey.db`; the trade registry, the financial statements,
+  the taxpayer file and ANAF's answers are read from their own files
+  through indexes each load builds there. On a full install `harvey.db`
+  goes from about 16 GB to about 1 GB, `anaf.db` from about 8 GB to about
+  1.2 GB (compressed; replaced answers are now kept as history), and pages
+  that took seconds to minutes answer in well under a second. Register
+  facts show the register's own date and current value, and a confirmed
+  register signal shows its data at once. Reloading the trade registry
+  rebuilds the financial statements' "filed accounts" from it.
+- **The upgrade.** An old `harvey.db` (schema 24) is never opened by the
+  new code: the dashboard shows an upgrade screen (what it does, expected
+  time, the disk it needs and the free space now, live progress per step,
+  the verification at the end) and the worker and `harvey run` wait. The
+  upgrade, from the screen or `harvey upgrade` (`--check` to only report),
+  builds the registers' indexes, rewrites `anaf.db` (every answer hashed
+  against the original), moves Harvey's data into a new file, verifies it,
+  and only then switches, keeping the old files as `harvey.db.v24` and
+  `anaf.db.old`. It resumes after a stop or a crash, refuses to switch when
+  verification fails, and deletes nothing: **Delete old files** (typed
+  confirmation) or `harvey upgrade --delete-old` does that.
+  `harvey upgrade --data DIR --out DIR` runs it on a copy and writes
+  nothing in the data folder. A database older than schema 24 is opened
+  once by the previous release first. A new install starts on the slim
+  database.
+
 ### Added
 
 - **The contact finder reads a site the way the old prospecting did.** It

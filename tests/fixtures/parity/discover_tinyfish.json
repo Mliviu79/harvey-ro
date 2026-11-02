@@ -1,176 +1,264 @@
 {
- "companies": [
+ "contact": [
   {
-   "address": "",
-   "company_size": "",
-   "created_at": true,
-   "cui": "",
-   "description": "",
-   "domain": "",
-   "external_id": "",
-   "id": "C1",
-   "industry": "",
-   "location": "Denver, Colorado",
-   "merged_into": "",
-   "name": "Vellmora Roofing Company",
-   "notes": "",
-   "phone": "+13035550199",
-   "profile_checked_at": false,
-   "prospects_checked_at": false,
-   "signals_json": "[]",
-   "source": "manual",
-   "source_url": "",
-   "tech_stack_json": "[]",
-   "updated_at": true,
-   "website": ""
-  },
-  {
-   "address": "",
-   "company_size": "",
-   "created_at": true,
-   "cui": "",
-   "description": "",
-   "domain": "brindlewickroofing.example",
-   "external_id": "",
-   "id": "C2",
-   "industry": "",
-   "location": "",
-   "merged_into": "",
-   "name": "Brindlewick",
-   "notes": "",
-   "phone": "",
-   "profile_checked_at": false,
-   "prospects_checked_at": false,
-   "signals_json": "[]",
-   "source": "manual",
-   "source_url": "",
-   "tech_stack_json": "[]",
-   "updated_at": true,
-   "website": ""
-  },
-  {
-   "address": "",
-   "company_size": "",
-   "created_at": true,
-   "cui": "",
-   "description": "",
-   "domain": "summitroofing.example",
-   "external_id": "",
-   "id": "C3",
-   "industry": "roofer",
-   "location": "Denver, CO",
-   "merged_into": "",
-   "name": "Summit Roofing",
-   "notes": "",
-   "phone": "",
-   "profile_checked_at": false,
-   "prospects_checked_at": false,
-   "signals_json": "[]",
-   "source": "discover:tinyfish",
-   "source_url": "https://summitroofing.example/services",
-   "tech_stack_json": "[]",
-   "updated_at": true,
-   "website": "https://summitroofing.example/services"
-  }
- ],
- "company_activities": [],
- "company_ids": [
-  {
-   "company_id": "C1",
-   "confidence": 1.0,
-   "created_at": true,
-   "kind": "phone",
-   "source": "manual",
+   "best_trust": 0,
+   "display": "+1 303-555-0199",
+   "do_not_contact": 0,
+   "first_seen": true,
+   "id": 1,
+   "kind": 2,
+   "last_seen": true,
+   "line_type": 0,
+   "n_firms": 1,
+   "status": 5,
    "value": "+13035550199"
-  },
-  {
-   "company_id": "C1",
-   "confidence": 1.0,
-   "created_at": true,
-   "kind": "name",
-   "source": "manual",
-   "value": "vellmora roofing@denver"
-  },
-  {
-   "company_id": "C2",
-   "confidence": 1.0,
-   "created_at": true,
-   "kind": "domain",
-   "source": "manual",
-   "value": "brindlewickroofing.example"
-  },
-  {
-   "company_id": "C3",
-   "confidence": 1.0,
-   "created_at": true,
-   "kind": "domain",
-   "source": "discover:tinyfish",
-   "value": "summitroofing.example"
-  },
-  {
-   "company_id": "C3",
-   "confidence": 1.0,
-   "created_at": true,
-   "kind": "name",
-   "source": "discover:tinyfish",
-   "value": "summit roofing@denver"
   }
  ],
- "company_merge_moves": [],
- "company_merges": [],
  "email_patterns": [],
- "match_candidates": [],
- "observations": [
+ "firm": [
   {
-   "collector": "discover",
-   "company_id": "C3",
-   "confidence": 1.0,
-   "evidence_url": "https://summitroofing.example/services",
-   "observed_at": true,
-   "prospect_id": "",
-   "run_id": "R1",
-   "signal_code": "FOUND_IN_SERP",
-   "value_num": null,
-   "value_text": "tinyfish"
+   "best_trust": 0,
+   "created": true,
+   "display_name": null,
+   "domain": null,
+   "finder_at": false,
+   "id": 1,
+   "last_search_at": false,
+   "live": 0,
+   "n_contacts": 1,
+   "n_email": 0,
+   "n_mobile": 0,
+   "n_people": 0,
+   "n_phone": 1,
+   "name_order": null,
+   "place_order": null,
+   "profiled_at": false,
+   "site_read_at": false,
+   "site_read_deep": null,
+   "website": null,
+   "website_fill": null,
+   "website_source": null,
+   "website_trust": null
   },
   {
-   "collector": "discover",
-   "company_id": "C3",
-   "confidence": 1.0,
-   "evidence_url": "https://summitroofing.example/services",
-   "observed_at": true,
-   "prospect_id": "",
-   "run_id": "R1",
-   "signal_code": "NO_WEBSITE",
-   "value_num": 0.0,
-   "value_text": ""
+   "best_trust": null,
+   "created": true,
+   "display_name": null,
+   "domain": "brindlewickroofing.example",
+   "finder_at": false,
+   "id": 2,
+   "last_search_at": false,
+   "live": 0,
+   "n_contacts": 0,
+   "n_email": 0,
+   "n_mobile": 0,
+   "n_people": 0,
+   "n_phone": 0,
+   "name_order": null,
+   "place_order": null,
+   "profiled_at": false,
+   "site_read_at": false,
+   "site_read_deep": null,
+   "website": null,
+   "website_fill": null,
+   "website_source": null,
+   "website_trust": null
   },
   {
-   "collector": "discover",
-   "company_id": "C3",
-   "confidence": 1.0,
-   "evidence_url": "https://summitroofing.example/services",
-   "observed_at": true,
-   "prospect_id": "",
-   "run_id": "R2",
-   "signal_code": "FOUND_IN_SERP",
-   "value_num": null,
-   "value_text": "tinyfish"
-  },
-  {
-   "collector": "discover",
-   "company_id": "C3",
-   "confidence": 1.0,
-   "evidence_url": "https://summitroofing.example/services",
-   "observed_at": true,
-   "prospect_id": "",
-   "run_id": "R2",
-   "signal_code": "NO_WEBSITE",
-   "value_num": 0.0,
-   "value_text": ""
+   "best_trust": null,
+   "created": true,
+   "display_name": null,
+   "domain": "summitroofing.example",
+   "finder_at": false,
+   "id": 3,
+   "last_search_at": false,
+   "live": 0,
+   "n_contacts": 0,
+   "n_email": 0,
+   "n_mobile": 0,
+   "n_people": 0,
+   "n_phone": 0,
+   "name_order": null,
+   "place_order": null,
+   "profiled_at": false,
+   "site_read_at": false,
+   "site_read_deep": null,
+   "website": "https://summitroofing.example/services",
+   "website_fill": null,
+   "website_source": 2,
+   "website_trust": null
   }
  ],
+ "firm_ident": [],
+ "firm_key": [
+  {
+   "firm": 3,
+   "kind": 3,
+   "source": 2,
+   "value": "summit roofing@denver"
+  },
+  {
+   "firm": 1,
+   "kind": 3,
+   "source": 1,
+   "value": "vellmora roofing@denver"
+  }
+ ],
+ "firm_source": [
+  {
+   "batch": 0,
+   "firm": 1,
+   "first_seen": true,
+   "last_seen": true,
+   "ref": "",
+   "source": 1
+  },
+  {
+   "batch": 0,
+   "firm": 2,
+   "first_seen": true,
+   "last_seen": true,
+   "ref": "",
+   "source": 1
+  },
+  {
+   "batch": 0,
+   "firm": 3,
+   "first_seen": true,
+   "last_seen": true,
+   "ref": "",
+   "source": 2
+  }
+ ],
+ "link": [
+  {
+   "contact": 1,
+   "firm": 1,
+   "first_seen": true,
+   "last_seen": true,
+   "location": 0,
+   "person": 0,
+   "trust": 0
+  }
+ ],
+ "link_evidence": [
+  {
+   "capability": null,
+   "confidence": 1.0,
+   "contact": 1,
+   "evidence_url": null,
+   "firm": 1,
+   "first_seen": true,
+   "last_seen": true,
+   "location": 0,
+   "person": 0,
+   "source": 1,
+   "trust": 0
+  }
+ ],
+ "local_firm": [
+  {
+   "address": null,
+   "country": null,
+   "county": "Colorado",
+   "description": null,
+   "firm": 1,
+   "gone": null,
+   "industry": null,
+   "locality": "Denver",
+   "name": "Vellmora Roofing Company",
+   "phone": "+13035550199",
+   "source_url": null
+  },
+  {
+   "address": null,
+   "country": null,
+   "county": null,
+   "description": null,
+   "firm": 2,
+   "gone": null,
+   "industry": null,
+   "locality": null,
+   "name": "Brindlewick",
+   "phone": null,
+   "source_url": null
+  },
+  {
+   "address": null,
+   "country": null,
+   "county": "CO",
+   "description": null,
+   "firm": 3,
+   "gone": null,
+   "industry": "roofer",
+   "locality": "Denver",
+   "name": "Summit Roofing",
+   "phone": null,
+   "source_url": "https://summitroofing.example/services"
+  }
+ ],
+ "locations": [],
+ "match_candidate": [],
+ "merge": [],
+ "merge_member": [],
+ "obs": [
+  {
+   "at": true,
+   "capability": 25,
+   "confidence": 1.0,
+   "evidence_url": "https://summitroofing.example/services",
+   "firm": 3,
+   "key": "tinyfish",
+   "module": 19,
+   "num": null,
+   "run": 1,
+   "signal": 10,
+   "text": "tinyfish"
+  },
+  {
+   "at": true,
+   "capability": 25,
+   "confidence": 1.0,
+   "evidence_url": "https://summitroofing.example/services",
+   "firm": 3,
+   "key": "",
+   "module": 19,
+   "num": 0.0,
+   "run": 1,
+   "signal": 11,
+   "text": null
+  }
+ ],
+ "person": [],
  "prospects": [],
+ "reading": [
+  {
+   "at": true,
+   "checked_at": true,
+   "confidence": 1.0,
+   "firm": 3,
+   "key": "tinyfish",
+   "module": 19,
+   "num": null,
+   "obs": 1,
+   "positive": 1,
+   "signal": 10,
+   "text": "tinyfish"
+  },
+  {
+   "at": true,
+   "checked_at": true,
+   "confidence": 1.0,
+   "firm": 3,
+   "key": "",
+   "module": 19,
+   "num": 0.0,
+   "obs": 2,
+   "positive": 0,
+   "signal": 11,
+   "text": null
+  }
+ ],
  "runs": [
   {
    "cost_usd": 0.0,
@@ -197,5 +285,6 @@
    "status": "completed"
   }
  ],
+ "search": [],
  "settings": []
 }

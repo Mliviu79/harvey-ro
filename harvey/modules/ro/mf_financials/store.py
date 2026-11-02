@@ -29,6 +29,7 @@ keep single-entry books and file no balance sheet, so they are never here.
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import re
 import sqlite3
@@ -39,6 +40,8 @@ from pathlib import Path
 
 from harvey.modules.ro import cui as ro_cui
 from harvey.paths import PROJECT_ROOT
+
+logger = logging.getLogger("harvey.financials")
 
 FINANCIALS_PATH = PROJECT_ROOT / "data" / "financials.db"
 INDICATORS = Path(__file__).with_name("indicators.csv")
@@ -312,7 +315,19 @@ def _build(sources, target: Path, progress, indicators: Path) -> dict:
     finally:
         con.close()
     os.replace(building, target)
+    _refile(target)
     return meta
+
+
+def _refile(target: Path) -> None:
+    """``filed`` with its noes from the trade registry beside it, when that
+    is loaded (derived.refile; the load itself builds it without)."""
+    from harvey.modules.ro.mf_financials import derived
+
+    try:
+        derived.refile(target, target.with_name("registry.db"))
+    except sqlite3.Error as e:
+        logger.warning("financials: filed accounts not built from the registry: %s", e)
 
 
 # ── Reading ──

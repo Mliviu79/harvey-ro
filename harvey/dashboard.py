@@ -55,16 +55,18 @@ def _resolve_config_file() -> Path:
 # route except the static shell needs the token (see dashboard_auth).
 @asynccontextmanager
 async def _lifespan(_app):
-    # Bring an existing database up to the current schema before the first
-    # request: pages that only read (Prezentare) never upgrade it, and the
-    # first one opened after an update would read tables that don't exist
-    # yet. A missing database stays missing until something writes.
+    # Bring in what modules declare before the first request. A missing
+    # database stays missing until something writes; an older schema waits
+    # for the upgrade (the pages show its screen until then).
     if DB_PATH.exists():
-        from harvey.state import StateManager
+        from harvey.state import StateManager, UpgradeNeeded
         try:
             await StateManager(str(DB_PATH)).init_db()
+        except UpgradeNeeded:
+            logger.warning("%s waits for the upgrade: the dashboard shows the upgrade screen",
+                           DB_PATH)
         except Exception:
-            logger.exception("could not upgrade %s", DB_PATH)
+            logger.exception("could not open %s", DB_PATH)
     # The job worker runs inside the dashboard: the usual install runs only
     # this process. It waits for the database to exist, and stands aside
     # while another worker (harvey worker, a command) holds the lease.
@@ -90,6 +92,9 @@ async def _run_worker(stop: asyncio.Event):
         if DB_PATH.exists():
             try:
                 state = _state()
+                # (Waits while the database waits for the upgrade.)
+                if not await state.wait_until_upgraded(stop):
+                    break
                 await state.init_db()
                 await Worker(state).run(stop)
             except Exception:
@@ -108,6 +113,36 @@ async def _run_worker(stop: asyncio.Event):
 app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_url=None,
               lifespan=_lifespan)
 token_store = auth.TokenStore(TOKEN_FILE)
+
+
+class _UpgradeGate:
+    """While harvey.db waits for the upgrade, every API call but the
+    upgrade's own answers 409: no page reads tables the old schema doesn't
+    have, and the dashboard shows the upgrade screen instead."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if path.startswith("/api/") and not path.startswith("/api/upgrade") \
+                and await asyncio.to_thread(_upgrade_needed):
+            response = JSONResponse({"upgrade_required": True, "message": (
+                "harvey.db waits for the upgrade to the slim database: open the dashboard "
+                "or run harvey upgrade")}, status_code=409)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _upgrade_needed() -> bool:
+    from harvey import upgrade
+
+    return upgrade.waiting(DB_PATH)
+
+
+# (The guard is outermost: a request without the token never learns more.)
+app.add_middleware(_UpgradeGate)
 app.add_middleware(auth.DashboardGuard, store=token_store)
 
 # Harvey process tracking
@@ -690,66 +725,21 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     from harvey.export import _EMAIL_STATUS_RANK, _phone_columns
     from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 
-    ids = [r["id"] for r in rows if r.get("id")]
-    if not ids:
+    if not rows:
         return rows
     # The same suppression as the exports: an address (or a whole domain) on
     # compliance.do_not_contact is never offered here either.
     blocked = _blocked_entries(config)
-    if all("_inputs" in r for r in rows):
-        # The overlay's rows (overlay.reads.company_rows) carry their own.
-        inputs = {r["id"]: r.pop("_inputs") for r in rows}
-        return _enriched(rows, config, blocked,
-                         {i: v["phones"] for i, v in inputs.items()},
-                         {i: v["people"] for i, v in inputs.items()},
-                         {i: v["prospects"] for i, v in inputs.items()}, {})
-    marks = _in(ids)
-    site_phones: dict[str, list[str]] = {}
-    official = _official_modules()
-    found = await query_db(
-        "SELECT company_id, value_text, module FROM observations WHERE signal_code = 'PHONE_NUMBER' "
-        f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
-        tuple(ids))
-    # An official register's numbers first, then the rest as they were found.
-    for r in sorted(found, key=lambda r: (r.get("module") or "") not in official):
-        numbers = site_phones.setdefault(r["company_id"], [])
-        if r["value_text"] not in numbers:
-            numbers.append(r["value_text"])
-    # Every number any source gave (a listing's, a merged record's): kept,
-    # shown after the main one.
-    for r in await query_db(
-            "SELECT company_id, value FROM company_ids WHERE kind = 'phone' "
-            f"AND company_id IN ({marks}) ORDER BY created_at, rowid", tuple(ids)):
-        numbers = site_phones.setdefault(r["company_id"], [])
-        if r["value"] not in numbers:
-            numbers.append(r["value"])
-    people: dict[str, list[dict]] = {}
-    for r in await query_db(
-            "SELECT company_id, value_text FROM observations WHERE signal_code = 'CONTACT_FOUND' "
-            f"AND value_text != '' AND company_id IN ({marks}) ORDER BY observed_at, rowid",
-            tuple(ids)):
-        found = people.setdefault(r["company_id"], [])
-        person = _split_person(r["value_text"])
-        if person["name"] and person not in found:
-            found.append(person)
-    contacts: dict[str, list[dict]] = {}
-    for p in await query_db(
-            "SELECT company_id, first_name, last_name, title, email, email_status, phone, "
-            "score, status FROM prospects "
-            f"WHERE company_id IN ({marks}) ORDER BY score DESC, created_at", tuple(ids)):
-        contacts.setdefault(p["company_id"], []).append(p)
-    activities = {}
-    try:
-        state = _state()
-        await state.init_db()
-        activities = await state.get_company_activities(ids)
-    except Exception as e:
-        logger.warning("company activities failed: %s", e)
-    return _enriched(rows, config, blocked, site_phones, people, contacts, activities)
+    # The rows (overlay.reads.company_rows) carry what they need.
+    inputs = {r["id"]: r.pop("_inputs") for r in rows}
+    return _enriched(rows, config, blocked,
+                     {i: v["phones"] for i, v in inputs.items()},
+                     {i: v["people"] for i, v in inputs.items()},
+                     {i: v["prospects"] for i, v in inputs.items()}, {})
 
 
 def _enriched(rows, config, blocked, site_phones, people, contacts, activities) -> list[dict]:
-    """_enrich_companies' columns from what it read (either schema)."""
+    """_enrich_companies' columns from what it read."""
     from harvey.collectors.phones import phone_region
     from harvey.export import _EMAIL_STATUS_RANK, _phone_columns
     from harvey.gate import do_not_contact_domain_match, do_not_contact_match
@@ -789,11 +779,6 @@ def _enriched(rows, config, blocked, site_phones, people, contacts, activities) 
 # Companies still standing on their own: a merged one's facts are its survivor's.
 _LIVE = "COALESCE(merged_into, '') = ''"
 
-_COMPANY_COLUMNS = ("c.id, c.name, c.cui, c.domain, c.website, c.industry, c.company_size, "
-                    "c.location, c.address, c.phone, c.source, c.source_url, c.description, "
-                    "c.external_id, c.created_at, c.updated_at")
-
-
 @app.get("/api/companies")
 async def get_companies(request: Request, limit: int | None = None, offset: int | None = None,
                         sort: str = "", dir: str = ""):
@@ -811,64 +796,13 @@ async def get_companies(request: Request, limit: int | None = None, offset: int 
     Paging: harvey/companies.py."""
     from harvey import companies
 
-    if DB_PATH.exists() and await _state().is_overlay():
-        return await _overlay_companies(request, limit, offset, sort, dir)
-    if not request.query_params:
-        return await query_db("""
-            SELECT c.*,
-                (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
-            FROM companies c WHERE COALESCE(c.merged_into, '') = ''
-            ORDER BY c.created_at DESC LIMIT 200
-        """)
-    limit, offset = _page_args(limit, offset)
-    args = dict(request.query_params)
-    if args.get("q") and not args.get("search"):
-        args["search"] = args["q"]
-    args.pop("q", None)
-    empty = {"total": 0, "offset": offset, "limit": limit, "sort": sort, "dir": dir,
-             "companies": [], "sources": [], "financials": False}
     if not DB_PATH.exists():
-        return empty
-    state = _state()
-    await state.init_db()
-    try:
-        f, attach = await _contact_filter(state, args)
-    except ValueError as e:
-        return JSONResponse({**empty, "error": str(e)}, status_code=400)
-    from harvey.modules.ro.mf_financials import store as fin_store
-    has_fin = Path(fin_store.FINANCIALS_PATH).is_file()
-    relevance = sort in ("", "relevance") and bool(f.search)
-    if not relevance and sort not in companies.SORTS:
-        sort = "created"
-    if sort in companies.FIGURE_SORTS and not has_fin:
-        sort = "created"
-    way = companies.direction(sort, dir)
-    async with _contacts_db(attach or has_fin) as db:
-        db.row_factory = aiosqlite.Row
-        started = time.monotonic()
-        if relevance:
-            sort = "relevance"
-        total, rowids, how = await companies.page(db, f, sort, way, limit, offset,
-                                                  figures_mark=_figures_mark())
-        rows = []
-        if rowids:
-            marks = ",".join("?" * len(rowids))
-            async with db.execute(f"SELECT c.rowid AS _r, {_COMPANY_COLUMNS} FROM companies c "
-                                  f"WHERE c.rowid IN ({marks})", rowids) as cur:
-                found = {r["_r"]: dict(r) for r in await cur.fetchall()}
-            rows = [found[i] for i in rowids if i in found]
-            for r in rows:
-                r.pop("_r", None)
-        figures = await companies.figures(db, [r["cui"] for r in rows]) if has_fin else {}
-        extra = await companies.counts(db, [r["id"] for r in rows])
-        sources = await companies.sources(db)
-        took = round((time.monotonic() - started) * 1000)
-    rows = await _enrich_companies(rows, _load_config_quietly())
-    for r in rows:
-        r["figures"] = figures.get(r.get("cui") or "")
-        r.update(extra.get(r["id"], {}))
-    return {**empty, "total": total, "sort": sort, "dir": way, "companies": rows,
-            "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
+        if not request.query_params:
+            return []
+        limit, offset = _page_args(limit, offset)
+        return {"total": 0, "offset": offset, "limit": limit, "sort": sort, "dir": dir,
+                "companies": [], "sources": [], "financials": False}
+    return await _overlay_companies(request, limit, offset, sort, dir)
 
 
 async def _overlay_companies(request: Request, limit, offset, sort: str, dir: str):
@@ -913,15 +847,6 @@ async def _overlay_companies(request: Request, limit, offset, sort: str, dir: st
             "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
 
 
-def _figures_mark():
-    """When the financial statements database last changed (a reload)."""
-    from harvey.modules.ro.mf_financials import store as fin_store
-    try:
-        return Path(fin_store.FINANCIALS_PATH).stat().st_mtime_ns
-    except OSError:
-        return None
-
-
 _CUI_QUERY = re.compile(r"\s*(?:RO\s*)?(\d{2,10})\s*", re.IGNORECASE)
 
 
@@ -932,24 +857,10 @@ async def _company_search(state, q: str, limit: int, offset: int) -> tuple[int, 
     m = _CUI_QUERY.fullmatch(q or "")
     cui = m.group(1) if m and (len(m.group(1)) != 4 or q.strip().upper().startswith("RO")) \
         else ""
-    if await state.is_overlay():
-        hits = await state.read("company_by_key", cui) if cui else []
-        if hits:
-            return len(hits), hits[offset:offset + limit]
-        return await state.read("search_companies", q, limit, offset)
-    if m and (len(m.group(1)) != 4 or q.strip().upper().startswith("RO")):
-        digits = m.group(1)
-        hits = await query_db(
-            "SELECT id, name, cui, location, address, phone, website, domain, industry, source "
-            f"FROM companies WHERE {_LIVE} AND cui != '' "
-            "AND REPLACE(UPPER(REPLACE(cui, ' ', '')), 'RO', '') = ? "
-            "ORDER BY name", (digits,))
-        if hits:
-            activities = await state.get_company_activities([h["id"] for h in hits])
-            for h in hits:
-                h["activities"] = activities.get(h["id"], [])
-            return len(hits), hits[offset:offset + limit]
-    return await state.search_companies(q, limit=limit, offset=offset)
+    hits = await state.read("company_by_key", cui) if cui else []
+    if hits:
+        return len(hits), hits[offset:offset + limit]
+    return await state.read("search_companies", q, limit, offset)
 
 
 @app.get("/api/companies/search")
@@ -980,13 +891,9 @@ async def search_companies(q: str = "", limit: int = 50, offset: int = 0):
 @app.get("/api/companies/{company_id}/contacts")
 async def get_company_contacts(company_id: str):
     """Get all contacts for a specific company."""
-    if DB_PATH.exists() and await _state().is_overlay():
-        return await _state().read("company_prospects", company_id)
-    rows = await query_db(
-        "SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC",
-        (company_id,),
-    )
-    return rows
+    if not DB_PATH.exists():
+        return []
+    return await _state().read("company_prospects", company_id)
 
 
 @app.post("/api/companies/{company_id}/remove")
@@ -1012,39 +919,9 @@ async def get_company(company_id: str):
     on file, the named people, its activities in words, and ``findings``:
     every phone and address any source gave with who gave it and when,
     and the latest official facts (official sources first)."""
-    if DB_PATH.exists() and await _state().is_overlay():
-        return await _overlay_company(company_id)
-    rows = await query_db(f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE c.id = ?",
-                          (company_id,))
-    if not rows:
+    if not DB_PATH.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
-    (row,) = await _enrich_companies(rows, _load_config_quietly())
-    try:
-        row["findings"] = await _company_findings(company_id, row)
-    except Exception as e:
-        logger.warning("company findings failed: %s", e)
-        row["findings"] = {"phones": [], "addresses": [], "facts": []}
-    try:
-        from harvey import contacts
-        async with _contacts_db() as db:
-            row["reach"] = await contacts.of_company(db, company_id)
-    except Exception as e:
-        logger.warning("company contacts failed: %s", e)
-        row["reach"] = {"contacts": [], "people": [], "locations": [], "sources": []}
-    try:
-        from harvey import companies
-        async with _contacts_db() as db:
-            row["record"] = await companies.record(db, row)
-            if row["record"]["financials"]["state"] != companies.OK:
-                years = await companies.observed_years(db, company_id)
-                if years:
-                    row["record"]["financials"].update(state=companies.OK, years=years,
-                                                       from_observations=True)
-            row.update((await companies.counts(db, [company_id]))[company_id])
-    except Exception as e:
-        logger.warning("company record failed: %s", e)
-        row["record"] = None
-    return row
+    return await _overlay_company(company_id)
 
 
 async def _overlay_company(company_id: str):
@@ -1086,87 +963,6 @@ def _official_modules() -> set[str]:
     return {m.id for m in switches.manifests() if m.official}
 
 
-async def _company_findings(company_id: str, company: dict) -> dict:
-    """Every phone and address on file for a company, each with every
-    source that gave it (module, when, confidence, whether it is an
-    official register), official sources first, then the newest; and the
-    latest reading of each fact an official source gave (a yearly one's
-    latest year)."""
-    from harvey.modules import switches
-
-    mans = switches.by_id()
-    official = {m for m, man in mans.items() if man.official}
-
-    def who(module: str, collector: str) -> str:
-        m = mans.get(module or "")
-        return (m.name or m.id) if m else (collector or module or "")
-
-    rows = await query_db(
-        "SELECT signal_code, value_num, value_text, module, collector, confidence, "
-        "observed_at, evidence_url FROM observations WHERE company_id = ? "
-        "ORDER BY observed_at DESC, rowid DESC", (company_id,))
-    lists: dict[str, dict[str, dict]] = {"PHONE_NUMBER": {}, "ADDRESS": {}}
-    for r in rows:
-        code = r["signal_code"]
-        if code not in lists or not (r["value_text"] or "").strip():
-            continue
-        entry = lists[code].setdefault(r["value_text"], {"value": r["value_text"], "sources": []})
-        entry["sources"].append({
-            "module": r["module"] or "", "name": who(r["module"], r["collector"]),
-            "official": (r["module"] or "") in official, "observed_at": r["observed_at"],
-            "confidence": r["confidence"], "evidence_url": r["evidence_url"] or ""})
-    address = (company.get("address") or "").strip()
-    source = (company.get("source") or "")
-    if address and address not in lists["ADDRESS"]:
-        module = source.split(":", 1)[1] if source.startswith("registry:") else ""
-        lists["ADDRESS"][address] = {"value": address, "sources": [{
-            "module": module, "name": who(module, source), "official": module in official,
-            "observed_at": company.get("updated_at") or company.get("created_at") or "",
-            "confidence": 1.0, "evidence_url": company.get("source_url") or ""}]}
-
-    def ordered(entries: dict) -> list[dict]:
-        out = list(entries.values())
-        for e in out:
-            # Official first, then the newest (two stable sorts).
-            e["sources"].sort(key=lambda x: x["observed_at"] or "", reverse=True)
-            e["sources"].sort(key=lambda x: not x["official"])
-            e["official"] = any(x["official"] for x in e["sources"])
-            e["latest"] = max((x["observed_at"] or "" for x in e["sources"]), default="")
-        out.sort(key=lambda e: e["latest"], reverse=True)
-        out.sort(key=lambda e: not e["official"])
-        return out
-
-    from harvey.collectors.phones import phone_hit
-
-    phones = ordered(lists["PHONE_NUMBER"])
-    for e in phones:
-        hit = phone_hit(e["value"])
-        e["display"] = hit.display if hit else e["value"]
-    codes = {r["code"]: r for r in await query_db(
-        "SELECT code, label, value_type, unit, keyed_by FROM signal_codes")}
-    facts: dict[str, dict] = {}
-    for r in rows:
-        code, module = r["signal_code"], r["module"] or ""
-        if module not in official or code in lists or code == "ACTIVITY_CODE":
-            continue
-        meta = codes.get(code) or {}
-        year = r["value_text"] if meta.get("keyed_by") == "year" else ""
-        old = facts.get(code)
-        if old is not None and not (year.isdigit() and old["year"].isdigit()
-                                    and int(year) > int(old["year"])):
-            continue
-        facts[code] = {
-            "code": code, "label": meta.get("label") or code,
-            "value_type": meta.get("value_type") or "text", "unit": meta.get("unit") or "",
-            "value_num": r["value_num"], "value_text": "" if year else r["value_text"],
-            "year": year, "module": module, "name": who(module, r["collector"]),
-            "observed_at": r["observed_at"], "evidence_url": r["evidence_url"] or ""}
-    order = [m.id for m in switches.manifests()]
-    fact_list = sorted(facts.values(), key=lambda f: (
-        order.index(f["module"]) if f["module"] in order else len(order), f["code"]))
-    return {"phones": phones, "addresses": ordered(lists["ADDRESS"]), "facts": fact_list}
-
-
 # ── The Registry page: the whole trade registry, with its financials ──
 #
 # harvey/registry_view.py lists and orders the firms; the filters are the
@@ -1192,32 +988,12 @@ async def _in_harvey(cuis: list[str], regs: list[str] = ()) -> dict[str, str]:
     if not (cuis or keys) or not DB_PATH.exists():
         return {}
     state = _state()
-    if await state.is_overlay():
-        # Held firms by their identifiers (a merged record's stand for
-        # its survivor).
-        found = await state.held_ids("ro.cui", cuis)
-        found.update({f"onrc:{reg}": cid for reg, cid in (await state.held_ids(
-            "ro.onrc_reg", [k[len("onrc:"):] for k in keys])).items()})
-        return found
-    out: dict[str, str] = {}
-    rows = []
-    if cuis:
-        marks = _in(cuis)
-        rows += await query_db(
-            "SELECT i.value AS cui, c.id, COALESCE(c.merged_into, '') AS merged_into "
-            f"FROM company_ids i JOIN companies c ON c.id = i.company_id "
-            f"WHERE i.kind = 'cui' AND i.value IN ({marks})", tuple(cuis))
-        rows += await query_db(
-            "SELECT cui, id, COALESCE(merged_into, '') AS merged_into FROM companies "
-            f"WHERE cui != '' AND cui IN ({marks})", tuple(cuis))
-    if keys:
-        rows += await query_db(
-            "SELECT external_id AS cui, id, COALESCE(merged_into, '') AS merged_into "
-            f"FROM companies WHERE external_id IN ({_in(keys)})", tuple(keys))
-    for r in rows:
-        if r["cui"] not in out or not r["merged_into"]:
-            out[r["cui"]] = r["merged_into"] or r["id"]
-    return out
+    # Held firms by their identifiers (a merged record's stand for
+    # its survivor).
+    found = await state.held_ids("ro.cui", cuis)
+    found.update({f"onrc:{reg}": cid for reg, cid in (await state.held_ids(
+        "ro.onrc_reg", [k[len("onrc:"):] for k in keys])).items()})
+    return found
 
 
 def _on_file(found: dict[str, str], cui: str, reg: str) -> str | None:
@@ -1321,10 +1097,6 @@ async def get_duplicates(status: str = "pending", limit: int = 100):
                           else state.duplicates(status, limit))
             pending = await state.count_duplicates()
     except Exception as e:
-        from harvey.state import NotOnOverlay
-
-        if isinstance(e, NotOnOverlay):
-            return JSONResponse({**empty, "error": str(e)}, status_code=501)
         logger.warning("duplicates failed: %s", e)
         return JSONResponse({**empty, "error": "duplicates failed"}, status_code=500)
     return {"status": status, "pending": pending, "rows": rows}
@@ -1422,9 +1194,6 @@ async def scan_duplicates():
 
     state = _state()
     await state.init_db()
-    if await state.is_overlay():
-        return JSONResponse({"error": "looking for duplicates isn't available on the upgraded "
-                                      "database yet"}, status_code=501)
     try:
         job_id = await job_kinds.enqueue_duplicates_scan(state)
     except jobs.Duplicate as e:
@@ -1894,28 +1663,74 @@ async def get_prospects(limit: int | None = None, offset: int | None = None,
         return rows
 
     limit, offset = _page_args(limit, offset)
-    where, params = _contact_search(q)
-    base = "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id"
-    searched = (" WHERE " + " AND ".join(where)) if where else ""
-    counts = {"all": await _scalar(f"SELECT COUNT(*) AS n {base}{searched}", tuple(params))}
-    for key, cond in _CONTACT_BUCKETS.items():
-        counts[key] = await _scalar(
-            f"SELECT COUNT(*) AS n {base} WHERE {cond}" + (" AND " + " AND ".join(where) if where else ""),
-            tuple(params))
-    bucket = _CONTACT_BUCKETS.get(filter)
-    conds = where + ([bucket] if bucket else [])
-    clause = (" WHERE " + " AND ".join(conds)) if conds else ""
-    rows = await query_db(
-        "SELECT p.*, COALESCE(c.phone, '') AS company_phone, COALESCE(c.location, '') AS "
-        "company_location, COALESCE(c.cui, '') AS company_cui, COALESCE(c.name, '') AS company_name "
-        f"{base}{clause} ORDER BY p.created_at DESC, p.rowid DESC LIMIT ? OFFSET ?",
-        (*params, limit, offset))
-    undone = await _opt_out_undone_ids()
+    if not DB_PATH.exists():
+        return {"total": 0, "offset": offset, "limit": limit, "counts": {}, "prospects": []}
+    return await _overlay_prospects(limit, offset, q, filter)
+
+
+# The Contacts page's buckets as Python tests of a prospect's status.
+_BUCKET_TESTS = {
+    "todo": lambda s: s in ("new", "queued"),
+    "contacted": lambda s: s == "contacted",
+    "replied": lambda s: s in ("replied", "interested", "meeting"),
+    "closed": lambda s: s not in ("new", "queued", "contacted", "replied", "interested",
+                                  "meeting"),
+}
+
+
+async def _overlay_prospects(limit: int, offset: int, q: str, filter: str) -> dict:
+    """get_prospects' page on the overlay: the prospects (a few thousand at
+    most) with their company's phone, place, CUI and name from the firm's
+    record, searched and counted here as _contact_search and
+    _CONTACT_BUCKETS do in SQL."""
+    state = _state()
+    rows = await state.read("prospect_rows")
+    firms = list(dict.fromkeys(str(r["company_id"]) for r in rows
+                               if str(r.get("company_id") or "").isdigit()))
+    cards = {c["id"]: c for c in await state.read("company_rows", firms)} if firms else {}
+    words = [w for w in (q or "")[:200].split()[:8]]
+    out, counts = [], dict.fromkeys(["all", *_BUCKET_TESTS], 0)
     for r in rows:
+        cid = "" if r.get("company_id") in (None, "") else str(r["company_id"])
+        r["company_id"] = cid
+        card = cards.get(cid) or {}
+        r.update(company_phone=card.get("phone") or "", company_location=card.get("location") or "",
+                 company_cui=card.get("cui") or "", company_name=card.get("name") or "")
+        text = _fold_text(" ".join(str(r.get(k) or "") for k in (
+            "first_name", "last_name", "company", "email", "title", "phone", "company_phone",
+            "company_name", "company_location", "company_cui")))
+        phones = re.sub(r"[\s+\-.()/]", "", f"{r.get('phone') or ''} {r['company_phone']}")
+        if not all(_fold_text(w) in text or _phone_word(w, phones) for w in words):
+            continue
+        counts["all"] += 1
+        status = r.get("status") or ""
+        for key, test in _BUCKET_TESTS.items():
+            if test(status):
+                counts[key] += 1
+        out.append(r)
+    test = _BUCKET_TESTS.get(filter)
+    if test:
+        out = [r for r in out if test(r.get("status") or "")]
+    page = out[offset:offset + limit]
+    undone = await _opt_out_undone_ids()
+    for r in page:
         r["opt_out_undone"] = r.get("id") in undone
-    return {"total": counts[filter] if bucket else counts["all"],
-            "offset": offset, "limit": limit, "filter": filter if bucket else "all",
-            "counts": counts, "prospects": rows}
+    return {"total": counts[filter] if test else counts["all"], "offset": offset, "limit": limit,
+            "filter": filter if test else "all", "counts": counts, "prospects": page}
+
+
+def _phone_word(word: str, phones: str) -> bool:
+    """Whether a number in the search matches a phone however it is written
+    (_contact_search's forms: 07... is also +40 7...)."""
+    digits = re.sub(r"[\s+\-.()/]", "", word)
+    if not (digits.isdigit() and len(digits) >= 3):
+        return False
+    forms = {digits}
+    if digits.startswith("0") and not digits.startswith("00"):
+        forms.add("40" + digits[1:])
+    elif digits.startswith("0040"):
+        forms.add(digits[2:])
+    return any(f in phones for f in forms)
 
 
 def _state():
@@ -1996,17 +1811,6 @@ def _search_arg(raw: str) -> tuple[str, str, bool]:
     return "", match, False
 
 
-async def _cui_on_file(state, cui: str) -> bool:
-    """Whether a live company has this CUI (the search box's number)."""
-    from harvey import contacts
-
-    conds, params = contacts.company_conditions(contacts.ContactFilter(cui=cui))
-    async with state._connect() as db:
-        async with db.execute(f"SELECT 1 FROM companies c WHERE {' AND '.join(conds)} LIMIT 1",
-                              params) as cur:
-            return await cur.fetchone() is not None
-
-
 async def _contact_filter(state, args) -> tuple[object, bool]:
     """The ContactFilter the query string asks for, and whether the
     financials database must be attached. Raises ValueError (or ModuleOff
@@ -2021,39 +1825,7 @@ async def _contact_filter(state, args) -> tuple[object, bool]:
         caen=_caen_arg(get("caen")), contact=_contact_arg(get("contact")),
         found_in=get("found_in"))
     f.cui, f.search, f.nothing = _search_arg(get("search"))
-    if await state.is_overlay():
-        return await _overlay_filter(state, f, args, get), False
-    if f.county or f.locality:
-        from harvey import companies
-
-        async with state._connect() as db:
-            f.places = await companies.places(db, f.county, f.locality)
-    if f.cui:
-        # The company with that CUI, else the number as a word ("24").
-        if await _cui_on_file(state, f.cui):
-            f.search = ""
-        else:
-            f.cui = ""
-            f.nothing = not f.search
-    require, exclude = _codes(args.get("require") or ""), _codes(args.get("exclude") or "")
-    if require or exclude:
-        await _refuse_hidden_signals(state, [*require, *exclude])
-        f.cohort = state._verdict_sql(require, exclude, [], 0.0)
-    bounds = {k: _number_arg(args.get(k)) for k in
-              ("min_turnover", "max_turnover", "min_employees", "max_employees")}
-    attach = False
-    if any(v is not None for v in bounds.values()):
-        from harvey.modules.ro.mf_financials import store as fin_store
-
-        figures = fin_store.Filter(**bounds, unknown="include" if get("unknown") == "include"
-                                   else "exclude")
-        if Path(fin_store.FINANCIALS_PATH).is_file():
-            f.figures = figures.in_sql("c.cui")
-            attach = True
-        elif figures.unknown != "include":
-            # No statements on file: no company has a known figure.
-            f.figures = ("0", [])
-    return f, attach
+    return await _overlay_filter(state, f, args, get), False
 
 
 async def _overlay_filter(state, f, args, get):
@@ -2091,15 +1863,6 @@ async def _contacts_db(attach_figures: bool = False):
         await db.close()
 
 
-async def _capped_count(db, with_sql: str, body: str, params: list) -> tuple[int, bool]:
-    from harvey.contacts import COUNT_CAP
-
-    async with db.execute(f"{with_sql}SELECT COUNT(*) FROM (SELECT 1 {body} LIMIT ?)",
-                          (*params, COUNT_CAP + 1)) as cur:
-        (n,) = await cur.fetchone()
-    return min(n, COUNT_CAP), n > COUNT_CAP
-
-
 @app.get("/api/contacts")
 async def get_contacts(request: Request, view: str = "contacts", limit: int = 50,
                        offset: int = 0, sort: str = "", dir: str = "desc"):
@@ -2127,52 +1890,10 @@ async def get_contacts(request: Request, view: str = "contacts", limit: int = 50
         f, attach = await _contact_filter(state, request.query_params)
     except ValueError as e:
         return JSONResponse({**empty, "error": str(e)}, status_code=400)
-    if await state.is_overlay():
-        found = await state.read("contacts_listing", f, sort, dir, limit, offset, people)
-        rows = found.pop("rows")
-        _block_listed(rows, people)
-        return {**empty, **found, "rows": rows}
-    from harvey.modules.ro.mf_financials import store as fin_store
-    empty["financials"] = Path(fin_store.FINANCIALS_PATH).is_file()
-    if people:
-        with_sql, body, params = contacts.people_query(f)
-        order = contacts.order_by(contacts.PEOPLE_SORTS, sort, dir, "first_seen", "p.id")
-        select = ("SELECT p.id, p.name, p.role, p.source, p.first_seen, "
-                  f"{contacts.PERSON_SEARCHED} AS searched_at, "
-                  "c.id AS company_id, c.name AS company_name, c.location, c.cui, c.domain ")
-    else:
-        with_sql, body, params = contacts.contact_query(f)
-        order = contacts.order_by(contacts.CONTACT_SORTS, sort, dir, "first_seen", "ct.id")
-        select = ("SELECT ct.id, ct.kind, ct.value, ct.display, ct.line_type, ct.status, "
-                  "ct.do_not_contact, ct.first_seen, ct.last_seen ")
-    async with _contacts_db(attach) as db:
-        db.row_factory = aiosqlite.Row
-        total, more = await _capped_count(db, with_sql, body, params)
-        async with db.execute(f"{with_sql}{select}{body}{order} LIMIT ? OFFSET ?",
-                              (*params, limit, offset)) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
-        if not people:
-            found = await contacts.summaries(db, [r["id"] for r in rows])
-            for r in rows:
-                r.update(found.get(r["id"], {}))
-                r["do_not_contact"] = bool(r["do_not_contact"])
-        async with db.execute(
-                "SELECT DISTINCT source FROM people WHERE source != '' ORDER BY source" if people
-                else "SELECT DISTINCT source FROM company_contacts WHERE source != '' "
-                     "ORDER BY source") as cur:
-            sources = [r[0] for r in await cur.fetchall()]
-        async with db.execute("SELECT kind, label, channel FROM contact_kinds "
-                              "WHERE available = 1 OR kind IN (SELECT DISTINCT kind FROM contacts) "
-                              "ORDER BY rowid") as cur:
-            kinds = [dict(r) for r in await cur.fetchall()]
-    blocked = _blocked_entries(_load_config_quietly()) if not people else []
-    if blocked:
-        from harvey.gate import do_not_contact_match
-        for r in rows:
-            if r["kind"] == "email" and do_not_contact_match(r["value"], blocked):
-                r["do_not_contact"] = True
-    return {**empty, "total": total, "more": more, "rows": rows, "sources": sources,
-            "kinds": kinds}
+    found = await state.read("contacts_listing", f, sort, dir, limit, offset, people)
+    rows = found.pop("rows")
+    _block_listed(rows, people)
+    return {**empty, **found, "rows": rows}
 
 
 def _block_listed(rows: list[dict], people: bool) -> None:
@@ -2335,10 +2056,7 @@ async def get_contact_reach(contact_id: int):
 
     if not DB_PATH.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
-    if await _state().is_overlay():
-        return await _state().read("reach", contact_id)
-    async with _contacts_db() as db:
-        return await contacts.reach(db, contact_id)
+    return await _state().read("reach", contact_id)
 
 
 async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
@@ -2353,55 +2071,7 @@ async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
     state = _state()
     await state.init_db()
     f, attach = await _contact_filter(state, request.query_params)
-    if await state.is_overlay():
-        return await _overlay_contact_export(state, f, request)
-    with_sql, body, params = contacts.contact_query(f)
-    order = contacts.order_by(contacts.CONTACT_SORTS, request.query_params.get("sort", ""),
-                              request.query_params.get("dir", "desc"), "first_seen", "ct.id")
-    blocked = _blocked_entries(_load_config_quietly(), strict=True)
-    out: list[dict] = []
-    async with _contacts_db(attach) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-                f"{with_sql}SELECT ct.id, ct.kind, ct.value, ct.display, ct.line_type, ct.status, "
-                f"ct.first_seen, ct.last_seen {body} AND ct.do_not_contact = 0{order} LIMIT ?",
-                (*params, CONTACT_EXPORT_MAX)) as cur:
-            rows = [dict(r) for r in await cur.fetchall()]
-        rows = [r for r in rows if not (r["kind"] == "email" and blocked
-                                        and do_not_contact_match(r["value"], blocked))]
-        for start in range(0, len(rows), 500):
-            chunk = rows[start:start + 500]
-            found = await contacts.summaries(db, [r["id"] for r in chunk])
-            marks = ",".join("?" * len(chunk))
-            names: dict[int, list[str]] = {}
-            people: dict[int, list[str]] = {}
-            barred: set[int] = set()
-            async with db.execute(
-                    "SELECT l.contact_id, c.name, COALESCE(p.name, ''), COALESCE(c.domain, '') "
-                    "FROM company_contacts l JOIN companies c ON c.id = l.company_id "
-                    "LEFT JOIN people p ON p.id = l.person_id "
-                    f"WHERE l.contact_id IN ({marks}) AND COALESCE(c.merged_into, '') = '' "
-                    "ORDER BY l.contact_id, l.id", [r["id"] for r in chunk]) as cur:
-                for cid, company, person, domain in await cur.fetchall():
-                    if blocked and domain and do_not_contact_domain_match(domain, blocked):
-                        barred.add(cid)
-                    if company and company not in names.setdefault(cid, []):
-                        names[cid].append(company)
-                    if person and person not in people.setdefault(cid, []):
-                        people[cid].append(person)
-            for r in chunk:
-                if r["id"] in barred:
-                    continue
-                info = found.get(r["id"], {})
-                out.append({
-                    "kind": r["kind"], "value": r["value"], "display": r["display"] or r["value"],
-                    "line_type": r["line_type"], "status": r["status"],
-                    "trust": info.get("trust", ""), "companies": info.get("companies", 0),
-                    "company_names": "; ".join(names.get(r["id"], [])[:10]),
-                    "people": "; ".join(people.get(r["id"], [])[:10]),
-                    "sources": "; ".join(info.get("sources", [])),
-                    "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
-    return out, len(out)
+    return await _overlay_contact_export(state, f, request)
 
 
 async def _overlay_contact_export(state, f, request: Request) -> tuple[list[dict], int]:
@@ -2479,70 +2149,9 @@ async def _with_context(items: list[dict]) -> list[dict]:
     """Attach the campaign, company, contact and signals behind each draft."""
     if not items:
         return items
-    if DB_PATH.exists() and await _state().is_overlay():
-        return await _with_context_overlay(items)
-    pids = sorted({i["prospect_id"] for i in items if i.get("prospect_id")})
-
-    people = {r["id"]: r for r in (await query_db(
-        "SELECT p.id, p.first_name, p.last_name, p.title, p.source, p.email_status, "
-        "p.score, p.personalization_notes, p.company_id, c.name AS company_name, "
-        "c.domain, c.website, c.description, c.industry AS found_by "
-        "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
-        f"WHERE p.id IN ({_in(pids)})", tuple(pids)) if pids else [])}
-    campaigns = await _campaign_names(items)
-
-    company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
-    signals: dict[str, dict[str, str]] = {}
-    if company_ids:
-        rows = await query_db(
-            "SELECT o.company_id, o.signal_code, o.value_num, o.value_text, "
-            "o.observed_at, o.run_id, "
-            "COALESCE(NULLIF(sc.label, ''), o.signal_code) AS label FROM observations o "
-            "LEFT JOIN signal_codes sc ON sc.code = o.signal_code "
-            f"WHERE o.company_id IN ({_in(company_ids)}) "
-            f"AND o.signal_code IN ({_in(OUTBOX_CONTEXT_SIGNALS)}) "
-            "ORDER BY o.observed_at, o.id",
-            (*company_ids, *OUTBOX_CONTEXT_SIGNALS),
-        )
-        # Oldest first, so the latest observation wins. A signal can be seen
-        # several times at once (one HIRING_ROLE row per open role): every
-        # value from the latest sighting shows, not just one of them.
-        latest: dict[tuple, tuple] = {}
-        for r in rows:
-            if r["value_text"]:
-                value = r["value_text"]
-            elif r["value_num"] is None:
-                value = ""
-            else:
-                value = "yes" if r["value_num"] else "no"
-            key = (r["company_id"], r["label"])
-            seen = (r["run_id"] or r["observed_at"])
-            prev_seen, values = latest.get(key, (None, []))
-            if seen != prev_seen:
-                values = []
-            if value not in values:
-                values = values + [value]
-            latest[key] = (seen, values)
-        for (company_id, label), (_, values) in latest.items():
-            signals.setdefault(company_id, {})[label] = ", ".join(v for v in values if v)
-
-    for item in items:
-        p = people.get(item.get("prospect_id")) or {}
-        item["context"] = {
-            "campaign": campaigns.get(item.get("campaign_id"), ""),
-            "company": p.get("company_name", ""),
-            "website": p.get("website") or (f"https://{p['domain']}" if p.get("domain") else ""),
-            "description": p.get("description", ""),
-            "found_by": p.get("found_by", ""),
-            "contact": " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x),
-            "contact_title": p.get("title", ""),
-            "contact_source": p.get("source", ""),
-            "email_status": p.get("email_status", ""),
-            "score": p.get("score"),
-            "notes": p.get("personalization_notes", ""),
-            "signals": signals.get(p.get("company_id"), {}),
-        }
-    return items
+    if not DB_PATH.exists():
+        return items
+    return await _with_context_overlay(items)
 
 
 async def _campaign_names(items: list[dict]) -> dict[str, str]:
@@ -3050,21 +2659,11 @@ async def _company_filter_ids(raw: dict, sort: str, way: str, limit: int) -> tup
     state = _state()
     await state.init_db()
     f, attach = await _contact_filter(state, {k: str(v) for k, v in raw.items() if v is not None})
-    if await state.is_overlay():
-        if (f.words or f.search) and sort in ("", "relevance"):
-            sort = "relevance"
-        elif sort not in companies.SORTS:
-            sort = "created"
-        return await state.read("ids_for", f, sort, companies.direction(sort, way), limit)
-    from harvey.modules.ro.mf_financials import store as fin_store
-    has_fin = Path(fin_store.FINANCIALS_PATH).is_file()
-    if f.search and sort in ("", "relevance"):
+    if (f.words or f.search) and sort in ("", "relevance"):
         sort = "relevance"
-    elif sort not in companies.SORTS or (sort in companies.FIGURE_SORTS and not has_fin):
+    elif sort not in companies.SORTS:
         sort = "created"
-    async with _contacts_db(attach or (has_fin and sort in companies.FIGURE_SORTS)) as db:
-        return await companies.ids_for(db, f, sort, companies.direction(sort, way), limit,
-                                       figures_mark=_figures_mark())
+    return await state.read("ids_for", f, sort, companies.direction(sort, way), limit)
 
 
 async def _search_all_ids(state, q: str) -> tuple[list[str], int]:
@@ -3359,60 +2958,25 @@ async def get_overview():
     opted-out or do-not-contact address), contacts and named people, plus
     whether email can go out right now (``sending``), so the page can say so
     even while the Email module's tabs are hidden."""
-    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
-
-    if DB_PATH.exists() and await _state().is_overlay():
-        return await _overlay_overview()
-    has_phone = ("(COALESCE(c.phone, '') != '' OR EXISTS (SELECT 1 FROM observations o "
-                 "WHERE o.company_id = c.id AND o.signal_code = 'PHONE_NUMBER' AND o.value_text != '') "
-                 "OR EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id AND p.phone != ''))")
-    phone_ids = {r["id"] for r in await query_db(
-        f"SELECT c.id FROM companies c WHERE COALESCE(c.merged_into, '') = '' AND {has_phone}")}
-    config = _load_config_quietly()
-    blocked = _blocked_entries(config)
-    email_ids = set()
-    for r in await query_db(
-            "SELECT p.company_id, p.email, COALESCE(c.domain, '') AS domain FROM prospects p "
-            "JOIN companies c ON c.id = p.company_id WHERE p.email != '' "
-            "AND COALESCE(p.email_status, '') != 'invalid' AND p.status IS NOT 'opted_out'"):
-        if r["company_id"] in email_ids:
-            continue
-        if blocked and (do_not_contact_match(r["email"], blocked)
-                        or do_not_contact_domain_match(r["domain"], blocked)):
-            continue
-        email_ids.add(r["company_id"])
-    return {
-        "companies": await _scalar(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}"),
-        "with_phone": len(phone_ids),
-        "with_email": len(email_ids),
-        "with_both": len(phone_ids & email_ids),
-        "contacts": await _scalar("SELECT COUNT(*) AS n FROM prospects"),
-        "people": await _scalar(
-            "SELECT COUNT(*) AS n FROM (SELECT DISTINCT company_id, value_text FROM observations "
-            "WHERE signal_code = 'CONTACT_FOUND' AND value_text != '')"),
-        "with_activity": await _scalar(
-            "SELECT COUNT(DISTINCT company_id) AS n FROM company_activities"),
-        "signals_proposed": await _scalar(
-            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'proposed' AND available = 1"),
-        "signals_confirmed": await _scalar(
-            "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'confirmed' AND available = 1"),
-        "sending": await _sending_summary(config),
-    }
+    if not DB_PATH.exists():
+        await _state().init_db()       # a new install: the empty database
+    return await _overlay_overview()
 
 
 async def _overlay_overview() -> dict:
     """get_overview on the overlay: the firm counts from overlay.reads (the
-    register's when counted for its load mark), the rest as on schema 24."""
+    register's when counted for its load mark), the rest from the outreach tables."""
     config = _load_config_quietly()
     state = _state()
     await state.init_db()
     found = await state.read("overview", _blocked_entries(config))
     codes = await state.get_signal_codes(available_only=True)
-    people = found["people"] + (found["people_firms"] or 0)
+    people = found["people"]
     return {"companies": found["companies"], "with_phone": found["with_phone"],
             "with_email": found["with_email"], "with_both": found["with_both"],
             "contacts": sum((await state.count_prospects_by_status()).values()),
             "people": people, "with_activity": found["with_activity"],
+            "counting": found.get("counting", False),
             "signals_proposed": sum(1 for c in codes if c.get("status") == "proposed"),
             "signals_confirmed": sum(1 for c in codes if c.get("status") == "confirmed"),
             "sending": await _sending_summary(config)}
@@ -4171,7 +3735,7 @@ def _lane_name(lane: str) -> str:
     m = switches.by_id().get(lane)
     if m is not None:
         return m.name or m.id
-    return {"contacts": "Contacts", "duplicates": "Duplicates"}.get(lane, lane)
+    return {"contacts": "Contacts", "duplicates": "Duplicates", "counts": "Counts"}.get(lane, lane)
 
 
 @app.get("/api/jobs")
@@ -4345,10 +3909,6 @@ STALE_RUN_SECONDS = 900
 # The contact finder has no run row: a company it searched this recently, or
 # a find_contacts job running, means it is at work.
 CONTACT_ACTIVE_SECONDS = 180
-# A company the contact finder searched (finder.FINDER's searches row).
-_FINDER_SEARCHED = ("EXISTS (SELECT 1 FROM searches s WHERE s.target = 'company' "
-                    "AND s.target_id = companies.id AND s.module = 'contact_finder' "
-                    "AND s.capability = 'find_contacts' AND s.outcome != 'error')")
 # Moved on from "waiting to be emailed" (opted_out too: never offered again).
 SENT_STATUSES = ("contacted", "replied", "meeting", "closed", "lost", "opted_out")
 REPLY_STATUSES = ("replied", "meeting", "closed")
@@ -4358,6 +3918,83 @@ def _eta_text(minutes) -> str:
     if minutes is None:
         return ""
     return "less than a minute left" if minutes < 1 else f"about {round(minutes)} min left"
+
+
+# ── The database upgrade (harvey/upgrade.py) ──
+
+def _upgrade_layout():
+    from harvey import upgrade
+
+    return upgrade.Layout(DB_PATH.parent)
+
+
+@app.get("/api/upgrade")
+async def get_upgrade():
+    """Whether harvey.db needs the upgrade, its stages, verification,
+    estimate (sizes, time, disk) and the old files the switch kept."""
+    from harvey import upgrade
+
+    return await asyncio.to_thread(upgrade.status, _upgrade_layout())
+
+
+def _spawn_upgrade() -> None:
+    """Run harvey upgrade in its own process (it outlives a closed tab, and
+    a crash there never takes the dashboard down); its output goes to
+    data/upgrade.log."""
+    log = open(DB_PATH.parent / "upgrade.log", "ab")
+    try:
+        subprocess.Popen([sys.executable, "-m", "harvey", "upgrade", "--yes", "--data",
+                          str(DB_PATH.parent)], cwd=str(PROJECT_ROOT), stdout=log,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=sys.platform != "win32")
+    finally:
+        log.close()
+
+
+@app.post("/api/upgrade/start")
+async def start_upgrade():
+    """Start (or resume) the upgrade; refused when none is needed, one is
+    running, or the free space is too little or can't be known."""
+    from harvey import upgrade
+
+    s = await asyncio.to_thread(upgrade.status, _upgrade_layout())
+    if not s["needed"]:
+        return JSONResponse({"success": False, "message": "harvey.db is upgraded already"},
+                            status_code=409)
+    if s["running"]:
+        return JSONResponse({"success": False, "message": "the upgrade is running"},
+                            status_code=409)
+    # (Finishing a switch writes nothing new: no space to check.)
+    est = {} if s.get("switch_pending") else s.get("estimate") or {}
+    if est.get("free_error"):
+        return JSONResponse({"success": False, "message": est["free_error"]}, status_code=409)
+    if est.get("free_bytes") is not None and est["free_bytes"] < est["floor_bytes"]:
+        return JSONResponse({"success": False, "message": (
+            f"{est['free_bytes'] / 1e9:.1f} GB free; the upgrade needs at least "
+            f"{est['floor_bytes'] / 1e9:.0f} GB")}, status_code=409)
+    await asyncio.to_thread(_spawn_upgrade)
+    return {"success": True}
+
+
+# What the user types to delete the old files (either language's word).
+DELETE_WORDS = ("șterge", "sterge", "delete")
+
+
+@app.post("/api/upgrade/delete-old")
+async def delete_old_files(request: Request):
+    """Delete the files the switch kept (harvey.db.v24, anaf.db.old), once
+    the typed confirmation says so."""
+    from harvey import upgrade
+
+    body = await request.json() if await request.body() else {}
+    if str(body.get("confirm", "")).strip().lower() not in DELETE_WORDS:
+        return JSONResponse({"success": False, "message": "type the word to confirm"},
+                            status_code=400)
+    try:
+        freed = await asyncio.to_thread(upgrade.delete_old, _upgrade_layout())
+    except upgrade.Refused as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=409)
+    return {"success": True, "freed": freed}
 
 
 @app.get("/api/live-status")
@@ -4371,20 +4008,12 @@ async def get_live_status():
     read), so a finished step always reaches 100% instead of sticking.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # DB stores naive UTC
-    has_site = f"COALESCE(domain, '') != '' AND {_LIVE}"
-    overlay = DB_PATH.exists() and await _state().is_overlay()
-    if overlay:
+    if DB_PATH.exists():
         firm_counts = await _state().read("status_counts")
         companies, with_site, profiled, checked = (
             firm_counts[k] for k in ("companies", "with_site", "profiled", "checked"))
     else:
-        companies = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {_LIVE}")
-        with_site = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {has_site}")
-        profiled = await _scalar(
-            f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at IS NOT NULL")
-        checked = await _scalar(
-            f"SELECT COUNT(*) FROM companies WHERE {has_site} "
-            f"AND profile_checked_at IS NOT NULL AND {_FINDER_SEARCHED}")
+        companies = with_site = profiled = checked = 0
     no_site = companies - with_site
 
     prospects = await query_db("SELECT id, email, email_status, status FROM prospects")
@@ -4428,33 +4057,23 @@ async def get_live_status():
             "SELECT * FROM runs WHERE status = 'running' ORDER BY started_at"):
         started = _parse_ts(run.get("started_at"))
         elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
-        last = started if overlay else _parse_ts(await _first(
-            "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
-            (run["id"],))) or started
+        last = started
         item = {"stage": run.get("stage"), "provider": run.get("provider"),
                 "elapsed_min": round(elapsed / 60, 1), "eta_min": None}
         if last and (now - last).total_seconds() > STALE_RUN_SECONDS:
             stopped.append(item)
             continue
         if run.get("stage") == "profile" and started:
-            if overlay:
-                done_in_run = (await _state().read(
-                    "status_counts", since=started.replace(tzinfo=timezone.utc).timestamp())
-                )["profiled_since"]
-            else:
-                done_in_run = await _scalar(
-                    f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at >= ?",
-                    (run["started_at"],))
+            done_in_run = (await _state().read(
+                "status_counts", since=started.replace(tzinfo=timezone.utc).timestamp())
+            )["profiled_since"]
             left = max(0, with_site - profiled)
             if left and done_in_run and elapsed > 0:
                 item["eta_min"] = left / (done_in_run / elapsed) / 60
         running.append(item)
 
     # (The newest searches only: the table holds every search ever made.)
-    last_contact = _parse_ts(firm_counts["last_contact"] if overlay else await _first(
-        "SELECT MAX(searched_at) AS t FROM (SELECT target, module, capability, searched_at "
-        "FROM searches ORDER BY id DESC LIMIT 500) WHERE target = 'company' "
-        "AND module = 'contact_finder' AND capability = 'find_contacts'"))
+    last_contact = _parse_ts(firm_counts["last_contact"]) if DB_PATH.exists() else None
     # Work is jobs now: one running on its lane counts as the step running.
     busy = {r["kind"] for r in await query_db(
         "SELECT DISTINCT kind FROM jobs WHERE status = 'running'")}
@@ -4599,11 +4218,7 @@ async def get_today():
             "SELECT COUNT(*) AS n FROM conversations WHERE status = 'needs_human'"
         )
         needs_human = handed[0]["n"] if handed else 0
-        if await state.is_overlay():
-            n_companies = (await state.read("tally")).get("firms", 0)
-        else:
-            companies = await query_db(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
-            n_companies = companies[0]["n"] if companies else 0
+        n_companies = (await state.read("tally")).get("firms", 0)
 
         unprofiled_count = await state.count_companies_needing_profile()
         stats = {
@@ -5449,22 +5064,16 @@ async def get_runs_api():
         await state.init_db()
         await state.sweep_stale_runs()
         runs = await state.get_runs(limit=25)
-        overlay = await state.is_overlay()
         # Same rule as the live panel: a "running" run that has recorded
         # nothing for STALE_RUN_SECONDS has stopped, whatever its row says.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         for run in runs:
             if run.get("status") != "running":
                 continue
-            if overlay:
-                # (Unix seconds: the overlay's obs time, by the run's batch.)
-                at = await state.read("run_last_at", run["id"])
-                last = (datetime.fromtimestamp(at, timezone.utc).replace(tzinfo=None)
-                        if at else None)
-            else:
-                last = _parse_ts(await _first(
-                    "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
-                    (run["id"],)))
+            # (Unix seconds: the obs time, by the run's batch.)
+            at = await state.read("run_last_at", run["id"])
+            last = (datetime.fromtimestamp(at, timezone.utc).replace(tzinfo=None)
+                    if at else None)
             last = last or _parse_ts(run.get("started_at"))
             if last and (now - last).total_seconds() > STALE_RUN_SECONDS:
                 run["status"] = "stalled"

@@ -14,7 +14,7 @@ Here is where a draft becomes rows, under the rules no module can skip:
   record it was found for before any merge (``origin_company_id``), which
   is what lets undoing an automatic merge take back exactly its facts.
 
-``store`` is a StateManager, or a CompanyBatch for many records on one
+``store`` is a StateManager, or its Batch for many records on one
 connection (a registry pull). Run bookkeeping (the runs log, a company's
 "profiled" mark) stays with the run that does it (harvey/modules/runs.py).
 """
@@ -118,7 +118,7 @@ async def place_of(store, company_id: str, record: Record, origin: str = "",
 async def source_record(batch, record: Record, *, collector: str,
                         dry_run: bool = False) -> Saved:
     """A company an official source (a trade registry) describes, on a
-    CompanyBatch. Matched by legal identity (CUI, registration number) and
+    Batch. Matched by legal identity (CUI, registration number) and
     name in its town; a domain it declares is self-declared, so it is a
     possible match for review, never a reason on its own to hang this
     record on another business, and a domain another company holds is left

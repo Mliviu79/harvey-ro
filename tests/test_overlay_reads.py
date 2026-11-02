@@ -201,8 +201,9 @@ async def test_rows_describe_firms_from_the_register_and_locally(state):
     assert alfa["_inputs"]["people"][0]["name"] == "Ana Exemplu"
     assert rows[i["gama"]]["external_id"] == "onrc:J08/3/2015" and rows[i["gama"]]["cui"] == ""
     listing = rows[i["listing"]]
-    # (A country named last is no county: the place line keeps the town.)
-    assert (listing["name"], listing["location"]) == ("Cabinet Exemplu", "Brașov")
+    # (A country named last is no county: kept as the country, which a
+    # recipient's time zone reads.)
+    assert (listing["name"], listing["location"]) == ("Cabinet Exemplu", "Brașov, Romania")
     assert listing["phone"] and listing["source"].startswith("discover:")
 
 
@@ -520,7 +521,7 @@ async def test_a_survivor_without_a_tax_code_sorts_by_its_merged_records_figure(
 async def test_outreach_reads_on_the_overlay(state, client):
     i = state.ids
     con = sqlite3.connect(state.db_path)
-    con.execute("INSERT INTO prospects (id, firm, first_name, email, score) "
+    con.execute("INSERT INTO prospects (id, company_id, first_name, email, score) "
                 "VALUES ('p1', ?, 'Ana', 'ana@alfa.example.com', 7)", (i["alfa"],))
     con.execute("INSERT INTO campaigns (id, name) VALUES ('c1', 'Exemplu')")
     con.commit()
@@ -534,9 +535,123 @@ async def test_outreach_reads_on_the_overlay(state, client):
     assert context["company"] == "EXEMPLU ALFA SRL" and context["campaign"] == "Exemplu"
     assert context["contact"] == "Ana" and context["website"] == "https://alfa.example.com"
     assert context["signals"]
-    # Reads it has no version of yet say so, and an id too long for an
-    # integer is no company (not an error).
-    assert client.get("/api/duplicates").status_code == 501
+    # An id too long for an integer is no company (not an error).
     assert client.get("/api/companies/" + "9" * 25).status_code == 404
     assert client.post("/api/companies/" + "9" * 25 + "/remove").status_code == 404
     assert "error" not in client.get("/api/runs").json()
+
+
+# ── Kept name and place positions, the People page's count, people overall ──
+
+def _orders(state):
+    con = sqlite3.connect(state.db_path)
+    try:
+        return dict((r[0], (r[1], r[2])) for r in con.execute(
+            "SELECT id, name_order, place_order FROM firm WHERE live = 0"))
+    finally:
+        con.close()
+
+
+@pytest.mark.asyncio
+async def test_kept_positions_sort_every_firm_by_index_and_follow_renames(state):
+    i = state.ids
+    # Not placed yet for this load: the pages sort the slow way.
+    assert _page(state, sort="name")[2] == "snapshot"
+    assert await state.refresh_orders() == 4
+    assert await state.refresh_orders() == 0          # current already
+    pos = _orders(state)
+    # A registered firm's position is its registry id; the listing's falls
+    # half a step before the first registry name after its own.
+    assert pos[i["alfa"]][0] == 1 and pos[i["beta"]][0] == 2 and pos[i["gama"]][0] == 3
+    assert pos[i["listing"]][0] == 0.5
+    reads.ORDERINGS.clear()
+    total, ids, how = _page(state, sort="name", way="asc")
+    assert (total, ids, how) == (4, [i["listing"], i["alfa"], i["beta"], i["gama"]], "index")
+    assert _page(state, sort="name")[1] == list(reversed(ids))
+    # Every firm is in one town: by place, ties by id.
+    assert _page(state, sort="place")[1] == sorted(ids, reverse=True)
+    assert _page(state, sort="place")[2] == "index"
+    # A filtered list sorts by the kept positions too.
+    county = ContactFilter(county="Brașov")
+    assert _page(state, county, sort="name", way="asc")[1] == ids
+    # A name Harvey gives a registered firm moves it.
+    await state.rename_company(str(i["alfa"]), "ZETA EXEMPLU")
+    reads.ORDERINGS.clear()
+    assert _page(state, sort="name", way="asc")[1] == [i["listing"], i["beta"], i["gama"],
+                                                       i["alfa"]]
+
+
+@pytest.mark.asyncio
+async def test_people_page_counts_to_its_cap_and_overview_counts_people(state, client):
+    con, r = _reader(state)
+    try:
+        # More people than the cap, with no kept count: counted up to it.
+        total, more, rows = r.people_page(ContactFilter(), "", "desc", 50, 0, cap=0)
+        assert (total, more) == (0, True)
+    finally:
+        con.close()
+    before = client.get("/api/overview").json()["people"]
+    # Ana Exemplu (Harvey's, from the site); the register's two counted once
+    # its signals are counted for the load.
+    assert before == 1
+    assert await state.recount_register_tally() > 0
+    assert client.get("/api/overview").json()["people"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_big_cohort_pages_through_the_name_index(state, monkeypatch):
+    i = state.ids
+    await state.refresh_orders()
+    monkeypatch.setattr(reads, "COHORT_SORTED_MAX", 0)
+    con, r = _reader(state)
+    try:
+        counts, rows = r.cohort_verdicts(["TECH_STACK"], [], verdicts=("possible",), limit=2)
+        assert counts["possible"] == 3
+        assert [int(x["id"]) for x in rows] == [i["listing"], i["beta"]]
+        _, rest = r.cohort_verdicts(["TECH_STACK"], [], verdicts=("possible",), offset=2,
+                                    limit=2)
+        assert [int(x["id"]) for x in rest] == [i["gama"]]
+    finally:
+        con.close()
+
+
+# ── Duplicates on the overlay ──
+
+@pytest.mark.asyncio
+async def test_duplicates_scan_lists_groups_and_merges(state, client):
+    i = state.ids
+    # A second listing with the first one's phone and another name.
+    saved = await ingest.listing(state, D.business_record(D.Business(
+        name="Clinica Exemplu", phone="+40 268 000 101", location="Brașov, Romania",
+        external_id="dataforseo:cid:2", provider="dataforseo_maps", has_website=False), QUERY))
+    other = int(saved.company_id)
+    assert other != i["listing"]
+    con = sqlite3.connect(state.db_path)
+    con.execute("DELETE FROM match_candidate")      # (as if saved before the resolver)
+    con.commit()
+    con.close()
+    done = await state.scan_duplicates()
+    # One phone, two names: a question, not a merge.
+    assert (done["pairs"], done["review"], done["merged"]) == (1, 1, 0)
+    pending = client.get("/api/duplicates").json()
+    assert pending["pending"] == 1 and await state.count_duplicates() == 1
+    group = pending["rows"][0]
+    assert sorted(int(m["id"]) for m in group["members"]) == sorted([i["listing"], other])
+    assert all(m["phones"] == ["+40268000101"] for m in group["members"])
+    assert {r["code"] for r in group["reasons"]} >= {"phone"}
+    await state.merge_group(group["keeper"], [m["id"] for m in group["members"]
+                                              if not m["keeper"]])
+    merged = client.get("/api/duplicates?status=merged").json()
+    assert merged["pending"] == 0 and len(merged["rows"]) == 1
+    row = merged["rows"][0]
+    assert {row["survivor"], row["merged"]} == {str(i["listing"]), str(other)}
+    assert row["b"]["merged_into"] == row["survivor"]
+    # Scanning again finds nothing new; the scan is a job on the duplicates lane.
+    assert (await state.scan_duplicates())["merged"] == 0
+    queued = client.post("/api/duplicates/scan").json()
+    assert queued["queued"] is True and queued["job"]
+    await state.separate_companies(str(i["alfa"]), str(i["beta"]))
+    apart = client.get("/api/duplicates?status=separate").json()["rows"]
+    assert {(r["company_a"], r["company_b"]) for r in apart} == {(str(i["alfa"]),
+                                                                  str(i["beta"]))}
+    assert apart[0]["a"]["name"] == "EXEMPLU ALFA SRL"

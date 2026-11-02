@@ -317,6 +317,10 @@ class Worker:
         """Work until ``stop`` is set. Returns False when the lease was
         held by another worker and ``wait_for_lease`` is off."""
         stop = stop or asyncio.Event()
+        # A database waiting for the upgrade runs no jobs (and takes no
+        # lease: the upgrade refuses while a worker holds one).
+        if not await self.state.wait_until_upgraded(stop):
+            return True
         jobs.listen(self._wake)
         try:
             if self.full:
@@ -335,6 +339,8 @@ class Worker:
                 self._renewer.hold(LEASE_NAME)
             self._renewer.start()
             logger.info("worker %s: running jobs", self.name)
+            if self.full:
+                await _enqueue_stale_counts(self.state)
             next_sweep = 0.0
             while not stop.is_set():
                 if LEASE_NAME in self._renewer.lost:
@@ -539,6 +545,18 @@ async def _enqueue_backlog(state) -> None:
         logger.warning("worker: feeding the contact finder's backlog failed: %s", e)
 
 
+async def _enqueue_stale_counts(state) -> None:
+    """The register counts the landing, Signals and People pages read,
+    queued when they aren't counted for the registers' current loads (the
+    first start after the upgrade, a reload or a merge)."""
+    try:
+        if await state.read("register_tally_stale"):
+            from harvey.modules.job_kinds import enqueue_register_counts
+            await enqueue_register_counts(state)
+    except Exception as e:
+        logger.warning("worker: checking the register counts failed: %s", e)
+
+
 async def _enqueue_due_sources(state) -> None:
     try:
         from harvey.modules.job_kinds import enqueue_due_sources
@@ -552,6 +570,10 @@ async def _enqueue_due_sources(state) -> None:
 async def serve(state, stop: asyncio.Event | None = None) -> None:
     """``harvey worker``: run jobs until stopped, waiting for the lease
     while another worker (the dashboard's) holds it."""
+    stop = stop or asyncio.Event()
+    # Never on a database waiting for the upgrade: wait for it instead.
+    if not await state.wait_until_upgraded(stop):
+        return
     await state.init_db()
     worker = Worker(state)
     holder = await lease_holder(state)

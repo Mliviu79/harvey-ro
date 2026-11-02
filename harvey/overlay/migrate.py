@@ -141,17 +141,16 @@ def _uri(path: Path, *, read_only: bool = False, immutable: bool = False) -> str
 
 # ── Reading the place line of a firm no register describes ──
 
-def place_parts(location: str) -> tuple[str, str]:
-    """(locality, county) from a schema 24 place line: "Town, County,
-    Country" (the country, a third part, is left out), "Town, Region", or
-    a town alone. A free text line: the split is what the line says, no
-    more."""
+def place_parts(location: str) -> tuple[str, str, str]:
+    """(locality, county, country) from a schema 24 place line: "Town,
+    County, Country" (the country a third part), "Town, Region", or a town
+    alone. A free text line: the split is what the line says, no more."""
     parts = [p.strip() for p in (location or "").split(",") if p.strip()]
     if not parts:
-        return "", ""
+        return "", "", ""
     if len(parts) >= 3:
-        return parts[0], ", ".join(parts[1:-1])
-    return parts[0], parts[1] if len(parts) == 2 else ""
+        return parts[0], ", ".join(parts[1:-1]), parts[-1]
+    return parts[0], parts[1] if len(parts) == 2 else "", ""
 
 
 # ── The run ──
@@ -635,11 +634,11 @@ def _local(run: Run) -> None:
     def body(lo, hi):
         run.x(f"""
             INSERT INTO local_firm (firm, name, county, locality, address, phone, industry,
-                                    description, source_url)
+                                    description, source_url, country)
             SELECT m.firm, NULLIF(c.name, ''), NULLIF(harvey_place(c.location, 1), ''),
                    NULLIF(harvey_place(c.location, 0), ''), NULLIF(c.address, ''),
                    NULLIF(c.phone, ''), NULLIF(c.industry, ''), NULLIF(c.description, ''),
-                   NULLIF(c.source_url, '')
+                   NULLIF(c.source_url, ''), NULLIF(harvey_place(c.location, 2), '')
             FROM work.map m JOIN old.companies c ON c.rowid = m.crow
             WHERE m.firm > ? AND m.firm <= ? AND NOT {described}""", (lo, hi))
 
@@ -889,6 +888,9 @@ def _observations(run: Run) -> None:
     _obs_rules(run)
     collectors = collector_modules(run.manifests)
     declared = dict(run.con.execute("SELECT code, module FROM old.signal_codes").fetchall())
+    stores = set(run.con.execute("SELECT s.code, m.name FROM signal_source ss JOIN signal s "
+                                 "ON s.id = ss.signal JOIN module m ON m.id = ss.module "
+                                 "WHERE ss.how = 0").fetchall())
     shape = {code: (keyed_by or "", cardinality or "") for code, keyed_by, cardinality in
              run.con.execute("SELECT code, keyed_by, cardinality FROM signal").fetchall()}
     register = sorted(run.register_modules)
@@ -903,7 +905,13 @@ def _observations(run: Run) -> None:
             f"AND r.module = COALESCE(o.module, '') AND r.collector = COALESCE(o.collector, ''))",
             (lo, hi)).fetchall()
         for code, module, collector in new:
-            owner = module or collectors.get(collector or "") or declared.get(code) or ""
+            # (The collector's module when it stores the signal, or is a
+            # register whose facts are read in place: "discover" names a
+            # search module, not the one a preset's fact belongs to.)
+            guess = collectors.get(collector or "")
+            owner = module or (guess if (code, guess) in stores
+                               or guess in run.register_modules else "") \
+                or declared.get(code) or ""
             keep = owner not in run.register_modules and code in shape
             keyed_by, cardinality = shape.get(code, ("", ""))
             run.x("INSERT INTO work.obs_rule VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -912,11 +920,15 @@ def _observations(run: Run) -> None:
                    run.one("SELECT id FROM signal WHERE code = ?", (code,)) if keep else None,
                    int(bool(keyed_by) or cardinality == "many")))
 
+    # A search's hit with no capability named keeps that it was one.
+    cap = (f"COALESCE(NULLIF(o.capability, ''), CASE WHEN o.collector = 'discover' "
+           f"THEN '{schema.SEARCH_HIT}' END)")
+
     def body(lo, hi):
         decide(lo, hi)
         run.batches_into(f"SELECT o.run_id AS n FROM old.observations o "
                          f"WHERE o.rowid > ? AND o.rowid <= ? AND {skip}", (lo, hi, *register))
-        _capabilities(run, f"SELECT r.module AS mo, o.capability AS n FROM old.observations o "
+        _capabilities(run, f"SELECT r.module AS mo, {cap} AS n FROM old.observations o "
                            f"JOIN work.obs_rule r ON r.code = o.signal_code "
                            f"AND r.module = COALESCE(o.module, '') "
                            f"AND r.collector = COALESCE(o.collector, '') AND r.keep = 1 "
@@ -929,7 +941,7 @@ def _observations(run: Run) -> None:
             SELECT {run.firm_of('o.company_id', origin='o.origin_company_id', moved=moved)},
                    r.signal_id, CASE WHEN r.keyed THEN COALESCE(o.value_text, '') ELSE '' END,
                    o.value_num, NULLIF(o.value_text, ''), o.confidence, r.module_id,
-                   (SELECT id FROM work.capname WHERE name = NULLIF(o.capability, '')),
+                   (SELECT id FROM work.capname WHERE name = {cap}),
                    (SELECT id FROM batch WHERE ref = NULLIF(o.run_id, '')),
                    NULLIF(o.evidence_url, ''), COALESCE({unix('o.observed_at')}, 0)
             FROM old.observations o
@@ -1026,9 +1038,9 @@ def _unfill(con, survivor: int, items: dict) -> int:
             cleared += con.execute(f"UPDATE local_firm SET {col} = NULL WHERE firm = ? "
                                    f"AND {col} = ?", (survivor, value)).rowcount
         elif key == "location":
-            locality, county = place_parts(value)
-            cleared += con.execute("UPDATE local_firm SET locality = NULL, county = NULL "
-                                   "WHERE firm = ? AND locality IS ? AND county IS ?",
+            locality, county, _ = place_parts(value)
+            cleared += con.execute("UPDATE local_firm SET locality = NULL, county = NULL, "
+                                   "country = NULL WHERE firm = ? AND locality IS ? AND county IS ?",
                                    (survivor, locality or None, county or None)).rowcount
     return cleared
 
@@ -1044,11 +1056,11 @@ def _outreach(run: Run) -> None:
             cols = [c for c in _columns(con, table, "main") if c in _columns(con, table, "old")]
             names = ", ".join(cols)
             con.execute(f"INSERT INTO main.{table} ({names}) SELECT {names} FROM old.{table}")
-        cols = [c for c in _columns(con, "prospects", "main") if c != "firm"]
+        cols = [c for c in _columns(con, "prospects", "main") if c != "company_id"]
         names = ", ".join(cols)
         moved = ("(SELECT w.firm FROM work.moved mv JOIN work.map w ON w.uuid = mv.uuid "
                  "WHERE mv.tbl = 'prospects' AND mv.key = p.id)")
-        con.execute(f"INSERT INTO prospects (firm, {names}) "
+        con.execute(f"INSERT INTO prospects (company_id, {names}) "
                     f"SELECT {run.firm_of('NULLIF(p.company_id, %s)' % repr(''), moved=moved)}, "
                     f"{', '.join('p.' + c for c in cols)} FROM old.prospects p")
         con.execute(f"""
@@ -1080,7 +1092,19 @@ def _legacy(run: Run) -> None:
             con.execute("INSERT OR IGNORE INTO legacy_id (uuid, firm) SELECT uuid, firm "
                         "FROM work.map WHERE uuid IN (SELECT value FROM json_each(?))",
                         (json.dumps(chunk),))
-        return {"tokens": len(found)}
+        # The columns a much earlier version filled (nothing has written
+        # them since: a site read's facts are observations): kept as notes.
+        notes = 0
+        have = _columns(con, "companies", "old")
+        for column, kind in (("tech_stack_json", "legacy tech stack"),
+                             ("signals_json", "legacy signals")):
+            if column in have:
+                notes += con.execute(
+                    f"INSERT OR IGNORE INTO migration_note (firm, kind, value) "
+                    f"SELECT w.firm, '{kind}', c.{column} FROM work.map w "
+                    f"JOIN old.companies c ON c.rowid = w.crow "
+                    f"WHERE COALESCE(c.{column}, '') NOT IN ('', '[]')").rowcount
+        return {"tokens": len(found), "legacy notes": notes}
 
     run.atomic("legacy", body)
 
@@ -1101,6 +1125,18 @@ def _recount(run: Run) -> None:
         run.on_chunk("recount", 0)
 
 
+def _orders(run: Run) -> None:
+    """Every firm's place in the directory register's name and place orders
+    (overlay/orders.py)."""
+    from harvey.overlay import orders
+    from harvey.overlay.idents import Schemes
+
+    def body():
+        orders.refresh(run.con, run.registers, Schemes.load(run.con, run.manifests))
+
+    run.atomic("orders", body)
+
+
 def _finish(run: Run) -> None:
     def body():
         run.x("ANALYZE main")
@@ -1110,4 +1146,4 @@ def _finish(run: Run) -> None:
 
 STEPS = (_vocabulary, _map, _firms, _idents, _keys, _local, _names, _local_names, _contacts,
          _people, _evidence, _searches, _sources, _observations, _merges, _outreach, _legacy,
-         _source_read, _recount, _finish)
+         _source_read, _recount, _orders, _finish)

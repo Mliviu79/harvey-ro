@@ -427,82 +427,10 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     facts_of: dict[str, list[api.Fact]] = {}
     for fact in draft.facts:
         facts_of.setdefault(fact.record, []).append(fact)
-    if await _overlay(state):
-        return await _save_source_overlay(
-            state, draft, report, facts_of, confirmed=confirmed, module=module,
-            dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
-            saved_ids=saved_ids, on_saved=on_saved)
-
-    async def save(batch, record: api.Record):
-        if ingest.excluded(record, do_not_contact):
-            report.excluded += 1
-            return
-        report.catch_all_only += record.counts.get("catch_all_only", 0)
-        found = facts_of.get(record.key, [])
-        saved = await ingest.source_record(batch, record, collector=collector,
-                                           dry_run=dry_run)
-        report.shared_domain += saved.shared_domain
-        if saved.created:
-            report.new_companies += 1
-        else:
-            report.known_companies += 1
-        report.administrators += record.counts.get("administrators", 0)
-        if dry_run:
-            return
-        if saved_ids is not None:
-            saved_ids.append(saved.company_id)
-        report.updated_companies += saved.updated
-        report.activities += saved.activities
-        rows = ingest.rows([replace(f, record="") for f in found],
-                           company_id=saved.company_id, origin=saved.origin,
-                           run_id=report.run_id, confirmed=confirmed)
-        fresh = await ingest.unseen(batch, saved.company_id, record.source_url, rows)
-        report.observations += await ingest.write(batch, fresh, report.run_id)
-        if "CONTACT_FOUND" not in confirmed:
-            # The people the source names (a registry's administrators) are
-            # people to search for a contact whatever is confirmed; only the
-            # reading waits for CONTACT_FOUND.
-            await ingest.named_people(batch, saved.company_id, found, origin=saved.origin,
-                                      source=module)
-
-    records = draft.records
-    try:
-        done = 0
-        for start in range(0, len(records), SOURCE_SAVE_BATCH):
-            # A batch that fails is rolled back, so are its counts.
-            counts = {k: getattr(report, k) for k in _REPORT_COUNTS}
-            first = len(saved_ids) if saved_ids is not None else 0
-            try:
-                async with state.batch() as batch:
-                    for record in records[start:start + SOURCE_SAVE_BATCH]:
-                        done += 1
-                        if progress and done % SOURCE_PROGRESS_EVERY == 0:
-                            progress(done, len(records))
-                        await save(batch, record)
-            except Exception:
-                for k, v in counts.items():
-                    setattr(report, k, v)
-                if saved_ids is not None:
-                    del saved_ids[first:]
-                raise
-            if on_saved is not None and saved_ids is not None:
-                on_saved(saved_ids[first:])
-        if not dry_run:
-            await state.finish_run(report.run_id, status="completed",
-                                   records=report.new_companies + report.known_companies)
-    except Exception as e:
-        logger.exception("%s import failed", module)
-        report.errors.append(str(e))
-        if not dry_run:
-            await state.finish_run(report.run_id, status="failed",
-                                   records=report.new_companies, error=str(e))
-    return report
-
-
-async def _overlay(state) -> bool:
-    """Whether ``state`` writes to the overlay (schema 25)."""
-    probe = getattr(state, "is_overlay", None)
-    return bool(probe is not None and await probe())
+    return await _save_source_overlay(
+        state, draft, report, facts_of, confirmed=confirmed, module=module,
+        dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
+        saved_ids=saved_ids, on_saved=on_saved)
 
 
 async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, confirmed,
@@ -592,13 +520,6 @@ async def registry_pull(state, con, q, *, limit: int | None = None,
         run_params=draft.values.get("run_params"), dry_run=dry_run,
         do_not_contact=do_not_contact, progress=progress, saved_ids=saved,
         on_saved=follow_up.add if follow_up is not None else None)
-    if saved and not report.errors and not await _overlay(state):
-        # What other free local sources know about them (their yearly
-        # figures), at once: a filter on those is decided before any paid
-        # search runs. (On the overlay those are read from the registers,
-        # and the pull kept their phones already.)
-        found = await lookup_by_id(state, saved)
-        report.observations += found["observations"]
     return report
 
 
@@ -759,6 +680,10 @@ async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
     <identifier>}]``, its facts and contacts keyed to them), so it opens its
     database once for them; one without is called a company at a time.
 
+    On the upgraded database (schema 25) a source's facts are read from
+    its own file where they are, never copied: only what it gives as a
+    contact (a phone) is kept, and a source that gives none is not read.
+
     Returns {"observations", "companies", "unconfirmed": {module: [codes]},
     "skipped" (a source with nothing loaded), "errors"}."""
     from harvey.modules import switches
@@ -774,6 +699,10 @@ async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
         if missing:
             out["unconfirmed"][m.id] = missing
         if not _wanted(cap, confirmed):
+            continue
+        # Register facts are read in place: only sources that bring
+        # contacts (ids) are asked.
+        if not (cap.get("outputs") or {}).get("ids"):
             continue
         companies = await state.companies_with_id(kind, company_ids)
         if not companies:
@@ -831,16 +760,10 @@ async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
                         draft = found.get(row["id"])
                         if draft is None:
                             continue
-                        rows = ingest.rows(draft.facts, company_id=row["id"], run_id=run_id,
-                                           confirmed=confirmed)
-                        await ingest.company_phones(batch, row["id"], draft.contacts)
-                        fresh = []
-                        for url in dict.fromkeys(r["evidence_url"] for r in rows):
-                            fresh += await ingest.unseen(
-                                batch, row["id"], url, [r for r in rows if r["evidence_url"] == url])
-                        if fresh:
+                        # (Register facts are read in place: only contacts.)
+                        if draft.contacts:
                             touched += 1
-                            written += await ingest.write(batch, fresh, run_id)
+                            await ingest.company_phones(batch, row["id"], draft.contacts)
                 if failed is not None:
                     out["errors"].append(f"{m.id}: {failed}")
                     break

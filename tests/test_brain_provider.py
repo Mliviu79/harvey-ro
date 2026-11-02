@@ -342,38 +342,6 @@ async def test_main_heartbeat_builds_brain_from_config(monkeypatch):
 # ── state migration ──
 
 
-@pytest.mark.asyncio
-async def test_existing_usage_rows_become_claude(tmp_path):
-    from datetime import date
-
-    import aiosqlite
-    from harvey.state import MIGRATIONS
-
-    db_path = str(tmp_path / "old.db")
-    async with aiosqlite.connect(db_path) as db:
-        for script in MIGRATIONS[:10]:  # a database from before v11
-            await db.executescript(script)
-        await db.execute("PRAGMA user_version = 10")
-        await db.execute("INSERT INTO usage_events (id, model, output_tokens) VALUES ('a', 'm', 5)")
-        # Harvey keys usage_log by the LOCAL date (date.today()); SQLite's
-        # date('now') is UTC, which is already tomorrow on a US evening.
-        await db.execute("INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', ?, 7)",
-                         (date.today().isoformat(),))
-        await db.commit()
-
-    sm = StateManager(db_path)
-    await sm.init_db()
-    rows = await sm.usage_by_provider(days=30)
-    assert [(r["provider"], r["output_tokens"]) for r in rows] == [("claude", 5)]
-    assert await sm.get_usage_today("claude") == 7
-    assert await sm.get_usage_today("codex") == 0
-    summary = await sm.get_state_summary()
-    assert summary["usage_today"] == 7
-    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0}
-    with pytest.raises(ValueError):
-        await sm.record_usage_event(provider="gemini")
-
-
 # ── training and setup preserve the selection ──
 
 
