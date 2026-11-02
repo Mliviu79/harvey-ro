@@ -19,9 +19,10 @@ from harvey import resolver
 from harvey.collectors import discover as D
 from harvey.collectors import onrc
 from harvey.models import Company, Prospect
-from harvey.modules import ingest, runs
+from harvey.modules import ingest
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 DATASET = onrc.Dataset("firme-01-01-2026", "2026-01-01", {})
 
@@ -43,13 +44,7 @@ def _firm(n=1, name="EXEMPLU SRL", locality="Brașov", cui=None, website="", dom
 
 
 async def _pull(state, *firms):
-    report = onrc.ImportReport(dataset=DATASET.name)
-    draft = onrc.firms_draft(list(firms), DATASET, codes={f.reg: [("8623", 3)] for f in firms},
-                             classes=[("8623", None)]).stamp("onrc", "registry_search")
-    draft.values.update(codes=("ACTIVITY_CODE",), collector=onrc.COLLECTOR)
-    await runs.save_source_draft(state, draft, report, module="onrc")
-    assert not report.errors, report.errors
-    return report
+    return await slim.pull(state, *firms, dataset=DATASET)
 
 
 async def _upsert(state, biz, query):
@@ -139,14 +134,16 @@ async def test_a_shared_booking_site_is_not_one_company(state):
     assert one[0] != two[0] and two[1]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_domain_two_companies_hold_says_nothing(state):
+    from harvey.overlay import schema
+
     a = await state.add_company(Company(name="Exemplu Unu", location="Cluj"))
     b = await state.add_company(Company(name="Exemplu Doi", location="Iași"))
     with sqlite3.connect(state.db_path) as con:      # a site both declare
-        con.executemany("INSERT INTO company_ids (company_id, kind, value) "
-                        "VALUES (?, 'domain', 'grup.example.com')", [(a,), (b,)])
+        con.executemany("INSERT INTO firm_key (kind, value, firm) "
+                        "VALUES (?, 'grup.example.com', ?)",
+                        [(schema.FIRM_KEY["domain"], int(a)), (schema.FIRM_KEY["domain"], int(b))])
     found = await state.match_company(Company(name="Exemplu Trei", location="Sibiu",
                                               domain="grup.example.com"))
     assert found.company_id is None
@@ -155,7 +152,6 @@ async def test_a_domain_two_companies_hold_says_nothing(state):
 # ── The bug: a map hit for a registry firm without a website ──
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_map_hit_with_same_name_and_town_goes_to_review(state):
     await _pull(state, _firm())
@@ -171,7 +167,6 @@ async def test_map_hit_with_same_name_and_town_goes_to_review(state):
     assert pair["a"]["cui"] == "90000001" and pair["b"]["listings"] == ["dataforseo:cid:1"]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_map_hit_with_same_name_town_and_phone_merges(state):
     await _pull(state, _firm())
@@ -188,12 +183,12 @@ async def test_map_hit_with_same_name_town_and_phone_merges(state):
     assert merge["score"] == 0.94                   # 1 - (1 - 0.8) * (1 - 0.7)
     assert {r["code"] for r in merge["reasons"]} == {"phone", "name"}
     assert await state.duplicates() == []
-    # The listing's phone filled the gap; its listing id now finds the firm.
-    assert (await state.get_company(firm.id)).phone == "0700 000 001"
+    # Its main phone is its own (the listing's, the same number); the
+    # listing id now finds the firm.
+    assert (await state.get_company(firm.id)).phone == "+40 700 000 001"
     assert (await state.get_company_by_external_id("dataforseo:cid:1")).id == firm.id
     # One company on the Firme page, not two.
-    counts = _rows(state.db_path, "SELECT COUNT(*) FROM companies WHERE merged_into = ''")
-    assert counts == [(1,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm WHERE live = 0") == [(1,)]
 
 
 @pytest.mark.asyncio
@@ -229,7 +224,6 @@ async def test_same_name_with_different_websites_is_not_evidence(state):
     assert new and await state.duplicates() == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_aggregator_domains_never_match(state):
     a = await state.save_company(Company(name="Exemplu Unu", domain="facebook.com",
@@ -237,8 +231,14 @@ async def test_aggregator_domains_never_match(state):
     b = await state.save_company(Company(name="Altceva Doi", domain="facebook.com",
                                          location="Iași"))
     assert b.match.score == 0
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM company_ids WHERE kind = 'domain'") == [(0,)]
-    assert a.company_id and a.created
+    assert a.company_id and a.created and b.created and b.company_id != a.company_id
+    # Neither holds the domain as its key, so a third never joins them.
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm WHERE domain IS NOT NULL") == [(0,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm_key WHERE value LIKE '%facebook%'") \
+        == [(0,)]
+    assert await state.add_company(Company(name="Trei", domain="facebook.com")) \
+        not in (a.company_id, b.company_id)
+    assert await state.get_company_by_domain("facebook.com") is None
 
 
 # ── Two CUIs never merge ──
@@ -287,21 +287,6 @@ async def test_a_declared_website_alone_is_only_a_question(state):
 # ── Merge and undo ──
 
 
-def _snapshot(path):
-    tables = {
-        "companies": "SELECT id, name, cui, external_id, domain, website, phone, address, "
-                     "location, industry, merged_into FROM companies ORDER BY id",
-        "observations": "SELECT id, company_id FROM observations ORDER BY id",
-        "prospects": "SELECT id, company_id FROM prospects ORDER BY id",
-        "company_ids": "SELECT company_id, kind, value FROM company_ids ORDER BY 1, 2, 3",
-        "company_activities": "SELECT company_id, code, version, source "
-                              "FROM company_activities ORDER BY 1, 2, 3, 4",
-        "search": "SELECT company_id, name, place FROM company_search ORDER BY company_id",
-    }
-    return {name: _rows(path, sql) for name, sql in tables.items()}
-
-
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_undo_restores_exactly(state):
     await _pull(state, _firm())
@@ -313,27 +298,32 @@ async def test_undo_restores_exactly(state):
     await state.add_observation(company_id=other, signal_code="FOUND_IN_SERP", value_text="osm")
     await state.add_prospect(Prospect(first_name="Ana", last_name="Exemplu",
                                       email="ana@exemplu.example.com", company_id=other))
-    await state.set_company_activities(other, [("8623", 3), ("8690", 2)], source="profile")
-    before = _snapshot(state.db_path)
+    before = slim.snapshot(state)
 
     merge_id = await state.merge_companies(firm.id, other)
     assert merge_id
-    after = _snapshot(state.db_path)
-    assert {r[1] for r in after["observations"]} == {firm.id}
-    assert {r[1] for r in after["prospects"]} == {firm.id}
-    assert other not in {r[0] for r in after["search"]}
-    [kept] = [c for c in after["companies"] if c[0] == firm.id]
-    assert kept[4] == "exemplu.example.com" and kept[6] == "+40700000006"   # gaps filled
-    assert kept[1] == "EXEMPLU SRL"                                       # nothing replaced
+    # Nothing moves: the merged record points at the survivor, whose page
+    # shows what both hold.
+    assert slim.q(state, "SELECT live FROM firm WHERE id = ?", int(other)) == [(int(firm.id),)]
+    kept = await state.get_company(firm.id)
+    assert kept.website == "https://exemplu.example.com" and kept.phone == "+40 700 000 006"
+    assert kept.name == "EXEMPLU SRL"                                     # nothing replaced
+    assert [o["value_text"] for o in await state.get_observations(firm.id, "FOUND_IN_SERP")] \
+        == ["osm"]
+    assert [p.email for p in await state.get_contacts_for_company(firm.id)] == [
+        "ana@exemplu.example.com"]
     total, hits = await state.search_companies("exemplu")
     assert [h["id"] for h in hits] == [firm.id]
+    assert slim.recount_diff(state) == {}
 
     await state.undo_merge(other)
-    assert _snapshot(state.db_path) == before
+    assert slim.snapshot(state) == before
+    assert slim.recount_diff(state) == {}
     # Back on the review list: an undo says the merge was wrong, and a
     # person still answers whether they are one company.
     [pair] = await state.duplicates("pending")
     assert {pair["company_a"], pair["company_b"]} == {firm.id, other}
+
 
 
 @pytest.mark.asyncio
@@ -352,7 +342,6 @@ async def test_an_automatic_merge_can_be_undone(state):
     assert await state.merges() == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_undo_takes_back_what_the_listing_brought_after_the_merge(state):
     await _pull(state, _firm())
@@ -363,20 +352,22 @@ async def test_undo_takes_back_what_the_listing_brought_after_the_merge(state):
     hit.source_url = "https://maps.example.com/?cid=7"
     survivor, created = await _upsert(state, hit, QUERY)
     assert survivor == firm.id and not created
-    # The run goes on to write the listing's facts to the company it joined.
+    [merge] = await state.merges()
+    # The run goes on to write the listing's facts for the record it found
+    # (shown on the company it joined).
     await state.add_observation(company_id=survivor, signal_code="REVIEW_RATING",
                                 collector="discover", value_num=4.5,
-                                evidence_url=hit.source_url)
-    [merge] = await state.merges()
+                                evidence_url=hit.source_url, origin_company_id=merge["merged"])
+    assert [o["value_num"] for o in await state.get_observations(firm.id, "REVIEW_RATING")] \
+        == [4.5]
     await state.undo_merge(merge["merged"])
-    assert _rows(state.db_path, "SELECT company_id FROM observations "
-                                "WHERE signal_code = 'REVIEW_RATING'") == [(merge["merged"],)]
+    assert await state.get_observations(firm.id, "REVIEW_RATING") == []
+    assert [o["value_num"] for o in await state.get_observations(merge["merged"],
+                                                                 "REVIEW_RATING")] == [4.5]
     # The survivor keeps the phone its own site gave.
-    assert (firm.id,) in _rows(state.db_path, "SELECT company_id FROM company_ids "
-                                              "WHERE kind = 'phone' AND value = '+40700000007'")
+    assert (await state.get_company(firm.id)).phone == "+40 700 000 007"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_two_merges_at_once_leave_one_company(state):
     import asyncio
@@ -387,11 +378,10 @@ async def test_two_merges_at_once_leave_one_company(state):
                                 return_exceptions=True)
     refused = [r for r in done if isinstance(r, resolver.MergeRefused)]
     assert len(refused) == 1 and refused[0].code == "already_merged"
-    live = _rows(state.db_path, "SELECT id FROM companies WHERE merged_into = ''")
+    live = _rows(state.db_path, "SELECT id FROM firm WHERE live = 0")
     assert len(live) == 1
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_double_click_merges_once(state):
     import asyncio
@@ -403,7 +393,7 @@ async def test_a_double_click_merges_once(state):
     assert sum(isinstance(r, dict) for r in done) == 1
     assert len(await state.merges()) == 1
     await state.undo_merge(b)
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM companies WHERE merged_into = ''") == [(2,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm WHERE live = 0") == [(2,)]
     assert await state.merges() == []
 
 
@@ -447,7 +437,6 @@ async def test_merge_pair_keeps_the_registry_record(state):
     assert (done["survivor"], done["merged"]) == (firm.id, site)
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_separate_takes_the_pair_off_the_list(state):
     await _pull(state, _firm())
@@ -471,23 +460,25 @@ async def test_merged_companies_leave_cohorts_and_work_lists(state):
 # ── Keys on file ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_site_phone_becomes_a_key(state):
     cid = await state.add_company(Company(name="Exemplu", location="Cluj"))
     await state.add_observation(company_id=cid, signal_code="PHONE_NUMBER",
                                 collector="profile", value_text="+40700000009")
-    assert _rows(state.db_path, "SELECT company_id FROM company_ids WHERE kind = 'phone' "
-                                "AND value = '+40700000009'") == [(cid,)]
+    # A contact linked to the record: what the resolver matches phones on.
+    assert _rows(state.db_path, "SELECT l.firm, c.n_firms FROM link l JOIN contact c "
+                                "ON c.id = l.contact WHERE c.value = '+40700000009'") == [
+        (int(cid), 1)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_lookups_use_the_key_index(state):
-    plan = " ".join(r[-1] for r in _rows(
-        state.db_path, "EXPLAIN QUERY PLAN SELECT company_id FROM company_ids "
-                       "WHERE kind = ? AND value = ?", "phone", "+40700000000"))
-    assert "USING" in plan and "INDEX" in plan and "SCAN" not in plan
+    for sql, args in (("SELECT id FROM contact WHERE kind = ? AND value = ?", (2, "+40700000000")),
+                      ("SELECT firm FROM firm_key WHERE kind = ? AND value = ?", (1, "a@x.test")),
+                      ("SELECT firm FROM firm_ident WHERE scheme = ? AND key = ?", (1, 1))):
+        plan = " ".join(r[-1] for r in _rows(state.db_path, "EXPLAIN QUERY PLAN " + sql, *args))
+        assert ("USING" in plan and ("INDEX" in plan or "PRIMARY KEY" in plan)
+                and "SCAN" not in plan), (sql, plan)
 
 
 def test_nothing_here_asks_a_model():
@@ -522,7 +513,6 @@ async def _seed_pair(path):
     return sm, (await sm.get_company_by_cui("90000001")).id, site
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_review_list_merge_and_undo_over_the_api(client):
     import asyncio
     _, firm, site = asyncio.run(_seed_pair(client.db_path))
@@ -574,7 +564,6 @@ def test_the_api_needs_the_token(client):
         assert anon.post("/api/duplicates/merge", json={"a": "x", "b": "y"}).status_code == 401
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_cli_lists_merges_and_undoes(tmp_path, monkeypatch, capsys):
     import asyncio
     import harvey.state as state_mod

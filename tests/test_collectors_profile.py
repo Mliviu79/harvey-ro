@@ -1,7 +1,6 @@
 """Tests for the free PROFILE collector and the observation model."""
 
 import os
-from contextlib import closing
 import tempfile
 
 import pytest
@@ -203,7 +202,6 @@ async def test_user_decision_survives_reseeding(state):
     assert codes["SERP_RANK"] == "rejected", "re-seeding must not undo a user's choice"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypatch):
     cid = await state.add_company(Company(name="Denver, CO | HOA Management Firm",
@@ -229,9 +227,7 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
                      {"id": keep, "name": "Birch Management", "domain": "birchmgt.example"},
                      {"id": derived, "name": "Thrive With Us", "domain": "thrivewithus.example"}],
                        {"TECH_STACK"})
-    import sqlite3
-    with closing(sqlite3.connect(state.db_path)) as db:
-        names = dict(db.execute("SELECT domain, name FROM companies"))
+    names = {d: (await state.get_company_by_domain(d)).name for d in pages}
     assert names["managementharbor.example"] == "Management Harbor"
     assert names["birchmgt.example"] == "Birch Management"   # already right: untouched
     assert names["thrivewithus.example"] == "Thrive Community Management"   # was domain-derived
@@ -249,7 +245,6 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
     ("Thrive With Us", "thrivewithus.example", "Thrive Community Management", "Thrive Community Management"),
     ("Roofing Services in Denver", "brindlewickroofing.example", "", "Roofing Services in Denver"),
 ])
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 async def test_profile_repairs_weak_names_and_retains_brands(
         state, monkeypatch, current, domain, homepage, expected):
     cid = await state.add_company(Company(name=current, domain=domain))
@@ -265,10 +260,8 @@ async def test_profile_repairs_weak_names_and_retains_brands(
     monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
     monkeypatch.setattr("harvey.modules.runs.asyncio.sleep", no_sleep)
     await runs.profile(state, [{"id": cid, "name": current, "domain": domain}], set())
-    import sqlite3
-    with closing(sqlite3.connect(state.db_path)) as db:
-        assert db.execute("SELECT name FROM companies WHERE id = ?", (cid,)).fetchone() == (expected,)
-        assert db.execute("SELECT company FROM prospects WHERE id = ?", (pid,)).fetchone() == (expected,)
+    assert (await state.get_company(cid)).name == expected
+    assert (await state.get_prospect(pid)).company == expected
 
 
 @pytest.mark.asyncio

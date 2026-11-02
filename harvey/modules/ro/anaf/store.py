@@ -17,7 +17,10 @@ lost. Version 2:
 - ``parsed``: the fields Harvey reads from an answer, so a cohort condition
   on them is an index read instead of decompressing every body;
 - ``dict``: the preset dictionaries, by id. A row names the one it was
-  compressed with, so a new dictionary never makes an old body unreadable.
+  compressed with, so a new dictionary never makes an old body unreadable;
+- ``meta``: ``saved``, when answers were last kept (nanoseconds): the
+  register's load mark (queries.py). The file is written in WAL mode, so
+  its own size and time don't move when answers are kept.
 
 The dictionary is the shape of an answer: every field name ANAF's
 PlatitorTvaRest v9 writes, in its order, with neutral values (no data from
@@ -104,6 +107,7 @@ CREATE INDEX IF NOT EXISTS parsed_vat ON parsed(cui) WHERE vat = 1;
 CREATE INDEX IF NOT EXISTS parsed_efactura ON parsed(cui) WHERE efactura = 1;
 CREATE INDEX IF NOT EXISTS parsed_inactive ON parsed(cui) WHERE inactive = 1;
 CREATE TABLE IF NOT EXISTS dict (id INTEGER PRIMARY KEY, zdict BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 PARSED = ("vat", "vat_since", "vat_cash", "split_vat", "inactive", "efactura", "status",
           "legal_form", "phone", "address")
@@ -126,8 +130,17 @@ def create(con: sqlite3.Connection, *, finished: bool = True) -> None:
     con.executescript(SCHEMA)
     con.executemany("INSERT OR IGNORE INTO dict (id, zdict) VALUES (?, ?)",
                     list(DICTIONARIES.items()))
+    mark_saved(con)
     con.execute(f"PRAGMA user_version = {VERSION if finished else PARTIAL}")
     con.commit()
+
+
+def mark_saved(con: sqlite3.Connection) -> None:
+    """Move the load mark (``meta.saved``): answers were kept. (A file a
+    rewrite made before ``meta`` existed gains it here.)"""
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('saved', ?)",
+                (str(time.time_ns()),))
 
 
 def _key(cui) -> int | None:
@@ -210,6 +223,7 @@ def keep(con: sqlite3.Connection, rows) -> int:
     replaces the one kept, which moves to answers_history when its body
     differs (a re-check that says the same only moves ``fetched``).
     Returns how many answers went to history. The caller commits."""
+    mark_saved(con)
     moved = 0
     zdicts = dicts(con)
     for cui, fetched_at, found, body in rows:

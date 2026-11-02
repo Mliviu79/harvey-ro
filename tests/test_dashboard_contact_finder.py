@@ -20,6 +20,7 @@ from harvey.models import Company
 from harvey.models.prospect import Prospect
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 WEB = Path(dash.__file__).resolve().parent / "web"
 
@@ -46,6 +47,12 @@ def _seed(db_path) -> dict:
         for code in ("PHONE_NUMBER", "CONTACT_FOUND"):
             await s.set_signal_status(code, "confirmed")
         ids = {}
+        # Registered firms, described by the registry beside the database:
+        # the first authorised for dentistry (8623) and run by Ana Exemplu.
+        slim.describe(s, *[slim.firm(f"EXEMPLU {i} SRL", f"9000000{i}",
+                                     address=f"Str. Exemplului nr. {i}") for i in range(5)],
+                      codes={f"J08/9000000{i}/2010": [("4778", 2)] for i in range(1, 5)},
+                      people=[("J08/90000000/2010", "EXEMPLU ANA", "administrator")])
         for i in range(5):
             ids[i] = await s.add_company(Company(
                 name=f"EXEMPLU {i} SRL", cui=f"9000000{i}", domain=f"exemplu{i}.example",
@@ -53,8 +60,6 @@ def _seed(db_path) -> dict:
                 phone="+40 268 000 101" if i == 0 else "", source="registry:onrc"))
         await s.add_observations([
             {"company_id": ids[0], "signal_code": "PHONE_NUMBER", "value_text": "+40700000102"},
-            {"company_id": ids[0], "signal_code": "CONTACT_FOUND",
-             "value_text": "Ana Exemplu — administrator"},
         ])
         await s.add_prospect(Prospect(company_id=ids[0], first_name="Ana", last_name="Exemplu",
                                       email="ana@exemplu0.example", email_status="verified"))
@@ -65,7 +70,6 @@ def _seed(db_path) -> dict:
         await s.add_prospect(Prospect(company_id=ids[1], first_name="Out", last_name="Opted",
                                       email="out@exemplu1.example", email_status="verified",
                                       status="opted_out"))
-        await s.set_company_activities(ids[0], [("8623", 3)], source="onrc")
         return ids
     return asyncio.run(go())
 
@@ -80,7 +84,6 @@ def test_companies_without_paging_is_the_original_list(client):
     assert "contact_count" in rows[0]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_companies_page_has_total_and_phone_email_first_fields(client):
     ids = _seed(client.db_path)
     page = client.get("/api/companies", params={"limit": 2, "offset": 0}).json()
@@ -92,7 +95,10 @@ def test_companies_page_has_total_and_phone_email_first_fields(client):
     assert first["phone_display"] == "+40 268 000 101" and first["phone_type"] == "landline"
     assert first["other_phones"] == ["+40 700 000 102"]
     assert [e["email"] for e in first["emails"]] == ["ana@exemplu0.example", "office@exemplu0.example"]
-    assert first["people"] == [{"name": "Ana Exemplu", "title": "administrator"}]
+    # The registry's administrator, then the people Harvey found (a
+    # prospect's person too: Ana once).
+    assert first["people"] == [{"name": "Ana Exemplu", "title": "Administrator"},
+                               {"name": "Bad Bounce", "title": ""}]
     assert first["activities"][0]["code"] == "8623"
     assert first["contact_count"] == 3
     opted = next(c for c in every if c["id"] == ids[1])
@@ -100,7 +106,6 @@ def test_companies_page_has_total_and_phone_email_first_fields(client):
     assert client.get("/api/companies", params={"limit": 10_000}).json()["limit"] == 200
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_search_results_are_enriched_too(client):
     _seed(client.db_path)
     res = client.get("/api/companies/search", params={"q": "8623", "limit": 10}).json()
@@ -110,7 +115,6 @@ def test_search_results_are_enriched_too(client):
     assert row["activities"][0]["matched"] is True
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_company_detail(client):
     ids = _seed(client.db_path)
     c = client.get(f"/api/companies/{ids[0]}").json()
@@ -126,7 +130,6 @@ def _csv(text):
     return list(csv.DictReader(io.StringIO(text.removeprefix("\ufeff"))))
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_company_export_by_ids_search_and_all(client):
     ids = _seed(client.db_path)
     r = client.post("/api/export/companies.csv", json={"ids": [ids[0], ids[2]]})
@@ -171,7 +174,6 @@ def test_exports_need_the_token(client):
 # ── Contacts ──
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_contacts_page_search_filter_counts_and_selection_export(client):
     _seed(client.db_path)
     assert isinstance(client.get("/api/prospects").json(), list)       # unchanged without paging
@@ -194,7 +196,6 @@ def test_contacts_page_search_filter_counts_and_selection_export(client):
     assert client.post("/api/export/prospects.csv", json={}).status_code == 400
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_dashboard_csvs_open_in_excel_and_carry_the_registry_identity(client):
     ids = _seed(client.db_path)
     r = client.post("/api/export/companies.csv", json={"ids": [ids[0]]})
@@ -216,7 +217,6 @@ def test_selected_contacts_never_hand_out_a_bounced_address(client):
     assert row["email"] == "" and row["last_name"] == "Bounce"
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_search_export_says_when_it_was_cut_short(client, monkeypatch):
     _seed(client.db_path)
     monkeypatch.setattr(dash, "EXPORT_SEARCH_MAX", 2)
@@ -248,7 +248,6 @@ def test_do_not_contact_addresses_are_not_shown_or_counted(client, monkeypatch):
 # ── Search ──
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_company_search_finds_a_cui(client):
     ids = _seed(client.db_path)
     for q in ("90000002", "RO90000002", "ro 90000002"):
@@ -324,13 +323,18 @@ def test_module_switch_is_not_read_by_sending():
 # ── Overview and live status ──
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_overview_counts(client):
     _seed(client.db_path)
     ov = client.get("/api/overview").json()
     assert ov["companies"] == 5 and ov["with_phone"] == 1
     assert ov["with_email"] == 1                         # the opt-out's company doesn't count
-    assert ov["contacts"] == 4 and ov["people"] == 1 and ov["with_activity"] == 1
+    # The registry's counts wait for their job; then every registered firm
+    # has an activity on file, and the people are Harvey's own (its
+    # prospects') and the one the registry names.
+    assert ov["contacts"] == 4 and ov["people"] == 3 and ov["with_activity"] is None
+    asyncio.run(StateManager(str(client.db_path)).recount_register_tally())
+    ov = client.get("/api/overview").json()
+    assert ov["people"] == 4 and ov["with_activity"] == 5
     assert ov["signals_confirmed"] == 2
 
 
@@ -495,24 +499,3 @@ def test_romanian_plurals_and_numbers_under_node():
     assert out["usd"].replace("\u00a0", " ") == "0,25 $"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-def test_startup_upgrades_an_older_database_before_any_page(monkeypatch, tmp_path):
-    # Prezentare only reads; after an update it used to hit tables the old
-    # schema didn't have, until some other page happened to upgrade it.
-    import sqlite3
-
-    from harvey.state import MIGRATIONS
-
-    db = tmp_path / "harvey.db"
-    with sqlite3.connect(db) as conn:
-        for version, script in enumerate(MIGRATIONS[:15], start=1):
-            conn.executescript(script)
-            conn.execute(f"PRAGMA user_version = {version}")
-    monkeypatch.setattr(dash, "DB_PATH", db)
-    dash.token_store.configure(tmp_path / "data" / "dashboard-token")
-    token = dash.token_store.get()
-    with TestClient(dash.app, base_url="http://127.0.0.1:5555",
-                    headers={"Authorization": f"Bearer {token}"}) as c:
-        with sqlite3.connect(db) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
-        assert c.get("/api/overview").json()["with_activity"] == 0

@@ -242,7 +242,6 @@ async def test_first_page_shrinks_to_what_the_cap_buys(state, monkeypatch, small
     assert report.unfetched == 19
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_full_run_stores_each_business_once(state, monkeypatch, small_pages):
     server = ListingsServer(total=23, tokens=False, overlap=2)
@@ -254,10 +253,10 @@ async def test_a_full_run_stores_each_business_once(state, monkeypatch, small_pa
     assert len(server.requests) == 3
     assert report.new_companies == 23 and report.known_companies == 0
     with closing(sqlite3.connect(state.db_path)) as db:
-        assert db.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 23
+        assert db.execute("SELECT COUNT(*) FROM firm WHERE live = 0").fetchone()[0] == 23
         rows, companies = db.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT company_id) FROM observations "
-            "WHERE signal_code = 'REVIEW_COUNT'").fetchone()
+            "SELECT COUNT(*), COUNT(DISTINCT o.firm) FROM obs o JOIN signal s "
+            "ON s.id = o.signal WHERE s.code = 'REVIEW_COUNT'").fetchone()
     assert rows == companies == 23
 
 

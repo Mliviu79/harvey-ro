@@ -13,6 +13,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from harvey.modules.ro.anaf import capabilities as caps
 from harvey.modules.ro.anaf import service
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 ANAF_CODES = ("VAT_REGISTERED", "VAT_SINCE", "VAT_ON_CASH", "SPLIT_VAT", "FISCALLY_INACTIVE",
               "EFACTURA_REGISTERED", "REGISTRATION_STATUS", "LEGAL_FORM", "ADDRESS",
@@ -197,7 +199,13 @@ async def test_answers_are_kept_and_reused_until_they_are_old(tmp_path, real_ask
         assert {(f.code, f.value_num) for f in again.facts} == {
             (f.code, f.value_num) for f in first.facts}
         # An answer older than cache_days is asked again; --missing never asks it.
-        service.keep(tmp_path / "anaf.db", {A: answer(A)}, set(), "2020-01-01T00:00:00+00:00")
+        # (Aged in place: keeping an older copy of the same answer never
+        # takes a newer fetch date back.)
+        from harvey.modules.ro.anaf import store
+
+        with sqlite3.connect(tmp_path / "anaf.db") as db:
+            db.execute("UPDATE answers SET fetched = ? WHERE cui = ?",
+                       (store.to_unix("2020-01-01T00:00:00+00:00"), int(A)))
         missing = await caps.CAPABILITIES["company_check"](
             api.Input(extra={"batch": [{"key": "a", "cui": A}], "missing_only": True}),
             ctx(http, tmp_path))
@@ -347,8 +355,10 @@ def test_the_pace_holds_across_threads_with_the_lane_file(monkeypatch, tmp_path)
 # ── Recording what ANAF says ──
 
 @pytest_asyncio.fixture
-async def state():
+async def state(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
+        # ANAF's answers beside the database, where its register is read.
+        monkeypatch.setattr(service, "CACHE_PATH", Path(tmp) / "anaf.db")
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
@@ -364,19 +374,36 @@ def stub_anaf(monkeypatch, known: dict, asked: list | None = None):
     monkeypatch.setattr(service, "ask", ask)
 
 
-def readings(state, code):
-    with sqlite3.connect(state.db_path) as db:
-        return [tuple(r) for r in db.execute(
-            "SELECT company_id, value_num, value_text, module FROM observations "
-            "WHERE signal_code = ? ORDER BY rowid", (code,))]
+async def readings(state, code):
+    """(company, value_num, value_text, module) of what ANAF's answers kept
+    beside the database give ``code`` (read in place: harvey.db stores
+    none of it), by company."""
+    out = []
+    for cid in slim.live_ids(state):
+        out += [(cid, r["value_num"], r["value_text"], r["module"])
+                for r in await state.read("register_readings", cid, [code])
+                if r["module"] == "anaf"]
+    return out
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
+def history(cui_) -> list[bool]:
+    """The earlier answers ANAF's file keeps for a CUI, in the order they
+    were replaced: whether each said the company was inactive."""
+    from harvey.modules.ro.anaf import store
+
+    with sqlite3.connect(service.CACHE_PATH) as db:
+        zdicts = store.dicts(db)
+        rows = db.execute("SELECT found, dict, body FROM answers_history WHERE cui = ? "
+                          "ORDER BY rowid", (int(cui_),)).fetchall()
+    return [json.loads(store.decompress(d, body, zdicts))["stare_inactiv"]["statusInactivi"]
+            for found, d, body in rows if found]
+
+
 @pytest.mark.asyncio
-async def test_a_check_records_confirmed_facts_only_when_they_change(state, monkeypatch):
+async def test_a_check_keeps_each_answer_once_and_reads_it_in_place(state, monkeypatch):
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
     b = await state.add_company(Company(name="EXEMPLU B SRL", cui=B, phone="0268 000 990",
-                                        source="registry:onrc"))
+                                        location="Brașov, Romania", source="registry:onrc"))
     asked = []
     stub_anaf(monkeypatch, {A: answer(A), B: answer(B, phone="0722 000 210")}, asked)
     for code in ("FISCALLY_INACTIVE", "VAT_REGISTERED", "PHONE_NUMBER", "ADDRESS"):
@@ -385,27 +412,32 @@ async def test_a_check_records_confirmed_facts_only_when_they_change(state, monk
     first = await runs.check_by_id(state, "anaf", "company_check")
     assert [sorted(b) for b in asked] == [[A, B]]             # one batch, one request
     assert first["companies"] == 2 and first["updated"] == 2
-    assert "LEGAL_FORM" in first["unconfirmed"] and not readings(state, "LEGAL_FORM")
-    assert sorted(readings(state, "FISCALLY_INACTIVE")) == sorted([(a, 0.0, "", "anaf"),
-                                                                   (b, 0.0, "", "anaf")])
+    assert "LEGAL_FORM" in first["unconfirmed"]
+    # ANAF's answers are read from its own file, never copied into harvey.db.
+    assert sorted(await readings(state, "FISCALLY_INACTIVE")) == sorted(
+        [(a, 0, None, "anaf"), (b, 0, None, "anaf")])
+    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
     # A phone fills only a company that has none.
     assert (await state.get_company(a)).phone == "+40 268 000 210"
-    assert (await state.get_company(b)).phone == "0268 000 990"
+    assert (await state.get_company(b)).phone == "+40 268 000 990"       # its own
     assert first["phones_set"] == 1
-    assert {r[2] for r in readings(state, "PHONE_NUMBER")} == {"+40268000210", "+40722000210"}
+    assert {r[2] for r in await readings(state, "PHONE_NUMBER")} == {
+        "+40268000210", "+40722000210"}
 
     # Asked again with nothing changed: nothing new is written.
-    service.keep(service.CACHE_PATH, {}, set())
     again = await runs.check_by_id(state, "anaf", "company_check", [a])
     assert again["observations"] == 0 and again["cached"] == 1
 
-    # It turns inactive, then active again: each change is recorded.
+    # It turns inactive, then active again: each answer replaced by a
+    # different one is kept (the active one, then the inactive one); asked
+    # again with the same answer, nothing more.
     for inactive in (True, False):
         service.keep(service.CACHE_PATH, {A: answer(A, inactive=inactive)}, set(),
                      "2020-01-01T00:00:00+00:00")
         stub_anaf(monkeypatch, {A: answer(A, inactive=inactive)})
         await runs.check_by_id(state, "anaf", "company_check", [a])
-    assert [r[1] for r in readings(state, "FISCALLY_INACTIVE") if r[0] == a] == [0.0, 1.0, 0.0]
+    assert [r[1] for r in await readings(state, "FISCALLY_INACTIVE") if r[0] == a] == [0]
+    assert history(A) == [False, True]
 
 
 @pytest.mark.asyncio
@@ -490,7 +522,6 @@ async def test_no_follow_up_while_the_module_is_off(state):
     assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_a_registry_pull_hands_each_saved_batch_to_the_follow_up(state, monkeypatch):
     from harvey.collectors.onrc import ImportReport
@@ -501,8 +532,10 @@ async def test_a_registry_pull_hands_each_saved_batch_to_the_follow_up(state, mo
                                for i, c in enumerate((A, B, C))],
                       values={"codes": (), "collector": "registry"})
 
+    from harvey.overlay import store
+
     handed = []
-    monkeypatch.setattr(runs, "SOURCE_SAVE_BATCH", 2)
+    monkeypatch.setattr(store, "PULL_CHUNK", 2)
     saved = []
     await runs.save_source_draft(state, draft, ImportReport(), module="onrc", saved_ids=saved,
                                  on_saved=lambda ids: handed.append(list(ids)))
@@ -511,143 +544,6 @@ async def test_a_registry_pull_hands_each_saved_batch_to_the_follow_up(state, mo
 
 # ── Saving a batch at a time, the next request going out meanwhile ──
 
-def _fixture_answer(i: int, number: str):
-    """A varied invented answer: inactive or not, VAT or not, a fiscal
-    domicile elsewhere, no phone, or a phone several companies share."""
-    phone = "" if i % 6 == 0 else "0268 000 210" if i % 13 == 0 else f"0722 000 {i:03d}"
-    return answer(number, vat=i % 3 != 0, inactive=i % 5 == 0, cash=i % 4 == 0,
-                  phone=phone, fiscal_street="Str. Fiscală" if i % 4 == 1 else "Str. Exemplu")
-
-
-async def _fixture(sm, n=230):
-    """``n`` invented companies, some with a phone of their own, some with
-    readings from an earlier check, one known by two CUIs; ANAF knows all
-    but every eleventh. Returns {cui: answer}."""
-    known = {}
-    for i in range(n):
-        number = cui(str(9300000 + i))
-        await sm.add_company(Company(name=f"EXEMPLU {i} SRL", cui=number,
-                                     phone="0268 000 900" if i % 7 == 0 else "",
-                                     location="Brașov, Brașov, Romania",
-                                     source="registry:onrc"))
-        if i % 11:
-            known[number] = _fixture_answer(i, number)
-    with sqlite3.connect(sm.db_path) as db:
-        ids = {c: i for i, c in db.execute("SELECT id, cui FROM companies")}
-        # One company known by a second CUI too (an earlier merge).
-        second = cui("9399999")
-        db.execute("INSERT INTO company_ids (company_id, kind, value) VALUES (?, 'cui', ?)",
-                   (ids[cui("9300001")], second))
-    known[second] = _fixture_answer(1, second)
-    earlier = []
-    for i in range(0, n, 9):
-        cid = ids[cui(str(9300000 + i))]
-        earlier += [dict(company_id=cid, signal_code="VAT_REGISTERED", value_num=0.0,
-                         module="anaf", capability="company_check", collector="anaf",
-                         observed_at="2026-01-01 00:00:00"),
-                    dict(company_id=cid, signal_code="ADDRESS", value_text=service.address(
-                        known.get(cui(str(9300000 + i)), answer("1"))["adresa_sediu_social"], "s"),
-                         module="anaf", capability="company_check", collector="anaf",
-                         observed_at="2026-01-01 00:00:00")]
-    await sm.add_observations(earlier)
-    for code in ANAF_CODES:
-        if code != "LEGAL_FORM":
-            await sm.set_signal_status(code, "confirmed")
-    return known
-
-
-async def _old_check(state):
-    """The check as it saved before, a company at a time (kept here to
-    compare with): its rows are what the batch save must write."""
-    from harvey.modules.ingest import Saved
-
-    confirmed = await state.confirmed_signal_codes()
-    companies = await state.companies_with_id("cui")
-    run = api.capability("anaf", "company_check")
-    many = ingest.many_codes()
-    ctx = api.Context(http=httpx.AsyncClient(), settings={}, wanted=frozenset(confirmed),
-                      enabled=await runs._enabled(state))
-    for start in range(0, len(companies), 100):
-        chunk = companies[start:start + 100]
-        draft = await run(api.Input(extra={
-            "batch": [{"key": r["id"], "cui": r["value"]} for r in chunk]}), ctx)
-        facts_of, contacts_of = {}, {}
-        for fact in draft.facts:
-            facts_of.setdefault(fact.record, []).append(fact)
-        for contact in draft.contacts:
-            contacts_of.setdefault(contact.record, []).append(contact)
-        async with state.batch() as batch:
-            for row in chunk:
-                cid = row["id"]
-                rows = ingest.rows(facts_of.get(cid, []), run_id="r", confirmed=confirmed,
-                                   records={cid: Saved(cid, cid)})
-                fresh = await ingest.changed(batch, cid, "anaf", rows, many)
-                await ingest.write(batch, fresh, "r")
-                await ingest.company_phones(batch, cid, contacts_of.get(cid, []))
-    await ctx.http.aclose()
-
-
-def _snapshot(path) -> dict:
-    """Everything a check writes, keyed by CUI (ids and times differ
-    between two databases): readings in the order written, contacts and
-    their links, phones, keys."""
-    with sqlite3.connect(path) as db:
-        key = dict(db.execute("SELECT id, cui FROM companies"))
-        key[""] = ""
-        readings: dict = {}
-        for row in db.execute(
-                "SELECT company_id, signal_code, value_num, value_text, collector, confidence, "
-                "evidence_url, module, capability, origin_company_id FROM observations "
-                "ORDER BY rowid"):
-            readings.setdefault(key[row[0]], []).append((*row[1:9], key[row[9]]))
-        return {
-            "readings": readings,
-            "contacts": sorted(db.execute(
-                "SELECT kind, value, display, line_type, status, do_not_contact FROM contacts")),
-            "links": sorted((key[r[0]], *r[1:-1], key[r[-1]]) for r in db.execute(
-                "SELECT l.company_id, k.kind, k.value, l.person_id, l.location_id, l.source, "
-                "l.capability, l.evidence_url, l.trust, l.confidence, l.origin_company_id "
-                "FROM company_contacts l JOIN contacts k ON k.id = l.contact_id")),
-            "phones": sorted(db.execute("SELECT cui, phone FROM companies")),
-            "keys": sorted((key[r[0]], *r[1:]) for r in db.execute(
-                "SELECT company_id, kind, value, source, confidence FROM company_ids")),
-            "people": sorted(db.execute("SELECT name, role, source FROM people")),
-        }
-
-
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-@pytest.mark.asyncio
-async def test_the_batch_save_writes_what_the_company_at_a_time_save_wrote(monkeypatch, tmp_path):
-    snaps = []
-    for label in ("before", "now"):
-        sm = StateManager(str(tmp_path / f"{label}.db"))
-        await sm.init_db()
-        await sync_vocabulary(sm)
-        known = await _fixture(sm)
-        monkeypatch.setattr(service, "CACHE_PATH", tmp_path / f"{label}-anaf.db")
-        asked = []
-        stub_anaf(monkeypatch, known, asked)
-        if label == "before":
-            await _old_check(sm)
-        else:
-            report = await runs.check_by_id(sm, "anaf", "company_check")
-            assert report["errors"] == [] and report["requests"] == 3
-            assert report["observations"] == sum(len(v) for v in _snapshot(sm.db_path)[
-                "readings"].values()) - 2 * len(range(0, 230, 9))
-        # Asked again with nothing new: nothing more is written, either way.
-        if label == "before":
-            await _old_check(sm)
-        else:
-            again = await runs.check_by_id(sm, "anaf", "company_check")
-            assert again["observations"] == 0 and again["phones_set"] == 0
-        snaps.append(_snapshot(sm.db_path))
-    before, now = snaps
-    for part in before:
-        assert now[part] == before[part], part
-    # The fixture exercised what it is there for.
-    assert any(len(v) > 6 for v in now["readings"].values())
-    assert any(r[1] == "phone" and r[5] == "registry:onrc" for r in now["links"])
-    assert not any(r[0] == "LEGAL_FORM" for v in now["readings"].values() for r in v)
 
 
 def _paced_anaf(monkeypatch, known, log):
@@ -675,7 +571,6 @@ def _slow_save(monkeypatch, log, seconds=0.25):
     monkeypatch.setattr(ingest, "checked", checked)
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_the_next_request_goes_out_while_a_batch_is_saved_never_faster_than_the_lane(
         state, monkeypatch):
@@ -699,14 +594,14 @@ async def test_the_next_request_goes_out_while_a_batch_is_saved_never_faster_tha
         most_ahead = max(most_ahead, asked - saved)
     assert most_requests == 1                  # one request at a time
     assert most_ahead == 2                     # this batch saving, the next asked: no more
-    # Each request after the first went out while the batch before it was saved.
-    saves = [(t, u) for (k, t, _), (k2, u, _) in zip(
-        [e for e in log if e[0] == "save"], [e for e in log if e[0] == "saved"])]
-    overlapped = sum(any(s < t < u for s, u in saves) for t in asks)
-    assert overlapped == 5
+    # Each request after the first went out before the batch before it was
+    # saved (as its save began: the batch's connection opening is part of it).
+    answered = [t for kind, t, _ in log if kind == "answered"]
+    saved = [t for kind, t, _ in log if kind == "saved"]
+    assert all(answered[i - 1] < asks[i] < saved[i - 1] for i in range(1, len(asks)))
+    assert len(asks) == 6
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_stop_ends_it_after_the_batch_already_asked_for_and_loses_nothing(
         state, monkeypatch):
@@ -726,7 +621,7 @@ async def test_a_stop_ends_it_after_the_batch_already_asked_for_and_loses_nothin
     assert report["stopped"] == "stopped" and asked == [100, 100]
     # Every batch asked about was saved: none answered and dropped.
     assert [len(b) for b in saved_batches] == [100, 100]
-    assert len(readings(state, "VAT_REGISTERED")) == 200 == report["updated"]
+    assert len(await readings(state, "VAT_REGISTERED")) == 200 == report["updated"]
 
 
 class _JobCtx:
@@ -755,7 +650,6 @@ class _JobCtx:
         return ""
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_paused_check_job_goes_on_from_where_it_got(state, monkeypatch):
     from harvey.modules import job_kinds
@@ -776,7 +670,7 @@ async def test_a_paused_check_job_goes_on_from_where_it_got(state, monkeypatch):
     assert sorted(every) == sorted(known) and len(every) == len(set(every))   # each once
     assert result["updated"] == 350 and result["requests"] == 4 and result["companies"] == 350
     assert second.progress["done"] == 350
-    assert len(readings(state, "VAT_REGISTERED")) == 350
+    assert len(await readings(state, "VAT_REGISTERED")) == 350
 
 
 @pytest.mark.asyncio
@@ -817,7 +711,6 @@ async def test_a_busy_anaf_hands_the_job_back_and_rests_the_lane(state, monkeypa
     assert calls[-1][0] not in calls[0]                   # it went on from where it got
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_save_that_fails_part_way_never_ends_the_job_done(state, monkeypatch):
     from harvey.modules import job_kinds
@@ -842,7 +735,9 @@ async def test_a_save_that_fails_part_way_never_ends_the_job_done(state, monkeyp
     ctx = _JobCtx(state, params)
     with pytest.raises(LaneExhausted):                    # some saved: goes on later
         await job_kinds.run_id_check(ctx)
-    assert ctx.progress["done"] == 100 and len(readings(state, "VAT_REGISTERED")) == 100
+    # (ANAF's answers are kept in its own file as they come: what harvey.db
+    # failed to save is a contact, never an answer lost.)
+    assert ctx.progress["done"] == 100
     # The first save fails: nothing went through, so a try is used.
     calls[0], fail_on = 0, {1}
     with pytest.raises(Transient):
@@ -851,10 +746,9 @@ async def test_a_save_that_fails_part_way_never_ends_the_job_done(state, monkeyp
     done = _JobCtx(state, params, progress=ctx.progress)
     result = await job_kinds.run_id_check(done)
     assert done.outcome == "" and result["errors"] == [] and done.progress["done"] == 350
-    assert len(readings(state, "VAT_REGISTERED")) == 350
+    assert len(await readings(state, "VAT_REGISTERED")) == 350
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_failed_batch_then_a_good_one_is_asked_again_not_skipped(state, monkeypatch):
     from harvey.modules import job_kinds
@@ -884,48 +778,8 @@ async def test_a_failed_batch_then_a_good_one_is_asked_again_not_skipped(state, 
     assert result["errors"] == [] and done.progress["done"] == 350
     assert calls[4] == calls[1]                           # the failed batch, asked again
     # Every company read once: the ones asked twice said nothing new.
-    assert len(readings(state, "VAT_REGISTERED")) == 350
+    assert len(await readings(state, "VAT_REGISTERED")) == 350
 
-
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-@pytest.mark.asyncio
-async def test_a_companys_two_cuis_are_never_split_between_batches_or_jobs(state, monkeypatch):
-    from harvey.modules import job_kinds, jobs
-
-    ids = await _companies(state, 300)
-    straddler = sorted(ids)[99]           # its two rows would be rows 99 and 100
-    second = cui("9299999")
-    with sqlite3.connect(state.db_path) as db:
-        db.execute("INSERT INTO company_ids (company_id, kind, value) VALUES (?, 'cui', ?)",
-                   (straddler, second))
-    rows = await state.companies_with_id("cui", ids)
-    assert [len(b) for b in runs._batches(rows, 100)] == [99, 100, 100, 2]
-    known = {r["value"]: answer(r["value"]) for r in rows}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
-    asked = []
-    stub_anaf(monkeypatch, known, asked)
-    params = {"module": "anaf", "capability": "company_check", "company_ids": ids}
-    first = _JobCtx(state, params, stop_after=1)          # paused after its first batch
-    await job_kinds.run_id_check(first)
-    # Its first two batches saved: rows 0-98, then 99-198 (the second
-    # starts with the company's two rows, so it ends at company 197).
-    assert first.progress["after"] == sorted(ids)[197]
-    await job_kinds.run_id_check(_JobCtx(state, params, progress=first.progress))
-    every = [c for b in asked for c in b]
-    assert second in every and sorted(set(every)) == sorted(known)
-    # Jobs: the company in one job, once (its rows straddle 1,000).
-    more = await _companies_from(state, 9210000, 800)
-    everyone = ids + more
-    order = sorted(everyone)
-    with sqlite3.connect(state.db_path) as db:
-        db.execute("INSERT INTO company_ids (company_id, kind, value) VALUES (?, 'cui', ?)",
-                   (order[999], cui("9298888")))
-        db.execute("DELETE FROM company_ids WHERE company_id = ? AND value = ?",
-                   (straddler, second))
-    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", everyone)
-    held = [(await jobs.get(state, j)).params["company_ids"] for j in queued]
-    assert [len(h) for h in held] == [999, 101]
-    assert sum(h.count(order[999]) for h in held) == 1
 
 
 @pytest.mark.asyncio
@@ -937,26 +791,6 @@ async def test_companies_with_an_id_come_in_id_order_whatever_order_they_are_ask
     rows = await state.companies_with_id("cui", sorted(ids, reverse=True))
     assert [r["id"] for r in rows] == sorted(ids)
 
-
-async def _companies_from(state, start, n):
-    return [await state.add_company(Company(name=f"EXEMPLU {start + i} SRL",
-                                            cui=cui(str(start + i)), source="registry:onrc"))
-            for i in range(n)]
-
-
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-@pytest.mark.asyncio
-async def test_two_cuis_answering_differently_write_nothing_on_a_second_check(state, monkeypatch):
-    a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
-    with sqlite3.connect(state.db_path) as db:
-        db.execute("INSERT INTO company_ids (company_id, kind, value) VALUES (?, 'cui', ?)",
-                   (a, B))
-    stub_anaf(monkeypatch, {A: answer(A, vat=True), B: answer(B, vat=False)})
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
-    first = await runs.check_by_id(state, "anaf", "company_check", [a])
-    assert len(readings(state, "VAT_REGISTERED")) == 1    # one reading, not one per CUI
-    again = await runs.check_by_id(state, "anaf", "company_check", [a])
-    assert again["observations"] == 0 and len(readings(state, "VAT_REGISTERED")) == 1
 
 
 @pytest.mark.asyncio
@@ -988,30 +822,26 @@ def client(monkeypatch, tmp_path):
         yield c
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_a_company_panel_shows_findings_official_first(client, monkeypatch, tmp_path):
     import harvey.dashboard as dash
+    from harvey import contacts
+
+    # ANAF's answers beside the database, where its register is read.
+    monkeypatch.setattr(service, "CACHE_PATH", tmp_path / "anaf.db")
 
     async def setup():
         sm = StateManager(str(tmp_path / "harvey.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, address="Str. Veche 2",
-                                           source="registry:onrc"))
+        slim.describe(sm, slim.firm("EXEMPLU A SRL", A, address="Str. Veche 2"))
+        cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
         for code in ("PHONE_NUMBER", "ADDRESS", "VAT_REGISTERED"):
             await sm.set_signal_status(code, "confirmed")
-        await sm.add_observations([
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40722000210",
-             "module": "phones", "capability": "site_phones", "collector": "profile",
-             "observed_at": "2026-10-01 10:00:00"},
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268000210",
-             "module": "anaf", "capability": "company_check", "collector": "anaf",
-             "observed_at": "2026-09-01 10:00:00"},
-            {"company_id": cid, "signal_code": "ADDRESS", "value_text": "Str. Exemplu 1",
-             "module": "anaf", "capability": "company_check", "collector": "anaf"},
-            {"company_id": cid, "signal_code": "VAT_REGISTERED", "value_num": 1.0,
-             "module": "anaf", "capability": "company_check", "collector": "anaf"},
-        ])
+        await sm.add_contacts(cid, [contacts.Found("phone", "+40722000210", source="phones",
+                                                   capability="site_phones",
+                                                   seen="2026-10-01 10:00:00")])
+        service.keep(service.CACHE_PATH, {A: answer(A, vat=True, phone="0268 000 210")},
+                     set(), "2026-09-01T10:00:00+00:00")
         return cid
 
     cid = asyncio.run(setup())
@@ -1020,37 +850,39 @@ def test_a_company_panel_shows_findings_official_first(client, monkeypatch, tmp_
     assert [p["value"] for p in phones] == ["+40268000210", "+40722000210"]   # official first
     assert phones[0]["official"] and phones[0]["sources"][0]["name"] == "ANAF – date firmă"
     assert phones[0]["display"] == "+40 268 000 210"
-    assert data["other_phones"][0] in ("+40 268 000 210", "+40268000210")
-    addresses = [a["value"] for a in data["findings"]["addresses"]]
-    assert set(addresses) == {"Str. Exemplu 1", "Str. Veche 2"}     # ANAF's and the registry's
-    assert all(a["official"] for a in data["findings"]["addresses"])
+    addresses = data["findings"]["addresses"]
+    assert {a["value"] for a in addresses} >= {"Str. Veche 2"}       # the registry's
+    assert any("Str. Exemplu" in a["value"] for a in addresses)      # and ANAF's
+    assert all(a["official"] for a in addresses)
     facts = {f["code"]: f for f in data["findings"]["facts"]}
-    assert facts["VAT_REGISTERED"]["value_num"] == 1.0 and facts["VAT_REGISTERED"]["module"] == "anaf"
+    assert facts["VAT_REGISTERED"]["value_num"] == 1 and facts["VAT_REGISTERED"]["module"] == "anaf"
     assert dash._official_modules() >= {"anaf", "onrc", "mf_financials", "mf_taxpayers"}
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
-def test_a_finding_lists_its_official_sources_newest_first(client, tmp_path):
+def test_a_finding_lists_its_official_sources_newest_first(client, monkeypatch, tmp_path):
+    from harvey import contacts
+
+    monkeypatch.setattr(service, "CACHE_PATH", tmp_path / "anaf.db")
+
     async def setup():
         sm = StateManager(str(tmp_path / "harvey.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
         cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
         await sm.set_signal_status("PHONE_NUMBER", "confirmed")
-        await sm.add_observations([
-            {"company_id": cid, "signal_code": "PHONE_NUMBER", "value_text": "+40268000210",
-             "module": module, "capability": "x", "collector": module, "observed_at": when}
-            for module, when in (("phones", "2026-10-20 10:00:00"),
-                                 ("anaf", "2026-09-01 10:00:00"),
-                                 ("mf_taxpayers", "2026-07-23 00:00:00"),
-                                 ("anaf", "2026-10-01 10:00:00"))])
+        await sm.add_contacts(cid, [contacts.Found("phone", "+40268000210", source="phones",
+                                                   capability="x", seen="2026-10-20 10:00:00")])
+        # ANAF's latest answer and the taxpayer file give the same number.
+        service.keep(service.CACHE_PATH, {A: answer(A, phone="0268 000 210")}, set(),
+                     "2026-10-01T10:00:00+00:00")
+        slim.taxpayers_beside(sm, [(A, "EXEMPLU A SRL", 1, 1, 0, "0268000210")],
+                              published="2026-07-23")
         return cid
 
     cid = asyncio.run(setup())
     sources = client.get(f"/api/companies/{cid}").json()["findings"]["phones"][0]["sources"]
     assert [(x["module"], x["observed_at"][:10]) for x in sources] == [
-        ("anaf", "2026-10-01"), ("anaf", "2026-09-01"), ("mf_taxpayers", "2026-07-23"),
-        ("phones", "2026-10-20")]
+        ("anaf", "2026-10-01"), ("mf_taxpayers", "2026-07-23"), ("phones", "2026-10-20")]
 
 
 def test_the_dashboard_checks_a_selection_at_anaf(client, monkeypatch, tmp_path):

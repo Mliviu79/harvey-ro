@@ -47,7 +47,7 @@ REGISTER_STATS = {
         "administrators": [("administrators_firm", "3298321 2")],
         "caen": [("sqlite_autoindex_caen_1", "2343 2 1")],
         "meta": [("sqlite_autoindex_meta_1", "11 1")],
-        "firm_by_cui": [(None, "3919161")],
+        "firm_by_cui": [(None, "3919161")], "firm_key": [(None, "4126464")],
         "name_key": [("name_key", "1784770 2 1 1")],
     },
     "fin": {
@@ -79,7 +79,8 @@ OVERLAY_STATS = {
              ("firm_no_contact", "1778000 1 1"), ("firm_by_contacts", "1790000 100000 1"),
              ("firm_with_site", "11000 50 1 1"), ("firm_profiled", "1790000 1000000"),
              ("firm_searched", "20000 2 1")],
-    "firm_ident": [("firm_ident", "3600000 1800000 1"), ("firm_ident_firm", "3600000 2 1")],
+    "firm_ident": [("firm_ident", "3600000 1800000 1"), ("firm_ident_firm", "3600000 2 1"),
+                   ("firm_ident_since", "3600000 3")],
     "local_firm": [(None, "400"), ("local_firm_place", "400 20 5")],
     "contact": [(None, "910000"), ("sqlite_autoindex_contact_1", "910000 300000 1"),
                 ("contact_new", "910000 2 1"), ("contact_kind", "910000 300000 200000 2 1"),
@@ -470,7 +471,8 @@ def test_register_values_reach_firms_only_through_keys(files):
             assert not re.search(r"\bf\.cui\s*=(?!\s*'')", st.sql), st.name
     names = {st.name for st in queries.named()}
     for m in registers.declared():
-        assert f"{m.id}.marks" in names or m.id == "anaf"
+        # (A register written in WAL mode marks its saves itself: anaf.)
+        assert f"{m.id}.marks" in names, m.id
         for r in m.register["reads"]:
             assert f"{m.id}.read.{r['code']}" in names, (m.id, r["code"])
 

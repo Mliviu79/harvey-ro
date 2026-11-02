@@ -55,8 +55,9 @@ ROLES = ("site_read", "finder", "deep_bit")
 # What the overlay counts with no clock (tally rows). ``outbox:<status>``
 # rows are added as statuses appear.
 TALLIES = ("firms", "firms_with_contact", "firms_with_site", "firms_merged",
-           "contacts", "contacts_email", "contacts_phone", "contacts_mobile",
-           "contacts_do_not_contact", "people")
+           "firms_with_email", "firms_with_phone", "firms_with_mobile", "contacts",
+           "contacts_email", "contacts_phone", "contacts_mobile", "contacts_do_not_contact",
+           "people")
 
 DICTIONARIES = """
 CREATE TABLE module (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -135,6 +136,9 @@ CREATE TABLE firm_ident (
   PRIMARY KEY (scheme, key)
 ) WITHOUT ROWID;
 CREATE INDEX firm_ident_firm ON firm_ident(firm, scheme);
+-- (Which records gained an identifier since a register's kept sets were
+-- built: register_set.)
+CREATE INDEX firm_ident_since ON firm_ident(since);
 -- Counters that only grow (never recounted): ``identity`` moves whenever
 -- which firm holds which identifier changes (a firm added, removed, merged
 -- or unmerged, an identifier added or removed), so what was worked out
@@ -280,6 +284,18 @@ CREATE TABLE signal_tally (signal INTEGER PRIMARY KEY, n_true INTEGER NOT NULL,
 CREATE TABLE register_tally (signal INTEGER NOT NULL, module INTEGER NOT NULL, mark TEXT NOT NULL,
   loaded INTEGER NOT NULL, n_true INTEGER, n_false INTEGER, at INTEGER, n_values INTEGER,
   PRIMARY KEY (signal, module));
+-- The same job keeps which records each register signal holds for: part 0
+-- the records the register has a value for, part 1 of those the ones whose
+-- value reads yes, each a compressed bitmap over firm ids (bit n: record n);
+-- part <year>, for a register that keeps each year's figures: the records
+-- whose statement that year has the signal's figure.
+-- What a cohort's register conditions are worked out from (overlay/bitmaps.py).
+-- top: the highest firm id then; records: how many firm rows there were;
+-- at: when the walk started (a record that gained an identifier since is
+-- read again from the register).
+CREATE TABLE register_set (signal INTEGER NOT NULL, module INTEGER NOT NULL, part INTEGER NOT NULL,
+  mark TEXT NOT NULL, top INTEGER NOT NULL, records INTEGER NOT NULL, at INTEGER NOT NULL,
+  bits BLOB NOT NULL, PRIMARY KEY (signal, module, part));
 """
 
 # The tables kept from schema 24, unchanged but for integer firm ids.

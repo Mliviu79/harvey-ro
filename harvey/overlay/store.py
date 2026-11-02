@@ -32,7 +32,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from harvey import contacts, resolver
-from harvey.overlay import merges, schema, triggers
+from harvey.overlay import bitmaps, merges, schema, triggers
+from harvey.overlay import queries as _statements  # noqa: F401  (registers the named ones it runs)
 from harvey.overlay.idents import Schemes
 from harvey.overlay.schema import CONTACT_STATUS, FIRM_KEY, LINE_TYPE, PHONE, TRUST
 
@@ -83,6 +84,14 @@ def unix(value) -> int | None:
 
 def _norm(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _key_domain(value: str | None) -> str:
+    """A domain as a firm's key (``firm.domain``), or "" for one that
+    identifies no single business (a social network, a directory, a free
+    mailbox, a shared booking site): such a domain never joins two firms."""
+    value = _norm(value)
+    return value if resolver.usable_domain(value) else ""
 
 
 def place_parts(location: str) -> tuple[str, str, str]:
@@ -429,7 +438,7 @@ class Store:
             key = self.schemes.key(kind, value) if kind in ("cui", "external") else None
             if key is not None and key not in keys:
                 keys.append(key)
-        domain = _norm(company.domain) or None
+        domain = _key_domain(company.domain) or None
         for scheme, key in keys:
             holder = self.one("SELECT firm FROM firm_ident WHERE scheme = ? AND key = ?",
                               (scheme, key))
@@ -581,7 +590,9 @@ class Store:
                           (value, fid)).rowcount:
                     changed.append(column)
             elif column == "domain":
-                value = _norm(value)
+                value = _key_domain(value)
+                if not value:
+                    continue
                 if self.one("SELECT 1 FROM firm WHERE domain = ? AND id != ?", (value, fid)):
                     continue
                 if self.x("UPDATE firm SET domain = ? WHERE id = ? AND domain IS NULL",
@@ -642,9 +653,14 @@ class Store:
             "phone", phone, source=source, trust="confirmed",
             region=phone_region(self._place(fid), None, domain))) is not None
 
-    def fill_company_phones(self, phones: dict) -> list[str]:
-        """fill_company_phone for many firms; the ids whose first phone it was."""
-        return [cid for cid, phone in phones.items() if self.fill_company_phone(cid, phone)]
+    def phoneless(self, company_ids) -> list[str]:
+        """The companies among ``company_ids`` with no phone yet."""
+        out = []
+        for cid in company_ids:
+            fid = self.live(cid)
+            if fid is not None and not self._has_phone(fid):
+                out.append(cid)
+        return out
 
     def set_company_activities(self, company_id, classes, source: str = "",
                                confidence: float = 1.0) -> int:
@@ -656,7 +672,7 @@ class Store:
         fid = self.live(company_id)
         if fid is None:
             return False
-        domain = _norm(domain)
+        domain = _key_domain(domain)
         if domain and self.one("SELECT 1 FROM firm WHERE domain = ? AND id != ?", (domain, fid)):
             domain = ""
         return self.x(
@@ -691,6 +707,39 @@ class Store:
         if record is None:
             return 0
         return sum(self._contact(record, f) is not None for f in found or ())
+
+    def prospect_contact(self, company_id, email: str, *, first: str = "", last: str = "",
+                         status: str = "", role: str = "", source: str = "",
+                         evidence_url: str = "", opted_out: bool = False) -> int | None:
+        """A prospect's address as one of its company's contacts, through its
+        person (the one already named there in either order of the names;
+        none for a company inbox), confirmed on the company's own domain,
+        else likely; an opted-out prospect's address is do-not-contact."""
+        record = self._record(company_id, "")
+        if record is None or "@" not in (email or "")[1:]:
+            return None
+        person = f"{first or ''} {last or ''}".strip()
+        reversed_ = contacts.name_norm(f"{last or ''} {first or ''}".strip())
+        if person and reversed_ != contacts.name_norm(person):
+            person = self.one("SELECT name FROM person WHERE firm = ? AND name_norm = ?",
+                              (record, reversed_)) or person
+        domain = self.one("SELECT domain FROM firm WHERE id = ?", (record,)) or ""
+        trust = "confirmed" if domain and email.rpartition("@")[2] == domain else "likely"
+        contact = self._contact(record, contacts.Found(
+            "email", email, display=email, status=status if status in (
+                "verified", "risky", "guess", "invalid") else "", person=person, role=role,
+            source=source, evidence_url=evidence_url, trust=trust))
+        if contact is not None and opted_out:
+            self.x("UPDATE contact SET do_not_contact = 1 WHERE id = ?", (contact,))
+        return contact
+
+    def set_do_not_contact(self, kind: str, value: str, flag: bool) -> int:
+        """Mark (or clear) a contact as do-not-contact: an opt-out and its undo."""
+        kind_id = self._kind(kind)
+        if kind_id is None or not value:
+            return 0
+        return self.x("UPDATE contact SET do_not_contact = ? WHERE kind = ? AND value = ?",
+                      (1 if flag else 0, kind_id, value.strip().lower())).rowcount
 
     def add_contact_list(self, items) -> int:
         """Contacts of many firms: (company_id, contacts.Found, origin) each."""
@@ -742,6 +791,11 @@ class Store:
                (record, contact, self.source(found.source), person, found.location_id or 0,
                 self.capability(found.source, found.capability), TRUST[trust],
                 float(found.confidence), found.evidence_url or None, seen, seen))
+        if found.kind == "email" and resolver.usable_email(value):
+            # An address the record has is one of its keys (never a free
+            # mailbox's): two records holding it may be one business.
+            self.x("INSERT OR IGNORE INTO firm_key (kind, value, firm, source) VALUES (?, ?, ?, ?)",
+                   (FIRM_KEY["email"], value, record, self.source(found.source)))
         return contact
 
     def _person(self, record: int, name: str, role: str = "", source: str = "",
@@ -1070,7 +1124,7 @@ class Store:
         if match is None:
             match = self.match_company(company, declared_domain=record.declared_domain)
         existing = self.live(match.company_id) if match.attach else None
-        domain = _norm(company.domain)
+        domain = _key_domain(company.domain)
         holder = self.live(self.one("SELECT id FROM firm WHERE domain = ?", (domain,))) \
             if domain else None
         shared = False
@@ -1216,11 +1270,20 @@ class Store:
                       (merged,)).fetchone()
         if gone is None:
             return None
-        mine = self.x("SELECT address, locality, county FROM local_firm WHERE firm = ?",
-                      (keep,)).fetchone() or (None, None, None)
         place = lambda loc, cty: ", ".join(p for p in (loc, cty) if p)  # noqa: E731
-        if not resolver.branch_place({"address": mine[0], "location": place(mine[1], mine[2])},
-                                     {"address": gone[1], "location": place(gone[2], gone[3])}):
+        mine = self.x("SELECT address, locality, county FROM local_firm WHERE firm = ?",
+                      (keep,)).fetchone()
+        if mine is not None:
+            here = {"address": mine[0], "location": place(mine[1], mine[2])}
+        else:
+            # A registered survivor: its place is the register's.
+            from harvey.overlay.reads import Reader
+
+            row = (Reader(self.con, self.registers, manifests=self.manifests)
+                   .company_rows([keep]) or [{}])[0]
+            here = {"address": row.get("address"), "location": row.get("location")}
+        if not resolver.branch_place(here, {"address": gone[1],
+                                            "location": place(gone[2], gone[3])}):
             return None
         return gone[0] or "", gone[1] or "", gone[2] or "", gone[3] or ""
 
@@ -1606,6 +1669,12 @@ class Store:
                         "DELETE FROM firm WHERE id = ?"):
                 self.x(sql, (fid,))
             self.x("DELETE FROM match_candidate WHERE a = ? OR b = ?", (fid, fid))
+        # The register sets the counts job kept count it: its bit goes, and
+        # one record from what they counted, so they stay in use (bitmaps.py).
+        for sig, mod, part, blob in self.x("SELECT signal, module, part, bits FROM register_set "
+                                           "WHERE top >= ?", (fid,)).fetchall():
+            self.x("UPDATE register_set SET bits = ?, records = records - 1 WHERE signal = ? "
+                   "AND module = ? AND part = ?", (bitmaps.clear(blob, fid), sig, mod, part))
         gone = 0
         for contact in linked:
             gone += self.x("DELETE FROM contact WHERE id = ? AND do_not_contact = 0 AND NOT EXISTS "

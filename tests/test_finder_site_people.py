@@ -28,6 +28,7 @@ from harvey.models import Company
 from harvey.modules import api, runs
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager, company_brief_lines
+from tests import slim
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sites"
 SITES = {"harborlinedental.example": "harborline", "clinica-exemplu.example": "clinica"}
@@ -228,13 +229,11 @@ async def _state(path) -> StateManager:
 
 
 def _addresses(db, cid):
-    return sorted(_rows(db, "SELECT p.name, ct.value, ct.status, l.trust FROM company_contacts l "
-                            "JOIN contacts ct ON ct.id = l.contact_id "
-                            "JOIN people p ON p.id = l.person_id "
-                            "WHERE l.company_id = ? AND ct.kind = 'email'", (cid,)))
+    """(person, address, status, trust) of the company's people's emails."""
+    return sorted((p, v, st, trust) for k, v, line, trust, p, st in slim.links(db, cid)
+                  if k == "email" and p)
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
         tmp_path, no_network):
     db = tmp_path / "harvey.db"
@@ -250,7 +249,7 @@ def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
     cid, found = run(go())
     assert found.steps[0] == "site" and found.people == 3
     # The owner was saved first: the address step takes people in that order.
-    assert _rows(db, "SELECT name, role FROM people ORDER BY id")[0] == (
+    assert _rows(db, "SELECT name, role FROM person ORDER BY id")[0] == (
         "Maren Calloway", "Owner and Lead Dentist")
     assert _addresses(db, cid) == [
         # Published on the site: theirs as it is, no check spent.
@@ -262,15 +261,15 @@ def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
     ]
     assert _rows(db, "SELECT pattern, source FROM email_patterns WHERE domain = ?", (EN,)) == [
         ("{f}", "site_address")]
-    owner = _rows(db, "SELECT value_text FROM observations WHERE signal_code = 'LIKELY_OWNER'")
+    owner = _rows(db, "SELECT o.text FROM obs o JOIN signal s ON s.id = o.signal "
+                      "WHERE s.code = 'LIKELY_OWNER'")
     assert len(owner) == 1 and owner[0][0].startswith("Maren Calloway")
     # The read is a deeper one: it looked for the owner.
-    assert _rows(db, "SELECT looked_for FROM searches WHERE module = 'website'") == [
-        (runs.CONTACT_READ,)]
+    [looked] = [r[3] for r in slim.searches(db) if r[1] == "website"]
+    assert set(looked.split(",")) == set(runs.CONTACT_READ.split(","))
     assert "owner" in runs.CONTACT_READ.split(",") and finder.SITE_WANTS == "owner"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_romanian_clinic_gets_its_doctors_addresses(tmp_path, no_network):
     db = tmp_path / "harvey.db"
 
@@ -289,7 +288,6 @@ def test_the_romanian_clinic_gets_its_doctors_addresses(tmp_path, no_network):
     ]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_registrys_administrator_gets_the_address_the_site_publishes_for_them(
         tmp_path, no_network):
     db = tmp_path / "harvey.db"
@@ -336,28 +334,27 @@ def _site(domain, html):
     return {f"https://{domain}": html}
 
 
-@pytest.mark.parametrize("source,size,employees,want", [
-    ("discover:serper", "", None, "john.doe@"),       # no size signal: first.last@
-    ("discover:osm", "", None, "john@"),              # a local-business listing
-    ("registry:onrc", "2-10", None, "john@"),         # its size on file
-    ("registry:onrc", "", 7, "john@"),                # its financial statements
-    ("registry:onrc", "", 140, "john.doe@"),
+@pytest.mark.parametrize("source,employees,want", [
+    ("discover:serper", None, "john.doe@"),       # no size signal: first.last@
+    ("discover:osm", None, "john@"),              # a local-business listing
+    ("registry:onrc", 7, "john@"),                # its financial statements
+    ("registry:onrc", 140, "john.doe@"),
 ])
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-def test_a_small_company_is_guessed_first_at(tmp_path, no_network, source, size, employees,
-                                             want):
+def test_a_small_company_is_guessed_first_at(tmp_path, no_network, source, employees, want):
     db = tmp_path / "harvey.db"
     no_network.extra.update(_site("acme-roofing.example",
                                   "<h3>John Doe</h3><p>Owner</p>" + "<p>Roofs.</p>" * 60))
 
     async def go():
         s = await _state(db)
-        cid = await s.add_company(Company(name="ACME ROOFING", domain="acme-roofing.example",
-                                          source=source, company_size=size))
+        cui = ""
         if employees is not None:
-            await s.add_observations([{"company_id": cid, "signal_code": "EMPLOYEES",
-                                       "value_num": employees, "value_text": "2025",
-                                       "collector": "financials"}])
+            # Its headcount, read from the financial statements beside it.
+            cui = "90000777"
+            slim.describe(s, slim.firm("ACME ROOFING SRL", cui, domain="acme-roofing.example"))
+            slim.financials_beside(s, [(cui, 100000, employees)])
+        cid = await s.add_company(Company(name="ACME ROOFING", domain="acme-roofing.example",
+                                          source=source, cui=cui))
         await finder.find(s, cid, spend=finder.Spend(), env={})
         return cid
 
@@ -366,7 +363,6 @@ def test_a_small_company_is_guessed_first_at(tmp_path, no_network, source, size,
     assert email == f"{want}acme-roofing.example" and status == "guess" and trust == "likely"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_small_icp_allows_first_at(tmp_path, no_network):
     db = tmp_path / "harvey.db"
     no_network.extra.update(_site("acme-roofing.example",
@@ -384,7 +380,6 @@ def test_a_small_icp_allows_first_at(tmp_path, no_network):
     assert email == "john@acme-roofing.example"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_two_people_who_could_share_an_address_get_no_guess(tmp_path, no_network):
     db = tmp_path / "harvey.db"
     no_network.extra.update(_site("acme-roofing.example", (
@@ -491,7 +486,6 @@ def test_the_audience_and_the_writer_get_the_companys_facts(tmp_path, monkeypatc
 FILLER = "<p>Roofs and gutters.</p>" * 60
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_built_guess_is_never_passed_off_as_a_published_address(tmp_path, no_network):
     """A guess built for the registry's administrator is on file at the
     domain; a forced run (Search again) must not take it for an address the
@@ -519,10 +513,11 @@ def test_a_built_guess_is_never_passed_off_as_a_published_address(tmp_path, no_n
     cid, first, published = run(go())
     assert first == [("OLTEANU MIHAI", "mihai.olteanu@acme-roofing.example", "guess", "likely")]
     assert published == []
-    links = _rows(db, "SELECT ct.status, l.trust, l.source FROM company_contacts l "
-                      "JOIN contacts ct ON ct.id = l.contact_id WHERE l.company_id = ?", (cid,))
-    assert not any(st == "guess" and t == "confirmed" for st, t, _ in links), links
-    assert not any(st == "guess" and src == "website" for st, _, src in links), links
+    links = _rows(db, f"SELECT ct.status, e.trust_name, e.source_name FROM {slim.EVIDENCE} e "
+                      "JOIN contact ct ON ct.id = e.contact WHERE e.firm = ?", (int(cid),))
+    guess = 3       # (overlay.schema.CONTACT_STATUS)
+    assert not any(st == guess and t == "confirmed" for st, t, _ in links), links
+    assert not any(st == guess and src == "website" for st, _, src in links), links
 
 
 def test_published_addresses_exclude_invalid_ones(tmp_path):
@@ -596,7 +591,6 @@ def test_a_huge_menu_and_a_language_switcher_stay_in_budget():
     assert not any("/de/team-0" in u for u in asked)        # /en/team-0 read instead
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_a_shallow_read_site_with_a_contact_gets_the_deeper_read_once(tmp_path, no_network):
     """A site the finder read the shallow way found a phone; the background
     still reads it the deeper way once, after the companies with no contact."""
@@ -622,7 +616,10 @@ def test_a_shallow_read_site_with_a_contact_gets_the_deeper_read_once(tmp_path, 
         return cid, other, before, first, await finder.next_free(s, 10)
 
     cid, other, before, first, after = run(go())
-    assert before == [other, cid]
+    # Every site with no deeper read yet, those with no contact first (a
+    # plain read's company too: its read never looked for emails).
+    plain = str(int(cid) + 2)
+    assert before == [other, plain, cid]
     assert "site" in first.steps
     assert cid not in after
 
@@ -639,12 +636,12 @@ def test_a_catch_all_address_is_no_surer_than_likely():
 
 
 def _email_searches(db):
-    return sorted(_rows(db, "SELECT p.name, s.outcome FROM searches s "
-                            "JOIN people p ON CAST(p.id AS TEXT) = s.target_id "
-                            "WHERE s.target = 'person' AND s.module = 'email_verify'"))
+    outcomes = {0: "error", 1: "found", 2: "nothing", 3: "skipped"}
+    return sorted((name, outcomes[o]) for name, o in _rows(
+        db, "SELECT p.name, s.outcome FROM search s JOIN person p ON p.id = s.target "
+            "JOIN module m ON m.id = s.module WHERE s.is_person = 1 AND m.name = 'email_verify'"))
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_with_no_cap_published_addresses_are_still_linked_to_their_people(tmp_path, no_network):
     """The background walk with no spend.per_day_usd: no address is built or
     checked, but a person's own address on the site is theirs for free; the
@@ -672,12 +669,9 @@ def test_with_no_cap_published_addresses_are_still_linked_to_their_people(tmp_pa
     # The capped run builds his, and links the others once.
     assert _addresses(db, cid) == linked + [
         ("Theo Ashgrove", "theo@harborlinedental.example", "guess", "likely")]
-    assert _rows(db, "SELECT COUNT(*) FROM company_contacts l JOIN contacts ct "
-                     "ON ct.id = l.contact_id WHERE ct.kind = 'email' AND l.person_id != 0 "
-                     "AND l.company_id = ?", (cid,)) == [(3,)]
+    assert len([x for x in slim.links(db, cid) if x[0] == "email" and x[4]]) == 3
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_with_no_cap_a_guess_on_file_is_never_linked_as_published(tmp_path, no_network):
     from harvey import contacts
 
@@ -701,7 +695,6 @@ def test_with_no_cap_a_guess_on_file_is_never_linked_as_published(tmp_path, no_n
     assert [a[0] for a in _addresses(db, cid)] == ["Lena Calderwyn", "Maren Calloway"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_not_at_all(
         tmp_path, no_network):
     db = tmp_path / "harvey.db"
@@ -709,9 +702,7 @@ def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_n
     async def go(trust, name="HARBORLINE DENTAL", town="Port Ellery"):
         s = await _state(db)
         cid = await s.add_company(Company(name=name, location=town, source="discover:serper"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE companies SET website = ?, website_trust = ? WHERE id = ?",
-                         (f"https://{EN}", trust, cid))
+        await s.set_found_website(cid, f"https://{EN}", trust=trust)
         found = await finder.find(s, cid, spend=finder.Spend(cap=False), env={})
         return cid, found
 
@@ -724,7 +715,6 @@ def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_n
     assert found.trust == "unconfirmed" and _addresses(db, cid) == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.parametrize("cap", [False, True])
 def test_a_twin_searched_earlier_with_nothing_found_does_not_block_her_published_address(
         tmp_path, no_network, cap):
@@ -740,7 +730,7 @@ def test_a_twin_searched_earlier_with_nothing_found_does_not_block_her_published
                                           location="Brașov, Brașov, Romania",
                                           source="registry:onrc"))
         await s.add_people(cid, [("VRÂNCEANU IOANA", "administrator")], source="onrc")
-        (pid,) = _rows(db, "SELECT id FROM people WHERE company_id = ?", (cid,))[0]
+        (pid,) = _rows(db, "SELECT id FROM person WHERE firm = ?", (int(cid),))[0]
         await s.record_search("person", pid, *finder.EMAIL, looked_for="email",
                               outcome="nothing", origin=cid)
         await finder.find(s, cid, spend=finder.Spend(cap=cap), env={})

@@ -195,6 +195,8 @@ async def collect_companies(state: StateManager, config=None,
             "id": c.get("id", ""),
             "cui": c.get("cui", "") or "",
             "address": c.get("address", "") or "",
+            # (The dashboard's export lists them: read with the row, not again.)
+            "_activities": c.get("activities") or [],
         })
     return out
 

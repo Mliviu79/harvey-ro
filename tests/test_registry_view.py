@@ -23,6 +23,7 @@ from harvey.modules.ro.mf_financials import store as fin_store
 from harvey.modules.ro.mf_taxpayers import store as tax_store
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 N = 400
 CODES = ["BV", "CJ", "B", "IS", "TM"]
@@ -110,13 +111,9 @@ def build(folder, n=N):
     tax.commit()
     tax.close()
 
-    anaf = anaf_service._connect(folder / "anaf.db")
-    anaf.execute("INSERT INTO answers VALUES (?, '2026-10-15T00:00:00+00:00', 1, ?)",
-                 (firm_cui(1), json.dumps({"date_generale": {"cui": int(firm_cui(1)),
-                                                             "denumire": "EXEMPLU 0001 SRL"},
-                                           "inregistrare_scop_Tva": {"scpTVA": True}})))
-    anaf.commit()
-    anaf.close()
+    anaf_service.keep(folder / "anaf.db", {firm_cui(1): {
+        "date_generale": {"cui": int(firm_cui(1)), "denumire": "EXEMPLU 0001 SRL"},
+        "inregistrare_scop_Tva": {"scpTVA": True}}}, set(), "2026-10-15T00:00:00+00:00")
 
 
 @pytest.fixture
@@ -328,6 +325,37 @@ def test_later_pages_come_from_the_kept_list(world, monkeypatch):
     assert len(deep["rows"]) == 20
 
 
+def test_a_plain_list_by_name_pages_from_the_search_index(world, monkeypatch):
+    # Nothing but words, area and status: the full-text index is read in its
+    # own order a page at a time, never every match first.
+    with monkeypatch.context() as m:
+        m.setattr(registry_view, "ordering", lambda *a: pytest.fail("read every match"))
+        for filters in ({}, {"county": "BV", "status": "all"}):
+            params = registry_params(filters)
+            up = registry_view.page(params, "name", "asc", 5, 3)
+            down = registry_view.page(params, "name", "desc", 5, 0)
+            assert up["paged_by"] == down["paged_by"] == "index"
+            assert up["total"] == down["total"] > 8
+    # A figure condition narrows it: the kept list.
+    narrowed = registry_view.page(registry_params({"min_employees": "3"}), "name", "", 5, 0)
+    assert narrowed["paged_by"] == "computed"
+
+def test_the_index_page_is_the_name_order(world, monkeypatch):
+    # The full-text index's rowid order stands for the name order (the load
+    # numbers firms by name): the same pages as the list worked out by name.
+    for filters in ({}, {"county": "BV", "status": "all"}):
+        params = registry_params(filters)
+        index = {(way, offset): registry_view.page(params, "name", way, 5, offset)
+                 for way, offset in (("asc", 0), ("asc", 3), ("desc", 2))}
+        with monkeypatch.context() as m:
+            m.setattr(registry_view, "_name_order_match", lambda con, q: None)
+            for (way, offset), got in index.items():
+                worked = registry_view.page(params, "name", way, 5, offset)
+                assert got["paged_by"] == "index" and worked["paged_by"] != "index"
+                assert got["total"] == worked["total"]
+                assert [r["reg"] for r in got["rows"]] == [r["reg"] for r in worked["rows"]]
+
+
 def test_a_reload_drops_the_kept_list(world):
     params = registry_params({"county": "CJ"})
     registry_view.page(params, "turnover", "", 10, 0)
@@ -408,7 +436,6 @@ async def state(world):
     yield sm
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_pull_of_chosen_firms_saves_exactly_them(world, state):
     from harvey.modules.runs import registry_pull
@@ -421,9 +448,9 @@ async def test_a_pull_of_chosen_firms_saves_exactly_them(world, state):
     finally:
         con.close()
     assert report.new_companies == 4 and not report.errors
-    with sqlite3.connect(state.db_path) as db:
-        saved = sorted(r[0][5:] for r in db.execute("SELECT external_id FROM companies"))
-    assert saved == sorted(regs)
+    saved = [r[0] for r in slim.q(state, "SELECT fi.key FROM firm_ident fi JOIN ident_scheme s "
+                                         "ON s.id = fi.scheme WHERE s.name = 'ro.onrc_reg'")]
+    assert sorted(saved) == sorted(regs)
 
 
 @pytest.fixture

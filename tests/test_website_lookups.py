@@ -20,6 +20,7 @@ from harvey.modules import api, ingest, job_kinds, jobs, lanes, switches
 from harvey.modules.original.brave import provider as brave
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 KEY = {"brave_api_key": "test-brave-key"}
 # What the fake Brave answers: one result is the company's site, the rest
@@ -269,7 +270,6 @@ def _site_reader(monkeypatch, read):
     monkeypatch.setattr(api, "capability", capability)
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_background_looks_up_inside_the_free_allowance_and_keeps_only_the_site(
         tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.DEBUG)
@@ -291,10 +291,11 @@ def test_the_background_looks_up_inside_the_free_allowance_and_keeps_only_the_si
     assert found.website == "alfa-dent.example" and read == ["alfa-dent.example"]
     assert len(fake.requests) == 1 and lanes.uses("brave") == {"month": 1}
     # The search is on record, free, naming only the site it chose.
-    assert _rows(db, "SELECT module, capability, outcome, cost, detail FROM searches "
-                     "WHERE looked_for = 'website'") == [
-        ("brave", "website_search", "found", 0.0, "alfa-dent.example")]
-    assert _rows(db, "SELECT website_trust FROM companies WHERE id = ?", (cid,)) == [("likely",)]
+    assert _rows(db, "SELECT m.name, c.name, s.outcome, s.cost, s.detail FROM search s "
+                     "JOIN module m ON m.id = s.module JOIN capability c ON c.id = s.capability "
+                     "WHERE s.looked_for = (SELECT bit FROM looked_for WHERE name = 'website')") == [
+        ("brave", "website_search", 1, 0.0, "alfa-dent.example")]
+    assert _rows(db, "SELECT website_trust FROM firm WHERE id = ?", (int(cid),)) == [(1,)]
     # Nothing else from the results is kept: not in the database, not in the log.
     everything = _everything(db)
     logged = "\n".join(r.getMessage() for r in caplog.records)
@@ -568,7 +569,6 @@ async def _addresses(s, cid):
     return out
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_other_order_is_checked_only_when_the_likelier_one_is_invalid(tmp_path,
                                                                          monkeypatch):
     db = tmp_path / "harvey.db"
@@ -586,10 +586,10 @@ def test_the_other_order_is_checked_only_when_the_likelier_one_is_invalid(tmp_pa
     assert asked == [("Ion", "Popescu"), ("Popescu", "Mihai")]
     assert out.contacts == 1 and left == ingest.monthly_allowance("email_verify") - 2
     # The person keeps the registry's text; the record says the order used.
-    assert _rows(db, "SELECT name FROM people") == [("POPESCU ION MIHAI",)]
-    assert _rows(db, "SELECT detail FROM searches WHERE target = 'person'") == [
+    assert _rows(db, "SELECT name FROM person") == [("POPESCU ION MIHAI",)]
+    assert _rows(db, "SELECT detail FROM search WHERE is_person = 1") == [
         ("read as Popescu Mihai",)]
-    assert _rows(db, "SELECT value, status FROM contacts WHERE kind = 'email'") == [
+    assert [(v, st) for k, v, line, trust, p, st in slim.links(db) if k == "email"] == [
         ("popescu.mihai@alfa-dent.example", "verified")]
 
 
@@ -607,7 +607,6 @@ def test_a_verified_first_order_needs_no_second_check(tmp_path, monkeypatch):
     assert asked == [("Ion", "Popescu")]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_an_order_the_companys_site_confirms_is_the_only_one_checked(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     asked = _verifier(monkeypatch, {})          # every address comes back invalid
@@ -624,8 +623,8 @@ def test_an_order_the_companys_site_confirms_is_the_only_one_checked(tmp_path, m
     # is Mihai Popescu): that order, once, and the page's own mention isn't
     # checked a second time.
     assert asked == [("Ion", "Popescu")]
-    details = dict(_rows(db, "SELECT p.name, s.detail FROM searches s JOIN people p "
-                             "ON CAST(p.id AS TEXT) = s.target_id WHERE s.target = 'person'"))
+    details = dict(_rows(db, "SELECT p.name, s.detail FROM search s JOIN person p ON p.id = s.target "
+                             "WHERE s.is_person = 1"))
     assert details["POPESCU MIHAI ION"] == "read as Ion Popescu (the company's site names them so)"
     assert details["Ion Popescu"] == "searched as POPESCU MIHAI ION"
 
@@ -740,7 +739,6 @@ def test_raising_a_discover_runs_cap_frees_its_paused_search(tmp_path):
     assert after_websites == {"search": 9.0, "websites": 3.0}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_different_person_on_the_site_doesnt_lend_the_admin_their_mailbox(
         tmp_path, monkeypatch):
     """POPESCU ION MIHAI (family name first) and a team page's "Ion Mihai"
@@ -758,13 +756,11 @@ def test_a_different_person_on_the_site_doesnt_lend_the_admin_their_mailbox(
 
     run(go())
     assert asked[0] == ("Ion", "Popescu") and ("Ion", "Mihai") in asked
-    linked = dict(_rows(db, "SELECT ct.value, p.name FROM company_contacts cc JOIN people p "
-                            "ON p.id = cc.person_id JOIN contacts ct ON ct.id = cc.contact_id "
-                            "WHERE ct.value = 'ion.mihai@alfa-dent.example'"))
+    linked = {v: p for k, v, line, trust, p, st in slim.links(db)
+              if v == "ion.mihai@alfa-dent.example"}
     assert linked == {"ion.mihai@alfa-dent.example": "Ion Mihai"}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_two_registry_people_a_site_name_fits_share_no_mailbox(tmp_path, monkeypatch):
     """Father and son POPESCU ION and POPESCU ION MIHAI; the site names
     "Ion Popescu". The match isn't one to one, so it confirms neither; and
@@ -782,12 +778,11 @@ def test_two_registry_people_a_site_name_fits_share_no_mailbox(tmp_path, monkeyp
 
     run(go())
     assert asked.count(("Ion", "Popescu")) == 1
-    owners = _rows(db, "SELECT p.name FROM company_contacts cc JOIN people p "
-                       "ON p.id = cc.person_id JOIN contacts ct ON ct.id = cc.contact_id "
-                       "WHERE ct.value = 'ion.popescu@alfa-dent.example'")
+    owners = [(p,) for k, v, line, trust, p, st in slim.links(db)
+              if v == "ion.popescu@alfa-dent.example"]
     assert owners == [("POPESCU ION",)]
-    details = dict(_rows(db, "SELECT p.name, s.detail FROM searches s JOIN people p "
-                             "ON CAST(p.id AS TEXT) = s.target_id WHERE s.target = 'person'"))
+    details = dict(_rows(db, "SELECT p.name, s.detail FROM search s JOIN person p ON p.id = s.target "
+                             "WHERE s.is_person = 1"))
     assert "site names them so" not in " ".join(details.values())
     # The site's own reading is the one already checked: it isn't swapped
     # for the other order (popescu.ion@), which is tried only after an

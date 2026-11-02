@@ -143,6 +143,12 @@ statement("overlay.read.sources_of",
 statement("overlay.read.links_of_firms",
           f"SELECT l.firm, l.contact, l.trust, l.person, l.location, l.first_seen FROM {_J} "
           "CROSS JOIN link l WHERE l.firm = j.value", params=_IDS, drives="j")
+# The contacts the firms' links reach, of a kind (and line type) when
+# given: a firm condition's contacts with no link row read into Python.
+statement("overlay.read.contacts_of_firms",
+          f"SELECT l.contact FROM {_J} CROSS JOIN link l CROSS JOIN contact c "
+          "WHERE l.firm = j.value AND c.id = l.contact AND (? IS NULL OR c.kind = ?) "
+          "AND (? IS NULL OR c.line_type = ?)", params=(*_IDS, 1, 1, None, None), drives="j")
 statement("overlay.read.links_of_contacts",
           f"SELECT l.contact, l.firm, l.trust, l.person, l.location, l.first_seen FROM {_J} "
           "CROSS JOIN link l WHERE l.contact = j.value", params=_IDS, drives="j")
@@ -224,6 +230,17 @@ statement("overlay.read.walk.asc",
           f"SELECT id FROM firm INDEXED BY firm_new WHERE {_WALK} "
           "ORDER BY created ASC, id ASC LIMIT ? OFFSET ?",
           params=(*_WALK_PARAMS, 50, 0), scans=_WALKED)
+# The firms of a list that pass Harvey's own columns (the same conditions),
+# in no order: a big set filtered in SQL, only the passing ids returned.
+statement("overlay.read.passing",
+          f"SELECT f.id FROM {_J} CROSS JOIN firm f WHERE f.id = j.value AND {_WALK}",
+          params=(*_IDS, *_WALK_PARAMS), drives="j")
+# A Find-contacts run's firms: when each was added and whether it has a
+# site, those with no contact only when asked (the second param: 1).
+statement("overlay.read.finder_rows",
+          f"SELECT f.id, f.created, (f.website IS NOT NULL OR f.domain IS NOT NULL) FROM {_J} "
+          "CROSS JOIN firm f WHERE f.id = j.value AND (? = 0 OR f.n_contacts = 0)",
+          params=(*_IDS, 1), drives="j")
 statement("overlay.read.walk.count",
           f"SELECT COUNT(*) FROM firm INDEXED BY firm_new WHERE {_WALK}",
           params=_WALK_PARAMS,
@@ -487,6 +504,31 @@ statement("overlay.read.domain_by_member",
           "SELECT COUNT(DISTINCT m.live) FROM firm m INDEXED BY firm_merged WHERE m.live != 0 "
           "AND m.domain IS NOT NULL AND (SELECT s.domain FROM firm s WHERE s.id = m.live) IS NULL")
 statement("overlay.read.identity", "SELECT n FROM revision WHERE name = 'identity'")
+# The register signals' kept sets (overlay/bitmaps.py): a signal's two parts;
+# where a walk starts (the highest firm id, how many firm rows there are);
+# whether a firm was removed since one (the rows there are now, less those
+# added after it, must be what it counted: a removal takes one off it); the
+# records given an identifier since it started, and how many identifiers
+# (up to a cap); and one row of a module's (its load mark, where and when
+# its walk started).
+statement("overlay.read.kept",
+          "SELECT part, mark, top, records, at, bits FROM register_set "
+          "WHERE signal = ? AND module = ?", params=(1, 1))
+statement("overlay.read.kept_start",
+          "SELECT (SELECT MAX(id) FROM firm), "
+          "(SELECT COALESCE(SUM(n), 0) FROM tally WHERE name IN ('firms', 'firms_merged'))")
+statement("overlay.read.kept_records",
+          "SELECT (SELECT COALESCE(SUM(n), 0) FROM tally WHERE name IN ('firms', 'firms_merged')) "
+          "- (SELECT COUNT(*) FROM firm WHERE id > ?)", params=(1,))
+statement("overlay.read.idents_since",
+          "SELECT DISTINCT firm FROM firm_ident INDEXED BY firm_ident_since WHERE since >= ?",
+          params=(1_700_000_000,))
+statement("overlay.read.idents_since_count",
+          "SELECT COUNT(*) FROM (SELECT 1 FROM firm_ident INDEXED BY firm_ident_since "
+          "WHERE since >= ? LIMIT ?)", params=(1_700_000_000, 10_001))
+statement("overlay.read.kept_of_module",
+          "SELECT mark, top, records, at FROM register_set WHERE module = ? LIMIT 1", params=(1,),
+          scans={"register_set": "a row per register signal and part (a few dozen)"})
 statement("overlay.read.marks",
           "SELECT (SELECT MAX(id) FROM firm), (SELECT MAX(id) FROM search), "
           "(SELECT MAX(id) FROM obs), (SELECT MAX(id) FROM person), "

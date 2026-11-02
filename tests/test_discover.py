@@ -9,7 +9,6 @@ anyone, and that directories never make it in.
 import asyncio
 import json
 import os
-from contextlib import closing
 import tempfile
 
 import httpx
@@ -21,6 +20,7 @@ from harvey.config import EnvConfig, load_config
 from harvey.modules import runs as R
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 
 @pytest_asyncio.fixture
@@ -97,6 +97,18 @@ def biz(**kw):
     kw.setdefault("provider", "fake")
     return D.Business(**kw)
 
+
+
+async def _observations(state):
+    """Every web reading of every company in Harvey, each with its company."""
+    out = []
+    for cid in slim.live_ids(state):
+        out += await state.get_observations(cid)
+    return out
+
+
+async def _exists(state, domain):
+    return await state.get_company_by_domain(domain) is not None
 
 # ── Junk filtering ──
 
@@ -277,7 +289,6 @@ async def test_junk_is_counted_not_silently_dropped(state, config, register):
 # ── Observations ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_every_fact_becomes_an_observation(state, config, register):
     register(FakeProvider([[biz(
@@ -286,7 +297,7 @@ async def test_every_fact_becomes_an_observation(state, config, register):
     )]]))
     await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
-    rows = {o["signal_code"]: o for o in await state.get_observations()}
+    rows = {o["signal_code"]: o for o in await _observations(state)}
     assert rows["SERP_RANK"]["value_num"] == 14
     assert rows["REVIEW_RATING"]["value_num"] == pytest.approx(4.6)
     assert rows["REVIEW_COUNT"]["value_num"] == 88
@@ -297,7 +308,6 @@ async def test_every_fact_becomes_an_observation(state, config, register):
     assert rows["FOUND_IN_SERP"]["collector"] == "discover"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_unconfirmed_signals_are_not_recorded(state, config, register):
     """The confirmation gate has to hold inside the collector, not just in
@@ -306,7 +316,7 @@ async def test_unconfirmed_signals_are_not_recorded(state, config, register):
     register(FakeProvider([[biz(domain="vellmora.example", rating=4.6, review_count=88)]]))
     await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
-    codes = {o["signal_code"] for o in await state.get_observations()}
+    codes = {o["signal_code"] for o in await _observations(state)}
     assert "REVIEW_RATING" not in codes
     assert "REVIEW_COUNT" in codes
 
@@ -1158,7 +1168,6 @@ def test_site_name_prefers_og_then_title_and_needs_domain_backing():
                                  "quillonam.example") == ""
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 @pytest.mark.parametrize('provider', ['serper', 'dataforseo_serp', 'scavio_search'])
 async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, monkeypatch):
@@ -1192,10 +1201,9 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     assert report.junk == 1, report.as_dict()
     assert report.found == 2
     assert report.new_companies == 1
-    import sqlite3
-    with closing(sqlite3.connect(state.db_path)) as db:
-        assert db.execute("SELECT domain, name FROM companies").fetchall() == [
-            ("brindlewickroofing.example", "Brindlewick Roofing")]
+    saved = [await state.get_company(cid) for cid in slim.live_ids(state)]
+    assert [(c.domain, c.name) for c in saved] == [
+        ("brindlewickroofing.example", "Brindlewick Roofing")]
 
 
 @pytest.mark.parametrize('title,domain,expected', [
@@ -1423,7 +1431,6 @@ def test_tinyfish_pacing_works_across_event_loops():
 # ── The do-not-contact list ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_forbidden_company_never_becomes_a_row(state, config, register):
     """Applied before the upsert, so a forbidden company costs nothing to
@@ -1449,14 +1456,13 @@ async def test_a_forbidden_company_never_becomes_a_row(state, config, register):
     assert report.excluded == 2
     assert report.junk == 0
     assert report.new_companies == 3
-    assert not await state.company_exists("rival.example")
-    assert not await state.company_exists("shop.rival.example")
+    assert not await _exists(state, "rival.example")
+    assert not await _exists(state, "shop.rival.example")
     # An address entry bars a mailbox, not the company: still discoverable.
-    assert await state.company_exists("other.example")
-    assert await state.company_exists("notrival.example")
+    assert await _exists(state, "other.example")
+    assert await _exists(state, "notrival.example")
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_an_empty_list_changes_discovery_not_at_all(state, config, register):
     """The positive control. Without it, the test above could pass because
@@ -1468,7 +1474,7 @@ async def test_an_empty_list_changes_discovery_not_at_all(state, config, registe
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.excluded == 0
     assert report.new_companies == 2
-    assert await state.company_exists("rival.example")
+    assert await _exists(state, "rival.example")
 
 
 @pytest.mark.parametrize("domain", ["jobs.example.com", "careers.example.org", "example.test"])
@@ -1559,7 +1565,6 @@ async def test_scavio_stops_run_on_account_errors(state, config, register, monke
     assert report.queries_succeeded == 0
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [402, 502])
 async def test_scavio_partial_search_preserves_prior_ranks_and_cost(state, config, register,
@@ -1585,7 +1590,7 @@ async def test_scavio_partial_search_preserves_prior_ranks_and_cost(state, confi
     assert report.actual_cost == pytest.approx(0.01)
     assert report.found == 10 and report.errors
     assert bool(report.stopped) is (failure == 402)
-    readings = [o for o in await state.get_observations()
+    readings = [o for o in await _observations(state)
                 if o["company_id"] == previous.id and o["signal_code"] == "SERP_RANK"]
     assert readings and all(o["value_num"] == 11 for o in readings)
 

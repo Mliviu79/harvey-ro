@@ -36,7 +36,7 @@ from urllib.parse import quote
 from harvey import contacts, queries
 from harvey import registers as regs_mod
 from harvey.overlay import queries as _statements  # noqa: F401  (registers them)
-from harvey.overlay import schema
+from harvey.overlay import bitmaps, schema
 from harvey.overlay.idents import Schemes
 from harvey.overlay.schema import EMAIL, PHONE, TRUST_NAMES
 
@@ -65,6 +65,10 @@ NAME_ORDER_FROM = 200_000
 # A cohort this big or smaller is sorted by name at once and kept; a bigger
 # one is read off the name index a page at a time.
 COHORT_SORTED_MAX = 20_000
+# Past this many identifiers given since the counts job kept the register
+# sets (a big pull), every first visit would read them all again from the
+# registers: the worker runs the job again instead (bitmaps.py).
+PATCH_MAX = 10_000
 
 
 def _iso(ts) -> str | None:
@@ -135,10 +139,24 @@ def recount_register_tally(path, codes=None) -> int:
     Returns how many rows were written."""
     con, attached = connect(path)
     try:
-        rows = Reader(con, attached).count_registers(codes)
+        # (Taken before the walk, with a second to spare: a record given an
+        # identifier meanwhile is read again from the register by a page,
+        # bitmaps.py.)
+        at = int(time.time()) - 1
+        top, records = con.execute(queries.sql("overlay.read.kept_start")).fetchone()
+        sets: dict = {}
+        rows = Reader(con, attached).count_registers(codes, sets)
         con.execute("BEGIN IMMEDIATE")
         con.executemany("INSERT OR REPLACE INTO register_tally (signal, module, mark, loaded, "
                         "n_true, n_false, at, n_values) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        # (A signal's sets replaced whole: a year no longer loaded goes.)
+        con.executemany("DELETE FROM register_set WHERE signal = ? AND module = ?",
+                        sorted({(sid, mid) for sid, mid, _ in sets}))
+        con.executemany(
+            "INSERT INTO register_set (signal, module, part, mark, top, records, at, bits) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(sid, mid, part, mark, top or 0, records, at, bitmaps.pack(bits))
+             for (sid, mid, part), (mark, bits) in sets.items()])
         con.execute("COMMIT")
         return len(rows)
     finally:
@@ -166,35 +184,82 @@ def call(path, method: str, *args, **kwargs):
 class FirmSet:
     """A set of live firm ids, or every live firm but those (``neg``): a
     filter that keeps most firms (no turnover outside a range) is held by
-    what it leaves out."""
+    what it leaves out. A big set worked out from a register is held as a
+    bitmap (``bits``, overlay/bitmaps.py), and combining it with another set
+    makes a bitmap too: a million ids are never a Python set."""
 
-    __slots__ = ("ids", "neg")
+    __slots__ = ("_ids", "neg", "_bits", "_lookup")
 
-    def __init__(self, ids=(), neg: bool = False):
-        self.ids = ids if isinstance(ids, set) else set(ids)
+    def __init__(self, ids=(), neg: bool = False, bits: int | None = None):
+        self._bits = bits
+        self._ids = None if bits is not None else (ids if isinstance(ids, set) else set(ids))
         self.neg = neg
+        self._lookup = None
+
+    @property
+    def ids(self) -> set[int]:
+        """The ids held (left out, for a negative set)."""
+        if self._ids is None:
+            self._ids = set(bitmaps.ids_of(self._bits))
+        return self._ids
+
+    @property
+    def bits(self) -> int:
+        if self._bits is None:
+            self._bits = bitmaps.bits_of(self._ids)
+        return self._bits
+
+    def _both_sets(self, other: "FirmSet") -> bool:
+        return self._bits is None and other._bits is None
 
     def __and__(self, other: "FirmSet") -> "FirmSet":
+        if self._both_sets(other):
+            if not self.neg and not other.neg:
+                return FirmSet(self.ids & other.ids)
+            if self.neg and other.neg:
+                return FirmSet(self.ids | other.ids, True)
+            pos, neg = (self, other) if not self.neg else (other, self)
+            return FirmSet(pos.ids - neg.ids)
         if not self.neg and not other.neg:
-            return FirmSet(self.ids & other.ids)
+            return FirmSet(bits=self.bits & other.bits)
         if self.neg and other.neg:
-            return FirmSet(self.ids | other.ids, True)
+            return FirmSet(neg=True, bits=self.bits | other.bits)
         pos, neg = (self, other) if not self.neg else (other, self)
-        return FirmSet(pos.ids - neg.ids)
+        return FirmSet(bits=pos.bits & ~neg.bits)
 
     def __or__(self, other: "FirmSet") -> "FirmSet":
+        if self._both_sets(other):
+            if not self.neg and not other.neg:
+                return FirmSet(self.ids | other.ids)
+            if self.neg and other.neg:
+                return FirmSet(self.ids & other.ids, True)
+            pos, neg = (self, other) if not self.neg else (other, self)
+            return FirmSet(neg.ids - pos.ids, True)
         if not self.neg and not other.neg:
-            return FirmSet(self.ids | other.ids)
+            return FirmSet(bits=self.bits | other.bits)
         if self.neg and other.neg:
-            return FirmSet(self.ids & other.ids, True)
+            return FirmSet(neg=True, bits=self.bits & other.bits)
         pos, neg = (self, other) if not self.neg else (other, self)
-        return FirmSet(neg.ids - pos.ids, True)
+        return FirmSet(neg=True, bits=neg.bits & ~pos.bits)
 
     def __invert__(self) -> "FirmSet":
-        return FirmSet(self.ids, not self.neg)
+        if self._bits is not None:
+            return FirmSet(neg=not self.neg, bits=self._bits)
+        return FirmSet(self._ids, not self.neg)
+
+    def __contains__(self, i: int) -> bool:
+        if self._bits is None:
+            return (i in self._ids) != self.neg
+        if self._lookup is None:
+            self._lookup = bitmaps.Lookup(self._bits)
+        return (i in self._lookup) != self.neg
+
+    def size(self) -> int:
+        """How many ids are held (left out, for a negative set)."""
+        return self._bits.bit_count() if self._bits is not None else len(self._ids)
 
     def count(self, total: int) -> int:
-        return total - len(self.ids) if self.neg else len(self.ids)
+        return total - self.size() if self.neg else self.size()
 
 
 class Reader:
@@ -419,6 +484,11 @@ class Reader:
         key = (*name, *self.held_mark())
         hit = SETS.get(key, ())
         if hit is None:
+            hit = self._held_by_ids(filters, ordered=False)
+            if hit is not None:
+                SETS.put(key, (), hit)
+                return set(hit)
+        if hit is None:
             before = dict(self.keys)
             self.keys = {}
             found = self.live_of_keys(self.directory.resolve(filters))
@@ -431,6 +501,45 @@ class Reader:
                 if k is not None:
                     self.keys.setdefault(f, k)
         return set(hit)
+
+    def _held_by_ids(self, filters: dict, ordered: bool = True):
+        """(live firm, the key that describes it or None, its place in the
+        register search's order) for what the directory's search finds:
+        the registry ids matched to records in one statement (the register's
+        key table), never a key list built in Python. Not ``ordered``:
+        {live firm: its key or None} instead. None when the register can't
+        (an older load's derived tables)."""
+        if not hasattr(self.directory, "held_of_ids"):
+            return None
+        ids = self.directory.resolve_ids(filters)
+        held = self.directory.held_of_ids(self.con, ids,
+                                          {s.name: s.id for s in self.schemes.by_id.values()})
+        if held is None:
+            return None
+        merged = self._merged()
+        if not ordered and not any(r[0] in merged for r in held):
+            # (Every record its own live firm, as nearly always: built in C.)
+            hit = {r[0]: (r[1], r[2]) for r in held}
+            self.keys = {**hit, **self.keys}
+            return hit
+        at = {rid: n for n, rid in enumerate(ids)}
+        out: dict[int, list] = {}
+        for record, scheme, k, rid in held:
+            live = merged.get(record, record)
+            have = out.get(live)
+            pos = at.get(rid, len(at))
+            if have is None:
+                out[live] = [(scheme, k) if record == live else None, pos]
+            else:
+                if record == live:
+                    have[0] = (scheme, k)
+                have[1] = min(have[1], pos)
+        for f, (k, _) in out.items():
+            if k is not None:
+                self.keys.setdefault(f, k)
+        if not ordered:
+            return {f: k for f, (k, _) in out.items()}
+        return [(f, k, pos) for f, (k, pos) in out.items()]
 
     def words_set(self, words: str) -> FirmSet:
         """Firms matching every word typed: the register's search (name,
@@ -453,7 +562,9 @@ class Reader:
 
         out: list[int] = []
         if self.directory is not None:
-            out = self.live_of_keys(self.directory.resolve({"words": words}))
+            found = self._held_by_ids({"words": words})
+            out = [f for f, _, _ in sorted(found, key=lambda x: x[2])] if found is not None \
+                else self.live_of_keys(self.directory.resolve({"words": words}))
         match, _ = search_terms(words)
         if match:
             seen = set(out)
@@ -548,15 +659,6 @@ class Reader:
         return p
 
     @staticmethod
-    def passes(row: dict, p: dict) -> bool:
-        if p["site"] is not None and bool(row["website"] or row["domain"]) != bool(p["site"]):
-            return False
-        if p["contact"] is not None and (row["n_contacts"] > 0) != bool(p["contact"]):
-            return False
-        return not ((p["email"] and not row["n_email"]) or (p["phone"] and not row["n_phone"])
-                    or (p["mobile"] and not row["n_mobile"]))
-
-    @staticmethod
     def narrowed(p: dict) -> bool:
         return p["site"] is not None or p["contact"] is not None or bool(
             p["email"] or p["phone"] or p["mobile"])
@@ -615,7 +717,7 @@ class Reader:
             return self.all_live()
         if not s.neg:
             return s.ids
-        return [f for f in self.all_live() if f not in s.ids]
+        return [f for f in self.all_live() if f in s]
 
     def matching(self, f, possible: bool = False) -> list[int]:
         """Every live firm the filter selects (its register conditions,
@@ -625,8 +727,7 @@ class Reader:
         ids = self.resolve(s)
         if not self.narrowed(p):
             return list(ids)
-        rows = self.firm_rows(ids)
-        return [i for i in ids if i in rows and self.passes(rows[i], p)]
+        return self.passing(list(ids), p)
 
     # ── Companies ──
 
@@ -668,13 +769,22 @@ class Reader:
             if s is not None:
                 other = self._without_words(f)
                 if other is not None:
-                    ids = [i for i in ids if (i in other.ids) != other.neg]
+                    ids = [i for i in ids if i in other]
         else:
             ids = list(self.resolve(s))
         if not self.narrowed(p):
             return list(ids)
-        rows = self.firm_rows(ids)
-        return [i for i in ids if i in rows and self.passes(rows[i], p)]
+        return self.passing(ids, p)
+
+    def passing(self, ids, p: dict) -> list[int]:
+        """The firms of ``ids`` (in their order) that pass Harvey's own
+        columns: filtered in SQL, only the passing ids read back."""
+        args = (p["site"], p["site"], p["contact"], p["contact"], p["email"], p["phone"],
+                p["mobile"])
+        keep = set()
+        for chunk in chunks(ids):
+            keep.update(r[0] for r in self.x("overlay.read.passing", (json.dumps(chunk), *args)))
+        return [i for i in ids if i in keep]
 
     def _without_words(self, f) -> FirmSet | None:
         from dataclasses import replace
@@ -700,9 +810,14 @@ class Reader:
             args = (p["site"], p["site"], p["contact"], p["contact"], p["email"], p["phone"],
                     p["mobile"])
             ids = [r[0] for r in self.x(f"overlay.read.walk{asc}", (*args, limit, offset))]
+            kinds = [k for k in ("email", "phone", "mobile") if p[k]]
             if (p["site"] == 0 and p["contact"] is None
                     and not (p["email"] or p["phone"] or p["mobile"])):
                 total = t.get("firms", 0) - t.get("firms_with_site", 0)
+            elif p["site"] is None and p["contact"] is None and len(kinds) == 1 \
+                    and f"firms_with_{kinds[0]}" in t:
+                # (A contact of that kind is a contact: counted by its tally.)
+                total = t[f"firms_with_{kinds[0]}"]
             else:
                 total = self._walk_count(args)
             return total, ids, "index"
@@ -769,7 +884,7 @@ class Reader:
         kept order, lowest first, read off the index until it is full."""
         out, skipped = [], 0
         for (i,) in self.x(f"overlay.read.walk_by_{sort}.asc"):
-            if (i in s.ids) == s.neg:
+            if i not in s:
                 continue
             if skipped < offset:
                 skipped += 1
@@ -1022,8 +1137,13 @@ class Reader:
             r = rows[i]
             group = groups[i]
             own = [k for m in group for k in idents.get(m, [])]
-            local = next((locals_[m] for m in group if m in locals_), None)
             card = described.get(i, {}).get("card") or {}
+            # Its own description; a merged record's only for a firm no
+            # register describes (a branch merged into a registered firm
+            # never lends it its town or address).
+            local = locals_.get(i)
+            if local is None and not card:
+                local = next((locals_[m] for m in group if m in locals_), None)
             srcs = sorted(s for m in group for s in sources.get(m, []))
             key = dict(own).get(self.key_scheme) if self.key_scheme else None
             external = ""
@@ -1033,7 +1153,7 @@ class Reader:
                     external = f"{s.prefix}{k}"
                     break
             main_phone = (local[5] if local and local[5] else "") or \
-                next((p["value"] for p in phones.get(i, [])), "")
+                next((p["display"] for p in phones.get(i, [])), "")
             out.append({
                 "id": str(i),
                 "name": r["display_name"] or card.get("name") or (local[1] if local else "") or "",
@@ -1135,8 +1255,11 @@ class Reader:
             old = best.get(contact)
             if old is None or (trust, first) < (old["trust"], old["first"]):
                 best[contact] = {"value": row[2], "display": row[3] or row[2], "trust": trust,
-                                 "first": first or 0, "line_type": LINE_NAMES.get(row[4], "")}
-        return {f: sorted(v.values(), key=lambda p: (p["trust"], p["first"]))
+                                 "first": first or 0, "line_type": LINE_NAMES.get(row[4], ""),
+                                 "_id": contact}
+        # (Ties, within a second, by the contact on file first.)
+        return {f: [{k: v for k, v in p.items() if k != "_id"} for p in sorted(
+                    v.values(), key=lambda p: (p["trust"], p["first"], p["_id"]))]
                 for f, v in found.items()}
 
     def people_named(self, groups: dict[int, list[int]], described: dict) -> dict[int, list[dict]]:
@@ -1232,8 +1355,22 @@ class Reader:
                 "overlay.read.readings_of", records):
             if module:
                 found.add(module)
-        if self.key_of(firms):
-            found |= {a.module for a in self.registers if a.module in self.enabled}
+        keys = self.key_of(firms)
+        for a in self.registers:
+            if a.module not in self.enabled or a.module in found:
+                continue
+            # A register is credited when it has a value of any signal it
+            # reads for one of them.
+            mine = [k for scheme, k in keys.values() if scheme == a.keyed_by]
+            for code in dict.fromkeys(c for c, scheme in a.by_signal if not scheme):
+                if not mine:
+                    break
+                try:
+                    if a.read(self.con, code, mine):
+                        found.add(a.module)
+                        break
+                except sqlite3.Error:
+                    break
         return sorted(found)
 
     # ── One company ──
@@ -1341,17 +1478,21 @@ class Reader:
         rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows",
                                               list({l[1] for l in links}))}
         evidence = {}
-        for firm, contact, source, trust, url, first, person, location in self._by_ids(
-                "overlay.read.evidence", [[l[0], l[1]] for l in links], 500):
-            evidence.setdefault((contact, person), set()).add(source)
         persons = {r[0]: r for r in self._by_ids("overlay.read.persons",
                                                  list({l[3] for l in links if l[3]}))}
+        for firm, contact, source, trust, url, first, person, location in self._by_ids(
+                "overlay.read.evidence", [[l[0], l[1]] for l in links], 500):
+            key = (contact, persons[person][3] if person in persons else person)
+            evidence.setdefault(key, set()).add(source)
+        # A person by name across the records (each record keeps its own
+        # row of someone named at two of them): one row per contact and name.
+        norm_of = {pid: r[3] for pid, r in persons.items()}
         merged: dict[tuple, dict] = {}
         for firm, contact, trust, person, location, first in links:
             row = rows.get(contact)
             if row is None:
                 continue
-            key = (contact, person)
+            key = (contact, norm_of.get(person, person))
             old = merged.get(key)
             if old is not None and old["rank"] <= trust:
                 continue
@@ -1370,14 +1511,26 @@ class Reader:
                         "_order": (link["kind"] or "", link["rank"], link["value"])})
         out.sort(key=lambda c: c.pop("_order"))
         linked_people = {l[3] for l in links if l[3]}
-        people = []
+        reached = {norm_of[p] for p in linked_people if p in norm_of}
+        people, named = [], {}
         searched = dict(self._by_ids("overlay.read.person_searched",
                                      [r[1] for r in self._by_ids("overlay.read.people_of", group)]))
         for firm, pid, name, norm, role, source, first in self._by_ids("overlay.read.people_of",
                                                                        group):
-            people.append({"id": pid, "name": name, "role": role, "source": source or "",
-                           "searched_at": _db_time(searched.get(pid)),
-                           "reached": pid in linked_people, "_n": norm})
+            # Once by name across the records (the survivor's row first).
+            at = searched.get(pid)
+            if norm in named:
+                seen = named[norm]
+                seen["role"] = seen["role"] or role
+                if at and (seen["_at"] is None or at > seen["_at"]):
+                    seen["_at"], seen["searched_at"] = at, _db_time(at)
+                continue
+            named[norm] = {"id": pid, "name": name, "role": role, "source": source or "",
+                           "searched_at": _db_time(at), "_at": at,
+                           "reached": pid in linked_people or norm in reached, "_n": norm}
+            people.append(named[norm])
+        for p in people:
+            p.pop("_at")
         people.sort(key=lambda p: p.pop("_n"))
         places = [dict(zip(("id", "name", "address", "locality", "county", "phone", "source",
                             "external_id"), r)) for r in self.con.execute(
@@ -1506,7 +1659,7 @@ class Reader:
         file, each with every source that gave it (a contact's evidence, a
         register's value: official sources first, then the newest), and
         the latest value of each fact an official register gives."""
-        from harvey.collectors.phones import phone_hit
+        from harvey.collectors.phones import field_phones, phone_hit
 
         fid = self.live(cid)
         if fid is None:
@@ -1545,8 +1698,18 @@ class Reader:
         for r in readings:
             code, module = r["signal_code"], r["module"]
             if code == "PHONE_NUMBER":
-                for number in str(r["value_text"] or "").split():
-                    add(code, number, module, r["observed_at"])
+                # A register's field as it writes it (E.164 numbers, or a
+                # national number as filed): each number once, in E.164,
+                # so two sources of one number are one finding.
+                raw = str(r["value_text"] or "")
+                if raw.startswith("+"):
+                    numbers = [(phone_hit(n), n) for n in raw.split()]
+                else:
+                    markets = getattr(mans.get(module), "markets", ()) or ()
+                    numbers = [(h, h.number) for h in field_phones(
+                        raw, markets[0] if markets else None)]
+                for hit, number in numbers:
+                    add(code, hit.number if hit else number, module, r["observed_at"])
                 continue
             if code == "ADDRESS":
                 for line in str(r["value_text"] or "").split("\n"):
@@ -1661,10 +1824,12 @@ class Reader:
     # ── Contacts ──
 
     def contacts_page(self, f, sort: str, way: str, limit: int, offset: int,
-                      cap: int = contacts.COUNT_CAP) -> tuple[int, bool, list[int]]:
+                      cap: int | None = None) -> tuple[int, bool, list[int]]:
         """(total up to ``cap``, more than that, the page's contact ids):
         the Contacts page on the overlay. A contact matches the company
-        conditions when any live firm it reaches does."""
+        conditions when any live firm it reaches does. ``cap``: by default
+        contacts.COUNT_CAP, read when called."""
+        cap = contacts.COUNT_CAP if cap is None else cap
         sort = sort if sort in contacts.CONTACT_SORTS else "first_seen"
         s = self.firm_set(f)
         p = self.predicates(f)
@@ -1716,10 +1881,19 @@ class Reader:
         links = None
         candidates = None
         if firms is not None:
-            groups = self.members(firms)
-            live_of = {m: g for g, ms in groups.items() for m in ms}
-            links = list(self._by_ids("overlay.read.links_of_firms", list(live_of)))
-            candidates = {l[1] for l in links}
+            # Each firm and the records merged into it (a few: the merged
+            # map, not a probe per firm).
+            live_of = {f: f for f in firms}
+            live_of.update({m: g for m, g in self._merged().items() if g in live_of})
+            if f.source or f.has_person:
+                links = list(self._by_ids("overlay.read.links_of_firms", list(live_of)))
+                candidates = {l[1] for l in links}
+            else:
+                # Only which contacts they reach (of the kind asked for).
+                line = schema.MOBILE if f.kind == "mobile" else None
+                candidates = {r[0] for chunk in chunks(list(live_of)) for r in self.x(
+                    "overlay.read.contacts_of_firms",
+                    (json.dumps(chunk), kind_id, kind_id, line, line))}
         # The narrowest condition a table answers by index (or a read of the
         # contact table returning the few that match) gives the candidates.
         narrow = []
@@ -1748,6 +1922,8 @@ class Reader:
                   schema.MOBILE if f.kind == "mobile" else None, 1 << 62, 0)
                  if kind_id == PHONE else (1 << 62, 0)))}
         rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", list(candidates))}
+        # (The sort reads the same rows: contacts_page.)
+        self._contact_rows = rows
         keep = []
         for cid, r in rows.items():
             if kind_id is not None and r[11] != kind_id:
@@ -1759,7 +1935,8 @@ class Reader:
             if trust is not None and (r[10] if r[10] is not None else 2) != trust:
                 continue
             keep.append(cid)
-        if not (f.source or f.has_person or firms is not None):
+        if not (f.source or f.has_person) and links is None:
+            # (A firm condition's candidates are its firms' contacts already.)
             return keep
         # Link conditions: the source and the person go with a link of a
         # firm that matches (any live firm when there is no firm condition).
@@ -1835,7 +2012,9 @@ class Reader:
 
     def _contact_order(self, ids, sort: str) -> list[int]:
         """Contacts in the sort's descending order (ties by id)."""
-        rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", list(ids))}
+        rows = getattr(self, "_contact_rows", None) or {}
+        if any(c not in rows for c in ids):
+            rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", list(ids))}
         col = {"value": 2, "kind": 1, "line_type": 4, "status": 5, "first_seen": 7,
                "last_seen": 8, "companies": 9}.get(sort)
         if sort == "trust":
@@ -1989,13 +2168,14 @@ class Reader:
     # ── People to search ──
 
     def people_page(self, f, sort: str, way: str, limit: int, offset: int,
-                    cap: int = contacts.COUNT_CAP) -> tuple[int, bool, list[dict]]:
+                    cap: int | None = None) -> tuple[int, bool, list[dict]]:
         """The people still to search: named at a live firm (a register's
         administrators and the people Harvey found, each name once per firm
         and its merged records) and reached by no contact of their own yet,
         newest firm first. The total stops at ``cap``: with no condition,
         when the register's count says the firms naming someone are more
         than that, only the page is read."""
+        cap = contacts.COUNT_CAP if cap is None else cap
         s = self.firm_set(f)
         p = self.predicates(f)
         unfiltered = s is None and not self.narrowed(p) and not f.source and not (f.q or "").strip()
@@ -2024,8 +2204,16 @@ class Reader:
         counted = None
         if not many and plain and not words and not f.source and firms is not None:
             # Counted, not walked: the register's people of the whole set,
-            # with the few firms Harvey found people at worked out one by one.
-            counted = self._count_people(firms, linked)
+            # with the few firms Harvey found people at worked out one by one
+            # (kept until a page may have changed, as the Contacts list is).
+            from dataclasses import astuple
+
+            key = ("people_count", repr(astuple(f)), self._main_file())
+            mark = (self.marks(), len(linked))
+            counted = SETS.get(key, mark)
+            if counted is None:
+                counted = self._count_people(firms, linked)
+                SETS.put(key, mark, counted)
         need = offset + limit if ((many or counted is not None) and plain) \
             else max(offset + limit, cap + 1)
         # The people Harvey found (a few thousand) are read whole; the
@@ -2297,15 +2485,30 @@ class Reader:
             mid = self.module_id(a.module)
             if mid is None or not a.by_signal:
                 continue
+            mark = a.marks(self.con) or ""
             if not self.one("SELECT 1 FROM register_tally WHERE module = ? AND mark = ? "
-                            "AND at IS NOT NULL LIMIT 1", (mid, a.marks(self.con) or "")):
+                            "AND at IS NOT NULL LIMIT 1", (mid, mark)):
+                return True
+            # (The sets a cohort reads, kept by the same job: none for this
+            # load, counting other firms than there are, or so many records
+            # given an identifier since that patching them costs more.)
+            row = self.x("overlay.read.kept_of_module", (mid,)).fetchone()
+            if row is None or row[0] != mark or self.one("overlay.read.kept_records",
+                                                         (row[1],)) != row[2]:
+                return True
+            if self.one("overlay.read.idents_since_count", (row[3], PATCH_MAX + 1)) > PATCH_MAX:
                 return True
         return False
 
-    def count_registers(self, codes=None) -> list[tuple]:
+    def count_registers(self, codes=None, sets: dict | None = None) -> list[tuple]:
         """Every (signal, module) a loaded register reads, counted true /
         false over the firms in Harvey (one walk of the scheme per read):
-        the rows register_tally keeps, per load mark. A job, never a page."""
+        the rows register_tally keeps, per load mark. A job, never a page.
+        ``sets``: filled with {(signal id, module id, part): (mark, bitmap)}
+        (bitmaps.py): the records with a value, those whose value reads yes
+        as a cohort reads it (any value of a text signal), and for a
+        register that keeps each year's figures, per year the records whose
+        statement that year has the signal's figure."""
         out = []
         now = int(time.time())
         for a in self.registers:
@@ -2318,6 +2521,8 @@ class Reader:
                 if sid is None or mid is None:
                     continue
                 per: dict[int, bool] = {}
+                text = (self._value_types().get(code) or "text") == "text"
+                reads_yes: set[int] = set()
                 values = 0
                 for (c, scheme), read in a.by_signal.items():
                     if c != code:
@@ -2330,16 +2535,29 @@ class Reader:
                     for firm, value, date in a.held_values(self.con, code, s.id, scheme):
                         yes = self._truth(read, value)
                         per[firm] = per.get(firm, False) or yes
+                        if yes or text:
+                            reads_yes.add(firm)
                         if firm != record:
                             record, seen = firm, set()
                         if yes and value not in seen:
                             seen.add(value)
                             values += 1
+                if sets is not None:
+                    sets[(sid, mid, bitmaps.VALUED)] = (mark, bitmaps.bits_of(per))
+                    sets[(sid, mid, bitmaps.YES)] = (mark, bitmaps.bits_of(reads_yes))
                 lives: dict[int, bool] = {}
                 for firm, live in self.live_of(per).items():
                     lives[live] = lives.get(live, False) or per[firm]
                 n_true = sum(1 for v in lives.values() if v)
                 out.append((sid, mid, mark, 1, n_true, len(lives) - n_true, now, values))
+            s = self.schemes.named(a.keyed_by)
+            if sets is None or mid is None or s is None or not hasattr(a, "year_valued"):
+                continue
+            for year in a.years(self.con):
+                for code, records in a.year_valued(self.con, year, s.id).items():
+                    sid = self.signal_id(code)
+                    if sid is not None and (codes is None or code in codes):
+                        sets[(sid, mid, year)] = (mark, bitmaps.bits_of(records))
         return out
 
     @staticmethod
@@ -2369,7 +2587,7 @@ class Reader:
     def _held(self, code: str, op: str, value) -> FirmSet:
         """Live firms whose register value of ``code`` satisfies ``op value``
         (an index search in the register), kept per load mark."""
-        out = set()
+        out = 0
         for a in self._readers_of(code):
             for scheme in self._schemes_read(a, code):
                 s = self.schemes.named(scheme)
@@ -2380,10 +2598,10 @@ class Reader:
                 key = ("held", a.module, code, scheme, op, value, *self.held_mark())
                 hit = SETS.get(key, ())
                 if hit is None:
-                    hit = self._lives(r[0] for r in self.con.execute(sql, (value, s.id)))
+                    hit = self._live_bits(r[0] for r in self.con.execute(sql, (value, s.id)))
                     SETS.put(key, (), hit, LONG_SECONDS)
                 out |= hit
-        return FirmSet(out)
+        return FirmSet(bits=out)
 
     def _register_sets(self, code: str, low=None, high=None) -> tuple[FirmSet, FirmSet]:
         """(true, false) for "has ``code`` [in range]" from the registers
@@ -2415,6 +2633,23 @@ class Reader:
         ranged = low is not None or high is not None
         own = a.by_signal.get((code, ""))
         indexed = own is not None and own.indexed
+        found = None if (ranged and not indexed) else self._kept(a, code)
+        if found is not None:
+            # The counts job's sets for this load (bitmaps.py): no walk.
+            valued, yes = found
+            if ranged:
+                true = FirmSet(neg=True)
+                if low is not None:
+                    true &= self._held(code, ">=", low)
+                if high is not None:
+                    true &= self._held(code, "<=", high)
+                if true.neg:
+                    true &= valued
+            else:
+                true = yes
+            if absent_false:
+                return true, ~true, FirmSet(neg=True)
+            return true, valued & ~true, valued
         text = (self._value_types().get(code) or "text") == "text"
         yes_sql = a.held_yes_sql(code)
         unvalued = None if (absent_false and (indexed or yes_sql)) else self._unvalued(a, code)
@@ -2452,6 +2687,93 @@ class Reader:
         if absent_false:
             return true, ~true, FirmSet(neg=True)
         return true, ~(unvalued | true), ~unvalued
+
+    def _kept(self, a, code: str) -> tuple[FirmSet, FirmSet] | None:
+        """(live firms register ``a`` has a value of ``code`` for, those of
+        them whose value reads yes) as bitmaps: the sets the counts job
+        kept for the register's current load, patched for the records
+        given an identifier since and for merges. None when none are kept
+        for this load (bitmaps.py)."""
+        sid, mid = self.signal_id(code), self.module_id(a.module)
+        if sid is None or mid is None:
+            return None
+        key = ("kept", a.module, code, *self.held_mark())
+        hit = SETS.get(key, ())
+        if hit is not None:
+            return hit or None
+        hit = self._patched(a, code, sid, mid)
+        SETS.put(key, (), hit or (), LONG_SECONDS)
+        return hit
+
+    def _kept_bits(self, a, sid: int, mid: int, parts) -> tuple[list[int], list[int]] | None:
+        """The bitmaps register_set keeps for ``parts`` of a signal, when
+        they were kept by one walk for the register's current load and
+        count the firms there are (a removal clears its bit and takes one
+        off), and the records given an identifier since (to read again);
+        else None."""
+        rows = {r[0]: r[1:] for r in self.x("overlay.read.kept", (sid, mid))}
+        if any(p not in rows for p in parts):
+            return None
+        heads = {tuple(rows[p][:4]) for p in parts}
+        if len(heads) != 1:
+            return None
+        mark, top, records, at = heads.pop()
+        if mark != (a.marks(self.con) or ""):
+            return None
+        if self.one("overlay.read.kept_records", (top,)) != records:
+            return None
+        changed = [r[0] for r in self.x("overlay.read.idents_since", (at,))]
+        return [bitmaps.unpack(rows[p][4]) for p in parts], changed
+
+    def _patched(self, a, code: str, sid: int, mid: int) -> tuple[FirmSet, FirmSet] | None:
+        """_kept's sets read from register_set and patched (not kept)."""
+        got = self._kept_bits(a, sid, mid, (bitmaps.VALUED, bitmaps.YES))
+        if got is None:
+            return None
+        (valued, yes), changed = got
+        if changed:
+            gone = ~bitmaps.bits_of(changed)
+            valued, yes = valued & gone, yes & gone
+            have, says_yes = self._read_records(a, code, changed)
+            valued |= bitmaps.bits_of(have)
+            yes |= bitmaps.bits_of(says_yes)
+        return FirmSet(bits=self._onto_survivors(valued)), FirmSet(bits=self._onto_survivors(yes))
+
+    def _read_records(self, a, code: str, records) -> tuple[set[int], set[int]]:
+        """(the records register ``a`` has a value of ``code`` for, those
+        whose value reads yes), read from the register by their keys."""
+        text = (self._value_types().get(code) or "text") == "text"
+        idents = self.idents(records)
+        have, says_yes = set(), set()
+        for (c, scheme), read in a.by_signal.items():
+            if c != code:
+                continue
+            name = scheme or a.keyed_by
+            holder = {k: f for f, ks in idents.items() for s, k in ks if s == name}
+            if not holder:
+                continue
+            for k, values in a.read(self.con, code, list(holder), scheme=scheme).items():
+                have.add(holder[k])
+                if text or any(self._truth(read, v) for v, _ in values):
+                    says_yes.add(holder[k])
+        return have, says_yes
+
+    def _onto_survivors(self, bits: int) -> int:
+        """A bitmap over records as one over live firms: a merged record's
+        bit moves to the firm it is merged into."""
+        merged = self._merged()
+        if not merged or not bits:
+            return bits
+        look = bitmaps.Lookup(bits)
+        moved = [m for m in merged if m in look]
+        if not moved:
+            return bits
+        return (bits & ~bitmaps.bits_of(moved)) | bitmaps.bits_of({merged[m] for m in moved})
+
+    def _live_bits(self, records) -> int:
+        """The bitmap of the live firms of records (a register statement's
+        firm_ident rows)."""
+        return self._onto_survivors(bitmaps.bits_of(array("q", records)))
 
     def _value_types(self) -> dict[str, str]:
         if not hasattr(self, "_vtypes"):
@@ -2626,7 +2948,62 @@ class Reader:
             # no stored reading says yes.
             true = true | rt
             false = (false | rf) & ~true
+        elif key is not None:
+            rt, rf = self._year_sets(code, low, high, key)
+            true = true | rt
+            false = (false | rf) & ~true
         return true, false
+
+    def _year_sets(self, code: str, low, high, year) -> tuple[FirmSet, FirmSet]:
+        """(true, false) for ``code`` [in range] in a named year, from the
+        registers that keep each year's figures: a firm with no figure that
+        year is unknown. Kept per load mark."""
+        if not str(year).isdigit():
+            return FirmSet(), FirmSet()
+        key = ("year", code, low, high, str(year), tuple(sorted(self.enabled)),
+               *self.held_mark())
+        hit = SETS.get(key, ())
+        if hit is not None:
+            return hit
+        true, false = FirmSet(), FirmSet()
+        for a in self._readers_of(code):
+            s = self.schemes.named(a.keyed_by)
+            if s is None or code not in getattr(a, "year_codes", ()):
+                continue
+            try:
+                if int(year) not in a.years(self.con):
+                    continue
+                valued = self._kept_year(a, code, int(year))
+                if valued is None:
+                    valued = FirmSet(bits=self._live_bits(
+                        a.year_valued(self.con, year, s.id)[code]))
+                held = FirmSet(bits=self._live_bits(
+                    a.year_held(self.con, code, year, low, high, s.id)))
+            except sqlite3.Error:
+                continue
+            true |= held
+            false |= valued & ~held
+        out = (true, false & ~true)
+        SETS.put(key, (), out, LONG_SECONDS)
+        return out
+
+    def _kept_year(self, a, code: str, year: int) -> FirmSet | None:
+        """Live firms whose ``year`` statement in register ``a`` has
+        ``code``'s figure: the counts job's set for this load, patched as
+        _patched patches (not kept); None when none is kept for it."""
+        sid, mid = self.signal_id(code), self.module_id(a.module)
+        got = None if sid is None or mid is None else self._kept_bits(a, sid, mid, (year,))
+        if got is None:
+            return None
+        (valued,), changed = got
+        if changed:
+            valued &= ~bitmaps.bits_of(changed)
+            holder = {k: f for f, ks in self.idents(changed).items() for s, k in ks
+                      if s == a.keyed_by}
+            if holder:
+                valued |= bitmaps.bits_of(
+                    [holder[k] for k in a.year_read(self.con, code, year, list(holder))])
+        return FirmSet(bits=self._onto_survivors(valued))
 
     def cohort_sets(self, require, exclude, ranges, min_confidence: float = 0.0
                     ) -> tuple[FirmSet, FirmSet]:
@@ -2689,7 +3066,7 @@ class Reader:
             # By name through the kept positions: a set of a few thousand
             # sorted by them, a bigger one (or one held by what it leaves
             # out) read off the index a page at a time.
-            if chosen.neg or len(chosen.ids) > COHORT_SORTED_MAX:
+            if chosen.neg or chosen.size() > COHORT_SORTED_MAX:
                 page = self.walk_order(chosen, "name", int(offset),
                                        None if limit is None else int(limit))
                 order = None
@@ -2703,8 +3080,7 @@ class Reader:
                 order = array("q", reversed(self._name_order(ids)))
             else:
                 names = self.sort_keys(ids, "name")
-                order = array("q", sorted(ids, key=lambda i: ((names.get(i) or "").lower(),
-                                                               str(i))))
+                order = array("q", sorted(ids, key=lambda i: ((names.get(i) or "").lower(), i)))
             ORDERINGS.put(key, mark, order)
         if order is not None:
             page = list(order[offset:] if limit is None else order[offset:offset + int(limit)])
@@ -2712,7 +3088,7 @@ class Reader:
         for v in wanted:
             s = sets[v]
             for i in page:
-                if (i in s.ids) != s.neg:
+                if i in s:
                     verdict_of.setdefault(i, v)
         rows = []
         for r in self.company_rows(page):
@@ -2735,7 +3111,9 @@ class Reader:
             found = sorted((i for i, r in rows.items() if r["domain"] and r["live"] == 0
                             and (r["profiled_at"] is None or r["profiled_at"] < cutoff)),
                            key=lambda i: (rows[i]["profiled_at"] is not None,
-                                          rows[i]["profiled_at"] or 0))[:int(limit)]
+                                          rows[i]["profiled_at"] or 0))
+            if int(limit) >= 0:         # (a negative limit is none, as in SQL)
+                found = found[:int(limit)]
         out = []
         for r in self.company_rows(found):
             out.append({"id": r["id"], "name": r["name"], "domain": r["domain"],
@@ -2904,17 +3282,20 @@ class Reader:
                 found = [r[0] for r in self.x("overlay.read.walk", (*args, int(limit), 0))]
             else:
                 found = self.matching(f, possible=True)
-        rows = self.firm_rows(found)
-        if not force:
-            found = [i for i in found if i in rows and rows[i]["n_contacts"] == 0]
+        # (Each firm's time and site only, those with no contact unless forced:
+        # read in SQL, a big area's firms never read whole.)
+        rows = {}
+        for chunk in chunks(found):
+            rows.update((r[0], r[1:]) for r in self.x("overlay.read.finder_rows",
+                                                      (json.dumps(chunk), 0 if force else 1)))
+        found = [i for i in found if i in rows]
         words = [contacts.fold(w) for w in (f.q or "")[:200].split()[:8]]
         if words:
             names = self.sort_keys(found, "name")
             found = [i for i in found
                      if all(w in contacts.name_norm(names.get(i, "")) for w in words)]
-        found.sort(key=lambda i: (rows[i]["created"], i) if i in rows else (0, i), reverse=True)
-        return [{"id": str(i), "site": bool(rows[i]["website"] or rows[i]["domain"])}
-                for i in found[:limit] if i in rows]
+        found.sort(key=lambda i: (rows[i][0], i), reverse=True)
+        return [{"id": str(i), "site": bool(rows[i][1])} for i in found[:limit]]
 
     def email_audience(self, limit: int = 200) -> list[dict]:
         """StateManager.email_audience on the overlay: email contacts the

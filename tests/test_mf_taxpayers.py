@@ -6,9 +6,6 @@ ending with the separator); every CUI, name, address and phone is
 fictional.
 """
 
-import os
-import sqlite3
-import tempfile
 
 import httpx
 import pytest
@@ -20,6 +17,7 @@ from harvey.modules.ro.mf_taxpayers import capabilities as caps
 from harvey.modules.ro.mf_taxpayers import source, store
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 COLUMNS = ("COD_FISCAL^DENUMIRE^COD_FISCAL_PARINTE^TIP_UNITATE^TIP_CONTRIB^LOCALITATE^STRADA^NR^"
            "DATA_INREGISTRARE^DATA_PRELUCRARE^FAX^SECTOR^TELEFON^JUDET_COMERT^NR_COMERT^AN_COMERT^"
@@ -282,16 +280,15 @@ def test_a_lookup_gives_facts_dated_the_day_the_file_was_published(db):
 @pytest_asyncio.fixture
 async def state(db, monkeypatch):
     monkeypatch.setattr(store, "TAXPAYERS_PATH", db)
-    with tempfile.TemporaryDirectory() as tmp:
-        sm = StateManager(os.path.join(tmp, "test.db"))
-        await sm.init_db()
-        await sync_vocabulary(sm)
-        yield sm
+    # Beside the taxpayer file: registers are read from the database's folder.
+    sm = StateManager(str(db.with_name("test.db")))
+    await sm.init_db()
+    await sync_vocabulary(sm)
+    yield sm
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
-async def test_companies_on_file_get_readings_once_and_a_phone(state):
+async def test_companies_on_file_get_their_phone_and_read_the_rest_in_place(state):
     a = await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
                                         source="registry:onrc"))
     pfa = await state.add_company(Company(name="POPESCU EXEMPLU PFA", cui="90000022",
@@ -303,31 +300,36 @@ async def test_companies_on_file_get_readings_once_and_a_phone(state):
     assert "MICRO_TAX_REGIME" in first["unconfirmed"]["mf_taxpayers"]
     assert (await state.get_company(a)).phone == "+40 268 000 210"
     assert (await state.get_company(pfa)).phone == "+40 722 000 210"
-    with sqlite3.connect(state.db_path) as con:
-        rows = con.execute("SELECT signal_code, module, observed_at FROM observations "
-                           "WHERE company_id = ? ORDER BY signal_code", (pfa,)).fetchall()
-    assert ("ADDRESS", "mf_taxpayers", "2026-07-23 00:00:00") in rows
-    assert sum(1 for r in rows if r[0] == "PHONE_NUMBER") == 2
+    # The rest is read from the file, dated as it was published.
+    readings = await state.read("register_readings", pfa)
+    rows = {(r["signal_code"], r["module"], r["observed_at"][:10]) for r in readings}
+    assert ("ADDRESS", "mf_taxpayers", "2026-07-23") in rows
+    # The sole trader's numbers: one reading, as the file writes them, and
+    # each of them a phone of the company's.
+    assert [r["value_text"] for r in readings if r["signal_code"] == "PHONE_NUMBER"
+            and r["module"] == "mf_taxpayers"] == ["0722000210 / 0268 000 310"]
+    assert sorted(v for (v,) in slim.q(
+        state, "SELECT c.value FROM link_evidence e JOIN contact c ON c.id = e.contact "
+               "WHERE e.firm = ? AND c.kind = 2", int(pfa))) == ["+40268000310", "+40722000210"]
+    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
     again = await runs.lookup_by_id(state)
     assert again["observations"] == 0                                # same file: nothing new
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
-async def test_anaf_s_newer_reading_stays_current(state):
+async def test_anaf_s_newer_reading_stays_current(state, monkeypatch):
+    from harvey.modules.ro.anaf import service
+    from tests.test_anaf import answer
+
     a = await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
                                         source="registry:onrc"))
     await state.set_signal_status("VAT_REGISTERED", "confirmed")
-    await state.add_observations([{"company_id": a, "signal_code": "VAT_REGISTERED",
-                                   "value_num": 0.0, "module": "anaf",
-                                   "capability": "company_check", "collector": "anaf"}])
-    await runs.lookup_by_id(state)                     # the file (July) says yes
-    with sqlite3.connect(state.db_path) as con:
-        current = con.execute(
-            "SELECT value_num, module FROM observations WHERE company_id = ? AND "
-            "signal_code = 'VAT_REGISTERED' ORDER BY observed_at DESC, rowid DESC LIMIT 1",
-            (a,)).fetchone()
-    assert current == (0.0, "anaf")
+    # ANAF answered (now) that it isn't VAT registered; the file (July) says yes.
+    monkeypatch.setattr(service, "CACHE_PATH", slim.folder(state) / "anaf.db")
+    service.keep(service.CACHE_PATH, {"90000014": answer("90000014", vat=False)}, set())
+    _, rows = await state.cohort_verdicts(["VAT_REGISTERED"], [],
+                                          verdicts=("match", "possible", "no_match"))
+    assert {r["id"]: r["verdict"] for r in rows}[a] == "no_match"
 
 
 @pytest.mark.asyncio

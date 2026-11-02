@@ -230,7 +230,14 @@ def _connect(path: Path) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass            # another process is switching it at this moment
     con.execute("PRAGMA synchronous=NORMAL")
-    con.execute(SCHEMA)
+    from harvey.modules.ro.anaf import store
+
+    if con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+        # A new file starts in the compressed form, the one its register
+        # reads (the plain one is only an older install's, until the upgrade).
+        store.create(con)
+    elif store.version(con) == 1:
+        con.execute(SCHEMA)
     return con
 
 

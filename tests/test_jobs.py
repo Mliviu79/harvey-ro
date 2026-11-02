@@ -478,7 +478,6 @@ class _Paged(D.Serper):
         self.key = key
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_search_stopped_by_the_cap_pauses_and_resumes_from_its_page(
         state, monkeypatch, claim_provider):
@@ -502,10 +501,9 @@ async def test_a_search_stopped_by_the_cap_pauses_and_resumes_from_its_page(
     assert job.status == "done" and server.asked == [1, 2, 3, 4]
     assert job.result["new_companies"] == 30 and job.progress["pages"] == 4
     assert job.actual_cost == pytest.approx(0.004)
-    assert rows(state, "SELECT COUNT(*) FROM companies")[0][0] == 30
+    assert rows(state, "SELECT COUNT(*) FROM firm WHERE live = 0")[0][0] == 30
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_search_cut_off_by_a_restart_resumes_from_its_cursor(
         state, monkeypatch, claim_provider):
@@ -523,12 +521,11 @@ async def test_a_search_cut_off_by_a_restart_resumes_from_its_cursor(
     assert job.status == "done" and server.asked == [3, 4, 5]
     assert job.progress["pages"] == 5 and job.progress["results"] == 40
     # Page 3's first result is ranked 21: positions carry on from the page.
-    ranks = rows(state, "SELECT value_num FROM observations WHERE signal_code = 'SERP_RANK' "
-                        "ORDER BY value_num LIMIT 1")
+    rank = "FROM obs o JOIN signal s ON s.id = o.signal WHERE s.code = 'SERP_RANK'"
+    ranks = rows(state, f"SELECT o.num {rank} ORDER BY o.num LIMIT 1")
     assert ranks == [(21.0,)]
     # A resumed search didn't see its first pages, so it marks nobody "gone".
-    assert rows(state, "SELECT COUNT(*) FROM observations WHERE signal_code = 'SERP_RANK' "
-                       "AND value_num = 0")[0][0] == 0
+    assert rows(state, f"SELECT COUNT(*) {rank} AND o.num = 0")[0][0] == 0
 
 
 @pytest.mark.asyncio
@@ -551,7 +548,6 @@ async def test_spend_is_reserved_from_the_run_s_cap_before_a_job_spends(
     assert await jobs.batch_spent(state, batch) == pytest.approx(0.001)
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_cancel_mid_search_stops_after_the_page_and_keeps_it(
         state, monkeypatch, claim_provider):
@@ -575,7 +571,7 @@ async def test_cancel_mid_search_stops_after_the_page_and_keeps_it(
     job = await jobs.get(state, job_id)
     assert job.status == "cancelled" and server.asked == [1]
     assert job.result["new_companies"] == 10            # page 1 is kept
-    assert rows(state, "SELECT COUNT(*) FROM companies")[0][0] == 10
+    assert rows(state, "SELECT COUNT(*) FROM firm WHERE live = 0")[0][0] == 10
 
 
 @pytest.mark.asyncio
@@ -658,7 +654,6 @@ CAPABILITIES = provider_capabilities("fakesearch", {"web_search": "fakesearch"})
 '''
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_new_search_source_is_one_module_folder(state, monkeypatch, tmp_path):
     import harvey.modules
@@ -697,7 +692,8 @@ async def test_a_new_search_source_is_one_module_folder(state, monkeypatch, tmp_
     await run_until_idle(state)
     job = await jobs.get(state, job_id)
     assert job.status == "done" and job.result["new_companies"] == 3
-    assert rows(state, "SELECT DISTINCT module FROM observations") == [("fakesearch",)]
+    assert rows(state, "SELECT DISTINCT m.name FROM obs o JOIN module m ON m.id = o.module") \
+        == [("fakesearch",)]
 
 
 # ── Commands wait for their jobs ──
@@ -1017,7 +1013,6 @@ async def test_the_cost_so_far_is_recorded_page_by_page(state, monkeypatch, clai
     assert seen == [pytest.approx(0.001), pytest.approx(0.002), pytest.approx(0.003)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_later_page_that_fails_for_a_moment_resumes_from_that_page(
         state, monkeypatch, claim_provider):
@@ -1031,7 +1026,7 @@ async def test_a_later_page_that_fails_for_a_moment_resumes_from_that_page(
     # Pages 1-2 are kept, and the next try is to start at page 3.
     assert job.status == "queued" and job.attempts == 1 and "503" in job.error
     assert job.progress["cursor"] == {"page": 3}
-    assert rows(state, "SELECT COUNT(*) FROM companies")[0][0] == 20
+    assert rows(state, "SELECT COUNT(*) FROM firm WHERE live = 0")[0][0] == 20
     with closing(sqlite3.connect(state.db_path)) as db:
         db.execute("UPDATE jobs SET not_before = NULL")
         db.commit()
@@ -1040,7 +1035,7 @@ async def test_a_later_page_that_fails_for_a_moment_resumes_from_that_page(
     assert job.status == "done" and server.asked == [1, 2, 3, 3, 4, 5]
     assert server.answered == [1, 2, 3, 4, 5]           # no page paid for twice
     assert job.actual_cost == pytest.approx(0.005)
-    assert rows(state, "SELECT COUNT(*) FROM companies")[0][0] == 40
+    assert rows(state, "SELECT COUNT(*) FROM firm WHERE live = 0")[0][0] == 40
 
 
 @pytest.mark.asyncio
@@ -1310,20 +1305,18 @@ def test_spend_limits_must_be_dollars():
             SpendConfig(per_month_usd=bad)
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_site_reads_look_up_only_the_companies_a_search_found(state):
-    with closing(sqlite3.connect(state.db_path)) as db:
-        for i in range(5):
-            db.execute("INSERT INTO companies (id, name, domain) VALUES (?, ?, ?)",
-                       (f"c{i}", f"Example {i}", f"example{i}.example.com"))
-        db.commit()
-    found = await state.companies_needing_profile(limit=-1, ids=["c1", "c3", "nope"])
-    assert sorted(c["id"] for c in found) == ["c1", "c3"]
+    from harvey.models import Company
+
+    ids = [await state.add_company(Company(name=f"Example {i}", domain=f"example{i}.example.com"))
+           for i in range(5)]
+    found = await state.companies_needing_profile(limit=-1, ids=[ids[1], ids[3], "999999"])
+    assert sorted(c["id"] for c in found) == sorted([ids[1], ids[3]])
     assert await state.companies_needing_profile(limit=-1, ids=[]) == []
     assert len(await state.companies_needing_profile(limit=-1)) == 5
-    ids, _ = await REAL_SITE_READS(state, ["c3"])
-    assert rows(state, "SELECT params_json FROM jobs") == [('{"company_id": "c3"}',)]
+    await REAL_SITE_READS(state, [ids[3]])
+    assert rows(state, "SELECT params_json FROM jobs") == [(f'{{"company_id": "{ids[3]}"}}',)]
 
 
 @pytest.mark.asyncio
@@ -1485,3 +1478,20 @@ def test_harvey_jobs_refuses_an_odd_lane_and_says_when_nothing_runs_a_job(
     assert "No lane 'no-such-lane'" in capsys.readouterr().out
     said = run("resume", job_id)
     assert "resumed" in said and "No worker is running" in said
+
+
+def test_every_job_kind_and_run_stage_is_named_in_both_languages():
+    # The Queue and the runs log show a job's kind and a run's stage by
+    # name; one with no translation showed its raw id in either language.
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "harvey" / "web" / "i18n.js").read_text(encoding="utf-8")
+    stages = set()
+    for path in (root / "harvey").rglob("*.py"):
+        src = path.read_text(encoding="utf-8")
+        stages |= set(re.findall(r"(?:start_run|lane_run)\(\s*\"([a-z_]+)\"", src))
+    assert {"discover", "profile", "contacts", "lookup"} <= stages
+    for key in [f"q.kind.{k}" for k in jobs.KINDS] + [f"runs.stage.{s}" for s in stages]:
+        assert text.count(f"'{key}':") == 2, key

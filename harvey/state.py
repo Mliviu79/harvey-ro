@@ -786,19 +786,15 @@ class StateManager:
         return total, rows
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC",
-                (company_id,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [self._prospect_from_row(r) for r in rows]
+        """The company's prospects (every record merged into it too), best
+        scored first."""
+        return [self._prospect_from_row(r)
+                for r in await self._read("company_prospects", company_id)]
 
     # ── Prospects (Contacts) ──
 
     @staticmethod
-    def _prospect_from_row(row: aiosqlite.Row) -> Prospect:
+    def _prospect_from_row(row) -> Prospect:
         d = dict(row)
         d["email_verified"] = bool(d.get("email_verified", 0))
         d["phone_verified"] = bool(d.get("phone_verified", 0))
@@ -841,6 +837,8 @@ class StateManager:
                 ),
             )
             await db.commit()
+            if cursor.rowcount == 1:
+                await self._prospect_contact(prospect)
             if cursor.rowcount == 0:
                 # Unique-constraint conflict: resolve to the existing record.
                 for column, value in (
@@ -858,6 +856,23 @@ class StateManager:
                             prospect.id = row[0]
                             break
         return prospect.id
+
+    async def _prospect_contact(self, prospect: Prospect) -> None:
+        """Mirror a prospect's address into its company's contacts (and its
+        person), as schema 24's prospect triggers did."""
+        if not prospect.company_id or not prospect.email:
+            return
+        await self._on_overlay(
+            "prospect_contact", prospect.company_id, prospect.email,
+            first=prospect.first_name or "", last=prospect.last_name or "",
+            status=prospect.email_status or "",
+            role=prospect.title or "", source=prospect.source or "",
+            evidence_url=prospect.source_url or "", opted_out=prospect.status == "opted_out")
+
+    async def _prospect_do_not_contact(self, prospect_id: str, flag: bool) -> None:
+        prospect = await self.get_prospect(prospect_id)
+        if prospect is not None and prospect.email:
+            await self._on_overlay("set_do_not_contact", "email", prospect.email, flag)
 
     async def get_prospect(self, prospect_id: str) -> Prospect | None:
         async with self._connect() as db:
@@ -897,6 +912,9 @@ class StateManager:
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
+        if status == "opted_out":
+            # Their address is never written to again, from any list.
+            await self._prospect_do_not_contact(prospect_id, True)
 
     async def undo_opt_out(self, prospect_id: str, details: dict | None = None) -> bool:
         """A human's undo of an opt-out: the one way off 'opted_out'.
@@ -929,7 +947,8 @@ class StateManager:
                  json.dumps({"prospect_id": prospect_id, **(details or {})})),
             )
             await db.commit()
-            return True
+        await self._prospect_do_not_contact(prospect_id, False)
+        return True
 
     async def opt_out_history(self, prospect_id: str) -> list[dict]:
         """Every opt-out and undo recorded for this person, oldest first."""
@@ -989,6 +1008,9 @@ class StateManager:
                 ),
             )
             await db.commit()
+        prospect = await self.get_prospect(prospect_id)
+        if prospect is not None:
+            await self._prospect_contact(prospect)
 
     # ── Email pattern cache (per-domain) ──
 

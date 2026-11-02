@@ -6,9 +6,6 @@ lines); every CUI is a fictional one, the same ones tests/test_onrc.py
 gives its invented firms, so the registry and the statements join.
 """
 
-import os
-import sqlite3
-import tempfile
 
 import httpx
 import pytest
@@ -22,6 +19,7 @@ from harvey.modules.ro.mf_financials import capabilities as caps
 from harvey.modules.ro.mf_financials import source, store
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 from tests.test_onrc import CAEN, DATASET, FIRMS, PEOPLE, STATUS, firm, write
 
 FIN_CODES = ("TURNOVER", "EMPLOYEES", "NET_RESULT", "EQUITY", "DEBTS", "TOTAL_ASSETS",
@@ -384,32 +382,6 @@ def test_the_registry_lookup_by_cui_uses_its_index(reg, reg_path):
     assert caps.registry_firm(reg, "90000155")["form"] == "PFA"       # an open connection
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
-@pytest.mark.asyncio
-async def test_a_lookup_pass_opens_each_database_once_a_batch(state, monkeypatch):
-    for i, cui in enumerate(("90000017", "90000025", "RO90000033", "90000041", "90000058")):
-        await _company(state, f"EXEMPLU {i} SRL", cui)
-    await state.set_signal_status("TURNOVER", "confirmed")
-    opened, calls = [], []
-    real_connect, real_run = store.connect, caps._lookup
-
-    def connect(path=None):
-        opened.append(path)
-        return real_connect(path)
-
-    async def lookup(inp, ctx):
-        calls.append(len(inp.extra.get("batch") or []))
-        return await real_run(inp, ctx)
-
-    monkeypatch.setattr(store, "connect", connect)
-    monkeypatch.setitem(caps.CAPABILITIES, "statements_lookup",
-                        api.Capability("mf_financials", "statements_lookup", lookup))
-    monkeypatch.setattr(runs, "SOURCE_SAVE_BATCH", 3)
-    report = await runs.lookup_by_id(state)
-    assert report["companies"] == 5
-    assert calls == [3, 2] and len(opened) == 2           # one call, one open, per batch
-    assert ("2025", 50_000.0) in _values(state, "TURNOVER")      # facts land on the right company
-
 
 def test_a_sole_trader_with_no_statement_gets_no_facts(fin_path):
     rows, complete, urls = _accounts(fin_path, "90000155")
@@ -423,11 +395,12 @@ def test_a_sole_trader_with_no_statement_gets_no_facts(fin_path):
 async def state(fin_path, monkeypatch):
     monkeypatch.setattr(store, "FINANCIALS_PATH", fin_path)
     monkeypatch.setattr(registry, "REGISTRY_PATH", fin_path.with_name("no-registry.db"))
-    with tempfile.TemporaryDirectory() as tmp:
-        sm = StateManager(os.path.join(tmp, "test.db"))
-        await sm.init_db()
-        await sync_vocabulary(sm)
-        yield sm
+    # Beside the statements (and the registry, when a test loads one):
+    # registers are read from the database's folder.
+    sm = StateManager(str(fin_path.with_name("test.db")))
+    await sm.init_db()
+    await sync_vocabulary(sm)
+    yield sm
 
 
 async def _company(state, name, cui):
@@ -436,16 +409,19 @@ async def _company(state, name, cui):
     return await state.add_company(Company(name=name, cui=cui, source="registry:onrc"))
 
 
-def _values(state, code):
-    with sqlite3.connect(state.db_path) as db:
-        return sorted((r[0], r[1]) for r in db.execute(
-            "SELECT value_text, value_num FROM observations WHERE signal_code = ?", (code,)))
+async def _values(state, code):
+    """(year, value) of what the statements beside the database give
+    ``code`` for the firms in Harvey (read in place, never copied)."""
+    out = []
+    for cid in slim.live_ids(state):
+        out += [(r["value_text"], r["value_num"])
+                for r in await state.read("register_readings", cid, [code])]
+    return sorted(out)
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
-async def test_lookups_write_only_confirmed_facts_once_per_file(state):
-    a = await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
+async def test_the_statements_are_read_in_place_never_copied(state):
+    await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
     await _company(state, "CLUJ EXEMPLU SRL", "90000041")
     nothing = await runs.lookup_by_id(state)
     assert nothing["observations"] == 0
@@ -453,20 +429,16 @@ async def test_lookups_write_only_confirmed_facts_once_per_file(state):
 
     for code in ("TURNOVER", "EMPLOYEES"):
         await state.set_signal_status(code, "confirmed")
+    # A lookup asks the statements nothing (they bring no contact) and
+    # writes nothing: every figure is read from their file.
     first = await runs.lookup_by_id(state)
-    assert first["companies"] == 2 and first["observations"] == 6
-    assert _values(state, "TURNOVER") == [("2024", 200_000.0), ("2024", 1_000_000.0),
-                                          ("2025", 1_500_000.0)]
-    assert _values(state, "NET_RESULT") == []                     # not confirmed
-    again = await runs.lookup_by_id(state)
-    assert again["observations"] == 0                             # same files: nothing new
-    with sqlite3.connect(state.db_path) as db:
-        who = db.execute("SELECT DISTINCT module, capability, collector FROM observations "
-                         "WHERE company_id = ?", (a,)).fetchall()
-    assert who == [("mf_financials", "statements_lookup", "financials")]
+    assert first["observations"] == 0 and first["companies"] == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'lookup'") == 0
+    # The newest year each firm filed, as the statements give it.
+    assert await _values(state, "TURNOVER") == [("2024", 200_000.0), ("2025", 1_500_000.0)]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_a_range_compares_the_latest_year_or_the_year_named(state):
     big = await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
@@ -549,7 +521,6 @@ def test_bounds_without_loaded_statements_are_refused(reg, tmp_path):
                         fin_path=tmp_path / "none.db")
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_pull_with_bounds_saves_only_the_matches_with_their_figures(reg, reg_path, state,
                                                                            monkeypatch):
@@ -563,10 +534,9 @@ async def test_a_pull_with_bounds_saves_only_the_matches_with_their_figures(reg,
     company = await state.get_company_by_cui("90000017")
     assert company is not None
     # Figures attached straight away, so a filter on them is decided now.
-    assert ("2025", 1_500_000.0) in _values(state, "TURNOVER")
+    assert ("2025", 1_500_000.0) in await _values(state, "TURNOVER")
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_sole_traders_missing_statement_is_never_a_no(reg, reg_path, state, monkeypatch):
     monkeypatch.setattr(registry, "REGISTRY_PATH", reg_path)
@@ -575,13 +545,14 @@ async def test_a_sole_traders_missing_statement_is_never_a_no(reg, reg_path, sta
                              with_administrators=False)
     sole = await state.get_company_by_cui("90000155")
     srl = await state.get_company_by_cui("90000025")
-    with sqlite3.connect(state.db_path) as db:
-        def filed(cid):
-            return sorted(db.execute("SELECT value_text, value_num FROM observations WHERE "
-                                     "company_id = ? AND signal_code = 'FILED_ACCOUNTS'",
-                                     (cid,)).fetchall())
-        assert filed(sole.id) == []
-        assert filed(srl.id) == [("2024", 1.0), ("2025", 1.0)]
+
+    async def filed(cid):
+        return [r["value_num"]
+                for r in await state.read("register_readings", cid, ["FILED_ACCOUNTS"])]
+    # Unknown for the sole trader (no statement is due), filed for the SRL
+    # (its newest year, read from the statements beside the database).
+    assert await filed(sole.id) == []
+    assert await filed(srl.id) == [1]
     # Its registered office is kept, like any firm's.
     assert sole.address == "Str. Exemplului 4"
 
@@ -628,16 +599,15 @@ async def test_nothing_is_downloaded_unless_auto_update_is_on(state, monkeypatch
     assert len(called) == 1 and called[0][:2] == ("source_sync", "mf_financials") and called[0][3]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_a_lookup_with_nothing_loaded_is_skipped_quietly(state, monkeypatch, tmp_path):
     monkeypatch.setattr(store, "FINANCIALS_PATH", tmp_path / "missing.db")
     await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
     await state.set_signal_status("TURNOVER", "confirmed")
     got = await runs.lookup_by_id(state)
-    assert got["errors"] == [] and got["skipped"] and got["observations"] == 0
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT COUNT(*) FROM runs WHERE stage = 'lookup'").fetchone() == (0,)
+    # The statements are read in place: a lookup asks them nothing, loaded or not.
+    assert got["errors"] == [] and got["observations"] == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'lookup'") == 0
 
 
 # ── The dashboard and the CLI ──
@@ -688,19 +658,19 @@ def test_a_cohort_range_can_name_a_year():
         dash._ranges([{"code": "TURNOVER", "min": 1, "key": "last"}])
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
-async def test_an_export_credits_the_sources_its_data_came_from(state):
+async def test_an_export_credits_the_sources_its_data_came_from(state, tmp_path):
     from harvey.export import latest_year_figures, source_notes
 
     a = await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
-    assert await source_notes(state, [a]) == ["ONRC open data, data.gov.ro (CC-BY 4.0)"]
+    other = await _company(state, "CU CIFRE SRL", "90000990")
+    # With no statement of its own, only the registry is credited.
+    assert await source_notes(state, [other]) == ["ONRC open data, data.gov.ro (CC-BY 4.0)"]
     await state.set_signal_status("TURNOVER", "confirmed")
-    await runs.lookup_by_id(state)
     notes = await source_notes(state, [a])
     assert any("Ministerul Finanțelor" in n for n in notes)
     assert (await latest_year_figures(state, [a], ("TURNOVER",)))[a] == (
-        "2025", {"TURNOVER": 1_500_000.0})
+        "2025", {"TURNOVER": 1_500_000})
 
 
 def test_cli_status_prints_json(tmp_path, monkeypatch, capsys):
@@ -811,24 +781,19 @@ async def test_a_download_is_refused_when_the_disk_is_short(tmp_path, monkeypatc
 
 # ── An export row's figures are all one year's ──
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_an_export_never_mixes_two_years_figures(state):
     from harvey.export import latest_year_figures, yearly_codes
 
     a = await _company(state, "EXEMPLU A SRL", "90000017")
-    await state.add_observations([
-        {"company_id": a, "signal_code": "TURNOVER", "value_num": 1_000_000.0,
-         "value_text": "2024", "module": "mf_financials", "collector": "financials"},
-        {"company_id": a, "signal_code": "EMPLOYEES", "value_num": 12.0,
-         "value_text": "2025", "module": "mf_financials", "collector": "financials"},
-        {"company_id": a, "signal_code": "FILED_ACCOUNTS", "value_num": 0.0,
-         "value_text": "2026", "module": "mf_financials", "collector": "financials"}])
+    # 2024's turnover, and a 2025 statement with only its headcount.
+    slim.financials_beside(state, [("90000017", 2024, 1_000_000, None),
+                                   ("90000017", 2025, None, 12)])
     codes = yearly_codes({"mf_financials"})
     assert codes[:2] == ["TURNOVER", "EMPLOYEES"] and "FILED_ACCOUNTS" not in codes
     assert yearly_codes({"onrc"}) == []                    # no such columns without the module
     # 2025's headcount alone, not 2024's turnover labelled 2025.
-    assert (await latest_year_figures(state, [a], codes))[a] == ("2025", {"EMPLOYEES": 12.0})
+    assert (await latest_year_figures(state, [a], codes))[a] == ("2025", {"EMPLOYEES": 12})
 
 
 def test_the_unknown_switch_covers_turnover_and_headcount():

@@ -443,8 +443,16 @@ def page(params: dict, sort: str, way: str, limit: int, offset: int) -> dict:
     con = connect()
     try:
         with _answering():
-            found, q, how = ordered(con, params, sort)
-        ids = found.slice(way, offset, limit)
+            q = resolve(con, params)
+            match = _name_order_match(con, q) if sort == "name" else None
+            if match is not None and SNAPSHOTS.get(_key(params, sort), _mark()) is None:
+                # Not kept yet: the page straight from the full-text index,
+                # which holds its firms in name order (no list of every
+                # match read first: 1.8M operating firms, about a second).
+                total, ids, how = _index_page(con, match, way, offset, limit)
+            else:
+                found, q, how = ordered(con, params, sort)
+                total, ids = len(found), found.slice(way, offset, limit)
         rows = registry.firm_rows(con, ids, q)
         figs = figures(con, [r["cui"] for r in rows])
     finally:
@@ -453,8 +461,33 @@ def page(params: dict, sort: str, way: str, limit: int, offset: int) -> dict:
         r["figures"] = figs.get(r["cui"]) if r["cui"] else None
         r.pop("financials", None)
         r.pop("id", None)
-    return {"total": len(found), "rows": rows, "sort": sort, "dir": way, "paged_by": how,
+    return {"total": total, "rows": rows, "sort": sort, "dir": way, "paged_by": how,
             "ms": round((time.monotonic() - started) * 1000)}
+
+
+def _name_order_match(con, q: registry.Query) -> str | None:
+    """The full-text expression a query's firms are, when nothing else
+    narrows them (no selection, figures, taxpayer conditions or
+    exclusions), so the index's own order is the name order; else None."""
+    if q.firm_ids is not None or q.excluded:
+        return None
+    match = q.match or ("" if q.all_statuses else f"tags : {registry.OPERATING_TAG}")
+    if not match or match == registry.EVERY or registry._where(con, q, exclusions=False)[0]:
+        return None
+    return match
+
+
+def _index_page(con, match: str, way: str, offset: int, limit: int) -> tuple[int, list, str]:
+    """(how many firms match, a page of them by name, "index"): the
+    full-text index counted and read in its rowid order (the registry's
+    ids follow its names' order)."""
+    from harvey import queries
+    from harvey.modules.ro.onrc import queries as _onrc  # noqa: F401  (registers the statements)
+
+    total = con.execute(queries.sql("onrc.index_count", "main"), (match,)).fetchone()[0]
+    page = f"onrc.index_page.{'asc' if way == 'asc' else 'desc'}"
+    ids = [r[0] for r in con.execute(queries.sql(page, "main"), (match, limit, offset))]
+    return total, ids, "index"
 
 
 def firm(reg: str) -> dict | None:

@@ -23,6 +23,7 @@ from harvey.models.prospect import Prospect
 from harvey.modules import api, ingest
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 WEB = Path(dash.__file__).resolve().parent / "web"
 
@@ -46,31 +47,31 @@ def _rows(path, sql, args=()):
 # ── Migration and backfill ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-def test_migration_keeps_a_parked_row_with_the_record_it_was_found_for(tmp_path):
-    """Rows a past merge moved still say whom they were found for, so an
-    undo after the upgrade sends them back."""
+def test_a_merge_moves_no_contact_and_undo_leaves_each_with_its_record(tmp_path):
+    """Rows stay with the record they were found for: an undo gives each
+    record back exactly what it had."""
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
+        slim.describe(s, slim.firm("EXEMPLU PATRU SRL", 90000004, "Cluj", county="Cluj"))
         a = await s.add_company(Company(name="Exemplu Patru", domain="patru.example",
                                         source="discover:osm", location="Cluj, Cluj, Romania"))
         b = await s.add_company(Company(name="EXEMPLU PATRU SRL", cui="90000004",
                                         source="registry:onrc", phone="0264 000 105",
                                         location="Cluj, Cluj, Romania"))
         await s.merge_companies(a, b)
-        merged = _rows(db, "SELECT company_id FROM company_contacts")
+        merged = (_rows(db, "SELECT firm FROM link"),
+                  [c["value"] for c in (await s.read("of_company", a))["contacts"]])
         await s.undo_merge(b)
         return a, b, merged
 
-    a, b, merged = run(go())
-    assert merged == [(a,)]
-    assert _rows(db, "SELECT company_id FROM company_contacts") == [(b,)]
-    assert {r[0] for r in _rows(db, "SELECT company_id FROM company_sources")} == {a, b}
+    a, b, (links, shown) = run(go())
+    assert links == [(int(b),)] and shown == ["+40264000105"]
+    assert _rows(db, "SELECT firm FROM link") == [(int(b),)]
+    assert {r[0] for r in _rows(db, "SELECT firm FROM firm_source")} == {int(a), int(b)}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_contact_kinds_are_declared_by_modules(tmp_path):
     db = tmp_path / "harvey.db"
     s = run(_state(db))
@@ -84,40 +85,40 @@ def test_contact_kinds_are_declared_by_modules(tmp_path):
                                           contacts.Found("email", "Info@Cinci.example")])
 
     assert run(undeclared()) == 1                       # the undeclared kind isn't kept
-    assert _rows(db, "SELECT kind, value FROM contacts") == [("email", "info@cinci.example")]
+    assert _rows(db, "SELECT k.kind, c.value FROM contact c JOIN contact_kinds k "
+                     "ON k.id = c.kind") == [("email", "info@cinci.example")]
 
 
 # ── Every source writes through ingest ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_listing_matching_a_company_by_phone_is_one_of_its_places(tmp_path):
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
+        slim.describe(s, slim.firm("FARMACIA EXEMPLU SRL", 90000106, website="https://farmacie.example",
+                                   domain="farmacie.example"))
         cid = await s.add_company(Company(name="Farmacia Exemplu", domain="farmacie.example",
                                           phone="+40268000106", source="registry:onrc",
-                                          location="Brașov, Brașov, Romania"))
+                                          cui="90000106", location="Brașov, Brașov, Romania"))
         saved = await ingest.listing(s, api.Record(
             name="Farmacia Exemplu", phone="+40268000106", website="https://farmacie.example",
             address="Str. Exemplului 9", location="Brașov, Brașov, Romania",
             external_id="osm:node/77", source="discover:osm", module="osm", capability="places"))
-        return cid, saved
+        return cid, saved, await s.read("of_company", cid)
 
-    cid, saved = run(go())
+    cid, saved, page = run(go())
     assert saved.company_id == cid and not saved.created
-    assert _rows(db, "SELECT name, address, external_id, phone, source FROM locations "
-                     "WHERE company_id = ?", (cid,)) == \
+    assert [(p["name"], p["address"], p["external_id"], p["phone"], p["source"])
+            for p in page["locations"]] == \
         [("Farmacia Exemplu", "Str. Exemplului 9", "osm:node/77", "+40268000106", "osm")]
-    assert ("discover:osm", "osm:node/77") in _rows(
-        db, "SELECT source, ref FROM company_sources WHERE company_id = ?", (cid,))
-    (link,) = _rows(db, "SELECT location_id FROM company_contacts WHERE company_id = ? "
-                        "AND source = 'osm'", (cid,))
+    assert ("discover:osm", "osm:node/77") in {(x["source"], x["ref"]) for x in page["sources"]}
+    (link,) = _rows(db, f"SELECT location FROM {slim.EVIDENCE} "
+                        "WHERE source_name = 'osm'")
     assert link[0] != 0
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_chain_sharing_one_phone_and_email_is_one_contact_each(tmp_path):
     db = tmp_path / "harvey.db"
 
@@ -133,26 +134,24 @@ def test_a_chain_sharing_one_phone_and_email_is_one_contact_each(tmp_path):
         return ids
 
     run(go())
-    assert _rows(db, "SELECT kind, COUNT(*) FROM contacts GROUP BY kind ORDER BY kind") == \
-        [("email", 1), ("phone", 1)]
-    assert _rows(db, "SELECT COUNT(*) FROM company_contacts")[0][0] == 10
+    assert _rows(db, f"SELECT kind_name, COUNT(*), MAX(n_firms) FROM {slim.CONTACTS} "
+                     "GROUP BY kind_name ORDER BY kind_name") == [("email", 1, 5), ("phone", 1, 5)]
+    assert _rows(db, "SELECT COUNT(*) FROM link")[0][0] == 10
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_registry_administrators_anaf_phones_site_reads_and_prospects(tmp_path):
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
         await s.set_signal_status("CONTACT_FOUND", "confirmed")
+        # The registry's administrators are read from it (never copied).
+        slim.describe(s, slim.firm("EXEMPLU SASE SRL", 90000006, domain="sase.example"),
+                      people=[("J08/90000006/2010", "EXEMPLU MARIA", "administrator")])
         cid = await s.add_company(Company(name="EXEMPLU SASE SRL", cui="90000006",
                                           domain="sase.example", source="registry:onrc",
                                           location="Brașov, Brașov, Romania"))
-        # The registry's administrators (written as CONTACT_FOUND rows).
-        await s.add_observations([{"company_id": cid, "signal_code": "CONTACT_FOUND",
-                                   "value_text": "Maria Exemplu — administrator",
-                                   "module": "onrc"}])
-        # ANAF's phone, on a batch, fills the main phone too.
+        # ANAF's phone, on a batch, is the main phone.
         async with s.batch() as batch:
             await ingest.company_phones(batch, cid, [
                 api.Contact("phone", "+40268000108", display="0268 000 108", module="anaf")])
@@ -164,22 +163,23 @@ def test_registry_administrators_anaf_phones_site_reads_and_prospects(tmp_path):
         await ingest.prospect(s, Prospect(company_id=cid, first_name="Maria", last_name="Exemplu",
                                           email="Maria@sase.example", email_status="verified",
                                           phone="0722 000 109", source="company_website"))
-        return cid
+        return s, cid
 
-    cid = run(go())
-    assert _rows(db, "SELECT phone FROM companies WHERE id = ?", (cid,)) == [("0268 000 108",)]
-    kinds = dict(_rows(db, "SELECT value, kind FROM contacts"))
+    s, cid = run(go())
+    company = run(s.get_company(cid))
+    assert company.phone in ("0268 000 108", "+40268000108")
+    kinds = dict(_rows(db, f"SELECT value, kind_name FROM {slim.CONTACTS}"))
     assert kinds == {"+40268000108": "phone", "https://sase.example/contact": "contact_form",
                      "https://facebook.com/exemplusase": "facebook",
                      "maria@sase.example": "email", "+40722000109": "phone"}
-    assert _rows(db, "SELECT name, role FROM people") == [("Maria Exemplu", "administrator")]
-    through = _rows(db, "SELECT ct.value, l.trust FROM company_contacts l JOIN contacts ct "
-                        "ON ct.id = l.contact_id WHERE l.person_id != 0 ORDER BY 1")
-    assert through == [("+40722000109", "likely"), ("maria@sase.example", "confirmed")]
-    assert ("anaf",) in _rows(db, "SELECT source FROM company_contacts")
+    assert run(slim.register_values(s, "CONTACT_FOUND")) == ["Maria Exemplu — Administrator"]
+    assert _rows(db, "SELECT name FROM person") == [("Maria Exemplu",)]
+    through = _rows(db, "SELECT ct.value, l.trust FROM link l JOIN contact ct "
+                        "ON ct.id = l.contact WHERE l.person != 0 ORDER BY 1")
+    assert through == [("+40722000109", 1), ("maria@sase.example", 0)]
+    assert ("anaf",) in _rows(db, f"SELECT source_name FROM {slim.EVIDENCE}")
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_an_opt_out_marks_the_contact_do_not_contact_and_its_undo_clears_it(tmp_path):
     db = tmp_path / "harvey.db"
 
@@ -188,23 +188,23 @@ def test_an_opt_out_marks_the_contact_do_not_contact_and_its_undo_clears_it(tmp_
         cid = await s.add_company(Company(name="Exemplu Sapte", domain="sapte.example"))
         pid = await s.add_prospect(Prospect(company_id=cid, email="ion@sapte.example"))
         await s.update_prospect_status(pid, "opted_out")
-        first = _rows(db, "SELECT do_not_contact FROM contacts")
+        first = _rows(db, "SELECT do_not_contact FROM contact")
         await s.undo_opt_out(pid)
         return first
 
     assert run(go()) == [(1,)]
-    assert _rows(db, "SELECT do_not_contact FROM contacts") == [(0,)]
+    assert _rows(db, "SELECT do_not_contact FROM contact") == [(0,)]
 
 
 # ── Merge and undo ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-def test_merge_moves_and_collapses_links_and_undo_restores_them(tmp_path):
+def test_a_merge_shows_each_contact_once_and_undo_gives_each_record_its_own(tmp_path):
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
+        slim.describe(s, slim.firm("EXEMPLU OPT SRL", 90000008, "Arad"))
         a = await s.add_company(Company(name="EXEMPLU OPT SRL", cui="90000008",
                                         source="registry:onrc", location="Arad, Arad, Romania"))
         b = await s.add_company(Company(name="Exemplu Opt", domain="opt.example",
@@ -215,35 +215,34 @@ def test_merge_moves_and_collapses_links_and_undo_restores_them(tmp_path):
         await s.add_contacts(b, [contacts.Found("email", "dan@opt.example", source="website",
                                                 person="Dan Exemplu")])
         await s.record_search("company", b, "people", "find_people", outcome="nothing")
+        before = slim.snapshot(s)
         await s.merge_companies(a, b)
+        page = await s.read("of_company", a)
         after = {
-            "links": _rows(db, "SELECT company_id, COUNT(*) FROM company_contacts GROUP BY 1"),
-            "visible": _rows(db, "SELECT COUNT(DISTINCT contact_id) FROM company_contacts "
-                                 "WHERE company_id = ?", (a,))[0][0],
-            "searched": await s.companies_needing_prospects(limit=10),
-            "search_on": _rows(db, "SELECT target_id FROM searches"),
+            "visible": sorted(c["value"] for c in page["contacts"]),
+            "people": [p["name"] for p in page["people"]],
+            "searched": [c["id"] for c in await s.companies_needing_prospects(limit=10)],
+            "searches": len(page["searches"]),
         }
         await s.undo_merge(b)
-        return a, b, after
+        return s, a, b, before, after
 
-    a, b, after = run(go())
-    # The survivor reaches both contacts; the duplicate phone link stays
-    # parked on the merged record with its own provenance.
-    assert after["visible"] == 2
-    assert dict(after["links"]) == {a: 2, b: 1}
-    assert after["search_on"] == [(a,)]
-    assert _rows(db, "SELECT company_id, COUNT(*) FROM company_contacts GROUP BY 1 ORDER BY 2") \
-        == sorted([(a, 1), (b, 2)], key=lambda r: r[1])
-    assert _rows(db, "SELECT target_id FROM searches") == [(b,)]
-    # Each person back at its own company, each link through its own person.
-    assert _rows(db, "SELECT COUNT(*) FROM company_contacts l JOIN people p "
-                     "ON p.id = l.person_id WHERE p.company_id != l.company_id")[0][0] == 0
+    s, a, b, before, after = run(go())
+    # The survivor reaches both contacts, each once, and one Dan (his two
+    # records' rows stay where they were found).
+    assert after["visible"] == ["+40257000110", "dan@opt.example"]
+    assert after["people"] == ["Dan Exemplu"]
+    assert after["searched"] == [] and after["searches"] == 1
+    assert slim.snapshot(s) == before
+    assert slim.recount_diff(s) == {}
+    # Each person at its own record, each link through its own person.
+    assert _rows(db, "SELECT COUNT(*) FROM link l JOIN person p "
+                     "ON p.id = l.person WHERE p.firm != l.firm")[0][0] == 0
 
 
 # ── Searches: once per source, unless forced or stale ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_company_searched_in_one_source_is_skipped_there_only(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
 
@@ -260,7 +259,7 @@ def test_a_company_searched_in_one_source_is_skipped_there_only(tmp_path, monkey
                                                                  capability="domain_search")
         monkeypatch.setattr(contacts, "refresh_days", lambda m, c: 30)
         with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE searches SET searched_at = datetime('now', '-31 days')")
+            conn.execute("UPDATE search SET at = at - 31 * 86400")
         out["stale"] = await s.companies_needing_prospects()
         return cid, out
 
@@ -272,17 +271,15 @@ def test_a_company_searched_in_one_source_is_skipped_there_only(tmp_path, monkey
     assert ids["stale"] == [cid]                        # older than refresh_days
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_force_searches_again_what_was_searched_before_the_run(tmp_path):
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
         cid = await s.add_company(Company(name="Exemplu Zece", domain="zece.example"))
-        with sqlite3.connect(db) as conn:
-            conn.execute("INSERT INTO searches (target, target_id, module, capability, outcome, "
-                         "searched_at) VALUES ('company', ?, 'people', 'find_people', 'nothing', "
-                         "datetime('now', '-1 day'))", (cid,))
+        await s.record_search("company", cid, "people", "find_people", outcome="nothing")
+        with sqlite3.connect(db) as conn:          # yesterday
+            conn.execute("UPDATE search SET at = at - 86400")
         since = contacts.now()
         before = await s.companies_needing_prospects(since=since)
         await s.record_search("company", cid, "people", "find_people", outcome="nothing")
@@ -326,6 +323,9 @@ def _seed(db) -> dict:
         s = await _state(db)
         ids = {}
         for i, (town, site) in enumerate([("Brașov", True), ("Brașov", False), ("Sibiu", True)]):
+            # Registered firms: the registry beside the database describes them.
+            slim.describe(s, slim.firm(f"EXEMPLU {i} SRL", f"9200000{i}", town,
+                                       domain=f"ex{i}.example" if site else ""))
             ids[i] = await s.add_company(Company(
                 name=f"EXEMPLU {i} SRL", cui=f"9200000{i}",
                 domain=f"ex{i}.example" if site else "", location=f"{town}, {town}, Romania",
@@ -339,17 +339,13 @@ def _seed(db) -> dict:
                            person="Ana Exemplu")])
         await s.add_contacts(ids[2], [
             contacts.Found("email", "info@ex2.example", source="serper", confidence=0.4)])
-        async with s._connect() as conn:
-            await contacts.add_person(conn, ids[2], "Ion Exemplu", "administrator", "onrc")
-            await contacts.record_search(conn, "company", ids[2], "people", "find_people",
-                                         outcome="nothing")
-            await conn.commit()
+        await s.add_people(ids[2], [("Ion Exemplu", "administrator")], source="onrc")
+        await s.record_search("company", ids[2], "people", "find_people", outcome="nothing")
         return ids
 
     return run(go())
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_one_row_per_contact_with_how_many_companies_it_reaches(client):
     ids = _seed(client.db_path)
     res = client.get("/api/contacts", params={"sort": "companies", "dir": "desc"}).json()
@@ -376,14 +372,12 @@ def test_one_row_per_contact_with_how_many_companies_it_reaches(client):
     ({"q": "0722 000"}, {"+40722000112"}),
     ({"q": "exemplu 0"}, {"+40268000111", "+40722000112", "ana@ex0.example"}),
 ])
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_filters(client, params, want):
     _seed(client.db_path)
     rows = client.get("/api/contacts", params=params).json()["rows"]
     assert {r["value"] for r in rows} == want
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_signal_filters_reuse_the_cohort_rules(client):
     ids = _seed(client.db_path)
 
@@ -404,7 +398,6 @@ def test_signal_filters_reuse_the_cohort_rules(client):
     assert client.get("/api/contacts", params={"require": "RUNNING_GOOGLE_ADS"}).status_code == 400
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_sort_paging_and_capped_count(client, monkeypatch):
     _seed(client.db_path)
     page = client.get("/api/contacts", params={"limit": 2, "offset": 2, "sort": "value",
@@ -418,7 +411,6 @@ def test_sort_paging_and_capped_count(client, monkeypatch):
     assert capped["total"] == 3 and capped["more"] is True
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_people_still_to_search(client):
     ids = _seed(client.db_path)
     res = client.get("/api/contacts", params={"view": "people"}).json()
@@ -426,11 +418,10 @@ def test_people_still_to_search(client):
     assert res["rows"][0]["searched_at"] is None
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_export_once_per_contact_leaving_do_not_contact_out(client):
     ids = _seed(client.db_path)
     with sqlite3.connect(client.db_path) as conn:
-        conn.execute("UPDATE contacts SET do_not_contact = 1 WHERE value = 'info@ex2.example'")
+        conn.execute("UPDATE contact SET do_not_contact = 1 WHERE value = 'info@ex2.example'")
     r = client.get("/api/export/contacts.csv", params={"kind": "phone"})
     rows = list(csv.DictReader(io.StringIO(r.text.removeprefix("﻿"))))
     assert [x["value"] for x in rows].count("+40268000111") == 1
@@ -440,7 +431,6 @@ def test_export_once_per_contact_leaving_do_not_contact_out(client):
     assert "info@ex2.example" not in {x["value"] for x in data}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_company_drawer_shows_contacts_people_places_sources_and_searches(client):
     ids = _seed(client.db_path)
     reach = client.get(f"/api/companies/{ids[2]}").json()["reach"]
@@ -452,7 +442,6 @@ def test_company_drawer_shows_contacts_people_places_sources_and_searches(client
     assert [(x["module"], x["outcome"]) for x in reach["searches"]] == [("people", "nothing")]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_find_contacts_queues_one_job_per_company_with_or_without_force(client):
     _seed(client.db_path)
     r = client.post("/api/contacts/find", json={"force": True, "limit": 50})
@@ -551,7 +540,6 @@ vm.runInThisContext(pick('let _cv = ', '// ── Contacts: same pattern as Comp
 # ── Each source of a contact, and what an export never lets out ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_second_source_of_the_same_contact_is_kept(client):
     async def go():
         s = await _state(client.db_path)
@@ -563,8 +551,8 @@ def test_a_second_source_of_the_same_contact_is_kept(client):
         return cid
 
     cid = run(go())
-    assert _rows(client.db_path, "SELECT source, trust FROM company_contacts ORDER BY source") == [
-        ("anaf", "confirmed"), ("website", "likely")]
+    assert _rows(client.db_path, f"SELECT source_name, trust_name FROM {slim.EVIDENCE} "
+                                 "ORDER BY source_name") == [("anaf", "confirmed"), ("website", "likely")]
     rows = client.get("/api/contacts", params={"source": "anaf"}).json()["rows"]
     assert [(r["value"], r["trust"], r["sources"]) for r in rows] == [
         ("+40257000111", "confirmed", ["anaf", "website"])]
@@ -573,7 +561,6 @@ def test_a_second_source_of_the_same_contact_is_kept(client):
     assert phone["sources"] == ["anaf", "website"] and phone["trust"] == "confirmed"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_do_not_contact_company_has_no_contact_in_the_export(client, monkeypatch):
     _seed(client.db_path)
     import harvey.export as export
@@ -585,7 +572,6 @@ def test_a_do_not_contact_company_has_no_contact_in_the_export(client, monkeypat
     assert values == {"info@ex2.example"}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_an_unreadable_do_not_contact_list_refuses_the_export(client, monkeypatch):
     _seed(client.db_path)
     import harvey.export as export
@@ -602,10 +588,8 @@ def test_an_unreadable_do_not_contact_list_refuses_the_export(client, monkeypatc
     assert client.get("/api/contacts").status_code == 200
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_registry_administrators_are_people_to_search_whatever_is_confirmed(tmp_path):
     from harvey.collectors import onrc
-    from harvey.modules import runs
 
     db = tmp_path / "harvey.db"
     dataset = onrc.Dataset("firme-01-01-2026", "2026-01-01", {})
@@ -615,36 +599,45 @@ def test_registry_administrators_are_people_to_search_whatever_is_confirmed(tmp_
 
     async def go():
         s = await _state(db)
-        draft = onrc.firms_draft([firm], dataset, codes={firm.reg: [("8623", 3)]},
-                                 people={firm.reg: [("POPESCU", "ION", "administrator")]},
-                                 classes=[("8623", None)]).stamp("onrc", "registry_search")
-        draft.values.update(codes=("CONTACT_FOUND",), collector=onrc.COLLECTOR)
-        report = onrc.ImportReport(dataset=dataset.name)
-        await runs.save_source_draft(s, draft, report, module="onrc")
-        assert not report.errors, report.errors
+        await slim.pull(s, firm, dataset=dataset,
+                        people=[(firm.reg, "POPESCU ION", "administrator")])
+        return s, await s.read("people_page", contacts.ContactFilter(), "first_seen", "desc",
+                               50, 0)
 
-    run(go())
-    assert _rows(db, "SELECT name, role, source FROM people") == [
-        ("POPESCU ION", "administrator", "onrc")]
-    # The reading itself still waits for CONTACT_FOUND to be confirmed.
-    assert _rows(db, "SELECT COUNT(*) FROM observations WHERE signal_code = 'CONTACT_FOUND'") == [
-        (0,)]
+    s, (total, more, rows) = run(go())
+    # Named by the registry, read in place (nothing copied): a person to
+    # search whether or not CONTACT_FOUND is confirmed.
+    assert [(r["name"], r["role"]) for r in rows] == [("Ion Popescu", "Administrator")]
+    assert _rows(db, "SELECT COUNT(*) FROM person") == [(0,)]
+    assert _rows(db, "SELECT COUNT(*) FROM obs") == [(0,)]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
-def test_a_start_waits_for_another_process_upgrading_the_schema(tmp_path, monkeypatch):
+def test_a_start_waits_for_another_process_creating_the_database(tmp_path, monkeypatch):
     import harvey.state as state_mod
+    from harvey.overlay import schema
 
-    asked = []
-    real = state_mod.aiosqlite.connect
+    path = tmp_path / "harvey.db"
 
-    def connect(path, timeout=None, **kw):
-        asked.append(timeout)
-        return real(path, timeout=timeout, **kw)
+    class Busy:
+        """Another process holds the new file while it creates it."""
+        VERSION = schema.VERSION
 
-    monkeypatch.setattr(state_mod.aiosqlite, "connect", connect)
-    run(StateManager(str(tmp_path / "harvey.db")).init_db())
-    assert asked[0] == state_mod.MIGRATION_TIMEOUT_SECONDS > state_mod.BUSY_TIMEOUT_SECONDS
+        @staticmethod
+        def create(con):
+            raise sqlite3.OperationalError("database is locked")
+
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        if len(slept) == 3:             # the other process is done
+            with sqlite3.connect(path) as other:
+                other.execute(f"PRAGMA user_version = {schema.VERSION}")
+
+    monkeypatch.setattr(state_mod.time, "sleep", sleep)
+    assert state_mod._open_or_create(str(path), Busy) == schema.VERSION
+    assert len(slept) == 3
+    assert state_mod.MIGRATION_TIMEOUT_SECONDS > state_mod.BUSY_TIMEOUT_SECONDS
 
 
 # ── The Email module's audience: contacts the Writer can write to ──
@@ -676,17 +669,14 @@ def _audience_db(db, monkeypatch, status="verified"):
             contacts.Found("email", "gone@alfa.example", status="verified", source="website")])
         await s.add_contacts(beta, [contacts.Found("email", "info@beta.example", status="verified",
                                                    source="serper", trust="unconfirmed")])
-        async with s._connect() as conn:
-            await conn.execute("UPDATE contacts SET do_not_contact = 1 "
-                               "WHERE value = 'gone@alfa.example'")
-            await conn.commit()
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE contact SET do_not_contact = 1 WHERE value = 'gone@alfa.example'")
         return s, alfa
 
     s, alfa = run(go())
     return s, alfa, checked
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_audience_makes_prospects_of_the_contacts_the_writer_can_use(tmp_path, monkeypatch):
     from harvey.agents.audience import Audience
 
@@ -709,10 +699,9 @@ def test_the_audience_makes_prospects_of_the_contacts_the_writer_can_use(tmp_pat
     inbox = by_email["office@alfa.example"]
     assert inbox.is_company_inbox and inbox.email_status == "verified"
     # The prospect is the registry's person, not a second one.
-    assert _rows(db, "SELECT name FROM people") == [("POPESCU ION",)]
+    assert _rows(db, "SELECT name FROM person") == [("POPESCU ION",)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_audience_never_makes_a_prospect_of_an_address_that_checks_out_bad(tmp_path,
                                                                               monkeypatch):
     from harvey.agents.audience import Audience
@@ -728,5 +717,7 @@ def test_the_audience_never_makes_a_prospect_of_an_address_that_checks_out_bad(t
     assert run(go()) == ["ion.popescu@alfa.example"]
     # Checked once: graded invalid, it stays a contact and isn't asked again.
     assert checked == ["office@alfa.example"]
-    assert _rows(db, "SELECT status FROM contacts WHERE value = 'office@alfa.example'") == [
-        ("invalid",)]
+    from harvey.overlay import schema
+
+    assert _rows(db, "SELECT status FROM contact WHERE value = 'office@alfa.example'") == [
+        (schema.CONTACT_STATUS["invalid"],)]

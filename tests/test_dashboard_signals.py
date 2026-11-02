@@ -358,30 +358,30 @@ def test_cohort_boundaries_and_duplicate_codes(client):
         'require': ['RUNNING_GOOGLE_ADS'], 'offset': 4}).json()['companies'] == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_cohort_over_previous_cap_and_stable_ties(client):
     import asyncio
     import csv
     import io
-    import sqlite3
-    from contextlib import closing
-    async def initialize():
+
+    from harvey.models import Company
+
+    async def seed():
         state = StateManager(str(client.db_path))
         await state.init_db()
         from harvey.signals import sync_vocabulary
         await sync_vocabulary(state)
-    asyncio.run(initialize())
-    # Bulk seed rather than opening 10,001 individual connections.
-    with closing(sqlite3.connect(client.db_path)) as db, db:
-        db.executemany('INSERT INTO companies (id, name) VALUES (?, ?)',
-                       [(f'{i:05}', 'Same') for i in range(10001)])
-        db.executemany('INSERT INTO observations (id, company_id, signal_code, value_num) '
-                       'VALUES (?, ?, ?, 1)',
-                       [(f'obs{i}', f'{i:05}', 'RUNNING_GOOGLE_ADS') for i in range(10001)])
+        await state.set_signal_status("RUNNING_GOOGLE_ADS", "confirmed")
+        # One transaction for the lot rather than 10,001 connections.
+        async with state.batch() as batch:
+            ids = [await batch.add_company(Company(name="Same")) for _ in range(10001)]
+        await state.add_observations([{"company_id": cid, "signal_code": "RUNNING_GOOGLE_ADS",
+                                       "value_num": 1} for cid in ids])
+        return ids
+    ids = asyncio.run(seed())
     page = client.post('/api/cohort', json={
         'require': ['RUNNING_GOOGLE_ADS'], 'offset': 9999, 'limit': 2}).json()
     assert page['size'] == 10001
-    assert [row['id'] for row in page['companies']] == ['09999', '10000']
+    assert [row['id'] for row in page['companies']] == ids[9999:]
     response = client.get('/api/cohort.csv', params={'require': 'RUNNING_GOOGLE_ADS'})
     assert response.status_code == 200
     assert len(list(csv.reader(io.StringIO(response.text)))) == 10002

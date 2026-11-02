@@ -715,3 +715,69 @@ def test_free_space_on_wsl_for_data_on_the_windows_drive_itself(tmp_path, monkey
     assert not disk.on_windows_drive(tmp_path)
     with pytest.raises(disk.HostDriveUnknown, match="same disk"):
         disk.free_bytes(tmp_path / "out.db")
+
+
+def test_the_host_drive_is_a_folder_of_its_own_never_a_drive_root(tmp_path, monkeypatch):
+    # The container reads untrusted websites: what it is told to mount for
+    # the free-space check is an empty folder on the Windows drive, whose
+    # free space is the drive's, never the drive itself.
+    import re
+
+    from harvey import disk
+
+    monkeypatch.setattr(disk, "on_wsl", lambda: True)
+    monkeypatch.setattr(disk, "DEFAULT_WSL_DRIVE", tmp_path / "no-such-drive")
+    monkeypatch.delenv("HARVEY_HOST_DRIVE", raising=False)
+    with pytest.raises(disk.HostDriveUnknown) as unseen:
+        disk.free_bytes(tmp_path / "out.db")
+    host = tmp_path / "host"
+    host.mkdir()
+    monkeypatch.setenv("HARVEY_HOST_DRIVE", str(host))
+    monkeypatch.setattr(disk, "same_disk", lambda a, b: True)
+    monkeypatch.setattr(disk, "on_windows_drive", lambda p: False)
+    with pytest.raises(disk.HostDriveUnknown) as same:
+        disk.free_bytes(tmp_path / "out.db")
+    for message in (str(unseen.value), str(same.value)):
+        assert "HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free" in message
+    root = Path(__file__).resolve().parent.parent
+    # (/mnt/c, /mnt/c/ and /mnt/c/. are all the drive's root.)
+    drive_root = re.compile(r"HARVEY_HOST_DRIVE_SOURCE=/mnt/[a-z]/?\.?(?=[\s\"'`)]|$)", re.M)
+    for root_spelling in ("/mnt/c", "/mnt/c/", "/mnt/d/.", "/mnt/c\n"):
+        assert drive_root.search(f"HARVEY_HOST_DRIVE_SOURCE={root_spelling}"), root_spelling
+    for folder in ("/mnt/c/harvey-free", "/mnt/c/harvey_free", "/mnt/c/.harvey"):
+        assert not drive_root.search(f"HARVEY_HOST_DRIVE_SOURCE={folder}"), folder
+    for name in ("docker-compose.yml", ".env.example", "README.md", "CLAUDE.md",
+                 "harvey/disk.py", "harvey/web/i18n.js"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert not drive_root.search(text), name
+    assert "/mnt/c/harvey-free" in (root / ".env.example").read_text(encoding="utf-8")
+    assert "${HARVEY_HOST_DRIVE_SOURCE:-.}" in (root / "docker-compose.yml").read_text(
+        encoding="utf-8")
+
+
+def test_a_host_drive_that_is_a_whole_drive_is_refused(tmp_path, monkeypatch):
+    # An older release's .env mounted the drive's root (/mnt/c): a folder
+    # holding what a Windows drive's root holds is refused, with what to
+    # set instead; a folder of its own, empty or not, is read.
+    from harvey import disk
+
+    monkeypatch.setattr(disk, "on_wsl", lambda: False)
+    drive = tmp_path / "drive"
+    for name in ("Users", "Windows"):
+        (drive / name).mkdir(parents=True)
+    monkeypatch.setenv("HARVEY_HOST_DRIVE", str(drive))
+    with pytest.raises(disk.HostDriveUnknown, match="whole drive") as e:
+        disk.free_bytes(tmp_path / "out.db")
+    assert "HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free" in str(e.value)
+    (drive / "Windows").rmdir()
+    with pytest.raises(disk.HostDriveUnknown, match="whole drive"):
+        disk.host_drive()
+    (drive / "Users").rmdir()
+    (drive / "Program Files").mkdir()
+    with pytest.raises(disk.HostDriveUnknown, match="whole drive"):
+        disk.host_drive()
+    # The native-Linux default (the checkout) and an empty folder are fine.
+    (drive / "Program Files").rmdir()
+    (drive / "harvey.db").write_text("")
+    assert disk.host_drive() == drive
+    assert disk.free_bytes(tmp_path / "out.db") > 0

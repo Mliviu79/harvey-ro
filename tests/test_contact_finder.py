@@ -19,6 +19,7 @@ from harvey.models import Company
 from harvey.modules import api, job_kinds, jobs, runs
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 ENV = {"serper_api_key": "test-key"}
 
@@ -147,7 +148,6 @@ def test_the_finders_site_read_keeps_emails_forms_profiles_and_people():
 # ── One company ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_known_website_is_read_first_free_and_every_contact_kept(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(sites={"alfa.example": _site(
@@ -168,19 +168,16 @@ def test_a_known_website_is_read_first_free_and_every_contact_kept(tmp_path, mon
     s, cid, found = run(go())
     assert fakes.read == [("alfa.example", True)] and fakes.looked == []
     assert found.steps == ["site"] and found.contacts == 3 and found.trust == "confirmed"
-    kept = _rows(db, "SELECT ct.kind, ct.line_type, l.trust FROM company_contacts l "
-                     "JOIN contacts ct ON ct.id = l.contact_id WHERE l.company_id = ? "
-                     "ORDER BY ct.kind", (cid,))
+    kept = [(k, line, trust) for k, v, line, trust, *_ in slim.links(s, cid)]
     assert kept == [("email", "", "confirmed"), ("linkedin", "", "confirmed"),
                     ("phone", "mobile", "confirmed")]
-    assert _rows(db, "SELECT name, role FROM people") == [("Ana Exemplu", "Owner")]
-    assert sorted(_rows(db, "SELECT module, capability FROM searches")) == [
+    assert _rows(db, "SELECT name, role FROM person") == [("Ana Exemplu", "Owner")]
+    assert sorted(x[1:3] for x in slim.searches(s)) == [
         ("contact_finder", "find_contacts"), ("website", "read_site")]
     b = run(finder.backlog(s, fresh=True))
     assert b["without_contact"] == 0 and b["site_to_read"] == 0
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_with_no_website_and_no_cap_nothing_is_paid_for_and_nothing_marked(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes().install(monkeypatch)
@@ -194,7 +191,7 @@ def test_with_no_website_and_no_cap_nothing_is_paid_for_and_nothing_marked(tmp_p
     assert fakes.looked == [] and found.steps == []
     assert "no spend cap set" in found.skipped[0]
     # Not marked searched: a run with a cap later still looks it up.
-    assert _rows(db, "SELECT COUNT(*) FROM searches")[0][0] == 0
+    assert _rows(db, "SELECT COUNT(*) FROM search")[0][0] == 0
 
 
 def _beta_results():
@@ -203,7 +200,6 @@ def _beta_results():
                  website="https://betaexample.example/")]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 def test_a_website_search_picks_the_company_and_its_cui_confirms_it(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(results=_beta_results(), sites={"betaexample.example": _site(
@@ -213,24 +209,24 @@ def test_a_website_search_picks_the_company_and_its_cui_confirms_it(tmp_path, mo
 
     async def go():
         s = await _state(db)
+        slim.describe(s, slim.firm("BETA EXAMPLE SRL", 92000001, "Sibiu"))
         cid = await _company(s, name="BETA EXAMPLE SRL", cui="92000001",
                              location="Sibiu, Sibiu, Romania")
-        return cid, await finder.find(s, cid, spend=_spend(), env=ENV, batch_id="b1")
+        return s, cid, await finder.find(s, cid, spend=_spend(), env=ENV, batch_id="b1")
 
-    cid, found = run(go())
+    s, cid, found = run(go())
     # The directory in the results is never taken for the company's site.
     assert fakes.looked == [("serper", "BETA EXAMPLE SRL", "Sibiu")]
     assert fakes.read == [("betaexample.example", True)]
     assert (found.website, found.trust) == ("betaexample.example", "confirmed")
-    assert _rows(db, "SELECT domain, website_trust, website_source FROM companies WHERE id = ?",
-                 (cid,)) == [("betaexample.example", "confirmed", "serper")]
-    assert _rows(db, "SELECT trust FROM company_contacts") == [("confirmed",)]
-    searched = _rows(db, "SELECT module, capability, looked_for, outcome, cost, batch_id "
-                         "FROM searches WHERE module = 'serper'")
+    assert _rows(db, "SELECT f.domain, f.website_trust, s.name FROM firm f JOIN source s "
+                     "ON s.id = f.website_source WHERE f.id = ?", (int(cid),)) == [
+        ("betaexample.example", 0, "serper")]
+    assert [x[3] for x in slim.links(s)] == ["confirmed"]
+    searched = [x[1:] for x in slim.searches(s) if x[1] == "serper"]
     assert searched == [("serper", "google_search", "website", "found", 0.001, "b1")]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_an_unproven_website_is_kept_marked_and_says_nothing_else(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(results=[dict(name="Gamma Tours", domain="gammatours.example",
@@ -250,21 +246,21 @@ def test_an_unproven_website_is_kept_marked_and_says_nothing_else(tmp_path, monk
         await s.set_signal_status("TECH_STACK", "confirmed")
         cid = await _company(s, name="DELTA EXAMPLE SRL", location="Cluj-Napoca, Cluj, Romania")
         await s.add_people(cid, [("POPESCU ION", "administrator")], source="onrc")
-        return cid, await finder.find(s, cid, spend=_spend(), env=ENV)
+        return s, cid, await finder.find(s, cid, spend=_spend(), env=ENV)
 
-    cid, found = run(go())
+    s, cid, found = run(go())
     assert found.trust == "unconfirmed"
     # Kept, marked, never the company's key, its name, or a fact about it.
-    assert _rows(db, "SELECT name, domain, website, website_trust FROM companies WHERE id = ?",
-                 (cid,)) == [("DELTA EXAMPLE SRL", "", "https://gammatours.example/",
-                              "unconfirmed")]
-    assert _rows(db, "SELECT trust FROM company_contacts") == [("unconfirmed",)]
-    assert _rows(db, "SELECT COUNT(*) FROM observations")[0][0] == 0
+    company = run(s.get_company(cid))
+    assert (company.name, company.domain, company.website) == (
+        "DELTA EXAMPLE SRL", "", "https://gammatours.example/")
+    assert _rows(db, "SELECT website_trust FROM firm WHERE id = ?", (int(cid),)) == [(2,)]
+    assert [x[3] for x in slim.links(s)] == ["unconfirmed"]
+    assert _rows(db, "SELECT COUNT(*) FROM obs")[0][0] == 0
     # No address is built at a domain that may be someone else's.
     assert fakes.checked == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_company_searched_in_one_source_is_still_searched_in_another(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(results=[]).install(monkeypatch)
@@ -277,9 +273,8 @@ def test_a_company_searched_in_one_source_is_still_searched_in_another(tmp_path,
         await s.record_search("company", cid, "tinyfish", "web_search", looked_for="website")
         first = await finder.find(s, cid, spend=_spend(), env=env)
         again = await finder.find(s, cid, spend=_spend(), env=env)
-        async with s._connect() as conn:
-            await conn.execute("UPDATE searches SET searched_at = '2026-01-01 00:00:00'")
-            await conn.commit()
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE search SET at = at - 86400")
         forced = await finder.find(s, cid, spend=_spend(), env=env, since=contacts.now())
         return first, again, forced
 
@@ -306,7 +301,6 @@ def test_a_spent_cap_skips_the_search_and_says_so(tmp_path, monkeypatch):
     assert fakes.looked == [] and "spend limit" in found.skipped[0]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_person_with_no_contact_gets_one_checked_address(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(email="ion.popescu@eta.example").install(monkeypatch)
@@ -316,16 +310,15 @@ def test_a_person_with_no_contact_gets_one_checked_address(tmp_path, monkeypatch
         cid = await _company(s, name="ETA EXAMPLE SRL", domain="eta.example")
         await s.add_people(cid, [("POPESCU ION", "administrator")], source="onrc")
         await s.record_search("company", cid, "website", "read_site", looked_for=runs.CONTACT_READ)
-        return cid, await finder.find(s, cid, spend=_spend(), env=ENV)
+        return s, cid, await finder.find(s, cid, spend=_spend(), env=ENV)
 
-    cid, found = run(go())
+    s, cid, found = run(go())
     # The registry writes the family name first.
     assert fakes.checked == [("Ion", "Popescu", "eta.example")]
     assert found.steps == ["address"] and found.contacts == 1
-    assert _rows(db, "SELECT ct.value, ct.status, p.name FROM company_contacts l "
-                     "JOIN contacts ct ON ct.id = l.contact_id JOIN people p ON p.id = l.person_id"
-                 ) == [("ion.popescu@eta.example", "verified", "POPESCU ION")]
-    assert _rows(db, "SELECT target, module, outcome FROM searches WHERE target = 'person'") == [
+    assert [(v, p, st) for k, v, line, trust, p, st in slim.links(s) if p] == [
+        ("ion.popescu@eta.example", "POPESCU ION", "verified")]
+    assert [(t, m, o) for t, m, c, looked, o, *_ in slim.searches(s) if t == "person"] == [
         ("person", "email_verify", "found")]
 
 
@@ -674,7 +667,6 @@ def test_harvey_contacts_status_and_find_in_the_background(tmp_path, monkeypatch
 # ── What the backlog, force and the caps keep straight ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_plain_site_read_leaves_the_finders_read_to_do(tmp_path, monkeypatch):
     """"Read sites" (and the upgrade's old profile marks) look for phones and
     a contact form, not emails: the company stays in the free backlog and
@@ -706,19 +698,21 @@ def test_a_plain_site_read_leaves_the_finders_read_to_do(tmp_path, monkeypatch):
                               looked_for="phone,contact_form")
         free = await finder.next_free(s, 10)
         found = await finder.find(s, cid, spend=_spend(cap=False), env=ENV)
-        return cid, other, free, found, await finder.next_free(s, 10)
+        return s, cid, other, free, found, await finder.next_free(s, 10)
 
-    cid, other, free, found, after = run(go())
+    s, cid, other, free, found, after = run(go())
     assert set(free) == {cid, other}
     assert fakes.read == [("kappa.example", False), ("kappa.example", True)]
     assert found.steps == ["site"] and found.contacts == 1
     assert after == [other]
-    looked = _rows(db, "SELECT looked_for FROM searches WHERE module = 'website' "
-                       "AND target_id = ? ORDER BY id", (cid,))
-    assert looked == [(runs.PLAIN_READ,), (runs.CONTACT_READ,)]
+    looked = [r[3] for r in slim.searches(s) if r[1] == "website"]
+    order = [n for (n,) in _rows(db, "SELECT name FROM looked_for ORDER BY bit")]
+    in_order = lambda names: ",".join(n for n in order if n in names.split(","))  # noqa: E731
+    # Its plain read, the other's mark, then its finder's read.
+    assert looked == [in_order(runs.PLAIN_READ), in_order("phone,contact_form"),
+                      in_order(runs.CONTACT_READ)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_failed_search_keeps_the_company_in_the_backlog(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     real = api.capability
@@ -733,12 +727,12 @@ def test_a_failed_search_keeps_the_company_in_the_backlog(tmp_path, monkeypatch)
         s = await _state(db)
         cid = await _company(s, name="BETA EXAMPLE SRL", location="Sibiu, Sibiu, Romania")
         found = await finder.find(s, cid, spend=finder.Spend(), env=ENV)
-        return cid, found, await finder.next_paid(s, 10, finder.searchers({"serper"}, ENV))
+        return s, cid, found, await finder.next_paid(s, 10, finder.searchers({"serper"}, ENV))
 
-    cid, found, after = run(go())
+    s, cid, found, after = run(go())
     assert found.steps == [] and found.failed == 1 and "provider 503" in found.skipped[0]
     assert cid in after
-    assert sorted(_rows(db, "SELECT module, outcome FROM searches")) == [
+    assert sorted((r[1], r[4]) for r in slim.searches(s)) == [
         ("contact_finder", "error"), ("serper", "error")]
 
 
@@ -830,7 +824,6 @@ def test_address_checks_count_against_the_months_checks(tmp_path, monkeypatch):
     assert "address checks are used" in found.skipped[-1]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_free_backlog_walks_companies_with_a_site_newest_first(tmp_path):
     db = tmp_path / "harvey.db"
 
@@ -839,10 +832,8 @@ def test_the_free_backlog_walks_companies_with_a_site_newest_first(tmp_path):
         old = await _company(s, name="OLD EXAMPLE SRL", domain="old.example")
         await _company(s, name="NONE EXAMPLE SRL")
         declared = await _company(s, name="DECL EXAMPLE SRL", website="https://decl.example")
-        async with s._connect() as conn:
-            await conn.execute("UPDATE companies SET created_at = '2020-01-01' WHERE id = ?",
-                               (old,))
-            await conn.commit()
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE firm SET created = 1577836800 WHERE id = ?", (int(old),))
         return old, declared, await finder.next_free(s, 10)
 
     old, declared, got = run(go())
@@ -864,18 +855,14 @@ def test_the_backlog_counts_are_kept_for_a_while(tmp_path):
     assert fresh["without_contact"] == 2
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_selection_by_ids_is_never_cut_short(tmp_path):
     db = tmp_path / "harvey.db"
 
     async def go():
         s = await _state(db)
-        ids = [f"c{i:05d}" for i in range(1_234)]
-        async with s._connect() as conn:
-            await conn.executemany(
-                "INSERT INTO companies (id, name, domain, source) VALUES (?, ?, ?, 'registry:onrc')",
-                [(i, f"FIRMA {i} SRL", f"{i}.example") for i in ids])
-            await conn.commit()
+        async with s.batch() as b:
+            ids = [await b.add_company(Company(name=f"FIRMA {i} SRL", domain=f"c{i:05d}.example",
+                                               source="registry:onrc")) for i in range(1_234)]
         batch = await jobs.new_batch(s, "discover", "big", max_spend=0.0)
         return await job_kinds.enqueue_finder_follow_ups(s, ids, batch_id=batch)
 

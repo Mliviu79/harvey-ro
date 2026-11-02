@@ -156,6 +156,46 @@ async def test_register_filters_read_the_register(state):
 
 
 @pytest.mark.asyncio
+async def test_a_register_search_matches_records_by_the_registers_key_table(state, tmp_path,
+                                                                           monkeypatch):
+    # The registry's ids go to records in one statement through its
+    # firm_key table: the same firms as its keys listed one by one, a firm
+    # with no CUI by its registration number included.
+    i = state.ids
+    filters = (ContactFilter(county="Brașov"), ContactFilter(words="exemplu gama"),
+               ContactFilter(words="exemplu", search='"exemplu"*'))
+    fast = [set(_page(state, f)[1]) for f in filters]
+    assert i["gama"] in fast[1] and i["listing"] in fast[0]
+    from harvey.modules.ro.onrc.queries import Adapter
+
+    def order():
+        con, r = _reader(state)
+        try:
+            return r.words_order("exemplu")
+        finally:
+            con.close()
+
+    ranked = order()
+    assert set(ranked) == set(i.values())
+
+    def listed(*a, **k):
+        raise AssertionError("keys listed one by one")
+
+    with monkeypatch.context() as m:
+        m.setattr(Adapter, "keys_of_ids", listed)
+        reads.SETS.clear()
+        assert [set(_page(state, f)[1]) for f in filters] == fast
+        assert order() == ranked
+    # A registry whose derived tables predate firm_key: its keys, as before.
+    con = sqlite3.connect(tmp_path / "registry.db")
+    con.execute("DROP TABLE firm_key")
+    con.commit()
+    con.close()
+    reads.SETS.clear()
+    assert [set(_page(state, f)[1]) for f in filters] == fast
+    assert order() == ranked
+
+@pytest.mark.asyncio
 async def test_sorts_by_name_place_figures_contacts_and_search(state, monkeypatch):
     i = state.ids
     by_name = _page(state, sort="name", way="asc")[1]
@@ -260,6 +300,29 @@ async def test_people_to_search_are_administrators_and_found_people(state):
     # reached by a contact of her own (she is linked), so only Ion is left;
     # the others name no one.
     assert names == {(str(state.ids["alfa"]), "Ion Exemplu")} and total == 1
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_people_count_is_kept_until_people_change(state, monkeypatch):
+    county = ContactFilter(county="Brașov")
+
+    def page():
+        con, r = _reader(state)
+        try:
+            return r.people_page(county, "", "desc", 50, 0)
+        finally:
+            con.close()
+
+    assert page()[0] == 1
+    with monkeypatch.context() as m:
+        m.setattr(reads.Reader, "_count_people",
+                  lambda *a: pytest.fail("counted again with nothing changed"))
+        assert page()[0] == 1
+    # Ion is reached by a contact of his own now: counted again.
+    await state.add_contacts(state.ids["alfa"], [contacts.Found(
+        "email", "ion@alfa.example.com", source="website", person="Ion Exemplu",
+        trust="confirmed")])
+    assert page()[0] == 0
 
 
 # ── Signals, cohorts ──
@@ -615,6 +678,276 @@ async def test_a_big_cohort_pages_through_the_name_index(state, monkeypatch):
         con.close()
 
 
+# ── Register conditions from the counts job's kept sets ──
+
+COHORTS = (
+    (["EFACTURA_REGISTERED"], [], []),
+    ([], ["EFACTURA_REGISTERED"], []),
+    (["HAS_EMPLOYEES_TAX"], ["EFACTURA_REGISTERED"], []),
+    ([], [], [{"code": "TURNOVER", "min": 1e6}]),
+    ([], [], [{"code": "TURNOVER", "max": 1e6}]),
+    (["ACTIVITY_CODE"], [], [{"code": "EMPLOYEES", "min": 1, "max": 20}]),
+    (["TECH_STACK", "EMPLOYEES"], [], []),
+    # Ranges naming a year: that year's statements.
+    ([], [], [{"code": "TURNOVER", "min": 1e6, "key": "2024"}]),
+    ([], [], [{"code": "EMPLOYEES", "max": 5, "key": "2024"}]),
+)
+
+
+def _verdicts(state):
+    reads.SETS.clear()
+    reads.ORDERINGS.clear()
+    con, r = _reader(state)
+    try:
+        return [(r.cohort_verdicts(req, exc, rng, verdicts=reads.Reader.VERDICTS)[0],
+                 sorted((int(x["id"]), x["verdict"]) for x in
+                        r.cohort_verdicts(req, exc, rng, verdicts=reads.Reader.VERDICTS)[1]))
+                for req, exc, rng in COHORTS]
+    finally:
+        con.close()
+
+
+def _no_walks(monkeypatch):
+    """A register condition worked out by walking the firms in Harvey fails."""
+    def walk(*a, **k):
+        raise AssertionError("walked every key instead of reading the kept sets")
+
+    from harvey.modules.ro.mf_financials import queries as fin_queries
+
+    for name in ("_unvalued", "_held_false", "_held_values", "unkeyed"):
+        monkeypatch.setattr(reads.Reader, name, walk)
+    monkeypatch.setattr(fin_queries.Adapter, "year_valued", walk)
+
+
+def _add_statement(tmp_path, cui, turnover, employees):
+    """A company in the financial statements that isn't in Harvey (yet)."""
+    from harvey.modules.ro.mf_financials import derived, store
+
+    con = sqlite3.connect(tmp_path / "financials.db")
+    con.execute("INSERT INTO accounts (cui, year, form, turnover, employees) "
+                "VALUES (?, 2024, 'UU', ?, ?)", (str(cui), turnover, employees))
+    con.execute("DELETE FROM latest")
+    con.execute(store.FILL_LATEST)
+    derived.build(con)
+    con.commit()
+    con.close()
+
+
+@pytest.mark.asyncio
+async def test_register_conditions_read_the_kept_sets_and_follow_changes(state, monkeypatch,
+                                                                         tmp_path):
+    i = state.ids
+    _add_statement(tmp_path, 1000020, 3_000_000, 15)
+    walked = _verdicts(state)
+    assert {v for counts, _ in walked for v in counts.values()} != {0}
+    with monkeypatch.context() as m:
+        _no_walks(m)
+        with pytest.raises(AssertionError, match="walked"):
+            _verdicts(state)
+    assert await state.recount_register_tally() > 0
+    assert not await state.read("register_tally_stale")
+    assert plans_rows(state, "SELECT COUNT(DISTINCT module) FROM register_set") == 4
+    with monkeypatch.context() as m:
+        _no_walks(m)
+        assert _verdicts(state) == walked
+        # A firm pulled after the job: read from the register by its key.
+        (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+        counts, rows = (await state.cohort_verdicts([], [], [{"code": "TURNOVER", "min": 1e6}]))
+        assert counts["match"] == 2 and {int(x["id"]) for x in rows} == {i["beta"], int(delta)}
+        # A merge: the record's values count on its survivor.
+        await state.merge_companies(str(i["listing"]), str(i["beta"]))
+        counts, rows = await state.cohort_verdicts([], [], [{"code": "TURNOVER", "min": 1e6}])
+        assert {int(x["id"]) for x in rows} == {i["listing"], int(delta)}
+        assert counts == {"match": 2, "possible": 1, "no_match": 1}
+        changed = _verdicts(state)
+    # The same answers as the walks give.
+    assert _verdicts(state) == changed
+    assert plans_rows(state, "SELECT COUNT(*) FROM register_set WHERE part = 2024") == 6
+    # A firm removed: its bits are cleared from the kept sets, which stay
+    # in use (no job queued) and give what the walks give.
+    await state.undo_merge(str(i["beta"]))
+    await state.recount_register_tally()           # (a merge's counts change)
+    gama = str(i["gama"])
+    assert (await state.remove_company(gama))["removed"]
+    assert not await state.read("register_tally_stale")
+    with monkeypatch.context() as m:
+        _no_walks(m)
+        removed = _verdicts(state)
+    assert all(gama not in {str(f) for f, _ in rows} for _, rows in removed)
+    _drop_kept_sets(state)
+    assert _verdicts(state) == removed
+    await state.recount_register_tally()
+    assert not await state.read("register_tally_stale")
+    with monkeypatch.context() as m:
+        _no_walks(m)
+        assert _verdicts(state) == removed
+
+
+def _drop_kept_sets(state):
+    con = sqlite3.connect(state.db_path)
+    con.execute("DELETE FROM register_set")
+    con.commit()
+    con.close()
+
+
+@pytest.mark.asyncio
+async def test_a_year_no_statement_is_loaded_for_reads_nothing(state, monkeypatch):
+    def walk(*a, **k):
+        raise AssertionError("read the statements for a year that isn't loaded")
+
+    from harvey.modules.ro.mf_financials import queries as fin_queries
+
+    monkeypatch.setattr(fin_queries.Adapter, "year_valued", walk)
+    monkeypatch.setattr(fin_queries.Adapter, "year_held", walk)
+    counts, _ = await state.cohort_verdicts([], [], [{"code": "TURNOVER", "min": 1, "key": "2019"}])
+    assert counts == {"match": 0, "possible": 4, "no_match": 0}
+
+
+@pytest.mark.asyncio
+async def test_anaf_answers_kept_while_a_page_holds_the_file_move_its_mark(state, tmp_path):
+    # ANAF's file is written in WAL mode: a batch's answers go to anaf.db-wal
+    # and the file itself keeps its size and time, also once a read-only
+    # reader that held it closes last. Its load mark moves all the same, so
+    # the counts are queued again and the kept sets aren't read.
+    from harvey.modules.ro.anaf import service
+
+    path = tmp_path / "anaf.db"
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.close()
+    assert await state.recount_register_tally() > 0
+    assert not await state.read("register_tally_stale")
+    i = state.ids
+    con, r = _reader(state)
+    try:
+        anaf = next(a for a in r.registers if a.module == "anaf")
+        before, size = anaf.marks(con), anaf.file_mark()
+        verdict = {int(x["id"]): x["verdict"] for x in r.cohort_verdicts(
+            ["EFACTURA_REGISTERED"], [], verdicts=reads.Reader.VERDICTS)[1]}
+        assert verdict[i["beta"]] == "possible"                 # never asked
+        service.keep(path, {str(BETA): {"date_generale": {"cui": BETA,
+                                                          "statusRO_e_Factura": True}}}, set())
+        assert (tmp_path / "anaf.db-wal").stat().st_size > 0
+        assert anaf.file_mark() == size and anaf.marks(con) != before
+        verdict = {int(x["id"]): x["verdict"] for x in r.cohort_verdicts(
+            ["EFACTURA_REGISTERED"], [], verdicts=reads.Reader.VERDICTS)[1]}
+        assert verdict[i["beta"]] == "match"
+    finally:
+        con.close()
+    assert anaf.file_mark() == size
+    assert await state.read("register_tally_stale")
+    await state.recount_register_tally()
+    assert not await state.read("register_tally_stale")
+
+
+@pytest.mark.asyncio
+async def test_a_registry_reload_moves_the_statements_filed_answers(state, tmp_path):
+    # ``filed`` says no from the registry's operating firms: a registry
+    # reload builds it again (derived.refile) while the statements stay as
+    # they were, and the kept FILED_ACCOUNTS set must not outlive it.
+    import time
+
+    from harvey.modules.ro.mf_financials import derived as fin_derived
+    from harvey.modules.ro.onrc import derived as reg_derived
+
+    def reload_registry(sql):
+        con = sqlite3.connect(tmp_path / "registry.db")
+        con.execute(sql)
+        con.execute("UPDATE meta SET value = value || '+' WHERE key = 'loaded_at'")
+        reg_derived.build(con)
+        con.commit()
+        con.close()
+        return fin_derived.refile(tmp_path / "financials.db", tmp_path / "registry.db")
+
+    def verdict(fid):
+        reads.SETS.clear()
+        con, r = _reader(state)
+        try:
+            _, rows = r.cohort_verdicts(["FILED_ACCOUNTS"], [], [],
+                                        verdicts=reads.Reader.VERDICTS)
+            return {int(x["id"]): x["verdict"] for x in rows}.get(fid)
+        finally:
+            con.close()
+
+    await state.set_signal_status("FILED_ACCOUNTS", "confirmed")
+    fin = sqlite3.connect(tmp_path / "financials.db")
+    fin.execute("INSERT OR IGNORE INTO complete_year VALUES (2024)")
+    fin.commit()
+    fin.close()
+    # An operating firm with no statement for the final year: filed says no.
+    assert reload_registry(
+        "INSERT INTO firms (reg, name, cui, form, county, county_code, locality, address, "
+        "website, domain, registered, statuses, operating) VALUES ('J08/4/2015', "
+        "'EXEMPLU DELTA SRL', '1000020', 'SRL', 'Brașov', 'BV', 'Brașov', "
+        "'Str. Exemplului nr. 4', '', '', '01/02/2015', '1048', 1)")["filed_no"] == 1
+    (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    time.sleep(2.1)                     # pulled before the walk starts (not read again)
+    await state.recount_register_tally()
+    assert not await state.read("register_tally_stale")
+    assert verdict(int(delta)) == "no_match"
+    # Reloaded: it no longer operates, so filed has no row for it.
+    assert reload_registry("UPDATE firms SET operating = 0 WHERE cui = '1000020'")[
+        "filed_no"] == 0
+    assert await state.read("register_tally_stale")
+    assert verdict(int(delta)) == "possible"
+    _drop_kept_sets(state)
+    assert verdict(int(delta)) == "possible"
+
+
+@pytest.mark.asyncio
+async def test_many_identifiers_given_since_the_kept_sets_queue_the_job(state, monkeypatch):
+    # Every first visit would read each of them again from the registers.
+    assert await state.recount_register_tally() > 0
+    await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    assert not await state.read("register_tally_stale")
+    monkeypatch.setattr(reads, "PATCH_MAX", 0)
+    assert await state.read("register_tally_stale")
+
+
+@pytest.mark.asyncio
+async def test_an_export_credits_a_register_for_any_signal_it_has(state, tmp_path):
+    # A statement with no turnover (the register's first signal) but a
+    # headcount still came from the statements.
+    _add_statement(tmp_path, 1000020, None, 3)
+    (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    con, r = _reader(state)
+    try:
+        assert "mf_financials" in r.modules_of([delta])
+        assert "mf_financials" not in r.modules_of([state.ids["gama"]])
+    finally:
+        con.close()
+
+
+def plans_rows(state, sql):
+    con = sqlite3.connect(state.db_path)
+    try:
+        return con.execute(sql).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_firm_sets_as_bitmaps_combine_like_sets():
+    from harvey.overlay import bitmaps
+
+    universe = set(range(1, 300))
+    a, b = {1, 5, 64, 65, 200}, {5, 6, 65, 299}
+    sets = {"a": a, "b": b, "~a": universe - a, "~b": universe - b}
+    forms = {"a": (a, False), "b": (b, False), "~a": (a, True), "~b": (b, True)}
+    for x, (xs, xn) in forms.items():
+        for y, (ys, yn) in forms.items():
+            for left, right in ((reads.FirmSet(xs, xn), reads.FirmSet(bits=bitmaps.bits_of(ys),
+                                                                      neg=yn)),
+                                (reads.FirmSet(bits=bitmaps.bits_of(xs), neg=xn),
+                                 reads.FirmSet(ys, yn))):
+                for op, want in (("&", sets[x] & sets[y]), ("|", sets[x] | sets[y])):
+                    got = left & right if op == "&" else left | right
+                    assert {f for f in universe if f in got} == want, (x, op, y)
+                    assert got.count(len(universe)) == len(want), (x, op, y)
+    assert bitmaps.ids_of(bitmaps.bits_of(a)) == sorted(a)
+    assert bitmaps.unpack(bitmaps.pack(bitmaps.bits_of(b))) == bitmaps.bits_of(b)
+    assert bitmaps.ids_of(0) == [] and bitmaps.bits_of([]) == 0
+
+
 # ── Duplicates on the overlay ──
 
 @pytest.mark.asyncio
@@ -655,3 +988,17 @@ async def test_duplicates_scan_lists_groups_and_merges(state, client):
     assert {(r["company_a"], r["company_b"]) for r in apart} == {(str(i["alfa"]),
                                                                   str(i["beta"]))}
     assert apart[0]["a"]["name"] == "EXEMPLU ALFA SRL"
+
+
+def test_the_dashboard_loads_what_first_requests_need_before_serving(client, monkeypatch):
+    # (A page's first request otherwise pays for the manifests, the CAEN
+    # reference and the settings file.)
+    import harvey.dashboard as dash
+
+    monkeypatch.setattr(reads, "_CAEN", None)
+    monkeypatch.setenv("HARVEY_DASHBOARD_WORKER", "off")
+    warmed = []
+    real = dash._warm_up
+    monkeypatch.setattr(dash, "_warm_up", lambda: warmed.append(real()))
+    with client:
+        assert warmed and reads._CAEN is not None

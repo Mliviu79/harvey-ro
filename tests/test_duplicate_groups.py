@@ -23,6 +23,7 @@ from harvey.models import Company
 from harvey.modules import ingest
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 TOWNS = ["Brașov", "Cluj", "Sibiu", "Iași", "Arad", "Deva", "Turda", "Bacău"]
 
@@ -47,6 +48,9 @@ def _phone(n: int) -> str:
 
 
 async def _listing(state, name, town, *, phone="", domain="", address="", n=0, cui=""):
+    if cui:
+        # A registered firm: the registry beside the database describes it.
+        slim.describe(state, slim.firm(name, cui, town, address=address))
     return await state.add_company(Company(
         name=name, location=f"{town}, Romania", phone=phone, domain=domain,
         website=f"https://{domain}" if domain else "", address=address, cui=cui,
@@ -82,23 +86,15 @@ async def _groups(state):
 
 
 def _snapshot(path):
-    tables = {
-        "companies": "SELECT id, name, cui, external_id, domain, website, phone, address, "
-                     "location, merged_into FROM companies ORDER BY id",
-        "observations": "SELECT id, company_id FROM observations ORDER BY id",
-        "company_ids": "SELECT company_id, kind, value FROM company_ids ORDER BY 1, 2, 3",
-        "locations": "SELECT id, company_id, locality, address, external_id FROM locations ORDER BY id",
-        "links": "SELECT id, company_id, contact_id, location_id FROM company_contacts ORDER BY id",
-        "candidates": "SELECT company_a, company_b, status FROM match_candidates "
-                      "WHERE status = 'separate' ORDER BY 1, 2",
-    }
-    return {name: _rows(path, sql) for name, sql in tables.items()}
+    out = slim.snapshot(path)
+    out["candidates"] = slim.q(path, "SELECT a, b, status FROM match_candidate "
+                                     "WHERE status = 'separate' ORDER BY 1, 2")
+    return out
 
 
 # ── Groups ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [3, 4, 6])
 async def test_a_chain_of_pairs_is_one_group_merged_in_one_go(state, size):
@@ -115,12 +111,13 @@ async def test_a_chain_of_pairs_is_one_group_merged_in_one_go(state, size):
     result = await state.merge_group(keep, [m for m in ids if m != keep])
     assert result["survivor"] == keep and len(result["merged"]) == size - 1
     assert await _groups(state) == []
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM companies WHERE merged_into = ''") == [(1,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm WHERE live = 0") == [(1,)]
     merges = await state.merges()
     assert {m["group_id"] for m in merges} == {result["group_id"]}
     # Each member's town is one of the keeper's places now.
-    assert len(_rows(state.db_path, "SELECT id FROM locations WHERE company_id = ?", keep)) \
+    assert len(_rows(state.db_path, "SELECT id FROM locations WHERE firm = ?", int(keep))) \
         == size - 1
+    assert slim.recount_diff(state) == {}
 
 
 @pytest.mark.asyncio
@@ -135,7 +132,6 @@ async def test_a_pair_made_stale_by_a_merge_follows_the_survivor(state):
     assert b not in {m["id"] for m in group["members"]}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_undo_one_member_then_the_whole_group(state):
     ids = await _chain(state, 4)
@@ -188,7 +184,6 @@ async def test_all_different_takes_the_whole_group_off(state):
 # ── Two CUIs ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_group_with_two_cuis_never_merges_them(state):
     x = await _listing(state, "Alfa Unu SRL", "Brașov", phone=_phone(1), cui="90000001")
@@ -212,14 +207,13 @@ async def test_a_group_with_two_cuis_never_merges_them(state):
     with pytest.raises(resolver.MergeRefused) as refused:
         await state.merge_group(keep, [listing, other])
     assert refused.value.code == "different_cui"
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM company_merges") == [(0,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM merge") == [(0,)]
 
     await state.merge_group(keep, [listing])
     # The listing is the kept firm's now; with the other firm, a CUI conflict.
     assert await _groups(state) == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_chain_phone_on_300_firms_proposes_nothing(state):
     async with state.batch() as batch:
@@ -227,14 +221,14 @@ async def test_a_chain_phone_on_300_firms_proposes_nothing(state):
             await batch.add_company(Company(name=f"Farmacia {n} Exemplu SRL", cui=str(91000000 + n),
                                             location=f"{TOWNS[n % 8]}, Romania",
                                             phone="+40210000300"))
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM company_ids WHERE kind = 'phone' "
-                                "AND value = '+40210000300'") == [(300,)]
+    assert _rows(state.db_path, "SELECT n_firms FROM contact WHERE value = '+40210000300'") \
+        == [(300,)]
     saved = await state.save_company(Company(name="Farmacia Exemplu", location="Deva, Romania",
                                              phone="+40210000300", external_id="osm:node/1"))
     assert saved.created and saved.match.company_id is None and not saved.match.others
     assert await _scan(state) == (0, 0)
     assert await _groups(state) == []
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM match_candidates") == [(0,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM match_candidate") == [(0,)]
 
 
 @pytest.mark.asyncio
@@ -248,7 +242,6 @@ async def test_two_firms_sharing_a_phone_are_never_a_question(state):
 # ── Branches as locations ──
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_listing_with_the_one_firms_phone_becomes_its_location(state):
     firm = await _listing(state, "Exemplu Dent SRL", "Brașov", phone=_phone(3), cui="90000005",
@@ -262,24 +255,27 @@ async def test_a_listing_with_the_one_firms_phone_becomes_its_location(state):
     assert saved.company_id == firm and not saved.created
     [merge] = await state.merges()
     assert merge["survivor"] == firm and {"phone", "one_firm"} <= {r["code"] for r in merge["reasons"]}
-    [place] = _rows(state.db_path, "SELECT id, company_id, locality, address, external_id "
-                                   "FROM locations")
+    # The listing's place is one of the firm's (its record's, which stands
+    # for the firm now: a merge moves no rows).
+    [place] = (await state.read("of_company", firm))["locations"]
     # (A search result's street address isn't kept: discover.business_record.)
-    assert place[1:] == (firm, "Cluj", "", "dataforseo:cid:31")
+    assert (place["locality"], place["address"], place["external_id"]) == (
+        "Cluj", "", "dataforseo:cid:31")
+    assert slim.q(state, "SELECT firm FROM locations") == [(int(merge["merged"]),)]
     # The listing's phone reaches the firm through that place.
-    tied = _rows(state.db_path, "SELECT DISTINCT l.location_id FROM company_contacts l "
-                                "JOIN contacts ct ON ct.id = l.contact_id "
-                                "WHERE l.company_id = ? AND ct.value = ? AND l.location_id != 0",
-                 firm, _phone(3))
-    assert tied == [(place[0],)]
+    tied = _rows(state.db_path, "SELECT DISTINCT l.location FROM link l "
+                                "JOIN contact ct ON ct.id = l.contact "
+                                "WHERE ct.value = ? AND l.location != 0", _phone(3))
+    assert tied == [(place["id"],)]
 
     await state.undo_merge(merge["merged"])
     after = _snapshot(state.db_path)
-    assert after["locations"] == [] and all(r[3] == 0 for r in after["links"] if r[1] == firm)
-    assert {r[0] for r in after["companies"]} == {r[0] for r in before["companies"]} | {merge["merged"]}
+    # Back on its own, the listing keeps its place; the firm has none.
+    assert (await state.read("of_company", firm))["locations"] == []
+    assert {r[0] for r in after["firm"]} == {r[0] for r in before["firm"]} | {int(merge["merged"])}
+    assert slim.recount_diff(state) == {}
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_a_listing_matching_two_firms_goes_to_review(state):
     x = await _listing(state, "Alfa SRL", "Brașov", phone=_phone(4), cui="90000006")
@@ -295,7 +291,6 @@ async def test_a_listing_matching_two_firms_goes_to_review(state):
     assert await state.merges() == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_group_merge_keeps_every_branch_address(state):
     firm = await _listing(state, "Exemplu Clinic SRL", "Brașov", cui="90000008",
@@ -316,8 +311,8 @@ async def test_a_group_merge_keeps_every_branch_address(state):
 
     before = _snapshot(state.db_path)
     await state.merge_group(firm, branches)
-    places = _rows(state.db_path, "SELECT locality FROM locations WHERE company_id = ? "
-                                  "ORDER BY locality", firm)
+    places = _rows(state.db_path, "SELECT locality FROM locations WHERE firm = ? "
+                                  "ORDER BY locality", int(firm))
     assert [p[0] for p in places] == ["Arad", "Cluj", "Deva", "Iași", "Sibiu"]
     await state.undo_group(firm)
     assert _snapshot(state.db_path) == before
@@ -335,20 +330,17 @@ async def test_the_same_address_adds_no_location(state):
 
 
 async def _email(state, company_id, address):
-    async with state._connect() as db:
-        await contacts.add(db, company_id, contacts.Found("email", address, source="profile"))
-        await db.commit()
+    await state.add_contacts(company_id, [contacts.Found("email", address, source="profile")])
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_shared_email_is_a_question(state):
     a = await _listing(state, "Alfa Unu", "Brașov", n=1)
     b = await _listing(state, "Beta Doi", "Cluj", n=2)
     for cid in (a, b):
         await _email(state, cid, "Office@Exemplu-Dent.example.com")
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM company_ids WHERE kind = 'email' "
-                                "AND value = 'office@exemplu-dent.example.com'") == [(2,)]
+    assert _rows(state.db_path, "SELECT n_firms FROM contact "
+                                "WHERE value = 'office@exemplu-dent.example.com'") == [(2,)]
     await state.scan_duplicates()
     [group] = await _groups(state)
     assert group["score"] == 0.8
@@ -356,7 +348,6 @@ async def test_a_shared_email_is_a_question(state):
     assert "office@exemplu-dent.example.com" in group["members"][0]["emails"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("address", ["exemplu.fictiv.0000@gmail.com", "exemplu.fictiv.0000@yahoo.ro"])
 async def test_a_free_mail_address_is_nobodys_identity(state, address):
@@ -369,26 +360,23 @@ async def test_a_free_mail_address_is_nobodys_identity(state, address):
     assert await _groups(state) == []
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
-@pytest.mark.asyncio
-async def test_existing_email_links_become_keys_on_upgrade(tmp_path):
-    from harvey.state import MIGRATIONS
-    path = str(tmp_path / "old.db")
-    sm = StateManager(path)
-    await sm.init_db()
-    cid = await sm.add_company(Company(name="Exemplu", location="Cluj"))
-    async with sm._connect() as db:
-        await contacts.add(db, cid, contacts.Found("email", "ana@exemplu.example.com"))
-        await db.commit()
-    with sqlite3.connect(path) as con:      # as before v24: no email keys
-        con.execute("DELETE FROM company_ids WHERE kind = 'email'")
-        con.execute("DROP TRIGGER trg_company_contacts_email")
-        con.execute(f"PRAGMA user_version = {len(MIGRATIONS) - 1}")
-    with sqlite3.connect(path) as con:
-        con.executescript(MIGRATIONS[-1].replace(
-            "ALTER TABLE company_merges ADD COLUMN group_id INTEGER DEFAULT 0;", ""))
-    assert _rows(path, "SELECT company_id, value FROM company_ids WHERE kind = 'email'") == \
-        [(cid, "ana@exemplu.example.com")]
+def test_email_keys_on_file_stay_keys_after_the_upgrade(tmp_path):
+    from harvey.overlay import migrate, schema
+    from tests import v24
+
+    old = tmp_path / "old.db"
+    v24.build(old)
+    with sqlite3.connect(old) as con:
+        con.execute("INSERT INTO companies (id, name, location, source, created_at) "
+                    "VALUES ('c-1', 'Exemplu', 'Cluj, Romania', 'discover:osm', "
+                    "'2026-01-01 10:00:00')")
+        con.execute("INSERT INTO company_ids (company_id, kind, value, source) "
+                    "VALUES ('c-1', 'email', 'ana@exemplu.example.com', 'site')")
+    new = tmp_path / "new.db"
+    migrate.migrate(old, new, min_free=0)
+    assert _rows(new, "SELECT kind, value, firm FROM firm_key WHERE kind = ?",
+                 schema.FIRM_KEY["email"]) == [(schema.FIRM_KEY["email"],
+                                                "ana@exemplu.example.com", 1)]
 
 
 # ── The scan ──
@@ -479,7 +467,6 @@ def test_group_merge_take_out_and_undo_over_the_api(client):
     assert client.get("/api/duplicates").json()["pending"] == 0
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_the_api_refuses_a_group_with_two_cuis(client):
     async def seed():
         sm = StateManager(str(client.db_path))
@@ -491,7 +478,7 @@ def test_the_api_refuses_a_group_with_two_cuis(client):
     x, y, z = asyncio.run(seed())
     r = client.post("/api/duplicates/merge", json={"keep": x, "members": [z, y]})
     assert r.status_code == 409 and r.json()["error"] == "different_cui"
-    assert _rows(client.db_path, "SELECT COUNT(*) FROM company_merges") == [(0,)]
+    assert _rows(client.db_path, "SELECT COUNT(*) FROM merge") == [(0,)]
     bad = client.post("/api/duplicates/merge", json={"keep": x})
     assert bad.status_code == 400
 
@@ -538,14 +525,20 @@ def test_cli_lists_groups_merges_them_and_undoes_the_group(tmp_path, monkeypatch
 # ── What the review of the group merge found ──
 
 
-def _key(path, company_id, kind, value):
-    with sqlite3.connect(path) as con:
-        con.execute("INSERT OR IGNORE INTO company_ids (company_id, kind, value) VALUES (?, ?, ?)",
-                    (company_id, kind, value))
+async def _key(state, company_id, kind, value):
+    """A key found for a record: a phone as a contact linked to it, a
+    domain as a found key beside the one it holds."""
+    if kind == "phone":
+        await state.add_contacts(company_id, [contacts.Found("phone", value, source="site")])
+        return
+    from harvey.overlay import schema
+
+    with sqlite3.connect(state.db_path) as con:
+        con.execute("INSERT OR IGNORE INTO firm_key (kind, value, firm) VALUES (?, ?, ?)",
+                    (schema.FIRM_KEY[kind], value, int(company_id)))
         con.commit()
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_sure_pairs_chaining_to_two_firms_are_one_question(state):
     """L1 holds only F1's phone, L2 only F2's, and L1 and L2 are one business
@@ -558,10 +551,10 @@ async def test_sure_pairs_chaining_to_two_firms_are_one_question(state):
     l1 = await _listing(state, "Exemplu Zeta", "Sibiu", phone=_phone(913), n=911)
     l2 = await _listing(state, "Exemplu Zeta", "Sibiu", phone=_phone(914), n=912)
     for cid, value in ((l1, _phone(911)), (l2, _phone(912)), (l2, _phone(913))):
-        _key(state.db_path, cid, "phone", value)
+        await _key(state, cid, "phone", value)
     done = await state.scan_duplicates()
     assert done["merged"] == 0
-    assert _rows(state.db_path, "SELECT COUNT(*) FROM companies WHERE merged_into != ''") == [(0,)]
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm WHERE live != 0") == [(0,)]
     [group] = await _groups(state)
     assert {l1, l2} <= {m["id"] for m in group["members"]}
     assert "several_firms" in {r["code"] for r in group["reasons"]}
@@ -572,7 +565,6 @@ async def test_sure_pairs_chaining_to_two_firms_are_one_question(state):
     assert other == [f2]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_undoing_one_member_leaves_what_another_still_gives_the_keeper(state):
     keep = await _listing(state, "Exemplu Dent SRL", "Brașov", phone=_phone(921),
@@ -585,25 +577,35 @@ async def test_undoing_one_member_leaves_what_another_still_gives_the_keeper(sta
         await state.add_company_source(cid, "discover:serper")
     await state.merge_group(keep, [a, b])
 
-    def held(cid):
-        return (_rows(state.db_path, "SELECT ct.value FROM company_contacts l JOIN contacts ct "
-                                     "ON ct.id = l.contact_id WHERE l.company_id = ? "
-                                     "AND ct.kind = 'email'", cid),
-                _rows(state.db_path, "SELECT source FROM company_sources WHERE company_id = ? "
-                                     "AND source = 'discover:serper'", cid),
-                _rows(state.db_path, "SELECT value FROM company_ids WHERE company_id = ? "
-                                     "AND kind = 'email'", cid))
+    async def held(cid):
+        """What the company's page shows: its emails, its serper source and
+        its email keys (its records')."""
+        group = [int(cid)] + [r[0] for r in _rows(
+            state.db_path, "SELECT id FROM firm WHERE live = ? AND live != 0", int(cid))]
+        if (await state.get_company(cid)).merged_into:
+            group = []
+        marks = ",".join("?" * len(group)) or "NULL"
+        return (_rows(state.db_path, f"SELECT DISTINCT ct.value FROM link l JOIN contact ct "
+                                     f"ON ct.id = l.contact WHERE l.firm IN ({marks}) "
+                                     f"AND ct.kind = 1", *group),
+                _rows(state.db_path, f"SELECT DISTINCT s.name FROM firm_source fs JOIN source s "
+                                     f"ON s.id = fs.source WHERE fs.firm IN ({marks}) "
+                                     f"AND s.name = 'discover:serper'", *group),
+                _rows(state.db_path, f"SELECT DISTINCT value FROM firm_key WHERE firm IN ({marks}) "
+                                     f"AND kind = 1", *group))
     await state.undo_merge(a)
-    emails, sources, keys = held(keep)
-    assert emails and sources and keys == [("office@dent.example.com",)]
-    assert held(a)[0] and held(a)[2]            # a has its own back, key and all
+    emails, sources, keys = await held(keep)
+    assert emails == keys == [("office@dent.example.com",)] and sources
+    a_has = await held(a)
+    assert a_has[0] and a_has[1] and a_has[2]   # a has its own back, key and all
     # Undoing b too leaves the keeper as it was before either merge.
     await state.undo_merge(b)
-    assert held(keep) == ([], [], [])
-    assert held(b)[0] and held(b)[1] and held(b)[2]
+    assert await held(keep) == ([], [], [])
+    b_has = await held(b)
+    assert b_has[0] and b_has[1] and b_has[2]
+    assert slim.recount_diff(state) == {}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_undoing_one_member_keeps_a_column_another_member_fills(state):
     keep = await _listing(state, "Exemplu Gama SRL", "Brașov", cui="90000931")
@@ -611,16 +613,15 @@ async def test_undoing_one_member_keeps_a_column_another_member_fills(state):
     b = await _listing(state, "Exemplu Gama Sibiu", "Sibiu", phone=_phone(933), n=932)
     before = _snapshot(state.db_path)
     await state.merge_group(keep, [a, b])
-    assert (await state.get_company(keep)).phone == _phone(932)
+    assert (await state.get_company(keep)).phone.replace(" ", "") == _phone(932)
     await state.undo_merge(a)
-    assert (await state.get_company(keep)).phone == _phone(933)
+    assert (await state.get_company(keep)).phone.replace(" ", "") == _phone(933)
     assert (await state.get_company(a)).external_id == "dataforseo:cid:931"
     await state.undo_merge(b)
-    assert _snapshot(state.db_path)["companies"] == before["companies"]
-    assert _snapshot(state.db_path)["company_ids"] == before["company_ids"]
+    assert _snapshot(state.db_path) == before
+    assert slim.recount_diff(state) == {}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_two_branches_in_one_town_keep_their_place_when_one_is_undone(state):
     keep = await _listing(state, "Exemplu Eta SRL", "Brașov", phone=_phone(941),
@@ -629,35 +630,35 @@ async def test_two_branches_in_one_town_keep_their_place_when_one_is_undone(stat
     b = await _listing(state, "Exemplu Eta Doi", "Cluj", phone=_phone(943))
     before = _snapshot(state.db_path)
     await state.merge_group(keep, [a, b])
-    [(place,)] = _rows(state.db_path, "SELECT id FROM locations WHERE company_id = ?", keep)
+    # One place per merge (each undone with its own merge).
+    assert _rows(state.db_path, "SELECT locality FROM locations WHERE firm = ?",
+                 int(keep)) == [("Cluj",), ("Cluj",)]
     await state.undo_merge(a)
-    assert _rows(state.db_path, "SELECT id FROM locations WHERE company_id = ?", keep) \
-        == [(place,)]
-    tied = _rows(state.db_path, "SELECT l.location_id FROM company_contacts l JOIN contacts ct "
-                                "ON ct.id = l.contact_id WHERE ct.value = ?", _phone(943))
-    assert tied and all(t == (place,) for t in tied)
+    assert [p["locality"] for p in (await state.read("of_company", keep))["locations"]] \
+        == ["Cluj"]
+    # (b's phone stays linked to b's record: a merge re-ties no link.)
+    assert [c["value"] for c in (await state.read("of_company", keep))["contacts"]
+            if c["kind"] == "phone"] == sorted([_phone(941), _phone(943)])
     await state.undo_merge(b)
     assert _snapshot(state.db_path) == before
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_two_records_without_a_cui_sharing_a_website_are_a_question(state):
     x = await _listing(state, "Exemplu Rho", "Brașov", phone=_phone(951), n=951)
     y = await _listing(state, "Exemplu Sigma", "Deva", phone=_phone(952), n=952)
     for cid in (x, y):
-        _key(state.db_path, cid, "domain", "grup.example.com")
+        await _key(state, cid, "domain", "grup.example.com")
     assert await _scan(state) == (0, 1)
     [group] = await _groups(state)
     assert "shared_site" in {r["code"] for r in group["reasons"]}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_pair_waiting_on_the_list_is_not_news_on_every_look(state):
     await _listing(state, "Exemplu Iota SRL", "Brașov", phone=_phone(961), cui="90000961")
     branch = await _listing(state, "Exemplu Iota Cluj", "Cluj", phone=_phone(962), n=961)
-    _key(state.db_path, branch, "phone", _phone(961))
+    await _key(state, branch, "phone", _phone(961))
     assert await _scan(state) == (1, 0)
     await state.undo_merge(branch)
     assert await _scan(state) == (0, 0)
@@ -665,7 +666,6 @@ async def test_a_pair_waiting_on_the_list_is_not_news_on_every_look(state):
     assert await state.count_duplicates() == 1
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_an_email_found_after_a_merge_goes_back_with_its_link(state):
     firm = await _listing(state, "Exemplu Kappa SRL", "Brașov", phone=_phone(971),
@@ -674,9 +674,15 @@ async def test_an_email_found_after_a_merge_goes_back_with_its_link(state):
     await state.merge_group(firm, [branch])
     await state.add_contacts(firm, [contacts.Found("email", "cluj@kappa.example.com",
                                                    source="site")], origin=branch)
+    assert "cluj@kappa.example.com" in {c["value"] for c in await _emails_of(state, firm)}
     await state.undo_merge(branch)
-    keys = _rows(state.db_path, "SELECT company_id FROM company_ids WHERE kind = 'email'")
-    assert keys == [(branch,)]
+    # Linked to the record it was found for: it goes back with it.
+    assert [c["value"] for c in await _emails_of(state, branch)] == ["cluj@kappa.example.com"]
+    assert await _emails_of(state, firm) == []
+
+
+async def _emails_of(state, cid):
+    return [c for c in (await state.read("of_company", cid))["contacts"] if c["kind"] == "email"]
 
 
 @pytest.mark.asyncio

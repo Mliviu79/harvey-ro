@@ -54,9 +54,10 @@ def _read(signal: str, column: str) -> Read:
 
 class Adapter(Base):
     module = MODULE
-    # Answers are added a hundred at a time: the file's size and last write
-    # mark it (no statement reads all of it).
-    marks_sql = ""
+    # Answers are added a hundred at a time, into the file's write-ahead
+    # log: its own size and time don't move, so every save marks it in
+    # ``meta`` (store.mark_saved).
+    marks_sql = "SELECT value FROM {alias}.meta WHERE key = 'saved'"
     reads = (
         _read("VAT_REGISTERED", "vat"),
         _read("VAT_ON_CASH", "vat_cash"),
@@ -71,6 +72,18 @@ class Adapter(Base):
         _read("PHONE_NUMBER", "phone"),
         _read("ADDRESS", "address"),
     )
+
+    def marks(self, con: sqlite3.Connection) -> str | None:
+        """When answers were last kept; a file no save has written since a
+        rewrite made it without ``meta`` (never written in WAL mode yet):
+        its size and last write."""
+        if self.alias not in {r[1] for r in con.execute("PRAGMA database_list")}:
+            return None
+        try:
+            row = con.execute(self.sql("marks")).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        return f"saved {row[0]}" if row else self.file_mark()
 
     def held_yes_sql(self, signal: str, scheme: str = "") -> str | None:
         if signal in FLAGS and not scheme:

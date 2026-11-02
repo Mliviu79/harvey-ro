@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import harvey.dashboard as dash
+from harvey.models import Company
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
@@ -59,17 +60,32 @@ def _ts(minutes_ago=0):
 
 
 def _company(env, cid, domain="", profiled=False, checked=False):
-    _sql(env, "INSERT INTO companies (id, name, domain, profile_checked_at) VALUES (?, ?, ?, ?)",
-         (cid, cid, domain, _ts(30) if profiled else None))
+    """A company named ``cid`` (its firm id kept in env["ids"]), read 30
+    minutes ago when ``profiled``, searched by the finder when ``checked``."""
+    async def add():
+        state = StateManager(db_path=str(env["db"]))
+        fid = await state.add_company(Company(name=cid, domain=domain))
+        if profiled:
+            await state.mark_company_profiled(fid)
+        return fid
+    fid = asyncio.run(add())
+    env.setdefault("ids", {})[cid] = fid
+    if profiled:
+        _sql(env, "UPDATE firm SET profiled_at = profiled_at - 1800 WHERE id = ?", (int(fid),))
     if checked:
         _searched(env, cid, minutes_ago=30)
+    return fid
 
 
 def _searched(env, cid, minutes_ago=30, outcome="nothing"):
-    """The contact finder searched the company (its searches row)."""
-    _sql(env, "INSERT INTO searches (target, target_id, module, capability, looked_for, "
-              "outcome, searched_at) VALUES ('company', ?, 'contact_finder', 'find_contacts', "
-              "'website,people,email,phone', ?, ?)", (cid, outcome, _ts(minutes_ago)))
+    """The contact finder searched the company (its search row)."""
+    async def record():
+        await StateManager(db_path=str(env["db"])).record_search(
+            "company", env["ids"][cid], "contact_finder", "find_contacts",
+            looked_for="website,people,email,phone", outcome=outcome)
+    asyncio.run(record())
+    _sql(env, "UPDATE search SET at = at - ? WHERE id = (SELECT MAX(id) FROM search)",
+         (minutes_ago * 60,))
 
 
 def _prospect(env, pid, email, email_status="verified", status="new"):
@@ -102,7 +118,6 @@ def test_live_status_without_a_database_file(client, env):
     assert client.get("/api/live-status").status_code == 200
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_businesses_without_a_website_do_not_stall_reading(client, env):
     _company(env, "a", "a.test", profiled=True, checked=True)
     _company(env, "b", "b.test", profiled=True, checked=True)
@@ -132,15 +147,18 @@ def test_unconfirmed_emails_are_reported_not_hidden(client, env):
     assert "1 not confirmed" in step["detail"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_live_run_shows_progress_and_time_left(client, env):
     _sql(env, "INSERT INTO runs (id, stage, status, provider, started_at) "
               "VALUES ('r1', 'profile', 'running', 'http', ?)", (_ts(10),))
-    _sql(env, "INSERT INTO companies (id, name, domain, profile_checked_at) "
-              "VALUES ('a', 'a', 'a.test', ?)", (_ts(1),))
+    a = _company(env, "a", "a.test", profiled=True)
+    _sql(env, "UPDATE firm SET profiled_at = profiled_at + 1740 WHERE id = ?", (int(a),))
     _company(env, "b", "b.test")
-    _sql(env, "INSERT INTO observations (company_id, signal_code, collector, observed_at, "
-              "run_id) VALUES ('a', 'TECH_STACK', 'profile', ?, 'r1')", (_ts(1),))
+
+    async def read():
+        state = StateManager(db_path=str(env["db"]))
+        await state.add_observation("TECH_STACK", company_id=a, collector="profile",
+                                    value_text="WordPress", run_id="r1", observed_at=_ts(1))
+    asyncio.run(read())
     data = client.get("/api/live-status").json()
     assert [r["stage"] for r in data["running"]] == ["profile"]
     assert data["running"][0]["eta_text"].endswith("min left")
@@ -148,7 +166,6 @@ def test_a_live_run_shows_progress_and_time_left(client, env):
     assert data["next"].startswith("Wait") and data["next_tab"] == ""
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_killed_run_is_reported_as_stopped_not_running(client, env):
     _sql(env, "INSERT INTO runs (id, stage, status, provider, started_at) "
               "VALUES ('r1', 'profile', 'running', 'http', ?)", (_ts(120),))
@@ -192,7 +209,6 @@ def test_opted_out_and_unreachable_people_are_never_asked_to_be_sent(client, env
     assert "Open Campaigns" not in client.get("/api/live-status").json()["next"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_find_emails_counts_the_contact_finders_searches(client, env):
     _company(env, "a", "a.test", profiled=True, checked=True)
     _company(env, "b", "b.test", profiled=True)
@@ -204,7 +220,6 @@ def test_find_emails_counts_the_contact_finders_searches(client, env):
     assert data["next_key"] == "find_emails" and data["next_vars"] == {"n": 2}
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_search_a_moment_ago_shows_the_finder_at_work(client, env):
     _company(env, "a", "a.test", profiled=True)
     _searched(env, "a", minutes_ago=1)
@@ -213,7 +228,6 @@ def test_a_search_a_moment_ago_shows_the_finder_at_work(client, env):
     assert data["next_key"] == "finding_emails"
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 def test_a_running_contact_job_shows_the_finder_at_work(env, monkeypatch):
     # No in-process worker: it would put this job (nobody's lease) back in
     # the queue before the request, under load.

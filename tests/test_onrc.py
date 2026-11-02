@@ -5,9 +5,7 @@ the same shape: '^'-separated, UTF-8 with a BOM, a header row. Every
 company, person and number in them is invented.
 """
 
-import os
 import sqlite3
-import tempfile
 
 import httpx
 import pytest
@@ -18,6 +16,7 @@ from harvey.models import Company
 from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 
 DATASET = onrc.Dataset("firme-01-10-2026", "2026-10-01", {})
 
@@ -125,26 +124,29 @@ def files(tmp_path):
 
 
 @pytest_asyncio.fixture
-async def state():
-    with tempfile.TemporaryDirectory() as tmp:
-        sm = StateManager(os.path.join(tmp, "test.db"))
-        await sm.init_db()
-        await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
-        yield sm
+async def state(tmp_path):
+    sm = StateManager(str(tmp_path / "test.db"))
+    await sm.init_db()
+    await sync_vocabulary(sm)
+    for sig in SIGNAL_CATALOG:
+        await sm.set_signal_status(sig["code"], "confirmed")
+    yield sm
 
 
 async def run(state, files, **kw):
+    """An import from the files, with the registry loaded from the same
+    files beside the database: the firms it saves are read from there (as
+    `harvey import-onrc` loads the dataset before it saves)."""
     kw.setdefault("county", "BV")
     kw.setdefault("classes", onrc.parse_classes("dentist"))
+    slim.registry_beside(state, {k: v for k, v in files.items() if v.exists()}, DATASET)
     return await runs.import_registry(state, files, DATASET, **kw)
 
 
-def obs(state, code):
-    with sqlite3.connect(state.db_path) as db:
-        return sorted(r[0] for r in db.execute(
-            "SELECT value_text FROM observations WHERE signal_code = ?", (code,)))
+async def obs(state, code):
+    """What the registry gives ``code`` for the firms saved (read in place:
+    schema 25 stores no register fact)."""
+    return await slim.register_values(state, code)
 
 
 # ── Small parts ──
@@ -216,7 +218,6 @@ def test_malformed_rows_are_skipped(tmp_path):
 
 # ── The import ──
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_import_filters_and_counts(state, files):
     report = await run(state, files)
@@ -236,10 +237,11 @@ async def test_import_filters_and_counts(state, files):
     assert a.domain == "zambet-exemplu.example.ro"
     assert a.website == "https://zambet-exemplu.example.ro"
     assert a.location == "Brașov, Romania"
-    assert a.industry == "Dental practice"
+    # The industry its first current class names, read from the registry
+    # (which class a pull asked for isn't kept).
+    assert a.industry == "Specialist medical practice"
     # Street and number, no block, staircase, floor or flat.
     assert a.address == "Str. Exemplului 12, 500123"
-    assert a.source_url == DATASET.page
 
     b = await state.get_company_by_cui("90000025")
     assert b.location == "Cristian, Brașov, Romania"
@@ -251,15 +253,15 @@ async def test_import_filters_and_counts(state, files):
     assert CNP not in str(vars(h))
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_administrators_only_the_people_who_run_it(state, files):
     await run(state, files)
-    assert obs(state, "CONTACT_FOUND") == [
+    assert await obs(state, "CONTACT_FOUND") == [
         "Andrei-Mihai Doi — Administrator", "Maria Testescu — Administrator"]
-    assert obs(state, "DECISION_MAKER_TITLE") == obs(state, "CONTACT_FOUND")
-    # The class with its CAEN revision: A and H are on Rev.2, B on Rev.3.
-    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
+    assert await obs(state, "DECISION_MAKER_TITLE") == await obs(state, "CONTACT_FOUND")
+    # The class with its CAEN revision: A and H are on Rev.2, B on Rev.3;
+    # A's other authorised class is read too (the registry's whole record).
+    assert await obs(state, "ACTIVITY_CODE") == ["8622/2", "8623/2", "8623/2", "8623/3"]
 
 
 @pytest.mark.asyncio
@@ -273,19 +275,19 @@ async def test_no_personal_data_is_stored(state, files):
         assert private not in dump
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_rerun_updates_without_duplicating(state, files):
     first = await run(state, files)
     again = await run(state, files)
+    assert (first.new_companies, first.known_companies) == (3, 0)
     assert (again.new_companies, again.known_companies) == (0, 3)
-    assert again.observations == 0 and first.observations > 0
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 3
-        assert db.execute("SELECT COUNT(*) FROM runs WHERE stage = 'import'").fetchone()[0] == 2
+    # The registry's facts are read in place: neither run stores any.
+    assert again.observations == first.observations == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM firm") == 3
+    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'import'") == 2
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_shared_website_is_never_a_merge(state, files):
     # The registry's website field is self-declared: the business already on
@@ -302,12 +304,10 @@ async def test_a_shared_website_is_never_a_merge(state, files):
     assert registry.website == "https://zambet-exemplu.example.ro"
     other = await state.get_company_by_domain("zambet-exemplu.example.ro")
     assert other.id == known and other.cui == "" and other.address == ""
-    with sqlite3.connect(state.db_path) as db:
-        assert not db.execute("SELECT 1 FROM observations WHERE company_id = ?",
-                              (known,)).fetchall()
+    assert other.name == "Clinica Zâmbet"
+    assert slim.one(state, "SELECT COUNT(*) FROM firm_ident WHERE firm = ?", int(known)) == 0
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_merges_into_the_same_legal_company(state, files):
     known = await state.add_company(Company(
@@ -317,8 +317,11 @@ async def test_merges_into_the_same_legal_company(state, files):
     assert (report.new_companies, report.known_companies) == (2, 1)
     merged = await state.get_company_by_cui("90000017")
     assert merged.id == known
-    assert merged.name == "Clinica Zâmbet"            # kept, not replaced
-    assert merged.address == "Str. Exemplului 12, 500123"   # gap filled
+    # The registry describes it now: its name and address are read from
+    # there (Harvey's own name for it would be a display name), the
+    # declared site is filled in.
+    assert merged.name == "ZÂMBET EXEMPLU SRL"
+    assert merged.address == "Str. Exemplului 12, 500123"
     assert merged.domain == "zambet-exemplu.example.ro"
     assert report.updated_companies == 1
 
@@ -354,14 +357,12 @@ async def test_unconfirmed_signals_are_not_recorded(state, files):
     assert report.unconfirmed == ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_dry_run_saves_nothing(state, files):
     report = await run(state, files, dry_run=True)
     assert (report.in_area, report.new_companies, report.administrators) == (3, 3, 2)
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM firm") == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM runs") == 0
 
 
 @pytest.mark.asyncio
@@ -476,9 +477,8 @@ def test_class_labels_name_each_code_once():
         "8623 Rev.2/3", "8695 Rev.3", "8690 Rev.2", "4773 Rev.2/3"]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
-async def test_catch_all_code_is_recorded_as_less_certain(state, files):
+async def test_a_catch_all_only_firm_is_counted_and_named_by_it(state, files):
     report = await run(state, files, classes=onrc.parse_classes("kinetoterapeut"))
     assert report.in_area == 3                      # P Q R
     assert report.catch_all_only == 1               # P
@@ -486,24 +486,15 @@ async def test_catch_all_code_is_recorded_as_less_certain(state, files):
     assert p.industry == "Other human health activities (labs, imaging, physio, psychologists)"
     r = await state.get_company_by_cui("90000104")
     assert r.industry == "Physiotherapy"            # its precise code wins
-    with sqlite3.connect(state.db_path) as db:
-        rows = sorted(db.execute(
-            "SELECT c.cui, o.value_text, o.confidence FROM observations o "
-            "JOIN companies c ON c.id = o.company_id "
-            "WHERE o.signal_code = 'ACTIVITY_CODE'").fetchall())
-    assert rows == [("90000082", "8690/2", 0.5), ("90000090", "8695/3", 1.0),
-                    ("90000104", "8690/2", 0.5), ("90000104", "8695/3", 1.0)]
+    # Each firm's classes are read from the registry as filed.
+    assert await obs(state, "ACTIVITY_CODE") == ["8690/2", "8690/2", "8695/3", "8695/3"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
-async def test_catch_all_asked_for_by_code_is_certain(state, files):
+async def test_a_catch_all_asked_for_by_code_is_no_catch_all_only(state, files):
     report = await run(state, files, classes=onrc.parse_classes("", "8690"))
     assert report.catch_all_only == 0
-    with sqlite3.connect(state.db_path) as db:
-        confidences = {c for (c,) in db.execute(
-            "SELECT confidence FROM observations WHERE signal_code = 'ACTIVITY_CODE'")}
-    assert confidences == {1.0}
+    assert report.in_area == 2                      # P R
 
 
 def test_activity_value_reads_back_with_its_revision():
@@ -580,45 +571,45 @@ async def test_several_localities(state, files):
 
 # ── Activities: every class of a kept company, searchable ──
 
-def activities(state, cui):
-    with sqlite3.connect(state.db_path) as db:
-        return sorted(db.execute(
-            "SELECT a.code, a.version, a.source FROM company_activities a "
-            "JOIN companies c ON c.id = a.company_id WHERE c.cui = ?", (cui,)).fetchall())
+async def activities(state, cid):
+    """The classes the registry lists for a company, (code, revision)."""
+    company = await state.read("company", cid)
+    return sorted((a["code"], a["version"]) for a in company["activities"])
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
-async def test_every_authorised_class_of_a_kept_company_is_saved(state, files):
+async def test_every_authorised_class_of_a_kept_company_is_read(state, files):
     # Asked for dentists; A is also authorised for specialist practice.
     report = await run(state, files)
-    assert activities(state, "90000017") == [("8622", 2, "registry"), ("8623", 2, "registry")]
-    assert report.activities == 4         # A: 2, B: 1, H: 1
-    # The signal still records what was asked for, as before.
-    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
+    a = await state.get_company_by_cui("90000017")
+    assert await activities(state, a.id) == [("8622", 2), ("8623", 2)]
+    # Read from the registry, never copied.
+    assert report.activities == 0
     total, rows = await state.search_companies("8622")
     assert [r["cui"] for r in rows] == ["90000017"] and total == 1
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
-async def test_activities_are_saved_without_the_signal_confirmed(state, files):
+async def test_activities_are_read_without_the_signal_confirmed(state, files):
     await state.set_signal_status("ACTIVITY_CODE", "proposed")
     await run(state, files)
-    assert obs(state, "ACTIVITY_CODE") == []
-    assert activities(state, "90000025") == [("8623", 3, "registry")]
+    b = await state.get_company_by_cui("90000025")
+    assert await activities(state, b.id) == [("8623", 3)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
+
+
+
+
 @pytest.mark.asyncio
 async def test_a_class_the_registry_drops_is_dropped(state, files, tmp_path):
     await run(state, files)
     files["caen"] = write(tmp_path / "less.csv", [r for r in CAEN if r[1] != "8622"])
     await run(state, files)
-    assert activities(state, "90000017") == [("8623", 2, "registry")]
+    a = await state.get_company_by_cui("90000017")
+    assert await activities(state, a.id) == [("8623", 2)]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_no_activity_imports_everything_operating_in_the_area(state, files):
     report = await run(state, files, classes=[])
@@ -628,34 +619,31 @@ async def test_no_activity_imports_everything_operating_in_the_area(state, files
     assert report.new_companies == 8
     pharmacy = await state.get_company_by_cui("90000066")
     assert pharmacy.industry == "Pharmacies"
-    assert activities(state, "90000066") == [("4773", 2, "registry")]
+    assert await activities(state, pharmacy.id) == [("4773", 2)]
     # E's pre-2008 code is kept as filed, though it never matches a filter
     # (and this one isn't in the nomenclature, so it names no industry).
-    assert activities(state, "90000058") == [("8623", 1, "registry")]
-    assert (await state.get_company_by_cui("90000058")).industry == ""
-    # Nothing was asked for, so no class is singled out as an observation:
-    # the activities above are the record.
-    assert obs(state, "ACTIVITY_CODE") == []
+    old = await state.get_company_by_cui("90000058")
+    assert await activities(state, old.id) == [("8623", 1)]
+    assert old.industry == ""
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_an_import_is_the_registry_modules_and_says_so(state, files):
     report = await run(state, files)
-    assert report.observations and not report.errors
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT DISTINCT module, capability FROM observations").fetchall() \
-            == [("onrc", "registry_import")]
-        assert db.execute("SELECT params_json FROM runs WHERE provider = 'onrc'").fetchone()
+    assert report.new_companies == 3 and not report.errors
+    assert slim.q(state, "SELECT DISTINCT s.name FROM firm_source fs "
+                         "JOIN source s ON s.id = fs.source") == [("registry:onrc",)]
+    assert slim.one(state, "SELECT params_json FROM runs WHERE provider = 'onrc'")
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_progress_is_reported_while_saving(state, files, monkeypatch):
-    monkeypatch.setattr(runs, "SOURCE_PROGRESS_EVERY", 3)
+    from harvey.overlay import store
+
+    monkeypatch.setattr(store, "PULL_CHUNK", 3)
     seen = []
     await run(state, files, classes=[], progress=lambda done, total: seen.append((done, total)))
-    assert seen == [(3, 8), (6, 8)]
+    assert seen == [(3, 8), (6, 8), (8, 8)]
 
 
 @pytest.mark.asyncio
@@ -670,15 +658,13 @@ async def test_no_activity_in_one_locality(state, files):
     assert report.in_area == 1 and await state.get_company_by_cui("90000025")
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_administrators_none_reads_no_representatives(state, files):
     files["people"].unlink()        # proves the file isn't opened
     report = await run(state, files, with_administrators=False)
     assert report.administrators == 0 and not report.errors
-    assert obs(state, "CONTACT_FOUND") == [] and obs(state, "DECISION_MAKER_TITLE") == []
     assert report.unconfirmed == []
-    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
+    assert report.new_companies == 3
 
 
 def test_authorised_codes_reads_only_the_registrations_asked_for(files):

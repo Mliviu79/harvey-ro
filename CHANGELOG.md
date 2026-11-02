@@ -36,6 +36,45 @@ minor versions can still change behaviour.
   nothing in the data folder. A database older than schema 24 is opened
   once by the previous release first. A new install starts on the slim
   database.
+- **What the slim database shows differently.** A registered firm's name,
+  place, address and activity are the register's current ones: its
+  industry is the first current class it is authorised for (not the class a
+  pull happened to ask for), and a name Harvey found first gives way to the
+  register's. A merge moves nothing: each record keeps its contacts, people,
+  readings and places, and the company shows them all (once each); undo
+  gives each record back exactly what it had. A firm holds one tax code at
+  most. The register's facts aren't copied, so a pull or a lookup reports
+  no "observations" for them, and the financial statements are never looked
+  up by company: they are read where they are. ANAF's whole answer is kept
+  whatever is confirmed (confirming decides what is shown), with earlier
+  answers as history. Every site with no deeper read yet (one only "Read
+  sites" visited included) is read once by the background, the companies
+  with no contact first.
+- **First visits are much faster on a full install.** The register
+  counts job, which walks every firm's register values once per load
+  anyway, now also keeps which firms each register signal holds for, as
+  compressed bitmaps (`register_set`): a cohort's register conditions (VAT,
+  e-Factura, filed accounts, a turnover range) are read from them and
+  patched for the firms added or merged since, instead of every key being
+  walked again on the first visit (5-7 s before on 1.8M firms). A register
+  search (a county, a locality, words) reaches the firms in Harvey through
+  a key table the registry's load builds (`firm_key`), the Companies
+  page's email, phone and mobile filters count from kept tallies, the
+  Registry page's plain list reads its first pages straight from the
+  search index, and the Find-contacts estimate reads only each firm's time
+  and site. A cohort range that names a year reads that year's statements
+  once, with the firms that have each figure kept by the same job. Until
+  the job has run after a register load (an ANAF check or a registry reload
+  included), the pages work the sets out as before; removing a firm keeps
+  them in use, and the job runs again once many firms were pulled since.
+- **Docker on WSL: the free-space check mounts one empty folder, never
+  the Windows drive.** `HARVEY_HOST_DRIVE_SOURCE` is now documented as a
+  dedicated empty folder on the drive (`mkdir /mnt/c/harvey-free`), whose
+  free space is the drive's, instead of `/mnt/c`, which showed every file
+  on the drive to a container that reads untrusted websites. If you set it
+  to `/mnt/c`, change it and recreate the container: until then the
+  free-space check refuses a folder that holds a drive's `Windows`, `Users`
+  or `Program Files`, so loads and the upgrade say what to set.
 
 ### Added
 

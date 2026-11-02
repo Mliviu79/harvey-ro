@@ -41,7 +41,10 @@ CUIS = [str(9100000 + i) for i in range(1, 41)]
 
 
 def plain_file(path, cuis=CUIS) -> None:
-    """A version 1 file as service.keep writes it."""
+    """A version 1 file as service.keep wrote it on an older install (a new
+    file starts compressed: the plain one is made here first)."""
+    with sqlite3.connect(path) as con:
+        con.execute(service.SCHEMA)
     found = {c: answer(c, vat=i % 2 == 0, inactive=i % 7 == 0) for i, c in enumerate(cuis)
              if i % 5}
     missing = {c for i, c in enumerate(cuis) if not i % 5}
@@ -245,3 +248,14 @@ def test_two_answers_replaced_in_the_same_second_both_stay_in_history(tmp_path):
         "SELECT dict, body FROM answers_history WHERE cui = ? ORDER BY rowid", (int(a),))]
     assert [json.loads(b)["adresa_sediu_social"]["sdenumire_Strada"] for b in bodies] == \
         ["Str. Unu", "Str. Doi", "Str. Trei"]
+
+
+def test_a_new_file_starts_compressed_where_its_register_reads_it(tmp_path):
+    """A new install's first answer: the compressed form, which the register
+    adapter reads (a plain file there counts as not loaded)."""
+    path = tmp_path / "anaf.db"
+    service.keep(path, {CUIS[0]: answer(CUIS[0])}, set(), "2026-11-01T08:00:00+00:00")
+    with sqlite3.connect(path) as con:
+        assert store.version(con) == store.VERSION
+        assert con.execute("SELECT vat FROM parsed WHERE cui = ?", (int(CUIS[0]),)).fetchone() \
+            == (1,)

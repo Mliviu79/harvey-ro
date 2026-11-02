@@ -385,11 +385,9 @@ async def _count(provider_key: str, queries, report):
 
 # ── Official sources (a trade registry: the onrc module) ──
 
-# Records saved per transaction (big enough that committing is noise, small
-# enough that an interrupted import keeps most of what it saved), and how
-# often progress is reported.
+# Companies a by-id lookup saves per transaction (big enough that committing
+# is noise, small enough that an interrupted run keeps most of what it saved).
 SOURCE_SAVE_BATCH = 500
-SOURCE_PROGRESS_EVERY = 500
 # The counts on a source's report a save adds to as it saves.
 _REPORT_COUNTS = ("catch_all_only", "shared_domain", "excluded", "new_companies",
                   "known_companies", "updated_companies", "administrators",
@@ -400,16 +398,16 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
                             run_params: dict | None = None, dry_run: bool = False,
                             do_not_contact: list[str] | None = None, progress=None,
                             saved_ids: list[str] | None = None, on_saved=None):
-    """Save what an official source (``module``) read, SOURCE_SAVE_BATCH records
-    per transaction, through ingest's rules for an official source.
+    """Save what an official source (``module``) read, overlay.store.PULL_CHUNK
+    records per transaction, through ingest's rules for an official source.
     ``report`` is the source's own report (its ``values["report"]``); the
     counts in _REPORT_COUNTS are added to it as records are saved, and
     ``unconfirmed`` lists the signals the read collects
     (``values["codes"]``) that aren't confirmed. ``dry_run`` matches
     everything and writes nothing. A fact is written once per dataset:
     re-reading the same dataset adds nothing, a newer one adds its readings
-    beside the old. ``progress(done, total)`` is called every
-    SOURCE_PROGRESS_EVERY records. ``saved_ids`` collects the id each saved
+    beside the old. ``progress(done, total)`` is called after each chunk
+    is written. ``saved_ids`` collects the id each saved
     record landed on; ``on_saved(ids)`` is told them as each batch commits."""
     from harvey.modules import switches
     from harvey.signals import sync_vocabulary
@@ -448,8 +446,6 @@ async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, con
         if ingest.excluded(record, do_not_contact):
             report.excluded += 1
             continue
-        report.catch_all_only += record.counts.get("catch_all_only", 0)
-        report.administrators += record.counts.get("administrators", 0)
         records.append(record)
     try:
         done = 0
@@ -462,6 +458,11 @@ async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, con
                 chunk, facts_of={r.key: facts_of.get(r.key, []) for r in chunk},
                 confirmed=frozenset(confirmed), run_id=report.run_id, dry_run=dry_run,
                 matches=matches, matched_at=matched_at)
+            # Counted once the chunk is written: a chunk that fails takes
+            # its counts with it.
+            for record in chunk:
+                report.catch_all_only += record.counts.get("catch_all_only", 0)
+                report.administrators += record.counts.get("administrators", 0)
             ids = []
             for company_id, created, updated, shared in results:
                 report.shared_domain += shared

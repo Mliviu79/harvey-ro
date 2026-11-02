@@ -5791,7 +5791,12 @@ function upgradeHtml(s) {
   }
   const started = s.stages.some(st => st.state && st.state !== 'todo');
   if (started || s.running) h += '<ol class="upgrade-stages">' + s.stages.map(upgradeStage).join('') + '</ol>';
-  if (s.error && !s.running) h += '<p class="banner wait">' + escHtml(t('upgrade.stopped', {why: s.error})) + '</p>';
+  // (A failed verification says so below, in the page's language, with
+  // what differed: the server's English summary of it isn't repeated.)
+  const unverified = s.verification && s.verification.passed === false;
+  if (s.error && !s.running && !unverified) {
+    h += '<p class="banner wait">' + escHtml(t('upgrade.stopped', {why: s.error})) + '</p>';
+  }
   h += upgradeVerification(s.verification);
   if (s.running) {
     h += '<p class="soft">' + escHtml(t('upgrade.running')) + '</p>';

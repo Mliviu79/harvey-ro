@@ -67,6 +67,7 @@ async def _lifespan(_app):
                            DB_PATH)
         except Exception:
             logger.exception("could not open %s", DB_PATH)
+    await asyncio.to_thread(_warm_up)
     # The job worker runs inside the dashboard: the usual install runs only
     # this process. It waits for the database to exist, and stands aside
     # while another worker (harvey worker, a command) holds the lease.
@@ -83,6 +84,21 @@ async def _lifespan(_app):
                 await asyncio.wait_for(task, timeout=30)
             except Exception:
                 logger.exception("the job worker didn't stop cleanly")
+
+
+def _warm_up() -> None:
+    """Load before the first request what every page's first request would
+    load otherwise (a few tenths of a second): the modules' manifests and
+    register adapters, the CAEN reference, the settings file."""
+    try:
+        from harvey import registers
+        from harvey.overlay import reads
+
+        registers.adapters(DB_PATH.parent)
+        reads._caen_names()
+        _load_config_quietly()
+    except Exception:
+        logger.debug("warm-up skipped", exc_info=True)
 
 
 async def _run_worker(stop: asyncio.Event):
@@ -2702,7 +2718,11 @@ async def _export_company_rows(request: Request) -> tuple[list[dict], int]:
             rank = {cid: i for i, cid in enumerate(ids)}
             rows.sort(key=lambda r: rank.get(r["id"], len(rank)))
         matched = getattr(request.state, "matched", None) or len(rows)
-    activities = await state.get_company_activities([r["id"] for r in rows])
+    # (Read with the rows; a row without them is asked for on its own.)
+    activities = {r["id"]: r.pop("_activities") for r in rows if "_activities" in r}
+    missing = [r["id"] for r in rows if r["id"] not in activities]
+    if missing:
+        activities.update(await state.get_company_activities(missing))
     for r in rows:
         acts = activities.get(r["id"], [])
         seen, listed = set(), []

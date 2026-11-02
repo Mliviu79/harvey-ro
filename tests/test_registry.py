@@ -4,10 +4,8 @@ Built from the same tiny invented files as tests/test_onrc.py, plus a few
 rows of its own. Every company, person and number here is invented.
 """
 
-import os
 import sqlite3
 import sys
-import tempfile
 import time
 
 import pytest
@@ -19,6 +17,7 @@ from harvey.models import Company
 from harvey.modules import runs
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 from tests.test_onrc import BIRTH, CAEN, CNP, DATASET, FIRMS, PEOPLE, STATUS, firm, write
 
 # A firm whose name says dentist but which isn't authorised for dentistry,
@@ -64,24 +63,18 @@ def con(db_path):
 
 
 @pytest_asyncio.fixture
-async def state():
-    with tempfile.TemporaryDirectory() as tmp:
-        sm = StateManager(os.path.join(tmp, "test.db"))
-        await sm.init_db()
-        await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
-        yield sm
+async def state(tmp_path):
+    # Beside registry.db (the db_path fixture's): the registry is read there.
+    sm = StateManager(str(tmp_path / "test.db"))
+    await sm.init_db()
+    await sync_vocabulary(sm)
+    for sig in SIGNAL_CATALOG:
+        await sm.set_signal_status(sig["code"], "confirmed")
+    yield sm
 
 
 def names(found):
     return [r["name"] for r in found["rows"]]
-
-
-def obs(state, code):
-    with sqlite3.connect(state.db_path) as db:
-        return sorted(r[0] for r in db.execute(
-            "SELECT value_text FROM observations WHERE signal_code = ?", (code,)))
 
 
 # ── Loading ──
@@ -233,7 +226,6 @@ def test_explicit_filters_as_import_onrc_gives_them(con):
 
 # ── Pulling into the working database ──
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_pull_saves_like_import_onrc(state, con):
     q = registry.resolve(con, "dentist BV")
@@ -242,22 +234,24 @@ async def test_pull_saves_like_import_onrc(state, con):
     assert (report.new_companies, report.known_companies) == (4, 0)
     a = await state.get_company_by_cui("90000017")
     assert a.external_id == "onrc:J08/100/2010" and a.source == "registry:onrc"
-    assert a.industry == "Dental practice" and a.location == "Brașov, Romania"
-    assert a.address == "Str. Exemplului 12, 500123" and a.source_url == DATASET.page
-    # ACTIVITY_CODE only for the classes the words named; the firm matched
-    # by its name alone gets none.
-    assert obs(state, "ACTIVITY_CODE") == ["8623/2", "8623/2", "8623/3"]
-    assert obs(state, "CONTACT_FOUND") == [
+    assert a.location == "Brașov, Romania"
+    assert a.address == "Str. Exemplului 12, 500123"
+    # What it does and who runs it are read from the registry: every class
+    # on file (the firm matched by its name alone has its own), and the
+    # administrators.
+    assert a.industry == "Specialist medical practice"
+    assert await slim.register_values(state, "ACTIVITY_CODE") == [
+        "4778/2", "8622/2", "8623/2", "8623/2", "8623/3"]
+    assert await slim.register_values(state, "CONTACT_FOUND") == [
         "Andrei-Mihai Doi — Administrator", "Maria Testescu — Administrator"]
     total, rows = await state.search_companies("8622")
     assert [r["cui"] for r in rows] == ["90000017"]
 
     again = await runs.registry_pull(state, con, q)
     assert (again.new_companies, again.known_companies) == (0, 4)
-    assert again.observations == 0
+    assert again.observations == 0 and slim.one(state, "SELECT COUNT(*) FROM obs") == 0
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_pull_merges_on_legal_identity_only(state, con):
     known = await state.add_company(Company(name="Clinica Zâmbet", cui="90000017",
@@ -267,7 +261,8 @@ async def test_pull_merges_on_legal_identity_only(state, con):
     report = await runs.registry_pull(state, con, registry.resolve(con, "8623 BV"))
     assert report.known_companies == 1 and report.new_companies == 2
     merged = await state.get_company_by_cui("90000017")
-    assert merged.id == known and merged.name == "Clinica Zâmbet"
+    # The same record, described by the registry now.
+    assert merged.id == known and merged.name == "ZÂMBET EXEMPLU SRL"
     assert merged.domain == ""                       # another business holds it
     assert report.shared_domain == 1
     assert (await state.get_company_by_domain("zambet-exemplu.example.ro")).id == other
@@ -287,7 +282,6 @@ async def test_pull_limit_dry_run_and_gate(state, con):
     assert report.unconfirmed == ["ACTIVITY_CODE"]
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_catch_all_through_the_registry(state, con):
     q = registry.resolve(con, classes=onrc.parse_classes("kinetoterapeut"),
@@ -479,7 +473,6 @@ def test_one_load_at_a_time(raw, db_path):
     assert registry.status(db_path)["dataset"] == newer.name
 
 
-@pytest.mark.skip(reason="fails an assertion on the slim schema: a fixture that needs the registers in place, or a difference still to check")
 @pytest.mark.asyncio
 async def test_a_failed_batch_takes_its_counts_with_it(state, con, monkeypatch):
     from harvey.overlay.store import Store
@@ -490,8 +483,7 @@ async def test_a_failed_batch_takes_its_counts_with_it(state, con, monkeypatch):
     report = await runs.registry_pull(state, con, registry.resolve(con, "dentist BV"))
     assert report.errors
     assert (report.new_companies, report.administrators, report.observations) == (0, 0, 0)
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM firm") == 0
 
 
 def test_cli_pull_asks_for_a_limit_on_big_matches(monkeypatch, capsys, db_path, tmp_path):

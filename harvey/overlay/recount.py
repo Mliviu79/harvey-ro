@@ -168,7 +168,7 @@ def _expected_contacts(con, links: str = "link") -> None:
 
 def _expected_tallies(con, firms: str, firm_signal: str) -> None:
     """exp_tally and exp_signal_tally, in full. ``firms``: a query giving
-    (live, n_contacts, website, domain) per firm."""
+    (live, n_contacts, n_email, n_phone, n_mobile, website, domain) per firm."""
     _drop(con, "exp_tally", "exp_signal_tally")
     con.execute("CREATE TEMP TABLE exp_tally (name TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID")
     con.execute(f"""
@@ -178,7 +178,13 @@ def _expected_tallies(con, firms: str, firm_signal: str) -> None:
                   FROM ({firms})
         UNION ALL SELECT 'firms_with_site', COALESCE(SUM(live = 0 AND (website IS NOT NULL
                                                       OR domain IS NOT NULL)), 0) FROM ({firms})
-        UNION ALL SELECT 'firms_merged', COALESCE(SUM(live != 0), 0) FROM ({firms})""")
+        UNION ALL SELECT 'firms_merged', COALESCE(SUM(live != 0), 0) FROM ({firms})
+        UNION ALL SELECT 'firms_with_email', COALESCE(SUM(live = 0 AND n_email > 0), 0)
+                  FROM ({firms})
+        UNION ALL SELECT 'firms_with_phone', COALESCE(SUM(live = 0 AND n_phone > 0), 0)
+                  FROM ({firms})
+        UNION ALL SELECT 'firms_with_mobile', COALESCE(SUM(live = 0 AND n_mobile > 0), 0)
+                  FROM ({firms})""")
     con.execute(f"""
         INSERT INTO exp_tally
         SELECT 'contacts', COUNT(*) FROM contact
@@ -226,7 +232,9 @@ def diff(con: sqlite3.Connection) -> dict[str, int]:
     _expected_firms(con, readings="exp_reading")
     _expected_contacts(con, links="exp_link")
     _expected_tallies(
-        con, "SELECT f.live, COALESCE(e.n_contacts, 0) AS n_contacts, f.website, f.domain "
+        con, "SELECT f.live, COALESCE(e.n_contacts, 0) AS n_contacts, "
+             "COALESCE(e.n_email, 0) AS n_email, COALESCE(e.n_phone, 0) AS n_phone, "
+             "COALESCE(e.n_mobile, 0) AS n_mobile, f.website, f.domain "
              "FROM firm f LEFT JOIN exp_firm e ON e.id = f.id", "exp_firm_signal")
     out = {
         "link": _diff_table(con, "link", "exp_link", ("firm", "contact"), LINK_COLUMNS),
@@ -358,7 +366,8 @@ def _write_firms_and_contacts(con) -> None:
 
 
 def _write_tallies(con) -> None:
-    _expected_tallies(con, "SELECT live, n_contacts, website, domain FROM firm", "firm_signal")
+    _expected_tallies(con, "SELECT live, n_contacts, n_email, n_phone, n_mobile, website, "
+                           "domain FROM firm", "firm_signal")
     con.execute("DELETE FROM tally")
     con.execute("INSERT INTO tally SELECT name, n FROM exp_tally")
     for name in TALLIES:

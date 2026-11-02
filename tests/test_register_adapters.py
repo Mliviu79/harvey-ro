@@ -312,6 +312,9 @@ def test_anaf_reads_the_compressed_file_and_counts_a_plain_one_not_loaded(tmp_pa
             "adresa_sediu_social": {"sdenumire_Strada": "Str. Exemplu", "snumar_Strada": "1",
                                     "sdenumire_Localitate": "Mun. Braşov"}}
     plain = tmp_path / "plain" / "anaf.db"
+    plain.parent.mkdir()
+    with sqlite3.connect(plain) as old:         # an older install's plain file
+        old.execute(service.SCHEMA)
     service.keep(plain, {"1000004": item}, set(), "2026-10-01T08:00:00+00:00")
     new = tmp_path / "anaf.db"
     con = sqlite3.connect(new)

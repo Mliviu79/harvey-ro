@@ -127,11 +127,16 @@ class Adapter:
         if self.alias not in {r[1] for r in con.execute("PRAGMA database_list")}:
             return None
         if not self.marks_sql:
-            # A file written a little at a time: its size and last write.
-            st = os.stat(self.path)
-            return f"{st.st_size} {st.st_mtime_ns}"
+            return self.file_mark()
         row = con.execute(self.sql("marks")).fetchone()
         return row[0] if row else ""
+
+    def file_mark(self) -> str:
+        """The file's size and last write. Not for a file written in WAL
+        mode: what is written goes to the ``-wal`` file beside it, and the
+        main file stays as it was until a checkpoint."""
+        st = os.stat(self.path)
+        return f"{st.st_size} {st.st_mtime_ns}"
 
     # Signals
 
@@ -146,7 +151,8 @@ class Adapter:
         if read is None:
             raise ValueError(f"{self.module} doesn't read {signal} by {scheme or 'its key'}")
         out: dict = {}
-        for chunk in chunks(keys):
+        # (Big chunks: a sort reads every firm of a county by its key.)
+        for chunk in chunks(keys, 10_000):
             for key, value, date in con.execute(self.sql(f"read.{signal}{read.suffix}"),
                                                 (json.dumps(chunk),)):
                 out.setdefault(key, []).append((value, date))

@@ -751,6 +751,9 @@ def _phrase_units(words: list[str]) -> list:
     from harvey.caen import _synonym_hits, _tokens
 
     plain = [i for i, w in enumerate(words) if not w[:1].isdigit()]
+    if not plain:
+        # (No word to look up: the phrase list isn't read at all.)
+        return list(words)
     hits = {}
     for start, phrase, classes in _synonym_hits([words[i] for i in plain]):
         size = len(_tokens(phrase))

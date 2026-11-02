@@ -61,6 +61,18 @@ queries.statement(
     "LEFT JOIN {derived}.firm_by_cui b ON b.cui = CAST(f.cui AS INTEGER) AND f.cui != '' "
     "WHERE f.id = j.value",
     params=("[1, 2]",), module=MODULE, drives="j")
+# The records in Harvey a search's registry ids stand for, by the key each
+# row is reached by (derived firm_key, which holds one of the two): a
+# CUI's canonical row by the CUI, a row with no CUI by its registration
+# number, each id probed once. Params: the ids as JSON, the CUI scheme's
+# id, the registration number scheme's.
+queries.statement(
+    "onrc.held_of_ids",
+    "SELECT fi.firm, k.cui IS NULL, COALESCE(k.cui, k.reg), k.firm_id FROM json_each(?) j "
+    "CROSS JOIN {derived}.firm_key k CROSS JOIN firm_ident fi WHERE k.firm_id = j.value "
+    "AND fi.scheme = CASE WHEN k.cui IS NULL THEN ? ELSE ? END "
+    "AND fi.key = +COALESCE(k.cui, k.reg)",
+    params=("[1, 2]", 2, 1), module=MODULE, drives="j")
 # Firms holding a class, through the registry's own full-text tags (the
 # activity table has no index by class), canonical rows only.
 queries.statement(
@@ -76,6 +88,21 @@ queries.statement(
     "SELECT f.reg FROM {alias}.firm_fts t CROSS JOIN {alias}.firms f "
     "WHERE t.firm_fts MATCH ? AND f.id = t.rowid AND f.cui = ''",
     params=("tags : c8623r3",), module=MODULE, drives="t")
+# The Registry page's list by name with nothing but words, area and status
+# (registry_view._index_page, on the registry's own connection: alias
+# ``main``): the full-text index counted, then a page of it in its rowid
+# order, which is the name order (the load numbers firms by name, as
+# registry_view.matching takes it too).
+queries.statement(
+    "onrc.index_count", "SELECT COUNT(*) FROM {alias}.firm_fts WHERE firm_fts MATCH ?",
+    params=("tags : activ",), module=MODULE,
+    scans={"firm_fts": "a page's total: the matches counted in the full-text index"})
+for _way in ("ASC", "DESC"):
+    queries.statement(
+        f"onrc.index_page.{_way.lower()}",
+        "SELECT rowid FROM {alias}.firm_fts WHERE firm_fts MATCH ? "
+        f"ORDER BY rowid {_way} LIMIT ? OFFSET ?",
+        params=("tags : activ", 50, 0), module=MODULE)
 # The registry's name for each firm in Harvey with a CUI (its canonical
 # row): an upgrade's comparison with the name Harvey shows.
 queries.statement(
@@ -468,10 +495,10 @@ class Adapter(Base):
             return []
         return [r[0] for r in con.execute(self.sql("name_key.holders"), (key, town))]
 
-    def resolve(self, filters: dict) -> list[tuple[str, object]]:
-        """The keys the Registry page's search finds for these filters
-        (words, county, locality, status "all"), in its order: read on its
-        own connection to the registry file."""
+    def resolve_ids(self, filters: dict) -> list[int]:
+        """The registry ids the Registry page's search finds for these
+        filters (words, county, locality, status "all"), in its order: read
+        on its own connection to the registry file."""
         from harvey import registry
 
         con = registry.connect(self.path)
@@ -481,9 +508,33 @@ class Adapter(Base):
                 counties=[filters["county"]] if filters.get("county") else None,
                 localities=[filters["locality"]] if filters.get("locality") else None,
                 all_statuses=filters.get("status") == "all")
-            ids = registry.matching_ids(con, q) if (q.match or q.firm_ids) else []
+            return registry.matching_ids(con, q) if (q.match or q.firm_ids) else []
         finally:
             con.close()
+
+    def held_of_ids(self, con, ids, scheme_ids: dict) -> list[tuple[int, str, object, int]] | None:
+        """(record in Harvey, scheme, key, registry id) for the registry ids
+        (a search's) that firms in Harvey hold, in no order: each id's key
+        (derived firm_key) probed in firm_ident. ``scheme_ids``: scheme
+        name -> id. None when the registry's derived tables predate
+        firm_key (its next load or reindex builds it)."""
+        out = []
+        # (A scheme Harvey doesn't know matches no identifier: id -1.)
+        sids = (scheme_ids.get(REG, -1), scheme_ids.get("ro.cui", -1))
+        schemes = ("ro.cui", REG)
+        try:
+            sql = self.sql("held_of_ids")
+            for chunk in chunks(ids, 50_000):
+                out += [(firm, schemes[by_reg], key, rid) for firm, by_reg, key, rid in
+                        con.execute(sql, (json.dumps(chunk), *sids))]
+        except sqlite3.OperationalError:
+            return None
+        return out
+
+    def resolve(self, filters: dict) -> list[tuple[str, object]]:
+        """The keys the Registry page's search finds for these filters, in
+        its order (resolve_ids' rows as the core's keys)."""
+        ids = self.resolve_ids(filters)
         mapper = sqlite3.connect(":memory:", uri=True)
         try:
             self.attach(mapper)

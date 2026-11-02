@@ -5,6 +5,11 @@
   firm Harvey means is the operating row, else the newest registration,
   else the highest registration number (stable across reloads, unlike the
   row ids). Keyed by the CUI as an integer.
+- ``firm_key``: the other way round, the key each registry row is reached
+  by: its CUI when it is that CUI's canonical row, its registration number
+  when it has no CUI (another row of a CUI has none). What a search's
+  registry ids are matched to the firms in Harvey by, without reading the
+  rows themselves.
 - ``place_rank``: every place line the registry has (onrc.queries.place:
   "Town, County, Romania"), ranked in sorted order: where a firm falls when
   firms are sorted by place (overlay/orders.py).
@@ -25,7 +30,7 @@ from pathlib import Path
 
 from harvey.registers import build_derived, mark_built
 
-TABLES = ("firm_by_cui", "name_key", "place_rank")
+TABLES = ("firm_by_cui", "firm_key", "name_key", "place_rank")
 # The rules place lines are written by (onrc.queries.place): a change of
 # them marks place_rank stale.
 PLACE_VERSION = "1"
@@ -52,6 +57,13 @@ def build(con, src: str = "main", dst: str = "main") -> dict:
         WHERE rn = 1 ORDER BY cui""")
     skipped = con.execute(f"SELECT COUNT(*) FROM {src}.firms f WHERE f.cui != '' "
                           f"AND NOT ({CUI_OK})").fetchone()[0]
+    con.execute(f"DROP TABLE IF EXISTS {dst}.firm_key")
+    con.execute(f"CREATE TABLE {dst}.firm_key (firm_id INTEGER PRIMARY KEY, cui INTEGER, reg TEXT)")
+    con.execute(f"""
+        INSERT INTO {dst}.firm_key (firm_id, cui, reg)
+        SELECT firm_id, cui, NULL FROM {dst}.firm_by_cui
+        UNION ALL SELECT f.id, NULL, f.reg FROM {src}.firms f WHERE f.cui = ''
+        ORDER BY 1""")
 
     con.create_function("harvey_name_key", 1, name_keys.name_key, deterministic=True)
     con.create_function("harvey_locality_key", 1, name_keys.locality_key, deterministic=True)
@@ -84,6 +96,7 @@ def build(con, src: str = "main", dst: str = "main") -> dict:
     mark_built(con, dst, "place_rank", PLACE_VERSION)
     q = con.execute
     return {"firm_by_cui": q(f"SELECT COUNT(*) FROM {dst}.firm_by_cui").fetchone()[0],
+            "firm_key": q(f"SELECT COUNT(*) FROM {dst}.firm_key").fetchone()[0],
             "name_key": q(f"SELECT COUNT(*) FROM {dst}.name_key").fetchone()[0],
             "place_rank": q(f"SELECT COUNT(*) FROM {dst}.place_rank").fetchone()[0],
             "cui_not_keyable": skipped}

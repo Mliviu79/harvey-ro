@@ -490,6 +490,13 @@ def _rows(state, sql, *args):
         return db.execute(sql, args).fetchall()
 
 
+# Each reading with its signal's code, the record it was found for (which a
+# merge never moves) and who found it.
+OBS = ("(SELECT o.id, s.code, o.num, CAST(o.firm AS TEXT) AS firm, m.name AS module, "
+       "c.name AS capability FROM obs o JOIN signal s ON s.id = o.signal "
+       "LEFT JOIN module m ON m.id = o.module LEFT JOIN capability c ON c.id = o.capability)")
+
+
 class Listing(D.DiscoveryProvider):
     """A map listing the same business is found under, run after run."""
 
@@ -503,13 +510,14 @@ class Listing(D.DiscoveryProvider):
         return True
 
     async def fetch(self, client, env, query):
+        # (A listing id a module declares a scheme for: what finds the
+        # record again on the next run.)
         return [D.Business(name="Vellmora Roofing Company", phone="+13035550199",
                            location="Denver, Colorado", rating=self.rating,
-                           external_id="fake_maps:1", source_url="https://maps.example/1",
+                           external_id="dataforseo:cid:1", source_url="https://maps.example/1",
                            provider=self.key)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monkeypatch,
                                                                    claim_provider):
@@ -522,29 +530,30 @@ async def test_facts_found_after_an_automatic_merge_go_back_on_undo(state, monke
 
     claim_provider(Listing(4.1))
     await runs.run_discovery(state, None, "fake_maps", query)
-    [(merged, into)] = _rows(state, "SELECT id, merged_into FROM companies WHERE merged_into != ''")
+    [(merged, into)] = _rows(state, "SELECT CAST(id AS TEXT), CAST(live AS TEXT) FROM firm "
+                                    "WHERE live != 0")
     assert into == survivor
     # Found again later: the listing's own id is the merged record's, and
-    # its facts land on the company it stands for, saying whose they are.
+    # its facts are that record's (shown on the company it stands for),
+    # saying whose they are.
     claim_provider(Listing(4.6))
     await runs.run_discovery(state, None, "fake_maps", query)
-    found = _rows(state, "SELECT signal_code, value_num, company_id, origin_company_id, module, "
-                         "capability FROM observations WHERE signal_code = 'REVIEW_RATING' "
-                         "ORDER BY rowid")
+    found = _rows(state, f"SELECT code, num, firm, module, capability FROM {OBS} "
+                         "WHERE code = 'REVIEW_RATING' ORDER BY id")
     # Said to be the stand-in module's: a source no module claims doesn't run.
-    assert found == [("REVIEW_RATING", 4.1, survivor, merged, "stub_fake_maps", "web_search"),
-                     ("REVIEW_RATING", 4.6, survivor, merged, "stub_fake_maps", "web_search")]
+    assert found == [("REVIEW_RATING", 4.1, merged, "stub_fake_maps", "web_search"),
+                     ("REVIEW_RATING", 4.6, merged, "stub_fake_maps", "web_search")]
+    assert [o["value_num"] for o in await state.get_observations(survivor, "REVIEW_RATING")] \
+        == [4.6, 4.1]
 
     await state.undo_merge(merged)
-    back = _rows(state, "SELECT company_id, COUNT(*) FROM observations WHERE origin_company_id = ? "
-                        "GROUP BY company_id", merged)
-    assert back == [(merged, 4)]          # FOUND_IN_SERP and REVIEW_RATING, both runs
+    # FOUND_IN_SERP (once: the second run said the same) and both ratings.
+    assert _rows(state, f"SELECT firm, COUNT(*) FROM {OBS} WHERE firm = ? GROUP BY firm",
+                 merged) == [(merged, 3)]
     # The survivor keeps its own, even one sharing the listing's address.
-    assert _rows(state, "SELECT signal_code FROM observations WHERE company_id = ?",
-                 survivor) == [("REVIEW_COUNT",)]
+    assert [o["signal_code"] for o in await state.get_observations(survivor)] == ["REVIEW_COUNT"]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(
         state, monkeypatch, claim_provider):
@@ -560,22 +569,21 @@ async def test_facts_found_after_a_chain_of_merges_go_back_to_the_first_owner(
     query = [D.DiscoveryQuery(term="roofer", location="Denver, CO")]
     claim_provider(Listing(4.1))
     await runs.run_discovery(state, None, "fake_maps", query)
-    [(listing, into)] = _rows(state, "SELECT id, merged_into FROM companies WHERE merged_into != ''")
+    [(listing, into)] = _rows(state, "SELECT CAST(id AS TEXT), CAST(live AS TEXT) FROM firm "
+                                     "WHERE live != 0")
     assert into == middle
     await state.merge_companies(top, middle)
 
     claim_provider(Listing(4.6))
     await runs.run_discovery(state, None, "fake_maps", query)
-    assert _rows(state, "SELECT DISTINCT company_id, origin_company_id FROM observations "
-                        "WHERE value_num = 4.6") == [(top, listing)]
+    assert _rows(state, f"SELECT DISTINCT firm FROM {OBS} WHERE num = 4.6") == [(listing,)]
+    assert 4.6 in [o["value_num"] for o in await state.get_observations(top, "REVIEW_RATING")]
 
     await state.undo_merge(middle)
     await state.undo_merge(listing)
-    assert _rows(state, "SELECT company_id, COUNT(*) FROM observations GROUP BY company_id") \
-        == [(listing, 4)]
+    assert _rows(state, f"SELECT firm, COUNT(*) FROM {OBS} GROUP BY firm") == [(listing, 3)]
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_every_observation_says_who_found_it(state, monkeypatch):
     parity.recorded(monkeypatch, parity.provider_handler)
@@ -583,9 +591,9 @@ async def test_every_observation_says_who_found_it(state, monkeypatch):
                         lambda *a, **k: EnvConfig(dataforseo_login="u", dataforseo_password="p"))
     await runs.run_discovery(state, None, "dataforseo_serp",
                              [D.DiscoveryQuery(term="roofer", **parity.DENVER)], max_spend=5.0)
-    rows = _rows(state, "SELECT DISTINCT module, capability FROM observations")
+    rows = _rows(state, f"SELECT DISTINCT module, capability FROM {OBS}")
     assert rows == [("dataforseo", "organic_rank")]
-    assert not _rows(state, "SELECT 1 FROM observations WHERE origin_company_id = ''")
+    assert not _rows(state, "SELECT 1 FROM obs WHERE firm IS NULL OR module IS NULL")
 
 
 # ── What core enforces whoever calls a capability ──
@@ -682,12 +690,11 @@ def test_a_site_read_is_told_only_the_preset_hits_a_read_declares():
     assert runs._hit_codes({"startups"}, {"TECH_STACK"}) == ()
 
 
-@pytest.mark.skip(reason="the fixture seeds schema 24 tables or helpers the slim schema dropped; to rewrite")
 @pytest.mark.asyncio
 async def test_a_single_observation_says_who_found_it(state):
     company = (await state.save_company(Company(name="Acme", domain="acme.example"))).company_id
     await state.add_observation("TECH_STACK", company_id=company, value_text="HubSpot",
                                 module="web_marketing", capability="marketing_profile",
                                 origin_company_id=company)
-    assert _rows(state, "SELECT module, capability, origin_company_id FROM observations") == [
+    assert _rows(state, f"SELECT module, capability, firm FROM {OBS}") == [
         ("web_marketing", "marketing_profile", company)]

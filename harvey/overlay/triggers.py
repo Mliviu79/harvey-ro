@@ -111,6 +111,10 @@ _FIRM_TALLIES = (
     ("'firms_with_contact'", "live = 0 AND n_contacts > 0"),
     ("'firms_with_site'", "live = 0 AND (website IS NOT NULL OR domain IS NOT NULL)"),
     ("'firms_merged'", "live != 0"),
+    # (The Companies page's email, phone and mobile filters count from these.)
+    ("'firms_with_email'", "live = 0 AND n_email > 0"),
+    ("'firms_with_phone'", "live = 0 AND n_phone > 0"),
+    ("'firms_with_mobile'", "live = 0 AND n_mobile > 0"),
 )
 _CONTACT_TALLIES = (
     ("'contacts'", "1"),
@@ -125,7 +129,8 @@ def _row_cond(cond: str, row: str) -> str:
     """A condition on a table's columns, rewritten onto NEW or OLD."""
     import re
 
-    words = ("live", "n_contacts", "website", "domain", "kind", "line_type", "do_not_contact")
+    words = ("live", "n_contacts", "n_email", "n_phone", "n_mobile", "website", "domain", "kind",
+             "line_type", "do_not_contact")
     return re.sub(r"\b(" + "|".join(words) + r")\b", lambda m: f"{row}.{m.group(1)}", cond)
 
 
@@ -377,7 +382,8 @@ CREATE TRIGGER {PREFIX}firm_del AFTER DELETE ON firm BEGIN
   {_tallies_for(_FIRM_TALLIES, False, True)}
 END""",
     "firm_upd": f"""
-CREATE TRIGGER {PREFIX}firm_upd AFTER UPDATE OF live, n_contacts, website, domain ON firm BEGIN
+CREATE TRIGGER {PREFIX}firm_upd AFTER UPDATE OF live, n_contacts, n_email, n_phone, n_mobile,
+  website, domain ON firm BEGIN
   {_tallies_for(_FIRM_TALLIES, True, True)}
 END""",
     "contact_ins": f"""

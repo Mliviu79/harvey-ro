@@ -328,17 +328,18 @@ async def checked(batch, module: str, found: dict[str, tuple[list[Fact], list]],
             new = _new_readings(found_rows, *readings[cid], many)
             fresh += new
             updated += bool(new)
-    written = await write(batch, fresh, run_id)
-    items, phones = [], {}
+    items, phones = [], []
     for cid, (_, contacts_) in found.items():
         items += _contact_items(cid, contacts_)
-        first = next((c for c in contacts_ or () if c.kind == "phone" and (c.display or c.value)),
-                     None)
-        if first is not None:
-            phones[cid] = first.display or first.value
+        if any(c.kind == "phone" and (c.display or c.value) for c in contacts_ or ()):
+            phones.append(cid)
+    # The companies whose first phone this is (asked before anything is
+    # written: a phone reading or a number linked gives them one).
+    phoneless = await batch.phoneless(phones) if phones else []
+    written = await write(batch, fresh, run_id)
     if items:
         await batch.add_contact_list(items)
-    set_ = await batch.fill_company_phones(phones) if phones else []
+    set_ = set(phoneless) - set(await batch.phoneless(phoneless)) if phoneless else set()
     return {"observations": written, "updated": updated, "phones_set": len(set_)}
 
 
@@ -360,16 +361,12 @@ def _one_each(found: list[dict], many: frozenset[str]) -> list[dict]:
 
 
 async def company_phones(batch, company_id: str, contacts) -> bool:
-    """An official record's phone as the company's phone when it has none
-    (on a batch); every number is a contact of the company, and is also
-    kept as a reading when PHONE_NUMBER is confirmed. True when the
-    company's phone was set."""
-    await add_contacts(batch, company_id, contacts)
+    """An official record's phones as the company's contacts (on a batch):
+    the first is its main phone when it has none. True when it had none."""
     phones = [c for c in contacts if c.kind == "phone" and (c.display or c.value)]
-    if not phones:
-        return False
-    changed_ = await batch.fill_company_fields(company_id, phone=phones[0].display or phones[0].value)
-    return "phone" in (changed_ or [])
+    had_none = bool(phones) and bool(await batch.phoneless([company_id]))
+    await add_contacts(batch, company_id, contacts)
+    return had_none and not await batch.phoneless([company_id])
 
 
 async def add_contacts(store, company_id: str, found, origin: str = "",
@@ -450,8 +447,8 @@ async def prospect(store, person) -> str:
     """A person at a company, as a contact. A contact already on file (same
     email or LinkedIn address) is kept as it is: a second source adds
     people, it doesn't rewrite them. Its email and its person are mirrored
-    into the contacts by the prospect triggers (migration v21); its own
-    phone, which needs parsing, here."""
+    into the contacts by StateManager.add_prospect; its own phone, which
+    needs parsing, here."""
     prospect_id = await store.add_prospect(person)
     phone = (getattr(person, "phone", "") or "").strip()
     if phone and person.company_id:
