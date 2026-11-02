@@ -199,7 +199,7 @@ def test_the_estimate_explains_a_drive_it_cant_see(data, monkeypatch):
     from harvey import disk
 
     def unseen(path):
-        raise disk.HostDriveUnknown("set HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free in .env")
+        raise disk.HostDriveUnknown("set HARVEY_HOST_DRIVE_SOURCE in .env")
 
     monkeypatch.setattr(disk, "free_bytes", unseen)
     est = upgrade.status(upgrade.Layout(data))["estimate"]

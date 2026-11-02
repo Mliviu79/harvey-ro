@@ -670,7 +670,7 @@ def test_free_space_counts_the_drive_a_virtual_disk_lives_on(tmp_path, monkeypat
 
     monkeypatch.setattr(disk.shutil, "disk_usage", fake)
     monkeypatch.setattr(disk, "on_wsl", lambda: True)
-    monkeypatch.setattr(disk, "DEFAULT_WSL_DRIVE", tmp_path / "no-such-drive")
+    monkeypatch.setattr(disk, "_wsl_drive_lookup", lambda: (None, "no reg.exe here"))
     monkeypatch.delenv("HARVEY_HOST_DRIVE", raising=False)
     with pytest.raises(disk.HostDriveUnknown):
         disk.free_bytes(tmp_path / "out.db")
@@ -696,7 +696,7 @@ def test_free_space_counts_the_drive_a_virtual_disk_lives_on(tmp_path, monkeypat
 
 
 def test_free_space_on_wsl_for_data_on_the_windows_drive_itself(tmp_path, monkeypatch):
-    # A checkout under /mnt/c: the host drive and the data share one file
+    # A checkout under /mnt/<drive>: the host drive and the data share one file
     # system, and that is the Windows drive itself, not the virtual disk.
     from harvey import disk
 
@@ -726,7 +726,7 @@ def test_the_host_drive_is_a_folder_of_its_own_never_a_drive_root(tmp_path, monk
     from harvey import disk
 
     monkeypatch.setattr(disk, "on_wsl", lambda: True)
-    monkeypatch.setattr(disk, "DEFAULT_WSL_DRIVE", tmp_path / "no-such-drive")
+    monkeypatch.setattr(disk, "_wsl_drive_lookup", lambda: (None, "no reg.exe here"))
     monkeypatch.delenv("HARVEY_HOST_DRIVE", raising=False)
     with pytest.raises(disk.HostDriveUnknown) as unseen:
         disk.free_bytes(tmp_path / "out.db")
@@ -738,7 +738,8 @@ def test_the_host_drive_is_a_folder_of_its_own_never_a_drive_root(tmp_path, monk
     with pytest.raises(disk.HostDriveUnknown) as same:
         disk.free_bytes(tmp_path / "out.db")
     for message in (str(unseen.value), str(same.value)):
-        assert "HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free" in message
+        assert "scripts/disk-check-folder.sh" in message
+        assert "HARVEY_HOST_DRIVE_SOURCE" in message and "/mnt/c" not in message
     root = Path(__file__).resolve().parent.parent
     # (/mnt/c, /mnt/c/ and /mnt/c/. are all the drive's root.)
     drive_root = re.compile(r"HARVEY_HOST_DRIVE_SOURCE=/mnt/[a-z]/?\.?(?=[\s\"'`)]|$)", re.M)
@@ -746,17 +747,29 @@ def test_the_host_drive_is_a_folder_of_its_own_never_a_drive_root(tmp_path, monk
         assert drive_root.search(f"HARVEY_HOST_DRIVE_SOURCE={root_spelling}"), root_spelling
     for folder in ("/mnt/c/harvey-free", "/mnt/c/harvey_free", "/mnt/c/.harvey"):
         assert not drive_root.search(f"HARVEY_HOST_DRIVE_SOURCE={folder}"), folder
+    # The drive is the one that holds the WSL disk, any letter: nothing
+    # tells the user to use C: (/mnt/c, its folders, or C:\\ itself).
+    # (Backslashes single in Markdown, doubled in Python source.)
+    names_c = re.compile(r"/mnt/c(?![a-z0-9_-])|(?<![A-Za-z])C:\\++(?!Users\\+example)")
+    for spelling in ("mkdir /mnt/c/harvey-disk-check", "HARVEY_HOST_DRIVE_SOURCE=/mnt/c",
+                     "(/mnt/c)", r"on C:\harvey", r"on C:\\harvey"):
+        assert names_c.search(spelling), spelling
+    for spelling in ("/mnt/<drive>/harvey-disk-check", "/mnt/cdrom", "isn't always C:",
+                     r"C:\Users\example\AppData", r"C:\\Users\\example"):
+        assert not names_c.search(spelling), spelling
     for name in ("docker-compose.yml", ".env.example", "README.md", "CLAUDE.md",
-                 "harvey/disk.py", "harvey/web/i18n.js"):
+                 "CHANGELOG.md", "harvey/disk.py", "harvey/web/i18n.js",
+                 "scripts/disk-check-folder.sh"):
         text = (root / name).read_text(encoding="utf-8")
         assert not drive_root.search(text), name
-    assert "/mnt/c/harvey-free" in (root / ".env.example").read_text(encoding="utf-8")
+        assert not names_c.search(text), name
+    assert "scripts/disk-check-folder.sh" in (root / ".env.example").read_text(encoding="utf-8")
     assert "${HARVEY_HOST_DRIVE_SOURCE:-.}" in (root / "docker-compose.yml").read_text(
         encoding="utf-8")
 
 
 def test_a_host_drive_that_is_a_whole_drive_is_refused(tmp_path, monkeypatch):
-    # An older release's .env mounted the drive's root (/mnt/c): a folder
+    # An older release's .env mounted the drive's root: a folder
     # holding what a Windows drive's root holds is refused, with what to
     # set instead; a folder of its own, empty or not, is read.
     from harvey import disk
@@ -768,7 +781,7 @@ def test_a_host_drive_that_is_a_whole_drive_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("HARVEY_HOST_DRIVE", str(drive))
     with pytest.raises(disk.HostDriveUnknown, match="whole drive") as e:
         disk.free_bytes(tmp_path / "out.db")
-    assert "HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free" in str(e.value)
+    assert "scripts/disk-check-folder.sh" in str(e.value)
     (drive / "Windows").rmdir()
     with pytest.raises(disk.HostDriveUnknown, match="whole drive"):
         disk.host_drive()

@@ -69,12 +69,23 @@ minor versions can still change behaviour.
   them in use, and the job runs again once many firms were pulled since.
 - **Docker on WSL: the free-space check mounts one empty folder, never
   the Windows drive.** `HARVEY_HOST_DRIVE_SOURCE` is now documented as a
-  dedicated empty folder on the drive (`mkdir /mnt/c/harvey-free`), whose
-  free space is the drive's, instead of `/mnt/c`, which showed every file
-  on the drive to a container that reads untrusted websites. If you set it
-  to `/mnt/c`, change it and recreate the container: until then the
-  free-space check refuses a folder that holds a drive's `Windows`, `Users`
-  or `Program Files`, so loads and the upgrade say what to set.
+  dedicated empty folder on the Windows drive that holds your WSL disk,
+  whose free space is the drive's, instead of the drive's root, which
+  showed every file on it to a container that reads untrusted websites.
+  `scripts/disk-check-folder.sh`, run once from the WSL shell, finds that
+  drive, creates `harvey-disk-check` on it and adds the setting to `.env`.
+  If you set it to a drive's root, change it and recreate the container:
+  until then the free-space check refuses a folder that holds a drive's
+  `Windows`, `Users` or `Program Files`, so loads and the upgrade say what
+  to set.
+- **WSL: the free-space check measures the drive that really holds the
+  disk.** It assumed C:, but a moved or imported distro's disk can be on
+  any drive. Outside Docker, Harvey now asks Windows which folder holds
+  this distro's disk (the registry, through `reg.exe`) and measures that
+  drive; when it can't tell, big writes are refused with what to set.
+  `scripts/disk-check-folder.sh` checks a `HARVEY_HOST_DRIVE_SOURCE` that
+  `.env` already sets: one on another drive (C:, as earlier instructions
+  said), missing or not empty is reported with what to change it to.
 
 ### Added
 

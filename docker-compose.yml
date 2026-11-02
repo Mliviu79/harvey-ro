@@ -36,11 +36,12 @@ services:
       # free space is read, so it should hold nothing (this container reads
       # untrusted websites). Native Linux: the checkout, already mounted
       # above, the default. WSL: the Linux disk is a file on a Windows drive
-      # that can fill while the Linux side still shows room, so create one
-      # empty folder on that drive (mkdir /mnt/c/harvey-free) and set
-      # HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free in .env. Never the drive
-      # itself (/mnt/c): that would show the whole Windows drive to the
-      # container. Harvey refuses big writes on WSL until it is set.
+      # that can fill while the Linux side still shows room, so mount one
+      # empty folder on the Windows drive that holds your WSL disk: run
+      # scripts/disk-check-folder.sh once from the WSL shell, which creates
+      # it and sets HARVEY_HOST_DRIVE_SOURCE in .env. Never the drive itself:
+      # that would show the whole Windows drive to the container. Harvey
+      # refuses big writes on WSL until it is set.
       - type: bind
         source: ${HARVEY_HOST_DRIVE_SOURCE:-.}
         target: /host-drive

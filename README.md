@@ -247,17 +247,26 @@ database upgrade) Harvey checks free space on the data's disk and on the drive
 under it. Under WSL the Linux disk is a file on a Windows drive, which can fill
 while Linux still shows room, and a container can't see that drive. Compose
 mounts `HARVEY_HOST_DRIVE_SOURCE` read-only for the check: the checkout by
-default (right on native Linux). On WSL, create an empty folder of its own on
-the drive that holds the WSL disk, put it in `.env` and recreate the container
-(`docker compose up -d`); until then, big writes are refused with a message
+default (right on native Linux). On WSL, the folder must be an empty one of
+its own on the Windows drive that holds your WSL disk, which isn't always C:
+(Windows records each distro's disk folder; a moved or imported distro can be
+on any drive). Run this once from the WSL shell, in the checkout: it finds the
+drive, creates `harvey-disk-check` on it and adds `HARVEY_HOST_DRIVE_SOURCE`
+to `.env`. A folder already set there is checked instead: kept when it's an
+empty folder on that drive, reported with what to change it to when it's on
+another drive (older instructions said C:), missing or not empty.
+Then recreate the container. Until then, big writes are refused with a message
 saying so. Only the folder's free space is read, which is the drive's. Don't
-mount the drive itself (`/mnt/c`): the container reads untrusted websites and
-would see every file on it.
+mount the drive itself: the container reads untrusted websites and would see
+every file on it.
 
 ```bash
-mkdir -p /mnt/c/harvey-free
-grep -q '^HARVEY_HOST_DRIVE_SOURCE=' .env || printf '\nHARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free\n' >> .env
+scripts/disk-check-folder.sh
+docker compose up -d harvey
 ```
+
+Outside Docker, Harvey finds the drive the same way by itself
+(`HARVEY_HOST_DRIVE` overrides it).
 
 The dashboard listens on 5555. If you change the port in the Compose `command`,
 change the Dockerfile health-check port too and rebuild. Stop the service with
@@ -774,9 +783,10 @@ Harvey wrote to the old file after it was migrated, the switch refuses and
 the next run migrates and verifies it again. Nothing is deleted on its own: once you're
 happy, **Delete old files** (dashboard, typed confirmation) or
 `harvey upgrade --delete-old` frees the space. In Docker on WSL the free
-space check must see the Windows drive: create an empty folder on it
-(`mkdir /mnt/c/harvey-free`) and set `HARVEY_HOST_DRIVE_SOURCE=/mnt/c/harvey-free`
-in `.env`, never the drive itself. A database older than schema 24 is first opened once by the
+space check must see the Windows drive that holds your WSL disk: run
+`scripts/disk-check-folder.sh` once from the WSL shell (it creates an empty
+folder on that drive and sets `HARVEY_HOST_DRIVE_SOURCE` in `.env`), then
+`docker compose up -d harvey`; never the drive itself. A database older than schema 24 is first opened once by the
 Harvey release before this one. `harvey upgrade --data DIR --out OUT` is a
 dry run on a copy: it writes only into `OUT`, reads the sources as files
 that don't change, and refuses a folder Harvey is running on.
