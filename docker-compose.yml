@@ -12,6 +12,10 @@ services:
       # The obscura service below. BROWSER_CDP_URL in .env overrides it;
       # BROWSER_CDP_URL=off reads every site over plain HTTP.
       HARVEY_BROWSER_CDP_DEFAULT: http://127.0.0.1:9230
+      # Where big writes (downloads, register loads, the database upgrade)
+      # check free space besides the data's own disk: the drive mounted
+      # below (harvey/disk.py).
+      HARVEY_HOST_DRIVE: /host-drive
     volumes:
       # Mount the checkout directory, not individual config files: setup and
       # training atomically replace files and create harvey.local.yaml.
@@ -26,6 +30,18 @@ services:
       - type: bind
         source: ${HOME}/.claude
         target: /home/harvey/.claude
+        bind:
+          create_host_path: false
+      # The drive free space is checked on, read-only (only its free space
+      # is read). Native Linux: the checkout's own disk, the default. WSL:
+      # the Linux disk is a file on a Windows drive that can fill while the
+      # Linux side still shows room, so set HARVEY_HOST_DRIVE_SOURCE=/mnt/c
+      # (the drive holding the WSL disk) in .env; Harvey refuses big writes
+      # on WSL until it is set.
+      - type: bind
+        source: ${HARVEY_HOST_DRIVE_SOURCE:-.}
+        target: /host-drive
+        read_only: true
         bind:
           create_host_path: false
     restart: unless-stopped

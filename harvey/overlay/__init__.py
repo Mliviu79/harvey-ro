@@ -12,7 +12,13 @@ merges with undo, sources, web signals and outreach.
   (``harvey doctor --recount``).
 - merges.py: merge and undo, which recount instead of relying on triggers.
 - queries.py: the overlay's named page statements.
+- idents.py: identifier schemes, and how a record's ids reach them.
+- store.py: Harvey's writes (the StateManager's, by the same names): firms
+  found or pulled, contacts and evidence, people, searches, web signals,
+  merges and undo, removing a firm.
+- reads.py: Harvey's reads (the pages', the CLI's, the agents'), in the
+  shapes schema 24's reads give them.
 
-Nothing user-facing reads this schema yet: the current schema (24, state.py)
-stays in use until the read and write paths move over.
+The StateManager writes through store.py and reads through reads.py when
+the database it opens is schema 25, and keeps schema 24's paths otherwise.
 """

@@ -83,6 +83,11 @@ def build_v24(path: Path) -> None:
     con.execute("INSERT INTO company_ids (company_id, kind, value, source) "
                 "VALUES (?, 'external', 'dataforseo:ChIJexample', 'discover:dataforseo_listings')",
                 (L2,))
+    # Name-in-town keys: a listing's moves over, a registered firm's is
+    # the register's own index now.
+    con.executemany("INSERT INTO company_ids (company_id, kind, value, source) "
+                    "VALUES (?, 'name', ?, 'example')",
+                    [(L2, "exemplu doi@brasov"), (R4, "exemplu patru@brasov")])
     # An identifier no module declares: kept aside.
     con.execute("INSERT INTO company_ids (company_id, kind, value, source) "
                 "VALUES (?, 'external', 'nowhere:77', 'discover:osm')", (L1,))
@@ -202,6 +207,9 @@ def build_v24(path: Path) -> None:
                 "'website')", (R5,))
     con.execute("INSERT INTO jobs (id, kind, lane, params_json) VALUES ('j1', 'find_contacts', "
                 "'contacts', ?)", (f'{{"company_ids": ["{R4}", "{L2}"]}}',))
+    # A finished job's ids are history: no old id is kept for them.
+    con.execute("INSERT INTO jobs (id, kind, lane, params_json, status) VALUES ('j2', "
+                "'find_contacts', 'contacts', ?, 'done')", (f'{{"company_ids": ["{R6}"]}}',))
     con.execute("INSERT INTO settings (key, value) VALUES ('example', 'on')")
     con.commit()
     con.close()
@@ -355,8 +363,10 @@ def test_the_upgrade_keeps_what_harvey_added_and_leaves_the_register_copies(v24,
     assert one("SELECT firm FROM firm_source WHERE ref = 'node/101'") == l1
     assert one("SELECT firm FROM prospects WHERE id = 'p1'") == r5
     assert one("SELECT firm FROM locations") == l1
-    assert one("SELECT COUNT(*) FROM jobs") == 1
+    assert one("SELECT COUNT(*) FROM jobs") == 2
     assert dict(q("SELECT uuid, firm FROM legacy_id")) == {R4: r4, L2: l2}
+    assert q("SELECT value, firm FROM firm_key WHERE kind = ?", schema.FIRM_KEY["name"]) == [
+        ("exemplu doi@brasov", l2)]
     # The vocabulary keeps the user's confirmations; every source is listed.
     assert one("SELECT status FROM signal WHERE code = 'TECH_STACK'") == \
         sqlite3.connect(v24).execute("SELECT status FROM signal_codes WHERE code = 'TECH_STACK'"
@@ -621,9 +631,36 @@ def test_free_space_counts_the_drive_a_virtual_disk_lives_on(tmp_path, monkeypat
     host.mkdir()
     usage[str(host)] = 20 * 10**9
     monkeypatch.setenv("HARVEY_HOST_DRIVE", str(host))
+    # A host drive on the virtual disk itself (a container's default mount
+    # left unset on WSL) is not the drive under it: refused.
+    with pytest.raises(disk.HostDriveUnknown, match="same disk"):
+        disk.free_bytes(tmp_path / "out.db")
+    monkeypatch.setattr(disk, "same_disk", lambda a, b: False)
     assert disk.free_bytes(tmp_path / "out.db") == 20 * 10**9
     with pytest.raises(migrate.Refused, match="20.0 GB free"):
         migrate.migrate(src, tmp_path / "out.db")
     assert not (tmp_path / "out.db").exists()
     monkeypatch.setenv("HARVEY_HOST_DRIVE", "none")
     assert disk.free_bytes(tmp_path / "out.db") == 500 * 10**9
+
+
+def test_free_space_on_wsl_for_data_on_the_windows_drive_itself(tmp_path, monkeypatch):
+    # A checkout under /mnt/c: the host drive and the data share one file
+    # system, and that is the Windows drive itself, not the virtual disk.
+    from harvey import disk
+
+    host = tmp_path / "host"
+    host.mkdir()
+    mounts = tmp_path / "mounts"
+    monkeypatch.setattr(disk, "MOUNTS", mounts)
+    monkeypatch.setattr(disk, "on_wsl", lambda: True)
+    monkeypatch.setenv("HARVEY_HOST_DRIVE", str(host))
+    monkeypatch.setattr(disk, "same_disk", lambda a, b: True)
+    mounts.write_text(f"/dev/sdc / ext4 rw 0 0\nC:\\ {tmp_path.resolve()} 9p rw 0 0\n")
+    assert disk.on_windows_drive(tmp_path)
+    assert disk.free_bytes(tmp_path / "out.db") == disk.shutil.disk_usage(tmp_path).free
+    # On the virtual disk itself it is still refused.
+    mounts.write_text("/dev/sdc / ext4 rw 0 0\n")
+    assert not disk.on_windows_drive(tmp_path)
+    with pytest.raises(disk.HostDriveUnknown, match="same disk"):
+        disk.free_bytes(tmp_path / "out.db")

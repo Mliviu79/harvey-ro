@@ -35,7 +35,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from harvey.overlay import recount
+from harvey.overlay import recount, schema
 from harvey.overlay.migrate import _uri, unix
 
 STATES = ("true", "false", "unknown")
@@ -132,7 +132,8 @@ def counts(con, register_modules) -> dict:
         "settings": ("SELECT COUNT(*) FROM old.settings", "SELECT COUNT(*) FROM settings"),
         "Harvey-found email and domain keys": (
             "SELECT COUNT(*) FROM old.company_ids WHERE kind IN ('email', 'domain')",
-            "SELECT COUNT(*) FROM firm_key"),
+            f"SELECT COUNT(*) FROM firm_key WHERE kind IN ({schema.FIRM_KEY['email']}, "
+            f"{schema.FIRM_KEY['domain']})"),
         "websites (live)": (
             "SELECT COUNT(*) FROM old.companies WHERE COALESCE(merged_into, '') = '' "
             "AND (website != '' OR domain != '')",
@@ -150,6 +151,8 @@ def counts(con, register_modules) -> dict:
     out["firms described locally (no register key)"] = _q(con, "SELECT COUNT(*) FROM local_firm")
     out["migration notes by kind"] = dict(con.execute(
         "SELECT kind, COUNT(*) FROM migration_note GROUP BY kind").fetchall())
+    out["name keys of firms described locally"] = _q(
+        con, f"SELECT COUNT(*) FROM firm_key WHERE kind = {schema.FIRM_KEY['name']}")
     out["legacy ids"] = _q(con, "SELECT COUNT(*) FROM legacy_id")
     out["websites by trust (live)"] = {
         str(k): v for k, v in con.execute(

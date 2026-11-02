@@ -46,6 +46,7 @@ filled, every other value stays on file with its source.
 """
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -53,6 +54,8 @@ from functools import lru_cache
 from harvey import contacts
 # The name and town keys (re-exported: resolver.fold, resolver.name_key, ...).
 from harvey.name_keys import fold, locality_key, name_key  # noqa: F401
+
+logger = logging.getLogger("harvey.resolver")
 
 ATTACH = 0.85
 REVIEW = 0.6
@@ -286,10 +289,10 @@ async def ids_of(db, company_id: str) -> dict[str, set[str]]:
     return out
 
 
-def conflict(mine: dict[str, set[str]], theirs: dict[str, set[str]]) -> str:
+def conflict(mine: dict[str, set[str]], theirs: dict[str, set[str]], legal=LEGAL) -> str:
     """The legal key two companies hold different values of ("cui", "reg"),
     or "" when nothing says they are different companies."""
-    for kind in LEGAL:
+    for kind in legal:
         if mine.get(kind) and theirs.get(kind) and not mine[kind] & theirs[kind]:
             return kind
     return ""
@@ -303,10 +306,10 @@ def _combined(weights) -> float:
 
 
 def _score(found: dict[str, tuple[float, str]], mine: dict[str, set[str]],
-           theirs: dict[str, set[str]]):
+           theirs: dict[str, set[str]], legal=LEGAL):
     """(score, reasons, evidence used) for two companies sharing ``found``
     ({code: (weight, value)}), or None when nothing counts."""
-    if conflict(mine, theirs):
+    if conflict(mine, theirs, legal):
         return None
     reasons = []
     if "name" in found and mine.get("domain") and theirs.get("domain") \
@@ -375,9 +378,6 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
     ids = identifiers(company, extra_ids)
     if not ids:
         return Match()
-    mine: dict[str, set[str]] = {}
-    for kind, value in ids:
-        mine.setdefault(kind, set()).add(value)
     # Every holder of every key, and every key those holders have, in one
     # query (a registry import matches hundreds of thousands of rows:
     # round trips are its cost).
@@ -409,6 +409,24 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
             theirs_all.setdefault(cid, {}).setdefault(kind, set()).add(value)
     for cid in via_merged:                 # reached through a merged record
         theirs_all[cid] = await ids_of(db, cid)
+    best = decide(ids, holders, theirs_all, merged_owner, declared_domain)
+    if best.same_record and not best.origin:
+        best.origin = await _moved_from(db, [pair for pair in ids if pair[0] in SAME_RECORD])
+    return best
+
+
+def decide(ids, holders: dict[tuple[str, str], set[str]],
+           theirs_all: dict[str, dict[str, set[str]]], merged_owner: dict[str, set[str]],
+           declared_domain: bool = False, legal=LEGAL) -> Match:
+    """The match itself, from what is on file: ``holders`` (each of the
+    record's keys -> the live companies holding it), ``theirs_all`` (each
+    such company -> every key it holds), ``merged_owner`` (a live company
+    -> its merged records that hold one of the record's own keys). Pure:
+    both schemas gather these their own way. ``legal``: the kinds two
+    different values of which are two companies."""
+    mine: dict[str, set[str]] = {}
+    for kind, value in ids:
+        mine.setdefault(kind, set()).add(value)
     my_firm = identity(mine)
     firm = {cid: identity(theirs_all.get(cid, {})) for live in holders.values() for cid in live}
     evidence: dict[str, dict[str, tuple[float, str]]] = {}
@@ -421,11 +439,11 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
             if flag:
                 flags.setdefault(cid, set()).add(flag)
     if not evidence:
-        return Match(new_ids=ids)
+        return Match(new_ids=list(ids))
 
     scored = []
     for cid in sorted(evidence):
-        result = _score(evidence[cid], mine, theirs_all[cid])
+        result = _score(evidence[cid], mine, theirs_all.get(cid, {}), legal)
         if result is None:
             continue
         score, reasons = _flagged(result[0], result[1], flags.get(cid, ()))
@@ -438,7 +456,7 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
             scored = [(min(score, REVIEW_CAP), cid,
                        reasons + ([{"code": "several_firms"}] if score >= REVIEW else []), found)
                       for score, cid, reasons, found in scored]
-    best = Match(new_ids=ids)
+    best = Match(new_ids=list(ids))
     for score, cid, reasons, found in scored:
         if score > best.score:
             held = {pair for pair, live in holders.items() if cid in live}
@@ -449,8 +467,6 @@ async def match(db, company, extra_ids=(), declared_domain: bool = False) -> Mat
     if not best.attach:
         best.others = [(cid, score, reasons) for score, cid, reasons, _ in scored
                        if cid != best.company_id and REVIEW <= score < ATTACH]
-    if best.same_record and not best.origin:
-        best.origin = await _moved_from(db, [pair for pair in ids if pair[0] in SAME_RECORD])
     return best
 
 
@@ -469,6 +485,169 @@ async def _moved_from(db, keys) -> str:
         if row:
             return row[0]
     return ""
+
+
+# ── Matching on the overlay (schema 25) ──
+#
+# The same rule over Harvey's own firm ids: identifiers are firm_ident rows
+# under the schemes modules declare (overlay/idents.py), domains a firm's
+# own column or a key Harvey found (firm_key), a phone's holders the firms
+# linking it, a name in its town a key of a firm no register describes or a
+# register's own name index (counted over the firms in Harvey only). Only a
+# legal scheme's keys keep two firms apart (ident_scheme.legal: a tax code;
+# a registration number is matched on, never a reason to refuse). Ids in
+# the Match are firm ids as text, like every company id the callers pass.
+
+def match_firm(con, company, extra_ids=(), declared_domain: bool = False, *, schemes,
+               registers=()) -> Match:
+    """match() on an overlay connection. Reads only. ``schemes``: the
+    database's Schemes; ``registers``: register adapters attached to
+    ``con`` (their name index answers the name in its town)."""
+    import harvey.overlay.queries  # noqa: F401  (registers the statements read below)
+
+    ids = identifiers(company, extra_ids)
+    if not ids:
+        return Match()
+    record_holders: dict[tuple[str, str], set[int]] = {}
+    for kind, value in ids:
+        found = _overlay_holders(con, schemes, kind, value, company, registers)
+        if found:
+            record_holders[(kind, value)] = found
+    records = {r for found in record_holders.values() for r in found}
+    live = _overlay_live(con, records)
+    holders: dict[tuple[str, str], set[str]] = {}
+    merged_owner: dict[str, set[str]] = {}
+    for (kind, value), found in record_holders.items():
+        for record in found:
+            to = live.get(record)
+            if not to:
+                continue
+            holders.setdefault((kind, value), set()).add(str(to))
+            if to != record and kind in SAME_RECORD:
+                merged_owner.setdefault(str(to), set()).add(str(record))
+    for pair in [p for p, held in holders.items()
+                 if p[0] in CONTACT_KEYS and len(held) > SHARED_FIRMS_REVIEW_MAX]:
+        if _shared_by_many_firms(con, schemes, holders[pair]):
+            # A switchboard's number says nothing (_contact_rule): the keys
+            # of its thousands of holders aren't gathered for nothing.
+            del holders[pair]
+    theirs_all = {cid: _overlay_keys(con, schemes, int(cid))
+                  for cid in {c for held in holders.values() for c in held}}
+    return decide(ids, holders, theirs_all, merged_owner, declared_domain,
+                  legal=schemes.legal_kinds())
+
+
+def _shared_by_many_firms(con, schemes, live: set[str]) -> bool:
+    """Whether more than SHARED_FIRMS_REVIEW_MAX firms (legal identities)
+    hold a contact among the live firms ``live``: then it is evidence for
+    none of them, whatever the record is. Stops reading at the first
+    firm past the limit."""
+    from harvey.queries import sql
+
+    firms = set()
+    for cid in sorted(live, key=int):
+        ids: dict[str, set[str]] = {}
+        for scheme, key in con.execute(sql("overlay.resolve.group_idents"), (int(cid), int(cid))):
+            for kind, value in schemes.kinds_of(scheme, key):
+                ids.setdefault(kind, set()).add(value)
+        firm = identity(ids)
+        if firm is not None:
+            firms.add(firm)
+            if len(firms) > SHARED_FIRMS_REVIEW_MAX:
+                return True
+    return False
+
+
+def _overlay_live(con, records) -> dict[int, int]:
+    from harvey.queries import sql
+
+    out = {}
+    for record in records:
+        row = con.execute(sql("overlay.resolve.live"), (record,)).fetchone()
+        if row:
+            out[record] = row[0]
+    return out
+
+
+def _overlay_holders(con, schemes, kind: str, value: str, company, registers) -> set[int]:
+    """The records (firm ids, merged or not) holding one key of a record."""
+    from harvey.overlay.schema import FIRM_KEY, PHONE
+    from harvey.overlay.triggers import active
+    from harvey.queries import sql
+
+    out: set[int] = set()
+    if kind in ("cui", "reg", "external"):
+        key = schemes.key(kind, value)
+        if key is not None:
+            out |= {r[0] for r in con.execute(sql("overlay.resolve.ident"), key)}
+    elif kind == "domain":
+        out |= {r[0] for r in con.execute(sql("overlay.resolve.domain"), (value,))}
+        out |= {r[0] for r in con.execute(sql("overlay.resolve.key"),
+                                          (FIRM_KEY["domain"], value))}
+    elif kind in ("email", "name"):
+        out |= {r[0] for r in con.execute(sql("overlay.resolve.key"), (FIRM_KEY[kind], value))}
+    elif kind == "phone":
+        out |= {r[0] for r in con.execute(sql("overlay.resolve.phone"), (PHONE, value))}
+        if active(con):
+            # A bulk write links its contacts only at its recount: the
+            # evidence it added so far holds them already.
+            out |= {r[0] for r in con.execute(
+                "SELECT t.firm FROM temp.touched_link t JOIN contact c ON c.id = t.contact "
+                "WHERE c.kind = ? AND c.value = ?", (PHONE, value))}
+    if kind == "name":
+        out |= _register_name_holders(con, schemes, company, registers)
+    return out
+
+
+# Registers whose stale name index was reported (once per process).
+_STALE_NAMES_LOGGED: set[str] = set()
+
+
+def _register_name_holders(con, schemes, company, registers) -> set[int]:
+    """The firms in Harvey a register names this way in this town."""
+    from harvey.queries import sql
+    from harvey.registers import Stale
+
+    get = (lambda k: company.get(k) or "") if isinstance(company, dict) \
+        else (lambda k: getattr(company, k, "") or "")
+    out: set[int] = set()
+    attached = {r[1] for r in con.execute("PRAGMA database_list")}
+    for adapter in registers:
+        if adapter.alias not in attached or not hasattr(adapter, "name_holders"):
+            continue
+        try:
+            reg_ids = adapter.name_holders(con, get("name"), get("location"))
+        except Stale as e:
+            if adapter.module not in _STALE_NAMES_LOGGED:
+                _STALE_NAMES_LOGGED.add(adapter.module)
+                logger.warning("matching by name in %s is off until its name index is rebuilt "
+                               "(reload the register): %s", adapter.module, e)
+            continue
+        if not reg_ids or len(reg_ids) > 50:
+            # More than a chain's worth: says nothing about which it is.
+            continue
+        for scheme_name, key in adapter.keys_of_ids(con, reg_ids):
+            scheme = schemes.named(scheme_name)
+            if scheme is not None:
+                out |= {r[0] for r in con.execute(sql("overlay.resolve.ident"), (scheme.id, key))}
+    return out
+
+
+def _overlay_keys(con, schemes, live: int) -> dict[str, set[str]]:
+    """Every key the records of live firm ``live`` hold, as the resolver's kinds."""
+    from harvey.overlay.schema import FIRM_KEY
+    from harvey.queries import sql
+
+    names = {v: k for k, v in FIRM_KEY.items()}
+    out: dict[str, set[str]] = {}
+    for scheme, key in con.execute(sql("overlay.resolve.group_idents"), (live, live)):
+        for kind, value in schemes.kinds_of(scheme, key):
+            out.setdefault(kind, set()).add(value)
+    for kind, value in con.execute(sql("overlay.resolve.group_keys"), (live, live)):
+        out.setdefault(names.get(kind, str(kind)), set()).add(value)
+    for (domain,) in con.execute(sql("overlay.resolve.group_domains"), (live, live)):
+        out.setdefault("domain", set()).add(domain)
+    return out
 
 
 async def scan(db) -> dict:

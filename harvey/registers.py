@@ -185,6 +185,39 @@ class Adapter:
             return None
         return self.sql(f"held.{signal}{read.suffix}.{OPS.index(op)}")
 
+    def unvalued_sql(self, signal: str) -> str | None:
+        """The records in Harvey whose key of the register's own scheme has
+        no value of ``signal`` (param: the scheme's id), or None."""
+        if (signal, "") not in self.by_signal:
+            return None
+        return self.sql(f"unvalued.{signal}")
+
+    def held_false_sql(self, signal: str, scheme: str = "") -> str | None:
+        read = self.by_signal.get((signal, scheme))
+        return None if read is None else self.sql(f"held_false.{signal}{read.suffix}")
+
+    def page_sql(self, signal: str, way: str = "desc") -> str | None:
+        """Every record in Harvey with a value, by the value (param: the
+        scheme's id, limit, offset), or None when it isn't indexed."""
+        read = self.by_signal.get((signal, ""))
+        if read is None or not read.indexed:
+            return None
+        return self.sql(f"page.{signal}{'.asc' if way == 'asc' else ''}")
+
+    def page_count_sql(self, signal: str) -> str:
+        return self.sql(f"page_count.{signal}")
+
+    def lacking_sql(self, signal: str) -> str:
+        """The live firms with no value, newest first (params: the scheme's
+        id, limit, offset)."""
+        return self.sql(f"lacking.{signal}")
+
+    def held_yes_sql(self, signal: str, scheme: str = "") -> str | None:
+        """A statement giving the records in Harvey whose value reads yes
+        (param: the scheme's id) through an index the register keeps for
+        that answer alone, or None (a module with one says so)."""
+        return None
+
     def range(self, con: sqlite3.Connection, signal: str, op: str, value,
               scheme: str = "") -> list:
         sql = self.range_sql(signal, op, scheme)
@@ -207,6 +240,22 @@ def register_reads(adapter: Adapter) -> None:
     mod = adapter.module
     if adapter.marks_sql:
         queries.statement(f"{mod}.marks", adapter.marks_sql, module=mod)
+    # The records in Harvey whose key of the register's own scheme has no
+    # value of a signal (usually none or few): a cohort's unknowns, with the
+    # firms that have no such key (overlay.reads). One walk of the scheme's
+    # keys, each probed in the register. Param: the scheme's id.
+    for r in adapter.reads:
+        if r.scheme:
+            continue
+        queries.statement(
+            f"{mod}.unvalued.{r.signal}",
+            f"SELECT fi.firm FROM firm_ident fi WHERE fi.scheme = ? AND NOT EXISTS ("
+            f"SELECT 1 FROM {r.table} WHERE c.{r.key} = "
+            f"{'CAST(fi.key AS TEXT)' if r.key_text else 'fi.key'} AND {r.where} "
+            f"AND {r.value} IS NOT NULL)",
+            params=(1,), module=mod, drives="fi",
+            scans={"firm_ident": "a cohort's unknowns for a register value: every key of the "
+                                 "scheme probed once per load mark (kept), never per page"})
     for r in adapter.reads:
         name = f"{r.signal}{r.suffix}"
         keyed = "CAST(j.value AS TEXT)" if r.key_text else "j.value"
@@ -233,6 +282,16 @@ def register_reads(adapter: Adapter) -> None:
             params=(1,), module=mod, drives="fi",
             scans={"firm_ident": "a recount job per load mark: every key of the scheme, "
                                  "each probed in the register by key"})
+        # The records in Harvey whose value reads no (a walk of the scheme's
+        # keys, returning only those: usually the few), for a value the
+        # register keeps no index of.
+        queries.statement(
+            f"{mod}.held_false.{name}",
+            f"SELECT fi.firm FROM firm_ident fi CROSS JOIN {r.table} "
+            f"WHERE fi.scheme = ? AND {probe} AND {false}",
+            params=(1,), module=mod, drives="fi",
+            scans={"firm_ident": "the firms whose register value reads no: every key of the "
+                                 "scheme, probed in the register, once per load mark (kept)"})
         queries.statement(
             f"{mod}.held_values.{name}",
             f"SELECT fi.firm, {r.value}, {r.date} FROM firm_ident fi CROSS JOIN {r.table} "
@@ -240,6 +299,46 @@ def register_reads(adapter: Adapter) -> None:
             params=(1,), module=mod, drives="fi",
             scans={"firm_ident": "an upgrade's or recount's walk: every key of the scheme, "
                                  "each probed in the register by key"})
+        if r.indexed and not r.scheme:
+            # Every firm in Harvey by this value (a page of the Companies
+            # sort): the register's index walked in order, highest first
+            # (or lowest), each key probed in firm_ident; the firms with no
+            # value after them, newest first; and how many have one.
+            walked = {r.base_table: "a page walked in the value's index order, each key probed "
+                                    "in firm_ident: the walk stops after its page"}
+            for suffix, way in (("", "DESC"), (".asc", "ASC")):
+                queries.statement(
+                    f"{mod}.page.{name}{suffix}",
+                    f"SELECT fi.firm FROM {r.table} CROSS JOIN firm_ident fi "
+                    f"WHERE {r.where} AND {r.value} IS NOT NULL AND fi.scheme = ? "
+                    f"AND fi.key = +c.{r.key} ORDER BY {r.value} {way}, c.{r.key} {way} "
+                    "LIMIT ? OFFSET ?",
+                    params=(1, 50, 0), module=mod, drives="c", scans=walked)
+            # (Records counted as live firms: a firm holds one key of the
+            # scheme a register is keyed by, a legal one, on at most one of
+            # its records, so a merged record with a value is its survivor's
+            # only one.)
+            queries.statement(
+                f"{mod}.page_count.{name}",
+                f"SELECT COUNT(*) FROM {r.table} CROSS JOIN firm_ident fi "
+                f"WHERE {r.where} AND {r.value} IS NOT NULL AND fi.scheme = ? "
+                f"AND fi.key = +c.{r.key}",
+                params=(1,), module=mod, drives="c",
+                scans={r.base_table: "how many firms in Harvey have a value: the value's index "
+                                     "read whole, once per load mark"})
+            # A live firm has no value when none of its records has one (a
+            # survivor with no tax code whose merged record holds it has).
+            queries.statement(
+                f"{mod}.lacking.{name}",
+                f"SELECT f.id FROM firm f INDEXED BY firm_new WHERE f.live = 0 AND NOT EXISTS ("
+                f"SELECT 1 FROM firm_ident fi CROSS JOIN {r.table} WHERE fi.firm IN ("
+                f"SELECT f.id UNION ALL SELECT m.id FROM firm m WHERE m.live = f.id "
+                f"AND m.live != 0) "
+                f"AND fi.scheme = ? AND {probe} AND {r.value} IS NOT NULL) "
+                "ORDER BY f.created DESC, f.id DESC LIMIT ? OFFSET ?",
+                params=(1, 50, 0), module=mod,
+                scans={"firm": "the firms with no value, a page walked newest first after "
+                               "the firms with one"})
         if r.indexed:
             matches = {r.base_table: "a range reads the index entries it matches (as many as "
                                      "the firms in range): an index search, never the table"}

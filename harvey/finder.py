@@ -921,6 +921,17 @@ async def backlog(state, fresh: bool = False) -> dict:
     BACKLOG_CACHE_SECONDS (``fresh`` counts again)."""
     import time
 
+    if await state.is_overlay():
+        key = str(state.db_path)
+        kept = _counted.get(key)
+        if fresh or kept is None or time.monotonic() - kept[0] > BACKLOG_CACHE_SECONDS:
+            kept = (time.monotonic(), await state.read("backlog", FINDER, SITE))
+            _counted[key] = kept
+        out = dict(kept[1])
+        looked = out.pop("looked")
+        out["jobs"] = await state.jobs_waiting("find_contacts")
+        out["background_search"] = await background_status(state, looked)
+        return out
     site_cond, site_args = _site_not_read()
     finder_cond, finder_args = _not_searched(*FINDER, None)
     key = str(state.db_path)
@@ -996,6 +1007,8 @@ async def next_free(state, limit: int) -> list[str]:
     deeper read (menu, people, owner, pattern) once. Walks the companies
     with a domain or a website (their indexes), never the whole table: on
     a registry most companies have neither."""
+    if await state.is_overlay():
+        return await state.read("next_free", int(limit))
     site_cond, site_args = _site_not_read()
     out: list[str] = []
     async with state._connect() as db:
@@ -1028,6 +1041,8 @@ async def next_paid(state, limit: int, available: list[Searcher] | None = None) 
         available = searchers(await switches.enabled_ids(state), _env())
     if not available:
         return []
+    if await state.is_overlay():
+        return await state.read("next_paid", int(limit), available)
     conds, args = [], []
     for s in available:
         cond, cond_args = _not_searched(s.module, s.capability, None)
@@ -1058,6 +1073,9 @@ async def select(state, f: contacts.ContactFilter | None = None, *, ids=None,
     ``force``), with whether each has a website, up to ``limit``. Given
     ``ids``, only those, in pieces of IDS_PER_QUERY."""
     f = f or contacts.ContactFilter()
+    if await state.is_overlay():
+        return await state.read("select", f, None if ids is None else list(ids), force,
+                                int(limit))
     with_sql, params = (f.cohort if f.cohort is not None else ("", []))
     conds, args = contacts.company_conditions(f, possible=True)
     if not force:

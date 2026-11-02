@@ -2243,6 +2243,17 @@ def cmd_doctor(args):
     from harvey.state import DB_PATH
 
     path = Path(args.db or DB_PATH)
+    if getattr(args, "registers", False):
+        from harvey.overlay import reads
+
+        if not path.is_file() or reads.version(path) != schema.VERSION:
+            print(f"\n  --registers counts the register signals of a schema {schema.VERSION} "
+                  "database.\n")
+            sys.exit(2)
+        n = reads.recount_register_tally(path)
+        print(f"\n  Counted {n} register signals over the firms in Harvey for the registers' "
+              "current loads.\n")
+        return
     if not args.recount:
         print("\n  Nothing to check: harvey doctor --recount compares every kept count "
               "with a full recount.\n")
@@ -2274,6 +2285,45 @@ def cmd_doctor(args):
             sys.exit(1)
     finally:
         con.close()
+
+
+_REMOVE_REFUSED = {
+    "not_found": "no such company",
+    "merged": "it is part of a merge (in force or undone); its history needs it",
+    "has_prospects": "outreach names it (its prospects and emails stay with it)",
+    "not_supported": "this needs the upgraded database",
+}
+
+
+def cmd_remove(args):
+    """Remove companies from Harvey, each on its own."""
+    from harvey.overlay.store import RemoveRefused
+    from harvey.state import StateManager
+
+    async def _remove():
+        state = StateManager()
+        await state.init_db()
+        failed = 0
+        print()
+        for company_id in args.company_ids:
+            try:
+                done = await state.remove_company(company_id)
+            except RemoveRefused as e:
+                failed += 1
+                print(f"  {company_id}: can't: {_REMOVE_REFUSED.get(e.code, e.code)}.")
+                continue
+            if not done["removed"]:
+                print(f"  {company_id}: kept, it holds {done['kept']}; "
+                      f"{done['pull_rows_removed']} register pull(s) taken off it.")
+                continue
+            extra = (f" and {done['contacts_removed']} contact(s) nothing else reaches"
+                     if done["contacts_removed"] else "")
+            print(f"  {company_id}: removed{extra}.")
+        print()
+        if failed:
+            sys.exit(1)
+
+    asyncio.run(_remove())
 
 
 def cmd_duplicates(args):
@@ -3008,11 +3058,22 @@ def main():
     sub.set_defaults(func=cmd_duplicates)
 
     sub = subparsers.add_parser(
+        "remove", help="Remove companies a register pull brought from Harvey (the register "
+                       "keeps them; a pull adds them again). One Harvey worked on stays, with "
+                       "only its pulls taken off. Refused for one in a merge or named by "
+                       "outreach")
+    sub.add_argument("company_ids", nargs="+", metavar="ID", help="The companies to remove")
+    sub.set_defaults(func=cmd_remove)
+
+    sub = subparsers.add_parser(
         "doctor", help="Check the database: --recount compares kept counts with a full recount")
     sub.add_argument("--recount", action="store_true",
                      help="Count every kept value again from its rows and list what differs")
     sub.add_argument("--fix", action="store_true",
                      help="With --recount: write the recounted values where they differ")
+    sub.add_argument("--registers", action="store_true",
+                     help="Count the register signals over the firms in Harvey (what the "
+                          "Signals and landing pages show) for the registers' current loads")
     sub.add_argument("--db", default="", help="The database to check (default: data/harvey.db)")
     sub.set_defaults(func=cmd_doctor)
 

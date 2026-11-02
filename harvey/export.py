@@ -155,6 +155,9 @@ async def collect_companies(state: StateManager, config=None,
     prospects: list[dict] = []
     site_phones: dict[str, list[str]] = {}
     phone_rows: list = []
+    if await state.is_overlay():
+        companies, prospects, site_phones = await _overlay_rows(state, ids)
+        chunks = []
     async with aiosqlite.connect(state.db_path) as db:
         db.row_factory = aiosqlite.Row
         for chunk in chunks:
@@ -247,6 +250,32 @@ async def collect_companies(state: StateManager, config=None,
             "address": c.get("address", "") or "",
         })
     return out
+
+
+async def _overlay_rows(state, ids) -> tuple[list[dict], list[dict], dict]:
+    """collect_companies' reads on the overlay (overlay.reads.company_rows):
+    the companies by name, their prospects (not opted out) and every phone
+    on file, 500 at a time."""
+    if ids is None:
+        total, ids, _ = await state.read("companies_page", _all_companies(), "created", "desc",
+                                         1 << 62, 0)
+    companies, prospects, phones = [], [], {}
+    for at in range(0, len(ids), 500):
+        for row in await state.read("company_rows", [i for i in ids[at:at + 500]
+                                                     if str(i).isdigit()]):
+            inputs = row.pop("_inputs")
+            phones[row["id"]] = inputs["phones"]
+            prospects += [{**p, "company_id": row["id"]} for p in inputs["prospects"]
+                          if p.get("status") != "opted_out"]
+            companies.append(row)
+    companies.sort(key=lambda c: ((c.get("name") or "").casefold(), c.get("created_at") or ""))
+    return companies, prospects, phones
+
+
+def _all_companies():
+    from harvey.contacts import ContactFilter
+
+    return ContactFilter()
 
 
 def _listed_phones(raw: str, region) -> list:
@@ -374,6 +403,9 @@ async def source_notes(state: StateManager, ids: list[str]) -> list[str]:
     from harvey.modules import switches
 
     found: set[str] = set()
+    if await state.is_overlay():
+        found = set(await state.read("modules_of", ids))
+        return [m.attribution for m in switches.manifests() if m.id in found and m.attribution]
     async with aiosqlite.connect(state.db_path) as db:
         for i in range(0, len(ids), _ID_CHUNK):
             chunk = ids[i:i + _ID_CHUNK]
@@ -411,6 +443,8 @@ async def latest_year_figures(state: StateManager, ids: list[str],
     years: dict[str, dict[str, dict[str, float]]] = {}
     if not codes:
         return {}
+    if await state.is_overlay():
+        return await state.read("year_figures", list(ids), list(codes))
     async with aiosqlite.connect(state.db_path) as db:
         for i in range(0, len(ids), _ID_CHUNK):
             chunk = ids[i:i + _ID_CHUNK]

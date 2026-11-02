@@ -567,6 +567,40 @@ def _close_bulk(con: sqlite3.Connection) -> None:
     install(con)
 
 
+def active(con: sqlite3.Connection) -> bool:
+    """Whether a bulk write is open on this connection (its kept-value
+    triggers are off and its touches are being noted)."""
+    return con.execute("SELECT 1 FROM temp.sqlite_master WHERE type = 'trigger' "
+                       "AND name = 'bulk_firm_ins'").fetchone() is not None
+
+
+@contextmanager
+def _nested(con: sqlite3.Connection):
+    """bulk() as a savepoint of the caller's transaction."""
+    con.execute("SAVEPOINT harvey_bulk")
+    try:
+        drop(con)
+        from harvey.overlay.schema import _script
+
+        _script(con, _TOUCH)
+        for table in TOUCH_TABLES:
+            con.execute(f"DELETE FROM temp.{table}")
+        yield Bulk(con)
+        _close_bulk(con)
+        con.execute("RELEASE harvey_bulk")
+    except BaseException:
+        # (The triggers' drop is undone with the rest.)
+        con.execute("ROLLBACK TO harvey_bulk")
+        con.execute("RELEASE harvey_bulk")
+        raise
+    finally:
+        for name in _TOUCH_TRIGGERS:
+            try:
+                con.execute(f"DROP TRIGGER IF EXISTS temp.{name}")
+            except sqlite3.Error:
+                pass
+
+
 @contextmanager
 def bulk(con: sqlite3.Connection):
     """One transaction with the kept-value triggers off: yields a Bulk;
@@ -578,9 +612,19 @@ def bulk(con: sqlite3.Connection):
     the end, or an error follows), the part already committed is
     recounted and the triggers are put back in a transaction of their own
     before the error is raised (BulkCommitted when the body raised none),
-    so the triggers are never left out."""
+    so the triggers are never left out.
+
+    Inside a transaction the caller holds, the bulk write is a savepoint
+    of it (recounted and released at the end, nothing committed), and
+    inside another bulk write it is part of that one (the outer recount
+    covers it)."""
     if con.in_transaction:
-        raise RuntimeError("bulk() starts its own transaction: commit first")
+        if active(con):
+            yield Bulk(con)
+            return
+        with _nested(con) as b:
+            yield b
+        return
     con.execute("BEGIN IMMEDIATE")
     try:
         drop(con)

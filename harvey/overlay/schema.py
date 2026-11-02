@@ -36,8 +36,10 @@ EMAIL, PHONE = 1, 2
 MOBILE = LINE_TYPE["mobile"]
 CORE_KINDS = ((EMAIL, "email", "Email", "email"), (PHONE, "phone", "Phone", "phone"))
 
-# The kinds of key Harvey found for a firm (firm_key.kind).
-FIRM_KEY = {"email": 1, "domain": 2}
+# The kinds of key Harvey found for a firm (firm_key.kind). A name in its
+# town ("name@town", resolver.name_key) is kept only for a firm no register
+# describes: a register's firms are matched by name through its own index.
+FIRM_KEY = {"email": 1, "domain": 2, "name": 3}
 
 # Roles the kept values need to recognise (role table): the capability a
 # website read is recorded under, the contact finder's, and the bit of
@@ -86,8 +88,10 @@ CREATE TABLE signal_source (
 """
 
 FIRMS = """
+-- AUTOINCREMENT: a removed firm's id is never given to another (jobs,
+-- actions and settings that name it must not reach a different firm).
 CREATE TABLE firm (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   live INTEGER NOT NULL DEFAULT 0,          -- 0: itself; else the final survivor it is merged into
   created INTEGER NOT NULL,
   display_name TEXT,                        -- Harvey's own name for it; NULL: the register's
@@ -122,6 +126,11 @@ CREATE TABLE firm_ident (
   PRIMARY KEY (scheme, key)
 ) WITHOUT ROWID;
 CREATE INDEX firm_ident_firm ON firm_ident(firm, scheme);
+-- Counters that only grow (never recounted): ``identity`` moves whenever
+-- which firm holds which identifier changes (a firm added, removed, merged
+-- or unmerged, an identifier added or removed), so what was worked out
+-- from the registers' keys for the firms in Harvey is known to be stale.
+CREATE TABLE revision (name TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID;
 
 -- The description of a firm no register describes (a listing; a market with
 -- no register module).
@@ -423,6 +432,41 @@ WHEN typeof(NEW.key) != 'integer'
      AND (SELECT numeric FROM ident_scheme WHERE id = NEW.scheme) = 1 BEGIN
   SELECT RAISE(ABORT, 'a numeric identifier scheme keeps its keys as integers');
 END;
+-- A legal scheme's key is a firm's only one in that scheme: a record holding
+-- a tax code never gains a second (two are two firms; merges refuse them).
+CREATE TRIGGER guard_ident_legal BEFORE INSERT ON firm_ident
+WHEN (SELECT legal FROM ident_scheme WHERE id = NEW.scheme) = 1
+     AND EXISTS (SELECT 1 FROM firm_ident x WHERE x.firm = NEW.firm AND x.scheme = NEW.scheme
+                 AND x.key IS NOT NEW.key) BEGIN
+  SELECT RAISE(ABORT, 'a firm holds one key of a legal identifier scheme at most');
+END;
+CREATE TRIGGER guard_ident_legal_upd BEFORE UPDATE OF scheme, key, firm ON firm_ident
+WHEN (SELECT legal FROM ident_scheme WHERE id = NEW.scheme) = 1
+     AND EXISTS (SELECT 1 FROM firm_ident x WHERE x.firm = NEW.firm AND x.scheme = NEW.scheme
+                 AND x.key IS NOT NEW.key AND x.key IS NOT OLD.key) BEGIN
+  SELECT RAISE(ABORT, 'a firm holds one key of a legal identifier scheme at most');
+END;
+-- Which firm holds which identifier: revision ``identity`` follows every
+-- change to it.
+CREATE TRIGGER follow_identity_ident_ins AFTER INSERT ON firm_ident BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
+CREATE TRIGGER follow_identity_ident_del AFTER DELETE ON firm_ident BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
+CREATE TRIGGER follow_identity_ident_upd AFTER UPDATE OF scheme, key, firm ON firm_ident BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
+CREATE TRIGGER follow_identity_firm_ins AFTER INSERT ON firm BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
+CREATE TRIGGER follow_identity_firm_del AFTER DELETE ON firm BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
+CREATE TRIGGER follow_identity_firm_live AFTER UPDATE OF live ON firm
+WHEN NEW.live IS NOT OLD.live BEGIN
+  UPDATE revision SET n = n + 1 WHERE name = 'identity';
+END;
 -- Contacts are never discarded: one a firm links stays (delete its
 -- evidence first, and the link goes with it).
 CREATE TRIGGER guard_contact_linked BEFORE DELETE ON contact
@@ -443,8 +487,10 @@ WHEN OLD.website_fill IS NOT NULL AND NEW.website_fill IS OLD.website_fill
   UPDATE firm SET website_fill = NULL WHERE id = NEW.id;
 END;
 """
-GUARD_NAMES = ("guard_ident_numeric", "guard_ident_numeric_upd", "guard_contact_linked",
-               "guard_firm_members",
+GUARD_NAMES = ("guard_ident_numeric", "guard_ident_numeric_upd", "guard_ident_legal",
+               "guard_ident_legal_upd", "follow_identity_ident_ins", "follow_identity_ident_del",
+               "follow_identity_ident_upd", "follow_identity_firm_ins", "follow_identity_firm_del",
+               "follow_identity_firm_live", "guard_contact_linked", "guard_firm_members",
                "follow_website_fill", "local_fts_ins", "local_fts_del", "local_fts_upd")
 
 PARTS = (DICTIONARIES, FIRMS, CONTACTS, SEARCHES, SIGNALS, OUTREACH, LOCAL_FTS_SYNC, GUARDS)
@@ -463,6 +509,7 @@ def create(con: sqlite3.Connection, *, triggers: bool = True) -> None:
         con.executemany("INSERT INTO contact_kinds (id, kind, label, channel) VALUES (?, ?, ?, ?)",
                         CORE_KINDS)
         con.executemany("INSERT INTO tally (name, n) VALUES (?, 0)", [(t,) for t in TALLIES])
+        con.execute("INSERT INTO revision (name, n) VALUES ('identity', 0)")
         con.execute(f"PRAGMA user_version = {VERSION}")
     if triggers:
         from harvey.overlay import triggers as kept
@@ -602,9 +649,12 @@ def sync_signals(con: sqlite3.Connection, rows=(), manifests=None) -> dict[str, 
     is the user's: an upgrade brings the old vocabulary's rows); a signal
     a manifest declares that isn't among them is added as proposed. Then
     one ``signal_source`` row per (signal, module): stored (how 0) for a
-    module that declares the signal, read (how 1) for a register module
-    that reads it, with its precedence and what no row means. Returns
-    code -> id."""
+    module that declares the signal, or whose capabilities return it as a
+    fact (``outputs.facts``: a search module recording a rank, a listing's
+    "no website"), read (how 1) for a register module that reads it, with
+    its precedence and what no row means. A stored source's precedence is
+    0 for the declaring module, 1 for one that only returns the fact.
+    Returns code -> id."""
     from harvey.modules.loader import load_manifests
 
     manifests = list(manifests if manifests is not None else load_manifests())
@@ -628,6 +678,14 @@ def sync_signals(con: sqlite3.Connection, rows=(), manifests=None) -> dict[str, 
             if sig["code"] not in read and sig["code"] in ids:
                 con.execute("INSERT OR IGNORE INTO signal_source (signal, module, how, precedence, "
                             "absent) VALUES (?, ?, 0, 0, 0)", (ids[sig["code"]], mod))
+        if not m.register:
+            # (A register module's facts are read from its register.)
+            for cap in m.capabilities:
+                for code in (cap.get("outputs") or {}).get("facts") or ():
+                    if code in ids:
+                        con.execute("INSERT OR IGNORE INTO signal_source (signal, module, how, "
+                                    "precedence, absent) VALUES (?, ?, 0, 1, 0)",
+                                    (ids[code], mod))
         for code, r in read.items():
             if code in ids:
                 con.execute("INSERT INTO signal_source (signal, module, how, precedence, absent) "

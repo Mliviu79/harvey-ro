@@ -242,6 +242,19 @@ To train later, use `docker compose run --rm harvey train <product-url>`;
 from the checkout: restart after updating it, and rebuild when dependencies or
 the Dockerfile change. The build context excludes local data and credentials.
 
+**Free space on WSL.** Before a big write (a download, a register load, the
+database upgrade) Harvey checks free space on the data's disk and on the drive
+under it. Under WSL the Linux disk is a file on a Windows drive, which can fill
+while Linux still shows room, and a container can't see that drive. Compose
+mounts `HARVEY_HOST_DRIVE_SOURCE` read-only for the check: the checkout by
+default (right on native Linux). On WSL, add the drive that holds the WSL disk
+to `.env` and recreate the container (`docker compose up -d`); until then, big
+writes are refused with a message saying so:
+
+```bash
+grep -q '^HARVEY_HOST_DRIVE_SOURCE=' .env || printf '\nHARVEY_HOST_DRIVE_SOURCE=/mnt/c\n' >> .env
+```
+
 The dashboard listens on 5555. If you change the port in the Compose `command`,
 change the Dockerfile health-check port too and rebuild. Stop the service with
 `docker compose down`; its files remain in the checkout. Use a host install if

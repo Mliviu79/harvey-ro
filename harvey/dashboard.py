@@ -696,6 +696,13 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     # The same suppression as the exports: an address (or a whole domain) on
     # compliance.do_not_contact is never offered here either.
     blocked = _blocked_entries(config)
+    if all("_inputs" in r for r in rows):
+        # The overlay's rows (overlay.reads.company_rows) carry their own.
+        inputs = {r["id"]: r.pop("_inputs") for r in rows}
+        return _enriched(rows, config, blocked,
+                         {i: v["phones"] for i, v in inputs.items()},
+                         {i: v["people"] for i, v in inputs.items()},
+                         {i: v["prospects"] for i, v in inputs.items()}, {})
     marks = _in(ids)
     site_phones: dict[str, list[str]] = {}
     official = _official_modules()
@@ -738,6 +745,14 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
         activities = await state.get_company_activities(ids)
     except Exception as e:
         logger.warning("company activities failed: %s", e)
+    return _enriched(rows, config, blocked, site_phones, people, contacts, activities)
+
+
+def _enriched(rows, config, blocked, site_phones, people, contacts, activities) -> list[dict]:
+    """_enrich_companies' columns from what it read (either schema)."""
+    from harvey.collectors.phones import phone_region
+    from harvey.export import _EMAIL_STATUS_RANK, _phone_columns
+    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 
     for row in rows:
         cid = row.get("id")
@@ -796,6 +811,8 @@ async def get_companies(request: Request, limit: int | None = None, offset: int 
     Paging: harvey/companies.py."""
     from harvey import companies
 
+    if DB_PATH.exists() and await _state().is_overlay():
+        return await _overlay_companies(request, limit, offset, sort, dir)
     if not request.query_params:
         return await query_db("""
             SELECT c.*,
@@ -854,6 +871,48 @@ async def get_companies(request: Request, limit: int | None = None, offset: int 
             "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
 
 
+async def _overlay_companies(request: Request, limit, offset, sort: str, dir: str):
+    """get_companies on the overlay (overlay.reads: a page by index, or a
+    kept ordering of the matching firms)."""
+    from harvey import companies
+
+    state = _state()
+    await state.init_db()
+    plain = not request.query_params
+    limit, offset = _page_args(limit, offset, 200 if plain else 50)
+    args = dict(request.query_params)
+    if args.get("q") and not args.get("search"):
+        args["search"] = args["q"]
+    args.pop("q", None)
+    empty = {"total": 0, "offset": offset, "limit": limit, "sort": sort, "dir": dir,
+             "companies": [], "sources": [], "financials": False}
+    try:
+        f, _ = await _contact_filter(state, args)
+    except ValueError as e:
+        return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    has_fin = bool(await state.read("reads_figures"))
+    relevance = sort in ("", "relevance") and bool(f.words or f.search)
+    if not relevance and sort not in companies.SORTS:
+        sort = "created"
+    if sort in companies.FIGURE_SORTS and not has_fin:
+        sort = "created"
+    if relevance:
+        sort = "relevance"
+    way = companies.direction(sort, dir)
+    started = time.monotonic()
+    total, rows, how, sources = await state.read("companies_listing", f, sort, way, limit, offset)
+    took = round((time.monotonic() - started) * 1000)
+    if plain:
+        # The original list: the newest 200, each with its contact count.
+        for r in rows:
+            r.pop("_inputs", None)
+            r["contact_count"] = r.get("contacts", 0)
+        return rows
+    rows = await _enrich_companies(rows, _load_config_quietly())
+    return {**empty, "total": total, "sort": sort, "dir": way, "companies": rows,
+            "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
+
+
 def _figures_mark():
     """When the financial statements database last changed (a reload)."""
     from harvey.modules.ro.mf_financials import store as fin_store
@@ -871,6 +930,13 @@ async def _company_search(state, q: str, limit: int, offset: int) -> tuple[int, 
     10004070"): when a company has that tax id, it is the answer. A bare
     four-digit number stays a CAEN code unless written with RO."""
     m = _CUI_QUERY.fullmatch(q or "")
+    cui = m.group(1) if m and (len(m.group(1)) != 4 or q.strip().upper().startswith("RO")) \
+        else ""
+    if await state.is_overlay():
+        hits = await state.read("company_by_key", cui) if cui else []
+        if hits:
+            return len(hits), hits[offset:offset + limit]
+        return await state.read("search_companies", q, limit, offset)
     if m and (len(m.group(1)) != 4 or q.strip().upper().startswith("RO")):
         digits = m.group(1)
         hits = await query_db(
@@ -914,11 +980,30 @@ async def search_companies(q: str = "", limit: int = 50, offset: int = 0):
 @app.get("/api/companies/{company_id}/contacts")
 async def get_company_contacts(company_id: str):
     """Get all contacts for a specific company."""
+    if DB_PATH.exists() and await _state().is_overlay():
+        return await _state().read("company_prospects", company_id)
     rows = await query_db(
         "SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC",
         (company_id,),
     )
     return rows
+
+
+@app.post("/api/companies/{company_id}/remove")
+async def remove_company(company_id: str):
+    """Remove a company a register pull brought from Harvey (the register
+    still has it, and a pull adds it again). One Harvey worked on stays,
+    with only its pulls taken off ("removed" is "", "kept" says why).
+    Refused (409) for a company in a merge, undone or not, or one outreach
+    names; 404 for none."""
+    from harvey.overlay.store import RemoveRefused
+
+    state = _state()
+    await state.init_db()
+    try:
+        return await state.remove_company(company_id)
+    except RemoveRefused as e:
+        return _refused(e)
 
 
 @app.get("/api/companies/{company_id}")
@@ -927,6 +1012,8 @@ async def get_company(company_id: str):
     on file, the named people, its activities in words, and ``findings``:
     every phone and address any source gave with who gave it and when,
     and the latest official facts (official sources first)."""
+    if DB_PATH.exists() and await _state().is_overlay():
+        return await _overlay_company(company_id)
     rows = await query_db(f"SELECT {_COMPANY_COLUMNS} FROM companies c WHERE c.id = ?",
                           (company_id,))
     if not rows:
@@ -957,6 +1044,39 @@ async def get_company(company_id: str):
     except Exception as e:
         logger.warning("company record failed: %s", e)
         row["record"] = None
+    return row
+
+
+async def _overlay_company(company_id: str):
+    """get_company on the overlay: the register parts read by the firm's
+    register keys, the rest from overlay.reads."""
+    from harvey import companies
+
+    state = _state()
+    await state.init_db()
+    found = await state.read("panel", company_id)
+    if found is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    (row,) = await _enrich_companies([found["row"]], _load_config_quietly())
+    row["findings"], row["reach"] = found["findings"], found["reach"]
+    keys = found["keys"]
+
+    def parts():
+        cuis = keys["cuis"]
+        return (companies.registry_part(cuis, keys["external_id"]),
+                companies.financials_part(cuis), companies.anaf_part(cuis),
+                companies.taxpayer_part(cuis))
+
+    try:
+        reg, fin, anaf, tax = await asyncio.to_thread(parts)
+        row["record"] = {"cuis": [{"cui": c, "sources": keys["sources"].get(c, [])}
+                                  for c in keys["cuis"]],
+                         "registry": reg, "financials": fin, "anaf": anaf, "taxpayer": tax,
+                         "signals": found["signals"]}
+    except Exception as e:
+        logger.warning("company record failed: %s", e)
+        row["record"] = None
+    row.update(found["counts"])
     return row
 
 
@@ -1071,6 +1191,14 @@ async def _in_harvey(cuis: list[str], regs: list[str] = ()) -> dict[str, str]:
     keys = [f"onrc:{r}" for r in dict.fromkeys(regs) if r]
     if not (cuis or keys) or not DB_PATH.exists():
         return {}
+    state = _state()
+    if await state.is_overlay():
+        # Held firms by their identifiers (a merged record's stand for
+        # its survivor).
+        found = await state.held_ids("ro.cui", cuis)
+        found.update({f"onrc:{reg}": cid for reg, cid in (await state.held_ids(
+            "ro.onrc_reg", [k[len("onrc:"):] for k in keys])).items()})
+        return found
     out: dict[str, str] = {}
     rows = []
     if cuis:
@@ -1193,6 +1321,10 @@ async def get_duplicates(status: str = "pending", limit: int = 100):
                           else state.duplicates(status, limit))
             pending = await state.count_duplicates()
     except Exception as e:
+        from harvey.state import NotOnOverlay
+
+        if isinstance(e, NotOnOverlay):
+            return JSONResponse({**empty, "error": str(e)}, status_code=501)
         logger.warning("duplicates failed: %s", e)
         return JSONResponse({**empty, "error": "duplicates failed"}, status_code=500)
     return {"status": status, "pending": pending, "rows": rows}
@@ -1290,6 +1422,9 @@ async def scan_duplicates():
 
     state = _state()
     await state.init_db()
+    if await state.is_overlay():
+        return JSONResponse({"error": "looking for duplicates isn't available on the upgraded "
+                                      "database yet"}, status_code=501)
     try:
         job_id = await job_kinds.enqueue_duplicates_scan(state)
     except jobs.Duplicate as e:
@@ -1886,6 +2021,8 @@ async def _contact_filter(state, args) -> tuple[object, bool]:
         caen=_caen_arg(get("caen")), contact=_contact_arg(get("contact")),
         found_in=get("found_in"))
     f.cui, f.search, f.nothing = _search_arg(get("search"))
+    if await state.is_overlay():
+        return await _overlay_filter(state, f, args, get), False
     if f.county or f.locality:
         from harvey import companies
 
@@ -1917,6 +2054,27 @@ async def _contact_filter(state, args) -> tuple[object, bool]:
             # No statements on file: no company has a known figure.
             f.figures = ("0", [])
     return f, attach
+
+
+async def _overlay_filter(state, f, args, get):
+    """The rest of _contact_filter on the overlay: the words typed, the
+    cohort's signals and the figures' bounds, as the overlay reads them."""
+    f.words = get("search") if (f.search or f.cui) else ""
+    if f.cui and not await state.read("cui_set_size", f.cui):
+        # No company has that number: it is a word ("24").
+        f.cui = ""
+        f.nothing = not f.search
+    if f.cui:
+        f.words = ""
+    require, exclude = _codes(args.get("require") or ""), _codes(args.get("exclude") or "")
+    if require or exclude:
+        await _refuse_hidden_signals(state, [*require, *exclude])
+        f.signals = (tuple(require), tuple(exclude))
+    bounds = {k: _number_arg(args.get(k)) for k in
+              ("min_turnover", "max_turnover", "min_employees", "max_employees")}
+    if any(v is not None for v in bounds.values()):
+        f.bounds = {**bounds, "unknown": "include" if get("unknown") == "include" else "exclude"}
+    return f
 
 
 @asynccontextmanager
@@ -1969,6 +2127,11 @@ async def get_contacts(request: Request, view: str = "contacts", limit: int = 50
         f, attach = await _contact_filter(state, request.query_params)
     except ValueError as e:
         return JSONResponse({**empty, "error": str(e)}, status_code=400)
+    if await state.is_overlay():
+        found = await state.read("contacts_listing", f, sort, dir, limit, offset, people)
+        rows = found.pop("rows")
+        _block_listed(rows, people)
+        return {**empty, **found, "rows": rows}
     from harvey.modules.ro.mf_financials import store as fin_store
     empty["financials"] = Path(fin_store.FINANCIALS_PATH).is_file()
     if people:
@@ -2010,6 +2173,16 @@ async def get_contacts(request: Request, view: str = "contacts", limit: int = 50
                 r["do_not_contact"] = True
     return {**empty, "total": total, "more": more, "rows": rows, "sources": sources,
             "kinds": kinds}
+
+
+def _block_listed(rows: list[dict], people: bool) -> None:
+    """Mark the emails on compliance.do_not_contact (the Contacts page)."""
+    blocked = _blocked_entries(_load_config_quietly()) if not people else []
+    if blocked:
+        from harvey.gate import do_not_contact_match
+        for r in rows:
+            if r["kind"] == "email" and do_not_contact_match(r["value"], blocked):
+                r["do_not_contact"] = True
 
 
 # A Find-contacts run takes at most this many companies (the newest first);
@@ -2162,6 +2335,8 @@ async def get_contact_reach(contact_id: int):
 
     if not DB_PATH.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
+    if await _state().is_overlay():
+        return await _state().read("reach", contact_id)
     async with _contacts_db() as db:
         return await contacts.reach(db, contact_id)
 
@@ -2178,6 +2353,8 @@ async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
     state = _state()
     await state.init_db()
     f, attach = await _contact_filter(state, request.query_params)
+    if await state.is_overlay():
+        return await _overlay_contact_export(state, f, request)
     with_sql, body, params = contacts.contact_query(f)
     order = contacts.order_by(contacts.CONTACT_SORTS, request.query_params.get("sort", ""),
                               request.query_params.get("dir", "desc"), "first_seen", "ct.id")
@@ -2224,6 +2401,30 @@ async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
                     "people": "; ".join(people.get(r["id"], [])[:10]),
                     "sources": "; ".join(info.get("sources", [])),
                     "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
+    return out, len(out)
+
+
+async def _overlay_contact_export(state, f, request: Request) -> tuple[list[dict], int]:
+    """_contact_export_rows on the overlay (the same suppression)."""
+    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
+
+    blocked = _blocked_entries(_load_config_quietly(), strict=True)
+    rows = await state.read("contact_export", f, request.query_params.get("sort", ""),
+                            request.query_params.get("dir", "desc"), CONTACT_EXPORT_MAX)
+    out = []
+    for r in rows:
+        if r["kind"] == "email" and blocked and do_not_contact_match(r["value"], blocked):
+            continue
+        if blocked and any(d and do_not_contact_domain_match(d, blocked) for d in r["domains"]):
+            continue
+        out.append({
+            "kind": r["kind"], "value": r["value"], "display": r["display"] or r["value"],
+            "line_type": r["line_type"], "status": r["status"], "trust": r.get("trust", ""),
+            "companies": r.get("companies", 0),
+            "company_names": "; ".join(r["company_names"][:10]),
+            "people": "; ".join(r["people_names"][:10]),
+            "sources": "; ".join(r.get("sources", [])),
+            "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
     return out, len(out)
 
 
@@ -2278,8 +2479,9 @@ async def _with_context(items: list[dict]) -> list[dict]:
     """Attach the campaign, company, contact and signals behind each draft."""
     if not items:
         return items
+    if DB_PATH.exists() and await _state().is_overlay():
+        return await _with_context_overlay(items)
     pids = sorted({i["prospect_id"] for i in items if i.get("prospect_id")})
-    cids = sorted({i["campaign_id"] for i in items if i.get("campaign_id")})
 
     people = {r["id"]: r for r in (await query_db(
         "SELECT p.id, p.first_name, p.last_name, p.title, p.source, p.email_status, "
@@ -2287,9 +2489,7 @@ async def _with_context(items: list[dict]) -> list[dict]:
         "c.domain, c.website, c.description, c.industry AS found_by "
         "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
         f"WHERE p.id IN ({_in(pids)})", tuple(pids)) if pids else [])}
-    campaigns = {r["id"]: r["name"] for r in (await query_db(
-        f"SELECT id, name FROM campaigns WHERE id IN ({_in(cids)})",
-        tuple(cids)) if cids else [])}
+    campaigns = await _campaign_names(items)
 
     company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
     signals: dict[str, dict[str, str]] = {}
@@ -2341,6 +2541,66 @@ async def _with_context(items: list[dict]) -> list[dict]:
             "score": p.get("score"),
             "notes": p.get("personalization_notes", ""),
             "signals": signals.get(p.get("company_id"), {}),
+        }
+    return items
+
+
+async def _campaign_names(items: list[dict]) -> dict[str, str]:
+    cids = sorted({i["campaign_id"] for i in items if i.get("campaign_id")})
+    return {r["id"]: r["name"] for r in (await query_db(
+        f"SELECT id, name FROM campaigns WHERE id IN ({_in(cids)})",
+        tuple(cids)) if cids else [])}
+
+
+async def _with_context_overlay(items: list[dict]) -> list[dict]:
+    """_with_context on the overlay: the company from its firm (the
+    registers and Harvey's own), its signals from its current readings."""
+    state = _state()
+    pids = sorted({i["prospect_id"] for i in items if i.get("prospect_id")})
+    people = await state.read("prospects_by_id", pids) if pids else {}
+    campaigns = await _campaign_names(items)
+    lives = {}
+    for p in people.values():
+        if p.get("firm") is not None:
+            live = await state.read("live", p["firm"])
+            if live is not None:
+                lives[p["id"]] = live
+    companies = {int(r["id"]): r for r in await state.read("company_rows",
+                                                            sorted(set(lives.values())))}
+    labels = {v["code"]: v.get("label") or v["code"]
+              for v in await state.read("signal_vocabulary")}
+    signals: dict[int, dict[str, str]] = {}
+    for live in companies:
+        for r in await state.read("readings_of", str(live)):
+            if r["signal_code"] not in OUTBOX_CONTEXT_SIGNALS:
+                continue
+            if r["value_text"]:
+                value = r["value_text"]
+            elif r["value_num"] is None:
+                value = ""
+            else:
+                value = "yes" if r["value_num"] else "no"
+            label = labels.get(r["signal_code"], r["signal_code"])
+            mine = signals.setdefault(live, {})
+            values = [v for v in (mine.get(label) or "").split(", ") if v]
+            if value and value not in values:
+                mine[label] = ", ".join([*values, value])
+    for item in items:
+        p = people.get(item.get("prospect_id")) or {}
+        c = companies.get(lives.get(p.get("id"))) or {}
+        item["context"] = {
+            "campaign": campaigns.get(item.get("campaign_id"), ""),
+            "company": c.get("name", ""),
+            "website": c.get("website") or (f"https://{c['domain']}" if c.get("domain") else ""),
+            "description": c.get("description", ""),
+            "found_by": c.get("industry", ""),
+            "contact": " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x),
+            "contact_title": p.get("title", ""),
+            "contact_source": p.get("source", ""),
+            "email_status": p.get("email_status", ""),
+            "score": p.get("score"),
+            "notes": p.get("personalization_notes", ""),
+            "signals": signals.get(lives.get(p.get("id")), {}),
         }
     return items
 
@@ -2790,6 +3050,12 @@ async def _company_filter_ids(raw: dict, sort: str, way: str, limit: int) -> tup
     state = _state()
     await state.init_db()
     f, attach = await _contact_filter(state, {k: str(v) for k, v in raw.items() if v is not None})
+    if await state.is_overlay():
+        if (f.words or f.search) and sort in ("", "relevance"):
+            sort = "relevance"
+        elif sort not in companies.SORTS:
+            sort = "created"
+        return await state.read("ids_for", f, sort, companies.direction(sort, way), limit)
     from harvey.modules.ro.mf_financials import store as fin_store
     has_fin = Path(fin_store.FINANCIALS_PATH).is_file()
     if f.search and sort in ("", "relevance"):
@@ -3095,6 +3361,8 @@ async def get_overview():
     even while the Email module's tabs are hidden."""
     from harvey.gate import do_not_contact_domain_match, do_not_contact_match
 
+    if DB_PATH.exists() and await _state().is_overlay():
+        return await _overlay_overview()
     has_phone = ("(COALESCE(c.phone, '') != '' OR EXISTS (SELECT 1 FROM observations o "
                  "WHERE o.company_id = c.id AND o.signal_code = 'PHONE_NUMBER' AND o.value_text != '') "
                  "OR EXISTS (SELECT 1 FROM prospects p WHERE p.company_id = c.id AND p.phone != ''))")
@@ -3130,6 +3398,24 @@ async def get_overview():
             "SELECT COUNT(*) AS n FROM signal_codes WHERE status = 'confirmed' AND available = 1"),
         "sending": await _sending_summary(config),
     }
+
+
+async def _overlay_overview() -> dict:
+    """get_overview on the overlay: the firm counts from overlay.reads (the
+    register's when counted for its load mark), the rest as on schema 24."""
+    config = _load_config_quietly()
+    state = _state()
+    await state.init_db()
+    found = await state.read("overview", _blocked_entries(config))
+    codes = await state.get_signal_codes(available_only=True)
+    people = found["people"] + (found["people_firms"] or 0)
+    return {"companies": found["companies"], "with_phone": found["with_phone"],
+            "with_email": found["with_email"], "with_both": found["with_both"],
+            "contacts": sum((await state.count_prospects_by_status()).values()),
+            "people": people, "with_activity": found["with_activity"],
+            "signals_proposed": sum(1 for c in codes if c.get("status") == "proposed"),
+            "signals_confirmed": sum(1 for c in codes if c.get("status") == "confirmed"),
+            "sending": await _sending_summary(config)}
 
 
 async def _sending_summary(config) -> dict:
@@ -4086,14 +4372,20 @@ async def get_live_status():
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # DB stores naive UTC
     has_site = f"COALESCE(domain, '') != '' AND {_LIVE}"
-    companies = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {_LIVE}")
-    with_site = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {has_site}")
+    overlay = DB_PATH.exists() and await _state().is_overlay()
+    if overlay:
+        firm_counts = await _state().read("status_counts")
+        companies, with_site, profiled, checked = (
+            firm_counts[k] for k in ("companies", "with_site", "profiled", "checked"))
+    else:
+        companies = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {_LIVE}")
+        with_site = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {has_site}")
+        profiled = await _scalar(
+            f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at IS NOT NULL")
+        checked = await _scalar(
+            f"SELECT COUNT(*) FROM companies WHERE {has_site} "
+            f"AND profile_checked_at IS NOT NULL AND {_FINDER_SEARCHED}")
     no_site = companies - with_site
-    profiled = await _scalar(
-        f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at IS NOT NULL")
-    checked = await _scalar(
-        f"SELECT COUNT(*) FROM companies WHERE {has_site} "
-        f"AND profile_checked_at IS NOT NULL AND {_FINDER_SEARCHED}")
 
     prospects = await query_db("SELECT id, email, email_status, status FROM prospects")
     with_email = [p for p in prospects if p.get("email")]
@@ -4136,7 +4428,7 @@ async def get_live_status():
             "SELECT * FROM runs WHERE status = 'running' ORDER BY started_at"):
         started = _parse_ts(run.get("started_at"))
         elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
-        last = _parse_ts(await _first(
+        last = started if overlay else _parse_ts(await _first(
             "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
             (run["id"],))) or started
         item = {"stage": run.get("stage"), "provider": run.get("provider"),
@@ -4145,16 +4437,21 @@ async def get_live_status():
             stopped.append(item)
             continue
         if run.get("stage") == "profile" and started:
-            done_in_run = await _scalar(
-                f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at >= ?",
-                (run["started_at"],))
+            if overlay:
+                done_in_run = (await _state().read(
+                    "status_counts", since=started.replace(tzinfo=timezone.utc).timestamp())
+                )["profiled_since"]
+            else:
+                done_in_run = await _scalar(
+                    f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at >= ?",
+                    (run["started_at"],))
             left = max(0, with_site - profiled)
             if left and done_in_run and elapsed > 0:
                 item["eta_min"] = left / (done_in_run / elapsed) / 60
         running.append(item)
 
     # (The newest searches only: the table holds every search ever made.)
-    last_contact = _parse_ts(await _first(
+    last_contact = _parse_ts(firm_counts["last_contact"] if overlay else await _first(
         "SELECT MAX(searched_at) AS t FROM (SELECT target, module, capability, searched_at "
         "FROM searches ORDER BY id DESC LIMIT 500) WHERE target = 'company' "
         "AND module = 'contact_finder' AND capability = 'find_contacts'"))
@@ -4302,8 +4599,11 @@ async def get_today():
             "SELECT COUNT(*) AS n FROM conversations WHERE status = 'needs_human'"
         )
         needs_human = handed[0]["n"] if handed else 0
-        companies = await query_db(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
-        n_companies = companies[0]["n"] if companies else 0
+        if await state.is_overlay():
+            n_companies = (await state.read("tally")).get("firms", 0)
+        else:
+            companies = await query_db(f"SELECT COUNT(*) AS n FROM companies WHERE {_LIVE}")
+            n_companies = companies[0]["n"] if companies else 0
 
         unprofiled_count = await state.count_companies_needing_profile()
         stats = {
@@ -5149,15 +5449,23 @@ async def get_runs_api():
         await state.init_db()
         await state.sweep_stale_runs()
         runs = await state.get_runs(limit=25)
+        overlay = await state.is_overlay()
         # Same rule as the live panel: a "running" run that has recorded
         # nothing for STALE_RUN_SECONDS has stopped, whatever its row says.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         for run in runs:
             if run.get("status") != "running":
                 continue
-            last = _parse_ts(await _first(
-                "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
-                (run["id"],))) or _parse_ts(run.get("started_at"))
+            if overlay:
+                # (Unix seconds: the overlay's obs time, by the run's batch.)
+                at = await state.read("run_last_at", run["id"])
+                last = (datetime.fromtimestamp(at, timezone.utc).replace(tzinfo=None)
+                        if at else None)
+            else:
+                last = _parse_ts(await _first(
+                    "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
+                    (run["id"],)))
+            last = last or _parse_ts(run.get("started_at"))
             if last and (now - last).total_seconds() > STALE_RUN_SECONDS:
                 run["status"] = "stalled"
         return runs

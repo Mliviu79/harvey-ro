@@ -56,13 +56,16 @@ STATUS_CASE = ("CASE {x} " + " ".join(f"WHEN '{k}' THEN {v}"
 _HEX_ID = re.compile(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])")
 
 # Tables copied as they are (columns both schemas have), and the text
-# columns of each that may name an old company id (legacy_id).
+# columns of each that may name an old company id (legacy_id), with the
+# rows that still need it: a job that may run again (queued, running,
+# paused); a finished one's ids are history no page follows.
 COPIED = ("campaigns", "outbox", "conversations", "processed_replies", "actions", "runs",
           "usage_log", "usage_events", "settings", "email_patterns", "jobs", "job_batches",
           "feedback")
-NAMES_IDS = {"jobs": ("params_json", "progress_json", "result_json"),
-             "job_batches": ("params_json",), "actions": ("details_json",),
-             "settings": ("value",), "runs": ("params_json",), "feedback": ("entity_id",)}
+NAMES_IDS = {"jobs": (("params_json", "progress_json", "result_json"),
+                      "status IN ('queued', 'running', 'paused')"),
+             "actions": (("details_json",), "1"), "settings": (("value",), "1"),
+             "runs": (("params_json",), "1"), "feedback": (("entity_id",), "1")}
 
 PROGRESS = """
 CREATE TABLE IF NOT EXISTS migrate_progress (
@@ -590,10 +593,15 @@ def _idents(run: Run) -> None:
     run.chunked("own_idents", "SELECT firm AS k FROM work.map", from_columns)
 
 
+# Harvey-found keys every firm keeps; a name in its town only a firm no
+# register describes (_local_names).
+FOUND_KEYS = ("email", "domain")
+
+
 def _keys(run: Run) -> None:
-    kinds = ", ".join(f"'{k}'" for k in schema.FIRM_KEY)
-    case = "CASE i.kind " + " ".join(f"WHEN '{k}' THEN {v}" for k, v in schema.FIRM_KEY.items()) \
-        + " END"
+    kinds = ", ".join(f"'{k}'" for k in FOUND_KEYS)
+    case = "CASE i.kind " + " ".join(f"WHEN '{k}' THEN {schema.FIRM_KEY[k]}"
+                                     for k in FOUND_KEYS) + " END"
 
     def body(lo, hi):
         sel = (f"SELECT i.source AS n FROM old.company_ids i "
@@ -636,6 +644,21 @@ def _local(run: Run) -> None:
             WHERE m.firm > ? AND m.firm <= ? AND NOT {described}""", (lo, hi))
 
     run.chunked("local", "SELECT firm AS k FROM work.map", body)
+
+
+def _local_names(run: Run) -> None:
+    """The name-in-town keys of the firms described locally (a register's
+    firms are matched by name through the register's own index)."""
+    def body(lo, hi):
+        run.x(f"""
+            INSERT OR IGNORE INTO firm_key (kind, value, firm, source)
+            SELECT {schema.FIRM_KEY['name']}, i.value, m.firm,
+                   (SELECT id FROM source WHERE name = NULLIF(i.source, ''))
+            FROM work.map m JOIN local_firm l ON l.firm = m.firm
+            JOIN old.company_ids i ON i.company_id = m.uuid AND i.kind = 'name'
+            WHERE m.firm > ? AND m.firm <= ?""", (lo, hi))
+
+    run.chunked("local_names", "SELECT firm AS k FROM local_firm", body)
 
 
 def _names(run: Run) -> None:
@@ -1041,14 +1064,15 @@ def _outreach(run: Run) -> None:
 
 
 def _legacy(run: Run) -> None:
-    """legacy_id: the old company ids still named in job payloads, actions,
-    settings, runs and feedback, so a paused job resumes and the Activity
-    page reads."""
+    """legacy_id: the old company ids still named by jobs that may run
+    again, actions, settings, runs and feedback, so a paused job resumes
+    and the Activity page reads."""
     def body():
         con = run.con
         found: set[str] = set()
-        for table, columns in NAMES_IDS.items():
-            for (text,) in con.execute(f"SELECT {' || char(10) || '.join(columns)} FROM {table}"):
+        for table, (columns, still) in NAMES_IDS.items():
+            for (text,) in con.execute(f"SELECT {' || char(10) || '.join(columns)} FROM {table} "
+                                       f"WHERE {still}"):
                 found.update(_HEX_ID.findall(text or ""))
         found = sorted(found)
         for start in range(0, len(found), 500):
@@ -1084,6 +1108,6 @@ def _finish(run: Run) -> None:
     run.atomic("finish", body)
 
 
-STEPS = (_vocabulary, _map, _firms, _idents, _keys, _local, _names, _contacts, _people,
-         _evidence, _searches, _sources, _observations, _merges, _outreach, _legacy, _source_read,
-         _recount, _finish)
+STEPS = (_vocabulary, _map, _firms, _idents, _keys, _local, _names, _local_names, _contacts,
+         _people, _evidence, _searches, _sources, _observations, _merges, _outreach, _legacy,
+         _source_read, _recount, _finish)

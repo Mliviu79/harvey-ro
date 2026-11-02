@@ -427,6 +427,11 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     facts_of: dict[str, list[api.Fact]] = {}
     for fact in draft.facts:
         facts_of.setdefault(fact.record, []).append(fact)
+    if await _overlay(state):
+        return await _save_source_overlay(
+            state, draft, report, facts_of, confirmed=confirmed, module=module,
+            dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
+            saved_ids=saved_ids, on_saved=on_saved)
 
     async def save(batch, record: api.Record):
         if ingest.excluded(record, do_not_contact):
@@ -494,6 +499,70 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     return report
 
 
+async def _overlay(state) -> bool:
+    """Whether ``state`` writes to the overlay (schema 25)."""
+    probe = getattr(state, "is_overlay", None)
+    return bool(probe is not None and await probe())
+
+
+async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, confirmed,
+                               module: str, dry_run: bool, do_not_contact, progress,
+                               saved_ids, on_saved):
+    """save_source_draft on the overlay: the records marked as Harvey's
+    in bulk, PULL_CHUNK at a time, each matched in a read first
+    (overlay.store.Store.match_records, then Store.pull). What a
+    register says of its firms (activities, administrators, its facts) is
+    read from it, not copied; only the facts a module stores are kept."""
+    from harvey.overlay.store import PULL_CHUNK
+
+    records = []
+    for record in draft.records:
+        if ingest.excluded(record, do_not_contact):
+            report.excluded += 1
+            continue
+        report.catch_all_only += record.counts.get("catch_all_only", 0)
+        report.administrators += record.counts.get("administrators", 0)
+        records.append(record)
+    try:
+        done = 0
+        for start in range(0, len(records), PULL_CHUNK):
+            chunk = records[start:start + PULL_CHUNK]
+            # Matched first in a read (no write lock); the write uses those
+            # matches unless a firm changed meanwhile.
+            matched_at, matches = (None, None) if dry_run else await state.match_records(chunk)
+            results = await state.pull_records(
+                chunk, facts_of={r.key: facts_of.get(r.key, []) for r in chunk},
+                confirmed=frozenset(confirmed), run_id=report.run_id, dry_run=dry_run,
+                matches=matches, matched_at=matched_at)
+            ids = []
+            for company_id, created, updated, shared in results:
+                report.shared_domain += shared
+                if created:
+                    report.new_companies += 1
+                else:
+                    report.known_companies += 1
+                report.updated_companies += updated
+                if company_id:
+                    ids.append(company_id)
+            done += len(chunk)
+            if progress:
+                progress(done, len(records))
+            if not dry_run and saved_ids is not None:
+                saved_ids.extend(ids)
+                if on_saved is not None:
+                    on_saved(ids)
+        if not dry_run:
+            await state.finish_run(report.run_id, status="completed",
+                                   records=report.new_companies + report.known_companies)
+    except Exception as e:
+        logger.exception("%s import failed", module)
+        report.errors.append(str(e))
+        if not dry_run:
+            await state.finish_run(report.run_id, status="failed",
+                                   records=report.new_companies, error=str(e))
+    return report
+
+
 async def _source_read(state, cap_id: str, inp: api.Input):
     """Call the onrc module's ``cap_id`` (refused while the module is off)."""
     from harvey.signals import sync_vocabulary
@@ -523,10 +592,11 @@ async def registry_pull(state, con, q, *, limit: int | None = None,
         run_params=draft.values.get("run_params"), dry_run=dry_run,
         do_not_contact=do_not_contact, progress=progress, saved_ids=saved,
         on_saved=follow_up.add if follow_up is not None else None)
-    if saved and not report.errors:
+    if saved and not report.errors and not await _overlay(state):
         # What other free local sources know about them (their yearly
         # figures), at once: a filter on those is decided before any paid
-        # search runs.
+        # search runs. (On the overlay those are read from the registers,
+        # and the pull kept their phones already.)
         found = await lookup_by_id(state, saved)
         report.observations += found["observations"]
     return report

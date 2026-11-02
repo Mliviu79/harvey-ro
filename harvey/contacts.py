@@ -740,6 +740,12 @@ class ContactFilter:
     # A financials condition on the company's CUI (mf_financials Filter.sql,
     # with the financials database attached as ``fin``).
     figures: tuple[str, list] | None = None
+    # The same conditions as the overlay (schema 25) reads them: the words
+    # typed in the search box, the cohort's (require, exclude) signal codes,
+    # and the figures' bounds ({min,max}_{turnover,employees}, unknown).
+    words: str = ""
+    signals: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    bounds: dict | None = None
 
 
 def _like(word: str) -> str:

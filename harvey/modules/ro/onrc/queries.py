@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from functools import lru_cache
 
 from harvey import queries
 from harvey.registers import Adapter as Base
@@ -92,6 +93,64 @@ queries.statement(
     params=(1,), module=MODULE, drives="fi",
     scans={"firm_ident": "an upgrade's walk: every registration number in Harvey, each "
                          "probed in the registry by key"})
+# What a page sorts a set of firms by (the registry id follows the names'
+# alphabetical order) and its place, by CUI or registration number.
+queries.statement(
+    "onrc.sort.by_cui",
+    "SELECT j.value, f.id, f.name, f.locality, f.county FROM json_each(?) j "
+    "CROSS JOIN {derived}.firm_by_cui b CROSS JOIN {alias}.firms f "
+    "WHERE b.cui = j.value AND f.id = b.firm_id",
+    params=("[1, 2]",), module=MODULE, drives="j")
+queries.statement(
+    "onrc.sort.by_reg",
+    "SELECT j.value, f.id, f.name, f.locality, f.county FROM json_each(?) j "
+    "CROSS JOIN {alias}.firms f WHERE f.reg = j.value",
+    params=('["J08/1/2015"]',), module=MODULE, drives="j")
+# The people a firm's registration names (its administrators), by CUI or
+# registration number: the People to search page.
+queries.statement(
+    "onrc.people.by_cui",
+    "SELECT j.value, a.first_name, a.last_name, a.role FROM json_each(?) j "
+    "CROSS JOIN {derived}.firm_by_cui b CROSS JOIN {alias}.administrators a "
+    "WHERE b.cui = j.value AND a.firm_id = b.firm_id",
+    params=("[1, 2]",), module=MODULE, drives="j", bounded=True)
+queries.statement(
+    "onrc.people.by_reg",
+    "SELECT j.value, a.first_name, a.last_name, a.role FROM json_each(?) j "
+    "CROSS JOIN {alias}.firms f CROSS JOIN {alias}.administrators a "
+    "WHERE f.reg = j.value AND a.firm_id = f.id",
+    params=('["J08/1/2015"]',), module=MODULE, drives="j", bounded=True)
+queries.statement(
+    "onrc.people_count.by_cui",
+    "SELECT COUNT(*) FROM (SELECT DISTINCT j.value, a.first_name, a.last_name FROM json_each(?) j "
+    "CROSS JOIN {derived}.firm_by_cui b CROSS JOIN {alias}.administrators a "
+    "WHERE b.cui = j.value AND a.firm_id = b.firm_id)",
+    params=("[1, 2]",), module=MODULE, drives="j", bounded=True)
+queries.statement(
+    "onrc.people_count.by_reg",
+    "SELECT COUNT(*) FROM (SELECT DISTINCT j.value, a.first_name, a.last_name FROM json_each(?) j "
+    "CROSS JOIN {alias}.firms f CROSS JOIN {alias}.administrators a "
+    "WHERE f.reg = j.value AND a.firm_id = f.id)",
+    params=('["J08/1/2015"]',), module=MODULE, drives="j", bounded=True)
+# The registry id alone (its names' order) by CUI or registration number:
+# what sorts every firm in Harvey by name without reading the names.
+queries.statement(
+    "onrc.order.by_cui",
+    "SELECT j.value, b.firm_id FROM json_each(?) j CROSS JOIN {derived}.firm_by_cui b "
+    "WHERE b.cui = j.value", params=("[1, 2]",), module=MODULE, drives="j")
+queries.statement(
+    "onrc.order.by_reg",
+    "SELECT j.value, f.id FROM json_each(?) j CROSS JOIN {alias}.firms f WHERE f.reg = j.value",
+    params=('["J08/1/2015"]',), module=MODULE, drives="j")
+# Every firm in Harvey with a CUI and its registry id (the names' order).
+queries.statement(
+    "onrc.order.held",
+    "SELECT fi.firm, b.firm_id FROM firm_ident fi CROSS JOIN {derived}.firm_by_cui b "
+    "WHERE fi.scheme = ? AND b.cui = fi.key",
+    params=(1,), module=MODULE, drives="fi",
+    scans={"firm_ident": "every CUI in Harvey, once per kept ordering of every firm by name"})
+queries.statement(
+    "onrc.name_of_id", "SELECT name FROM {alias}.firms WHERE id = ?", params=(1,), module=MODULE)
 queries.statement(
     "onrc.name_key.version",
     "SELECT version FROM {derived}.derived_meta WHERE name = 'name_key'", module=MODULE)
@@ -99,6 +158,25 @@ queries.statement(
     "onrc.name_key.holders",
     "SELECT n.firm_id FROM {derived}.name_key n WHERE n.key = ? AND n.locality = ?",
     params=("exemplu", "brasov"), module=MODULE)
+
+
+@lru_cache(maxsize=20_000)
+def place(locality, county) -> str:
+    """The place line a pull gives a firm ("Town, County, Romania")."""
+    from types import SimpleNamespace
+
+    from harvey.collectors.onrc import _location
+
+    return _location(SimpleNamespace(locality=locality or "", county=county or ""))
+
+
+def industry(activities) -> str:
+    """What a firm does, in words: its first current class (collectors.onrc)."""
+    from harvey.caen import describe
+    from harvey.collectors.onrc import _industry_class
+
+    first = _industry_class([(str(c), int(v)) for c, v in activities])
+    return (describe(*first) or "") if first else ""
 
 
 class Adapter(Base):
@@ -151,6 +229,64 @@ class Adapter(Base):
             for firm_id, first, last, role in con.execute(self.sql("describe.administrators"), arg):
                 by_id[firm_id]["administrators"].append((first, last, role))
         return out
+
+    def card(self, firm: dict) -> dict:
+        """A described firm as the core shows a company: its name, place
+        line, address, legal form, declared site, what it does (the
+        industry its first current class names) and whether it operates."""
+        return {"name": firm.get("name") or "", "location": place(firm.get("locality"),
+                                                                   firm.get("county")),
+                "address": firm.get("address") or "", "legal_form": firm.get("form") or "",
+                "website": firm.get("website") or "", "domain": firm.get("domain") or "",
+                "industry": industry(firm.get("activities") or []),
+                "registered": firm.get("registered") or "",
+                "operating": bool(firm.get("operating")), "reg": firm.get("reg") or ""}
+
+    def sort_keys(self, con, keys, scheme: str = "ro.cui", places: bool = True) -> dict:
+        """{key: (registry id, name, place line)} for sorting a set of firms
+        (the registry id follows the names in alphabetical order); the place
+        line is "" unless ``places``."""
+        name = "sort.by_cui" if scheme == "ro.cui" else "sort.by_reg"
+        out = {}
+        for chunk in chunks(keys, 10_000):
+            for key, rid, firm_name, locality, county in con.execute(self.sql(name),
+                                                                    (json.dumps(chunk),)):
+                out[key] = (rid, firm_name or "", place(locality, county) if places else "")
+        return out
+
+    def people(self, con, keys, scheme: str = "ro.cui") -> dict:
+        """{key: [(name, role)]}: the people each firm's registration names."""
+        name = "people.by_cui" if scheme == "ro.cui" else "people.by_reg"
+        out: dict = {}
+        for chunk in chunks(keys, 10_000):
+            for key, first, last, role in con.execute(self.sql(name), (json.dumps(chunk),)):
+                out.setdefault(key, []).append((f"{first} {last}".strip(), role or ""))
+        return out
+
+    def count_people(self, con, keys, scheme: str = "ro.cui") -> int:
+        """How many people (each name once per firm) the firms' registrations
+        name."""
+        name = "people_count.by_cui" if scheme == "ro.cui" else "people_count.by_reg"
+        return sum(con.execute(self.sql(name), (json.dumps(chunk),)).fetchone()[0]
+                   for chunk in chunks(keys, 50_000))
+
+    def name_order(self, con, keys, scheme: str = "ro.cui") -> dict:
+        """{key: its registry id}: the registry's ids follow its names'
+        alphabetical order, so sorting by id sorts by name."""
+        name = "order.by_cui" if scheme == "ro.cui" else "order.by_reg"
+        out = {}
+        for chunk in chunks(keys, 50_000):
+            out.update(con.execute(self.sql(name), (json.dumps(chunk),)).fetchall())
+        return out
+
+    def held_name_order(self, con, scheme_id: int) -> list[tuple[int, int]]:
+        """(record, registry id) for every record in Harvey with a CUI the
+        registry has, in its names' order (the CUI scheme's id given)."""
+        return sorted(con.execute(self.sql("order.held"), (scheme_id,)), key=lambda r: r[1])
+
+    def name_of_id(self, con, registry_id: int) -> str:
+        row = con.execute(self.sql("name_of_id"), (registry_id,)).fetchone()
+        return row[0] if row else ""
 
     def names_sql(self, scheme: str = "") -> str | None:
         if scheme in ("", "ro.cui"):

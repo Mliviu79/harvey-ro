@@ -19,9 +19,11 @@ from harvey.registers import Adapter as Base
 from harvey.registers import Read, chunks
 
 MODULE = "anaf"
-# When the answer was fetched, as the job writes the time (ISO, UTC).
-FETCHED = "strftime('%Y-%m-%dT%H:%M:%S+00:00', a.fetched, 'unixepoch')"
-TABLE = "{alias}.parsed c CROSS JOIN {alias}.answers a"
+# When the answer was fetched, as the job writes the time (ISO, UTC): read
+# from the answer by key, so a value is read from the parsed table alone.
+FETCHED = ("(SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', a.fetched, 'unixepoch') "
+           "FROM {alias}.answers a WHERE a.cui = c.cui)")
+TABLE = "{alias}.parsed c"
 
 queries.statement(
     "anaf.describe",
@@ -32,8 +34,22 @@ queries.statement("anaf.dicts", "SELECT id, zdict FROM {alias}.dict", module=MOD
                   scans={"dict": "the preset dictionaries: one row each"})
 
 
+# The firms in Harvey whose answer reads yes, for the flags the file keeps
+# a partial index of (store.py): that index drives, each CUI probed in
+# firm_ident by (scheme, key). Param: the scheme's id.
+FLAGS = {"VAT_REGISTERED": "vat", "EFACTURA_REGISTERED": "efactura",
+         "FISCALLY_INACTIVE": "inactive"}
+for _code, _col in FLAGS.items():
+    queries.statement(
+        f"anaf.held.{_code}.yes",
+        f"SELECT fi.firm FROM {{alias}}.parsed c INDEXED BY parsed_{_col} CROSS JOIN firm_ident fi "
+        f"WHERE c.{_col} = 1 AND fi.scheme = ? AND fi.key = +c.cui",
+        params=(1,), module=MODULE, drives="c",
+        scans={"parsed": "the answers that read yes: the flag's partial index, never the table"})
+
+
 def _read(signal: str, column: str) -> Read:
-    return Read(signal, TABLE, "cui", f"c.{column}", date=FETCHED, where="a.cui = c.cui")
+    return Read(signal, TABLE, "cui", f"c.{column}", date=FETCHED)
 
 
 class Adapter(Base):
@@ -55,6 +71,11 @@ class Adapter(Base):
         _read("PHONE_NUMBER", "phone"),
         _read("ADDRESS", "address"),
     )
+
+    def held_yes_sql(self, signal: str, scheme: str = "") -> str | None:
+        if signal in FLAGS and not scheme:
+            return self.sql(f"held.{signal}.yes")
+        return None
 
     def attach(self, con: sqlite3.Connection) -> bool:
         """Attach the file when it is the compressed form; a plain or a

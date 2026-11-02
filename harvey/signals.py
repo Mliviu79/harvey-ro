@@ -468,6 +468,19 @@ def absence(code: str) -> str:
     return "unknown"
 
 
+def available_codes(stored: dict[str, str], manifests=None) -> set[str]:
+    """The signals collected with these module switches (``stored``): those
+    a module that is on declares, or lists among a capability's outputs."""
+    from harvey.modules import switches
+
+    manifests = switches.manifests() if manifests is None else manifests
+    on = switches.resolve(stored, manifests)
+    produced = {fact for m in manifests if m.id in on for cap in m.capabilities
+                for fact in (cap.get("outputs") or {}).get("facts", [])}
+    return {sig["code"] for m in manifests for sig in m.signals
+            if m.id in on or sig["code"] in produced}
+
+
 async def sync_vocabulary(state) -> int:
     """Bring signal_codes in line with the module manifests.
 
@@ -489,9 +502,7 @@ async def sync_vocabulary(state) -> int:
     descriptions = {sig["code"]: sig["description"] for sig in SIGNAL_CATALOG}
 
     def rows(stored: dict[str, str]) -> list[dict]:
-        on = switches.resolve(stored, manifests)
-        produced = {fact for m in manifests if m.id in on for cap in m.capabilities
-                    for fact in (cap.get("outputs") or {}).get("facts", [])}
+        available = available_codes(stored, manifests)
         return [dict(
             code=sig["code"],
             label=sig.get("label", sig["code"]),
@@ -508,7 +519,7 @@ async def sync_vocabulary(state) -> int:
             keyed_by=sig["keyed_by"],
             absence=sig["absence"],
             when_known=sig["when_known"],
-            available=m.id in on or sig["code"] in produced,
+            available=sig["code"] in available,
         ) for m in manifests for sig in m.signals]
 
     declared = await state.write_vocabulary(rows, switches.PREFIX)

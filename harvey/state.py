@@ -9,6 +9,7 @@ list tracked with SQLite's ``PRAGMA user_version`` so existing user DBs
 upgrade cleanly in place.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -2159,9 +2160,68 @@ def _current_cte(codes: int = 0) -> str:
     """
 
 
+class NotOnOverlay(RuntimeError):
+    """A read the upgraded database (schema 25) has no version of yet:
+    raised, never answered from tables it doesn't have."""
+
+
 class StateManager:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or str(DB_PATH)
+        # The open database's schema version, read once (25: the overlay,
+        # whose writes harvey/overlay/store.py makes).
+        self._schema: int | None = None
+
+    async def _overlay(self) -> bool:
+        """Whether the database is the overlay (schema 25)."""
+        if self._schema is None:
+            from harvey.overlay import store
+
+            self._schema = await asyncio.to_thread(store.version, self.db_path)
+        return self._schema == 25
+
+    async def _v24_only(self, what: str) -> None:
+        """Raise NotOnOverlay on schema 25 for a read it has no version of."""
+        if await self._overlay():
+            raise NotOnOverlay(f"{what} isn't available on the upgraded database yet")
+
+    async def _on_overlay(self, method: str, *args, **kwargs):
+        """overlay.store's ``method`` in a write transaction of its own, in
+        a worker thread."""
+        from harvey.overlay import store
+
+        return await asyncio.to_thread(store.call, self.db_path, method, *args, **kwargs)
+
+    async def _read(self, method: str, *args, **kwargs):
+        """overlay.reads' ``method`` in a read transaction of its own, in a
+        worker thread."""
+        from harvey.overlay import reads
+
+        return await asyncio.to_thread(reads.call, self.db_path, method, *args, **kwargs)
+
+    async def recount_register_tally(self, codes=None) -> int:
+        """Count the register signals over the firms in Harvey for the
+        registers' current load marks (overlay.reads.recount_register_tally;
+        0 on schema 24, which keeps them as observations)."""
+        if not await self._overlay():
+            return 0
+        from harvey.overlay import reads
+
+        return await asyncio.to_thread(reads.recount_register_tally, self.db_path, codes)
+
+    async def jobs_waiting(self, kind: str) -> dict[str, int]:
+        """{status: how many} of a job kind's queued, running and paused jobs."""
+        async with self._connect() as db:
+            async with db.execute(
+                    "SELECT status, COUNT(*) FROM jobs WHERE kind = ? "
+                    "AND status IN ('queued', 'running', 'paused') GROUP BY status",
+                    (kind,)) as cur:
+                return {s: n for s, n in await cur.fetchall()}
+
+    async def read(self, method: str, *args, **kwargs):
+        """A page read on the overlay (overlay.reads.Reader's ``method``):
+        the dashboard's schema 25 pages."""
+        return await self._read(method, *args, **kwargs)
 
     @asynccontextmanager
     async def _connect(self, timeout: float = BUSY_TIMEOUT_SECONDS):
@@ -2183,6 +2243,10 @@ class StateManager:
         index refreshed once for every company touched. For importers that
         save thousands of companies, where opening a connection and
         committing per call is most of the time."""
+        if await self._overlay():
+            async with self._overlay_batch() as batch:
+                yield batch
+            return
         async with self._connect() as db:
             try:
                 yield CompanyBatch(db)
@@ -2191,6 +2255,23 @@ class StateManager:
             except BaseException:
                 await db.rollback()
                 raise
+
+    @asynccontextmanager
+    async def _overlay_batch(self):
+        from harvey.overlay import store
+
+        con, attached = await asyncio.to_thread(store.connect, self.db_path)
+        try:
+            await asyncio.to_thread(con.execute, "BEGIN IMMEDIATE")
+            try:
+                yield store.Batch(store.Store(con, registers=attached))
+                await asyncio.to_thread(con.execute, "COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    await asyncio.to_thread(con.execute, "ROLLBACK")
+                raise
+        finally:
+            await asyncio.to_thread(con.close)
 
     async def init_db(self):
         """Create/upgrade the schema. Safe to call on every startup."""
@@ -2209,6 +2290,17 @@ class StateManager:
 
             async with db.execute("PRAGMA user_version") as cursor:
                 (version,) = await cursor.fetchone()
+            self._schema = version
+            if version == 25:
+                # The overlay: its schema is created whole (overlay/schema.py)
+                # or by the upgrade; only what modules declare is brought in
+                # (looked at first: most starts have nothing to write, and
+                # a page must not wait on a registry pull's write lock).
+                from harvey.overlay import store
+
+                if await asyncio.to_thread(store.call, self.db_path, "dictionaries_stale"):
+                    await self._on_overlay("sync_dictionaries")
+                return
 
             for target, script in enumerate(MIGRATIONS, start=1):
                 if version >= target:
@@ -2297,6 +2389,8 @@ class StateManager:
         website still has to dedup across re-runs, and for anyone selling
         websites those are the best prospects on the list.
         """
+        if await self._overlay():
+            return await self._on_overlay("add_company", company)
         async with self._connect() as db:
             company_id = await _insert_company(db, company)
             await db.commit()
@@ -2305,6 +2399,8 @@ class StateManager:
     async def match_company(self, company: Company, extra_ids=(),
                             declared_domain: bool = False) -> "resolver.Match":
         """The company on file ``company`` is, if any (resolver.match)."""
+        if await self._overlay():
+            return await self._on_overlay("match_company", company, extra_ids, declared_domain)
         async with self._connect() as db:
             return await resolver.match(db, company, extra_ids, declared_domain)
 
@@ -2312,6 +2408,8 @@ class StateManager:
         """Save a company from an outside source through the resolver: the
         same company on file gets its keys (or is merged with it), a
         possible one goes to the review list (_save_company)."""
+        if await self._overlay():
+            return await self._on_overlay("save_company", company, None, extra_ids)
         async with self._connect() as db:
             # The match and the save in one write transaction: two saves of
             # one business at once can't both find nothing and both insert.
@@ -2326,6 +2424,7 @@ class StateManager:
         """Pairs on the review list with ``status`` (pending | merged |
         separate), most likely first, each side as the panel shows it. The
         pending ones as the panel decides them are duplicate_groups."""
+        await self._v24_only("the duplicate review list")
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2353,6 +2452,7 @@ class StateManager:
         most) and, per member, whether it is another firm than the group's
         (``conflict``: a CUI other than the keeper's, or than the first
         member's when the keeper has none, so never merged with it)."""
+        await self._v24_only("the duplicate review list")
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             found = await resolver.groups(db)
@@ -2424,12 +2524,15 @@ class StateManager:
 
     async def count_duplicates(self) -> int:
         """How many groups wait on the review list."""
+        await self._v24_only("the duplicate review list")
         async with self._connect() as db:
             return len(await resolver.groups(db))
 
     async def merge_companies(self, keep: str, merged: str, decided_by: str = "you") -> int:
         """Merge ``merged`` into ``keep`` (resolver.merge). Raises
         resolver.MergeRefused when it can't be done."""
+        if await self._overlay():
+            return await self._on_overlay("merge_companies", keep, merged, decided_by)
         async with self._connect() as db:
             # Checks and writes in one write transaction: a second merge of
             # the same pair (a double click, or the other way round at the
@@ -2451,6 +2554,8 @@ class StateManager:
     async def merge_pair(self, a: str, b: str) -> dict:
         """"Same company" on a review pair: the one with a CUI (the
         registry's record) survives; otherwise the older one."""
+        if await self._overlay():
+            return await self._on_overlay("merge_pair", a, b)
         if a == b:
             raise resolver.MergeRefused("same_company")
         async with self._connect() as db:
@@ -2469,6 +2574,8 @@ class StateManager:
         ``keep`` (resolver.merge_group), and each of ``out`` (taken out of
         the group by the person) is marked a different company from them,
         in one transaction. Raises resolver.MergeRefused."""
+        if await self._overlay():
+            return await self._on_overlay("merge_group", keep, members, out, decided_by)
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
@@ -2486,6 +2593,8 @@ class StateManager:
         """Take ``out`` out of their group: each is a different company from
         every one of ``rest`` (or, with no ``rest``, they are all different
         from one another). Raises resolver.MergeRefused for an unknown company."""
+        if await self._overlay():
+            return await self._on_overlay("separate_group", out, rest)
         ids = list(dict.fromkeys([*out, *rest]))
         if len(ids) < 2:
             raise resolver.MergeRefused("same_company")
@@ -2503,6 +2612,8 @@ class StateManager:
 
     async def undo_group(self, company_id: str) -> list[dict]:
         """Undo the whole group merge ``company_id`` kept or joined."""
+        if await self._overlay():
+            return await self._on_overlay("undo_group", company_id)
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
@@ -2544,6 +2655,8 @@ class StateManager:
     async def separate_companies(self, a: str, b: str) -> bool:
         """"Different companies": the pair leaves the review list for good.
         Raises resolver.MergeRefused for an unknown company or a pair of one."""
+        if await self._overlay():
+            return await self._on_overlay("separate_companies", a, b)
         if a == b:
             raise resolver.MergeRefused("same_company")
         async with self._connect() as db:
@@ -2563,6 +2676,8 @@ class StateManager:
 
     async def undo_merge(self, merged: str) -> dict:
         """Undo the merge that took ``merged`` (resolver.undo)."""
+        if await self._overlay():
+            return await self._on_overlay("undo_merge", merged)
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")      # one undo at a time
             result = await resolver.undo(db, merged)
@@ -2570,8 +2685,43 @@ class StateManager:
             await db.commit()
         return result
 
+    async def remove_company(self, company_id: str) -> dict:
+        """Remove a firm from Harvey (overlay.store.Store.remove_company):
+        refused (store.RemoveRefused) for one in a merge or named by
+        outreach. Only the overlay keeps firms this way: on schema 24 the
+        company stays."""
+        if not await self._overlay():
+            from harvey.overlay.store import RemoveRefused
+
+            raise RemoveRefused("not_supported", "removing a company needs the upgraded database")
+        return await self._on_overlay("remove_company", company_id)
+
+    async def is_overlay(self) -> bool:
+        """Whether the database is the overlay (schema 25)."""
+        return await self._overlay()
+
+    async def pull_records(self, records, **kwargs) -> list[tuple[str, bool, bool, bool]]:
+        """A register pull's records marked as Harvey's in one bulk write
+        (overlay.store.Store.pull; the overlay only)."""
+        return await self._on_overlay("pull", records, **kwargs)
+
+    async def match_records(self, records) -> tuple[int, list]:
+        """A register pull's records matched in a read transaction, before
+        pull_records writes them (overlay.store.Store.match_records)."""
+        from harvey.overlay import store
+
+        return await asyncio.to_thread(store.call, self.db_path, "match_records", records)
+
+    async def held_ids(self, scheme: str, keys) -> dict:
+        """{key: the company holding it} for keys of an identifier scheme
+        (the overlay; {} on schema 24, which keeps them by kind)."""
+        if not await self._overlay():
+            return {}
+        return await self._on_overlay("held", scheme, list(keys))
+
     async def merges(self, limit: int = 50) -> list[dict]:
         """Merges still in force, newest first, both sides as the panel shows them."""
+        await self._v24_only("the merges list")
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2595,6 +2745,9 @@ class StateManager:
         where it is, what it does (its activity when no industry is on
         file), and the latest reading of the signals that make an email
         specific (company_brief_lines). [] for a company not on file."""
+        if await self._overlay():
+            found = await self._read("company_brief", company_id, list(BRIEF_CODES))
+            return company_brief_lines(*found) if found else []
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2616,7 +2769,18 @@ class StateManager:
                              if c["name_en"] or c["name"]), "")
         return company_brief_lines(company["location"] or "", activity, rows)
 
+    async def _overlay_company(self, method: str, *args) -> Company | None:
+        """A company as the overlay's reads describe it (reads.Reader's
+        ``method``: company, company_by), as a Company."""
+        row = await self._read(method, *args)
+        if not row:
+            return None
+        fields = {k: v for k, v in row.items() if k in Company.model_fields and v is not None}
+        return Company(**fields)
+
     async def get_company(self, company_id: str) -> Company | None:
+        if await self._overlay():
+            return await self._overlay_company("company", company_id)
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2626,6 +2790,8 @@ class StateManager:
                 return self._company_from_row(row) if row else None
 
     async def get_company_by_domain(self, domain: str) -> Company | None:
+        if await self._overlay():
+            return await self._overlay_company("company_by", "domain", _norm(domain))
         async with self._connect() as db:
             return await _company_by(db, "domain", _norm(domain))
 
@@ -2637,6 +2803,8 @@ class StateManager:
         """
         if not external_id:
             return None
+        if await self._overlay():
+            return await self._overlay_company("company_by", "external_id", external_id)
         async with self._connect() as db:
             return await _company_by(db, "external_id", external_id)
 
@@ -2645,6 +2813,8 @@ class StateManager:
         cui = (cui or "").strip()
         if not cui:
             return None
+        if await self._overlay():
+            return await self._overlay_company("company_by", "cui", cui)
         async with self._connect() as db:
             return await _company_by(db, "cui", cui)
 
@@ -2659,6 +2829,8 @@ class StateManager:
         registry re-import is how a moved office reaches the record. Returns
         the columns changed.
         """
+        if await self._overlay():
+            return await self._on_overlay("fill_company_fields", company_id, **fields)
         async with self._connect() as db:
             changed = await _fill_company_fields(db, company_id, fields)
             await db.commit()
@@ -2674,6 +2846,8 @@ class StateManager:
         removed (a re-import of a newer registry dataset drops a class the
         company gave up). Other sources' rows are left alone. Returns how
         many were added."""
+        if await self._overlay():
+            return 0
         async with self._connect() as db:
             added = await _set_company_activities(db, company_id, classes, source, confidence)
             await self._flush_company_search(db)
@@ -2689,6 +2863,10 @@ class StateManager:
         ids = list(dict.fromkeys(company_ids))
         out: dict[str, list[dict]] = {i: [] for i in ids}
         if not ids:
+            return out
+        if await self._overlay():
+            rows = await self._read("company_rows", [i for i in ids if str(i).isdigit()])
+            out.update({r["id"]: r["activities"] for r in rows})
             return out
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -2732,6 +2910,11 @@ class StateManager:
             return 0, []
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
+        if await self._overlay():
+            total, rows = await self._read("search_companies", query, limit, offset)
+            for r in rows:
+                r.pop("_inputs", None)
+            return total, rows
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -3562,6 +3745,8 @@ class StateManager:
         another process lands before this reads or after it commits, never
         in between, so the availability written always matches the
         switches. Returns how many rows were written."""
+        if await self._overlay():
+            return await self._on_overlay("write_vocabulary", rows_for, settings_prefix)
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
@@ -3582,6 +3767,9 @@ class StateManager:
     async def write_contact_kinds(self, rows_for, settings_prefix: str) -> None:
         """The contact kinds the manifests declare (contacts.sync_kinds), with
         the switches read in the same transaction (see write_vocabulary)."""
+        if await self._overlay():
+            return await self._on_overlay("write_contact_kinds", rows_for,
+                                          settings_prefix)
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
@@ -3600,6 +3788,10 @@ class StateManager:
                                available_only: bool = False) -> list[dict]:
         """The vocabulary. ``available_only`` leaves out the signals of
         modules that are off (hidden, never collected)."""
+        if await self._overlay():
+            rows = await self._read("signal_vocabulary", status)
+            rows = [r for r in rows if r["available"]] if available_only else rows
+            return sorted(rows, key=lambda r: (r.get("category") or "", r["code"]))
         sql = "SELECT * FROM signal_codes"
         where, params = [], []
         if status:
@@ -3620,6 +3812,8 @@ class StateManager:
         collected — Harvey proposes, the user decides."""
         if status not in ("proposed", "confirmed", "rejected"):
             raise ValueError(f"invalid signal status: {status}")
+        if await self._overlay():
+            return await self._on_overlay("set_signal_status", code, status)
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE signal_codes SET status = ?, updated_at = CURRENT_TIMESTAMP "
@@ -3632,6 +3826,14 @@ class StateManager:
     async def confirmed_signal_codes(self) -> set[str]:
         """What collectors may collect: confirmed by a person, and declared
         by a module that is on."""
+        if await self._overlay():
+            from harvey.modules import switches
+            from harvey.signals import available_codes
+
+            stored = await self.settings_with_prefix(switches.PREFIX)
+            available = available_codes(stored)
+            return {c for c in await self._on_overlay("signal_codes", "confirmed")
+                    if c in available}
         return {r["code"] for r in await self.get_signal_codes(status="confirmed",
                                                                 available_only=True)}
 
@@ -3658,6 +3860,14 @@ class StateManager:
         a typo must fail loudly rather than create a junk signal.
         ``module``, ``capability`` and ``origin_company_id`` say who found
         it and for which record, as ingest's rows do."""
+        if await self._overlay():
+            await self.add_observations([{
+                "company_id": company_id, "signal_code": signal_code, "collector": collector,
+                "value_num": value_num, "value_text": value_text, "confidence": confidence,
+                "evidence_url": evidence_url, "run_id": run_id, "observed_at": observed_at,
+                "module": module, "capability": capability,
+                "origin_company_id": origin_company_id}], run_id)
+            return ""
         obs_id = _new_id()
         async with self._connect() as db:
             await db.execute(
@@ -3682,6 +3892,8 @@ class StateManager:
 
     async def add_contacts(self, company_id: str, found: list, origin: str = "") -> int:
         """Save contacts (contacts.Found) found for a company, linked to it."""
+        if await self._overlay():
+            return await self._on_overlay("add_contacts", company_id, found, origin)
         if not found:
             return 0
         async with self._connect() as db:
@@ -3691,6 +3903,8 @@ class StateManager:
 
     async def add_location(self, company_id: str, **place) -> int:
         """One of a company's places (contacts.add_location)."""
+        if await self._overlay():
+            return await self._on_overlay("add_location", company_id, **place)
         async with self._connect() as db:
             location_id = await contacts.add_location(db, company_id, **place)
             await db.commit()
@@ -3698,6 +3912,9 @@ class StateManager:
 
     async def add_company_source(self, company_id: str, source: str, ref: str = "",
                                  origin: str = "") -> None:
+        if await self._overlay():
+            return await self._on_overlay("add_company_source", company_id, source, ref,
+                                          origin)
         async with self._connect() as db:
             await contacts.add_source(db, company_id, source, ref, origin)
             await db.commit()
@@ -3705,6 +3922,8 @@ class StateManager:
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
         """Batch insert. Flushed per batch by callers — a long run that dies
         must not lose everything it observed."""
+        if await self._overlay():
+            return await self._on_overlay("add_observations", rows, run_id)
         if not rows:
             return 0
         async with self._connect() as db:
@@ -3766,6 +3985,11 @@ class StateManager:
         latest_only: bool = False,
         limit: int = 500,
     ) -> list[dict]:
+        if await self._overlay():
+            if not company_id:
+                raise NotOnOverlay("observations of every company aren't available on the "
+                                   "upgraded database: ask for one company's")
+            return await self._read("observations", company_id, signal_code, latest_only, limit)
         where, params = [], []
         if company_id:
             where.append("company_id = ?")
@@ -3823,6 +4047,8 @@ class StateManager:
 
     async def signal_counts(self) -> list[dict]:
         """How many entities actually carry each signal — the cohort sizes."""
+        if await self._overlay():
+            return await self._read("signal_counts")
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -3844,6 +4070,8 @@ class StateManager:
         same reading a cohort condition "has it" makes (see cohort_verdicts)."""
         from harvey.signals import absence
 
+        if await self._overlay():
+            return await self._read("signal_states", list(codes))
         async with self._connect() as db:
             async with db.execute(f"SELECT COUNT(*) FROM companies c WHERE {LIVE_COMPANY}") as cursor:
                 total = (await cursor.fetchone())[0]
@@ -3896,6 +4124,8 @@ class StateManager:
         ``kind`` (a CUI): ``{"id", "name", "value"}``, one row per
         identifier, in company id order (then value), a company's rows
         together. Only ``company_ids`` when given."""
+        if await self._overlay():
+            return await self._on_overlay("companies_with_id", kind, company_ids)
         sql = (f"SELECT c.id, c.name, i.value FROM company_ids i "
                f"JOIN companies c ON c.id = i.company_id "
                f"WHERE i.kind = ? AND i.value != '' AND {LIVE_COMPANY}")
@@ -4078,6 +4308,10 @@ class StateManager:
         ranges = list(ranges or [])
         if not require and not exclude and not ranges:
             return counts, []
+        if await self._overlay():
+            return await self._read("cohort_verdicts", require, exclude, ranges,
+                                    verdicts=tuple(verdicts), offset=offset, limit=limit,
+                                    min_confidence=min_confidence)
         wanted = [v for v in dict.fromkeys(verdicts) if v in self.VERDICTS]
         sql, params = self._verdict_sql(require, exclude, ranges, min_confidence)
         async with self._connect() as db:
@@ -4120,6 +4354,9 @@ class StateManager:
         ``ids`` looks only at those companies (a search's results), so a
         run's handful isn't found by reading the whole backlog.
         """
+        if await self._overlay():
+            return await self._read("needing_profile", limit, stale_days,
+                                    None if ids is None else list(ids))
         out: list[dict] = []
         chunks = [None] if ids is None else [
             list(ids)[i:i + 500] for i in range(0, len(list(ids)), 500)]
@@ -4142,6 +4379,8 @@ class StateManager:
         return out
 
     async def count_companies_needing_profile(self, stale_days: int = 90) -> int:
+        if await self._overlay():
+            return await self._read("needs_profile", stale_days)
         async with self._connect() as db:
             async with db.execute(
                 f"""SELECT COUNT(*) FROM companies c
@@ -4157,6 +4396,8 @@ class StateManager:
     async def mark_company_profiled(self, company_id: str):
         """Record that a profile pass looked at this company, whether or
         not it was reachable — advances the rotation regardless."""
+        if await self._overlay():
+            return await self._on_overlay("mark_company_profiled", company_id)
         async with self._connect() as db:
             await db.execute(
                 """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
@@ -4167,6 +4408,8 @@ class StateManager:
 
     async def rename_company(self, company_id: str, name: str):
         """Set a company's name, and the copy each of its prospects carries."""
+        if await self._overlay():
+            return await self._on_overlay("rename_company", company_id, name)
         async with self._connect() as db:
             await db.execute(
                 "UPDATE companies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -4183,6 +4426,8 @@ class StateManager:
     async def fill_company_phone(self, company_id: str, phone: str) -> bool:
         """Set a company's phone only when it has none: a listing's number
         is never overwritten by one read off the site. True when set."""
+        if await self._overlay():
+            return await self._on_overlay("fill_company_phone", company_id, phone)
         if not company_id or not phone:
             return False
         async with self._connect() as db:
@@ -4216,6 +4461,7 @@ class StateManager:
         company not searched since then. Never-searched companies first,
         then the longest ago, so the whole backlog rotates.
         """
+        await self._v24_only("companies needing prospects")
         cutoff = contacts.search_cutoff(module, capability, since)
         last = ("(SELECT MAX(s.searched_at) FROM searches s WHERE s.target = 'company' "
                 "AND s.target_id = c.id AND s.module = ? AND s.capability = ?)")
@@ -4240,6 +4486,8 @@ class StateManager:
         do-not-contact, reaching a live company with trust confirmed or
         likely. Each comes with one link (through a person first, then the
         best trust): its company, person and source. Oldest first."""
+        if await self._overlay():
+            return await self._read("email_audience", limit)
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -4267,6 +4515,9 @@ class StateManager:
                             **done) -> None:
         """A search done for a record (contacts.record_search), whatever it
         found."""
+        if await self._overlay():
+            return await self._on_overlay("record_search", target, target_id, module,
+                                          capability, **done)
         async with self._connect() as db:
             await contacts.record_search(db, target, target_id, module, capability, **done)
             await db.commit()
@@ -4278,6 +4529,9 @@ class StateManager:
         company's key only when ``domain`` is given (a confirmed match) and
         no other company holds it. False when the company has a website
         already: a found one never replaces it."""
+        if await self._overlay():
+            return await self._on_overlay("set_found_website", company_id, website,
+                                          domain=domain, trust=trust, source=source)
         async with self._connect() as db:
             if domain:
                 async with db.execute("SELECT 1 FROM companies WHERE domain = ? AND id != ? "
@@ -4300,6 +4554,9 @@ class StateManager:
                          source: str = "", origin: str = "") -> int:
         """People named at a company ((name, role) pairs), each kept once
         by name; a second mention fills a missing role. How many were new."""
+        if await self._overlay():
+            return await self._on_overlay("add_people", company_id, people, source=source,
+                                          origin=origin)
         async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) FROM people WHERE company_id = ?",
                                   (company_id,)) as cur:
