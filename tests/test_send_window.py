@@ -90,10 +90,13 @@ async def seed_at(state, location: str, email: str, status="queued") -> str:
 
 async def approved(state, pid, to, kind="sequence", step=1, campaign="c1"):
     past = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1)).isoformat()
+    # A first email to a named person's address carries its source note.
+    note = "Am găsit adresa pe site-ul dumneavoastră." if kind == "sequence" and step == 1 else ""
     return await state.add_outbox_item(
         prospect_id=pid, to_email=to, subject="hello there",
-        body="A short, plain note. Question?", send_at=past, status="approved",
-        campaign_id=campaign if kind == "sequence" else "", step=step, kind=kind)
+        body="A short, plain note. Question?" + (f"\n\n{note}" if note else ""), send_at=past,
+        status="approved", campaign_id=campaign if kind == "sequence" else "", step=step,
+        kind=kind, source_note=note)
 
 
 async def outbox_row(state, item_id):

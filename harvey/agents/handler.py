@@ -8,23 +8,30 @@ sending domain while nobody's watching.
 """
 
 import html
+import json
 import logging
 import re
+import time
+import unicodedata
 from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
+from harvey import suppression, unsubscribe
 from harvey.config import (
-    DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
-    live_do_not_contact,
+    DEFAULT_OPT_OUT_LINE, ENGLISH_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of,
+    legacy_sending_held, live_do_not_contact,
 )
-from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import (
     NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
 )
 from harvey.models.conversation import Conversation, Message
-from harvey.state import COLLEAGUE_REPLIED, REVIEW_NEXT_REPLY_KEY, StateManager
+from harvey.state import (
+    COLLEAGUE_REPLIED, FREE_MAIL_DOMAINS, MAIL_READ_KEY, READ_GAP_KEY, REVIEW_NEXT_REPLY_KEY,
+    StateManager,
+)
 from harvey.sending_mode import sync_sending_mode
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
@@ -32,6 +39,10 @@ from harvey.untrusted import UNTRUSTED_RULE, fence
 logger = logging.getLogger("harvey.handler")
 
 KILL_SWITCH_KEY = "sending_paused"
+# An unsubscribe or opt-out that couldn't be recorded is read again for
+# this many cycles (counted under this settings key and the message's id).
+STOP_RETRY_KEY = "stop_retry:"
+STOP_RETRIES = 5
 BOUNCE_COUNT_KEY = "bounce_count"
 # Kill switch only engages after this many sends (a tiny sample lies).
 MIN_SENDS_FOR_KILL_SWITCH = 10
@@ -54,7 +65,8 @@ AUTO_REPLY_INTENTS = {"interested", "objection", "question", "wrong_person"}
 NO_COMPANY_STOP_INTENTS = {"ooo", "wrong_person"}
 
 # Hard opt-out phrases. If any of these appear, we ALWAYS honor the
-# opt-out regardless of what the LLM classifier says.
+# opt-out regardless of what the LLM classifier says. The Romanian ones are
+# RO_OPT_OUTS below.
 OPT_OUT_PATTERNS = (
     "unsubscribe",
     "opt out",
@@ -72,16 +84,64 @@ OPT_OUT_PATTERNS = (
     "delete my info",
     "delete my data",
 )
+# Of those (and on their own), the ones that object to the processing itself
+# (GDPR art. 21, or an erasure request): the address is suppressed as an
+# objection, and the conversation goes to a human, who may need to delete
+# their data or say where the address came from.
+OBJECTION_PATTERNS = (
+    "delete my info",
+    "delete my data",
+    "where did you get my",
+    "de unde aveti adresa",
+    "de unde aveti emailul",
+    "de unde aveti datele",
+)
+# Romanian opt-outs and objections: (pattern, objection). Written without
+# diacritics and matched, on word boundaries, on the reply with its
+# diacritics taken off, so "nu mă mai contactați" and "nu ma mai contactati"
+# both count. Singular and plural ("nu mai doresc", "nu mai dorim"), the
+# pronoun forms ("nu ne mai trimiteți", "scoateți-mă", "să mă scoateți")
+# and a hyphen or a space alike. "Nu mai doresc" counts only with what they
+# no longer want ("să primesc", "emailuri"...), so "nu mai doresc să aștept"
+# isn't one; said alone it is (BARE_OPT_OUTS). "Să primesc" counts with
+# mail after it or nothing ("nu mai dorim să primim facturi pe hârtie"
+# isn't one), and offers only as a kind ("oferte", not "oferta inițială"),
+# reclame not reclamații. "Ștergeți datele" counts unless it is "nu
+# ștergeți datele".
+_RO_WANT = r"(?:doresc|dorim|vreau|vrem)"
+_RO_MAIL = (r"(?:astfel\s+de\s+|asemenea\s+|niciun\w*\s+)?"
+            r"(?:e-?mail\w*|mail\w*|mesaj\w*|oferte(?:le)?|newsletter\w*|informar\w*|"
+            r"notificar\w*|comunicar\w*|reclame(?:le)?|nimic)\b")
+_RO_RECEIVE = (r"(?:(?:primesc|primim|primi)(?:\s+(?:de\s+la\s+(?:voi|dvs|dumneavoastra)\.?\s+)?"
+               rf"{_RO_MAIL}|\s*(?:[.,;!]|$))|f(?:iu|im)\s+contactat\w*)")
+_RO_PRONOUN = r"(?:[\s-]+(?:ma|ne|imi|mi|-mi|-ne))?"
+RO_OPT_OUTS = tuple((re.compile(p), objection) for p, objection in (
+    (r"\bdezabon\w*", False),
+    (rf"\bnu\s+mai\s+{_RO_WANT}\s+(?:sa\s+(?:mai\s+)?{_RO_RECEIVE}|{_RO_MAIL})", False),
+    (rf"\bnu\s+{_RO_WANT}\s+sa\s+mai\s+{_RO_RECEIVE}", False),
+    (rf"\bnu{_RO_PRONOUN}\s+mai\s+(?:trimiteti|scrieti|contactati|cautati|sunati)\b", False),
+    (r"\bscoate(?:ti)?[\s-]+(?:ma|ne)\b", False),
+    (r"\b(?:ma|ne)\s+scoateti\b", False),
+    (r"\bsterge(?:ti)?[\s-]+(?:ma|ne)\b", True),
+    (r"(?<!\bnu )\bstergeti(?:[\s-]+(?:mi|ne))?\s+(?:toate\s+)?datele\b", True),
+))
 # "No thanks" (what cold email's footer asks for) as a phrase: not "no
 # Thanksgiving", "Bruno / Thanks," or "yes or no, thanks".
 # Checked one line at a time: "...the answer is no / Thanks!" is a sign-off.
 NO_THANKS_RE = re.compile(
     r"(?<!\bor )\bno,?[ \t]+thank(?:s|[ \t]+you)\b(?![ \t]+(?:needed|necessary|required))")
-# A reply that says only this (signature aside) is an opt-out ("Reply STOP").
+# A reply that says only this (signature aside) is an opt-out ("Reply STOP"),
+# also with a thanks after it ("Stop, mulțumesc"; THANKS_TAIL_RE).
 BARE_OPT_OUTS = {"stop", "unsubscribe", "remove", "remove me", "opt out",
-                 "no thanks", "no thank you"}
+                 "no thanks", "no thank you", "dezabonare", "dezabonati-ma", "dezabonez",
+                 "nu multumesc", "nu multumim", "nu va multumesc", "nu va multumim",
+                 "nu mai doresc", "nu mai dorim", "nu mai vreau", "nu mai vrem"}
+THANKS_TAIL_RE = re.compile(
+    r"(?:\s+(?:va\s+)?(?:multumesc|multumim|mersi|thanks|thank\s+you|o\s+zi\s+buna|"
+    r"o\s+zi\s+frumoasa|toate\s+cele\s+bune|cu\s+stima|salut|regards))+$")
 _MOBILE_SIGNATURE_RE = re.compile(
-    r"^[ \t]*(?:sent from my \w[^\n]*|get outlook for \w[^\n]*|sent from \w+ mail[^\n]*)$",
+    r"^[ \t]*(?:sent from my \w[^\n]*|get outlook for \w[^\n]*|sent from \w+ mail[^\n]*|"
+    r"trimis de pe \w[^\n]*|trimis din \w[^\n]*|expediat de pe \w[^\n]*)$",
     re.IGNORECASE | re.MULTILINE)
 # A line of their reply at least this long that repeats what Harvey wrote
 # for this person is our text, not theirs. Shorter unmarked lines are always
@@ -143,6 +203,12 @@ class OurText:
         return "\n".join(kept)
 
 
+def _plain(text: str) -> str:
+    """``text`` with its diacritics taken off (ș, ţ, ă, î, â...)."""
+    text = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
 def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
     """Which opt-out rule their reply trips, and on what words, or None.
 
@@ -151,21 +217,35 @@ def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
     thanks" only within a line. The result is kept with the opt-out so a
     human can see why Harvey stopped, and undo it if it was wrong."""
     flat = _flat(their_text)
-    for p in OPT_OUT_PATTERNS:
-        if p in flat:
-            return {"rule": "phrase", "matched": p,
+    plain = _plain(flat)
+    for p in OPT_OUT_PATTERNS + OBJECTION_PATTERNS:
+        if p in flat or p in plain:
+            return {"rule": "phrase", "matched": p, "objection": p in OBJECTION_PATTERNS,
                     "why": f'Their reply contains "{p}".'}
+    for pattern, objection in RO_OPT_OUTS:
+        m = pattern.search(plain)
+        if m:
+            return {"rule": "phrase", "matched": m.group(0), "objection": objection,
+                    "why": f'Their reply contains "{m.group(0)}".'}
     for line in their_text.split("\n"):
         m = NO_THANKS_RE.search(_flat(line))
         if m:
             return {"rule": "no_thanks", "matched": m.group(0),
                     "why": f'Their reply says "{m.group(0)}", what the opt-out line asks for.'}
-    bare = _flat(_MOBILE_SIGNATURE_RE.sub("", own_words or ""))
-    bare = re.sub(r"[^\w\s-]", "", bare).strip()
-    if bare in BARE_OPT_OUTS:
-        return {"rule": "only_words", "matched": bare,
-                "why": f'Their reply was only "{bare}".'}
+    bare = _plain(_flat(_MOBILE_SIGNATURE_RE.sub("", own_words or "")))
+    bare = " ".join(re.sub(r"[^\w\s-]", " ", bare).split())
+    for words in dict.fromkeys((bare, THANKS_TAIL_RE.sub("", bare).strip())):
+        if words in BARE_OPT_OUTS:
+            return {"rule": "only_words", "matched": words,
+                    "why": f'Their reply was only "{words}".'}
     return None
+
+
+def _own_words(body: str) -> str:
+    """What a message's body says of its own: the quote and a phone's
+    signature taken out ("" for an empty body or a signature only)."""
+    own = strip_quoted_reply(body or "") if (body or "").strip() else ""
+    return _MOBILE_SIGNATURE_RE.sub("", own).strip()
 
 
 MODEL_OPT_OUT = {"rule": "model", "matched": "",
@@ -262,6 +342,10 @@ class Handler:
         self.provider = get_mail_provider(config, env)
         self.skills = ""
         self.last_read_problem = ""   # why the last mailbox read failed, for the heartbeat
+        # The message being handled carries an unsubscribe or opt-out
+        # (seen), not yet recorded (pending): _run_native, _retry_stop.
+        self._stop_pending = False
+        self._stop_seen = False
 
     @property
     def is_native(self) -> bool:
@@ -348,6 +432,7 @@ class Handler:
         logger.info(f"Handler: Reply from {lead_email}")
 
         consumed = True
+        self._stop_pending = self._stop_seen = False
         try:
             await self._process_reply(lead_email, reply_text, reply_uuid, campaign.id)
         except BrainUnavailable:
@@ -355,12 +440,19 @@ class Handler:
             # it for the next cycle instead of losing it to a provider outage.
             consumed = False
             raise
+        except Exception as e:
+            # An opt-out read but not recorded is read again (_retry_stop).
+            if self._stop_pending and reply_uuid:
+                consumed = not await self._retry_stop(reply_uuid, lead_email, reply_text, e)
+            raise
         finally:
             # Otherwise ALWAYS mark processed — even on early exits (opt-out,
             # OOO, unknown prospect) — so the same reply is never re-handled
             # or double-replied on the next cycle.
             if reply_uuid and consumed:
                 await self.state.mark_reply_processed(reply_uuid)
+                if self._stop_seen and not self._stop_pending:
+                    await self._forget_retries(reply_uuid)
         return True
 
     async def _our_text(self, prospect) -> OurText:
@@ -371,6 +463,7 @@ class Handler:
             *await self.state.get_texts_for_prospect(prospect.id),
             *await self.state.get_footer_history(),
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
+            ENGLISH_OPT_OUT_LINE,
         ])
 
     async def _stop_colleagues(self, prospect):
@@ -450,7 +543,7 @@ class Handler:
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
         if not prospect:
-            logger.warning(f"Handler: No prospect found for {lead_email}")
+            await self._unknown_sender(lead_email, reply_text, reply_meta or {})
             return
 
         # Their words, without what we sent them. The keyword checks below
@@ -469,9 +562,22 @@ class Handler:
             await self._record_after_opt_out(prospect, reply_text, campaign_id, escalate)
             return
 
-        # Update prospect status + stop-on-reply: a human answered, so every
-        # queued sequence email for them is now wrong to send.
-        await self.state.update_prospect_status(prospect.id, "replied")
+        # An opt-out in their own words is recorded first, before anything
+        # else about the reply (the conversation, a model call) can fail:
+        # status, do-not-contact entry and all, in one write.
+        opt_out = _opt_out_reason(their_text, reply_text)
+        objection = bool(opt_out and opt_out.get("objection"))
+        if opt_out:
+            self._stop_pending = self._stop_seen = True
+            await self.state.update_prospect_status(
+                prospect.id, "opted_out", reason="objection" if objection else "opt_out",
+                by="reply", note=reply_text, ref=(reply_meta or {}).get("message_id", "")
+                or reply_uuid)
+            self._stop_pending = False
+        else:
+            await self.state.update_prospect_status(prospect.id, "replied")
+        # Stop-on-reply: a human answered, so every queued sequence email
+        # for them is now wrong to send.
         try:
             cancelled = await self.state.cancel_pending_outbox_for_prospect(prospect.id)
             if cancelled:
@@ -484,7 +590,6 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        opt_out = _opt_out_reason(their_text, reply_text)
         if opt_out:
             intent = "unsubscribe"
         elif any(p in keyword_text for p in ESCALATION_PATTERNS):
@@ -527,8 +632,9 @@ class Handler:
         held = not self.is_native and legacy_sending_held(self.config)
         # Nothing can be sent to someone on the do-not-contact list, so don't
         # spend a model call drafting; they go to you instead (step 3).
-        listed = do_not_contact_match(prospect.email or lead_email,
-                                      live_do_not_contact(self.config))
+        hit = await self.state.suppression_check(prospect.email or lead_email,
+                                                 firm=prospect.company_id, config=self.config)
+        listed = hit.value if hit is not None else ""
         response = ""
         if intent in AUTO_REPLY_INTENTS and not held and not listed:
             response = await self._generate_response(intent, reply_text, prospect, convo)
@@ -548,9 +654,18 @@ class Handler:
 
         # 3. Route based on intent
         if intent == "unsubscribe":
-            # Honor opt-outs ALWAYS. No reply, no future contact.
-            await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
-            await self.state.update_prospect_status(prospect.id, "opted_out")
+            # Honor opt-outs ALWAYS. No reply, no future contact: the
+            # address goes on the do-not-contact list (an objection to the
+            # processing, or an erasure request, as such: a human then
+            # answers it), and every sequence to their company stopped above.
+            # An opt-out in their words was recorded at the top; one only
+            # the model read is recorded now.
+            await self.state.update_conversation(
+                convo.id, status="needs_human" if objection else "closed", stage="closed_lost")
+            if not opt_out:
+                await self.state.update_prospect_status(
+                    prospect.id, "opted_out", reason="opt_out", by="reply", note=reply_text,
+                    ref=(reply_meta or {}).get("message_id", "") or reply_uuid)
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
@@ -695,7 +810,12 @@ class Handler:
 
     async def _run_native(self) -> bool:
         """Poll the mailbox, split bounces from human replies, handle both.
-        Returns True only if the mailbox was read and every message handled."""
+        Returns True only if the mailbox was read and every message handled.
+
+        Every read goes back at least to the last complete one (the
+        provider reads by date when Harvey was off), so an unsubscribe sent
+        while it was off is still read. A read that couldn't cover that gap
+        holds cold email (READ_GAP_KEY) until one does."""
         if not self.provider.is_configured():
             logger.debug(
                 f"Handler: provider '{self.provider.name}' not configured yet."
@@ -703,8 +823,16 @@ class Handler:
             return True  # nothing to read; the sender can't send through it either
 
         self.last_read_problem = ""
+        mailbox = self._mailbox()
+        since = await self.state.last_mail_read(mailbox)
+        started = time.time()
+        self.provider.read_since = since
         try:
-            inbound = await self.provider.get_replies()
+            inbound = list(await self.provider.get_replies())
+            # And the spam/junk folder, for unsubscribe messages only.
+            spam = getattr(self.provider, "get_spam_unsubscribes", None)
+            if spam is not None:
+                inbound += await spam()
         except Exception as e:
             logger.error(f"Handler: fetching replies failed: {e}")
             # Kept for the heartbeat: sending is held, and Today says why.
@@ -714,22 +842,45 @@ class Handler:
         handled = 0
         complete = True
         for msg in inbound:
-            dedup_key = msg.provider_id or msg.message_id
+            key = msg.provider_id or msg.message_id
+            # A spam/junk message is read for the token only, under a key of
+            # its own: moved to the inbox later, it is read as a reply then.
+            dedup_key = f"{msg.folder}:{key}" if key and getattr(msg, "folder", "") else key
             if not dedup_key or await self.state.is_reply_processed(dedup_key):
                 continue
             consumed = True
+            # Set while an unsubscribe or opt-out this message carries is
+            # read but not yet recorded (_retry_stop).
+            self._stop_pending = self._stop_seen = False
             try:
+                # An unsubscribe first, before anything else is decided about
+                # the message, and whatever its body (a mail client's
+                # unsubscribe button often sends a subject and nothing else).
+                if await self._unsubscribe(msg):
+                    if dedup_key != key:
+                        await self.state.mark_reply_processed(key)
+                    handled += 1
+                    continue
+                if getattr(msg, "folder", ""):
+                    continue        # spam/junk: read only for an unsubscribe
+                text = msg.body.strip()
+                if not _own_words(text):
+                    # Nothing of their own in the body (empty, a phone's
+                    # signature): a subject that asks to stop is the reply.
+                    text = self._subject_opt_out(msg.subject) or text
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
-                elif msg.body.strip():
+                elif text:
                     await self._process_reply(
                         msg.from_email,
-                        msg.body.strip(),
+                        text,
                         reply_uuid="",
                         reply_meta={
                             "thread_ref": msg.thread_ref,
                             "message_id": msg.message_id,
                             "subject": msg.subject,
+                            "in_reply_to": msg.in_reply_to,
+                            "references": (msg.headers or {}).get("references", ""),
                         },
                     )
                 handled += 1
@@ -742,9 +893,14 @@ class Handler:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
                 self.last_read_problem = f"a reply from {msg.from_email} couldn't be handled ({e})"
                 complete = False
+                if self._stop_pending:
+                    consumed = not await self._retry_stop(
+                        dedup_key, msg.from_email, f"{msg.subject or ''} {msg.body or ''}", e)
             finally:
                 if consumed:
                     await self.state.mark_reply_processed(dedup_key)
+                    if self._stop_seen and not self._stop_pending:
+                        await self._forget_retries(dedup_key)
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
@@ -755,7 +911,184 @@ class Handler:
             # read after these (Gmail's history marker). Not otherwise, so
             # what wasn't handled is read again.
             self.provider.confirm_read()
+            await self._record_coverage(mailbox, since, started)
         return complete
+
+    async def _retry_stop(self, dedup_key: str, sender: str, preview: str,
+                          error: Exception) -> bool:
+        """An unsubscribe or opt-out was read and couldn't be recorded (a
+        locked database, say): True to leave the message unprocessed, so the
+        next cycle reads it again (the read is incomplete meanwhile, so
+        sending waits). After STOP_RETRIES tries it is given up on and goes
+        to you, so one message that always fails can't hold sending forever."""
+        try:
+            tries = await self.state.increment_setting(STOP_RETRY_KEY + dedup_key)
+        except Exception:
+            return True             # can't even count: keep it for next cycle
+        if tries < STOP_RETRIES:
+            logger.warning(f"Handler: the opt-out from {sender} couldn't be recorded "
+                           f"({error}); it is read again next cycle.")
+            return True
+        logger.error(f"Handler: the opt-out from {sender} couldn't be recorded after "
+                     f"{tries} tries ({error}); handed to you.")
+        try:
+            await self.state.delete_setting(STOP_RETRY_KEY + dedup_key)
+            await self.state.log_action(
+                action_type="escalation", agent="handler",
+                details={"prospect_email": sender,
+                         "reason": f"an opt-out couldn't be recorded ({error}); "
+                                   "add them to the do-not-contact list by hand",
+                         "reply_preview": preview.strip()[:200]})
+        except Exception:
+            pass
+        return False
+
+    async def _forget_retries(self, dedup_key: str):
+        try:
+            if await self.state.get_setting(STOP_RETRY_KEY + dedup_key):
+                await self.state.delete_setting(STOP_RETRY_KEY + dedup_key)
+        except Exception:
+            pass
+
+    def _mailbox(self) -> str:
+        """The mailbox a read's coverage is kept for: provider and address."""
+        try:
+            address = self.provider.from_address()
+        except Exception:
+            address = ""
+        address = address or getattr(getattr(self.config, "persona", None), "email", "") or ""
+        return f"{self.provider.name}:{address.strip().lower()}"
+
+    async def _record_coverage(self, mailbox: str, since: float | None, started: float):
+        """A complete read: when it went back to the last complete one (or
+        the provider read incrementally from it), it is the new last
+        complete read and any gap note goes; otherwise the gap stays, and
+        cold email waits (the sender reads READ_GAP_KEY)."""
+        covered = getattr(self.provider, "covered_from", None)
+        if since is not None and covered is not None and covered > since:
+            days = max(1, round((started - since) / 86400))
+            reason = (f"the mailbox was last read completely {days} day(s) ago, and the read "
+                      f"went back only to {datetime.fromtimestamp(covered, timezone.utc):%Y-%m-%d}; "
+                      "an unsubscribe in between may be unread")
+            if not await self.state.get_setting(READ_GAP_KEY):
+                logger.warning(f"Handler: cold email waits: {reason}.")
+            await self.state.set_setting(READ_GAP_KEY, json.dumps(
+                {"since": since, "covered_from": covered, "reason": reason,
+                 "mailbox": mailbox}))
+            return
+        await self.state.set_setting(MAIL_READ_KEY + mailbox, str(int(started)))
+        if await self.state.get_setting(READ_GAP_KEY):
+            await self.state.delete_setting(READ_GAP_KEY)
+
+    @staticmethod
+    def _subject_opt_out(subject: str) -> str:
+        """An empty-bodied message's subject, when it asks to stop (a
+        mailto unsubscribe whose token is missing or unknown), as the text
+        to handle; else ""."""
+        subject = (subject or "").strip()
+        if subject and (unsubscribe.WORD_RE.search(subject)
+                        or _opt_out_reason(subject, subject) is not None):
+            return subject
+        return ""
+
+    async def _unsubscribe(self, msg) -> bool:
+        """A message carrying a known unsubscribe token (its subject or
+        body): the address the email went to, and the sender when it is
+        another address (a forward, an alias), go on the do-not-contact
+        list; their queued email is cancelled and their conversation
+        closed. No reply is sent. False when the message carries no token
+        Harvey sent."""
+        token = unsubscribe.find_token(msg.subject, msg.body)
+        item = await self.state.find_outbox_by_unsub_token(token) if token else None
+        if item is None:
+            return False
+        self._stop_pending = self._stop_seen = True
+        addresses = [a for a in dict.fromkeys(((item.get("to_email") or "").strip().lower(),
+                                               (msg.from_email or "").strip().lower()))
+                     if suppression.normalize_address(a)]
+        for address in addresses:
+            await self.state.suppress("address", address, "unsubscribe", by="unsubscribe",
+                                      campaign=item.get("campaign_id") or "",
+                                      ref=item.get("id") or "", note=msg.subject or "")
+        cancelled = 0
+        for address in addresses:
+            prospect = await self.state.get_prospect_by_email(address)
+            if prospect is None:
+                continue
+            await self.state.update_prospect_status(
+                prospect.id, "opted_out", reason="unsubscribe", by="unsubscribe",
+                note=msg.subject or "", ref=item.get("id") or "")
+            cancelled += await self.state.cancel_pending_outbox_for_prospect(
+                prospect.id, reason="unsubscribed")
+            for convo in await self.state.get_conversations_by_status("open"):
+                if convo.prospect_id == prospect.id:
+                    await self.state.update_conversation(convo.id, status="closed",
+                                                         stage="closed_lost")
+            await self.state.log_action(
+                action_type="opt_out", agent="handler",
+                details={"prospect_id": prospect.id, "prospect_email": prospect.email,
+                         "rule": "unsubscribe", "matched": unsubscribe.WORD,
+                         "why": "They used the unsubscribe link of one of Harvey's emails.",
+                         "message": (msg.subject or "")[:1000]})
+        self._stop_pending = False
+        logger.info(f"Handler: unsubscribe for {', '.join(addresses)}: suppressed, "
+                    f"{cancelled} queued email(s) cancelled. No reply sent.")
+        return True
+
+    async def _unknown_sender(self, lead_email: str, reply_text: str, reply_meta: dict):
+        """A message from an address with no prospect card. Plausibly about
+        someone Harvey wrote to (it answers one of Harvey's emails, or it
+        comes from the domain of a firm Harvey emailed), it goes to you as a
+        conversation of that prospect, their company's cold email stops,
+        and, when their own words (the quote and our text taken out) ask to
+        stop, the sender goes on the do-not-contact list. Anything else (a
+        newsletter with its own "dezabonare" link, a stranger) is left
+        alone. Either way the message is marked processed: it never holds
+        sending."""
+        prospect, how = None, ""
+        for ref in [reply_meta.get("in_reply_to", "")] + (reply_meta.get("references") or "").split():
+            item = await self.state.find_outbox_by_message_id(ref.strip())
+            if item:
+                prospect, how = await self.state.get_prospect(item["prospect_id"]), "thread"
+                break
+        if prospect is None:
+            domain = lead_email.rpartition("@")[2].lower()
+            if domain and domain not in FREE_MAIL_DOMAINS:
+                prospect = await self.state.prospect_written_at_domain(domain)
+                how = "domain"
+        if prospect is None:
+            logger.info(f"Handler: a message from {lead_email}, not about anyone Harvey "
+                        "wrote to: left alone.")
+            return
+        ours = await self._our_text(prospect)
+        own = ours.remove(strip_quoted_reply(reply_text) or reply_text)
+        opt_out = _opt_out_reason(own, own)
+        if opt_out and suppression.normalize_address(lead_email):
+            self._stop_pending = self._stop_seen = True
+            await self.state.suppress(
+                "address", lead_email, "objection" if opt_out.get("objection") else "opt_out",
+                by="reply", note=own, ref=reply_meta.get("message_id", ""))
+            self._stop_pending = False
+            logger.info(f"Handler: {lead_email} asked to stop: on the do-not-contact list.")
+        await self.state.cancel_pending_outbox_for_prospect(prospect.id)
+        await self._stop_colleagues(prospect)
+        message = Message(sender="prospect", content=f"[{lead_email}] {reply_text}")
+        stored = next((c for c in await self.state.get_conversations_by_status("open")
+                       if c.prospect_id == prospect.id), None)
+        if stored is not None:
+            stored.thread.append(message)
+            await self.state.update_conversation(stored.id, thread_json=stored.thread_json(),
+                                                 status="needs_human")
+        else:
+            await self.state.add_conversation(Conversation(
+                id="", prospect_id=prospect.id, channel="email", thread=[message],
+                intent="escalate", status="needs_human"))
+        await self.state.log_action(
+            action_type="reply_from_someone_else", agent="handler",
+            details={"from": lead_email, "prospect_email": prospect.email, "matched": how,
+                     "reply_preview": reply_text[:200]})
+        logger.info(f"Handler: {lead_email} wrote about {prospect.email} ({how}): handed to "
+                    "you; their company's cold email stopped.")
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
@@ -849,6 +1182,7 @@ class Handler:
         """Why an Instantly reply must not go out by itself, or []."""
         gate = pre_send_check(prospect.email, "Re:", response, kind="reply",
                               do_not_contact=live_do_not_contact(self.config))
+        # (The do-not-contact list's entries were checked before drafting.)
         return list(gate.reasons) + autopilot_review("", response, self.config,
                                                      recipient=prospect.email)
 

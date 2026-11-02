@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 25).
+"""The overlay's tables (harvey.db schema 26).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -9,13 +9,23 @@ Kept values (counts, current readings, last-search times) are maintained by
 triggers.py on row-at-a-time writes and by recount.py after bulk writes.
 Anything that depends on the clock is never kept: a timestamp plus an index,
 counted by index range when read.
+
+Versions. The upgrade (harvey/upgrade.py, overlay/migrate.py) writes schema
+25 exactly as it was released: PARTS below is that schema and is never
+edited. Every later change is a step in STEPS, run in place when a file is
+opened (state._open_or_create), so a file the upgrade wrote, or one an
+earlier release made, takes the steps it lacks in one transaction.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-VERSION = 25
+# The schema the upgrade writes and verifies (frozen: PARTS), and the one
+# this release reads, reached from it by STEPS.
+UPGRADE_TARGET = 25
+LATEST = 26
+VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
 # a later site read can tell it from its own "not stated".
@@ -39,6 +49,11 @@ ERROR = OUTCOME["error"]
 EMAIL, PHONE = 1, 2
 MOBILE = LINE_TYPE["mobile"]
 CORE_KINDS = ((EMAIL, "email", "Email", "email"), (PHONE, "phone", "Phone", "phone"))
+
+# Do-not-contact entries (suppression.scope, .reason).
+SUPPRESSION_SCOPE = {"address": 1, "domain": 2, "firm": 3}
+SUPPRESSION_REASON = {"unsubscribe": 1, "opt_out": 2, "objection": 3, "by_hand": 4,
+                      "bounce": 5, "complaint": 6, "migrated": 7}
 
 # The kinds of key Harvey found for a firm (firm_key.kind). A name in its
 # town ("name@town", resolver.name_key) is kept only for a firm no register
@@ -522,14 +537,107 @@ GUARD_NAMES = ("guard_ident_numeric", "guard_ident_numeric_upd", "guard_ident_le
 
 PARTS = (DICTIONARIES, FIRMS, CONTACTS, SEARCHES, SIGNALS, OUTREACH, LOCAL_FTS_SYNC, GUARDS)
 
+# ── Schema 26: the do-not-contact list, the cold-email acknowledgement ──
 
-def create(con: sqlite3.Connection, *, triggers: bool = True) -> None:
+SCHEMA_26 = """
+-- One do-not-contact list. An entry is keyed on what it names, never on a
+-- contact or firm row: an address (normalised), a domain (its subdomains
+-- too), or a firm ("<legal scheme>:<key>" when it holds one, else
+-- "firm:<record id>", matched through firm.live). Undoing one is soft.
+CREATE TABLE suppression (
+  id INTEGER PRIMARY KEY,
+  scope INTEGER NOT NULL, value TEXT NOT NULL, reason INTEGER NOT NULL,
+  campaign TEXT NOT NULL DEFAULT '', ref TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL, by TEXT NOT NULL DEFAULT '',
+  undone_at INTEGER, undone_by TEXT NOT NULL DEFAULT '', undo_note TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX suppression_live ON suppression(scope, value) WHERE undone_at IS NULL;
+CREATE INDEX suppression_value ON suppression(value);
+-- The operator's acknowledgement before cold email goes out: one row per
+-- version of the text, with the text's hash.
+CREATE TABLE acknowledgement (
+  kind TEXT NOT NULL, version INTEGER NOT NULL, text_sha TEXT NOT NULL,
+  at INTEGER NOT NULL, by TEXT NOT NULL,
+  PRIMARY KEY (kind, version)
+) WITHOUT ROWID;
+-- The token a cold email's unsubscribe header carries, and the source
+-- note a first email to a personal address was staged with.
+ALTER TABLE outbox ADD COLUMN unsub_token TEXT DEFAULT '';
+ALTER TABLE outbox ADD COLUMN source_note TEXT DEFAULT '';
+CREATE INDEX idx_outbox_unsub ON outbox(unsub_token) WHERE unsub_token != '';
+CREATE INDEX idx_outbox_message_id ON outbox(message_id) WHERE message_id != '';
+"""
+
+# contact.do_not_contact mirrors the live address entries; nothing else
+# may clear it while one stands. Rules, not kept values: never dropped,
+# bulk writes included (a contact a registry pull finds again comes back
+# flagged).
+SUPPRESSION_GUARDS = f"""
+CREATE TRIGGER follow_suppression_ins AFTER INSERT ON suppression
+WHEN NEW.scope = 1 AND NEW.undone_at IS NULL BEGIN
+  UPDATE contact SET do_not_contact = 1
+  WHERE kind = {EMAIL} AND value = NEW.value AND do_not_contact = 0;
+END;
+CREATE TRIGGER follow_suppression_undo AFTER UPDATE OF undone_at ON suppression
+WHEN NEW.scope = 1 AND OLD.undone_at IS NULL AND NEW.undone_at IS NOT NULL BEGIN
+  UPDATE contact SET do_not_contact = 0
+  WHERE kind = {EMAIL} AND value = NEW.value AND do_not_contact != 0
+    AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 1 AND s.value = NEW.value
+                    AND s.undone_at IS NULL);
+END;
+CREATE TRIGGER follow_suppression_contact AFTER INSERT ON contact
+WHEN NEW.kind = {EMAIL} AND NEW.do_not_contact = 0
+     AND EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 1 AND s.value = NEW.value
+                 AND s.undone_at IS NULL) BEGIN
+  UPDATE contact SET do_not_contact = 1 WHERE id = NEW.id;
+END;
+CREATE TRIGGER guard_suppressed_contact BEFORE UPDATE OF do_not_contact ON contact
+WHEN NEW.do_not_contact = 0 AND OLD.do_not_contact != 0 AND NEW.kind = {EMAIL}
+     AND EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 1 AND s.value = NEW.value
+                 AND s.undone_at IS NULL) BEGIN
+  SELECT RAISE(ABORT, 'this address is on the do-not-contact list: undo its entry instead');
+END;
+"""
+SUPPRESSION_GUARD_NAMES = ("follow_suppression_ins", "follow_suppression_undo",
+                           "follow_suppression_contact", "guard_suppressed_contact")
+
+
+def _to_26(con: sqlite3.Connection) -> None:
+    """Schema 26: the suppression list (what was do-not-contact before,
+    a flagged email contact or an opted-out prospect, carried over), its
+    triggers, the acknowledgement, the outbox's token and source note."""
+    _script(con, SCHEMA_26)
+    _script(con, SUPPRESSION_GUARDS)
+    migrated, address = SUPPRESSION_REASON["migrated"], SUPPRESSION_SCOPE["address"]
+    con.execute(f"""
+        INSERT INTO suppression (scope, value, reason, at, by)
+        SELECT {address}, value, {migrated}, CAST(strftime('%s', 'now') AS INTEGER), 'migration'
+        FROM contact WHERE kind = {EMAIL} AND do_not_contact != 0 AND value LIKE '%_@_%'
+        ON CONFLICT DO NOTHING""")
+    con.execute(f"""
+        INSERT INTO suppression (scope, value, reason, at, by)
+        SELECT {address}, lower(trim(email)), {migrated},
+               CAST(strftime('%s', 'now') AS INTEGER), 'migration'
+        FROM prospects WHERE status = 'opted_out' AND email LIKE '%_@_%'
+        ON CONFLICT DO NOTHING""")
+
+
+# (target version, step), in order. Append only: a released step is never
+# edited, and PARTS stays schema 25.
+STEPS = ((26, _to_26),)
+
+
+def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:
     """Create the schema in an empty database: tables, indexes, the core
     contact kinds and roles, zeroed tallies, and the kept-value triggers
     (``triggers=False`` leaves them out, for a bulk load that recounts
-    and installs them at the end)."""
+    and installs them at the end). ``version``: LATEST by default; the
+    upgrade asks for UPGRADE_TARGET (schema 25 as released)."""
+    version = LATEST if version is None else version
+    if not UPGRADE_TARGET <= version <= LATEST:
+        raise ValueError(f"schema {version} isn't one this release creates")
     if con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0]:
-        raise ValueError("schema 25 is created in an empty database only")
+        raise ValueError(f"schema {version} is created in an empty database only")
     with con:
         for part in PARTS:
             _script(con, part)
@@ -537,11 +645,37 @@ def create(con: sqlite3.Connection, *, triggers: bool = True) -> None:
                         CORE_KINDS)
         con.executemany("INSERT INTO tally (name, n) VALUES (?, 0)", [(t,) for t in TALLIES])
         con.execute("INSERT INTO revision (name, n) VALUES ('identity', 0)")
-        con.execute(f"PRAGMA user_version = {VERSION}")
+        for target, step in STEPS:
+            if target <= version:
+                step(con)
+        con.execute(f"PRAGMA user_version = {version}")
     if triggers:
         from harvey.overlay import triggers as kept
 
         kept.install(con)
+
+
+def step_up(con: sqlite3.Connection) -> int:
+    """Take a file of schema UPGRADE_TARGET or later to LATEST in place
+    (an autocommit connection): every step it lacks, in one write
+    transaction, its version read again inside it (another process may
+    have just done it). Returns the version it is at; any other version
+    (older: the upgrade's; newer: a newer Harvey's) is left as it is."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        found = version(con)
+        if UPGRADE_TARGET <= found < LATEST:
+            for target, step in STEPS:
+                if found < target:
+                    step(con)
+                    found = target
+            con.execute(f"PRAGMA user_version = {found}")
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    return found
 
 
 _SHAPE: dict[str, set[str]] | None = None
@@ -549,8 +683,8 @@ _SHAPE: dict[str, set[str]] | None = None
 
 def missing(con: sqlite3.Connection) -> list[str]:
     """What this release's schema has that the open database lacks
-    (tables, ``table.column``): a file made by an earlier build of schema
-    25, which no version number tells apart."""
+    (tables, ``table.column``): a file made by an earlier build of the
+    same schema version, which no version number tells apart."""
     global _SHAPE
     if _SHAPE is None:
         mem = sqlite3.connect(":memory:")
@@ -579,11 +713,22 @@ def _columns(con: sqlite3.Connection) -> dict[str, set[str]]:
     return {t: {r[1] for r in con.execute(f"PRAGMA main.table_info(\"{t}\")")} for t in tables}
 
 
+def guard_names(con: sqlite3.Connection) -> tuple[str, ...]:
+    """The guards this file should have: schema 26's with its tables."""
+    if con.execute("SELECT 1 FROM main.sqlite_master WHERE type = 'table' "
+                   "AND name = 'suppression'").fetchone():
+        return GUARD_NAMES + SUPPRESSION_GUARD_NAMES
+    return GUARD_NAMES
+
+
 def install_guards(con: sqlite3.Connection) -> None:
     """Create the guards and the full-text sync triggers that are missing."""
     have = {r[0] for r in con.execute("SELECT name FROM main.sqlite_master WHERE type = 'trigger'")}
+    script = LOCAL_FTS_SYNC + GUARDS
+    if len(guard_names(con)) > len(GUARD_NAMES):
+        script += SUPPRESSION_GUARDS
     buf = ""
-    for line in (LOCAL_FTS_SYNC + GUARDS).splitlines(keepends=True):
+    for line in script.splitlines(keepends=True):
         buf += line
         if sqlite3.complete_statement(buf):
             name = buf.split("CREATE TRIGGER", 1)[-1].split()[0] if "CREATE TRIGGER" in buf else ""

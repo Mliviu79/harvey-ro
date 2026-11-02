@@ -20,6 +20,7 @@ import json
 import logging
 import time
 import webbrowser
+from dataclasses import replace
 from email.message import EmailMessage, Message
 from email.utils import parseaddr
 
@@ -27,10 +28,13 @@ import httpx
 
 from harvey.paths import PROJECT_ROOT
 from harvey.integrations.mail_provider import (
+    UNSUBSCRIBE_WORD,
     InboundMessage,
     MailProvider,
     SendResult,
     looks_like_bounce,
+    partial_reach,
+    read_window_start,
 )
 
 logger = logging.getLogger("harvey.gmail")
@@ -41,6 +45,10 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 LOOPBACK_PORT = 8765
+# Pages a read lists (500 ids each), newest first. A full read with more is
+# complete only from the oldest message read (covered_from), and the Handler
+# holds cold email until the gap is read or accepted; a history list with
+# more falls back to the full read.
 MAX_INBOX_PAGES = 40
 # A full 7-day read runs at least this often, whatever the history says.
 FULL_READ_EVERY_SECONDS = 24 * 3600
@@ -89,6 +97,7 @@ def _save_token(data: dict):
 
 class GmailProvider(MailProvider):
     name = "gmail"
+    supports_headers = True
 
     def __init__(self, config, env):
         self.config = config
@@ -109,9 +118,20 @@ class GmailProvider(MailProvider):
         self._last_full_read = 0.0
         self._verify_week = False      # list the week once more after a full read
         self._pending: tuple | None = None
+        self._me = ""                # the signed-in address, once Gmail said it
+        self._cut_short = False      # the last full read had more than MAX_INBOX_PAGES
 
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and _load_token())
+
+    def from_address(self) -> str:
+        """persona.email, else the signed-in address once Gmail said it."""
+        return super().from_address() or self._me
+
+    async def sender_address(self) -> str:
+        if not super().from_address() and not self._me:
+            await self._current_history_id()      # its profile names the address
+        return self.from_address()
 
     async def _token(self) -> str | None:
         """Valid access token, refreshing via the stored refresh token."""
@@ -213,6 +233,7 @@ class GmailProvider(MailProvider):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        headers: dict | None = None,
     ) -> SendResult:
         msg = EmailMessage()
         persona = self.config.persona
@@ -222,6 +243,8 @@ class GmailProvider(MailProvider):
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to
+        for name, value in (headers or {}).items():
+            msg[name] = value
         msg.set_content(body)
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -264,12 +287,14 @@ class GmailProvider(MailProvider):
         """Every reply since the last confirmed read, or raise, so sends wait.
 
         The first read, and one a day after that, is the complete 7-day
-        inbox (_read_week). In between, Gmail's history list says only what
-        was added since the marker, so a big mailbox costs what a small one
-        does. The marker moves on only when the handler confirms every reply
-        was handled (confirm_read), so a reply that couldn't be handled
-        comes back. A marker Gmail no longer has (404, usually after about a
-        week) means the 7-day read again.
+        inbox (_read_week), or back to the last complete read (read_since)
+        when Harvey was off longer. In between, Gmail's history list says
+        only what was added since the marker, so a big mailbox costs what a
+        small one does. The marker moves on only when the handler confirms
+        every reply was handled (confirm_read), so a reply that couldn't be
+        handled comes back. A marker Gmail no longer has (404, usually after
+        about a week) means the full read again. Each read also lists the
+        spam folder for unsubscribe messages (folder "spam").
         """
         if not await self._token():
             raise GmailError(self._token_problem
@@ -288,17 +313,22 @@ class GmailProvider(MailProvider):
                     # be in neither read. A cycle later the index has caught
                     # up, so the first history read lists the week once more.
                     have = {m.provider_id for m in messages}
-                    messages = messages + [m for m in await self._read_week(limit, prune=False)
+                    messages = messages + [m for m in await self._read_week(
+                        limit, prune=False, start=self._extended_start())
                                            if m.provider_id not in have]
                     verified = True
                 self._pending = (marker, False, verified)
+                self.covered_from = None
                 return messages
             logger.info("Gmail: the history marker has expired; reading the last week in full.")
         # The marker comes first: anything arriving during the read is in
         # the next history list (and deduplicated if it's in both).
         marker = await self._current_history_id()
-        messages = await self._read_week(limit)
+        self._cut_short = False
+        messages = await self._read_week(limit, start=self._extended_start())
         self._pending = (marker, True, False)
+        self.covered_from = (partial_reach(messages) if self._cut_short
+                             else read_window_start(self.read_since))
         return messages
 
     def confirm_read(self):
@@ -323,6 +353,8 @@ class GmailProvider(MailProvider):
         except Exception as e:
             logger.warning(f"Gmail: couldn't read the history marker: {e}")
             return None
+        if isinstance(profile, dict) and isinstance(profile.get("emailAddress"), str):
+            self._me = profile["emailAddress"].strip().lower()
         marker = profile.get("historyId") if isinstance(profile, dict) else None
         return str(marker) if isinstance(marker, (str, int)) and str(marker) else None
 
@@ -382,8 +414,9 @@ class GmailProvider(MailProvider):
             seen_tokens.add(token)
             params["pageToken"] = token
         else:
-            raise GmailError(f"history has more than {MAX_INBOX_PAGES} pages; "
-                             "refusing a partial read")
+            logger.info(f"Gmail: more than {MAX_INBOX_PAGES} pages of changes; reading the "
+                        "inbox in full instead.")
+            return None
         out, done = [], set()
         for msg_id, moved_in in wanted:
             if msg_id in done:
@@ -406,13 +439,35 @@ class GmailProvider(MailProvider):
                 out.append(msg)
         return out, str(marker)
 
-    async def _read_week(self, limit: int, prune: bool = True) -> list[InboundMessage]:
-        """The complete 7-day inbox, or raise. ``limit`` is a page size,
-        not a cap: a reply beyond the first page must still stop its
-        follow-ups. Bounded like the Graph provider (MAX_INBOX_PAGES of
-        Gmail's largest pages, which are ids only), never partial."""
-        params = {"q": "in:inbox -from:me newer_than:7d",
-                  "maxResults": max(1, min(500, int(limit)))}
+    def _extended_start(self) -> float | None:
+        """Where a full read starts when Harvey was off longer than the
+        usual week (back to just before the last complete read), else None
+        (the usual 7 days)."""
+        start = read_window_start(self.read_since)
+        return start if start < read_window_start(None) - 60 else None
+
+    async def get_spam_unsubscribes(self, limit: int = 500) -> list[InboundMessage]:
+        """Unsubscribe messages that landed in spam (a short message whose
+        subject is "dezabonare XXXX" is a likely candidate), or raise."""
+        found = await self._read_week(limit, prune=False, start=self._extended_start(),
+                                      query=f"in:spam subject:{UNSUBSCRIBE_WORD}", spam=True)
+        # Copies: the cached message itself stays as read (moved to the
+        # inbox later, it is a reply there).
+        return [replace(msg, folder="spam") for msg in found]
+
+    async def _read_week(self, limit: int, prune: bool = True, start: float | None = None,
+                         query: str = "in:inbox -from:me", spam: bool = False
+                         ) -> list[InboundMessage]:
+        """The complete inbox since ``start`` (the last 7 days by default),
+        or raise. ``limit`` is a page size, not a cap: a reply beyond the
+        first page must still stop its follow-ups. Bounded like the Graph
+        provider (MAX_INBOX_PAGES of Gmail's largest pages, which are ids
+        only): past that, the newest pages, and the inbox read is marked
+        cut short (covered_from is then the oldest message read)."""
+        when = f"after:{int(start)}" if start is not None else "newer_than:7d"
+        params = {"q": f"{query} {when}", "maxResults": max(1, min(500, int(limit)))}
+        if spam:
+            params["includeSpamTrash"] = "true"
         out = []
         seen_ids = set()
         seen_tokens = set()
@@ -448,9 +503,11 @@ class GmailProvider(MailProvider):
                 raise GmailError(f"inbox page {page}: invalid or repeated nextPageToken")
             seen_tokens.add(token)
             params["pageToken"] = token
-        raise GmailError(
-            f"inbox has more than {MAX_INBOX_PAGES} pages; refusing a partial read"
-        )
+        logger.warning(f"Gmail: more than {MAX_INBOX_PAGES} pages for '{query}'; read the "
+                       "newest of them.")
+        if not spam:
+            self._cut_short = True
+        return out
 
     @staticmethod
     def _parse_message(data: dict) -> InboundMessage | None:

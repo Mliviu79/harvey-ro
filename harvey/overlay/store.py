@@ -733,14 +733,6 @@ class Store:
             self.x("UPDATE contact SET do_not_contact = 1 WHERE id = ?", (contact,))
         return contact
 
-    def set_do_not_contact(self, kind: str, value: str, flag: bool) -> int:
-        """Mark (or clear) a contact as do-not-contact: an opt-out and its undo."""
-        kind_id = self._kind(kind)
-        if kind_id is None or not value:
-            return 0
-        return self.x("UPDATE contact SET do_not_contact = ? WHERE kind = ? AND value = ?",
-                      (1 if flag else 0, kind_id, value.strip().lower())).rowcount
-
     def add_contact_list(self, items) -> int:
         """Contacts of many firms: (company_id, contacts.Found, origin) each."""
         return sum(self.add_contacts(cid, [found], origin) for cid, found, origin in items)

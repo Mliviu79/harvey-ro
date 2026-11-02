@@ -271,7 +271,7 @@ def test_the_upgrade_keeps_what_harvey_added_and_leaves_the_register_copies(v24,
     q = lambda sql, *a: con.execute(sql, a).fetchall()  # noqa: E731
     one = lambda sql, *a: con.execute(sql, a).fetchone()[0]  # noqa: E731
 
-    assert schema.version(con) == schema.VERSION
+    assert schema.version(con) == schema.UPGRADE_TARGET  # the upgrade writes 25 as released
     assert {k: v for k, v in recount.diff(con).items() if v} == {}
     assert triggers.missing(con) == []
     # Firms: new ids in creation order; merges flattened.

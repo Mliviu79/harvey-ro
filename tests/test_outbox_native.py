@@ -141,7 +141,8 @@ async def seed_campaign(state, prospect_ids):
 def test_gate_blocks_bad_content():
     p = Prospect(first_name="J", last_name="D", title="VP",
                  email="jane@acme.example", email_status="verified")
-    ok = pre_send_check("jane@acme.example", "hello", "Short and fine. Question?", p)
+    ok = pre_send_check("jane@acme.example", "hello", "Short and fine. Question?", p,
+                        acknowledged=True, personal=False)
     assert ok.ok
 
     bad = pre_send_check("jane@acme.example", "hello", "Hi {{first_name}}, act now!", p)

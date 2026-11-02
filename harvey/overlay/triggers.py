@@ -437,11 +437,11 @@ def names(con: sqlite3.Connection) -> set[str]:
 def missing(con: sqlite3.Connection) -> list[str]:
     """The kept-value triggers and guards the schema should have and hasn't
     (a bulk write cut short outside its transaction would leave them out)."""
-    from harvey.overlay.schema import GUARD_NAMES
+    from harvey.overlay.schema import guard_names
 
     have = {r[0] for r in con.execute(
         "SELECT name FROM main.sqlite_master WHERE type = 'trigger'")}
-    want = [PREFIX + n for n in TRIGGERS] + list(GUARD_NAMES)
+    want = [PREFIX + n for n in TRIGGERS] + list(guard_names(con))
     return [n for n in want if n not in have]
 
 

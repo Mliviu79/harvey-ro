@@ -34,7 +34,7 @@ def _prospect(email):
 def _check(to_email, entries, kind="sequence"):
     return pre_send_check(
         to_email, "hello there", BODY, prospect=_prospect(to_email),
-        kind=kind, do_not_contact=entries,
+        kind=kind, do_not_contact=entries, acknowledged=True, personal=False,
     )
 
 
@@ -175,7 +175,7 @@ async def test_listed_leads_are_left_out_of_the_instantly_upload(state):
     sender = Sender(brain=None, state=state, config=cfg, env=Env())
     kept = Prospect(first_name="Al", last_name="B", company="Co", email="al@other.example")
     listed = Prospect(first_name="Jo", last_name="C", company="Acme", email="jo@acme.example")
-    assert sender._reviewed_leads([kept, listed]) == [kept]
+    assert await sender._reviewed_leads([kept, listed]) == [kept]
 
 
 @pytest.mark.asyncio

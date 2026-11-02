@@ -14,6 +14,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from harvey import email_rules
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
@@ -85,6 +86,12 @@ class Writer:
         prospects_with_email = [
             p for p in prospects_with_email
             if not await self.state.colleague_who_replied(p.id)
+        ]
+        # On the do-not-contact list: never spend a model call on them.
+        prospects_with_email = [
+            p for p in prospects_with_email
+            if not await self.state.suppression_check(p.email, firm=p.company_id,
+                                                      config=self.config)
         ]
         if not prospects_with_email:
             logger.info(
@@ -222,13 +229,17 @@ class Writer:
 
         drafted = 0
         for (prospect, _), draft in zip(pending, polished):
+            # A personal address's first email says where the address was
+            # found: a fixed line (email_rules), never the model's words.
+            _, note = await self.state.personal_address(prospect.email)
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
                 step=1,
                 to_email=prospect.email,
                 subject=draft["subject"],
-                body=draft["body"],
+                body=email_rules.with_note(draft["body"], note),
+                source_note=note,
                 send_at=now,
                 status=status,
                 provider=provider,

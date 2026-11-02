@@ -176,11 +176,25 @@ def pre_send_check(
     kind: str = "sequence",
     postal_address: str = "",
     do_not_contact=(),
+    suppressed: str = "",
+    acknowledged: bool = False,
+    step: int = 1,
+    personal: bool | None = None,
+    source_note: str = "",
 ) -> GateResult:
     """Run every deterministic check. Returns ok=False with reasons on any hit.
 
     postal_address: when set, a cold (sequence) email must carry it (CAN-SPAM).
     do_not_contact: addresses and domains that must never be emailed at all.
+    suppressed: why the do-not-contact list bars the recipient
+        (suppression.check), "" when it doesn't.
+    acknowledged: whether the operator gave the cold-email acknowledgement
+        (harvey/acknowledgement.py); cold email never goes without it, so a
+        caller that doesn't say is refused.
+    personal / source_note: a first cold email (``step`` 1) to a personal
+        address (email_rules) must carry the source note it was staged with.
+        A first cold email whose caller didn't say whether the address is
+        personal (None) is refused.
     """
     reasons: list[str] = []
     subject = (subject or "").strip()
@@ -196,6 +210,15 @@ def pre_send_check(
     blocked = do_not_contact_match(to_email, do_not_contact)
     if blocked:
         reasons.append(f"'{blocked}' is on the do-not-contact list")
+    if suppressed:
+        reasons.append(suppressed)
+    if kind == "sequence" and not acknowledged:
+        reasons.append("the cold-email acknowledgement isn't given yet (harvey ack)")
+    if kind == "sequence" and int(step or 1) <= 1:
+        if personal is None:
+            reasons.append("whether the address is personal wasn't checked")
+        elif personal and (not source_note.strip() or source_note.strip() not in body):
+            reasons.append("a first email to a personal address needs its source note")
     if prospect is not None:
         if (prospect.email or "").strip().lower() != to_email:
             reasons.append("recipient does not match the prospect record")

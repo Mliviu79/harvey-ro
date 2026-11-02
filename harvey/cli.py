@@ -2299,8 +2299,13 @@ def _print_upgrade_status(s: dict) -> None:
               "waits until then).")
     elif s.get("needed"):
         print(f"\n  harvey.db is schema {s['schema']}: it needs the upgrade to the slim database.")
-    elif s["schema"] == 25:
-        print("\n  harvey.db is upgraded (schema 25).")
+    elif s.get("newer"):
+        from harvey.overlay import schema as overlay_schema
+        from harvey.state import newer_build_message
+
+        print(f"\n  {newer_build_message(s['schema'], overlay_schema.LATEST)}.")
+    elif s["schema"] >= 25:
+        print(f"\n  harvey.db is upgraded (schema {s['schema']}).")
     if est:
         print(f"  Reads: harvey.db {_gb(sizes.get('harvey'))}, anaf.db {_gb(sizes.get('anaf'))}; "
               f"about {max(1, est['seconds'] // 60)} minutes.")
@@ -2730,9 +2735,122 @@ def cmd_sending(args):
             await state.set_setting("sending_paused", "")
             await state.set_setting("bounce_count", "0")
             print("\n  Sending resumed (bounce counter reset).\n")
+        elif args.sending_action == "accept-gap":
+            # Cold email waits for a mailbox read back to the last complete
+            # one; a mailbox too big to read that far never gets there.
+            gap = await state.read_gap()
+            if gap is None:
+                print("\n  No read gap: cold email isn't waiting for one.\n")
+                return
+            print(f"\n  {gap.get('reason') or 'The mailbox was not read back to its last read.'}")
+            print("  Accepting it means an unsubscribe or reply sent in that time may stay "
+                  "unread.")
+            try:
+                typed = input("  Type accept to go on: ").strip()
+            except EOFError:
+                typed = ""
+            if typed.lower() != "accept":
+                print("\n  Not accepted. Cold email keeps waiting.\n")
+                sys.exit(1)
+            await state.accept_read_gap("cli")
+            print("\n  Accepted. Cold email goes again; the next read is the usual one.\n")
         else:
             paused = await state.get_setting("sending_paused")
-            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
+            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}")
+            gap = await state.read_gap()
+            if gap is not None:
+                print("  Cold email waits for a complete mailbox read "
+                      "(harvey sending accept-gap to go on without it).")
+            print()
+
+    asyncio.run(_run())
+
+
+def cmd_ack(args):
+    """The cold-email acknowledgement: show it, and record it once typed."""
+    from harvey import acknowledgement
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        status = await state.acknowledgement_status()
+        text = acknowledgement.TEXT_EN if args.english else acknowledgement.TEXT_RO
+        print("\n" + "\n".join("  " + line for line in text.splitlines()) + "\n")
+        if status["given"]:
+            print(f"  Already confirmed (version {status['version']}, by {status['by']}).\n")
+            return
+        if args.status:
+            print("  Not confirmed yet: cold email waits until it is (harvey ack).\n")
+            return
+        try:
+            typed = input(f"  Type {acknowledgement.CONFIRM_WORD} to confirm: ").strip()
+        except EOFError:
+            typed = ""
+        if typed.lower() != acknowledgement.CONFIRM_WORD:
+            print("\n  Not confirmed. Nothing was changed.\n")
+            sys.exit(1)
+        await state.acknowledge("cli")
+        print("\n  Confirmed. Cold email can go out (approval, caps and quiet hours as "
+              "before).\n")
+
+    asyncio.run(_run())
+
+
+def cmd_suppress(args):
+    """The do-not-contact list: list it (or as CSV), add an address, a
+    domain or a firm, or undo an entry."""
+    import csv
+    from harvey import suppression
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        action = args.suppress_action
+        if action == "add":
+            scope = "firm" if args.firm else ("address" if "@" in args.value else "domain")
+            try:
+                made = await state.suppress(scope, args.value, "by_hand", by="cli",
+                                            note=args.note or "")
+            except suppression.Refused as e:
+                print(f"\n  {e}\n")
+                sys.exit(1)
+            print("\n  " + (f"Added ({scope}): never emailed again." if made else
+                             "Already on the list.") + "\n")
+        elif action == "undo":
+            entries = {e["id"]: e for e in await state.suppression_entries()}
+            entry = entries.get(args.id)
+            if entry is None:
+                print("\n  No entry in force with that id.\n")
+                sys.exit(1)
+            if entry["reason"] in {suppression.REASON_NAMES[r] for r in suppression.PERSON_ASKED}:
+                if not args.note:
+                    print("\n  They asked not to be contacted: say why you undo it (--note).\n")
+                    sys.exit(1)
+                try:
+                    typed = input("  Type confirm to undo it: ").strip()
+                except EOFError:
+                    typed = ""
+                if typed.lower() != "confirm":
+                    print("\n  Not undone.\n")
+                    sys.exit(1)
+            await state.undo_suppression(args.id, by="cli", note=args.note or "")
+            print("\n  Undone (kept in the list's history).\n")
+        else:
+            rows = await state.suppression_entries(live_only=not args.all)
+            if args.csv:
+                cols = ["id", "scope", "value", "reason", "at", "by", "undone_at", "undone_by"]
+                out = csv.DictWriter(sys.stdout, fieldnames=cols, extrasaction="ignore")
+                out.writeheader()
+                out.writerows(rows)
+                return
+            print(f"\n  {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}"
+                  + ("" if args.all else " in force") + ".")
+            for r in rows[:200]:
+                gone = "  (undone)" if r["undone_at"] else ""
+                print(f"    {r['id']:>5}  {r['scope']:<7} {r['value']:<40} {r['reason']}{gone}")
+            print()
 
     asyncio.run(_run())
 
@@ -2813,7 +2931,7 @@ def main():
     )
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
     sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
-    sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
+    sub.add_argument("--all", action="store_true", help="Export the raw list without filters (not for outreach); the do-not-contact list is left out even then")
     sub.add_argument("--companies", action="store_true",
                      help="One row per company (phone, location, best contact if any), "
                           "including companies with no email found; other filters don't apply")
@@ -3198,9 +3316,32 @@ def main():
         "worker", help="Run queued jobs without the dashboard (one worker per database)")
     sub.set_defaults(func=cmd_worker)
 
-    sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
+    sub = subparsers.add_parser(
+        "ack", help="Read and confirm the cold-email acknowledgement (cold email waits for it)")
+    sub.add_argument("--status", action="store_true", help="Show it and whether it's confirmed")
+    sub.add_argument("--english", action="store_true", help="Show the English text")
+    sub.set_defaults(func=cmd_ack)
+
+    sub = subparsers.add_parser(
+        "suppress", help="The do-not-contact list: list, add an address/domain/firm, undo")
+    ssub = sub.add_subparsers(dest="suppress_action")
+    r = ssub.add_parser("list", help="The entries in force")
+    r.add_argument("--all", action="store_true", help="Undone entries too")
+    r.add_argument("--csv", action="store_true", help="As CSV, to keep beside an export")
+    r = ssub.add_parser("add", help="Never email an address, a domain, or a firm (--firm ID)")
+    r.add_argument("value", help="An address, a domain, or with --firm a company id")
+    r.add_argument("--firm", action="store_true", help="VALUE is a company id: the whole firm")
+    r.add_argument("--note", default="", help="Why (kept with the entry)")
+    r = ssub.add_parser("undo", help="Undo an entry (soft: its history stays)")
+    r.add_argument("id", type=int)
+    r.add_argument("--note", default="", help="Why (required when they asked to stop)")
+    sub.set_defaults(func=cmd_suppress, suppress_action="list", all=False, csv=False)
+
+    sub = subparsers.add_parser(
+        "sending", help="Kill switch: pause/resume sending; accept-gap: let cold email go "
+                        "after a mailbox read that couldn't reach back to the last one")
     sub.add_argument("sending_action", nargs="?", default="status",
-                     choices=["pause", "resume", "status"])
+                     choices=["pause", "resume", "status", "accept-gap"])
     sub.set_defaults(func=cmd_sending)
 
     sub = subparsers.add_parser(

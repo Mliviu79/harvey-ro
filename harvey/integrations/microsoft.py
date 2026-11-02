@@ -17,8 +17,17 @@ Setup (one-time):
    https://myaccount.microsoft.com → Apps.
 
 Harvey never marks your mail read or moves it: it reads the last 7 days of
-the inbox and remembers what it has handled. Mail is sent as the signed-in
-mailbox, under its own display name.
+the inbox (further back, to the last complete read, when Harvey was off
+longer) and remembers what it has handled; the junk folder is read for
+unsubscribe messages only. Mail is sent as the signed-in mailbox, under its
+own display name.
+
+A cold email carries a List-Unsubscribe header. Graph's JSON send accepts
+only custom ``x-`` headers (internetMessageHeaders), so an email with
+headers is created from its MIME text instead (POST /me/messages with a
+base64 MIME body), then sent. UNVERIFIED: that Exchange keeps
+List-Unsubscribe exactly as written on such a message has not been checked
+against a live mailbox (no real email is sent from Harvey's tests).
 """
 
 import asyncio
@@ -31,16 +40,21 @@ import secrets
 import socket
 import time
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import datetime, timezone
+from email.message import EmailMessage
 
 import httpx
 
 from harvey.paths import PROJECT_ROOT
 from harvey.integrations.mail_provider import (
+    UNSUBSCRIBE_WORD,
     InboundMessage,
     MailProvider,
     SendResult,
     looks_like_bounce,
+    partial_reach,
+    read_window_start,
 )
 
 logger = logging.getLogger("harvey.microsoft")
@@ -50,8 +64,12 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 GRAPH_HOST = "graph.microsoft.com"
 INBOX_MESSAGES = "/me/mailFolders/inbox/messages"
 INBOX_MESSAGES_PATH = "/v1.0" + INBOX_MESSAGES
-# Inbox pages read per cycle (limit messages each). More than this and the
-# read fails, and sending is held, rather than acting on a partial inbox.
+JUNK_MESSAGES = "/me/mailFolders/junkemail/messages"
+JUNK_MESSAGES_PATH = "/v1.0" + JUNK_MESSAGES
+# Inbox pages read per cycle (limit messages each), newest first. More than
+# this and the read is complete only from the oldest message read
+# (covered_from): the Handler holds cold email until the gap is read or
+# accepted.
 MAX_INBOX_PAGES = 40
 LOGIN = "https://login.microsoftonline.com"
 SCOPE = (
@@ -59,7 +77,6 @@ SCOPE = (
     "https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read"
 )
 LOOPBACK_PORT = 8766
-REPLY_WINDOW_DAYS = 7
 MAX_RETRY_AFTER_SECONDS = 10
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
@@ -100,6 +117,7 @@ def _token_url(tenant: str) -> str:
 
 class MicrosoftProvider(MailProvider):
     name = "microsoft"
+    supports_headers = True
 
     def __init__(self, config, env, transport=None):
         self.config = config
@@ -109,6 +127,7 @@ class MicrosoftProvider(MailProvider):
         self._access_token = ""
         self._access_expires = 0.0
         self._me = ""
+        self._cut_short = False      # the last inbox read had more than MAX_INBOX_PAGES
 
     def is_configured(self) -> bool:
         return bool(self.client_id and _load_token())
@@ -194,6 +213,13 @@ class MicrosoftProvider(MailProvider):
             )
         return data
 
+    def from_address(self) -> str:
+        """persona.email, else the signed-in mailbox once Graph said it."""
+        return super().from_address() or self._me
+
+    async def sender_address(self) -> str:
+        return super().from_address() or await self._my_address()
+
     async def _my_address(self) -> str:
         if not self._me:
             me = await self._request("GET", "/me", params={"$select": "mail,userPrincipalName"})
@@ -220,10 +246,13 @@ class MicrosoftProvider(MailProvider):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        headers: dict | None = None,
     ) -> SendResult:
         """Draft, then send, so the RFC Message-ID is known (bounces and
         replies are matched on it). A reply is drafted with createReply on
-        the prospect's message, which sets In-Reply-To/References."""
+        the prospect's message, which sets In-Reply-To/References. A new
+        email with ``headers`` is drafted from its MIME text (the module
+        docstring says why, and what is unverified)."""
         content = {
             "subject": subject,
             "body": {"contentType": "Text", "content": body},
@@ -244,6 +273,11 @@ class MicrosoftProvider(MailProvider):
                     if draft and draft.get("id"):
                         await self._delete_draft(draft["id"])
                     draft = None
+            if draft is None and headers:
+                draft = await self._request(
+                    "POST", "/me/messages",
+                    content=self._mime(to_email, subject, body, headers),
+                    headers={"Content-Type": "text/plain"})
             if draft is None:
                 draft = await self._request("POST", "/me/messages", json=content)
             await self._request("POST", f"/me/messages/{draft['id']}/send")
@@ -258,6 +292,21 @@ class MicrosoftProvider(MailProvider):
             thread_ref=draft.get("conversationId", ""),
         )
 
+    def _mime(self, to_email: str, subject: str, body: str, headers: dict) -> bytes:
+        """A plain-text email as Graph's MIME create takes it: base64 of
+        the whole message, From the persona's address."""
+        persona = getattr(self.config, "persona", None)
+        address = (getattr(persona, "email", "") or self._me or "").strip()
+        name = (getattr(persona, "name", "") or "").strip()
+        msg = EmailMessage()
+        msg["To"] = to_email
+        msg["From"] = f"{name} <{address}>" if name else address
+        msg["Subject"] = subject
+        for header, value in headers.items():
+            msg[header] = value
+        msg.set_content(body)
+        return base64.b64encode(msg.as_bytes())
+
     async def _delete_draft(self, draft_id: str):
         try:
             await self._request("DELETE", f"/me/messages/{draft_id}")
@@ -265,14 +314,38 @@ class MicrosoftProvider(MailProvider):
             logger.warning(f"Microsoft: couldn't delete unsent draft {draft_id}: {e}")
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
-        """The last week of the inbox, newest first, minus your own mail.
-        Every page is read (``limit`` is only the page size), following
-        Graph's @odata.nextLink as-is. Raises on any failure, including a
-        later page: the heartbeat then holds sends, because an unread reply
-        can't have stopped its follow-ups. Never returns a partial inbox."""
+        """The last week of the inbox (back to the last complete read when
+        Harvey was off longer), newest first, minus your own mail. Every
+        page is read (``limit`` is only the page size), following Graph's
+        @odata.nextLink as-is. Raises on any failure, including a later
+        page: the heartbeat then holds sends, because an unread reply can't
+        have stopped its follow-ups. More than MAX_INBOX_PAGES: the newest
+        pages, with covered_from at the oldest message read."""
         me = await self._check_identity()
-        since = (datetime.now(timezone.utc) - timedelta(days=REPLY_WINDOW_DAYS))
-        url = str(httpx.URL(f"{GRAPH}{INBOX_MESSAGES}", params={
+        start = read_window_start(self.read_since)
+        self._cut_short = False
+        out = await self._read_folder(INBOX_MESSAGES, INBOX_MESSAGES_PATH, start, limit, me)
+        self.covered_from = partial_reach(out) if self._cut_short else start
+        return out
+
+    async def get_spam_unsubscribes(self, limit: int = 50) -> list[InboundMessage]:
+        """Unsubscribe messages in the junk folder since the read's start
+        (folder "spam"), or raise."""
+        me = await self._check_identity()
+        try:
+            found = await self._read_folder(JUNK_MESSAGES, JUNK_MESSAGES_PATH,
+                                            read_window_start(self.read_since), limit, me)
+        except GraphError as e:
+            if str(e).startswith("Graph 404 "):
+                return []       # a mailbox with no junk folder has nothing there
+            raise
+        return [replace(m, folder="spam") for m in found
+                if UNSUBSCRIBE_WORD in (m.subject or "").lower()]
+
+    async def _read_folder(self, folder: str, folder_path: str, start: float, limit: int,
+                           me: str) -> list[InboundMessage]:
+        since = datetime.fromtimestamp(start, timezone.utc)
+        url = str(httpx.URL(f"{GRAPH}{folder}", params={
             "$filter": f"receivedDateTime ge {since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
             "$orderby": "receivedDateTime desc",
             "$top": str(max(1, int(limit))),
@@ -297,13 +370,14 @@ class MicrosoftProvider(MailProvider):
             next_link = data.get("@odata.nextLink")
             if next_link is None:
                 return out
-            url = _checked_next_link(next_link)
+            url = _checked_next_link(next_link, folder_path)
             if url in seen_urls:
                 raise GraphError(f"inbox page {page}: @odata.nextLink repeats an earlier page")
             seen_urls.add(url)
-        raise GraphError(
-            f"inbox has more than {MAX_INBOX_PAGES} pages; refusing a partial read"
-        )
+        logger.warning(f"Microsoft: {folder} has more than {MAX_INBOX_PAGES} pages since the "
+                       "last complete read; read the newest of them.")
+        self._cut_short = True
+        return out
 
     @staticmethod
     def _parse_message(item) -> InboundMessage | None:
@@ -372,10 +446,10 @@ class MicrosoftProvider(MailProvider):
         return True, f"Connected as {me}"
 
 
-def _checked_next_link(link) -> str:
+def _checked_next_link(link, folder_path: str = INBOX_MESSAGES_PATH) -> str:
     """Graph's @odata.nextLink, used whole (Microsoft: don't rebuild or
     edit $skip). It gets the bearer token, so it must point back at the
-    inbox listing on Graph itself: https, graph.microsoft.com, the same
+    folder listing on Graph itself: https, graph.microsoft.com, the same
     path, no credentials, no fragment. Anything else raises GraphError."""
     if not isinstance(link, str) or not link:
         raise GraphError("@odata.nextLink is not a URL")
@@ -392,7 +466,7 @@ def _checked_next_link(link) -> str:
         or url.port not in (None, 443)
         or url.userinfo
         or url.fragment
-        or path.lower() != INBOX_MESSAGES_PATH.lower()
+        or path.lower() != folder_path.lower()
         or not url.query
     ):
         raise GraphError("@odata.nextLink rejected: not the Graph inbox listing")

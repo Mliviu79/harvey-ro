@@ -143,7 +143,8 @@ COLLEAGUE_REPLIED = "a colleague replied"
 # Setting set (to their name) when someone's reply stops their company.
 # An out-of-office or a "wrong person" doesn't set it.
 COMPANY_STOP_KEY = "company_stop:"
-# Shared mailbox providers: two people on one aren't colleagues.
+# Shared mailbox providers: two people on one aren't colleagues, a firm is
+# never keyed on one, and an address on one is personal.
 FREE_MAIL_DOMAINS = frozenset({
     "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com",
     "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com",
@@ -162,6 +163,10 @@ FREE_MAIL_DOMAINS = frozenset({
     "naver.com", "seznam.cz", "wp.pl", "o2.pl", "tutanota.com", "tuta.io",
     "yahoo.ro", "yahoo.fr", "yahoo.it", "yahoo.de", "yahoo.es", "hotmail.fr",
     "hotmail.it", "hotmail.de", "hotmail.es", "outlook.fr", "outlook.de",
+    # Romanian webmail and home-ISP mailboxes (a person's, never a firm's
+    # domain): the resolver never joins two firms on them, and an address
+    # there is personal (email_rules).
+    "rdslink.ro", "clicknet.ro", "email.ro", "k.ro", "home.ro", "gmx.net",
 })
 
 
@@ -196,6 +201,25 @@ def _company_answered(p: str) -> str:
             f"WHERE s.key = '{COMPANY_STOP_KEY}' || c.id AND {_colleagues(p, 'c')})")
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
+# Outbox error on cold email that waits, approved, for the operator's
+# cold-email acknowledgement (harvey ack).
+ACK_NEEDED = "waiting for the cold-email acknowledgement: run harvey ack"
+# Outbox error on cold email that waits, approved, because the address it
+# goes out from (which its unsubscribe header names) isn't known.
+NO_SENDER_ADDRESS = ("waiting: the sending address isn't known, so the unsubscribe header "
+                     "can't be built; set persona.email")
+# Outbox error on a first email to a personal address that lacked its source
+# note: the note was added, and it waits for you to approve it as it is now.
+NOTE_ADDED = ("waiting for you: the address is personal, so the line saying where it was "
+              "found was added")
+# Outbox error on cold email that waits, approved, while the mailbox read
+# hasn't covered the time Harvey was off (READ_GAP_KEY).
+READ_GAP_HELD = "waiting: the mailbox hasn't been read back to the last complete read"
+# Settings: when each mailbox was last read completely (unix seconds), and,
+# while a read hasn't covered the gap since, why cold email waits (JSON:
+# since, reason).
+MAIL_READ_KEY = "mail_read_at:"
+READ_GAP_KEY = "mail_read_gap"
 # Outbox error on an approved cold email the compliance check couldn't answer
 # for: it was moved back and is tried again then (sender: _retry_later).
 RECHECK_PREFIX = "Precleared couldn't check this address; trying again after "
@@ -332,7 +356,8 @@ class Resolution:
 
 class UpgradeNeeded(RuntimeError):
     """The database is an older schema: harvey upgrade (or the dashboard's
-    upgrade screen) brings it to schema 25 first."""
+    upgrade screen) brings it to schema 25 first (the steps after it run
+    when it is opened)."""
 
     def __init__(self, version: int):
         self.version = version
@@ -344,20 +369,38 @@ class UpgradeNeeded(RuntimeError):
                              "harvey upgrade (or open the dashboard) to finish it")
 
 
+class NewerBuild(UpgradeNeeded):
+    """The database was made by a newer Harvey: this one never opens it."""
+
+    def __init__(self, version: int, latest: int):
+        RuntimeError.__init__(self, newer_build_message(version, latest))
+        self.version = version
+
+
+def newer_build_message(version: int, latest: int) -> str:
+    return (f"harvey.db was made by a newer Harvey (schema {version}; this one reads up to "
+            f"schema {latest}): update Harvey (git pull, then pip install -e .) to open it")
+
+
 def _open_or_create(path: str, overlay_schema) -> int:
-    """The file's schema version, creating schema 25 in a new empty file
-    (WAL, so readers never block the writer). Two processes starting on a
-    new file at once: one creates it, the other waits for it."""
+    """The file's schema version, creating the latest schema in a new empty
+    file (WAL, so readers never block the writer), and taking a file the
+    upgrade wrote (schema 25) or an earlier release made through the steps
+    it lacks, in place. Two processes starting on a new file at once: one
+    creates it, the other waits for it."""
     con = sqlite3.connect(path, isolation_level=None, timeout=BUSY_TIMEOUT_SECONDS)
     try:
         version = con.execute("PRAGMA user_version").fetchone()[0]
-        if version and version != overlay_schema.VERSION:
-            return version      # an older schema: never touched here
+        first = getattr(overlay_schema, "UPGRADE_TARGET", overlay_schema.VERSION)
+        if version and not first <= version <= overlay_schema.VERSION:
+            return version      # older (the upgrade's) or newer: never touched here
         try:
             con.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
             pass    # another process is setting the new file up right now
         con.execute("PRAGMA synchronous=NORMAL")
+        if version and version < overlay_schema.VERSION:
+            return overlay_schema.step_up(con)
         if version:
             return version
         try:
@@ -376,7 +419,7 @@ def _open_or_create(path: str, overlay_schema) -> int:
 
 
 class EarlierBuild(RuntimeError):
-    """A schema 25 file made by an earlier build of the slim database: it
+    """A file of this release's schema made by an earlier build of it: it
     lacks tables or columns this release reads."""
 
 
@@ -496,10 +539,12 @@ class StateManager:
             await asyncio.to_thread(con.close)
 
     async def init_db(self):
-        """Create the database (schema 25) when there is none, and bring in
+        """Create the database (the latest schema) when there is none, take
+        one of schema 25 or later through the steps it lacks, and bring in
         what modules declare. Safe to call on every startup. An older
         schema is never changed here: it waits for the upgrade
-        (harvey/upgrade.py), and this raises UpgradeNeeded."""
+        (harvey/upgrade.py), and this raises UpgradeNeeded (NewerBuild for
+        a file a newer Harvey made)."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         from harvey import upgrade
         from harvey.overlay import schema as overlay_schema
@@ -511,6 +556,8 @@ class StateManager:
             raise UpgradeNeeded(0)
         version = await asyncio.to_thread(_open_or_create, self.db_path, overlay_schema)
         self._schema = version
+        if version > overlay_schema.VERSION:
+            raise NewerBuild(version, overlay_schema.VERSION)
         if version != overlay_schema.VERSION:
             raise UpgradeNeeded(version)
         await asyncio.to_thread(_check_shape, self.db_path, overlay_schema)
@@ -869,11 +916,6 @@ class StateManager:
             role=prospect.title or "", source=prospect.source or "",
             evidence_url=prospect.source_url or "", opted_out=prospect.status == "opted_out")
 
-    async def _prospect_do_not_contact(self, prospect_id: str, flag: bool) -> None:
-        prospect = await self.get_prospect(prospect_id)
-        if prospect is not None and prospect.email:
-            await self._on_overlay("set_do_not_contact", "email", prospect.email, flag)
-
     async def get_prospect(self, prospect_id: str) -> Prospect | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -902,9 +944,17 @@ class StateManager:
             )
             await db.commit()
 
-    async def update_prospect_status(self, prospect_id: str, status: str):
+    async def update_prospect_status(self, prospect_id: str, status: str, *,
+                                     reason: str = "opt_out", by: str = "reply",
+                                     note: str = "", ref: str = ""):
         # An opt-out is permanent: nothing Harvey does later (a reply, a
         # send, a retry) may move someone off it and back into outreach.
+        if status == "opted_out":
+            # Their address goes on the do-not-contact list in the same
+            # write (suppression.py), so it is never written to again, from
+            # any list, whatever happens to this prospect card.
+            await self._in_tx(self._opt_out, prospect_id, reason, by, note, ref)
+            return
         async with self._connect() as db:
             await db.execute(
                 "UPDATE prospects SET status = ?, updated_at = ? "
@@ -912,9 +962,17 @@ class StateManager:
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
-        if status == "opted_out":
-            # Their address is never written to again, from any list.
-            await self._prospect_do_not_contact(prospect_id, True)
+
+    @staticmethod
+    def _opt_out(con, prospect_id: str, reason: str, by: str, note: str, ref: str) -> None:
+        from harvey import suppression
+
+        row = con.execute("SELECT email FROM prospects WHERE id = ?", (prospect_id,)).fetchone()
+        con.execute("UPDATE prospects SET status = 'opted_out', updated_at = ? "
+                    "WHERE id = ? AND status IS NOT 'opted_out'",
+                    (_utcnow().isoformat(), prospect_id))
+        if row and suppression.normalize_address(row[0]):
+            suppression.add(con, "address", row[0], reason, by=by, note=note, ref=ref)
 
     async def undo_opt_out(self, prospect_id: str, details: dict | None = None) -> bool:
         """A human's undo of an opt-out: the one way off 'opted_out'.
@@ -923,32 +981,142 @@ class StateManager:
         nothing new on its own (the sender never stages 'replied'), and what
         the opt-out cancelled stays cancelled. Harvey's first reply to them
         after this waits for approval even on autopilot (REVIEW_NEXT_REPLY_KEY).
-        The status, that flag and the opt_out_undone log entry are one write.
-        False, and nothing written, when they weren't opted out."""
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE prospects SET status = 'replied', updated_at = ? "
-                "WHERE id = ? AND status = 'opted_out'",
-                (_utcnow().isoformat(), prospect_id),
-            )
-            if cursor.rowcount != 1:
-                await db.rollback()
-                return False
-            await db.execute(
-                """INSERT INTO settings (key, value, updated_at)
-                   VALUES (?, '1', CURRENT_TIMESTAMP)
-                   ON CONFLICT(key) DO UPDATE SET
-                       value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
-                (REVIEW_NEXT_REPLY_KEY + prospect_id,),
-            )
-            await db.execute(
-                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
-                (_new_id(), "opt_out_undone", "dashboard",
-                 json.dumps({"prospect_id": prospect_id, **(details or {})})),
-            )
-            await db.commit()
-        await self._prospect_do_not_contact(prospect_id, False)
+        The status, that flag, the opt_out_undone log entry and the soft
+        undo of their address's do-not-contact entries are one write. Only
+        an opt-out Harvey read in their words (opt_out, migrated: a keyword
+        or the model can be wrong) is lifted here, never one you added by
+        hand. False, and nothing written, when they weren't opted out.
+        Raises suppression.Refused, and writes nothing, while an
+        unsubscribe, objection or complaint of theirs stands: that is
+        undone on the do-not-contact list, with a note saying why."""
+        return await self._in_tx(self._undo_opt_out, prospect_id, details or {})
+
+    @staticmethod
+    def _undo_opt_out(con, prospect_id: str, details: dict) -> bool:
+        from harvey import suppression
+
+        email = (con.execute("SELECT email FROM prospects WHERE id = ?",
+                             (prospect_id,)).fetchone() or [""])[0]
+        asked = suppression.standing_request(con, email)
+        if asked:
+            raise suppression.Refused(
+                f"they asked for it themselves ({asked}): undo it on the do-not-contact list, "
+                "with a note saying why")
+        if con.execute("UPDATE prospects SET status = 'replied', updated_at = ? "
+                       "WHERE id = ? AND status = 'opted_out'",
+                       (_utcnow().isoformat(), prospect_id)).rowcount != 1:
+            return False
+        con.execute("""INSERT INTO settings (key, value, updated_at)
+                       VALUES (?, '1', CURRENT_TIMESTAMP)
+                       ON CONFLICT(key) DO UPDATE SET
+                           value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                    (REVIEW_NEXT_REPLY_KEY + prospect_id,))
+        con.execute("INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                    (_new_id(), "opt_out_undone", "dashboard",
+                     json.dumps({"prospect_id": prospect_id, **details})))
+        suppression.undo_address(con, email, by="you",
+                                 note=str(details.get("reason") or details.get("note") or ""),
+                                 reasons=suppression.READ_IN_THEIR_WORDS)
         return True
+
+    # ── The do-not-contact list (harvey/suppression.py) ──
+
+    def _tx(self, fn, *args, write: bool = True):
+        """``fn(connection, *args)`` in one transaction of its own (a write
+        one unless ``write`` is False), in the calling thread."""
+        con = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+        try:
+            con.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            try:
+                out = fn(con, *args)
+                con.execute("COMMIT")
+                return out
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    async def _in_tx(self, fn, *args, write: bool = True):
+        return await asyncio.to_thread(self._tx, fn, *args, write=write)
+
+    async def suppress(self, scope: str, value, reason, *, by: str, campaign: str = "",
+                       ref: str = "", note: str = "") -> int | None:
+        """Add a do-not-contact entry (suppression.add): its id, or None
+        when one already stands. Raises suppression.Refused."""
+        from harvey import suppression
+
+        return await self._in_tx(lambda con: suppression.add(
+            con, scope, value, reason, by=by, campaign=campaign, ref=ref, note=note))
+
+    async def undo_suppression(self, entry_id: int, *, by: str, note: str = "") -> bool:
+        from harvey import suppression
+
+        return await self._in_tx(lambda con: suppression.undo(con, entry_id, by=by, note=note))
+
+    async def suppression_check(self, email: str, firm=None, config=None):
+        """suppression.check for one address: the entry (or the line of
+        compliance.do_not_contact, read live from ``config``) that bars it,
+        or None."""
+        from harvey import suppression
+
+        listed = ()
+        if config is not None:
+            from harvey.config import live_do_not_contact
+
+            listed = live_do_not_contact(config)
+        firms = [firm] if firm not in (None, "") else None
+        return await self._in_tx(lambda con: suppression.check(con, email, firms, listed),
+                                 write=False)
+
+    async def suppressed_emails(self, emails) -> set[str]:
+        """Of these addresses, the ones an entry in force bars (address,
+        domain, or a firm they are linked to). The config list is the
+        caller's (the exports read it already)."""
+        from harvey import suppression
+
+        emails = [e for e in dict.fromkeys(emails) if e]
+        if not emails or not Path(self.db_path).exists():
+            return set()
+
+        def run(con):
+            index = suppression.Index(con)
+            return {e for e in emails if index and index.hit(e) is not None}
+
+        return await self._in_tx(run, write=False)
+
+    async def suppression_entries(self, live_only: bool = True) -> list[dict]:
+        from harvey import suppression
+
+        return await self._in_tx(lambda con: suppression.entries(con, live_only), write=False)
+
+    # ── The cold-email acknowledgement (harvey/acknowledgement.py) ──
+
+    async def acknowledged(self) -> bool:
+        from harvey import acknowledgement
+
+        return await self._in_tx(acknowledgement.given, write=False)
+
+    async def acknowledge(self, by: str) -> bool:
+        from harvey import acknowledgement
+
+        return await self._in_tx(lambda con: acknowledgement.record(con, by))
+
+    async def acknowledgement_status(self) -> dict:
+        from harvey import acknowledgement
+
+        return await self._in_tx(acknowledgement.status, write=False)
+
+    async def personal_address(self, email: str) -> tuple[int, str]:
+        """(email_rules' reason the address is personal, 0 when it isn't;
+        the source note a first email to it carries, "" when none is
+        needed). Read from every firm the address is linked to."""
+        from harvey import email_rules
+
+        facts = await self._read("address_facts", email)
+        reason = email_rules.personal_reason(email, facts)
+        return reason, email_rules.source_note(facts) if reason else ""
 
     async def opt_out_history(self, prospect_id: str) -> list[dict]:
         """Every opt-out and undo recorded for this person, oldest first."""
@@ -1085,10 +1253,13 @@ class StateManager:
         thread_ref: str = "",
         in_reply_to: str = "",
         approved_by: str = "",
+        source_note: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
-        ``approved_by="autopilot"`` when it's queued approved on autopilot."""
+        ``approved_by="autopilot"`` when it's queued approved on autopilot.
+        ``source_note``: the line a first email to a personal address was
+        staged with (email_rules; it is in the body too)."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -1105,6 +1276,9 @@ class StateManager:
             )
             if cursor.rowcount > 0 and approved_by:
                 await db.execute("UPDATE outbox SET approved_by = ? WHERE id = ?", (approved_by, item_id))
+            if cursor.rowcount > 0 and source_note:
+                await db.execute("UPDATE outbox SET source_note = ? WHERE id = ?",
+                                 (source_note, item_id))
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
 
@@ -1253,7 +1427,7 @@ class StateManager:
 
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
-        "subject", "body", "send_at", "provider",
+        "subject", "body", "send_at", "provider", "unsub_token", "source_note",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -1561,6 +1735,75 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def find_outbox_by_unsub_token(self, token: str) -> dict | None:
+        """The sent cold email whose unsubscribe header carried ``token``."""
+        if not token:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE unsub_token = ? ORDER BY rowid DESC LIMIT 1",
+                (token.upper(),),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def prospect_written_at_domain(self, domain: str) -> Prospect | None:
+        """The prospect Harvey last emailed at this domain (their address's,
+        or their company's), or None: who a message from a stranger there
+        is plausibly about."""
+        domain = (domain or "").strip().lower()
+        if not domain or domain in FREE_MAIL_DOMAINS:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT p.* FROM prospects p LEFT JOIN firm f ON f.id = p.company_id "
+                "WHERE (lower(substr(p.email, instr(p.email, '@') + 1)) = ? "
+                "OR lower(COALESCE(f.domain, '')) = ?) "
+                "AND EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id "
+                "AND o.status = 'sent') "
+                "ORDER BY (SELECT MAX(o.sent_at) FROM outbox o WHERE o.prospect_id = p.id "
+                "AND o.status = 'sent') DESC LIMIT 1", (domain, domain),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return self._prospect_from_row(row) if row else None
+
+    async def last_mail_read(self, mailbox: str) -> float | None:
+        """When ``mailbox`` was last read completely (unix seconds), or None."""
+        try:
+            return float(await self.get_setting(MAIL_READ_KEY + mailbox) or "") or None
+        except ValueError:
+            return None
+
+    async def read_gap(self) -> dict | None:
+        """Why cold email waits for a complete mailbox read (READ_GAP_KEY:
+        since, covered_from, reason, mailbox), or None."""
+        raw = await self.get_setting(READ_GAP_KEY)
+        if not raw:
+            return None
+        try:
+            gap = json.loads(raw)
+        except (TypeError, ValueError):
+            gap = {}
+        return gap if isinstance(gap, dict) else {}
+
+    async def accept_read_gap(self, by: str) -> bool:
+        """The operator accepts that the time between the last complete read
+        and what the mailbox read reached stays unread (a mailbox too big to
+        read back that far): the last complete read becomes now, so the
+        next read is the usual one, and cold email goes again. Logged, with
+        the gap. False when there was none."""
+        gap = await self.read_gap()
+        if gap is None:
+            return False
+        if gap.get("mailbox"):
+            await self.set_setting(MAIL_READ_KEY + str(gap["mailbox"]), str(int(time.time())))
+        await self.delete_setting(READ_GAP_KEY)
+        await self.log_action("read_gap_accepted", by, {k: gap.get(k) for k in
+                                                        ("since", "covered_from", "mailbox")})
+        return True
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 

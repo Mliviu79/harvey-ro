@@ -393,7 +393,7 @@ async def test_instantly_leads_whose_fields_carry_a_foreign_link_are_left_out(st
     clean = Prospect(first_name="Al", last_name="B", company="Co", email="al@co.test")
     dirty = Prospect(first_name="Bo", last_name="C", company="Co", email="bo@co.test",
                      personalization_notes="mention evil.example/deal")
-    assert sender._reviewed_leads([clean, dirty]) == [clean]
+    assert await sender._reviewed_leads([clean, dirty]) == [clean]
 
 
 def test_training_on_your_site_marks_its_domain_as_yours():

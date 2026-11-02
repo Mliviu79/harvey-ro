@@ -106,10 +106,11 @@ async def test_old_configs_without_a_compliance_section_still_send(state):
 
 def test_the_gate_refuses_cold_email_missing_its_configured_address():
     ok = pre_send_check("jane@acme.example", "hello there", "A note. Question?",
-                        postal_address=ADDRESS)
+                        postal_address=ADDRESS, acknowledged=True, personal=False)
     assert not ok and any("postal address" in r for r in ok.reasons)
     assert pre_send_check("jane@acme.example", "hello there",
-                          "A note. Question?\n\n" + ADDRESS, postal_address=ADDRESS)
+                          "A note. Question?\n\n" + ADDRESS, postal_address=ADDRESS,
+                          acknowledged=True, personal=False)
     # Replies never need it.
     assert pre_send_check("jane@acme.example", "hello there", "Sure, Tuesday works.",
                           kind="reply", postal_address=ADDRESS)

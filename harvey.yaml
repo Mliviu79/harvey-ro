@@ -102,8 +102,9 @@ compliance:
   # postal address you receive mail at: a street address, PO box or virtual
   # mailbox. Until it's set, cold email still sends, with a warning.
   postal_address: ""
-  # Keep wording Harvey recognises as an opt-out ("no thanks", "unsubscribe").
-  opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
+  # Keep wording Harvey recognises as an opt-out ("stop", "dezabonare",
+  # "no thanks", "unsubscribe"). No link or address: opting out is a reply.
+  opt_out_line: 'Nu vă interesează? Răspundeți „stop" și nu vă mai scriu.'
   # Never email these, cold or in reply: competitors, your existing customers,
   # anyone under a legal hold. An entry is an address or a domain, and a domain
   # covers its subdomains ("acme.example" also blocks "mail.acme.example", but

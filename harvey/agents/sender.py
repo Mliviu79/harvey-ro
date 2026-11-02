@@ -20,17 +20,19 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of, live_do_not_contact, operator_timezone, send_window_of,
+    compliance_of, operator_timezone, send_window_of,
 )
-from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
+from harvey import email_rules, unsubscribe
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
 from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
-    AUTOPILOT_OFF_REASON, COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
-    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, RECHECK_PREFIX, StateManager,
+    ACK_NEEDED, AUTOPILOT_OFF_REASON, COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
+    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, NO_SENDER_ADDRESS, NOTE_ADDED, READ_GAP_HELD,
+    READ_GAP_KEY, RECHECK_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -306,15 +308,17 @@ class Sender:
                 return False
         return True
 
-    def _reviewed_leads(self, prospects: list) -> list:
-        """The prospects whose merge fields pass the autopilot review."""
+    async def _reviewed_leads(self, prospects: list) -> list:
+        """The prospects whose merge fields pass the autopilot review, and
+        that the do-not-contact list doesn't bar."""
         kept = []
         for p in prospects:
             fields = " \n".join(str(v or "") for v in (
                 p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
             held = autopilot_review("", fields, self.config, recipient=p.email)
-            if listed := do_not_contact_match(p.email, live_do_not_contact(self.config)):
-                held = [f"'{listed}' is on the do-not-contact list", *held]
+            if hit := await self.state.suppression_check(p.email, firm=p.company_id,
+                                                         config=self.config):
+                held = [hit.text, *held]
             if held:
                 logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
             else:
@@ -474,7 +478,7 @@ class Sender:
 
         # Instantly fills these into the templates on its side, unseen:
         # scraped text carrying a planted link keeps that lead out.
-        prospects = self._reviewed_leads(prospects)
+        prospects = await self._reviewed_leads(prospects)
         if not prospects:
             return
         leads = [
@@ -614,6 +618,7 @@ class Sender:
         staged = 0
         skipped = 0
         answered = 0
+        listed = 0
         now = _utcnow()
         seen_emails: set[str] = set()
         window = send_window_of(self.config)
@@ -633,7 +638,14 @@ class Sender:
             if await self.state.colleague_who_replied(prospect.id):
                 answered += 1     # their company already answered
                 continue
+            if await self.state.suppression_check(email, firm=prospect.company_id,
+                                                  config=self.config):
+                listed += 1       # on the do-not-contact list
+                continue
             seen_emails.add(email)
+            # A first email to a personal address carries where the address
+            # was found (email_rules), decided now and kept on the row.
+            _, note = await self.state.personal_address(email)
 
             # With a send window, each email is planned for the recipient's
             # office hours; follow-ups keep their delay, then move into it.
@@ -644,17 +656,20 @@ class Sender:
                 send_at = now + timedelta(days=cumulative_days)
                 if window is not None:
                     send_at = next_send_time(send_at, zone, window)
+                body = self._render(step.body, prospect)
+                first = int(step.step) <= 1
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
                     step=step.step,
                     to_email=email,
                     subject=self._render(step.subject, prospect),
-                    body=self._render(step.body, prospect),
+                    body=email_rules.with_note(body, note) if first else body,
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
                     approved_by="" if require_approval else "autopilot",
+                    source_note=note if first else "",
                 )
                 if item_id:
                     staged += 1
@@ -672,6 +687,11 @@ class Sender:
             logger.info(
                 f"Sender: left out {answered} prospect(s) from '{campaign.name}': "
                 f"{COLLEAGUE_REPLIED} at their company."
+            )
+        if listed:
+            logger.info(
+                f"Sender: left out {listed} prospect(s) from '{campaign.name}': on the "
+                "do-not-contact list."
             )
         if staged:
             mode = "awaiting your approval" if require_approval else "approved"
@@ -774,11 +794,40 @@ class Sender:
             colleague = await self.state.colleague_who_replied(prospect.id)
             if colleague:
                 return "cancelled", f"{COLLEAGUE_REPLIED} ({colleague})"
+        # The do-not-contact list (an entry or compliance.do_not_contact),
+        # replies included: "never contact" means never.
+        hit = await self.state.suppression_check(item["to_email"], firm=prospect.company_id,
+                                                 config=self.config)
+        personal, note = 0, ""
+        acknowledged = item["kind"] != "sequence" or await self.state.acknowledged()
+        if item["kind"] == "sequence" and hit is None:
+            # Cold email waits, approved, for the operator's acknowledgement.
+            if not acknowledged:
+                return "approved", ACK_NEEDED
+            # Its unsubscribe header names the sending address: unknown
+            # (no persona.email, and the provider couldn't say), it waits.
+            if getattr(self.provider, "supports_headers", False) \
+                    and not await self._sending_address():
+                return "approved", NO_SENDER_ADDRESS
+            if int(item["step"]) <= 1:
+                personal, note = await self.state.personal_address(item["to_email"])
+                note = item.get("source_note") or note
+                if personal and not (item.get("source_note")
+                                     and item["source_note"] in (item["body"] or "")):
+                    # Staged before the address was known to be personal (or
+                    # the line was edited out): it gets the line, and waits
+                    # for you to approve it as it now is.
+                    await self.state.update_outbox_item(
+                        item["id"], body=email_rules.with_note(item["body"], note),
+                        source_note=note)
+                    return "pending_review", NOTE_ADDED
         gate = pre_send_check(
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
             postal_address=compliance_of(self.config).postal_address,
-            do_not_contact=live_do_not_contact(self.config),
+            suppressed=hit.text if hit is not None else "",
+            acknowledged=acknowledged,
+            step=int(item["step"] or 1), personal=bool(personal), source_note=note,
         )
         if not gate:
             logger.warning(
@@ -793,12 +842,43 @@ class Sender:
         if item.get("approved_by") != "you":
             # Nobody approved this one (autopilot): what a planted
             # instruction would add sends it back to you instead.
-            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config,
+            # (The source note is Harvey's fixed line, naming the site the
+            # address was found on: not a link a model added.)
+            body = self._outgoing_body(item)
+            if item.get("source_note"):
+                body = body.replace(item["source_note"], "")
+            held = autopilot_review(item["subject"], body, self.config,
                                     recipient=item["to_email"])
             if held:
                 logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
                 return "pending_review", (HELD_FOR_REVIEW + "; ".join(held))[:300]
         return None
+
+    async def _sending_address(self) -> str:
+        """The address cold email goes out from (its unsubscribe comes back
+        there), or "" when neither persona.email nor the provider says."""
+        try:
+            address = (await self.provider.sender_address() or "").strip()
+        except Exception as e:
+            logger.warning(f"Sender: couldn't ask {self.provider.name} for its address: {e}")
+            address = ""
+        return address or (getattr(getattr(self.config, "persona", None), "email", "")
+                           or "").strip()
+
+    async def _unsubscribe_headers(self, item: dict) -> dict:
+        """The unsubscribe header a cold email goes out with, as send_email
+        keyword arguments ({} for a reply, or a provider that can't carry
+        headers). Its token is stored on the row before it goes, so the
+        unsubscribe it brings back names this email."""
+        if item["kind"] != "sequence" or not getattr(self.provider, "supports_headers", False):
+            return {}
+        address = await self._sending_address()
+        if not address:
+            return {}           # never reached: _blocked holds it first
+        token = item.get("unsub_token") or unsubscribe.new_token()
+        if token != item.get("unsub_token"):
+            await self.state.update_outbox_item(item["id"], unsub_token=token)
+        return {"headers": unsubscribe.headers(address, token)}
 
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
@@ -865,6 +945,11 @@ class Sender:
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         window = send_window_of(self.config)
+        # The mailbox read hasn't covered the time since the last complete
+        # one (Handler: Harvey was off longer than the provider reads back):
+        # an unsubscribe may be unread, so cold email waits. Replies go.
+        read_gap = bool(await self.state.get_setting(READ_GAP_KEY))
+        held_gap = 0
         sent = 0
         sent_cold = 0
         outside_window = 0
@@ -888,6 +973,11 @@ class Sender:
                 break
             if self.cold_only and item["kind"] != "sequence":
                 continue  # quiet hours: replies wait for the operator's hours
+            if item["kind"] == "sequence" and read_gap:
+                held_gap += 1
+                if item.get("error") != READ_GAP_HELD:
+                    await self.state.update_outbox_item(item["id"], error=READ_GAP_HELD)
+                continue
             if item["kind"] == "sequence" and sent_cold >= cold_left:
                 held_cold += 1
                 continue
@@ -1021,6 +1111,7 @@ class Sender:
                     item["to_email"], item["subject"], body,
                     thread_ref=item.get("thread_ref", ""),
                     in_reply_to=item.get("in_reply_to", ""),
+                    **await self._unsubscribe_headers(item),
                 )
             except Exception as e:
                 # It may have gone out before the error: never retry it.
@@ -1041,7 +1132,9 @@ class Sender:
                 sent_cold += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             # A note that the check moved it back no longer applies.
-            note = {"error": ""} if (item.get("error") or "").startswith(RECHECK_PREFIX) else {}
+            # Nor one that it waited for a complete mailbox read.
+            note = {"error": ""} if ((item.get("error") or "").startswith(RECHECK_PREFIX)
+                                     or item.get("error") == READ_GAP_HELD) else {}
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body,
                 message_id=result.message_id, thread_ref=result.thread_ref, **note,
@@ -1084,6 +1177,10 @@ class Sender:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
         self.compliance_held = compliance_paused
+        if held_gap:
+            logger.warning(
+                f"Sender: {held_gap} cold email(s) wait until the mailbox is read back to "
+                "its last complete read (an unsubscribe may be unread). Replies still go out.")
         if outside_window:
             logger.info(
                 f"Sender: {outside_window} cold email(s) wait for the recipient's "

@@ -22,6 +22,8 @@ def pytest_configure(config):
         "markers", "modules_on(*ids): these modules count as switched on")
     config.addinivalue_line(
         "markers", "live_anaf_client: the ANAF request code runs (against a stubbed client)")
+    config.addinivalue_line(
+        "markers", "no_acknowledgement: the cold-email acknowledgement isn't given")
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +40,18 @@ def _modules_on(request, monkeypatch):
     forced = {switches.KEY.format(m): switches.ON for m in marker.args}
     monkeypatch.setattr(switches, "resolve",
                         lambda stored, mans=None: real({**stored, **forced}, mans))
+
+
+@pytest.fixture(autouse=True)
+def _cold_email_acknowledged(request, monkeypatch):
+    """Cold email waits for the operator's acknowledgement (harvey ack).
+    Tests of sending run as if it was given; ``@pytest.mark.no_acknowledgement``
+    tests (and tests of the acknowledgement itself) get the real check."""
+    if request.node.get_closest_marker("no_acknowledgement"):
+        return
+    from harvey import acknowledgement
+
+    monkeypatch.setattr(acknowledgement, "given", lambda con: True)
 
 
 @pytest.fixture(autouse=True)

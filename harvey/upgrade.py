@@ -152,10 +152,24 @@ def needed(data: Path | None = None) -> bool:
     return waiting(Path(data or DATA_DIR) / "harvey.db")
 
 
+def _target() -> int:
+    """The schema the upgrade writes (25 as released; Harvey takes it
+    through the later steps when it opens it)."""
+    from harvey.overlay import schema
+
+    return schema.UPGRADE_TARGET
+
+
+def _newer(found: int) -> bool:
+    from harvey.overlay import schema
+
+    return found > schema.LATEST
+
+
 def waiting(db: Path) -> bool:
     """Whether the database at ``db`` waits for the upgrade (Harvey opens
     nothing on it, and creates nothing in its place, until then)."""
-    return 0 < schema_of(db) < 25 or switch_pending(db)
+    return 0 < schema_of(db) < _target() or switch_pending(db)
 
 
 def switch_pending(db: Path) -> bool:
@@ -167,7 +181,7 @@ def switch_pending(db: Path) -> bool:
     if found == 0:
         return db.with_name(db.name + ".v25").exists() or db.with_name(db.name + ".v24").exists()
     # (Beside the live harvey.db only: an output folder's files aren't switched.)
-    return found == 25 and db.name == "harvey.db" and (db.parent / NEW_ANAF).is_file()
+    return found >= _target() and db.name == "harvey.db" and (db.parent / NEW_ANAF).is_file()
 
 
 def _size(path: Path) -> int:
@@ -266,7 +280,8 @@ def status(layout: Layout | None = None) -> dict:
     schema = schema_of(layout.db, layout.read_only)
     state = read_state(layout)
     pending = not layout.out and switch_pending(layout.db)
-    out = {"schema": schema, "needed": (0 < schema < 25 or pending) and not layout.out,
+    out = {"schema": schema, "needed": (0 < schema < _target() or pending) and not layout.out,
+           "newer": _newer(schema),
            "switch_pending": pending,
            "running": running(layout), "stages": [{"id": s, **state["stages"][s]}
                                                    for s in STAGES],
@@ -403,7 +418,12 @@ def run(layout: Layout | None = None, *, say=None, check_space: bool = True) -> 
     state = read_state(layout)
     # A switch cut short is finished, whatever else the state file says.
     pending = not layout.out and switch_pending(layout.db)
-    if schema == 25 and not layout.out and not pending:
+    if _newer(schema):
+        from harvey.overlay import schema as overlay_schema
+        from harvey.state import newer_build_message
+
+        raise Refused(newer_build_message(schema, overlay_schema.LATEST))
+    if schema >= _target() and not layout.out and not pending:
         return status(layout)
     if schema != 24 and not pending:
         if schema == 0:
@@ -746,7 +766,7 @@ def _switch(layout: Layout, progress: _Progress) -> None:
             raise Refused(f"there is no harvey.db, and no {new_db.name} and {old_db.name} to "
                           f"finish the switch with: rename {old_db.name} back to harvey.db, "
                           "then upgrade again")
-    elif found != 25:
+    elif found < _target():
         raise Refused(f"{db.name} is schema {found}: nothing is switched")
     m = _manifests().get(ANAF_MODULE)
     anaf = None
@@ -770,17 +790,17 @@ def _switch(layout: Layout, progress: _Progress) -> None:
         if live.is_file():
             _settle(live)
         _swap(live, layout.new_anaf, old)
-    if schema_of(db) != 25:
+    if schema_of(db) < _target():
         raise Refused("the switch didn't leave a schema 25 harvey.db: nothing more was changed")
     progress.end("switch", kept=[f["name"] for f in old_files(layout)])
 
 
 def delete_old(layout: Layout | None = None) -> int:
     """Delete the files the switch kept aside: only once the switch is done
-    (the live harvey.db is schema 25, nothing waits to take a live name).
-    Returns the bytes freed."""
+    (the live harvey.db is schema 25 or later, nothing waits to take a live
+    name). Returns the bytes freed."""
     layout = layout or Layout(DATA_DIR)
-    if schema_of(layout.db) != 25 or switch_pending(layout.db) or layout.new_db.exists() \
+    if schema_of(layout.db) < _target() or switch_pending(layout.db) or layout.new_db.exists() \
             or read_state(layout)["stages"]["switch"].get("state") != "done":
         raise Refused("the switch isn't finished: the old files stay")
     if running(layout):

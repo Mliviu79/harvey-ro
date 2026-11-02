@@ -3297,6 +3297,42 @@ class Reader:
         found.sort(key=lambda i: (rows[i][0], i), reverse=True)
         return [{"id": str(i), "site": bool(rows[i][1])} for i in found[:limit]]
 
+    def address_facts(self, email: str) -> dict:
+        """What email_rules decides an address by, from every firm it is
+        linked to (any link, not one chosen): whether a link names a person,
+        the names of the people of those firms (Harvey's and the register's
+        administrators), each firm's legal forms (``firm_forms``: per firm,
+        the register's form and ANAF's LEGAL_FORM readings, so each is
+        decided on its own), the evidence sources and pages of the address,
+        and the firms' domains."""
+        address = (email or "").strip().lower()
+        out: dict = {"email": address, "person_link": False, "people": [], "firm_forms": [],
+                     "sources": [], "evidence_urls": [], "domains": []}
+        links = list(self.x("overlay.read.links_of_address", (EMAIL, address)))
+        if not links:
+            return out
+        out["person_link"] = any(person for _, person, _, _ in links)
+        lives = self.live_of([firm for firm, *_ in links])
+        groups = self.members(list(dict.fromkeys(lives.values())))
+        described = self.describe(self.group_idents(list(groups)))
+        for f, people in self.people_named(groups, described).items():
+            out["people"] += [p["name"] for p in people if p["name"] not in out["people"]]
+        for f in groups:
+            form = (described.get(f, {}).get("card") or {}).get("legal_form") or ""
+            anaf = list(dict.fromkeys(r["value_text"] for r in self.register_readings(
+                f, {"LEGAL_FORM"}) if r["value_text"]))
+            out["firm_forms"].append([form, anaf])
+        for row in self.company_rows(list(groups)):
+            if row.get("domain") and row["domain"] not in out["domains"]:
+                out["domains"].append(row["domain"])
+        for firm, contact, src, trust, url, first, person, location in self._by_ids(
+                "overlay.read.evidence", [[firm, contact] for firm, _, _, contact in links], 500):
+            if src and src not in out["sources"]:
+                out["sources"].append(src)
+            if url and url not in out["evidence_urls"]:
+                out["evidence_urls"].append(url)
+        return out
+
     def email_audience(self, limit: int = 200) -> list[dict]:
         """StateManager.email_audience on the overlay: email contacts the
         Email module can write to and has no prospect for yet (verified,
@@ -3310,6 +3346,14 @@ class Reader:
         taken = {r[0] for r in self._by_ids("overlay.read.prospected_emails",
                                             [rows[c][2] for c in cands])}
         cands = [c for c in cands if rows[c][2] not in taken]
+        # The do-not-contact list's domain and firm entries (an address
+        # entry flags the contact already): left out before the limit, so
+        # they never crowd out addresses that can be written to.
+        from harvey import suppression
+
+        index = suppression.Index(self.con)
+        if index:
+            cands = [c for c in cands if index.hit(rows[c][2]) is None]
         cands.sort(key=lambda c: (rows[c][5] == schema.CONTACT_STATUS["unchecked"], c))
         links = list(self._by_ids("overlay.read.links_of_contacts", cands))
         lives = self.live_of([l[1] for l in links])

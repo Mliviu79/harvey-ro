@@ -80,9 +80,11 @@ def test_an_old_database_is_never_opened_or_changed_by_harvey(data):
 
 
 def test_a_new_install_starts_on_the_slim_database(tmp_path):
+    from harvey.overlay import schema
+
     path = tmp_path / "harvey.db"
     asyncio.run(StateManager(str(path)).init_db())
-    assert _version(path) == 25 and not upgrade.needed(tmp_path)
+    assert _version(path) == schema.LATEST and not upgrade.needed(tmp_path)
 
 
 def test_the_worker_waits_and_takes_no_lease_while_the_upgrade_is_pending(data):
@@ -127,8 +129,17 @@ def test_the_upgrade_runs_every_stage_switches_and_keeps_the_old_files(data, mon
     con = sqlite3.connect(data / "financials.db")
     assert con.execute("SELECT COUNT(*) FROM filed").fetchone()[0] > 0
     con.close()
-    # Harvey opens the new file; the old files go only when asked.
+    # Harvey opens the new file, and takes it through the steps after 25 in
+    # place; the old files go only when asked.
     asyncio.run(StateManager(str(data / "harvey.db")).init_db())
+    from harvey.overlay import schema
+
+    assert _version(data / "harvey.db") == schema.LATEST
+    con = sqlite3.connect(data / "harvey.db")
+    assert schema.missing(con) == []
+    assert con.execute("SELECT COUNT(*) FROM suppression").fetchone()[0] >= 0
+    con.close()
+    assert not upgrade.needed(data) and not upgrade.switch_pending(data / "harvey.db")
     freed = upgrade.delete_old(upgrade.Layout(data))
     assert freed > 0 and upgrade.old_files(upgrade.Layout(data)) == []
     assert upgrade.run(upgrade.Layout(data), check_space=False)["switched"]   # nothing to do

@@ -78,11 +78,18 @@ def with_check(sender, transport, api_key=""):
     return sender
 
 
+# A first email to a named person's address carries where the address was
+# found (email_rules), as staging adds it.
+SOURCE_NOTE = "Am găsit adresa într-o sursă publică."
+
+
 async def queue(state, pid, step=1, kind="sequence", to="jane@acme.example", campaign="c1"):
+    note = SOURCE_NOTE if kind == "sequence" and step == 1 else ""
     return await state.add_outbox_item(
         prospect_id=pid, to_email=to, subject="hello",
-        body="Fine body. Question?", send_at=_now_iso(), status="approved",
-        campaign_id=campaign if kind == "sequence" else "", step=step, kind=kind,
+        body="Fine body. Question?" + (f"\n\n{note}" if note else ""), send_at=_now_iso(),
+        status="approved", campaign_id=campaign if kind == "sequence" else "", step=step,
+        kind=kind, source_note=note,
     )
 
 

@@ -345,14 +345,15 @@ def migrate(src, dst, *, chunk: int = CHUNK, obs_chunk: int = OBS_CHUNK,
 
 
 def _create(dst: Path) -> None:
-    """The empty schema 25 file, written aside and renamed into place (a
-    run killed while creating it leaves no half-made output)."""
+    """The empty schema 25 file (as released: the steps after it run when
+    Harvey opens the switched file), written aside and renamed into place
+    (a run killed while creating it leaves no half-made output)."""
     part = Path(str(dst) + ".part")
     for suffix in ("", "-journal", "-wal", "-shm"):
         Path(str(part) + suffix).unlink(missing_ok=True)
     con = sqlite3.connect(part, isolation_level=None)
     try:
-        schema.create(con, triggers=False)
+        schema.create(con, triggers=False, version=schema.UPGRADE_TARGET)
         con.execute(PROGRESS)
     finally:
         con.close()

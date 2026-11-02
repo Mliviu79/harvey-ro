@@ -371,13 +371,19 @@ class PreclearedConfig(BaseModel):
         return self
 
 
-DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# The opt-out line under every cold email: Romanian by default (Harvey RO
+# writes to Romanian firms); the English one Harvey used before is still
+# recognised as its own text in a quoted reply.
+DEFAULT_OPT_OUT_LINE = 'Nu vă interesează? Răspundeți \u201estop" și nu vă mai scriu.'
+ENGLISH_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
 # The replies the Handler always honours as an opt-out on their own; an
-# opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"').
+# opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"',
+# 'Răspundeți „stop"').
 OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me",
-                 "opt out")
+                 "opt out", "dezabonare", "nu mai doresc", "nu, mulțumesc", "nu multumesc")
 _ASKS_FOR_OPT_OUT_RE = re.compile(
-    r"\breply(?:\s+with)?\s*[\"'\u201c\u2018]?\s*(?:"
+    r"\b(?:reply|r[ăa]spunde(?:[țţt]i)?)(?:\s+(?:with|cu))?\s*"
+    r"[\"'\u201c\u2018\u201e\u00ab]?\s*(?:"
     + "|".join(re.escape(w) for w in OPT_OUT_WORDS) + r")\b", re.IGNORECASE)
 
 

@@ -17,12 +17,20 @@ it isn't a MailProvider because Instantly owns sequencing/sending itself.
 
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("harvey.mail")
 
 NATIVE_PROVIDERS = ("gmail", "smtp", "microsoft")
+# How far back a read goes at least (the providers' usual window), and the
+# margin a read by date takes before the last complete read, so a message
+# that arrived while that read ran is never just outside both.
+READ_WINDOW_DAYS = 7
+READ_MARGIN_SECONDS = 24 * 3600
+# What an unsubscribe in a spam or junk folder is looked for by.
+UNSUBSCRIBE_WORD = "dezabonare"
 
 
 @dataclass
@@ -45,6 +53,48 @@ class InboundMessage:
     date: str = ""
     is_bounce: bool = False
     headers: dict = field(default_factory=dict)
+    # "spam" for a message read from the spam/junk folder: the Handler reads
+    # those only for an unsubscribe token.
+    folder: str = ""
+
+
+def read_window_start(since: float | None, now: float | None = None) -> float:
+    """Where a read by date starts: the usual week, or further back to just
+    before the last complete read (``since``) when Harvey was off longer."""
+    now = time.time() if now is None else now
+    start = now - READ_WINDOW_DAYS * 86400
+    if since is not None:
+        start = min(start, since - READ_MARGIN_SECONDS)
+    return start
+
+
+def message_time(msg) -> float | None:
+    """When a message was sent or received (unix seconds), from its date
+    (RFC 2822, or Graph's ISO 8601), or None when it can't be read."""
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+
+    text = (getattr(msg, "date", "") or "").strip()
+    if not text:
+        return None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        try:
+            when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def partial_reach(messages) -> float:
+    """Where a read cut short (too many messages to read them all) is
+    complete from: the oldest message it read, or now when no date can be
+    read (the safe side: the Handler then holds cold email for the gap)."""
+    times = [t for t in map(message_time, messages) if t is not None]
+    return min(times) if times else time.time()
 
 
 BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery subsystem")
@@ -117,6 +167,28 @@ class MailProvider(ABC):
     """A mailbox Harvey can send from and read replies out of."""
 
     name: str = "base"
+    # Whether send_email takes ``headers`` (a cold email's List-Unsubscribe).
+    supports_headers: bool = False
+    # Set by the Handler before get_replies: when the mailbox was last read
+    # completely (unix seconds), so a read goes back at least that far. And
+    # set by get_replies: where that read was complete from (None: it went
+    # on from the last confirmed read, as Gmail's history does). A mailbox
+    # with more mail since then than a read takes is read newest first and
+    # complete only from the oldest message read (partial_reach), and the
+    # Handler holds cold email for the rest.
+    read_since: float | None = None
+    covered_from: float | None = None
+
+    def from_address(self) -> str:
+        """The address mail goes out from (an unsubscribe comes back to it)."""
+        persona = getattr(getattr(self, "config", None), "persona", None)
+        return (getattr(persona, "email", "") or "").strip()
+
+    async def sender_address(self) -> str:
+        """from_address, asking the provider for the signed-in mailbox when
+        no persona.email is set (Gmail, Microsoft); "" when unknown. A cold
+        email's unsubscribe header is built from it."""
+        return self.from_address()
 
     @abstractmethod
     def is_configured(self) -> bool:
@@ -131,11 +203,18 @@ class MailProvider(ABC):
         thread_ref: str = "",
         in_reply_to: str = "",
     ) -> SendResult:
-        """Send one plain-text email. Reply threading when refs are given."""
+        """Send one plain-text email. Reply threading when refs are given.
+        A provider with ``supports_headers`` also takes ``headers``."""
 
     @abstractmethod
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
         """Fetch recent inbound messages (dedup is the caller's job)."""
+
+    async def get_spam_unsubscribes(self, limit: int = 500) -> list[InboundMessage]:
+        """Unsubscribe messages in the spam/junk folder since the read's
+        start (folder "spam"; the Handler reads them for the token only), or
+        raise. A provider that can't look there returns none."""
+        return []
 
     def confirm_read(self) -> None:
         """Every reply the last get_replies returned was handled. A provider

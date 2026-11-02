@@ -164,6 +164,7 @@ def counts(con, register_modules) -> dict:
         rule = COUNT_RULES.get(name, "equal")
         out[name] = {"old": old, "new": new, "rule": rule,
                      "passed": old == new if rule == "equal" else True}
+    out.update(suppression_counts(con))
     out["identifiers by scheme"] = dict(con.execute(
         "SELECT s.name, COUNT(*) FROM firm_ident fi JOIN ident_scheme s ON s.id = fi.scheme "
         "GROUP BY s.name").fetchall())
@@ -181,6 +182,41 @@ def counts(con, register_modules) -> dict:
 
 
 # A count that may differ, and why (every other count must be equal).
+def _has_table(con, schema_name: str, table: str) -> bool:
+    return con.execute(f"SELECT 1 FROM {schema_name}.sqlite_master WHERE type = 'table' "
+                       "AND name = ?", (table,)).fetchone() is not None
+
+
+def _suppression_digest(con, schema_name: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for row in con.execute(f"SELECT scope, value, reason, undone_at IS NULL FROM "
+                           f"{schema_name}.suppression ORDER BY scope, value, reason, id"):
+        h.update(("|".join(str(v) for v in row) + "\n").encode())
+    return h.hexdigest()
+
+
+def suppression_counts(con) -> dict:
+    """The do-not-contact list, old and new: a copy migration must carry
+    every entry (in force and undone) as it was. Nothing to compare when
+    the source has no list (schema 24)."""
+    if not _has_table(con, "old", "suppression"):
+        return {}
+    have = _has_table(con, "main", "suppression")
+    out = {}
+    for name, where in (("do-not-contact entries", ""),
+                        ("do-not-contact entries in force", " WHERE undone_at IS NULL")):
+        old = _q(con, f"SELECT COUNT(*) FROM old.suppression{where}")
+        new = _q(con, f"SELECT COUNT(*) FROM main.suppression{where}") if have else None
+        out[name] = {"old": old, "new": new, "rule": "equal", "passed": old == new}
+    same = have and _suppression_digest(con, "old") == _suppression_digest(con, "main")
+    out["do-not-contact entries (digest)"] = {
+        "old": "", "new": "", "rule": "equal", "passed": bool(same),
+        "failures": [] if same else ["the do-not-contact list differs from the source's"]}
+    return out
+
+
 COUNT_RULES = {
     "sources (rows)": "rows schema 24 held twice (on a survivor and on the record merged into "
                       "it) are one row now: the count by record found for must be equal",

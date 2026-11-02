@@ -3,6 +3,7 @@ reading the inbox without touching it, and failing loudly."""
 
 import json
 import os
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -432,16 +433,24 @@ async def test_next_link_back_to_the_first_page_is_refused(graph):
 
 
 @pytest.mark.asyncio
-async def test_too_many_pages_fails_closed(graph, monkeypatch):
+async def test_too_many_pages_reads_the_newest_and_says_where_it_is_complete_from(
+        graph, monkeypatch):
+    from harvey.integrations.mail_provider import read_window_start
+
     monkeypatch.setattr(microsoft, "MAX_INBOX_PAGES", 3)
     graph.inbox = [message(i) for i in range(10)]
-    with pytest.raises(GraphError, match="more than 3 pages"):
-        await provider(graph).get_replies(limit=3)
-    assert len(graph.inbox_requests()) == 3
+    p = provider(graph)
+    found = await p.get_replies(limit=3)
+    # Not a failed read any more: the newest pages, and the read is complete
+    # only from the oldest message on them (the Handler holds cold email).
+    assert len(found) == 9 and len(graph.inbox_requests()) == 3
+    assert p.covered_from == datetime(2026, 10, 14, 15, tzinfo=timezone.utc).timestamp()
 
     graph.requests.clear()
-    graph.inbox = graph.inbox[:9]  # exactly 3 pages is fine
-    assert len(await provider(graph).get_replies(limit=3)) == 9
+    graph.inbox = graph.inbox[:9]  # exactly 3 pages is a whole read
+    p = provider(graph)
+    assert len(await p.get_replies(limit=3)) == 9
+    assert abs(p.covered_from - read_window_start(None)) < 60
 
 
 @pytest.mark.asyncio

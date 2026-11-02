@@ -95,11 +95,15 @@ async def test_repeated_page_token_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_page_bound_does_not_return_a_partial_inbox(monkeypatch):
+async def test_page_bound_reads_the_newest_and_marks_the_read_cut_short(monkeypatch):
     import harvey.integrations.gmail as gmail
     monkeypatch.setattr(gmail, 'MAX_INBOX_PAGES', 2, raising=False)
-    with pytest.raises(RuntimeError, match='partial'):
-        await provider([{'nextPageToken': 'one'}, {'nextPageToken': 'two'}]).get_replies()
+    p = provider([{'nextPageToken': 'one'}, {'nextPageToken': 'two'}])
+    assert await p.get_replies() == []
+    # No message to date it by: complete only from now, so the Handler
+    # holds cold email for the gap until a read covers it or it's accepted.
+    import time
+    assert p.covered_from > time.time() - 60
 
 
 @pytest.mark.asyncio

@@ -92,6 +92,16 @@ def test_undo_puts_them_back_as_replied_and_keeps_the_record(client):
     assert undone["prospect_id"] == "p1" and undone["previous_why"] == 'Their reply was only "stop".'
 
 
+def test_undo_with_one_click_refuses_an_unsubscribe(client):
+    _seed(client.db_path)
+    state = StateManager(str(client.db_path))
+    asyncio.run(state.suppress("address", "i@x.test", "unsubscribe", by="unsubscribe"))
+    r = client.post("/api/prospects/p1/opt-out/undo", json={"confirm": True})
+    assert r.status_code == 409 and r.json()["code"] == "optout_listed"
+    assert _sql(client.db_path, "SELECT status FROM prospects")[0][0] == "opted_out"
+    assert asyncio.run(state.suppression_check("i@x.test")).reason == "unsubscribe"
+
+
 def test_undo_refuses_someone_who_is_not_opted_out(client):
     _seed(client.db_path, status="replied")
     r = client.post("/api/prospects/p1/opt-out/undo", json={"confirm": True})
@@ -173,3 +183,19 @@ def test_the_contact_list_flags_an_undone_opt_out(client):
     assert client.post("/api/prospects/p1/opt-out/undo", json={"confirm": True}).status_code == 200
     flags = {p["id"]: p["opt_out_undone"] for p in client.get("/api/prospects").json()}
     assert flags == {"p1": True, "p2": False}
+
+
+def test_a_read_gap_is_accepted_only_when_typed(client):
+    from harvey.state import READ_GAP_KEY
+
+    asyncio.run(StateManager(str(client.db_path)).init_db())
+    _sql(client.db_path, "INSERT INTO settings (key, value) VALUES (?, ?)",
+         (READ_GAP_KEY, json.dumps({"since": 1, "covered_from": 2, "reason": "a test gap",
+                                    "mailbox": "fake:h@x.test"})))
+    assert client.post("/api/mail/read-gap/accept", json={}).status_code == 400
+    assert client.post("/api/mail/read-gap/accept", json={"typed": "accept"}).json() == {
+        "success": True}
+    assert _sql(client.db_path, "SELECT COUNT(*) FROM settings WHERE key = ?",
+                (READ_GAP_KEY,))[0][0] == 0
+    assert client.post("/api/mail/read-gap/accept",
+                       json={"typed": "accept"}).status_code == 404

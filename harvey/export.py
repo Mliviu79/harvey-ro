@@ -53,7 +53,9 @@ async def collect_prospects(
 
     Default view is the *deliverable* list (verified + risky emails).
     Outreach exports exclude opted-out prospects even with explicit filters.
-    ``include_all`` disables every filter for a full dump. ``ids`` keeps
+    ``include_all`` disables every filter for a full dump but the
+    do-not-contact list (an entry in force or compliance.do_not_contact),
+    which no export ever includes. ``ids`` keeps
     only those prospects (on top of the other filters).
     """
     import aiosqlite
@@ -99,11 +101,15 @@ async def collect_prospects(
     firms = list(dict.fromkeys(r["company_id"] for r in rows if r["company_id"].isdigit()))
     companies = {c["id"]: c for c in await state.read("company_rows", firms)} if firms else {}
 
-    if not include_all:
-        # A list for another sequencer is still contact: leave out anyone on
-        # compliance.do_not_contact, as the send gate would.
-        rows = [r for r in rows
-                if not do_not_contact_match(r.get("email") or "", _do_not_contact(config))]
+    # A list for another sequencer is still contact: leave out anyone on
+    # compliance.do_not_contact or the do-not-contact list, as the send gate
+    # would, even in a full dump (``include_all``), which could be fed to
+    # one just the same. (An export is what was true when it was made: the
+    # list itself is exported beside it, harvey suppress list --csv.)
+    suppressed = await state.suppressed_emails([r.get("email") for r in rows])
+    rows = [r for r in rows
+            if not do_not_contact_match(r.get("email") or "", _do_not_contact(config))
+            and r.get("email") not in suppressed]
 
     out = []
     for r in rows:
@@ -148,9 +154,10 @@ async def collect_companies(state: StateManager, config=None,
     companies, prospects, site_phones = await _overlay_rows(state, ids)
 
     entries = _do_not_contact(config)
+    suppressed = await state.suppressed_emails([p.get("email") for p in prospects])
     by_company: dict[str, list[dict]] = {}
     for p in prospects:
-        if do_not_contact_match(p.get("email") or "", entries):
+        if do_not_contact_match(p.get("email") or "", entries) or p.get("email") in suppressed:
             continue
         if p.get("email_status") == "invalid":
             p = {**p, "email": "", "bounced": True}

@@ -126,3 +126,14 @@ async def test_authenticated_dashboard_export_uses_the_same_policy(state, monkey
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert _names(response.text) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_full_dump_still_leaves_out_the_do_not_contact_list(state):
+    # --all can be fed to another sequencer like any export: a barred
+    # address is never in it.
+    await state.suppress("address", "new@example.test", "unsubscribe", by="unsubscribe")
+    rows = await collect_prospects(state, include_all=True)
+    names = {row["first_name"] for row in rows}
+    assert "New" not in names
+    assert {"Catchall", "Contacted", "Guess"} <= names

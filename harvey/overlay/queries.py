@@ -107,6 +107,11 @@ statement("overlay.resolve.phone",
           "SELECT l.firm FROM contact c CROSS JOIN link l "
           "WHERE c.kind = ? AND c.value = ? AND l.contact = c.id",
           params=(2, "+40700000000"), drives="c")
+# Every link of one address (email_rules: any link names a person).
+statement("overlay.read.links_of_address",
+          "SELECT l.firm, l.person, l.trust, c.id FROM contact c CROSS JOIN link l "
+          "WHERE c.kind = ? AND c.value = ? AND l.contact = c.id",
+          params=(1, "office@example.com"), drives="c")
 statement("overlay.resolve.group_idents",
           f"SELECT scheme, key FROM firm_ident WHERE firm IN {_GROUP}", params=(1, 1))
 statement("overlay.resolve.group_keys",

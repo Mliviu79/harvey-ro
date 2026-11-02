@@ -7,6 +7,73 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **One do-not-contact list.** Unsubscribes, opt-outs, objections and the
+  entries you add are kept in one list keyed on the address, the domain or
+  the firm's tax code, so an entry holds through merges, their undo, an
+  address found again and a firm removed and pulled again. The send gate,
+  the Writer, the audience, the exports and the reply handler all check it
+  (`harvey suppress`, `/api/suppression`, a CSV to keep beside an export).
+  What was opted out before is carried over. Undoing is soft and keeps the
+  history.
+- **Unsubscribe header.** Every cold email carries a mailto
+  `List-Unsubscribe` header with a token (Gmail, SMTP, Microsoft 365, the
+  latter created from MIME); the unsubscribe it brings back is honoured at
+  once, even with an empty body or in the spam folder. No one-click header:
+  that needs a public HTTPS address.
+- **The cold-email acknowledgement.** Cold email waits until you confirm,
+  once per version of the text, what sending it to firms means
+  (`harvey ack`). Today says when cold email is waiting for it.
+- **The source line for personal addresses.** A first email to a named
+  person's address, a free-mail address or a PFA/II/IF gets a fixed line
+  saying where the address was found, added at staging; the gate refuses
+  one without it.
+
+### Changed
+
+- **The opt-out line is Romanian by default** (*Nu vă interesează?
+  Răspundeți „stop" și nu vă mai scriu.*), and Romanian opt-out words
+  (*dezabonare*, *nu mai doresc să primesc*, *nu ne mai trimiteți*,
+  *scoateți-mă din listă*, *Stop, mulțumesc*, *Nu, mulțumim*, singular or
+  plural, with or without diacritics) are honoured by the keyword rules;
+  *nu mai doresc să aștept* and *nu ștergeți datele* are not opt-outs. An
+  objection (*de unde aveți adresa?*, *ștergeți-mi datele*) is recorded as
+  one and handed to you. An opt-out is recorded before anything else about
+  the reply, and one that couldn't be recorded (a locked database) is read
+  again next cycle, up to five times, then handed to you.
+- **Undoing an opt-out with one click** lifts only one Harvey read in the
+  reply's words. An unsubscribe, an objection or a complaint is undone on
+  the do-not-contact list, with a note saying why.
+- **`harvey export --all` leaves the do-not-contact list out** too: a full
+  dump can be fed to another sequencer just the same.
+- **Every reply is read.** IMAP reads by date in read-only mode (nothing is
+  marked read), and a read reaches back to the last complete one when
+  Harvey was off longer than a week; cold email waits while a read hasn't
+  covered the gap. A mailbox with more mail since then than a read takes
+  (5,000 IMAP messages, 40 pages on Gmail or Microsoft 365) is read newest
+  first instead of failing every read; cold email then waits until a read
+  covers the gap or you accept it (`harvey sending accept-gap`,
+  `POST /api/mail/read-gap/accept`). A message from a stranger never holds
+  sending: it is marked read, and handed to you, and put on the list when
+  their own words ask to stop, only when it answers Harvey's thread or
+  comes from a firm Harvey wrote to; a newsletter's "dezabonare" link bars
+  nobody. An IMAP read that fails now holds sending instead of looking
+  like an empty inbox.
+- **Cold email waits when the sending address isn't known** (no
+  `persona.email` and Gmail or Microsoft 365 couldn't say which mailbox is
+  signed in), rather than going without its unsubscribe header.
+- **Schema 26, in place.** The upgrade still writes schema 25; Harvey takes
+  the file to 26 when it opens it, in one transaction. A file a newer
+  Harvey made is refused with a message that says so. Going back to an
+  earlier release after this one has opened the database doesn't work:
+  earlier releases don't know schema 26 and ask for `harvey upgrade`,
+  which can't help. Keep a copy of `data/harvey.db` from before updating
+  if you may need to go back.
+- **Romanian webmail domains** (rdslink.ro, clicknet.ro, email.ro, k.ro,
+  home.ro) and gmx.net count as free mail: never a firm's key, and an
+  address there is personal.
+
 ### Changed
 
 - **A slim database: harvey.db keeps Harvey's own work, the registers are

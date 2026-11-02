@@ -62,6 +62,7 @@ function failMsg(data, fallback) {
                        status: t('q.st.' + data.job.status)});
   }
   if (data && data.code === 'not_stoppable') return t('q.not_stoppable');
+  if (data && data.code === 'optout_listed') return t('optout.still_listed');
   return (data && (data.message || data.error || data.detail)) || fallback;
 }
 
@@ -1130,6 +1131,8 @@ function todayItemText(it, stats) {
     case 'outbox': return tr(t('today.item.outbox', {n: s.outbox_pending || 0}),
       /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
+    case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
+    case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.outbox_action'));
   }
   if (/Open the log/.test(it.action || '')) same.action = t('today.item.open_log');
   return same;

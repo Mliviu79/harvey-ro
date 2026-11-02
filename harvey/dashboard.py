@@ -59,9 +59,11 @@ async def _lifespan(_app):
     # database stays missing until something writes; an older schema waits
     # for the upgrade (the pages show its screen until then).
     if DB_PATH.exists():
-        from harvey.state import StateManager, UpgradeNeeded
+        from harvey.state import NewerBuild, StateManager, UpgradeNeeded
         try:
             await StateManager(str(DB_PATH)).init_db()
+        except NewerBuild as e:
+            logger.error("%s", e)
         except UpgradeNeeded:
             logger.warning("%s waits for the upgrade: the dashboard shows the upgrade screen",
                            DB_PATH)
@@ -748,6 +750,11 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     blocked = _blocked_entries(config)
     # The rows (overlay.reads.company_rows) carry what they need.
     inputs = {r["id"]: r.pop("_inputs") for r in rows}
+    # An address the do-not-contact list bars is never offered either.
+    suppressed = await _state().suppressed_emails(
+        [p.get("email") for v in inputs.values() for p in v["prospects"]])
+    for v in inputs.values():
+        v["prospects"] = [p for p in v["prospects"] if p.get("email") not in suppressed]
     return _enriched(rows, config, blocked,
                      {i: v["phones"] for i, v in inputs.items()},
                      {i: v["people"] for i, v in inputs.items()},
@@ -1908,17 +1915,20 @@ async def get_contacts(request: Request, view: str = "contacts", limit: int = 50
         return JSONResponse({**empty, "error": str(e)}, status_code=400)
     found = await state.read("contacts_listing", f, sort, dir, limit, offset, people)
     rows = found.pop("rows")
-    _block_listed(rows, people)
+    _block_listed(rows, people, set() if people else await state.suppressed_emails(
+        [r["value"] for r in rows if r.get("kind") == "email"]))
     return {**empty, **found, "rows": rows}
 
 
-def _block_listed(rows: list[dict], people: bool) -> None:
-    """Mark the emails on compliance.do_not_contact (the Contacts page)."""
+def _block_listed(rows: list[dict], people: bool, suppressed: set | None = None) -> None:
+    """Mark the emails on compliance.do_not_contact, and those the
+    do-not-contact list bars (``suppressed``), on the Contacts page."""
     blocked = _blocked_entries(_load_config_quietly()) if not people else []
-    if blocked:
+    if blocked or suppressed:
         from harvey.gate import do_not_contact_match
         for r in rows:
-            if r["kind"] == "email" and do_not_contact_match(r["value"], blocked):
+            if r["kind"] == "email" and (r["value"] in (suppressed or ()) or (
+                    blocked and do_not_contact_match(r["value"], blocked))):
                 r["do_not_contact"] = True
 
 
@@ -2097,9 +2107,14 @@ async def _overlay_contact_export(state, f, request: Request) -> tuple[list[dict
     blocked = _blocked_entries(_load_config_quietly(), strict=True)
     rows = await state.read("contact_export", f, request.query_params.get("sort", ""),
                             request.query_params.get("dir", "desc"), CONTACT_EXPORT_MAX)
+    # The do-not-contact list's entries (address, domain, a firm the address
+    # reaches) as well as compliance.do_not_contact.
+    suppressed = await state.suppressed_emails(
+        [r["value"] for r in rows if r["kind"] == "email"])
     out = []
     for r in rows:
-        if r["kind"] == "email" and blocked and do_not_contact_match(r["value"], blocked):
+        if r["kind"] == "email" and (r["value"] in suppressed or (
+                blocked and do_not_contact_match(r["value"], blocked))):
             continue
         if blocked and any(d and do_not_contact_domain_match(d, blocked) for d in r["domains"]):
             continue
@@ -2370,7 +2385,8 @@ async def outbox_edit(item_id: str, request: Request):
         footer = _compliance_view()["footer"]
         if item.get("kind") == "sequence" and footer and not text.rstrip().endswith(footer):
             checked = text.rstrip() + "\n\n" + footer  # as the Sender will send it
-        gate = pre_send_check("reviewer@example.com", subject, checked)
+        gate = pre_send_check("reviewer@example.com", subject, checked,
+                              acknowledged=True, personal=False)
         if not gate:
             return JSONResponse({"success": False,
                                  "message": "The sender would have blocked this: "
@@ -3122,11 +3138,144 @@ async def undo_opt_out(prospect_id: str, request: Request):
     await state.init_db()
     history = await state.opt_out_history(prospect_id)
     last = next((h for h in reversed(history) if h["action"] == "opt_out"), {})
-    if not await state.undo_opt_out(prospect_id, details={
+    from harvey import suppression
+    try:
+        undone = await state.undo_opt_out(prospect_id, details={
             "prospect_email": rows[0].get("email") or "",
-            "previous_why": last.get("why", ""), "previous_at": last.get("at", "")}):
+            "previous_why": last.get("why", ""), "previous_at": last.get("at", "")})
+    except suppression.Refused as e:
+        # An unsubscribe, objection or complaint: undone on the list, with
+        # a note (POST /api/suppression/{id}/undo), not with one click.
+        return JSONResponse({"success": False, "message": str(e), "code": "optout_listed"},
+                            status_code=409)
+    if not undone:
         return _refuse("This person isn't opted out.")
     return {"success": True, "status": "replied"}
+
+
+# ── The cold-email acknowledgement and the do-not-contact list ──
+
+@app.get("/api/acknowledgement")
+async def get_acknowledgement():
+    """The cold-email acknowledgement's text (Romanian and English), its
+    version and whether it was confirmed. Cold email waits until it is."""
+    state = _state()
+    await state.init_db()
+    return await state.acknowledgement_status()
+
+
+@app.post("/api/acknowledgement")
+async def post_acknowledgement(request: Request):
+    """Confirm it: {"typed": "accept"}, the word typed by the operator."""
+    from harvey import acknowledgement
+
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    typed = str((body or {}).get("typed") or "").strip().lower() if isinstance(body, dict) else ""
+    if typed != acknowledgement.CONFIRM_WORD:
+        return _refuse(f'expected {{"typed": "{acknowledgement.CONFIRM_WORD}"}}', 400)
+    state = _state()
+    await state.init_db()
+    await state.acknowledge("dashboard")
+    return {"success": True, **await state.acknowledgement_status()}
+
+
+@app.post("/api/mail/read-gap/accept")
+async def accept_read_gap(request: Request):
+    """Let cold email go after a mailbox read that couldn't reach back to
+    the last complete one: {"typed": "accept"}. An unsubscribe or reply
+    sent in that time may stay unread; the acceptance is logged."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    typed = str((body or {}).get("typed") or "").strip().lower() if isinstance(body, dict) else ""
+    if typed != "accept":
+        return _refuse('expected {"typed": "accept"}', 400)
+    state = _state()
+    await state.init_db()
+    if not await state.accept_read_gap("dashboard"):
+        return _refuse("Cold email isn't waiting for a mailbox read.", 404)
+    return {"success": True}
+
+
+@app.get("/api/suppression")
+async def get_suppression(all: bool = False):
+    """The do-not-contact list: the entries in force (``all``: undone too)."""
+    state = _state()
+    await state.init_db()
+    rows = await state.suppression_entries(live_only=not all)
+    return {"rows": rows, "total": len(rows)}
+
+
+@app.get("/api/suppression.csv")
+async def get_suppression_csv(all: bool = False):
+    """The list as CSV, to keep beside an export: an export is what was
+    true when it was made, the list is what holds from now on."""
+    import csv
+    import io
+
+    state = _state()
+    await state.init_db()
+    rows = await state.suppression_entries(live_only=not all)
+    buf = io.StringIO()
+    out = csv.DictWriter(buf, fieldnames=["id", "scope", "value", "reason", "at", "by",
+                                          "undone_at", "undone_by"], extrasaction="ignore")
+    out.writeheader()
+    out.writerows(rows)
+    return _csv_download(buf.getvalue(), "nu-contacta.csv")
+
+
+@app.post("/api/suppression")
+async def add_suppression(request: Request):
+    """Never email an address, a domain or a firm again: {"scope": "address"
+    | "domain" | "firm", "value": ..., "note": ...} (a firm's value is its
+    company id)."""
+    from harvey import suppression
+
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("scope") not in ("address", "domain", "firm"):
+        return _refuse('expected {"scope": "address" | "domain" | "firm", "value": ...}', 400)
+    state = _state()
+    await state.init_db()
+    try:
+        made = await state.suppress(body["scope"], body.get("value") or "", "by_hand",
+                                    by="you", note=str(body.get("note") or ""))
+    except suppression.Refused as e:
+        return _refuse(str(e), 400)
+    return {"success": True, "added": made is not None, "id": made}
+
+
+@app.post("/api/suppression/{entry_id}/undo")
+async def undo_suppression(entry_id: int, request: Request):
+    """Undo an entry (soft: its history stays). One the person asked for
+    (an unsubscribe, an opt-out, an objection) needs {"typed": "confirm",
+    "note": why}; one you added needs nothing."""
+    from harvey import suppression
+
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    body = body if isinstance(body, dict) else {}
+    state = _state()
+    await state.init_db()
+    entry = next((e for e in await state.suppression_entries() if e["id"] == entry_id), None)
+    if entry is None:
+        return _refuse("no entry in force with that id", 404)
+    asked = {suppression.REASON_NAMES[r] for r in suppression.PERSON_ASKED}
+    note = str(body.get("note") or "").strip()
+    if entry["reason"] in asked and (str(body.get("typed") or "").strip().lower() != "confirm"
+                                     or not note):
+        return _refuse('they asked not to be contacted: expected {"typed": "confirm", '
+                       '"note": why}', 400)
+    await state.undo_suppression(entry_id, by="you", note=note)
+    return {"success": True}
 
 
 @app.get("/api/conversations")
@@ -4249,6 +4398,7 @@ async def get_today():
             "outbox_approved": len(approved),
             "open_conversations": open_convos,
             "needs_human": needs_human,
+            "cold_waiting": len([i for i in pending + approved if i.get("kind") == "sequence"]),
             "signals_proposed": len(proposed),
             "email_provider": _current_provider(),
             "unprofiled": unprofiled_count,
@@ -4274,6 +4424,32 @@ async def get_today():
             items.append({
                 "key": "sends-held", "tone": "bad", "title": title, "detail": detail,
                 "action": "Open the log", "tab": "controls",
+            })
+
+        # Cold email waits until the mailbox was read back to its last
+        # complete read (an unsubscribe sent while Harvey was off).
+        gap = await state.read_gap()
+        if gap is not None:
+            items.append({
+                "key": "read-gap", "tone": "bad",
+                "title": "Cold email waits for a complete mailbox read",
+                "detail": ("The last read didn't reach back to the one before it, so an "
+                           "unsubscribe in between may be unread. Replies still go out; "
+                           "cold email goes once a read covers the gap, or once you accept "
+                           "it (harvey sending accept-gap)."),
+                "reason": gap.get("reason") or "",
+                "action": "Open the log", "tab": "controls",
+            })
+
+        # Cold email waits for the operator's acknowledgement.
+        cold_waiting = [i for i in pending + approved if i.get("kind") == "sequence"]
+        if cold_waiting and not await state.acknowledged():
+            items.append({
+                "key": "ack", "tone": "bad",
+                "title": "Cold email waits for your acknowledgement",
+                "detail": ("Read what sending cold email to firms means and confirm it once: "
+                           "run harvey ack in a terminal."),
+                "action": "Open the decisions desk", "tab": "outbox",
             })
 
         if paused:
