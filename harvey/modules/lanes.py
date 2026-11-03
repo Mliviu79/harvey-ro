@@ -172,6 +172,17 @@ async def wait(lane: str) -> None:
         await asyncio.to_thread(_turn, lane, gap)
 
 
+async def wait_gap(lane: str, seconds: float) -> None:
+    """wait() with a pace a setting gives (a requests-per-minute limit the
+    user sets) rather than a manifest's: the lane still has to be declared,
+    and the turns are shared between processes the same way."""
+    interval(lane)
+    if seconds <= 0:
+        return
+    async with _lock(lane):
+        await asyncio.to_thread(_turn, lane, float(seconds))
+
+
 # ── Free allowances: what a service gives free each period ──
 #
 # A search module's manifest declares the requests it may make free each

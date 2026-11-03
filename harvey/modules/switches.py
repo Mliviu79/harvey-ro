@@ -163,6 +163,13 @@ def setting_value(spec: dict, raw):
         if kind == "list":
             return [v.strip() for v in str(raw).split(",") if v.strip()] \
                 if not isinstance(raw, list) else raw
+        if kind == "choice":
+            # One of the manifest's choices, else the default.
+            text = str(raw).strip()
+            return text if text in (spec.get("choices") or ()) else default
+        if kind == "str":
+            text = str(raw).strip()
+            return text[:int(spec["max_length"])] if spec.get("max_length") else text
         return str(raw)
     except (TypeError, ValueError):
         return default

@@ -142,6 +142,9 @@ class Record:
     activities: list[tuple[str, int]] = field(default_factory=list)
     # The search phrase that found it.
     found_by: str = ""
+    # The short text a search result shows under its title: read once, in
+    # memory, to tell a company's own site from the rest; never stored.
+    snippet: str = ""
     # What the source counted for it: {"administrators": 2}.
     counts: dict[str, int] = field(default_factory=dict)
     module: str = ""

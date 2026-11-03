@@ -22,6 +22,7 @@
    "site_read_at": false,
    "site_read_deep": null,
    "website": "https://www.brindlewickroofing.example/",
+   "website_basis": null,
    "website_fill": null,
    "website_source": 1,
    "website_trust": null
@@ -46,6 +47,7 @@
    "site_read_at": false,
    "site_read_deep": null,
    "website": "https://brightpathlabs.example/about",
+   "website_basis": null,
    "website_fill": null,
    "website_source": 1,
    "website_trust": null
@@ -70,6 +72,7 @@
    "site_read_at": false,
    "site_read_deep": null,
    "website": "https://vellmoraroofing.example/",
+   "website_basis": null,
    "website_fill": null,
    "website_source": 1,
    "website_trust": null

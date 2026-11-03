@@ -782,9 +782,9 @@ async def known_lane(state, lane: str) -> bool:
     that holds jobs or is paused already. Anything else is a typo, and
     pausing it would only make a lane that doesn't exist."""
     from harvey.modules import switches
-    from harvey.modules.job_kinds import CONTACTS_LANE
+    from harvey.modules.job_kinds import CONTACTS_LANE, SITE_CHECK_LANE
 
-    if lane in switches.by_id() or lane == CONTACTS_LANE:
+    if lane in switches.by_id() or lane in (CONTACTS_LANE, SITE_CHECK_LANE):
         return True
     if lane in await paused_lanes(state):
         return True

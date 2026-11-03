@@ -9,6 +9,52 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A small model that tells a firm's own website from the rest.** The
+  contact finder weighs every search result, not just the best-named one.
+  Code rules out directories, listings, profiles of the firm on other sites
+  and institutions by their address, before any visit; a register fact on
+  the pages decides the rest when it can (the firm's CUI or registration
+  number with no other firm's beside it, an official email or phone next
+  to its name that few firms share); everything else goes to a small, fast
+  yes/no classifier you choose (Settings → Classifier: any
+  OpenAI-compatible endpoint, local or hosted, a small Claude model, or
+  Harvey's own). Each candidate is asked alone whether it is the firm's
+  site, and exactly one yes is taken; then each contact read there is
+  asked whether it is the firm's own (the firm's official phones and
+  emails are always kept). It can only
+  make a site likely, never confirmed. `harvey contacts
+  judge-test` scores it over a built-in fictional labelled set or your own
+  file.
+- **Decision models as a classifier provider** (`decision`): any endpoint
+  in the System One format (a state and atomic questions, each answered
+  with a probability), called over HTTP at the full endpoint URL you enter:
+  it is for TypeSafe's Jev (`https://api.typesafe.ai/v1/systemone`, model
+  `jev-latest`, key `TYPESAFE_API_KEY`). It gets questions of its own,
+  combined in code: for a site, does it name the firm (at least 0.5),
+  present the firm's own business (at least 0.4), is it a directory or an
+  institution (each under 0.7), the bars as measured; for each contact on
+  the chosen site, whose it is, kept at the contacts bar (`classify_yes`,
+  0.7, a setting). The company panel shows the probability.
+- **What the classifier costs, and a USD budget.** Every call records its
+  cost: the reply's own when it says one, else tokens times the price you
+  enter, else, on an OpenAI-compatible DeepInfra endpoint, the model's
+  price on DeepInfra's public price list (a decision model has only the
+  price you enter); unknown is recorded at $0 and said so. USD caps a day and a month
+  (Settings → Classifier) sit next to the call caps: reached, the firms
+  wait unlinked; with the price unknown, only the call caps hold. The card
+  shows calls and spend today and this month, cost per site checked and
+  tokens a call; on DeepInfra it lists the models with their prices to
+  choose from, and an Account box reads the key's usage, limit and balance
+  on the server. `harvey contacts status` and the judge test print spend.
+  You choose provider, model, prices and budget: none is filled in for you.
+- **A check of the websites found before** (`harvey contacts rejudge`,
+  Today, Settings → Classifier): counted first, run when you start it (on
+  a lane of its own, behind no Find contacts run), one that isn't the
+  firm's taken off with exactly what its read left, and `--undo BATCH` to
+  put it back. One it takes only gains: the contacts chosen are made surer,
+  and nothing linked is removed or made less sure. A site that doesn't answer is taken off only after three
+  days of trying. The company panel says why a found website was taken.
+
 - **The cold-email acknowledgement on the dashboard.** Settings → Sending
   shows whether it was given (version, when, from where) and opens a dialog
   with the whole text, in the page's language, where you type `accept`;
@@ -525,6 +571,11 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **A website a search found is no longer linked on its name alone.** With
+  no classifier set up, a site no register fact confirms is kept with
+  nothing linked from it, waiting for a check, instead of linking every
+  phone and email on it as "unconfirmed".
+
 - **Autopilot approves an answer when it goes, as it does cold email.** The
   Handler's answers always wait in the Outbox; on autopilot the drain that
   sends one approves it then, after the autopilot review, so an answer
@@ -777,6 +828,12 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **A found website no longer confirms itself.** A second read of a site a
+  search found counted the phones and emails its first read had linked as
+  "on file" and marked them confirmed (campaign audiences take confirmed
+  links). Only a phone or email an official source gave confirms a site
+  now; the check of found websites re-trusts what was linked that way.
 
 - **Conversations from before replies were attributed land in their
   campaign** (schema 28, in place): the campaign of the cold email each one

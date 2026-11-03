@@ -13,7 +13,7 @@ import sqlite3
 import httpx
 import pytest
 
-from harvey import contacts, finder
+from harvey import classify, contacts, finder
 from harvey.collectors import discover as D
 from harvey.models import Company
 from harvey.modules import api, ingest, job_kinds, jobs, lanes, switches
@@ -277,6 +277,16 @@ def test_the_background_looks_up_inside_the_free_allowance_and_keeps_only_the_si
     fake = FakeBrave().install(monkeypatch)
     read = []
     _site_reader(monkeypatch, read)
+    asked = []
+
+    async def ask(state, task, payload, **kw):
+        # The classifier (a fake) takes the one candidate read.
+        asked.append((task, [c.domain for c in payload.get("cards", [])]))
+        if task == "contacts":
+            return classify.Answer(value={"contacts": [0]}, model="fake-small")
+        return classify.Answer(value={"yes": True}, model="fake-small")
+
+    monkeypatch.setattr(classify, "ask", ask)
 
     async def go():
         s = await _state(db)
@@ -290,11 +300,14 @@ def test_the_background_looks_up_inside_the_free_allowance_and_keeps_only_the_si
     assert found.steps[:2] == ["search:brave", "site"] and found.cost == 0.0
     assert found.website == "alfa-dent.example" and read == ["alfa-dent.example"]
     assert len(fake.requests) == 1 and lanes.uses("brave") == {"month": 1}
-    # The search is on record, free, naming only the site it chose.
+    # (The listing was left out by its address: only one candidate to judge.)
+    assert asked == [("site", ["alfa-dent.example"]), ("contacts", ["alfa-dent.example"])]
+    # The search is on record, free, naming only the site it read.
     assert _rows(db, "SELECT m.name, c.name, s.outcome, s.cost, s.detail FROM search s "
                      "JOIN module m ON m.id = s.module JOIN capability c ON c.id = s.capability "
                      "WHERE s.looked_for = (SELECT bit FROM looked_for WHERE name = 'website')") == [
-        ("brave", "website_search", 1, 0.0, "alfa-dent.example")]
+        ("brave", "website_search", 1, 0.0, "2 results: 1 profile; read: alfa-dent.example; "
+         "alfa-dent.example: the classifier said yes")]
     assert _rows(db, "SELECT website_trust FROM firm WHERE id = ?", (int(cid),)) == [(1,)]
     # Nothing else from the results is kept: not in the database, not in the log.
     everything = _everything(db)

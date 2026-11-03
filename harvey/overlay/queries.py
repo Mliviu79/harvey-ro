@@ -367,16 +367,19 @@ statement("overlay.read.backlog.searched",
           "AND finder_at >= ?", params=(0,),
           scans={"firm": "the firms with no contact, counted once per BACKLOG_CACHE_SECONDS: "
                          "the no-contact index read whole (about 0.3 s over 700k)"})
+# (A website a search found that waits for a check is never read meanwhile:
+# finder.find skips it, so the walk leaves it out.)
+_NOT_WAITING = "AND (website_trust IS NOT 2 OR domain IS NOT NULL) "
 statement("overlay.read.next_free",
           "SELECT id FROM firm INDEXED BY firm_with_site WHERE live = 0 "
           "AND (website IS NOT NULL OR domain IS NOT NULL) AND n_contacts = 0 "
-          "AND (site_read_deep IS NULL OR site_read_deep < ?) ORDER BY created DESC, id DESC "
-          "LIMIT ?", params=(0, 50), bounded=True)
+          "AND (site_read_deep IS NULL OR site_read_deep < ?) " + _NOT_WAITING +
+          "ORDER BY created DESC, id DESC LIMIT ?", params=(0, 50), bounded=True)
 statement("overlay.read.next_shallow",
           "SELECT id FROM firm INDEXED BY firm_with_site WHERE live = 0 "
           "AND (website IS NOT NULL OR domain IS NOT NULL) AND n_contacts > 0 "
-          "AND site_read_at IS NOT NULL AND site_read_deep IS NULL ORDER BY created DESC, id DESC "
-          "LIMIT ?", params=(50,), bounded=True)
+          "AND site_read_at IS NOT NULL AND site_read_deep IS NULL " + _NOT_WAITING +
+          "ORDER BY created DESC, id DESC LIMIT ?", params=(50,), bounded=True)
 statement("overlay.read.next_paid",
           "SELECT id FROM firm INDEXED BY firm_no_contact WHERE live = 0 AND n_contacts = 0 "
           "AND website IS NULL AND domain IS NULL ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
@@ -608,3 +611,39 @@ statement("overlay.read.orders",
 statement("overlay.read.prospect_rows",
           "SELECT * FROM prospects ORDER BY created_at DESC, rowid DESC", bounded=True,
           scans={"prospects": "the Email module's prospects (thousands at most), every one"})
+
+# ── The contact finder's website check (harvey/finder.py, site_match.py) ──
+# Found websites nothing checked yet: a small partial index (schema 29).
+_SITE_CHECK = ("live = 0 AND website_source IS NOT NULL AND website_basis IS NULL "
+               "AND website_trust > 0")
+statement("overlay.site_check.ids",
+          f"SELECT id FROM firm INDEXED BY firm_site_check WHERE {_SITE_CHECK} "
+          "ORDER BY id LIMIT ?", params=(50,))
+statement("overlay.site_check.count",
+          f"SELECT website_trust, COUNT(*) FROM firm INDEXED BY firm_site_check "
+          f"WHERE {_SITE_CHECK} GROUP BY website_trust")
+statement("overlay.site_check.rows",
+          f"SELECT f.id, f.website, f.website_trust FROM {_J} CROSS JOIN firm f "
+          "WHERE f.id = j.value", params=_IDS, drives="j")
+# The classifier's calls since midnight (its day cap), by its usage rows.
+statement("overlay.classify.calls_today",
+          "SELECT COUNT(*) FROM usage_events WHERE created_at >= ? AND task LIKE ?",
+          params=("2026-01-01 00:00:00", "classify.%"))
+# What its calls cost since a time (its USD caps): the classifier's own rows
+# only (Harvey's own model records its usage under its own source).
+statement("overlay.classify.spend_since",
+          "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_events WHERE created_at >= ? "
+          "AND task LIKE 'classify.%' AND source LIKE 'classify%'",
+          params=("2026-01-01 00:00:00",))
+# Its calls, errors, tokens, spend and unpriced calls per task since a time.
+statement("overlay.classify.by_task",
+          "SELECT task, COUNT(*), SUM(is_error), SUM(input_tokens), SUM(output_tokens), "
+          "SUM(cost_usd), SUM(source = 'classify:unpriced' AND is_error = 0) "
+          "FROM usage_events WHERE created_at >= ? AND task LIKE 'classify.%' GROUP BY task",
+          params=("2026-01-01 00:00:00",), bounded=True)
+# How the last answered call of a model was priced (a reply carrying its cost).
+statement("overlay.classify.last_source",
+          "SELECT source FROM usage_events WHERE created_at >= ? AND task LIKE 'classify.%' "
+          "AND model = ? AND is_error = 0 AND input_tokens > 0 "
+          "ORDER BY created_at DESC LIMIT 1",
+          params=("2026-01-01 00:00:00", "m"))

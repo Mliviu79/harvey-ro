@@ -54,6 +54,12 @@ COUNTED_CONTACTS = ("any", "none", "email", "phone", "mobile")
 # theirs; and the register-condition sets a cohort reads, per load mark.
 from harvey.companies import Ordered, Snapshots  # noqa: E402
 
+# The sources a read of a website writes contacts under (its pages, its
+# phones, the people it names, an address built at its domain): never
+# evidence that a site is the company's.
+SITE_SOURCES = frozenset({"website", "phones", "people", "email_verify", "profile",
+                          "profile:browser"})
+
 ORDERINGS = Snapshots()
 SETS = Snapshots(kept=64, seconds=600)
 # How long an ordering of every firm (no filter) is kept at most: it is
@@ -1780,6 +1786,7 @@ class Reader:
         row = self.company(cid)
         if row is None:
             return None
+        row["website_basis"] = self.website_basis(cid)
         return {"row": row, "findings": self.findings(cid), "reach": self.of_company(cid),
                 "keys": self.company_keys(cid), "signals": self.panel_signals(cid),
                 "counts": self.counts([row["id"]])[row["id"]]}
@@ -3430,10 +3437,14 @@ class Reader:
         if not rows:
             return None
         r = rows[0]
-        trust = self.one("SELECT website_trust FROM firm WHERE id = ?", (fid,))
+        trust, found = self.x("SELECT website_trust, website_source FROM firm WHERE id = ?",
+                              (fid,)).fetchone()
         out = {k: r.get(k) or "" for k in ("id", "name", "domain", "website", "location", "cui",
                                            "phone", "source_url", "source", "company_size")}
         out["website_trust"] = TRUST_NAMES.get(trust, "") if trust is not None else ""
+        # (A website a search found, as opposed to one the firm declares,
+        # which has a source and no trust.)
+        out["website_found"] = found is not None and trust is not None and bool(r.get("website"))
         return out
 
     def _group_links(self, cid) -> tuple[list[int], list, dict]:
@@ -3448,10 +3459,184 @@ class Reader:
         return group, links, rows
 
     def finder_on_file(self, cid) -> set[str]:
-        """The phones and emails on file for a company, lower case."""
-        _, links, rows = self._group_links(cid)
-        return {rows[l[1]][2].lower() for l in links
-                if l[1] in rows and rows[l[1]][11] in (PHONE, EMAIL)}
+        """The phones and emails on file for a company that a source other
+        than a read of a website gave (a register, ANAF, the taxpayer file,
+        a listing), lower case: what confirms a site the company's. One a
+        site's own read linked never does, or a second read of the same
+        site would confirm it by what the first left."""
+        return {c["value"].lower() for c in self._official_contacts(cid)
+                if c["kind"] in (PHONE, EMAIL)}
+
+    def _official_contacts(self, cid) -> list[dict]:
+        """The company's contacts with evidence from a source that isn't a
+        website's read (SITE_SOURCES): {"kind", "value", "n_firms"}."""
+        group, links, rows = self._group_links(cid)
+        pairs = [[l[0], l[1]] for l in links if l[1] in rows]
+        official = set()
+        for contact, source, _ in self._by_ids("overlay.read.evidence_caps", pairs, 500):
+            if (source or "") not in SITE_SOURCES:
+                official.add(contact)
+        return [{"kind": rows[c][11], "value": rows[c][2], "n_firms": rows[c][9] or 0}
+                for c in sorted(official)]
+
+    def site_facts(self, cid) -> dict | None:
+        """What the registers say of a company, as the contact finder's
+        evidence cards compare a website with it (site_match.Facts): name,
+        legal form, CUI, registration number, street and number, town,
+        county, and the phones (E.164) and emails official sources give,
+        each with how many firms hold it (``holders``: an accountant's
+        address or a group's switchboard says nothing of whose site it is)."""
+        from harvey import site_match
+
+        fid = self.live(cid)
+        if fid is None:
+            return None
+        rows = self.company_rows([fid])
+        if not rows:
+            return None
+        row = rows[0]
+        group = self.members([fid])[fid]
+        idents = self.idents(group)
+        own = [k for m in group for k in idents.get(m, [])]
+        card = self.describe({fid: own}).get(fid, {}).get("card") or {}
+        reg = card.get("reg") or ""
+        if not reg and (row.get("external_id") or "").count(":") >= 2:
+            reg = row["external_id"].rsplit(":", 1)[-1]
+        place = [p.strip() for p in (row.get("location") or "").split(",")]
+        street, number = site_match.split_street(row.get("address") or "")
+        official = self._official_contacts(fid)
+        return {"name": row.get("name") or "", "form": card.get("legal_form") or "",
+                "cui": row.get("cui") or "", "reg": reg, "street": street, "number": number,
+                "locality": place[0] if place else "",
+                "county": place[1] if len(place) > 2 else "",
+                "phones": [c["value"] for c in official if c["kind"] == PHONE],
+                "holders": {c["value"] if c["kind"] == PHONE else c["value"].lower(): c["n_firms"]
+                            for c in official if c["kind"] in (PHONE, EMAIL)},
+                "emails": [c["value"].lower() for c in official if c["kind"] == EMAIL],
+                "region": "RO" if (row.get("location") or "").strip().endswith("Romania")
+                or row.get("cui") else ""}
+
+    def classify_calls_today(self, task: str = "") -> int:
+        """Calls the classifier made since midnight UTC (one task's, when given)."""
+        import datetime as _dt
+
+        day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d 00:00:00")
+        like = f"classify.{task}" if task else "classify.%"
+        return int(self.one("overlay.classify.calls_today", (day, like)) or 0)
+
+    def classify_spend_since(self, since: str) -> float:
+        """USD the classifier's own calls cost since ``since`` (UTC)."""
+        return float(self.one("overlay.classify.spend_since", (since,)) or 0.0)
+
+    def classify_by_task(self, since: str) -> dict:
+        """{task: {"calls", "errors", "tokens_in", "tokens_out", "usd",
+        "unpriced"}} of the classifier's calls since ``since`` (UTC)."""
+        out = {}
+        for task, calls, errors, tin, tout, usd, unpriced in self.x(
+                "overlay.classify.by_task", (since,)):
+            out[str(task).split(".", 1)[-1]] = {
+                "calls": int(calls or 0), "errors": int(errors or 0),
+                "tokens_in": int(tin or 0), "tokens_out": int(tout or 0),
+                "usd": round(float(usd or 0.0), 6), "unpriced": int(unpriced or 0)}
+        return out
+
+    def classify_last_source(self, model: str, since: str) -> str:
+        """How the last answered call of ``model`` since ``since`` was
+        priced (its usage row's source), "" when there is none."""
+        return str(self.one("overlay.classify.last_source", (since, model)) or "")
+
+    def site_check_ids(self, limit: int = -1) -> list[int]:
+        """Live firms whose website a search found and nothing checked yet
+        (unconfirmed, or likely with no basis): the re-check's selection,
+        oldest first."""
+        return [r[0] for r in self.x("overlay.site_check.ids", (int(limit),))]
+
+    def site_check_count(self) -> dict:
+        """{"unconfirmed": n, "likely": n} of site_check_ids."""
+        out = {"unconfirmed": 0, "likely": 0}
+        for trust, n in self.x("overlay.site_check.count"):
+            out[TRUST_NAMES.get(trust, "unconfirmed")] = n
+        return out
+
+    def site_check_rows(self, ids) -> list[dict]:
+        """For each firm: id, website, trust, and the facts screen() reads
+        from a URL alone (name, CUI, registration number)."""
+        out = []
+        for chunk in chunks(list(ids), 500):
+            rows = {r["id"]: r for r in self.company_rows(chunk)}
+            for fid, website, trust in self._by_ids("overlay.site_check.rows", chunk):
+                r = rows.get(str(fid)) or {}
+                out.append({"id": fid, "website": website or "",
+                            "trust": TRUST_NAMES.get(trust, ""), "name": r.get("name") or "",
+                            "cui": r.get("cui") or "", "external_id": r.get("external_id") or ""})
+        return out
+
+    def site_candidates(self, cid) -> list[str]:
+        """The candidates a waiting found website's lookup left in question
+        (site_match.waiting_detail on the newest read of it), in order; [] for
+        a site found before the finder kept them."""
+        from harvey.site_match import WAITING, waiting_candidates
+
+        fid = self.live(cid)
+        cap = self.capability_id("website", "read_site")
+        if fid is None or cap is None:
+            return []
+        group = self.members([fid])[fid]
+        marks = ",".join("?" * len(group))
+        row = self.x(f"SELECT detail FROM search WHERE is_person = 0 AND target IN ({marks}) "
+                     f"AND capability = ? AND detail LIKE ? ORDER BY at DESC, id DESC LIMIT 1",
+                     (*group, cap, WAITING + "%")).fetchone()
+        return waiting_candidates(row[0]) if row else []
+
+    def site_check_failures(self, cid, prefix: str) -> int:
+        """On how many days the re-check found a firm's website not
+        answering (its judge_site errors whose detail starts ``prefix``)."""
+        fid = self.live(cid)
+        mid = self.module_id("contact_finder")
+        cap = self.capability_id("contact_finder", "judge_site")
+        if fid is None or mid is None or cap is None:
+            return 0
+        group = self.members([fid])[fid]
+        marks = ",".join("?" * len(group))
+        return int(self.one(
+            f"SELECT COUNT(DISTINCT at / 86400) FROM search WHERE is_person = 0 "
+            f"AND target IN ({marks}) AND module = ? AND capability = ? AND outcome = 0 "
+            f"AND detail LIKE ?", (*group, mid, cap, prefix + "%")) or 0)
+
+    def site_check_last(self, cid) -> str:
+        """The detail of the re-check's newest search of a firm ("" when
+        none): what its last check said."""
+        fid = self.live(cid)
+        mid = self.module_id("contact_finder")
+        cap = self.capability_id("contact_finder", "judge_site")
+        if fid is None or mid is None or cap is None:
+            return ""
+        group = self.members([fid])[fid]
+        marks = ",".join("?" * len(group))
+        return self.one(
+            f"SELECT detail FROM search WHERE is_person = 0 AND target IN ({marks}) "
+            f"AND module = ? AND capability = ? ORDER BY at DESC, id DESC LIMIT 1",
+            (*group, mid, cap)) or ""
+
+    def website_basis(self, cid) -> dict:
+        """Why a found website was taken (firm.website_basis), with its trust
+        and the module whose search found it; {} for a site no search found."""
+        fid = self.live(cid)
+        if fid is None:
+            return {}
+        row = self.x("SELECT website_trust, website_source, website_basis FROM firm WHERE id = ?",
+                     (fid,)).fetchone()
+        # (A website the firm's own source declared has a source and no trust.)
+        if row is None or row[1] is None or row[0] is None:
+            return {}
+        try:
+            basis = json.loads(row[2]) if row[2] else {}
+        except ValueError:
+            basis = {}
+        source = self.one("SELECT name FROM source WHERE id = ?", (row[1],)) or ""
+        return {**(basis if isinstance(basis, dict) else {}),
+                "trust": TRUST_NAMES.get(row[0], "") if row[0] is not None else "",
+                "found_by": source}
 
     def finder_has_contact(self, cid) -> bool:
         fid = self.live(cid)

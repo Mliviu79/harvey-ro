@@ -35,7 +35,7 @@ from harvey import contacts, resolver
 from harvey.overlay import bitmaps, merges, schema, triggers
 from harvey.overlay import queries as _statements  # noqa: F401  (registers the named ones it runs)
 from harvey.overlay.idents import Schemes
-from harvey.overlay.schema import CONTACT_STATUS, FIRM_KEY, LINE_TYPE, PHONE, TRUST
+from harvey.overlay.schema import CONTACT_STATUS, EMAIL, FIRM_KEY, LINE_TYPE, PHONE, TRUST
 
 logger = logging.getLogger("harvey.overlay")
 
@@ -668,7 +668,8 @@ class Store:
         return 0
 
     def set_found_website(self, company_id, website: str, *, domain: str = "",
-                          trust: str = "unconfirmed", source: str = "") -> bool:
+                          trust: str = "unconfirmed", source: str = "",
+                          basis: dict | None = None) -> bool:
         fid = self.live(company_id)
         if fid is None:
             return False
@@ -677,9 +678,283 @@ class Store:
             domain = ""
         return self.x(
             "UPDATE firm SET website = ?, website_trust = ?, website_source = ?, "
-            "domain = COALESCE(domain, ?) WHERE id = ? AND website IS NULL AND domain IS NULL",
+            "website_basis = ?, domain = COALESCE(domain, ?) "
+            "WHERE id = ? AND website IS NULL AND domain IS NULL",
             (website, TRUST.get(trust, TRUST["unconfirmed"]), self.source(source),
-             domain or None, fid)).rowcount > 0
+             json.dumps(basis, ensure_ascii=False) if basis else None, domain or None,
+             fid)).rowcount > 0
+
+    # ── A found website checked again (harvey/finder.py: recheck) ──
+
+    # The sources a site's read writes contacts under (its pages, its
+    # phones); and those that wrote an address at its domain (a person's
+    # published one, one built and checked there).
+    SITE_READ_SOURCES = ("website", "phones", "profile", "profile:browser")
+    AT_DOMAIN_SOURCES = ("people", "email_verify")
+
+    def _found_site(self, company_id):
+        """(live firm, its found website's host, the firm's website columns)
+        or None when it has no website a search found."""
+        from harvey.collectors.discover import normalize_domain
+
+        fid = self.live(company_id)
+        if fid is None:
+            return None
+        row = self.x("SELECT website, domain, website_trust, website_source, website_basis, "
+                     "website_fill FROM firm WHERE id = ?", (fid,)).fetchone()
+        if row is None or row[0] is None or row[3] is None:
+            return None
+        cols = dict(zip(("website", "domain", "website_trust", "website_source",
+                         "website_basis", "website_fill"), row))
+        return fid, normalize_domain(row[0]), cols
+
+    def _site_evidence(self, group: list[int], host: str) -> list[dict]:
+        """The evidence a read of ``host`` left on the firm's records: its
+        pages' contacts (an evidence URL on the host or under it, or none
+        from a site read), and addresses at the host a person's page or an
+        address check gave."""
+        from urllib.parse import urlsplit
+
+        on_host = lambda h: bool(h) and (h == host or h.endswith("." + host))  # noqa: E731
+        reads = {self.source(n) for n in self.SITE_READ_SOURCES}
+        at_domain = {self.source(n) for n in self.AT_DOMAIN_SOURCES}
+        caps = {c for c in (self.capability("website", "read_site"),
+                            self.capability("phones", "site_phones")) if c is not None}
+        marks = ",".join("?" * len(group))
+        cols = ("firm", "contact", "source", "person", "location", "capability", "trust",
+                "confidence", "evidence_url", "first_seen", "last_seen")
+        out = []
+        for row in self.x(
+                f"SELECT e.firm, e.contact, e.source, e.person, e.location, e.capability, e.trust, "
+                f"e.confidence, e.evidence_url, e.first_seen, e.last_seen, c.kind, c.value "
+                f"FROM link_evidence e JOIN contact c ON c.id = e.contact "
+                f"WHERE e.firm IN ({marks})", group):
+            e = dict(zip(cols, row[:11]))
+            kind, value = row[11], row[12] or ""
+            url_host = (urlsplit(e["evidence_url"]).hostname or "").lower().removeprefix("www.") \
+                if e["evidence_url"] else ""
+            if e["source"] in reads:
+                mine = on_host(url_host) or (not e["evidence_url"] and e["capability"] in caps)
+            elif e["source"] in at_domain:
+                mine = kind == EMAIL and on_host(value.rpartition("@")[2].lower())
+            else:
+                mine = False
+            if mine:
+                out.append({**e, "kind": kind, "value": value})
+        return out
+
+    def _drop_evidence(self, group: list[int], rows: list[dict]) -> dict:
+        """Delete ``rows`` (link_evidence, as _site_evidence gives them) and
+        what they leave with nothing: email keys, the site's people, and
+        contacts no link, list or campaign names. Returns what was removed,
+        in full, for an undo."""
+        marks = ",".join("?" * len(group))
+        for e in rows:
+            self.x("DELETE FROM link_evidence WHERE firm = ? AND contact = ? AND source = ? "
+                   "AND person = ?", (e["firm"], e["contact"], e["source"], e["person"]))
+        keys = []
+        for e in rows:
+            if e["kind"] != EMAIL or self.one("SELECT 1 FROM link WHERE firm = ? AND contact = ?",
+                                              (e["firm"], e["contact"])):
+                continue
+            for k in self.x("SELECT kind, value, firm, source FROM firm_key WHERE kind = ? "
+                            "AND value = ? AND firm = ?",
+                            (FIRM_KEY["email"], e["value"], e["firm"])).fetchall():
+                keys.append(list(k))
+                self.x("DELETE FROM firm_key WHERE kind = ? AND value = ? AND firm = ?", k[:3])
+        site_people = [self.source(n) for n in ("people", "website")]
+        persons, person_searches = [], []
+        for p in self.x(
+                f"SELECT id, firm, name, name_norm, role, source, first_seen, last_seen FROM person "
+                f"WHERE firm IN ({marks}) AND source IN (?, ?) "
+                f"AND NOT EXISTS (SELECT 1 FROM link l WHERE l.person = person.id)",
+                (*group, *site_people)).fetchall():
+            persons.append(list(p))
+            person_searches += [list(r) for r in self.x(
+                "SELECT id, target, is_person, origin, module, capability, looked_for, at, "
+                "outcome, found, cost, batch, detail FROM search WHERE is_person = 1 "
+                "AND target = ?", (p[0],))]
+            self.x("DELETE FROM search WHERE is_person = 1 AND target = ?", (p[0],))
+            self.x("DELETE FROM person WHERE id = ?", (p[0],))
+        gone, kept = [], 0
+        for contact in dict.fromkeys(e["contact"] for e in rows):
+            row = self.x("SELECT id, kind, value, display, line_type, status, do_not_contact, "
+                         "first_seen, last_seen FROM contact WHERE id = ?", (contact,)).fetchone()
+            if row is None or self.one("SELECT 1 FROM link WHERE contact = ? LIMIT 1", (contact,)):
+                continue
+            value = row[2] or ""
+            if (row[6] or self.one("SELECT 1 FROM suppression WHERE value = ? "
+                                   "AND undone_at IS NULL LIMIT 1", (value,))
+                    or self.one("SELECT 1 FROM campaign_member WHERE contact = ? OR email = ? "
+                                "LIMIT 1", (contact, value))
+                    or self.one("SELECT 1 FROM outbox WHERE to_email = ? LIMIT 1", (value,))):
+                kept += 1            # named by the list or outreach: unlinked, never deleted
+                continue
+            gone.append(list(row))
+            self.x("DELETE FROM contact WHERE id = ?", (contact,))
+        return {"evidence": [{k: v for k, v in e.items() if k not in ("kind", "value")}
+                             | {"kind": e["kind"], "value": e["value"]} for e in rows],
+                "keys": keys, "persons": persons, "person_searches": person_searches,
+                "contacts": gone, "contacts_kept": kept}
+
+    def reject_found_site(self, company_id, *, batch: str, detail: str = "") -> dict:
+        """A found website that isn't the firm's, taken off it with exactly
+        what its read left (_site_evidence: its pages' contacts, addresses
+        at its domain, the people it named, their keys, contacts left with
+        nothing); everything removed is kept in site_undo under ``batch``
+        first. The searches that relied on it stay on file (their cost
+        counted) but no longer count as done (outcome error, the detail
+        saying why): the lookup that picked it, so the firm is looked up
+        again; its reads, so a website the firm declares later is read;
+        the address checks of the people left (a register's
+        administrators), so they are searched at the next site. Official
+        sources' evidence, the do-not-contact list and campaign members
+        are never touched. Returns counts."""
+        found = self._found_site(company_id)
+        if found is None:
+            return {"removed": 0, "skipped": "no website a search found"}
+        fid, host, cols = found
+        group = self._group(fid)
+        evidence = self._site_evidence(group, host) if host else []
+        dropped = self._drop_evidence(group, evidence)
+        marks = ",".join("?" * len(group))
+        error = schema.OUTCOME["error"]
+        website_bit = schema.looked_for_bit(self.con, "website")
+        not_lookups = [schema.dict_id(self.con, "module", m) for m in ("website", "contact_finder")]
+        # The lookup that picked it: the newest website lookup of a search
+        # module that found one (its detail is free text: never matched on).
+        lookups = self.x(
+            f"SELECT id, outcome, detail FROM search WHERE is_person = 0 AND target IN ({marks}) "
+            f"AND (looked_for & ?) != 0 AND module NOT IN (?, ?) AND outcome = ? "
+            f"ORDER BY at DESC, id DESC LIMIT 1",
+            (*group, website_bit, *not_lookups, schema.OUTCOME["found"])).fetchall()
+        reads = self.x(
+            f"SELECT id, outcome, detail FROM search WHERE is_person = 0 AND target IN ({marks}) "
+            f"AND capability = ? AND outcome != ?",
+            (*group, schema.capability_id(self.con, "website", "read_site"), error)).fetchall()
+        checks = self.x(
+            f"SELECT s.id, s.outcome, s.detail FROM search s WHERE s.is_person = 1 "
+            f"AND s.module = ? AND s.outcome != ? AND s.target IN "
+            f"(SELECT p.id FROM person p WHERE p.firm IN ({marks}))",
+            (schema.dict_id(self.con, "module", "email_verify"), error, *group)).fetchall()
+        withdrawn = []
+        for sid, outcome, was in [*lookups, *reads, *checks]:
+            withdrawn.append([sid, outcome, was])
+            self.x("UPDATE search SET outcome = ?, detail = ? WHERE id = ?",
+                   (error, f"taken back, {host} isn't the firm's site: {was or ''}"[:500], sid))
+        self.x("UPDATE firm SET website = NULL, website_trust = NULL, website_source = NULL, "
+               "website_basis = NULL, website_fill = NULL, "
+               "domain = CASE WHEN domain = ? THEN NULL ELSE domain END WHERE id = ?", (host, fid))
+        payload = {"firm": cols, "host": host, "withdrawn": withdrawn, **dropped}
+        self.x("INSERT OR REPLACE INTO site_undo (firm, batch, at, payload) VALUES (?, ?, ?, ?)",
+               (fid, batch, int(time.time()), json.dumps(payload, ensure_ascii=False)))
+        self.record_search("company", fid, "contact_finder", "judge_site", looked_for="website",
+                           outcome="nothing", batch_id="", detail=(detail or f"not {host}")[:500])
+        return {"removed": len(evidence), "contacts": len(dropped["contacts"]),
+                "contacts_kept": dropped["contacts_kept"], "people": len(dropped["persons"]),
+                "keys": len(dropped["keys"]), "searches": len(withdrawn)}
+
+    def move_found_website(self, company_id, website: str) -> bool:
+        """A waiting found website changed to another of its lookup's
+        candidates (the re-check took that one): only while nothing was
+        linked from it, which a waiting site never has."""
+        found = self._found_site(company_id)
+        if found is None:
+            return False
+        fid, host, cols = found
+        if cols["domain"] or (host and self._site_evidence(self._group(fid), host)):
+            return False
+        return self.x("UPDATE firm SET website = ? WHERE id = ?", (website, fid)).rowcount > 0
+
+    def accept_found_site(self, company_id, *, trust: str, basis: dict,
+                          chosen: list[str] | None = None, detail: str = "") -> dict:
+        """A found website checked and taken: its trust and basis, and the
+        evidence its read left raised to match (a link never surer than the
+        site): given ``chosen`` (the contact values the check chose), only
+        those. Nothing is taken off or made less sure: the classifier only
+        says which contacts it picked, never that one isn't the firm's, so
+        what it left out stays as it was. A confirmed site's domain becomes
+        the firm's key when no other firm holds it."""
+        found = self._found_site(company_id)
+        if found is None:
+            return {"updated": 0, "skipped": "no website a search found"}
+        fid, host, cols = found
+        group = self._group(fid)
+        evidence = [e for e in self._site_evidence(group, host)
+                    if e["source"] in {self.source(n) for n in self.SITE_READ_SOURCES}]
+        level = TRUST[trust]
+        wanted = {v.lower() for v in chosen} if chosen is not None else None
+        raised = [e for e in evidence if wanted is None or e["value"].lower() in wanted]
+        for e in raised:
+            self.x("UPDATE link_evidence SET trust = MIN(trust, ?) WHERE firm = ? AND contact = ? "
+                   "AND source = ? AND person = ?",
+                   (level, e["firm"], e["contact"], e["source"], e["person"]))
+        domain = host if trust == "confirmed" and host and not self.one(
+            "SELECT 1 FROM firm WHERE domain = ? AND id != ?", (host, fid)) else None
+        self.x("UPDATE firm SET website_trust = ?, website_basis = ?, "
+               "domain = COALESCE(domain, ?) WHERE id = ?",
+               (level, json.dumps(basis, ensure_ascii=False), domain, fid))
+        self.record_search("company", fid, "contact_finder", "judge_site", looked_for="website",
+                           outcome="found", found=1, detail=(detail or host)[:500])
+        return {"updated": len(raised), "left": len(evidence) - len(raised)}
+
+    def undo_site_checks(self, batch: str) -> dict:
+        """Put back what reject_found_site took off in ``batch``: the
+        website, the evidence, contacts, people, keys and searches, as they
+        were (counts follow through the triggers). A firm that got another
+        website since is left as it is."""
+        done, refused = 0, 0
+        for fid, raw in self.x("SELECT firm, payload FROM site_undo WHERE batch = ? "
+                               "AND undone_at IS NULL", (batch,)).fetchall():
+            p = json.loads(raw)
+            if self.one("SELECT website IS NOT NULL OR domain IS NOT NULL FROM firm WHERE id = ?",
+                        (fid,)):
+                refused += 1
+                continue
+            ids = {}
+            for c in p.get("contacts") or []:
+                self.x("INSERT INTO contact (id, kind, value, display, line_type, status, "
+                       "do_not_contact, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                       "ON CONFLICT DO NOTHING", c)
+                ids[c[0]] = self.one("SELECT id FROM contact WHERE kind = ? AND value = ?",
+                                     (c[1], c[2]))
+            people = {}
+            for row in p.get("persons") or []:
+                self.x("INSERT INTO person (id, firm, name, name_norm, role, source, first_seen, "
+                       "last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", row)
+                people[row[0]] = self.one("SELECT id FROM person WHERE firm = ? AND name_norm = ?",
+                                          (row[1], row[3]))
+            for e in p.get("evidence") or []:
+                contact = ids.get(e["contact"]) or self.one(
+                    "SELECT id FROM contact WHERE kind = ? AND value = ?", (e["kind"], e["value"]))
+                if contact is None:
+                    continue
+                self.x("INSERT INTO link_evidence (firm, contact, source, person, location, "
+                       "capability, trust, confidence, evidence_url, first_seen, last_seen) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                       (e["firm"], contact, e["source"], people.get(e["person"], e["person"]),
+                        e["location"], e["capability"], e["trust"], e["confidence"],
+                        e["evidence_url"], e["first_seen"], e["last_seen"]))
+            for k in p.get("keys") or []:
+                self.x("INSERT OR IGNORE INTO firm_key (kind, value, firm, source) "
+                       "VALUES (?, ?, ?, ?)", k)
+            for r in [[r[0], people.get(r[1], r[1]), *r[2:]]
+                      for r in p.get("person_searches") or []]:
+                self.x("INSERT INTO search (target, is_person, origin, module, capability, "
+                       "looked_for, at, outcome, found, cost, batch, detail) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", r[1:])
+            for sid, outcome, was in p.get("withdrawn") or []:
+                self.x("UPDATE search SET outcome = ?, detail = ? WHERE id = ?",
+                       (outcome, was, sid))
+            f = p["firm"]
+            self.x("UPDATE firm SET website = ?, website_trust = ?, website_source = ?, "
+                   "website_basis = ?, website_fill = ?, domain = COALESCE(domain, ?) WHERE id = ?",
+                   (f["website"], f["website_trust"], f["website_source"], f["website_basis"],
+                    f["website_fill"], f["domain"], fid))
+            self.x("UPDATE site_undo SET undone_at = ? WHERE batch = ? AND firm = ?",
+                   (int(time.time()), batch, fid))
+            done += 1
+        return {"restored": done, "refused": refused}
 
     def mark_company_profiled(self, company_id) -> None:
         fid = self.live(company_id)

@@ -78,7 +78,7 @@ OVERLAY_STATS = {
              ("firm_new", "1790000 1 1"), ("firm_with_contact", "11500 1 1"),
              ("firm_no_contact", "1778000 1 1"), ("firm_by_contacts", "1790000 100000 1"),
              ("firm_with_site", "11000 50 1 1"), ("firm_profiled", "1790000 1000000"),
-             ("firm_searched", "20000 2 1")],
+             ("firm_searched", "20000 2 1"), ("firm_site_check", "9500 1")],
     "firm_ident": [("firm_ident", "3600000 1800000 1"), ("firm_ident_firm", "3600000 2 1"),
                    ("firm_ident_since", "3600000 3")],
     "local_firm": [(None, "400"), ("local_firm_place", "400 20 5")],

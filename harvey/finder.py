@@ -15,9 +15,13 @@ search, whichever source brought it in. For one company at a time (the
    "website"`` (cheapest first, never a hard-coded list), until one gives a
    candidate. Only inside a spend cap: the run's, or the install's
    ``spend.per_day_usd`` for background work; with neither, it is skipped
-   and says so (a search priced at $0 needs no cap). The results are read once, in memory, and never stored: the
-   best candidate is read like any website, and only it and what its pages
-   publish are kept.
+   and says so (a search priced at $0 needs no cap). The results are read
+   once, in memory, and never stored. Code drops those that can't be the
+   company's own site by their address alone (a directory, a listing, a
+   profile of the firm on someone else's site, an institution:
+   site_match.screen); a small model (classify's ``results`` task, when
+   one is set up) keeps at most three of the rest; those are read, free,
+   and nothing is written until one is chosen (see below).
 3. A person named at a company with a website, reached by no contact of
    their own, gets one address built from the domain's pattern and checked
    by a verification tier (email_verify), inside the same cap and the
@@ -25,12 +29,23 @@ search, whichever source brought it in. For one company at a time (the
    free tier running out). An address the site publishes as the person's
    own is linked to them as it is, with no check, cap or not.
 
-Nothing found is thrown away because the match is unproven. A website found
-by searching is tagged confirmed (its pages carry the company's CUI, or a
-phone or email already on file), likely (the name and the town match) or
-unconfirmed, and every contact read off it carries no more than that trust.
-Below confirmed, the site says nothing else about the company (no facts, no
-new name) and its domain doesn't become the company's key.
+A website found by searching is the company's only on evidence. Code
+decides what a register fact settles (site_match.hard): the firm's CUI or
+registration number on the pages (no other firm's beside it), an official
+email, an official phone next to its name: confirmed; another firm's CUI as
+the site's owner, or several firms' (a listing): not its site. The rest
+goes to the classifier (classify's ``site`` task): a yes/no question per
+candidate, each asked alone with the firm's register facts and that
+candidate's evidence card; exactly one yes is likely, never confirmed;
+none links nothing; two or more wait, unsettled. On the site chosen, the ``contacts`` task says which
+contacts read there are the firm's own (not a web agency's footer phone,
+not an office abroad), and only those are linked. With no model set up
+(or held, or its day's calls used), a site no register fact confirms is
+kept unlinked, its trust unconfirmed and nothing linked from it, waiting
+for ``harvey contacts rejudge`` (recheck below). Below confirmed, the site
+says nothing else about the company (no facts, no new name, no people) and
+its domain doesn't become the company's key. A website the company declares (its own
+key, its registry entry) is read as before.
 
 Every step is a row in ``searches`` (harvey/contacts.py): a company searched
 by one module's capability isn't searched by it again (unless forced, or
@@ -54,13 +69,17 @@ import re
 from dataclasses import dataclass, field
 
 
-from harvey import contacts, resolver
+from harvey import classify, contacts, resolver, site_match
 from harvey.modules import api, ingest
 
 logger = logging.getLogger("harvey.finder")
 
 FINDER = ("contact_finder", "find_contacts")
 LOOKUP = ("contact_finder", "find_website")
+# The check of a found website (a search row of its own, its outcome and why).
+CHECK = ("contact_finder", "judge_site")
+# Candidates read for one lookup, at most.
+MAX_CANDIDATES = 3
 SITE = ("website", "read_site")
 # What the finder's site read looks for that a plain read doesn't: only a
 # read that looked for the owner closes it (runs.CONTACT_READ). A read that
@@ -187,21 +206,6 @@ def name_score(company_name: str, record) -> int:
     if words and all(w in stem or w in theirs.split() for w in words):
         return 1
     return 0
-
-
-def pick(company: dict, records) -> tuple[object, int] | None:
-    """The best website candidate among a search's results: one domain
-    that is a single business's (not a directory, a booking platform or a
-    social network), the best name match first, then the search's order."""
-    best = None
-    for i, record in enumerate(records):
-        domain = (record.domain or "").lower()
-        if not domain or not resolver.usable_domain(domain):
-            continue
-        score = name_score(company.get("name") or "", record)
-        if best is None or score > best[1]:
-            best = (record, score, i)
-    return (best[0], best[1]) if best else None
 
 
 def _cui_on(text: str, cui: str) -> bool:
@@ -334,8 +338,22 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
     site_done = bool(domain) and await company_searched(state, company_id, *SITE, since,
                                                         looked_for=SITE_WANTS)
     had_contact = await state.read("finder_has_contact", company_id)
+    # A website a search found that nothing has checked yet: nothing is read
+    # off it until the check (recheck) takes it, and it isn't looked up again.
+    waiting = bool(domain) and company.get("website_found") and floor == "unconfirmed"
 
-    if domain and not site_done:
+    if waiting:
+        out.skipped.append("the website a search found waits for a check "
+                           "(harvey contacts rejudge)")
+    elif domain and not site_done and company.get("website_found"):
+        # A website a search found and the evidence took, read again
+        # (Search again, a refresh): the same evidence and the same
+        # contact choice as when it was found, never everything on it.
+        async with _reader(state, confirmed, config) as read:
+            await _reread_found(state, company, domain, read, out, run_id=run_id,
+                                config=config)
+        out.website = domain
+    elif domain and not site_done:
         on_file = await _on_file(state, company_id)
         verdict = judge(company, on_file, 1, floor=floor) if floor else None
         async with _reader(state, confirmed, config) as read:
@@ -371,6 +389,45 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
             found=out.contacts, cost=out.cost, batch_id=batch_id,
             detail="; ".join(out.steps + out.skipped))
     return out
+
+
+async def _reread_found(state, company: dict, domain: str, read, out: Found, *,
+                        run_id: str = "", config=None) -> None:
+    """A found website read again: its card decided as a lookup's is
+    (decide), and only the contacts that gives linked, at most at the
+    trust the site has. Nothing is linked when the evidence no longer
+    holds or the classifier gives no answer (the re-check settles it)."""
+    from harvey.collectors.discover import normalize_domain
+
+    facts_raw = await state.read("site_facts", company["id"]) or {}
+    facts = site_match.Facts.of(facts_raw)
+    website = company.get("website") or f"https://{domain}"
+    draft = await read.fetch(company, domain=domain)
+    out.steps.append("site")
+    card = site_match.card(facts, normalize_domain(website) or domain, draft or api.Draft(),
+                           url=website, holders=facts_raw.get("holders"))
+    d = await decide(state, facts, [card], config=config)
+    have = company.get("website_trust") or "likely"
+    if d.index is None:
+        # Nothing linked off its pages. A site checked before (its basis)
+        # whose contacts only wait for the classifier keeps its trust for
+        # the addresses built at it; one nothing checked builds none, until
+        # the re-check settles it.
+        checked = bool((await state.read("website_basis", company["id"])).get("by"))
+        out.trust = have if d.waiting and checked else "unconfirmed"
+        _skip(out, f"nothing linked from the website read again: {d.note}")
+        await state.record_search("company", company["id"], *SITE, looked_for=_contact_read(),
+                                  outcome="nothing" if draft is not None else "error",
+                                  detail=f"not linked: {d.note}"[:500])
+        return
+    trust = max(d.trust, have, key=contacts.TRUST_LEVELS.index)
+    draft.contacts = chosen_contacts(card, d.selection)
+    if trust != "confirmed":
+        draft.people = []
+    done = await read.keep(company, draft, domain=domain, trust=trust, run_id=run_id)
+    out.contacts += done.contacts
+    out.people += done.people
+    out.trust = trust
 
 
 def _reader(state, confirmed, config):
@@ -495,39 +552,313 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
             else:
                 out.failed += 1
                 out.skipped.append(f"{s.module} search failed: {draft.failed}")
-            choice = pick(company, draft.records) if draft.failed is None else None
-            await state.record_search(
-                "company", company_id, s.module, s.capability, looked_for="website",
-                outcome="error" if draft.failed is not None else "found" if choice else "nothing",
-                found=1 if choice else 0, cost=cost, batch_id=batch_id,
-                detail=draft.failed or (choice[0].domain if choice else ""))
-            if draft.failed is not None and draft.stop:
-                # Out of credit or a refused key: the background leaves it
-                # alone for a while (until when it said, when it did).
-                await asyncio.to_thread(lanes.hold, s.module, draft.values.get("retry_after"))
-            if choice is None:
+            if draft.failed is not None:
+                await state.record_search(
+                    "company", company_id, s.module, s.capability, looked_for="website",
+                    outcome="error", cost=cost, batch_id=batch_id, detail=draft.failed)
                 if draft.stop:
+                    # Out of credit or a refused key: the background leaves
+                    # it alone for a while (until when it said, when it did).
+                    await asyncio.to_thread(lanes.hold, s.module, draft.values.get("retry_after"))
                     out.skipped.append(f"{s.module}: {draft.stop}")
                 continue
-            record, score = choice
-            domain = record.domain.lower()
-            on_file = await _on_file(state, company_id)
-            verdict = judge(company, on_file, score)
-            async with _reader(state, confirmed, config) as read:
-                done = await read(company, domain=domain, judge=verdict, run_id=run_id)
-            trust = verdict(done.draft) if done is not None else ("likely" if score else
-                                                                  "unconfirmed")
-            await state.set_found_website(
-                company_id, record.website or f"https://{domain}",
-                domain=domain if trust == "confirmed" else "", trust=trust,
-                source=s.module)
-            out.website, out.trust = domain, trust
-            out.steps.append("site")
-            if done is not None:
-                out.contacts += done.contacts
-                out.people += done.people
-            return domain
+            chosen = await choose(state, company, draft.records, confirmed=confirmed,
+                                  config=config, run_id=run_id, source=s.module)
+            await state.record_search(
+                "company", company_id, s.module, s.capability, looked_for="website",
+                outcome="found" if chosen.domain else "nothing",
+                found=1 if chosen.domain else 0, cost=cost, batch_id=batch_id,
+                detail=chosen.detail)
+            if chosen.read:
+                out.steps.append("site")
+            if chosen.waiting:
+                _skip(out, f"the website found waits for the classifier ({chosen.waiting})")
+            if chosen.domain:
+                out.website, out.trust = chosen.domain, chosen.trust
+                out.contacts += chosen.contacts
+                out.people += chosen.people
+                return chosen.domain if chosen.trust != "unconfirmed" else ""
+            if draft.stop:
+                out.skipped.append(f"{s.module}: {draft.stop}")
     return ""
+
+
+# ── Choosing a company's website among a search's results ──
+
+
+@dataclass
+class Decision:
+    """What the evidence says of a firm's candidate sites: the one taken
+    (``index``) at ``trust`` and why (``basis``), the contacts the
+    classifier chose there (``selection``: {"contacts": [card indices]};
+    None: every one code read), or ``waiting`` (why the classifier gave no
+    answer, or "unsettled": it said yes to several) when it had to."""
+
+    index: int | None = None
+    trust: str = ""
+    basis: dict = field(default_factory=dict)
+    selection: dict | None = None
+    waiting: str = ""
+    note: str = ""
+    # The cards still in question (no rule ruled them out, or every one the
+    # classifier said yes to), surest first: what waits for the check.
+    pool: list[int] = field(default_factory=list)
+
+
+# The rule that confirmed a site, as the search row says it.
+RULE_WORDS = {"cui": "the firm's CUI on its pages", "ro+cui": "the firm's VAT code on its pages",
+              "reg": "the firm's registration number on its pages",
+              "email": "an official email on its pages",
+              "phone": "an official phone next to the firm's name"}
+
+
+async def facts_of(state, company_id) -> site_match.Facts:
+    found = await state.read("site_facts", company_id)
+    return site_match.Facts.of(found or {})
+
+
+def question(cards: list) -> tuple[int | None, list[int], list]:
+    """What code alone makes of ``cards`` (site_match.hard): the one a
+    register fact settles (or None), else the cards the classifier is
+    asked to choose among (several confirmed ones, else those in
+    question), and every card's verdict."""
+    verdicts = [site_match.hard(c) for c in cards]
+    sure = [i for i, (v, _) in enumerate(verdicts) if v == "confirmed"]
+    if len({cards[i].domain for i in sure}) == 1:
+        return sure[0], [], verdicts
+    open_ = [i for i, (v, _) in enumerate(verdicts) if v == "judge"]
+    return None, sure if len(sure) > 1 else open_, verdicts
+
+
+async def ask_sites(state, facts: site_match.Facts, cards: list, pool: list[int], *, s,
+                    config=None) -> tuple[list[tuple[int, bool]], list, str]:
+    """Classify's ``site`` task for each card of ``pool``, each one alone
+    (a call each): ([(card index, its yes or no)], every Answer, why it
+    stopped: "" when every card was answered). It stops at the first card
+    with no answer: a choice among some of them would be no choice."""
+    said, answers = [], []
+    for i in pool:
+        ans = await classify.ask(state, "site", {"firm": facts.as_dict(), "cards": [cards[i]],
+                                                 "region": facts.region}, s=s, config=config)
+        answers.append(ans)
+        if ans.value is None:
+            return said, answers, ans.why or "no answer"
+        said.append((i, bool(ans.value["yes"])))
+    return said, answers, ""
+
+
+async def ask_contacts(state, facts: site_match.Facts, card, *, s, config=None):
+    """Classify's ``contacts`` task on the chosen ``card``: its Answer, or
+    None when the card has no contacts or the task is off."""
+    if not card.contacts or not s.task_on("contacts"):
+        return None
+    return await classify.ask(state, "contacts", {"firm": facts.as_dict(), "cards": [card],
+                                                  "region": facts.region}, s=s, config=config)
+
+
+def official(card, facts: site_match.Facts) -> list[int]:
+    """The card's contacts an official source gives the firm (its register
+    phones and emails): what code confirms of a site's contacts by itself."""
+    phones, emails = set(facts.phones), {e.lower() for e in facts.emails}
+    return [j for j, c in enumerate(card.contacts)
+            if (c["kind"] == "phone" and c["value"] in phones)
+            or (c["kind"] == "email" and str(c["value"]).lower() in emails)]
+
+
+async def decide(state, facts: site_match.Facts, cards: list, *, s=None,
+                 config=None) -> Decision:
+    """Which of ``cards`` (site_match.Card, read already) is the firm's:
+    by a register fact (site_match.hard) when one settles it, else by the
+    classifier's ``site`` task, each candidate asked alone: exactly one
+    yes is the firm's (likely, never confirmed by the model); none links
+    nothing; two or more is an unsettled question, and the site waits.
+    Then the ``contacts`` task says which contacts read on the chosen site
+    are the firm's own."""
+    import time
+
+    settled, pool, verdicts = question(cards)
+    ruled = "; ".join(f"{cards[i].domain}: {r}" for i, (v, r) in enumerate(verdicts)
+                      if v == "rejected")
+    s = s or await classify.settings(state)
+    if settled is not None:
+        i = settled
+        rule = verdicts[i][1]
+        d = Decision(i, "confirmed", {"by": rule, "at": int(time.time())},
+                     note=f"{cards[i].domain}: {RULE_WORDS.get(rule, rule)}")
+        await _choose_contacts(state, facts, cards[i], d, s=s, config=config)
+        return d
+    if not pool:
+        return Decision(note=f"no candidate is the firm's ({ruled or 'none read'})")
+    said, answers, why = await ask_sites(state, facts, cards, pool, s=s, config=config)
+    if why:
+        return Decision(waiting=why, pool=list(pool), note=f"waits for the classifier ({why})")
+    model = next((a.model for a in reversed(answers) if a.model), "")
+    yes = [i for i, y in said if y]
+    basis = {"by": "judge", "model": model, "at": int(time.time())}
+    if not yes:
+        return Decision(basis=basis, note="the classifier: none is the firm's")
+    if len(yes) > 1:
+        # Two sites both the firm's, by the model: a question it can't
+        # settle. Nothing linked; the site waits, with those still in it
+        # (the re-check doesn't ask the same again: site_check.UNSETTLED).
+        return Decision(waiting="unsettled", pool=yes, basis=basis,
+                        note=f"waits: the classifier says yes to {len(yes)} sites "
+                             f"({', '.join(cards[i].domain for i in yes)})")
+    i = yes[0]
+    p = (answers[pool.index(i)].value or {}).get("p")
+    if p is not None:
+        # (A System One classifier's probability, shown on the company panel.)
+        basis["p"] = p
+    trust = "likely"
+    if verdicts[i][0] == "confirmed":
+        trust = "confirmed"
+        basis["by"] = verdicts[i][1]
+    d = Decision(i, trust, basis, note=f"{cards[i].domain}: the classifier said yes")
+    await _choose_contacts(state, facts, cards[i], d, s=s, config=config)
+    return d
+
+
+async def _choose_contacts(state, facts, card, d: Decision, *, s, config=None) -> None:
+    """``d.selection``: the contacts the ``contacts`` task says are the
+    firm's own, and always those an official source gives the firm. On a
+    site a register fact confirmed, the task only takes off what it says
+    no to: a contact it wasn't shown or didn't answer stays, as code read
+    it. With no answer from it (switched off, held, the day's calls used,
+    no valid answer), nothing is linked beyond what code confirms: on a
+    site a register fact confirmed, every contact code read there
+    (selection None); on one the model chose, only the official ones."""
+    ans = await ask_contacts(state, facts, card, s=s, config=config)
+    if ans is not None and ans.value is not None:
+        own = set(official(card, facts))
+        if d.basis.get("by") == "judge":
+            pick = set(ans.value["contacts"]) | own
+        else:
+            no = set(ans.value.get("no") or ())
+            pick = {j for j in range(len(card.contacts)) if j not in no} | own
+        d.selection = {"contacts": sorted(pick)}
+        d.basis["model"] = ans.model or d.basis.get("model", "")
+    elif d.basis.get("by") == "judge" and card.contacts:
+        d.selection = {"contacts": official(card, facts)}
+
+
+def chosen_contacts(card, selection: dict | None) -> list:
+    """The contacts to link from a chosen site: those the classifier chose,
+    or with no selection every one code read, placeholders left out
+    (site_match.card)."""
+    if selection is None:
+        return list(card.picks)
+    return [card.picks[i] for i in selection.get("contacts") or [] if 0 <= i < len(card.picks)]
+
+
+@dataclass
+class Chosen:
+    """What one lookup's results gave: the website taken (``domain``, at
+    ``trust``; "unconfirmed" when it waits for a check), what was linked,
+    and the search row's detail (counts, never the results themselves)."""
+
+    domain: str = ""
+    trust: str = ""
+    contacts: int = 0
+    people: int = 0
+    read: int = 0
+    waiting: str = ""
+    detail: str = ""
+
+
+def _results(n: int, reasons: dict) -> str:
+    """"10 results: 6 directory, 2 profile": what a search gave, as counts."""
+    counts = ", ".join(f"{k} {why}" for why, k in sorted(reasons.items(), key=lambda x: -x[1]))
+    return f"{n} result{'' if n == 1 else 's'}" + (f": {counts}" if counts else "")
+
+
+async def choose(state, company: dict, records, *, confirmed=frozenset(), config=None,
+                 run_id: str = "", source: str = "") -> Chosen:
+    """The company's own site among a search's ``records`` (in memory
+    only), chosen and written (site_match.screen, classify's ``results``,
+    reads of at most MAX_CANDIDATES, decide). The search row keeps counts
+    and the domains Harvey read, never the other results."""
+    out = Chosen()
+    raw = await state.read("site_facts", company["id"]) or {}
+    facts, holders = site_match.Facts.of(raw), raw.get("holders")
+    reasons: dict[str, int] = {}
+    survivors, seen = [], set()
+    for r in records:
+        domain = (r.domain or "").lower()
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        why = site_match.screen(r.website or f"https://{domain}", domain, facts)
+        if why:
+            reasons[why] = reasons.get(why, 0) + 1
+        else:
+            survivors.append(r)
+    head = _results(len(records), reasons)
+    if not survivors:
+        out.detail = f"{head}; none could be the firm's site"
+        return out
+    s = await classify.settings(state)
+    ranked = sorted(survivors, key=lambda r: -name_score(company.get("name") or "", r))
+    picked = ranked[:MAX_CANDIDATES]
+    if len(survivors) >= 2:
+        ans = await classify.ask(state, "results", {"firm": facts.as_dict(),
+                                                     "results": survivors},
+                                 s=s, config=config)
+        if ans.value is not None:
+            picked = [survivors[i] for i in ans.value["keep"]][:MAX_CANDIDATES]
+            dropped = len(survivors) - len(picked)
+            if dropped:
+                reasons["left out by the classifier"] = dropped
+            head = _results(len(records), reasons)
+            if not picked:
+                out.detail = f"{head}; none could be the firm's site"
+                return out
+    async with _reader(state, confirmed, config) as read:
+        drafts, cards = [], []
+        for r in picked:
+            domain = r.domain.lower()
+            draft = await read.fetch(company, domain=domain)
+            drafts.append(draft or api.Draft())
+            cards.append(site_match.card(facts, domain, draft or api.Draft(),
+                                         url=r.website or f"https://{domain}", holders=holders))
+        out.read = len(cards)
+        names = ", ".join(c.domain for c in cards)
+        d = await decide(state, facts, cards, s=s, config=config)
+        out.detail = f"{head}; read: {names}; {d.note}"
+        if d.index is None and not d.waiting:
+            return out
+        # (Waiting: the first candidate no rule ruled out, never one that
+        # didn't answer or is another firm's.)
+        i = d.index if d.index is not None else d.pool[0]
+        card, draft, record = cards[i], drafts[i], picked[i]
+        website = record.website or f"https://{card.domain}"
+        if d.waiting:
+            # Kept with nothing linked, for the check to take up later with
+            # every candidate still in question (the read's detail names
+            # them); the read is recorded so the backlog doesn't read it
+            # again meanwhile.
+            await state.set_found_website(company["id"], website, trust="unconfirmed",
+                                          source=source)
+            await state.record_search(
+                "company", company["id"], *SITE, looked_for=_contact_read(), outcome="nothing",
+                detail=site_match.waiting_detail([cards[j].domain for j in d.pool]))
+            out.domain, out.trust, out.waiting = card.domain, "unconfirmed", d.waiting
+            return out
+        await state.set_found_website(company["id"], website,
+                                      domain=card.domain if d.trust == "confirmed" else "",
+                                      trust=d.trust, source=source, basis=d.basis)
+        draft.contacts = chosen_contacts(card, d.selection)
+        if d.trust != "confirmed":
+            draft.people = []
+        done = await read.keep(company, draft, domain=card.domain, trust=d.trust, run_id=run_id)
+        out.domain, out.trust = card.domain, d.trust
+        out.contacts, out.people = done.contacts, done.people
+    return out
+
+
+def _contact_read() -> str:
+    from harvey.modules.runs import CONTACT_READ
+
+    return CONTACT_READ
 
 
 def _skip(out: Found, why: str) -> None:

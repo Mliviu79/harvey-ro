@@ -78,7 +78,8 @@ def _run(body):
              "function relTime() { return 'now'; }\n"
              "function actionText(a) { return String(a.action_type); }\n"
              "function renderOverviewHints() {} function navCount() {}\n"
-             "function renderOverviewSending() {} function renderOverviewSetup() {}\n")
+             "function renderOverviewSending() {} function renderOverviewSetup() {}\n"
+             "function loadOverviewSiteCheck() {}\n")
     script = (
         "global.localStorage = {getItem: () => null, setItem() {}};"
         f"require('vm').runInThisContext(require('fs').readFileSync({json.dumps(str(WEB / 'i18n.js'))}, 'utf8'));"

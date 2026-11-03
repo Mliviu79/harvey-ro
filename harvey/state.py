@@ -337,7 +337,9 @@ SCAN_WRITE_BATCH = 200
 # Live companies: not merged into another (SQL, on companies aliased "c").
 LIVE_COMPANY = "COALESCE(c.merged_into, '') = ''"
 
-BRAIN_PROVIDERS = ("claude", "codex")
+# (openai_compatible, anthropic and decision: the classifier's providers,
+# harvey/classify.py; Harvey's own model is claude or codex.)
+BRAIN_PROVIDERS = ("claude", "codex", "openai_compatible", "anthropic", "decision")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 
 _CAMPAIGN_COLUMNS = frozenset({
@@ -2299,14 +2301,37 @@ class StateManager:
                                       capability, **done)
 
     async def set_found_website(self, company_id: str, website: str, *, domain: str = "",
-                                trust: str = "unconfirmed", source: str = "") -> bool:
-        """A website the contact finder found for a company with none, and
-        how sure it is (companies.website_trust). Its domain is the
-        company's key only when ``domain`` is given (a confirmed match) and
-        no other company holds it. False when the company has a website
-        already: a found one never replaces it."""
+                                trust: str = "unconfirmed", source: str = "",
+                                basis: dict | None = None) -> bool:
+        """A website the contact finder found for a company with none, how
+        sure it is (companies.website_trust) and why (``basis``: what
+        confirmed it, or the classifier's yes; None while nothing checked
+        it). Its domain is the company's key only when ``domain`` is given
+        (a confirmed match) and no other company holds it. False when the
+        company has a website already: a found one never replaces it."""
         return await self._on_overlay("set_found_website", company_id, website,
-                                      domain=domain, trust=trust, source=source)
+                                      domain=domain, trust=trust, source=source, basis=basis)
+
+    async def reject_found_site(self, company_id: str, *, batch: str, detail: str = "") -> dict:
+        """A found website checked and found not to be the company's, taken
+        off with what its read left (overlay.store.reject_found_site)."""
+        return await self._on_overlay("reject_found_site", company_id, batch=batch,
+                                      detail=detail)
+
+    async def accept_found_site(self, company_id: str, *, trust: str, basis: dict,
+                                chosen: list[str] | None = None, detail: str = "") -> dict:
+        """A found website checked and taken (overlay.store.accept_found_site)."""
+        return await self._on_overlay("accept_found_site", company_id, trust=trust, basis=basis,
+                                      chosen=chosen, detail=detail)
+
+    async def move_found_website(self, company_id: str, website: str) -> bool:
+        """A waiting found website changed to another of its lookup's
+        candidates (overlay.store.move_found_website)."""
+        return await self._on_overlay("move_found_website", company_id, website)
+
+    async def undo_site_checks(self, batch: str) -> dict:
+        """Put back what a re-check's rejections took off (overlay.store)."""
+        return await self._on_overlay("undo_site_checks", batch)
 
     async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
                          source: str = "", origin: str = "") -> int:

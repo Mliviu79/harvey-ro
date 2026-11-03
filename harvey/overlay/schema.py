@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 27).
+"""The overlay's tables (harvey.db schema 29).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 28
+LATEST = 29
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -797,9 +797,39 @@ def _to_28(con: sqlite3.Connection) -> None:
     con.execute("UPDATE prospects SET status = 'new' WHERE status = 'write_failed'")
 
 
+# ── Schema 29: why a found website was taken, and a re-check's undo ──
+
+SCHEMA_29 = """
+-- Why a website a search found was taken (harvey/finder.py): a short JSON,
+-- {"by": "cui"|"ro+cui"|"reg"|"email"|"phone"|"judge", "model", "at"}.
+-- NULL: nothing checked it yet.
+ALTER TABLE firm ADD COLUMN website_basis TEXT;
+-- The found websites nothing checked yet (the re-check's selection).
+CREATE INDEX firm_site_check ON firm(id)
+  WHERE live = 0 AND website_source IS NOT NULL AND website_basis IS NULL
+    AND website_trust > 0;
+-- What a re-check took away when it found a website wasn't the firm's:
+-- everything its read had left (evidence, contacts, people, keys, the
+-- lookup's search), so ``harvey contacts rejudge --undo BATCH`` puts it back.
+CREATE TABLE site_undo (
+  firm INTEGER NOT NULL, batch TEXT NOT NULL, at INTEGER NOT NULL,
+  payload TEXT NOT NULL, undone_at INTEGER,
+  PRIMARY KEY (batch, firm)
+) WITHOUT ROWID;
+CREATE INDEX site_undo_firm ON site_undo(firm);
+"""
+
+
+def _to_29(con: sqlite3.Connection) -> None:
+    """Schema 29: firm.website_basis, the index of found websites nothing
+    checked yet, and site_undo. Nothing on file changes: the re-check runs
+    only when the user starts it."""
+    _script(con, SCHEMA_29)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26), (27, _to_27), (28, _to_28))
+STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

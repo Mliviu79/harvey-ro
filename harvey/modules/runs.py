@@ -1121,6 +1121,20 @@ async def site_reader(state, confirmed: set[str], *, config=None,
         return await _read_site(state, cap, ctx, company, confirmed, hit_codes,
                                 run_id=run_id, domain=domain, judge=judge)
 
+    async def fetch(company: dict, *, domain: str):
+        """The site's draft, read and written nowhere (None when the read
+        failed): a candidate the contact finder hasn't decided on yet."""
+        return await _fetch_site(state, cap, ctx, company, hit_codes, domain=domain)
+
+    async def keep(company: dict, draft, *, domain: str, trust: str = "", run_id: str = ""):
+        """A draft fetch() read, marked read and written at ``trust`` (only
+        the contacts it still holds: the caller may have left some out)."""
+        await _mark_profiled(state, company["id"], found=len(draft.contacts),
+                             contacts=bool(ctx.settings.get("contacts")))
+        return await _keep_site(state, company, draft, confirmed, domain=domain, trust=trust,
+                                run_id=run_id)
+
+    read.fetch, read.keep = fetch, keep
     try:
         yield read
     finally:
@@ -1139,12 +1153,9 @@ async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, ru
     name, no phone of record). None when the read failed."""
     domain = (domain or company.get("domain") or "").strip()
     company_id = company["id"]
-    hits, source_url = await _known(state, company, hit_codes)
-    inp = api.Input(company_id=company_id, name=company.get("name") or "",
-                    domain=domain, locality=company.get("location") or "",
-                    facts={"search_hits": hits}, extra={"source_url": source_url})
     try:
-        draft = await cap(inp, ctx)
+        draft = await _fetch_site(state, cap, ctx, company, hit_codes, domain=domain,
+                                  raise_errors=True)
     except Exception as e:
         _profile_log.warning(f"profile failed for {domain}: {e}")
         await _mark_profiled(state, company_id, "error", detail=str(e))
@@ -1155,6 +1166,33 @@ async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, ru
     await _mark_profiled(state, company_id, found=len(draft.contacts),
                          contacts=bool(ctx.settings.get("contacts")))
     trust = judge(draft) if judge is not None else ""
+    return await _keep_site(state, company, draft, confirmed, domain=domain, trust=trust,
+                            run_id=run_id)
+
+
+async def _fetch_site(state, cap, ctx, company: dict, hit_codes, *, domain: str,
+                      raise_errors: bool = False):
+    """One read of a site as a draft, nothing written (None when it failed,
+    unless ``raise_errors``)."""
+    hits, source_url = await _known(state, company, hit_codes)
+    inp = api.Input(company_id=company["id"], name=company.get("name") or "",
+                    domain=domain, locality=company.get("location") or "",
+                    facts={"search_hits": hits}, extra={"source_url": source_url})
+    try:
+        return await cap(inp, ctx)
+    except Exception as e:
+        if raise_errors:
+            raise
+        _profile_log.info(f"read failed for {domain}: {e}")
+        return None
+
+
+async def _keep_site(state, company: dict, draft, confirmed, *, domain: str, trust: str = "",
+                     run_id: str = "") -> SiteRead:
+    """What a read found, written: every contact the draft holds (at most
+    ``trust``) and its people; below confirmed nothing else about the site
+    is said of the company (no facts, no new name, no phone of record)."""
+    company_id = company["id"]
     own = trust in ("", "confirmed")
     done = SiteRead(draft)
     better = draft.values.get("name")

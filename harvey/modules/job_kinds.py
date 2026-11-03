@@ -943,6 +943,75 @@ async def enqueue_contact_search(state, selected: list[str], *, max_spend: float
     return batch_id, ids, dupes
 
 
+# ── Checking the websites a search found before (harvey/site_check.py) ──
+
+CLASSIFY_LANE = "classify"      # the classifier's test over the built-in set
+# The re-check's own lane: thousands of jobs that never hold up a person's
+# Find contacts run on the contacts lane.
+SITE_CHECK_LANE = "site_check"
+
+
+async def enqueue_site_checks(state, *, limit: int = 0) -> tuple[str, list, list]:
+    """One batch checking every found website nothing checked yet (or the
+    first ``limit``), one firm per job on the re-check's lane. Returns (batch
+    id, new job ids, jobs already waiting); Duplicate when every one is
+    already waiting."""
+    ids = [str(i) for i in await state.read("site_check_ids", int(limit) if limit else -1)]
+    batch_id = await jobs.new_batch(state, "recheck_site", "Check found websites",
+                                    params={"companies": len(ids)})
+    labels = await _labels(state, ids)
+    specs = [dict(kind="recheck_site", lane=SITE_CHECK_LANE, module="contact_finder",
+                  capability="judge_site", label=labels.get(i) or i, params={"company_id": i},
+                  dedupe_key=f"recheck_site:{i}") for i in ids]
+    new, dupes = await jobs.enqueue_many(state, specs, batch_id=batch_id)
+    if not new:
+        await jobs.drop_batch(state, batch_id)
+        if dupes:
+            raise jobs.Duplicate(dupes[0])
+    return batch_id, new, dupes
+
+
+@jobs.kind("recheck_site")
+async def run_recheck_site(ctx) -> dict:
+    """One firm's found website checked again (site_check.recheck_one):
+    free reads, a classifier call under its cap. While the classifier is
+    held or its day's calls are used, nothing is read and the whole lane
+    rests until then (not one job after another); with no classifier set
+    up, a site only it could settle is left as it is."""
+    from harvey import classify, site_check
+    from harvey.modules import lanes
+
+    company_id = ctx.params.get("company_id", "")
+    if not company_id:
+        raise JobError("recheck_site needs a company_id")
+    if "config" not in ctx.lane:
+        ctx.lane["config"] = _config()
+    done = await site_check.recheck_one(ctx.state, company_id, batch=ctx.job.batch_id,
+                                        config=ctx.lane["config"])
+    if done.get("outcome") == "waiting" and done.get("why") in site_check.STOPS:
+        wait = (await asyncio.to_thread(lanes.held, classify.LANE) if done["why"] == "held"
+                else site_check._seconds_to_midnight())
+        wait = max(60.0, wait)
+        await jobs.rest_lane(ctx.state, ctx.job.lane, wait, but=ctx.job.id)
+        raise jobs.LaneExhausted(f"the classifier: {done['why']}", retry_after=wait)
+    ctx.count(1)
+    await ctx.say(f"  {done.get('outcome')}: {done.get('why') or done.get('trust') or ''}")
+    return done
+
+
+@jobs.kind("classify_test")
+async def run_classify_test(ctx) -> dict:
+    """The classifier over the built-in labelled set (Settings' Test)."""
+    from harvey import site_check
+
+    try:
+        return await site_check.judge_test(ctx.state, site_check.builtin_cases(),
+                                           every=bool(ctx.params.get("every")),
+                                           config=_config())
+    except ValueError as e:
+        raise JobError(str(e))
+
+
 # How many background finder jobs wait at most: the backlog is fed a little
 # at a time, so a person's run never queues behind a million of them.
 BACKLOG_QUEUED = 50

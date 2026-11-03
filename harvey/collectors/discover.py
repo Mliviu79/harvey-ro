@@ -332,6 +332,7 @@ class Business:
     source_url: str = ""
     provider: str = ""
     raw_title: str = ""             # SERP evidence for junk filtering before normalization
+    snippet: str = ""               # the text under a web result's title (never stored)
 
     def identity(self) -> str:
         return self.domain or self.external_id
@@ -1141,6 +1142,7 @@ class Serper(DiscoveryProvider):
                 out.append(Business(
                     name=business_name(item.get("title") or "", domain),
                     raw_title=item.get("title") or "",
+                    snippet=_text(item.get("snippet")),
                     domain=domain,
                     website=item.get("link") or "",
                     location=query.location,
@@ -1265,6 +1267,9 @@ class TinyFish(DiscoveryProvider):
                 out.append(Business(
                     name=business_name(title, domain),
                     raw_title=title,
+                    # (TinyFish's answer may name it either way.)
+                    snippet=_text(item.get("snippet") or item.get("description")
+                                  or item.get("content")),
                     domain=domain,
                     website=url,
                     location=query.location,
@@ -2225,6 +2230,11 @@ def _rank_tuple(biz: Business) -> tuple:
     return tuple(getattr(biz, name) for name in RANK_FIELDS)
 
 
+def _text(value) -> str:
+    """A result's text field, as one short line ("" for anything else)."""
+    return re.sub(r"\s+", " ", value).strip()[:300] if isinstance(value, str) else ""
+
+
 def business_record(biz: Business, query: DiscoveryQuery | None, key: str = "") -> Record:
     """The company a result describes. The listing's street address isn't
     kept (a search result's is often the map pin's, not the office's)."""
@@ -2233,7 +2243,7 @@ def business_record(biz: Business, query: DiscoveryQuery | None, key: str = "") 
         phone=biz.phone, industry=biz.category or (query.term if query else ""),
         location=biz.location or (query.location if query else ""),
         source=f"discover:{biz.provider}", source_url=biz.source_url,
-        external_id=biz.external_id, alt_ids=tuple(biz.alt_ids),
+        external_id=biz.external_id, alt_ids=tuple(biz.alt_ids), snippet=biz.snippet,
     )
 
 

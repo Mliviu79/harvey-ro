@@ -227,7 +227,7 @@ def test_a_website_search_picks_the_company_and_its_cui_confirms_it(tmp_path, mo
     assert searched == [("serper", "google_search", "website", "found", 0.001, "b1")]
 
 
-def test_an_unproven_website_is_kept_marked_and_says_nothing_else(tmp_path, monkeypatch):
+def test_an_unproven_website_is_kept_unlinked_and_waits_for_a_check(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     fakes = Fakes(results=[dict(name="Gamma Tours", domain="gammatours.example",
                                 website="https://gammatours.example/")],
@@ -250,12 +250,15 @@ def test_an_unproven_website_is_kept_marked_and_says_nothing_else(tmp_path, monk
 
     s, cid, found = run(go())
     assert found.trust == "unconfirmed"
-    # Kept, marked, never the company's key, its name, or a fact about it.
+    assert any("waits for the classifier (off)" in why for why in found.skipped)
+    # Kept for a check, with nothing linked from it: never the company's
+    # key, its name, a fact about it, or a contact.
     company = run(s.get_company(cid))
     assert (company.name, company.domain, company.website) == (
         "DELTA EXAMPLE SRL", "", "https://gammatours.example/")
-    assert _rows(db, "SELECT website_trust FROM firm WHERE id = ?", (int(cid),)) == [(2,)]
-    assert [x[3] for x in slim.links(s)] == ["unconfirmed"]
+    assert _rows(db, "SELECT website_trust, website_basis FROM firm WHERE id = ?",
+                 (int(cid),)) == [(2, None)]
+    assert slim.links(s) == []
     assert _rows(db, "SELECT COUNT(*) FROM obs")[0][0] == 0
     # No address is built at a domain that may be someone else's.
     assert fakes.checked == []

@@ -698,23 +698,40 @@ def test_with_no_cap_a_guess_on_file_is_never_linked_as_published(tmp_path, no_n
 
 
 def test_with_no_cap_a_site_below_confirmed_links_at_its_trust_and_unconfirmed_not_at_all(
-        tmp_path, no_network):
+        tmp_path, no_network, monkeypatch):
+    from harvey import classify
+
     db = tmp_path / "harvey.db"
+
+    async def ask(state, task, payload, **kw):
+        # (The classifier took the site before; it takes every contact again.)
+        if task == "site":
+            return classify.Answer(value={"yes": True})
+        return classify.Answer(value={"contacts": list(range(len(payload["cards"][0].contacts)))})
+
+    monkeypatch.setattr(classify, "ask", ask)
 
     async def go(trust, name="HARBORLINE DENTAL", town="Port Ellery"):
         s = await _state(db)
         cid = await s.add_company(Company(name=name, location=town, source="discover:serper"))
-        await s.set_found_website(cid, f"https://{EN}", trust=trust)
+        await s.set_found_website(cid, f"https://{EN}", trust=trust,
+                                  basis={"by": "judge"} if trust == "likely" else None)
         found = await finder.find(s, cid, spend=finder.Spend(cap=False), env={})
         return cid, found
 
     cid, found = run(go("likely"))
     assert found.trust == "likely"
-    assert {a[3] for a in _addresses(db, cid)} == {"likely"} and len(_addresses(db, cid)) == 2
+    links = slim.links(db, cid)
+    assert links and {link[3] for link in links} == {"likely"}
+    # (Below confirmed a site names no people, as when it was found: a
+    # likely site may be a namesake's, its team someone else's.)
+    assert _addresses(db, cid) == [] and found.people == 0
     db.unlink()
     # A site that may be another business's (neither its name nor its town).
     cid, found = run(go("unconfirmed", "QUILLNEST LOGISTICS", "Vellmora"))
-    assert found.trust == "unconfirmed" and _addresses(db, cid) == []
+    # (Nothing is read off it at all until a check takes it.)
+    assert any("waits for a check" in why for why in found.skipped)
+    assert _addresses(db, cid) == []
 
 
 @pytest.mark.parametrize("cap", [False, True])

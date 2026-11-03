@@ -36,6 +36,114 @@ default = 0.5
 min = 0.05
 max = 1.0
 
+# The small yes/no classifier that says which search results could be a
+# company's own site, which read site is, and which contacts on it are its
+# own (harvey/classify.py). Off until you set one:
+# then a searched site that no register fact confirms is kept unlinked,
+# waiting for a check. openai_compatible: any OpenAI-compatible endpoint
+# (a local Ollama, llama.cpp or LM Studio server, vLLM, a hosted one) at
+# classify_base_url; anthropic: a small Claude model; brain: Harvey's own
+# model; decision: a decision model in the System One format (not a chat
+# model: atomic questions, each a probability), POSTed to classify_base_url
+# as given, the full endpoint URL: it is for TypeSafe's Jev
+# (https://api.typesafe.ai/v1/systemone, model jev-latest, key
+# TYPESAFE_API_KEY). You choose the endpoint, the model, the prices and the
+# budget: none is filled in.
+[settings.classify_provider]
+type = "choice"
+choices = ["off", "openai_compatible", "anthropic", "brain", "decision"]
+default = "off"
+
+[settings.classify_base_url]
+type = "str"
+default = ""
+max_length = 300
+
+[settings.classify_model]
+type = "str"
+default = ""
+max_length = 120
+
+# The name of the .env key that holds the endpoint's key (never the key):
+# CLASSIFY_* or *_API_KEY, never one of Harvey's own keys.
+[settings.classify_key_name]
+type = "str"
+default = "CLASSIFY_API_KEY"
+max_length = 80
+
+# Ask for a JSON object (response_format) where the endpoint has it.
+[settings.classify_json_mode]
+type = "bool"
+default = true
+
+# Calls a day across every task (0: none), and a pace: free tiers limit both.
+[settings.classify_per_day]
+type = "int"
+default = 2000
+min = 0
+max = 100000
+
+[settings.classify_per_minute]
+type = "int"
+default = 20
+min = 1
+max = 600
+
+# A local model on a CPU needs about 120.
+[settings.classify_timeout_seconds]
+type = "int"
+default = 30
+min = 5
+max = 600
+
+# decision only: the probability the model must give for a contact to be
+# the firm's own (0.7 was chosen on held-apart labelled data).
+[settings.classify_yes]
+type = "float"
+default = 0.7
+min = 0.5
+max = 0.99
+
+# USD a million input and output tokens, as text (blank: unknown; enter 0
+# for a side that is free). With both blank and an openai_compatible
+# DeepInfra endpoint, the model's price on DeepInfra's public price list,
+# and a reply that carries its own cost is recorded at that. A decision
+# model is priced only by these.
+[settings.classify_price_in_per_m]
+type = "str"
+default = ""
+max_length = 20
+
+[settings.classify_price_out_per_m]
+type = "str"
+default = ""
+max_length = 20
+
+# The classifier's USD caps, today and this month (UTC), as text (blank:
+# none; the call caps stay). With the price unknown they can't count.
+[settings.classify_usd_per_day]
+type = "str"
+default = ""
+max_length = 20
+
+[settings.classify_usd_per_month]
+type = "str"
+default = ""
+max_length = 20
+
+# Each task's switch and day cap, as JSON: {"results": {"on": true,
+# "per_day": 1500}, ...}. A task not named is on, at its own cap.
+[settings.classify_tasks]
+type = "str"
+default = "{}"
+max_length = 2000
+
+# The classifier's pace between processes (the per-minute setting gives
+# the gap: harvey/modules/lanes.py wait_gap).
+[[lanes]]
+id = "classify"
+min_interval_seconds = 1
+
 [cost]
 as_of = 2026-10-30
 usd = 0.0

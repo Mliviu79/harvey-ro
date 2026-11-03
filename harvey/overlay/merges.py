@@ -88,6 +88,12 @@ def merge(con: sqlite3.Connection, survivor: int, merged: int, *, score: float |
     return mid
 
 
+def _has_basis(con) -> bool:
+    """Whether the file has firm.website_basis (schema 29; the upgrade's
+    schema 25 file, merged on before its steps, has not)."""
+    return any(r[1] == "website_basis" for r in con.execute("PRAGMA table_info(firm)"))
+
+
 def _fill_website(con, survivor: int, taken: list[int], mid: int) -> None:
     """A survivor with no website takes the first merged record's that has
     one (its domain, as a site, when it has only that: the domain itself
@@ -96,13 +102,14 @@ def _fill_website(con, survivor: int, taken: list[int], mid: int) -> None:
     if row[0] is not None or row[1] is not None:
         return
     for firm in taken:
-        site = con.execute("SELECT website, domain, website_trust, website_source FROM firm "
-                           "WHERE id = ?", (firm,)).fetchone()
+        basis = ", website_basis" if _has_basis(con) else ""
+        site = con.execute(f"SELECT website, domain, website_trust, website_source{basis} "
+                           f"FROM firm WHERE id = ?", (firm,)).fetchone()
         website = site[0] or (f"https://{site[1]}" if site[1] else None)
         if website:
-            con.execute("UPDATE firm SET website = ?, website_trust = ?, website_source = ?, "
-                        "website_fill = ? WHERE id = ?",
-                        (website, site[2], site[3], mid, survivor))
+            con.execute(f"UPDATE firm SET website = ?, website_trust = ?, website_source = ?, "
+                        f"website_fill = ?{basis.replace(', website_basis', ', website_basis = ?')} "
+                        f"WHERE id = ?", (website, site[2], site[3], mid, *site[4:], survivor))
             return
 
 
@@ -126,8 +133,10 @@ def undo(con: sqlite3.Connection, merge_id: int, *, at: int | None = None) -> li
             (merge_id, survivor, merged))]
         con.executemany("UPDATE firm SET live = CASE WHEN id = ? THEN 0 ELSE ? END WHERE id = ?",
                         [(merged, merged, f) for f in back])
-        con.execute("UPDATE firm SET website = NULL, website_trust = NULL, website_source = NULL, "
-                    "website_fill = NULL WHERE id = ? AND website_fill = ?", (survivor, merge_id))
+        basis = "website_basis = NULL, " if _has_basis(con) else ""
+        con.execute(f"UPDATE firm SET website = NULL, website_trust = NULL, website_source = NULL, "
+                    f"{basis}website_fill = NULL WHERE id = ? AND website_fill = ?",
+                    (survivor, merge_id))
         if location:
             con.execute("DELETE FROM locations WHERE id = ?", (location,))
         con.execute("UPDATE merge SET undone_at = ? WHERE id = ?", (at, merge_id))

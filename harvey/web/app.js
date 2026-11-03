@@ -516,7 +516,7 @@ function loadCurrentTab() {
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
+    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -916,6 +916,7 @@ function switchLang(lang) {
 
 async function loadOverview() {
   renderOverviewHints();
+  loadOverviewSiteCheck();
   const [ov, runs, setup] = await Promise.all([api('/api/overview'), api('/api/runs'), api('/api/setup-status')]);
   const statsEl = document.getElementById('overview-stats');
   if (!ov) {
@@ -1135,6 +1136,7 @@ function todayItemText(it, stats) {
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
+    case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
     case 'provider': return tr(t('today.item.provider'),
       // Instantly (removed) has its own words; any other name isn't one Harvey knows.
       String(it.provider || '').toLowerCase() === 'instantly' ? t('today.item.provider_detail')
@@ -3038,6 +3040,20 @@ function renderOverviewSending(s) {
     '<p>' + (words.detail ? escHtml(words.detail) + '. ' : '') + escHtml(t('send.hidden_note')) + '</p></div>' + sendingButton(s) + '</div>';
 }
 
+// Overview: the found websites waiting for a check (Today says it too, when
+// the Email module is on), with the way to the Classifier card.
+async function loadOverviewSiteCheck() {
+  const el = document.getElementById('overview-site-check');
+  if (!el) return;
+  const c = await api('/api/classify');
+  const n = (c && c.waiting) || 0;
+  if (!n) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>' +
+    escHtml(t('today.item.site_check', {n: fmtN(n)})) + '</b><p>' + escHtml(t('today.item.site_check_detail')) +
+    '</p></div><button class="btn btn-secondary btn-sm" onclick="goTab(\'settings\')">' +
+    escHtml(t('today.item.site_check_action')) + '</button></div>';
+}
+
 // Controls: always there, whatever the modules.
 async function loadControlSending() {
   const el = document.getElementById('control-sending');
@@ -4432,6 +4448,7 @@ function renderDrawer() {
     [t('drawer.place'), escHtml(String(c.location || '').replace(/,\s*Romania$/i, ''))],
     [t('drawer.website'), site ? '<a href="' + site + '" target="_blank" rel="noopener noreferrer">' +
       escHtml(String(c.website || c.domain).replace(/^https?:\/\//i, '')) + ' &#8599;</a>' : ''],
+    [t('site.basis.title'), escHtml(siteBasisText(c.website_basis))],
     [t('drawer.source'), sourceLabel(c.source) + (safeHref(c.source_url) ? ' · <a href="' + safeHref(c.source_url) +
       '" target="_blank" rel="noopener noreferrer">' + escHtml(t('drawer.evidence')) + '</a>' : '')],
     [t('drawer.added'), relTime(c.created_at)],
@@ -5064,6 +5081,244 @@ async function setFinderBg(change) {
   showToast(res && res.success ? t('set.bg_saved') : failMsg(res, t('set.bg_failed')),
             res && res.success ? 'success' : 'error');
   loadFinderBgCard();
+}
+
+// Settings: the classifier (a small language model) that says which
+// search results and which read sites are a firm's own; and the check of
+// the websites found before it. The key is named, never shown.
+let _classify = null;
+
+// A classifier amount: small ones with four decimals.
+function clsUsd(n) {
+  if (n === null || n === undefined) return '–';
+  return fmtUsd(n, Math.abs(Number(n)) >= 1 ? 2 : 4);
+}
+
+// Its calls and spend today and this month, cost per site, tokens a call.
+function classifyMetricsHtml(m, cost) {
+  if (!m || !m.today || !(m.month && m.month.calls)) return '';
+  const tasks = Object.keys(m.per_task || {}).sort().map(k => {
+    const v = m.per_task[k];
+    return escHtml(t('cls.metrics.task', {task: t('cls.task.' + k), n: fmtN(v.calls || 0), usd: clsUsd(v.usd),
+      tok: v.avg_tokens === null || v.avg_tokens === undefined ? '–' : fmtN(v.avg_tokens)}));
+  }).join(' &middot; ');
+  return '<p class="desc" id="cls-metrics">' + escHtml(t('cls.metrics', {
+      today: fmtN(m.today.calls || 0), today_usd: clsUsd(m.today.usd), month: fmtN(m.month.calls || 0),
+      month_usd: clsUsd(m.month.usd), site: clsUsd(m.cost_per_site),
+      tok: m.month.avg_tokens === null || m.month.avg_tokens === undefined ? '–' : fmtN(m.month.avg_tokens)})) +
+    ((m.month.unpriced || (cost && cost.why && !cost.known && _classify && _classify.provider !== 'brain'))
+      ? ' ' + escHtml(t('cls.cost_unknown')) : '') + '</p>' +
+    (tasks ? '<p class="hint">' + tasks + '</p>' : '');
+}
+
+// Where a call's price comes from, or that it isn't known.
+function classifyCostHtml(c) {
+  const cost = c.cost || {};
+  if (!c.provider || c.provider === 'off' || c.provider === 'brain') return '';
+  if (!cost.known) return '<p class="hint warn" id="cls-cost">' + escHtml(t('cls.cost_unknown')) +
+    (c.usd_per_day !== null && c.usd_per_day !== undefined || c.usd_per_month !== null && c.usd_per_month !== undefined
+      ? ' ' + escHtml(t('cls.cost_unknown_caps')) : '') + '</p>';
+  if (cost.source === 'reply') return '<p class="hint" id="cls-cost">' + escHtml(t('cls.cost.reply')) + '</p>';
+  return '<p class="hint" id="cls-cost">' + escHtml(t('cls.cost.' + cost.source, {
+    pin: clsUsd(cost.in_per_m), pout: clsUsd(cost.out_per_m)})) + '</p>';
+}
+
+async function loadClassifyCard() {
+  const el = document.getElementById('classify-card');
+  if (!el) return;
+  const c = await api('/api/classify');
+  if (!c || c.error) { el.innerHTML = '<p class="muted small">' + escHtml(failMsg(c, t('cls.failed'))) + '</p>'; return; }
+  _classify = c;
+  const on = c.provider && c.provider !== 'off';
+  const opt = (v) => '<option value="' + escHtml(v) + '"' + (v === c.provider ? ' selected' : '') + '>' +
+    escHtml(t('cls.provider.' + v)) + '</option>';
+  const field = (id, label, value, type, extra) => '<div class="form-group"><label class="form-label" for="cls-' + id + '">' +
+    escHtml(label) + '</label><input class="form-input" id="cls-' + id + '" type="' + (type || 'text') + '" value="' +
+    escHtml(String(value === undefined || value === null ? '' : value)) + '"' + (extra || '') + '></div>';
+  const tasks = Object.keys(c.tasks || {}).map(k => '<label class="pd-setting"><input type="checkbox" id="cls-task-' + escHtml(k) + '"' +
+    ((c.tasks[k] || {}).on ? ' checked' : '') + '> ' + escHtml(t('cls.task.' + k)) + '</label>').join(' ');
+  const key = (c.key_set === null || c.key_set === undefined ? '' :
+    '<span class="hint">' + escHtml(t(c.key_set ? 'cls.key_set' : 'cls.key_missing', {name: c.key_name || ''})) + '</span>') +
+    // Where the questions and the key go, plainly.
+    ((c.provider === 'openai_compatible' || c.provider === 'decision') && c.host ? '<p class="hint" id="cls-host">' +
+      escHtml(t('cls.sends_to', {key: c.key_name || '', host: c.host})) + '</p>' : '') +
+    (c.sdk_missing ? '<p class="hint warn">' + escHtml(t('cls.sdk_missing', {sdk: c.sdk_missing})) + '</p>' : '');
+  el.innerHTML = '<div class="settings-row"><div><h3>' + escHtml(t('cls.title')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('cls.desc')) + '</p>' +
+      '<p class="desc">' + escHtml(t('cls.calls_today', {n: fmtN(c.calls_today || 0), of: fmtN(c.per_day || 0)})) +
+      (c.held_seconds ? ' &middot; ' + escHtml(t('cls.held', {min: Math.ceil(c.held_seconds / 60)})) : '') + '</p>' +
+      (c.budget_reached ? '<p class="hint warn" id="cls-budget">' + escHtml(t('cls.budget_reached')) + '</p>' : '') +
+      classifyMetricsHtml(c.metrics, c.cost) +
+      (c.account ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="loadClassifyAccount()">' +
+        escHtml(t('cls.account')) + '</button></div><div id="cls-account"></div>' : '') + '</div>' +
+    '<div class="fields">' +
+      '<div class="form-group"><label class="form-label" for="cls-provider">' + escHtml(t('cls.provider')) + '</label>' +
+        '<select class="form-input" id="cls-provider">' + (c.providers || ['off']).map(opt).join('') + '</select></div>' +
+      '<div class="form-row">' + field('base_url', t('cls.base_url'), c.base_url, 'url', ' placeholder="http://127.0.0.1:11434/v1"') +
+        field('model', t('cls.model'), c.model) + '</div>' +
+      (c.provider === 'decision' ? '<p class="hint">' + escHtml(t('cls.decision_hint')) + '</p>' : '') +
+      // (DeepInfra's own price list to choose a model from: the field stays free text.)
+      (c.price_list ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="loadClassifyModels()">' +
+        escHtml(t('cls.models')) + '</button></div><div id="cls-models"></div>' : '') +
+      '<div class="form-row">' + field('key_name', t('cls.key_name'), c.key_name) + '</div>' + key +
+      // (The contacts bar: only for the provider that answers with probabilities.)
+      (c.provider === 'decision' ? '<div class="form-row">' +
+        field('yes', t('cls.yes'), c.yes, 'number', ' min="0.5" max="0.99" step="0.01"') +
+        '</div><p class="hint">' + escHtml(t('cls.yes_hint')) + '</p>' : '') +
+      (on && c.provider !== 'brain' ? '<div class="form-row">' +
+        field('price_in', t('cls.price_in'), c.price_in_per_m, 'number', ' min="0" step="any"') +
+        field('price_out', t('cls.price_out'), c.price_out_per_m, 'number', ' min="0" step="any"') + '</div>' +
+        '<p class="hint">' + escHtml(t('cls.price_hint')) + '</p>' + classifyCostHtml(c) +
+        '<div class="form-row">' +
+        field('usd_day', t('cls.usd_per_day'), c.usd_per_day, 'number', ' min="0" step="any"') +
+        field('usd_month', t('cls.usd_per_month'), c.usd_per_month, 'number', ' min="0" step="any"') + '</div>' +
+        '<p class="hint">' + escHtml(t('cls.usd_hint')) + '</p>' : '') +
+      '<div class="form-row">' + field('per_day', t('cls.per_day'), c.per_day, 'number', ' min="0"') +
+        field('per_minute', t('cls.per_minute'), c.per_minute, 'number', ' min="1"') +
+        field('timeout', t('cls.timeout'), c.timeout_seconds, 'number', ' min="5"') + '</div>' +
+      '<div class="form-group"><label class="pd-setting"><input type="checkbox" id="cls-json"' + (c.json_mode ? ' checked' : '') + '> ' +
+        escHtml(t('cls.json_mode')) + '</label></div>' +
+      '<div class="form-group"><span class="form-label">' + escHtml(t('cls.tasks')) + '</span>' + tasks + '</div>' +
+      '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="saveClassify()">' + escHtml(t('cls.save')) + '</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="testClassify()"' + (on ? '' : ' disabled') + '>' + escHtml(t('cls.test')) + '</button></div>' +
+      '<div id="cls-test-result"></div>' +
+    '</div></div>' +
+    '<div class="settings-row"><div><h3>' + escHtml(t('rejudge.title')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('rejudge.desc')) + '</p></div>' +
+    '<div class="fields" id="rejudge-box"><p class="muted small">' + escHtml(t(c.waiting ? 'rejudge.counting' : 'rejudge.none')) + '</p></div></div>';
+  if (c.waiting) loadRejudgeCount();
+}
+
+async function loadRejudgeCount() {
+  const el = document.getElementById('rejudge-box');
+  if (!el) return;
+  const r = await api('/api/contacts/site-checks');
+  if (!r || r.error) { el.innerHTML = '<p class="muted small">' + escHtml(failMsg(r, t('cls.failed'))) + '</p>'; return; }
+  if (!r.firms) { el.innerHTML = '<p class="muted small">' + escHtml(t('rejudge.none')) + '</p>'; return; }
+  el.innerHTML = '<p>' + escHtml(t('rejudge.count', {n: fmtN(r.firms), u: fmtN(r.unconfirmed || 0), l: fmtN(r.likely || 0),
+      ruled: fmtN(r.ruled_out_by_address || 0), read: fmtN(r.to_read || 0)})) + '</p>' +
+    (r.provider === 'off' ? '<p class="muted small">' + escHtml(t('rejudge.off')) + '</p>' :
+      (r.days ? '<p class="muted small">' + escHtml(t('rejudge.days', {n: fmtN(r.days)})) + '</p>' : '')) +
+    '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="startRejudge(' + Number(r.firms || 0) + ')">' + escHtml(t('rejudge.start')) + '</button></div>';
+}
+
+async function startRejudge(n) {
+  // (With the classifier off it still takes off what the address or a
+  // register fact settles: said before it starts.)
+  const off = !_classify || !_classify.provider || _classify.provider === 'off';
+  if (!confirm(t(off ? 'rejudge.confirm_off' : 'rejudge.confirm', {n: fmtN(n || 0)}))) return;
+  const res = await api('/api/contacts/site-checks', {method: 'POST'});
+  showToast(res && res.success ? t('rejudge.started', {n: fmtN(res.queued || 0), batch: res.batch_id || ''})
+            : failMsg(res, t('cls.failed')), res && res.success ? 'success' : 'error');
+  loadRejudgeCount();
+}
+
+async function saveClassify() {
+  const v = (id) => (document.getElementById('cls-' + id) || {}).value;
+  const tasks = {};
+  Object.keys((_classify && _classify.tasks) || {}).forEach(k => {
+    const box = document.getElementById('cls-task-' + k);
+    tasks[k] = {on: !!(box && box.checked), per_day: (_classify.tasks[k] || {}).per_day || 0};
+  });
+  const body = {provider: v('provider'), base_url: v('base_url') || '', model: v('model') || '',
+                key_name: v('key_name') || '', per_day: Number(v('per_day') || 0),
+                per_minute: Number(v('per_minute') || 1), timeout_seconds: Number(v('timeout') || 30),
+                json_mode: !!(document.getElementById('cls-json') || {}).checked, tasks: tasks};
+  if (document.getElementById('cls-yes')) body.yes = Number(v('yes') || 0.7);
+  // (Blank: unknown price, no USD cap.)
+  [['price_in', 'price_in_per_m'], ['price_out', 'price_out_per_m'], ['usd_day', 'usd_per_day'],
+   ['usd_month', 'usd_per_month']].forEach(([id, key]) => {
+    if (document.getElementById('cls-' + id)) body[key] = (v(id) || '').trim();
+  });
+  const res = await api('/api/classify/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(res && res.success ? t('cls.saved') : failMsg(res, t('cls.failed')), res && res.success ? 'success' : 'error');
+  loadClassifyCard();
+}
+
+// DeepInfra's models for this provider, with their prices: picking one
+// fills the model field (saved with Save). No recommendation.
+async function loadClassifyModels() {
+  const el = document.getElementById('cls-models');
+  if (!el) return;
+  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
+  const r = await api('/api/classify/models');
+  const rows = (r && r.models) || [];
+  if (!rows.length) {
+    el.innerHTML = '<p class="muted small">' + escHtml(t(r && r.error ? 'cls.models_failed' : 'cls.models_none')) + '</p>';
+    return;
+  }
+  el.innerHTML = '<div class="table-wrap"><table class="table small"><thead><tr><th>' + escHtml(t('cls.model')) + '</th><th>' +
+    escHtml(t('cls.models.in')) + '</th><th>' + escHtml(t('cls.models.out')) + '</th><th>' + escHtml(t('cls.models.context')) +
+    '</th><th></th></tr></thead><tbody>' + rows.map(m => '<tr><td>' + escHtml(m.model) + '</td><td>' + escHtml(clsUsd(m.in_per_m)) +
+    '</td><td>' + escHtml(clsUsd(m.out_per_m)) + '</td><td>' + (m.context ? escHtml(fmtN(m.context)) : '–') +
+    '</td><td><button class="btn btn-secondary btn-sm" data-model="' + escHtml(m.model) +
+    '" onclick="pickClassifyModel(this.dataset.model)">' + escHtml(t('cls.models.pick')) + '</button></td></tr>').join('') +
+    '</tbody></table></div><p class="hint">' + escHtml(t('cls.models_hint')) + '</p>';
+}
+
+function pickClassifyModel(name) {
+  const input = document.getElementById('cls-model');
+  if (input) input.value = name || '';
+}
+
+// The key's DeepInfra account, read by the server (the key stays there).
+async function loadClassifyAccount() {
+  const el = document.getElementById('cls-account');
+  if (!el) return;
+  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
+  const a = await api('/api/classify/account');
+  if (!a || !a.available) {
+    el.innerHTML = '<p class="muted small">' + escHtml(a && a.code ? t('cls.account.err.' + a.code, {name: (_classify || {}).key_name || ''})
+                                                                   : t('cls.failed')) + '</p>';
+    return;
+  }
+  const part = (p, ok) => p && p.ok ? ok(p) : '<li class="muted">' + escHtml(p && p.code
+    ? t('cls.account.err.' + p.code, {scope: p.scope || '', status: p.status || ''}) : t('cls.failed')) + '</li>';
+  el.innerHTML = '<ul class="small">' +
+    part(a.usage, u => '<li>' + escHtml(t('cls.account.usage', {usd: clsUsd(u.total_usd), period: u.period || ''})) +
+      ((u.models || []).length ? ': ' + u.models.map(m => escHtml(m.model + ' ' + clsUsd(m.usd))).join(', ') : '') + '</li>') +
+    part(a.limits, l => (l.keys || []).map(k => '<li>' + escHtml(t('cls.account.key', {name: k.name,
+      spend: clsUsd(k.spend_usd), limit: k.limit_usd === null || k.limit_usd === undefined ? t('cls.account.no_limit') : clsUsd(k.limit_usd)})) + '</li>').join('')) +
+    part(a.balance, b => '<li>' + escHtml(t('cls.account.balance', {credit: clsUsd(b.credit_usd), owed: clsUsd(b.owed_usd)})) +
+      (b.suspended ? ' &middot; <b>' + escHtml(t('cls.account.suspended')) + '</b>' : '') + '</li>') + '</ul>';
+}
+
+async function testClassify() {
+  const el = document.getElementById('cls-test-result');
+  const res = await api('/api/classify/test', {method: 'POST'});
+  if (!res || !res.success) { showToast(failMsg(res, t('cls.failed')), 'error'); return; }
+  if (el) el.innerHTML = '<p class="muted small">' + escHtml(t('cls.testing')) + '</p>';
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const j = await api('/api/classify/test/' + encodeURIComponent(res.job_id));
+    if (!j || j.error) break;
+    if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') {
+      const r = j.result || {};
+      if (el) el.innerHTML = j.status === 'done'
+        ? '<p class="small">' + escHtml(t('cls.test_result', {acc: r.accuracy === null || r.accuracy === undefined ? '–' : r.accuracy,
+            n: fmtN(r.scored || 0), fl: fmtN(r.false_links || 0), miss: fmtN(r.misses || 0), bad: fmtN(r.invalid || 0),
+            ms: (r.latency_ms || {}).median === null || (r.latency_ms || {}).median === undefined ? '–' : fmtN(r.latency_ms.median),
+            tin: fmtN(r.tokens_in || 0), tout: fmtN(r.tokens_out || 0)})) +
+            ' ' + escHtml(t(r.cost_known === false ? 'cls.test_spend_unknown' : 'cls.test_spend', {usd: clsUsd(r.cost_usd || 0)})) + '</p>'
+        : '<div class="test-result error">' + escHtml(j.error || t('cls.failed')) + '</div>';
+      return;
+    }
+  }
+}
+
+// Why a website a search found was taken: the register fact that confirmed
+// it, or the classifier's yes (the company panel).
+function siteBasisText(b) {
+  if (!b || !b.found_by) return '';
+  const by = t('site.basis.found_by', {module: tServer('module.' + b.found_by + '.name', b.found_by)});
+  if (!b.by) return by + ' · ' + t('site.basis.unchecked');
+  if (b.by !== 'judge') return by + ' · ' + t('site.basis.' + b.by);
+  if (typeof b.p === 'number') {
+    return by + ' · ' + t('site.basis.judge_yes_p', {model: b.model || '', p: Math.round(b.p * 100)});
+  }
+  return by + ' · ' + t('site.basis.judge_yes', {model: b.model || ''});
 }
 
 let _finder = null;

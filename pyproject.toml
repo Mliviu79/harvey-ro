@@ -33,6 +33,9 @@ dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
     "phonenumbers>=8.13,<10",
+    # The classifier's providers (harvey/classify.py), imported only when one is set.
+    "openai>=1.40,<3",
+    "anthropic>=0.40,<1",
 ]
 
 [project.optional-dependencies]

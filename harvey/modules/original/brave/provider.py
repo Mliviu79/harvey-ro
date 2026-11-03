@@ -120,7 +120,9 @@ class Brave(DiscoveryProvider):
             if not domain:
                 continue
             title = item.get("title") if isinstance(item.get("title"), str) else ""
+            snippet = item.get("description") if isinstance(item.get("description"), str) else ""
             out.append(Business(name=business_name(title, domain), raw_title=title,
+                                snippet=" ".join(snippet.split())[:300],
                                 domain=domain, website=url, location=query.location,
                                 has_website=True, source_url=url, provider=self.key,
                                 keyword=query.keyword()))

@@ -62,6 +62,7 @@
    "site_read_at": true,
    "site_read_deep": null,
    "website": null,
+   "website_basis": null,
    "website_fill": null,
    "website_source": null,
    "website_trust": null
@@ -86,6 +87,7 @@
    "site_read_at": true,
    "site_read_deep": null,
    "website": null,
+   "website_basis": null,
    "website_fill": null,
    "website_source": null,
    "website_trust": null

@@ -51,7 +51,7 @@ ALLOWANCE_PERIODS = ("minute", "hour", "day", "month")
 # only (both orders are tried where it matters), "" when there is none.
 NAME_ORDERS = ("", "given_first", "family_first")
 CAPABILITY_OPS = ("query", "lookup", "read", "sync", "expand", "judge", "action")
-SETTING_TYPES = ("bool", "int", "float", "str", "list")
+SETTING_TYPES = ("bool", "int", "float", "str", "list", "choice")
 ABSENCE_VALUES = ("unknown", "false")
 # What a signal is about, how many current values it has, what its rows are
 # told apart by (the search phrase of a rank, the financial year of a
@@ -347,6 +347,12 @@ def _check_settings(raw, where: str, problems: list[str]) -> dict:
         if kind not in SETTING_TYPES:
             problems.append(f"{where}: setting {key} needs a type, one of "
                             f"{', '.join(SETTING_TYPES)}; got {kind!r}")
+        elif kind == "choice":
+            choices = spec.get("choices")
+            if not isinstance(choices, list) or not choices \
+                    or spec.get("default") not in choices:
+                problems.append(f"{where}: choice setting {key} needs choices, a list that "
+                                f"holds its default")
     return dict(raw)
 
 

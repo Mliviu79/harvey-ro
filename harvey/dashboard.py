@@ -1956,6 +1956,223 @@ async def set_contact_finder_settings(request: Request):
     return {"success": True, **await finder.background_status(state)}
 
 
+# ── The classifier (harvey/classify.py) and the found websites' check ──
+
+# Settings the Classifier card may change: (the setting, how it is typed).
+CLASSIFY_FIELDS = {"provider": "classify_provider", "base_url": "classify_base_url",
+                   "model": "classify_model", "key_name": "classify_key_name",
+                   "json_mode": "classify_json_mode", "per_day": "classify_per_day",
+                   "per_minute": "classify_per_minute",
+                   "timeout_seconds": "classify_timeout_seconds", "tasks": "classify_tasks",
+                   "yes": "classify_yes",
+                   "price_in_per_m": "classify_price_in_per_m",
+                   "price_out_per_m": "classify_price_out_per_m",
+                   "usd_per_day": "classify_usd_per_day", "usd_per_month": "classify_usd_per_month"}
+# The ones that are USD amounts (blank or null: none).
+CLASSIFY_MONEY = ("price_in_per_m", "price_out_per_m", "usd_per_day", "usd_per_month")
+
+
+async def _classify_status(state) -> dict:
+    from harvey import classify, site_check
+    from harvey import classify_prices as prices
+    from harvey.modules import lanes
+
+    s = await classify.settings(state)
+    held = await asyncio.to_thread(lanes.held, classify.LANE)
+    key_set = bool(s.key_name) and bool(classify._key(s)) if s.provider in (
+        "openai_compatible", "anthropic", "decision") else None
+    deepinfra = prices.is_deepinfra(s.base_url)
+    return {**s.public(), "providers": list(classify.PROVIDERS),
+            "calls_today": await classify.calls_today(state), "held_seconds": int(held),
+            "key_set": key_set, "sdk_missing": classify.sdk_missing(s.provider),
+            "waiting": await site_check.waiting(state),
+            "cost": await classify.cost_status(state, s),
+            "budget_reached": s.provider != "off"
+            and await classify.available(state, "site", s) == "budget",
+            "metrics": await classify.metrics(state),
+            "deepinfra": deepinfra,
+            "price_list": deepinfra and s.provider in prices.KINDS,
+            "account": deepinfra and bool(key_set)}
+
+
+@app.get("/api/classify")
+async def get_classify():
+    """The classifier's settings (the key's name, never a value; whether
+    the .env holds one), today's calls, whether it is held, and how many
+    found websites wait for a check."""
+    if not DB_PATH.exists():
+        return {"provider": "off", "waiting": 0, "calls_today": 0}
+    state = _state()
+    await state.init_db()
+    return await _classify_status(state)
+
+
+@app.post("/api/classify/settings")
+async def set_classify(request: Request):
+    """Change the classifier's settings: any of provider, base_url, model,
+    key_name (the .env key's name), json_mode, per_day, per_minute,
+    timeout_seconds, tasks ({"site": {"on": true, "per_day": 500}, ...}),
+    yes (a decision model's contacts bar, 0.5 to 0.99), price_in_per_m and
+    price_out_per_m (USD a million tokens), usd_per_day and usd_per_month
+    (the USD caps): a number of at least 0, or blank / null for none."""
+    from harvey import classify, finder
+    from harvey.modules import switches
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or not body or any(k not in CLASSIFY_FIELDS for k in body):
+        return JSONResponse({"success": False, "message": "expected any of "
+                             + ", ".join(CLASSIFY_FIELDS)}, status_code=400)
+    if "provider" in body and body["provider"] not in classify.PROVIDERS:
+        return JSONResponse({"success": False, "message": "provider must be one of "
+                             + ", ".join(classify.PROVIDERS)}, status_code=400)
+    # (The Test button sends the named key to the base URL: only a key
+    # meant for a classifier, never one of Harvey's own, and only http(s).)
+    if "key_name" in body:
+        why = classify.key_name_problem(str(body["key_name"]))
+        if why:
+            return JSONResponse({"success": False, "message": f"key_name is the name of a .env "
+                                 f"key, never the key: {why}"}, status_code=400)
+    if "base_url" in body:
+        why = classify.base_url_problem(str(body["base_url"] or ""))
+        if why:
+            return JSONResponse({"success": False, "message": why}, status_code=400)
+    if "yes" in body:
+        if isinstance(body["yes"], bool) or not isinstance(body["yes"], (int, float)):
+            return JSONResponse({"success": False, "message": "yes is a number from "
+                                 "0.5 to 0.99"}, status_code=400)
+        body["yes"] = classify.yes_setting(body["yes"])
+    for money in CLASSIFY_MONEY:
+        if money in body:
+            raw = body[money]
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                body[money] = ""
+                continue
+            value = classify.money_setting(raw)
+            if value is None or isinstance(raw, bool):
+                return JSONResponse({"success": False, "message": f"{money} is an amount in "
+                                     "USD of at least 0, or blank for none"}, status_code=400)
+            body[money] = f"{value:g}"
+    if "tasks" in body:
+        if not isinstance(body["tasks"], dict) or any(
+                k not in classify.TASKS or not isinstance(v, dict) for k, v in body["tasks"].items()):
+            return JSONResponse({"success": False, "message": "tasks: {name: {on, per_day}} "
+                                 "for " + ", ".join(classify.TASKS)}, status_code=400)
+        try:
+            body["tasks"] = json.dumps({
+                k: {"on": bool(v.get("on", True)),
+                    "per_day": min(classify.MAX_PER_DAY, max(0, int(v.get("per_day") or 0)))}
+                for k, v in body["tasks"].items()})
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "tasks: per_day is a number"},
+                                status_code=400)
+    state = _state()
+    await state.init_db()
+    for key, value in body.items():
+        await switches.set_module_setting(state, finder.FINDER[0], CLASSIFY_FIELDS[key], value)
+    return {"success": True, **await _classify_status(state)}
+
+
+@app.get("/api/classify/models")
+async def get_classify_models(provider: str = ""):
+    """DeepInfra's models the classifier can be asked through, with their
+    price a million input and output tokens and their context, cheapest
+    first (text-generation, for openai_compatible: the current provider's
+    when none is named). Fetched here, kept a day; sorted by price and
+    nothing else."""
+    from harvey import classify
+    from harvey import classify_prices as prices
+
+    state = _state()
+    await state.init_db()
+    s = await classify.settings(state)
+    provider = provider or s.provider
+    if provider not in prices.KINDS:
+        return JSONResponse({"models": [], "error": "a price list is for openai_compatible"},
+                            status_code=400)
+    return await prices.choices(state, provider)
+
+
+@app.get("/api/classify/account")
+async def get_classify_account(refresh: bool = False):
+    """The classifier key's DeepInfra account, read here with the key
+    (never sent to the browser): this month's usage per model, the key's
+    limit and spend, the balance; each part says when it can't be read."""
+    from harvey import classify
+    from harvey import classify_prices as prices
+
+    state = _state()
+    await state.init_db()
+    return await prices.account(await classify.settings(state), refresh=refresh)
+
+
+@app.post("/api/classify/test")
+async def start_classify_test():
+    """Run the classifier over the built-in labelled set, as a job: its id
+    (GET /api/classify/test/{id} for the summary)."""
+    from harvey import classify
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import CLASSIFY_LANE
+
+    state = _state()
+    await state.init_db()
+    if (await classify.settings(state)).provider == "off":
+        return JSONResponse({"success": False, "message": "choose a provider first"},
+                            status_code=409)
+    try:
+        job_id = await jobs.enqueue(state, "classify_test", CLASSIFY_LANE, {},
+                                    dedupe_key="classify_test", label="Classifier test",
+                                    module="contact_finder")
+    except jobs.Duplicate as e:
+        job_id = e.job.id
+    jobs.notify()
+    return {"success": True, "job_id": job_id}
+
+
+@app.get("/api/classify/test/{job_id}")
+async def get_classify_test(job_id: str):
+    from harvey.modules import jobs
+
+    state = _state()
+    await state.init_db()
+    job = await jobs.get(state, job_id)
+    if job is None or job.kind != "classify_test":
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"status": job.status, "error": job.error, "result": job.result}
+
+
+@app.get("/api/contacts/site-checks")
+async def get_site_checks():
+    """What checking the found websites would do (counted, nothing changed)."""
+    from harvey import site_check
+
+    if not DB_PATH.exists():
+        return {"firms": 0}
+    state = _state()
+    await state.init_db()
+    return await site_check.count(state)
+
+
+@app.post("/api/contacts/site-checks")
+async def start_site_checks():
+    """Check every found website nothing checked yet: one batch, one job per
+    firm (its id undoes what the check took off: harvey contacts rejudge
+    --undo BATCH)."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_site_checks
+
+    state = _state()
+    await state.init_db()
+    try:
+        batch_id, ids, dupes = await enqueue_site_checks(state)
+    except jobs.Duplicate as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=409)
+    jobs.notify()
+    return {"success": True, "batch_id": batch_id, "queued": len(ids), "waiting": len(dupes)}
+
+
 @app.get("/api/contacts/{contact_id}")
 async def get_contact_reach(contact_id: int):
     """Every live company a contact reaches, through whom and where."""
@@ -4154,7 +4371,8 @@ def _lane_name(lane: str) -> str:
     m = switches.by_id().get(lane)
     if m is not None:
         return m.name or m.id
-    return {"contacts": "Contacts", "duplicates": "Duplicates", "counts": "Counts"}.get(lane, lane)
+    return {"contacts": "Contacts", "duplicates": "Duplicates", "counts": "Counts",
+            "classify": "Classifier", "site_check": "Website checks"}.get(lane, lane)
 
 
 @app.get("/api/jobs")
@@ -4786,6 +5004,22 @@ async def get_today():
                            "an email specific — who their agency is, what they "
                            "are missing, whether they are spending on ads."),
                 "action": "Read their sites", "tab": "discover",
+            })
+
+        # Websites a search found that nothing has checked yet (found before
+        # the finder chose sites on evidence, or waiting for the classifier).
+        from harvey import site_check
+        to_check = await site_check.waiting(state)
+        stats["sites_to_check"] = to_check
+        if to_check:
+            items.append({
+                "key": "site-check", "tone": "warn",
+                "title": f"{to_check} found websites wait for a check",
+                "detail": ("A search found them, but nothing proved they are the firms' own. "
+                           "The check rules out directories by their address, reads the "
+                           "rest again and asks the classifier; nothing changes until you "
+                           "start it."),
+                "action": "Review the check", "tab": "settings",
             })
 
         if needs_human:

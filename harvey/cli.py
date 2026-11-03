@@ -564,6 +564,107 @@ async def _print_finder_status(state) -> None:
     print(f"  Last 24 hours:                {day['companies']:,} companies, "
           f"{day['found']:,} contacts found, ${day['cost']:.4f}")
     print(f"  Finder jobs waiting:          {waiting:,}\n")
+    await _print_site_checks(state)
+
+
+async def _print_site_checks(state) -> None:
+    from harvey import classify, site_check
+
+    c = await site_check.count(state)
+    s = await classify.settings(state)
+    print(f"  Found websites waiting for a check: {c['firms']:,} "
+          f"({c['unconfirmed']:,} unconfirmed, {c['likely']:,} likely)")
+    if c["firms"]:
+        print(f"    ruled out by their address:  {c['ruled_out_by_address']:,} (no visit)")
+        print(f"    to read again and decide:    {c['to_read']:,} (free reads; the "
+              "classifier where no register fact settles it)")
+    used = c["calls_today"]
+    if s.provider == "off":
+        print("  Classifier: off (Settings → Classifier, or harvey contacts judge-test "
+              "once one is set)\n")
+    else:
+        print(f"  Classifier: {s.provider} {s.model_name}, {used:,} calls today of "
+              f"{s.per_day:,}" + (f"; at most {c['days']} day(s) for the check"
+                                  if c.get("days") else ""))
+        await _print_classifier_spend(state, s)
+        print()
+
+
+async def _print_classifier_spend(state, s) -> None:
+    """The classifier's spend and budget, one line each."""
+    from harvey import classify
+
+    status = await classify.cost_status(state, s)
+    print(f"    {classify.metrics_line(await classify.metrics(state), status)}")
+    caps = [f"{classify.usd(v)} {k}" for k, v in (("a day", s.usd_per_day),
+                                                    ("a month", s.usd_per_month))
+            if v is not None]
+    if caps:
+        why = await classify.available(state, "site", s)
+        print("    USD cap: " + ", ".join(caps) + (
+            "; reached: the firms wait unlinked until it renews" if why == "budget" else "")
+            + ("" if status["known"] else f" ({classify.COST_UNKNOWN}: the call caps hold)"))
+
+
+async def _rejudge(state, args) -> None:
+    """harvey contacts rejudge: count (--dry-run, the default), check
+    (--run), or put back what a check took off (--undo BATCH)."""
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_site_checks
+
+    if args.undo:
+        done = await state.undo_site_checks(args.undo)
+        print(f"\n  Put back {done['restored']:,} website(s)"
+              + (f"; {done['refused']:,} left as they are (another website since)"
+                 if done["refused"] else "") + "\n")
+        return
+    await _print_site_checks(state)
+    if not args.run:
+        print("  Nothing changed. harvey contacts rejudge --run checks them "
+              "(--checks N for the first N).\n")
+        return
+    try:
+        batch_id, ids, dupes = await enqueue_site_checks(state, limit=args.limit_checks)
+    except jobs.Duplicate as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(2)
+    print(f"  {len(ids):,} queued" + (f", {len(dupes):,} already waiting" if dupes else "")
+          + f" (batch {batch_id}; harvey contacts rejudge --undo {batch_id} puts back what "
+          "it takes off)")
+    if args.background or not ids:
+        await _queued_note(state, batch_id, len(ids))
+        return
+    found = await _wait_for(state, batch_id)
+    outcomes: dict[str, int] = {}
+    for j in found:
+        if j.status == jobs.DONE:
+            key = j.result.get("outcome") or "done"
+            outcomes[key] = outcomes.get(key, 0) + 1
+    print("\n  " + (", ".join(f"{n:,} {k}" for k, n in sorted(outcomes.items())) or "nothing done"))
+    _job_failures(found)
+    print()
+
+
+async def _judge_test(state, args) -> None:
+    """harvey contacts judge-test: the configured classifier over a
+    labelled set (the built-in fictional one, or --file)."""
+    from harvey import classify, site_check
+
+    rows = site_check.read_cases(args.file) if args.file else site_check.builtin_cases()
+    try:
+        r = await site_check.judge_test(state, rows, every=args.all, task=args.task,
+                                        limit=args.limit_checks)
+    except ValueError as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(2)
+    print()
+    for line in site_check.summary_lines(r):
+        print(f"  {line}")
+    await _print_classifier_spend(state, await classify.settings(state))
+    for f in r["failures"][:10]:
+        print(f"    - {f.get('id')}: expected {f.get('expected')}, got "
+              f"{f.get('got', f.get('why'))}")
+    print()
 
 
 def cmd_contacts(args):
@@ -581,6 +682,12 @@ def cmd_contacts(args):
         await state.init_db()
         if args.action == "status":
             await _print_finder_status(state)
+            return
+        if args.action == "rejudge":
+            await _rejudge(state, args)
+            return
+        if args.action == "judge-test":
+            await _judge_test(state, args)
             return
         from harvey.contacts import ContactFilter
 
@@ -3148,8 +3255,11 @@ def main():
                     "first (free), then, within --max-spend, a search by name and town "
                     "for those with no website and one checked address per person "
                     "named there. 'status' shows the backlog.")
-    sub.add_argument("action", nargs="?", default="find", choices=["find", "status"],
-                     help="find (default) or status")
+    sub.add_argument("action", nargs="?", default="find",
+                     choices=["find", "status", "rejudge", "judge-test"],
+                     help="find (default), status, rejudge (check the websites a search "
+                          "found before: counts unless --run) or judge-test (the "
+                          "classifier over a labelled set)")
     sub.add_argument("--county", default="", help="Only companies in this county")
     sub.add_argument("--locality", default="", help="Only companies in this town")
     sub.add_argument("--website", default="", choices=["", "yes", "no"],
@@ -3166,6 +3276,22 @@ def main():
     sub.add_argument("--force", action="store_true",
                      help="Search again companies already searched (each search is "
                           "kept; the company drawer shows where and when)")
+    sub.add_argument("--dry-run", action="store_true",
+                     help="rejudge: count only (the default)")
+    sub.add_argument("--run", action="store_true",
+                     help="rejudge: check them (one firm per job on a lane of its own)")
+    sub.add_argument("--undo", default="", metavar="BATCH",
+                     help="rejudge: put back what that check's batch took off")
+    sub.add_argument("--file", default="",
+                     help="judge-test: your own labelled file (one JSON object a line); "
+                          "default: the built-in fictional set")
+    sub.add_argument("--all", action="store_true",
+                     help="judge-test: ask about every row, not only those no register "
+                          "fact settles")
+    sub.add_argument("--task", default="site", choices=["site", "results"],
+                     help="judge-test: which task to test (default: site)")
+    sub.add_argument("--checks", dest="limit_checks", type=int, default=0, metavar="N",
+                     help="rejudge / judge-test: the first N only")
     _background_arg(sub)
     sub.set_defaults(func=cmd_contacts)
 
