@@ -343,7 +343,14 @@
 
 <!-- Campaigns (Email module) -->
 <div id="campaigns" class="section" data-module="email">
-  <div class="section-head"><div><h2 data-i18n="camp.title">Campanii</h2><p data-i18n="camp.lede">Secvențele de email scrise de Harvey și cât de departe a ajuns fiecare.</p></div></div>
+  <div class="section-head">
+    <div><h2 data-i18n="camp.title">Campanii</h2><p data-i18n="camp.lede">Campaniile tale: cui scrii, ce scrii și cât de departe a ajuns fiecare.</p></div>
+    <div class="page-actions"><button class="btn btn-primary" onclick="openCampaignWizard()" data-i18n="cw.new">Campanie nouă</button></div>
+  </div>
+  <div class="toolbar"><div class="segmented" id="camp-tabs" role="group" data-i18n-aria="cp.tabs_label" aria-label="Campanii și publicuri"></div></div>
+  <div id="campaign-wizard"></div>
+  <div id="campaign-detail"></div>
+  <div id="campaigns-table"></div>
   <div id="campaigns-list"></div>
 </div>
 

@@ -119,6 +119,8 @@ const STATUS = {
   verified: 'good', risky: 'waiting', guess: 'idle', invalid: 'bad',
   running: 'active', stale: 'bad', stalled: 'bad',
   unchecked: 'idle', valid: 'good', likely: 'waiting', unconfirmed: 'idle',
+  finished: 'idle', archived: 'idle', waiting: 'waiting', ready: 'active', staged: 'waiting',
+  in_sequence: 'active', done: 'good', stopped: 'idle', suppressed: 'bad', skipped: 'idle', removed: 'idle',
 };
 
 function statusMeta(status) {
@@ -4580,7 +4582,8 @@ function fbCampaign(i) {
 
 let _cv = { view: 'contacts', q: '', f: {}, sort: '', dir: 'desc', offset: 0, limit: loadPageSize(),
             total: 0, more: false, rows: [], open: null, reach: {}, gen: 0, timer: null, force: false,
-            sources: [], kinds: [], financials: false, signals: null, error: '' };
+            sources: [], kinds: [], financials: false, signals: null, error: '', sel: new Set(),
+            adding: false };
 const CONTACT_STATUSES = ['verified', 'risky', 'guess', 'unchecked', 'invalid', 'valid'];
 const CONTACT_TRUST = ['confirmed', 'likely', 'unconfirmed'];
 const CONTACT_LINES = ['mobile', 'fixed', 'voip', 'toll_free'];
@@ -4627,6 +4630,14 @@ function contactParams(paged) {
   return p.toString();
 }
 
+// The Contacts filters as a saved audience keeps them (no page, no sort).
+function contactQuery() {
+  const p = new URLSearchParams();
+  if (_cv.q.trim()) p.set('q', _cv.q.trim());
+  Object.keys(_cv.f).forEach(k => { if (_cv.f[k] !== '' && _cv.f[k] !== undefined) p.set(k, _cv.f[k]); });
+  return p.toString();
+}
+
 async function loadContactList() {
   const body = document.getElementById('ct-body');
   if (!body) return;
@@ -4638,7 +4649,7 @@ async function loadContactList() {
         'data-i18n-aria="cl.search_label" placeholder="' + escHtml(t(ph)) + '" aria-label="' + escHtml(t('cl.search_label')) + '" ' +
         'oninput="contactListSearch(this.value)"></label><div id="cl-actions"></div></div>' +
       '<details class="more-fields" id="cl-more"><summary>' + escHtml(t('cl.filters')) + '</summary><div id="cl-filters"></div></details>' +
-      '<div id="cl-finder"></div><div id="cl-rows"></div>';
+      '<div id="cl-finder"></div><div id="cl-addbar"></div><div id="cl-rows"></div>';
     loadFinderStatus();
     document.getElementById('cl-search').value = _cv.q;
     renderContactFilters();
@@ -4788,7 +4799,16 @@ function renderContactList() {
       : emptyState(icon('contacts'), escHtml(t(people ? 'cl.people_empty' : 'ct.empty')), escHtml(t(people ? 'cl.people_empty_copy' : 'ct.empty_copy')))) + '</div>';
     return;
   }
-  let html = '<div class="table-card"><table class="data ct-table">' + contactHeader(people ? PEOPLE_COLUMNS : CONTACT_COLUMNS) + '<tbody>';
+  // Email addresses can be ticked and added to a campaign (Email module).
+  const ticks = !people && !!_modules.email;
+  const emails = _cv.rows.filter(r => r.kind === 'email');
+  const allOn = emails.length > 0 && emails.every(r => _cv.sel.has(r.value));
+  let head = contactHeader(people ? PEOPLE_COLUMNS : CONTACT_COLUMNS);
+  if (ticks) {
+    head = head.replace('<tr>', '<tr><th class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.page')) + '"' +
+      (allOn ? ' checked' : '') + (emails.length ? '' : ' disabled') + ' onchange="selectAddressPage(this.checked)"></th>');
+  }
+  let html = '<div class="table-card"><table class="data ct-table">' + head + '<tbody>';
   _cv.rows.forEach((r, i) => {
     if (people) {
       html += '<tr><td class="ct-name"><div class="cell-row"><span class="avatar">' + initials(...String(r.name).split(' ')) + '</span>' +
@@ -4806,7 +4826,10 @@ function renderContactList() {
     const reach = r.companies > 1
       ? '<button type="button" class="link-btn" aria-expanded="' + open + '" onclick="toggleContactReach(' + i + ')">' + escHtml(t('kpi.fact_companies', {n: r.companies})) + '</button>'
       : '';
-    html += '<tr class="' + (open ? 'selected' : '') + '"><td data-label="' + escHtml(t('cl.col.contact')) + '">' + contactValue(r) + '</td>' +
+    const tick = !ticks ? '' : '<td class="sel" data-label="">' + (r.kind === 'email'
+      ? '<input type="checkbox" aria-label="' + escHtml(t('sel.row', {name: r.value})) + '"' +
+        (_cv.sel.has(r.value) ? ' checked' : '') + ' onchange="selectAddress(' + i + ', this.checked)">' : '') + '</td>';
+    html += '<tr class="' + (open ? 'selected' : '') + '">' + tick + '<td data-label="' + escHtml(t('cl.col.contact')) + '">' + contactValue(r) + '</td>' +
       '<td data-label="' + escHtml(t('cl.col.status')) + '">' + (r.status ? badge(r.status) : '') + '</td>' +
       '<td data-label="' + escHtml(t('cl.col.trust')) + '">' + badge(r.trust) + '</td>' +
       '<td data-label="' + escHtml(t('cl.col.companies')) + '"><div class="cell-stack">' +
@@ -4816,7 +4839,7 @@ function renderContactList() {
         (r.people > 1 ? '<div class="cell-sub">' + escHtml(t('cl.people_n', {n: r.people})) + '</div>' : '') + '</td>' +
       '<td class="muted" data-label="' + escHtml(t('cl.col.sources')) + '">' + (r.sources || []).map(sourceLabel).join(', ') + '</td>' +
       '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.first_seen')) + '">' + relTime(r.first_seen) + '</td></tr>';
-    if (open) html += '<tr class="detail-row"><td colspan="7">' + contactReachHtml(_cv.reach[r.id]) + '</td></tr>';
+    if (open) html += '<tr class="detail-row"><td colspan="' + (ticks ? 8 : 7) + '">' + contactReachHtml(_cv.reach[r.id]) + '</td></tr>';
   });
   rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_cv, _cv.total, 'pageContactList', {more: _cv.more, jump: true});
 }
@@ -4852,11 +4875,70 @@ function renderContactListActions() {
     '<input type="checkbox" id="cl-force"' + (_cv.force ? ' checked' : '') + ' onchange="_cv.force = this.checked"> ' +
     escHtml(t('cl.find_force')) + '</label>' +
     '<button class="btn btn-secondary btn-sm" onclick="findContacts()">' + escHtml(t('cl.find')) + '</button>';
+  // Campaigns (Email module): the filter as an audience, the ticked rows into a campaign.
+  const email = _modules.email ? [
+    {sep: true, label: t('cl.campaign_label')},
+    {label: t('cl.save_audience'), note: t('cl.save_audience_note'), icon: 'campaigns', action: 'saveAudienceFromContacts()'},
+    {label: t('cl.add_to_campaign', {n: _cv.sel.size}), icon: 'campaigns', action: 'openAddToCampaign()', disabled: !_cv.sel.size},
+  ] : [];
   el.innerHTML = find + (_cv.view === 'people' ? '' : menuHtml('cl-menu', [
     {sep: true, label: t('cl.export_label')},
     {label: t('actions.csv'), note: t('cl.export_note'), action: 'exportContactList(\'csv\')', disabled: !_cv.total},
     {label: t('cl.export_json'), action: 'exportContactList(\'json\')', disabled: !_cv.total},
-  ])) + '</div>';
+  ].concat(email))) + '</div>';
+}
+
+function selectAddress(i, on) {
+  const r = _cv.rows[i];
+  if (!r || r.kind !== 'email') return;
+  if (on) _cv.sel.add(r.value); else _cv.sel.delete(r.value);
+  renderContactList();
+}
+
+function selectAddressPage(on) {
+  _cv.rows.forEach(r => { if (r.kind !== 'email') return; if (on) _cv.sel.add(r.value); else _cv.sel.delete(r.value); });
+  renderContactList();
+}
+
+async function saveAudienceFromContacts() {
+  const name = prompt(t('cl.audience_name_prompt'));
+  if (!name || !name.trim()) return;
+  const res = await api('/api/audiences', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify({name: name.trim(), query: contactQuery()})});
+  if (res && res.success) showToast(t('cl.audience_saved', {name: name.trim()}), 'success');
+  else showToast((res && res.message) || t('camp.save_failed'), 'error');
+}
+
+// Pick a campaign (one not finished, made on the Campaigns page) for the ticked addresses.
+async function openAddToCampaign() {
+  const el = document.getElementById('cl-addbar');
+  if (!el || !_cv.sel.size) return;
+  const data = await api('/api/campaigns');
+  const open = (data || []).filter(c => c.origin === 'user' && ['draft', 'active', 'paused'].includes(c.status));
+  if (!open.length) { showToast(t('cl.no_campaign'), 'error'); return; }
+  el.innerHTML = '<div class="card"><div class="form-row"><div class="form-group"><label class="form-label" for="cl-add-camp">' +
+    escHtml(t('cl.add_to_campaign', {n: _cv.sel.size})) + '</label><select class="form-input" id="cl-add-camp">' +
+    open.map(c => '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + ' (' + escHtml(statusMeta(c.status).label) + ')</option>').join('') +
+    '</select></div><div class="btn-row"><button class="btn btn-primary btn-sm" onclick="addSelectedToCampaign()">' + escHtml(t('cl.add')) +
+    '</button><button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'cl-addbar\').innerHTML=\'\'">' +
+    escHtml(t('common.cancel')) + '</button></div></div><p class="muted small">' + escHtml(t('cl.add_rules')) + '</p></div>';
+}
+
+async function addSelectedToCampaign() {
+  const sel = document.getElementById('cl-add-camp');
+  if (!sel || _cv.adding) return;
+  _cv.adding = true;
+  try {
+    const res = await api('/api/campaigns/' + encodeURIComponent(sel.value) + '/members', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: [..._cv.sel]})});
+    if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+    showToast(t('cl.added', {n: res.counts.added, left: res.counts.total - res.counts.added + (res.counts.not_found || 0)}), 'success');
+    _cv.sel.clear();
+    document.getElementById('cl-addbar').innerHTML = '';
+    renderContactList();
+  } finally {
+    _cv.adding = false;
+  }
 }
 
 // Find contacts for the page's filter: priced first (websites to read are
@@ -5345,16 +5427,13 @@ function campaignProgress(c) {
       '<span><i class="' + p[2] + '"></i>' + escHtml(p[0]) + ' <b>' + p[1] + '</b></span>').join('') + '</div></div>';
 }
 
-async function loadCampaigns() {
+// Each campaign's sequence, step by step, with sending by hand when Harvey
+// can't send itself.
+function renderSequenceCards(data) {
   const el = document.getElementById('campaigns-list');
-  const data = await api('/api/campaigns');
-  if (!data) { el.innerHTML = offlineState(); return; }
-  _campaigns = data;
-  if (!data.length) {
-    el.innerHTML = emptyState(icon('campaigns'), escHtml(t('camp.empty')), escHtml(t('camp.empty_copy')));
-    return;
-  }
-  let html = '';
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  let html = '<div class="subhead">' + escHtml(t('cp.sequences')) + '</div>';
   data.forEach((c, i) => {
     let stepsHtml = '';
     (c.sequence || []).forEach((step, s) => {
@@ -5408,6 +5487,416 @@ async function loadCampaigns() {
       (stepsHtml || '<p class="muted small" style="padding-top:16px">' + escHtml(t('camp.no_steps')) + '</p>') + '</div></div>';
   });
   el.innerHTML = html;
+}
+
+// ── Campaigns you make: the list, the audiences, the new-campaign wizard ──
+//
+// A campaign takes its members from an audience (a saved Contacts filter),
+// through the same rules wherever they come from; staging only fills the
+// review queue. The wizard saves a draft first, so generating the sequence
+// and starting work on what is saved.
+
+let _cp = {tab: 'campaigns', setup: null, open: null, detail: null, wiz: null, busy: false, previews: {}};
+const CAMPAIGN_TABS = ['campaigns', 'audiences'];
+const MEMBER_ORDER = ['waiting', 'ready', 'staged', 'in_sequence', 'done', 'replied', 'stopped', 'suppressed',
+                      'bounced', 'skipped', 'removed'];
+
+async function loadCampaigns() {
+  const tabs = document.getElementById('camp-tabs');
+  if (tabs) tabs.innerHTML = CAMPAIGN_TABS.map(v =>
+    '<button class="' + (v === _cp.tab ? 'on' : '') + '" aria-pressed="' + (v === _cp.tab) + '" onclick="setCampaignTab(\'' + v + '\')">' +
+      escHtml(t('cp.tab.' + v)) + '</button>').join('');
+  _cp.setup = await api('/api/campaigns/setup') || _cp.setup;
+  renderCampaignWizard();
+  if (_cp.tab === 'audiences') {
+    document.getElementById('campaign-detail').innerHTML = '';
+    document.getElementById('campaigns-list').innerHTML = '';
+    return loadAudiences();
+  }
+  const el = document.getElementById('campaigns-table');
+  const data = await api('/api/campaigns');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  _campaigns = data;
+  if (!data.length) {
+    el.innerHTML = emptyState(icon('campaigns'), escHtml(t('camp.empty')), escHtml(t('camp.empty_copy')));
+    document.getElementById('campaigns-list').innerHTML = '';
+    return;
+  }
+  const act = (id, action, label, cls) => '<button class="btn ' + (cls || 'btn-ghost') + ' btn-sm" onclick="campaignAction(' + jsq(id) + ', \'' + action + '\')">' +
+    escHtml(t(label)) + '</button>';
+  let html = '<div class="table-card"><table class="data"><thead><tr><th>' + escHtml(t('cp.col.name')) + '</th><th>' + escHtml(t('cp.col.status')) +
+    '</th><th>' + escHtml(t('cp.col.members')) + '</th><th>' + escHtml(t('cp.col.sent')) + '</th><th>' + escHtml(t('cp.col.replies')) +
+    '</th><th>' + escHtml(t('cp.col.created')) + '</th><th></th></tr></thead><tbody>';
+  data.forEach(c => {
+    const auto = c.origin !== 'user';
+    const actions = [];
+    actions.push('<button class="btn btn-secondary btn-sm" onclick="openCampaign(' + jsq(c.id) + ')">' + escHtml(t('cp.open')) + '</button>');
+    if (c.status === 'draft' && !auto) actions.push('<button class="btn btn-ghost btn-sm" onclick="editCampaign(' + jsq(c.id) + ')">' + escHtml(t('cp.edit')) + '</button>');
+    if (c.status === 'active') actions.push(act(c.id, 'pause', 'cp.pause'));
+    if (c.status === 'paused') actions.push(act(c.id, 'resume', 'cp.resume'));
+    if (['draft', 'active', 'paused'].includes(c.status)) actions.push(act(c.id, 'stop', 'cp.stop'));
+    if (['draft', 'finished'].includes(c.status)) actions.push(act(c.id, 'archive', 'cp.archive'));
+    html += '<tr><td data-label="' + escHtml(t('cp.col.name')) + '"><div class="cell-stack"><span class="cell-main">' + escHtml(c.name || t('camp.untitled')) + '</span>' +
+        '<span class="cell-sub">' + escHtml(t(auto ? 'cp.origin_auto' : 'cp.origin_user')) + (c.rolling ? ' · ' + escHtml(t('cp.rolling')) : '') + '</span></div></td>' +
+      '<td data-label="' + escHtml(t('cp.col.status')) + '">' + badge(c.status) + '</td>' +
+      '<td data-label="' + escHtml(t('cp.col.members')) + '">' + fmtN(c.member_total || 0) + '</td>' +
+      '<td data-label="' + escHtml(t('cp.col.sent')) + '">' + fmtN(c.sent || 0) + '</td>' +
+      '<td data-label="' + escHtml(t('cp.col.replies')) + '">' + fmtN(c.replies || 0) + '</td>' +
+      '<td class="muted nowrap" data-label="' + escHtml(t('cp.col.created')) + '">' + relTime(c.created_at) + '</td>' +
+      '<td><div class="btn-row">' + actions.join('') + '</div></td></tr>';
+  });
+  el.innerHTML = html + '</tbody></table></div>';
+  renderSequenceCards(data);
+  if (_cp.open) loadCampaignDetail();
+}
+
+function setCampaignTab(v) {
+  if (v === _cp.tab) return;
+  _cp.tab = v;
+  document.getElementById('campaigns-table').innerHTML = '';
+  loadCampaigns();
+}
+
+async function campaignAction(id, action) {
+  if (_cp.busy) return;
+  if (action === 'stop' && !confirm(t('cp.stop_confirm'))) return;
+  _cp.busy = true;
+  try {
+    const res = await api('/api/campaigns/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
+    if (res && res.success) showToast(t('cp.done.' + action), 'success');
+    else showToast((res && res.message) || t('camp.save_failed'), 'error');
+  } finally {
+    _cp.busy = false;
+  }
+  loadCampaigns();
+}
+
+// Why a member left a campaign, as the server keeps it (English, sometimes
+// with a name or date after it): the known reasons in the page's language,
+// the rest of the text kept as it is.
+const MEMBER_REASONS = [
+  [/^they replied$/, 'cp.why.replied'], [/^the email bounced$/, 'cp.why.bounced'],
+  [/^every step sent$/, 'cp.why.done'], [/^(campaign )?stopped by you$/, 'cp.why.stopped'],
+  [/^taken out by you$/, 'cp.why.removed'], [/^sent_by_hand$/, 'cp.why.hand_sent'],
+  [/^no trusted link any more$/, 'cp.why.untrusted'], [/^no usable address$/, 'cp.why.no_address'],
+  [/^(unsubscribe|opt_out|objection)$/, 'cp.why.opted_out'],
+  [/^email status /, 'cp.why.email_status'], [/^prospect status /, 'cp.why.prospect_status'],
+  [/^a colleague replied/, 'cp.why.colleague'], [/^(overlap: |already contacted \()in campaign /, 'cp.why.in_campaign'],
+  [/^(overlap: |already contacted \()cold email sent /, 'cp.why.sent_lately'],
+  [/^(overlap: |already contacted \()contacted outside the outbox/, 'cp.why.contacted_elsewhere'],
+  [/^already contacted/, 'cp.why.already'], [/^gate: /, 'cp.why.gate'],
+  [/ is on the do-not-contact list/, 'cp.why.suppressed'],
+];
+
+function memberReason(text) {
+  const s = String(text || '');
+  for (const [re, key] of MEMBER_REASONS) {
+    const m = s.match(re);
+    if (!m) continue;
+    // What follows the known words (a campaign's name, a date, a status).
+    let rest = s.slice(0, m.index) + s.slice(m.index + m[0].length);
+    if (m[0].includes('(')) rest = rest.replace(/\)$/, '');
+    return t(key) + (rest.trim() ? ' ' + rest.trim() : '');
+  }
+  return s;
+}
+
+function openCampaign(id) {
+  _cp.open = id;
+  loadCampaignDetail();
+}
+
+async function loadCampaignDetail() {
+  const el = document.getElementById('campaign-detail');
+  if (!el || !_cp.open) return;
+  const data = await api('/api/campaigns/' + encodeURIComponent(_cp.open));
+  if (!data) { el.innerHTML = ''; _cp.open = null; return; }
+  _cp.detail = data;
+  const c = data.campaign;
+  const counts = MEMBER_ORDER.filter(k => (c.members || {})[k]).map(k =>
+    '<span class="tag">' + escHtml(statusMeta(k).label) + ' <b>' + fmtN(c.members[k]) + '</b></span>').join(' ');
+  const open = ['waiting', 'ready', 'staged', 'in_sequence'];
+  const rows = (data.members || []).map((m, i) =>
+    '<tr><td class="mono">' + escHtml(m.email) + '</td><td>' + badge(m.status_name) + '</td>' +
+    '<td>' + escHtml(String(m.last_step || 0)) + '</td><td class="muted">' + escHtml(memberReason(m.end_reason)) + '</td>' +
+    '<td>' + (open.includes(m.status_name) && ['draft', 'active', 'paused'].includes(c.status)
+      ? '<button class="btn btn-ghost btn-sm" onclick="removeCampaignMember(' + i + ')">' + escHtml(t('cp.remove')) + '</button>' : '') +
+    '</td></tr>').join('');
+  el.innerHTML = '<div class="card"><div class="card-head"><h3>' + escHtml(c.name) + '</h3><span class="meta">' + badge(c.status) + '</span></div>' +
+    '<p class="small">' + (counts || escHtml(t('cp.no_members'))) + '</p>' +
+    '<div class="subhead">' + escHtml(t('cp.filter')) + '</div>' +
+    '<p class="small"><code>' + escHtml(c.query || t('cp.no_filter')) + '</code>' +
+      (c.query ? ' <button class="btn btn-ghost btn-sm" onclick="openQueryInContacts(' + jsq(c.query) + ')">' + escHtml(t('cp.open_in_contacts')) + '</button>' : '') + '</p>' +
+    '<div class="subhead">' + escHtml(t('cw.li_title')) + '</div>' +
+    '<p class="small" style="white-space:pre-wrap">' + escHtml(c.li_note || t('cp.no_note')) + '</p>' +
+    (rows ? '<div class="table-card"><table class="data"><thead><tr><th>' + escHtml(t('cp.col.address')) + '</th><th>' + escHtml(t('cp.col.status')) +
+      '</th><th>' + escHtml(t('cp.col.step')) + '</th><th>' + escHtml(t('cp.col.why')) + '</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '') +
+    '<div class="btn-row" style="margin-top:12px"><button class="btn btn-ghost btn-sm" onclick="_cp.open=null;document.getElementById(\'campaign-detail\').innerHTML=\'\'">' +
+      escHtml(t('common.close')) + '</button></div></div>';
+}
+
+async function removeCampaignMember(i) {
+  const m = _cp.detail && (_cp.detail.members || [])[i];
+  if (!m || !confirm(t('cp.remove_confirm', {email: m.email}))) return;
+  const res = await api('/api/campaigns/' + encodeURIComponent(_cp.open) + '/members', {
+    method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: [m.email]})});
+  if (!res || !res.success) showToast((res && res.message) || t('camp.save_failed'), 'error');
+  loadCampaigns();
+}
+
+// A saved filter back on the Contacts page.
+function openQueryInContacts(query) {
+  const p = new URLSearchParams(query);
+  _cv.f = {};
+  _cv.q = p.get('q') || '';
+  p.forEach((v, k) => { if (k !== 'q') _cv.f[k] = v; });
+  _cv.view = 'contacts';
+  _cv.offset = 0;
+  const body = document.getElementById('ct-body');
+  if (body) body.innerHTML = '';
+  goTab('prospects');
+}
+
+// ── Audiences ──
+
+async function loadAudiences() {
+  const el = document.getElementById('campaigns-table');
+  const data = await api('/api/audiences');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  const rows = data.audiences || [];
+  if (!rows.length) {
+    el.innerHTML = emptyState(icon('contacts'), escHtml(t('cp.aud_empty')), escHtml(t('cp.aud_empty_copy')));
+    return;
+  }
+  el.innerHTML = '<div class="table-card"><table class="data"><thead><tr><th>' + escHtml(t('cp.col.name')) + '</th><th>' +
+    escHtml(t('cp.filter')) + '</th><th>' + escHtml(t('cp.col.campaigns')) + '</th><th></th></tr></thead><tbody>' +
+    rows.map(a => '<tr><td class="cell-main">' + escHtml(a.name) + '</td><td class="mono small">' + escHtml(a.query) + '</td>' +
+      '<td>' + fmtN(a.campaigns || 0) + '</td><td><div class="btn-row">' +
+      '<button class="btn btn-secondary btn-sm" onclick="previewAudience(' + a.id + ')">' + escHtml(t('cw.preview')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="openQueryInContacts(' + jsq(a.query) + ')">' + escHtml(t('cp.open_in_contacts')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="renameAudience(' + a.id + ', ' + jsq(a.name) + ')">' + escHtml(t('cp.rename')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="archiveAudience(' + a.id + ')">' + escHtml(t('cp.archive')) + '</button></div>' +
+      (_cp.previews[a.id] ? previewHtml(_cp.previews[a.id]) : '') + '</td></tr>').join('') + '</tbody></table></div>';
+}
+
+async function previewAudience(id) {
+  const res = await api('/api/audiences/' + id + '/preview');
+  if (!res || !res.counts) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  _cp.previews[id] = res.counts;
+  loadAudiences();
+}
+
+async function renameAudience(id, name) {
+  const next = prompt(t('cp.rename_prompt'), name);
+  if (!next || !next.trim()) return;
+  await api('/api/audiences/' + id, {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify({name: next.trim()})});
+  loadAudiences();
+}
+
+async function archiveAudience(id) {
+  await api('/api/audiences/' + id, {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify({archived: true})});
+  loadAudiences();
+}
+
+// What a campaign would take, counted (nothing is written by a preview).
+function previewHtml(c) {
+  const p = c.personal || {};
+  const line = (key, n) => '<li>' + tBold(key, n || 0) + '</li>';
+  return '<ul class="small preview-counts">' +
+    line('cw.c.ready', c.ready) + line('cw.c.risky', c.risky) + line('cw.c.to_verify', c.to_verify) +
+    line('cw.c.left_out', c.left_out) + line('cw.c.untrusted', c.untrusted) + line('cw.c.suppressed', c.suppressed) +
+    line('cw.c.overlap', c.overlap) + line('cw.c.answered', c.answered) + line('cw.c.risky_held', c.risky_held) +
+    line('cw.c.personal', (p.named || 0) + (p.free_mail || 0) + (p.natural_person || 0)) +
+    line('cw.c.firms', c.firms) + '</ul>' +
+    (c.days_at_cap ? '<p class="small muted">' + escHtml(t('cw.c.days', {n: c.days_at_cap, cap: (_cp.setup || {}).max_daily_sends || 0})) + '</p>' : '');
+}
+
+// ── The new-campaign wizard ──
+
+function openCampaignWizard() {
+  const s = _cp.setup || {};
+  _cp.wiz = {id: null, name: '', audience: (s.audiences || []).length ? String(s.audiences[0].id) : 'current', rolling: false,
+             offer: (s.offer || {}).offer || '', goal: 'reply', booking_link: '', review: false,
+             steps: [{subject: '', body: '', delay_days: 0}], li_note: s.li_note_template || '', counts: null};
+  renderCampaignWizard();
+  const el = document.getElementById('campaign-wizard');
+  if (el) el.scrollIntoView({block: 'start'});
+}
+
+async function editCampaign(id) {
+  const data = await api('/api/campaigns/' + encodeURIComponent(id));
+  if (!data) return;
+  const c = data.campaign;
+  _cp.wiz = {id: c.id, name: c.name, audience: c.audience_id ? String(c.audience_id) : 'current', rolling: !!c.rolling,
+             offer: (c.offer || {}).offer || '', goal: (c.offer || {}).goal || 'reply', booking_link: (c.offer || {}).booking_link || '',
+             review: c.review === 'always', steps: (c.sequence || []).length ? c.sequence : [{subject: '', body: '', delay_days: 0}],
+             li_note: c.li_note || '', counts: null, query: c.audience_query || ''};
+  renderCampaignWizard();
+}
+
+function closeCampaignWizard() {
+  _cp.wiz = null;
+  renderCampaignWizard();
+}
+
+function cwSet(key, value) { if (_cp.wiz) _cp.wiz[key] = value; }
+
+function cwStep(i, key, value) {
+  const st = _cp.wiz && _cp.wiz.steps[i];
+  if (!st) return;
+  st[key] = key === 'delay_days' ? Number(value) || 0 : value;
+}
+
+function cwAddStep() {
+  if (!_cp.wiz || _cp.wiz.steps.length >= 5) return;
+  _cp.wiz.steps.push({subject: '', body: '', delay_days: 3});
+  renderCampaignWizard();
+}
+
+function cwRemoveStep(i) {
+  if (!_cp.wiz || _cp.wiz.steps.length <= 1) return;
+  _cp.wiz.steps.splice(i, 1);
+  renderCampaignWizard();
+}
+
+function renderCampaignWizard() {
+  const el = document.getElementById('campaign-wizard');
+  if (!el) return;
+  const s = _cp.setup;
+  const w = _cp.wiz;
+  if (!w) { el.innerHTML = ''; return; }
+  if (s && !s.native) {
+    el.innerHTML = '<div class="banner bad">' + icon('alert') + '<div><b>' + escHtml(t('cw.native_title')) + '</b><p>' +
+      escHtml(t('cw.native_only')) + '</p><div class="btn-row"><button class="btn btn-ghost btn-sm" onclick="goTab(\'settings\')">' +
+      escHtml(t('cw.to_settings')) + '</button><button class="btn btn-ghost btn-sm" onclick="closeCampaignWizard()">' +
+      escHtml(t('common.close')) + '</button></div></div></div>';
+    return;
+  }
+  const opt = (v, label, cur) => '<option value="' + escHtml(v) + '"' + (String(cur) === String(v) ? ' selected' : '') + '>' + escHtml(label) + '</option>';
+  const audiences = ((s && s.audiences) || []).map(a => opt(a.id, a.name, w.audience)).join('') +
+    opt('current', t('cw.from_contacts'), w.audience);
+  const accounts = ((s && s.accounts) || []).map(a => opt(a.id, (a.address || a.label) + ' (' + (a.provider || '?') + ')', 1)).join('');
+  const steps = w.steps.map((st, i) => '<div class="card"><div class="card-head"><h3>' +
+      escHtml(i === 0 ? t('camp.first') : t('camp.followup')) + '</h3>' +
+      (i ? '<button class="btn btn-ghost btn-sm" onclick="cwRemoveStep(' + i + ')">' + escHtml(t('cw.remove_step')) + '</button>' : '') + '</div>' +
+      '<div class="form-row"><div class="form-group"><label class="form-label" for="cw-subj-' + i + '">' + escHtml(t('cw.subject')) + '</label>' +
+      '<input class="form-input" id="cw-subj-' + i + '" value="' + escHtml(st.subject) + '" oninput="cwStep(' + i + ', \'subject\', this.value)"></div>' +
+      (i ? '<div class="form-group"><label class="form-label" for="cw-delay-' + i + '">' + escHtml(t('cw.delay')) + '</label>' +
+        '<input class="form-input" type="number" min="1" max="60" id="cw-delay-' + i + '" value="' + escHtml(String(st.delay_days || 3)) + '" ' +
+        'oninput="cwStep(' + i + ', \'delay_days\', this.value)"></div>' : '') + '</div>' +
+      '<div class="form-group"><label class="form-label" for="cw-body-' + i + '">' + escHtml(t('cw.body')) + '</label>' +
+      '<textarea class="form-input" rows="5" id="cw-body-' + i + '" oninput="cwStep(' + i + ', \'body\', this.value)">' + escHtml(st.body) + '</textarea></div></div>').join('');
+  const min = (s && s.li_note_min) || 80;
+  el.innerHTML = '<div class="card"><div class="card-head"><h3>' + escHtml(t(w.id ? 'cw.edit_title' : 'cw.title')) + '</h3>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeCampaignWizard()">' + escHtml(t('common.close')) + '</button></div>' +
+    '<div class="form-group"><label class="form-label" for="cw-name">' + escHtml(t('cw.name')) + '</label>' +
+      '<input class="form-input" id="cw-name" value="' + escHtml(w.name) + '" oninput="cwSet(\'name\', this.value)"></div>' +
+    '<div class="subhead">1. ' + escHtml(t('cw.step.audience')) + '</div>' +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="cw-aud">' + escHtml(t('cw.audience')) + '</label>' +
+      '<select class="form-input" id="cw-aud" onchange="cwSet(\'audience\', this.value)">' + audiences + '</select></div>' +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="cwPreview()">' + escHtml(t('cw.preview')) + '</button></div></div>' +
+    '<label class="check-line small"><input type="checkbox"' + (w.rolling ? ' checked' : '') + ' onchange="cwSet(\'rolling\', this.checked)"> ' +
+      escHtml(t('cw.rolling')) + '</label>' + (w.counts ? previewHtml(w.counts) : '') +
+    '<div class="subhead">2. ' + escHtml(t('cw.step.offer')) + '</div>' +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="cw-offer">' + escHtml(t('cw.offer')) + '</label>' +
+      '<input class="form-input" id="cw-offer" value="' + escHtml(w.offer) + '" oninput="cwSet(\'offer\', this.value)"></div>' +
+      '<div class="form-group"><label class="form-label" for="cw-goal">' + escHtml(t('cw.goal')) + '</label>' +
+      '<select class="form-input" id="cw-goal" onchange="cwSet(\'goal\', this.value)">' + opt('reply', t('cw.goal.reply'), w.goal) +
+        opt('meeting', t('cw.goal.meeting'), w.goal) + '</select></div>' +
+      '<div class="form-group"><label class="form-label" for="cw-book">' + escHtml(t('cw.booking')) + '</label>' +
+      '<input class="form-input" id="cw-book" value="' + escHtml(w.booking_link) + '" oninput="cwSet(\'booking_link\', this.value)"></div></div>' +
+    '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="cwGenerate()">' + escHtml(t('cw.generate')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="cwAddStep()"' + (w.steps.length >= 5 ? ' disabled' : '') + '>' + escHtml(t('cw.add_step')) + '</button></div>' +
+    '<p class="small muted">' + escHtml(t('cw.merge_hint')) + '</p>' + steps +
+    '<div class="subhead">3. ' + escHtml(t('cw.step.sending')) + '</div>' +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="cw-acct">' + escHtml(t('cw.account')) + '</label>' +
+      '<select class="form-input" id="cw-acct">' + accounts + '</select></div>' +
+      '<div class="form-group"><label class="form-label" for="cw-profile">' + escHtml(t('cw.profile')) + '</label>' +
+      '<select class="form-input" id="cw-profile" disabled>' + opt('', t('cw.profile_soon'), '') + '</select></div></div>' +
+    '<label class="check-line small"><input type="checkbox"' + (w.review ? ' checked' : '') + ' onchange="cwSet(\'review\', this.checked)"> ' +
+      escHtml(t('cw.review')) + '</label>' +
+    '<div class="subhead">4. ' + escHtml(t('cw.li_title')) + '</div>' +
+    '<p class="small muted">' + escHtml(t('cw.li_help', {n: min})) + '</p>' +
+    '<textarea class="form-input" rows="5" id="cw-li" oninput="cwSet(\'li_note\', this.value);document.getElementById(\'cw-li-n\').textContent=this.value.trim().length">' +
+      escHtml(w.li_note) + '</textarea><p class="small muted"><span id="cw-li-n">' + w.li_note.trim().length + '</span> / ' + min + '</p>' +
+    '<div class="subhead">5. ' + escHtml(t('cw.step.start')) + '</div>' +
+    '<p class="small">' + escHtml(t(s && s.acknowledged ? 'cw.start_note' : 'cw.ack_needed')) + '</p>' +
+    '<div class="btn-row"><button class="btn btn-secondary" onclick="cwSave()">' + escHtml(t('cw.save')) + '</button>' +
+      '<button class="btn btn-primary" onclick="cwStart()">' + escHtml(t('cw.start')) + '</button></div></div>';
+}
+
+function cwBody() {
+  const w = _cp.wiz;
+  const body = {name: w.name, rolling: !!w.rolling, li_note: w.li_note, review: w.review ? 'always' : 'inherit',
+                offer: {offer: w.offer, goal: w.goal, booking_link: w.booking_link}};
+  if (w.audience === 'current') body.query = contactQuery() || 'kind=email';
+  else body.audience_id = Number(w.audience);
+  const steps = w.steps.filter(st => st.subject.trim() || st.body.trim());
+  if (steps.length) body.sequence = steps;
+  return body;
+}
+
+async function cwPreview() {
+  const w = _cp.wiz;
+  if (!w) return;
+  const res = w.audience === 'current'
+    ? await api('/api/audiences/preview', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                           body: JSON.stringify({query: contactQuery() || 'kind=email'})})
+    : await api('/api/audiences/' + Number(w.audience) + '/preview');
+  if (!res || !res.counts) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  w.counts = res.counts;
+  renderCampaignWizard();
+}
+
+// Save the draft (made the first time); true when saved.
+async function cwSave(quiet) {
+  const w = _cp.wiz;
+  if (!w || _cp.busy) return false;
+  _cp.busy = true;
+  try {
+    const body = cwBody();
+    const res = w.id
+      ? await api('/api/campaigns/' + encodeURIComponent(w.id), {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                                                                body: JSON.stringify(body)})
+      : await api('/api/campaigns', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return false; }
+    if (!w.id) w.id = res.id;
+    if (!quiet) { showToast(t('cw.saved'), 'success'); loadCampaigns(); }
+    return true;
+  } finally {
+    _cp.busy = false;
+  }
+}
+
+async function cwGenerate() {
+  const w = _cp.wiz;
+  if (!w || !(await cwSave(true))) return;
+  showToast(t('cw.generating'));
+  const res = await api('/api/campaigns/' + encodeURIComponent(w.id) + '/templates', {method: 'POST'});
+  if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  w.steps = res.sequence;
+  renderCampaignWizard();
+}
+
+async function cwStart() {
+  const w = _cp.wiz;
+  if (!w || !(await cwSave(true))) return;
+  if (_cp.setup && !_cp.setup.acknowledged) {
+    const typed = prompt(t('cw.ack_prompt'));
+    if (!typed) return;
+    const ack = await api('/api/acknowledgement', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                   body: JSON.stringify({typed: typed.trim()})});
+    if (!ack || !ack.success) { showToast(t('cw.ack_failed'), 'error'); return; }
+    _cp.setup.acknowledged = true;
+  }
+  const res = await api('/api/campaigns/' + encodeURIComponent(w.id) + '/start', {method: 'POST'});
+  if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  showToast(t('cw.started', {n: (res.counts || {}).added || 0}), 'success');
+  _cp.open = w.id;
+  _cp.wiz = null;
+  loadCampaigns();
 }
 
 // The whole exchange in order: Harvey's cold emails (from the Outbox), the

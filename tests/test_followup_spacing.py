@@ -92,7 +92,7 @@ async def test_the_campaign_delay_sets_the_gap_not_a_late_staging_time(state):
     # after step 1's: the campaign's 3 days still decide when it may go.
     pid = await seed_prospect(state, status="contacted")
     await seed_campaign(state, [pid])  # step 2 delay_days=3
-    campaign = (await state.get_campaigns_by_status("draft"))[0]
+    campaign = (await state.get_campaigns_by_status("active"))[0]
     one = await _sequence(state, pid, 1, "approved", _now() - timedelta(days=20), campaign=campaign.id)
     await _sent(state, one, _now() - timedelta(days=4))
     await _sequence(state, pid, 2, "approved", _now() - timedelta(minutes=5), campaign=campaign.id)

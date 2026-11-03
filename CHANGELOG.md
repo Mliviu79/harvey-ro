@@ -9,6 +9,47 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Campaigns you make.** The Campaigns page has a new-campaign wizard: an
+  audience (a saved Contacts filter, or the page's current one), the offer
+  and its sequence (write it, or have it generated and edit it), the
+  sending account, "always review", and the legitimate-interest note (80
+  characters at least, never sent; your record). Starting it needs the
+  note, a sequence and the cold-email acknowledgement, and takes the
+  audience as it is then; a rolling campaign takes new matches at most
+  hourly. Each campaign has its members and their progress, pause, resume,
+  stop and archive; once started, its note can be edited but not shortened
+  below 80 characters. A campaign that doesn't roll finishes when no member
+  is left open, also when its audience matched no one. Each cycle writes
+  at most 8 first emails across all campaigns, and only while the first
+  emails waiting to go are fewer than two days of today's cold cap, so
+  drafting (a model call each) never runs ahead of sending. A paused
+  campaign's approved emails wait without holding up other campaigns'.
+  `harvey campaigns` does the same from the terminal. New campaigns need
+  Gmail, SMTP or Microsoft 365; on Instantly they are refused, and a draft
+  you made is never deployed there.
+- **Audiences.** Contacts → Actions → *Salvează ca public* keeps the page's
+  filters under a name (Campaigns → Publicuri, `harvey audiences`), read by
+  the same code as the page, so a campaign gets exactly what the page
+  showed. Ticked email addresses can be added to a campaign (*Adaugă în
+  campanie…*).
+- **One set of rules for every way into a campaign.** The start, a roll
+  and adding by hand all take an address only when it is verified,
+  catch-all (with `send_to_risky`) or not yet checked, linked to a live
+  firm with trust confirmed or likely, not on the do-not-contact list, not
+  in another active campaign's sequence or sent cold email in the last 90
+  days (or marked contacted with no cold email on file, as Instantly
+  leaves it), and neither its person nor anyone at its firm has answered;
+  the preview counts what each rule
+  left out. Unchecked addresses are checked by a verifier before anything
+  is written for them (a roll's, at most 50 a campaign a day).
+- **Sending accounts and AI profiles, the hook.** A campaign names the
+  mailbox it sends from and the AI profile that writes for it (one per
+  mailbox). Today there is one of each, from your settings; caps, warmup
+  and reading replies still come from the settings.
+- **Replies land in their campaign.** A reply is attributed through the
+  email it answers (else the last cold email to that address), and the
+  campaign shows its replies. A reply anywhere ends that address's places
+  in every campaign, and its colleagues' at the same firm.
 - **One do-not-contact list.** Unsubscribes, opt-outs, objections and the
   entries you add are kept in one list keyed on the address, the domain or
   the firm's tax code, so an entry holds through merges, their undo, an
@@ -29,132 +70,6 @@ minor versions can still change behaviour.
   person's address, a free-mail address or a PFA/II/IF gets a fixed line
   saying where the address was found, added at staging; the gate refuses
   one without it.
-
-### Changed
-
-- **The opt-out line is Romanian by default** (*Nu vă interesează?
-  Răspundeți „stop" și nu vă mai scriu.*), and Romanian opt-out words
-  (*dezabonare*, *nu mai doresc să primesc*, *nu ne mai trimiteți*,
-  *scoateți-mă din listă*, *Stop, mulțumesc*, *Nu, mulțumim*, singular or
-  plural, with or without diacritics) are honoured by the keyword rules;
-  *nu mai doresc să aștept* and *nu ștergeți datele* are not opt-outs. An
-  objection (*de unde aveți adresa?*, *ștergeți-mi datele*) is recorded as
-  one and handed to you. An opt-out is recorded before anything else about
-  the reply, and one that couldn't be recorded (a locked database) is read
-  again next cycle, up to five times, then handed to you.
-- **Undoing an opt-out with one click** lifts only one Harvey read in the
-  reply's words. An unsubscribe, an objection or a complaint is undone on
-  the do-not-contact list, with a note saying why.
-- **`harvey export --all` leaves the do-not-contact list out** too: a full
-  dump can be fed to another sequencer just the same.
-- **Every reply is read.** IMAP reads by date in read-only mode (nothing is
-  marked read), and a read reaches back to the last complete one when
-  Harvey was off longer than a week; cold email waits while a read hasn't
-  covered the gap. A mailbox with more mail since then than a read takes
-  (5,000 IMAP messages, 40 pages on Gmail or Microsoft 365) is read newest
-  first instead of failing every read; cold email then waits until a read
-  covers the gap or you accept it (`harvey sending accept-gap`,
-  `POST /api/mail/read-gap/accept`). A message from a stranger never holds
-  sending: it is marked read, and handed to you, and put on the list when
-  their own words ask to stop, only when it answers Harvey's thread or
-  comes from a firm Harvey wrote to; a newsletter's "dezabonare" link bars
-  nobody. An IMAP read that fails now holds sending instead of looking
-  like an empty inbox.
-- **Cold email waits when the sending address isn't known** (no
-  `persona.email` and Gmail or Microsoft 365 couldn't say which mailbox is
-  signed in), rather than going without its unsubscribe header.
-- **Schema 26, in place.** The upgrade still writes schema 25; Harvey takes
-  the file to 26 when it opens it, in one transaction. A file a newer
-  Harvey made is refused with a message that says so. Going back to an
-  earlier release after this one has opened the database doesn't work:
-  earlier releases don't know schema 26 and ask for `harvey upgrade`,
-  which can't help. Keep a copy of `data/harvey.db` from before updating
-  if you may need to go back.
-- **Romanian webmail domains** (rdslink.ro, clicknet.ro, email.ro, k.ro,
-  home.ro) and gmx.net count as free mail: never a firm's key, and an
-  address there is personal.
-
-### Changed
-
-- **A slim database: harvey.db keeps Harvey's own work, the registers are
-  read in place.** The firms you pulled or worked on, their contacts and
-  evidence, people, searches, sources, merges, web signals and the email
-  side stay in `harvey.db`; the trade registry, the financial statements,
-  the taxpayer file and ANAF's answers are read from their own files
-  through indexes each load builds there. On a full install `harvey.db`
-  goes from about 16 GB to about 1 GB, `anaf.db` from about 8 GB to about
-  1.2 GB (compressed; replaced answers are now kept as history), and pages
-  that took seconds to minutes answer in well under a second. Register
-  facts show the register's own date and current value, and a confirmed
-  register signal shows its data at once. Reloading the trade registry
-  rebuilds the financial statements' "filed accounts" from it.
-- **The upgrade.** An old `harvey.db` (schema 24) is never opened by the
-  new code: the dashboard shows an upgrade screen (what it does, expected
-  time, the disk it needs and the free space now, live progress per step,
-  the verification at the end) and the worker and `harvey run` wait. The
-  upgrade, from the screen or `harvey upgrade` (`--check` to only report),
-  builds the registers' indexes, rewrites `anaf.db` (every answer hashed
-  against the original), moves Harvey's data into a new file, verifies it,
-  and only then switches, keeping the old files as `harvey.db.v24` and
-  `anaf.db.old`. It resumes after a stop or a crash, refuses to switch when
-  verification fails, and deletes nothing: **Delete old files** (typed
-  confirmation) or `harvey upgrade --delete-old` does that.
-  `harvey upgrade --data DIR --out DIR` runs it on a copy and writes
-  nothing in the data folder. A database older than schema 24 is opened
-  once by the previous release first. A new install starts on the slim
-  database.
-- **What the slim database shows differently.** A registered firm's name,
-  place, address and activity are the register's current ones: its
-  industry is the first current class it is authorised for (not the class a
-  pull happened to ask for), and a name Harvey found first gives way to the
-  register's. A merge moves nothing: each record keeps its contacts, people,
-  readings and places, and the company shows them all (once each); undo
-  gives each record back exactly what it had. A firm holds one tax code at
-  most. The register's facts aren't copied, so a pull or a lookup reports
-  no "observations" for them, and the financial statements are never looked
-  up by company: they are read where they are. ANAF's whole answer is kept
-  whatever is confirmed (confirming decides what is shown), with earlier
-  answers as history. Every site with no deeper read yet (one only "Read
-  sites" visited included) is read once by the background, the companies
-  with no contact first.
-- **First visits are much faster on a full install.** The register
-  counts job, which walks every firm's register values once per load
-  anyway, now also keeps which firms each register signal holds for, as
-  compressed bitmaps (`register_set`): a cohort's register conditions (VAT,
-  e-Factura, filed accounts, a turnover range) are read from them and
-  patched for the firms added or merged since, instead of every key being
-  walked again on the first visit (5-7 s before on 1.8M firms). A register
-  search (a county, a locality, words) reaches the firms in Harvey through
-  a key table the registry's load builds (`firm_key`), the Companies
-  page's email, phone and mobile filters count from kept tallies, the
-  Registry page's plain list reads its first pages straight from the
-  search index, and the Find-contacts estimate reads only each firm's time
-  and site. A cohort range that names a year reads that year's statements
-  once, with the firms that have each figure kept by the same job. Until
-  the job has run after a register load (an ANAF check or a registry reload
-  included), the pages work the sets out as before; removing a firm keeps
-  them in use, and the job runs again once many firms were pulled since.
-- **Docker on WSL: the free-space check mounts one empty folder, never
-  the Windows drive.** `HARVEY_HOST_DRIVE_SOURCE` is now documented as a
-  dedicated empty folder on the Windows drive that holds your WSL disk,
-  whose free space is the drive's, instead of the drive's root, which
-  showed every file on it to a container that reads untrusted websites.
-  `scripts/disk-check-folder.sh`, run once from the WSL shell, finds that
-  drive, creates `harvey-disk-check` on it and adds the setting to `.env`.
-  If you set it to a drive's root, change it and recreate the container:
-  until then the free-space check refuses a folder that holds a drive's
-  `Windows`, `Users` or `Program Files`, so loads and the upgrade say what
-  to set.
-- **WSL: the free-space check measures the drive that really holds the
-  disk.** It assumed C:, but a moved or imported distro's disk can be on
-  any drive. Outside Docker, Harvey now asks Windows which folder holds
-  this distro's disk (the registry, through `reg.exe`) and measures that
-  drive; when it can't tell, big writes are refused with what to set.
-  `scripts/disk-check-folder.sh` checks a `HARVEY_HOST_DRIVE_SOURCE` that
-  `.env` already sets: one on another drive (C:, as earlier instructions
-  said), missing or not empty is reported with what to change it to.
-
-### Added
 
 - **The contact finder reads a site the way the old prospecting did.** It
   follows the homepage's own menu to the team, about and contact pages
@@ -588,6 +503,148 @@ minor versions can still change behaviour.
   CSV downloads carry dashboard authorization and escape spreadsheet formulas.
 
 ### Changed
+
+- **The opt-out line is Romanian by default** (*Nu vă interesează?
+  Răspundeți „stop" și nu vă mai scriu.*), and Romanian opt-out words
+  (*dezabonare*, *nu mai doresc să primesc*, *nu ne mai trimiteți*,
+  *scoateți-mă din listă*, *Stop, mulțumesc*, *Nu, mulțumim*, singular or
+  plural, with or without diacritics) are honoured by the keyword rules;
+  *nu mai doresc să aștept* and *nu ștergeți datele* are not opt-outs. An
+  objection (*de unde aveți adresa?*, *ștergeți-mi datele*) is recorded as
+  one and handed to you. An opt-out is recorded before anything else about
+  the reply, and one that couldn't be recorded (a locked database) is read
+  again next cycle, up to five times, then handed to you.
+- **Undoing an opt-out with one click** lifts only one Harvey read in the
+  reply's words. An unsubscribe, an objection or a complaint is undone on
+  the do-not-contact list, with a note saying why.
+- **`harvey export --all` leaves the do-not-contact list out** too: a full
+  dump can be fed to another sequencer just the same.
+- **Every reply is read.** IMAP reads by date in read-only mode (nothing is
+  marked read), and a read reaches back to the last complete one when
+  Harvey was off longer than a week; cold email waits while a read hasn't
+  covered the gap. A mailbox with more mail since then than a read takes
+  (5,000 IMAP messages, 40 pages on Gmail or Microsoft 365) is read newest
+  first instead of failing every read; cold email then waits until a read
+  covers the gap or you accept it (`harvey sending accept-gap`,
+  `POST /api/mail/read-gap/accept`). A message from a stranger never holds
+  sending: it is marked read, and handed to you, and put on the list when
+  their own words ask to stop, only when it answers Harvey's thread or
+  comes from a firm Harvey wrote to; a newsletter's "dezabonare" link bars
+  nobody. An IMAP read that fails now holds sending instead of looking
+  like an empty inbox.
+- **Cold email waits when the sending address isn't known** (no
+  `persona.email` and Gmail or Microsoft 365 couldn't say which mailbox is
+  signed in), rather than going without its unsubscribe header.
+- **Schema 26, in place.** The upgrade still writes schema 25; Harvey takes
+  the file to 26 when it opens it, in one transaction. A file a newer
+  Harvey made is refused with a message that says so. Going back to an
+  earlier release after this one has opened the database doesn't work:
+  earlier releases don't know schema 26 and ask for `harvey upgrade`,
+  which can't help. Keep a copy of `data/harvey.db` from before updating
+  if you may need to go back.
+- **Romanian webmail domains** (rdslink.ro, clicknet.ro, email.ro, k.ro,
+  home.ro) and gmx.net count as free mail: never a firm's key, and an
+  address there is personal.
+- **Cold email is staged for review, and autopilot approves it when it is
+  about to go.** Staging (and the Writer's first emails) always waits in
+  the Outbox; on autopilot the drain that sends an email approves it then,
+  after the autopilot review, never when it was staged. So staging goes on
+  while sending is paused, and resuming never sends a backlog nobody
+  looked at without that review.
+- **Each heartbeat reads replies, drains the Outbox, then works the
+  campaigns** (Gmail, SMTP, Microsoft 365): no action is chosen any more,
+  so an open conversation or paused sending no longer stops writing. The
+  Writer no longer makes campaigns of its own on these providers, and the
+  audience no longer fills a global pool: campaigns take their members.
+  Instantly keeps its old flow.
+- **Schema 27, in place.** Sending accounts, audiences, campaign members
+  and the campaigns' new columns are added when Harvey opens the file. A
+  campaign the Writer made earlier stays as it was ('made by Harvey'), its
+  prospects become its members (done when every step went out already),
+  and nothing is staged or sent from a draft:
+  you start it (or archive it) on the Campaigns page.
+- **Bulk mail isn't a reply.** A message with its own `List-Unsubscribe`,
+  `List-Id` or `Precedence: bulk` that doesn't answer one of Harvey's
+  emails, from an address Harvey never sent cold email to, is read and left
+  alone: its "dezabonare" or "stop" is not an opt-out, and no model call or
+  answer is spent on it.
+- **A slim database: harvey.db keeps Harvey's own work, the registers are
+  read in place.** The firms you pulled or worked on, their contacts and
+  evidence, people, searches, sources, merges, web signals and the email
+  side stay in `harvey.db`; the trade registry, the financial statements,
+  the taxpayer file and ANAF's answers are read from their own files
+  through indexes each load builds there. On a full install `harvey.db`
+  goes from about 16 GB to about 1 GB, `anaf.db` from about 8 GB to about
+  1.2 GB (compressed; replaced answers are now kept as history), and pages
+  that took seconds to minutes answer in well under a second. Register
+  facts show the register's own date and current value, and a confirmed
+  register signal shows its data at once. Reloading the trade registry
+  rebuilds the financial statements' "filed accounts" from it.
+- **The upgrade.** An old `harvey.db` (schema 24) is never opened by the
+  new code: the dashboard shows an upgrade screen (what it does, expected
+  time, the disk it needs and the free space now, live progress per step,
+  the verification at the end) and the worker and `harvey run` wait. The
+  upgrade, from the screen or `harvey upgrade` (`--check` to only report),
+  builds the registers' indexes, rewrites `anaf.db` (every answer hashed
+  against the original), moves Harvey's data into a new file, verifies it,
+  and only then switches, keeping the old files as `harvey.db.v24` and
+  `anaf.db.old`. It resumes after a stop or a crash, refuses to switch when
+  verification fails, and deletes nothing: **Delete old files** (typed
+  confirmation) or `harvey upgrade --delete-old` does that.
+  `harvey upgrade --data DIR --out DIR` runs it on a copy and writes
+  nothing in the data folder. A database older than schema 24 is opened
+  once by the previous release first. A new install starts on the slim
+  database.
+- **What the slim database shows differently.** A registered firm's name,
+  place, address and activity are the register's current ones: its
+  industry is the first current class it is authorised for (not the class a
+  pull happened to ask for), and a name Harvey found first gives way to the
+  register's. A merge moves nothing: each record keeps its contacts, people,
+  readings and places, and the company shows them all (once each); undo
+  gives each record back exactly what it had. A firm holds one tax code at
+  most. The register's facts aren't copied, so a pull or a lookup reports
+  no "observations" for them, and the financial statements are never looked
+  up by company: they are read where they are. ANAF's whole answer is kept
+  whatever is confirmed (confirming decides what is shown), with earlier
+  answers as history. Every site with no deeper read yet (one only "Read
+  sites" visited included) is read once by the background, the companies
+  with no contact first.
+- **First visits are much faster on a full install.** The register
+  counts job, which walks every firm's register values once per load
+  anyway, now also keeps which firms each register signal holds for, as
+  compressed bitmaps (`register_set`): a cohort's register conditions (VAT,
+  e-Factura, filed accounts, a turnover range) are read from them and
+  patched for the firms added or merged since, instead of every key being
+  walked again on the first visit (5-7 s before on 1.8M firms). A register
+  search (a county, a locality, words) reaches the firms in Harvey through
+  a key table the registry's load builds (`firm_key`), the Companies
+  page's email, phone and mobile filters count from kept tallies, the
+  Registry page's plain list reads its first pages straight from the
+  search index, and the Find-contacts estimate reads only each firm's time
+  and site. A cohort range that names a year reads that year's statements
+  once, with the firms that have each figure kept by the same job. Until
+  the job has run after a register load (an ANAF check or a registry reload
+  included), the pages work the sets out as before; removing a firm keeps
+  them in use, and the job runs again once many firms were pulled since.
+- **Docker on WSL: the free-space check mounts one empty folder, never
+  the Windows drive.** `HARVEY_HOST_DRIVE_SOURCE` is now documented as a
+  dedicated empty folder on the Windows drive that holds your WSL disk,
+  whose free space is the drive's, instead of the drive's root, which
+  showed every file on it to a container that reads untrusted websites.
+  `scripts/disk-check-folder.sh`, run once from the WSL shell, finds that
+  drive, creates `harvey-disk-check` on it and adds the setting to `.env`.
+  If you set it to a drive's root, change it and recreate the container:
+  until then the free-space check refuses a folder that holds a drive's
+  `Windows`, `Users` or `Program Files`, so loads and the upgrade say what
+  to set.
+- **WSL: the free-space check measures the drive that really holds the
+  disk.** It assumed C:, but a moved or imported distro's disk can be on
+  any drive. Outside Docker, Harvey now asks Windows which folder holds
+  this distro's disk (the registry, through `reg.exe`) and measures that
+  drive; when it can't tell, big writes are refused with what to set.
+  `scripts/disk-check-folder.sh` checks a `HARVEY_HOST_DRIVE_SOURCE` that
+  `.env` already sets: one on another drive (C:, as earlier instructions
+  said), missing or not empty is reported with what to change it to.
 
 - `persona.linkedin` is optional and nothing reads it; training and setup
   no longer write one (training used to invent a profile URL from your

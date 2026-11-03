@@ -195,12 +195,22 @@ def _colleagues(p: str, c: str) -> str:
     )
 
 
+# SQL: outbox row ``o`` belongs to a campaign that is paused or a draft.
+_HELD_CAMPAIGN = ("o.campaign_id IN (SELECT id FROM campaigns "
+                  "WHERE status IN ('paused', 'draft'))")
+
+
 def _company_answered(p: str) -> str:
     """SQL: someone at prospect ``p``'s company has replied."""
     return (f"EXISTS (SELECT 1 FROM prospects c, settings s "
             f"WHERE s.key = '{COMPANY_STOP_KEY}' || c.id AND {_colleagues(p, 'c')})")
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
+# Outbox errors on cold email whose campaign is paused or not started yet
+# (it waits, approved), or asks for every email to be reviewed.
+CAMPAIGN_PAUSED = "waiting: its campaign is paused"
+CAMPAIGN_NOT_STARTED = "waiting: its campaign hasn't started"
+CAMPAIGN_REVIEWS = "waiting for you: its campaign asks you to review every email"
 # Outbox error on cold email that waits, approved, for the operator's
 # cold-email acknowledgement (harvey ack).
 ACK_NEEDED = "waiting for the cold-email acknowledgement: run harvey ack"
@@ -973,6 +983,10 @@ class StateManager:
                     (_utcnow().isoformat(), prospect_id))
         if row and suppression.normalize_address(row[0]):
             suppression.add(con, "address", row[0], reason, by=by, note=note, ref=ref)
+            # Every campaign they are in ends for them (campaign_member).
+            from harvey import campaigns
+
+            campaigns.end_memberships(con, row[0], "suppressed", reason)
 
     async def undo_opt_out(self, prospect_id: str, details: dict | None = None) -> bool:
         """A human's undo of an opt-out: the one way off 'opted_out'.
@@ -1254,6 +1268,7 @@ class StateManager:
         in_reply_to: str = "",
         approved_by: str = "",
         source_note: str = "",
+        account_id: int | None = 1,
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
@@ -1266,12 +1281,12 @@ class StateManager:
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, account_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
-                    status, send_at, provider, thread_ref, in_reply_to,
+                    status, send_at, provider, thread_ref, in_reply_to, account_id,
                 ),
             )
             if cursor.rowcount > 0 and approved_by:
@@ -1291,12 +1306,17 @@ class StateManager:
         skip_unready_follow_ups: bool = False,
         kind: str | None = None,
         follow_ups_only: bool = False,
+        skip_held_campaigns: bool = False,
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
         previous step hasn't gone out yet, so they can't fill the page.
         kind: only that kind ("sequence" for cold email).
-        follow_ups_only: only sequence emails after the first step."""
+        follow_ups_only: only sequence emails after the first step.
+        skip_held_campaigns: leave out cold email of a paused or draft
+        campaign, which waits, approved, and would fill the page too."""
         where, params = [], []
+        if skip_held_campaigns:
+            where.append(f"NOT (o.kind = 'sequence' AND {_HELD_CAMPAIGN})")
         if kind:
             where.append("kind = ?")
             params.append(kind)
@@ -1342,14 +1362,16 @@ class StateManager:
             ) as cursor:
                 texts += [r[0] or "" for r in await cursor.fetchall()]
             async with db.execute(
-                "SELECT sequence_json, prospect_ids_json FROM campaigns "
-                "WHERE prospect_ids_json LIKE ? ORDER BY created_at DESC LIMIT ?",
-                ("%" + prospect_id + "%", int(limit)),
+                "SELECT sequence_json, prospect_ids_json, id IN (SELECT campaign FROM "
+                "campaign_member WHERE prospect_id = ?) FROM campaigns "
+                "WHERE prospect_ids_json LIKE ? OR id IN (SELECT campaign FROM campaign_member "
+                "WHERE prospect_id = ?) ORDER BY created_at DESC LIMIT ?",
+                (prospect_id, "%" + prospect_id + "%", prospect_id, int(limit)),
             ) as cursor:
                 rows = await cursor.fetchall()
-        for sequence_json, ids_json in rows:
+        for sequence_json, ids_json, member in rows:
             try:
-                if prospect_id not in json.loads(ids_json or "[]"):
+                if not member and prospect_id not in json.loads(ids_json or "[]"):
                     continue
                 texts += [str(step.get("body") or "") for step in json.loads(sequence_json or "[]")
                           if isinstance(step, dict)]
@@ -1381,7 +1403,7 @@ class StateManager:
             due = f"({due} OR substr(COALESCE(o.error, ''), 1, ?) = ?)"
             params += [len(moved_back_prefix), moved_back_prefix]
         sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
-               f"AND o.kind = 'sequence' AND {due} "
+               f"AND o.kind = 'sequence' AND {due} AND NOT {_HELD_CAMPAIGN} "
                "AND NOT (o.step > 1 AND EXISTS ("
                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
                "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
@@ -1510,7 +1532,20 @@ class StateManager:
                 (prospect_id, reason),
             ) as cursor:
                 rows = [dict(r) for r in await cursor.fetchall()]
+            # Their places in campaigns that stopped for the same reason
+            # open again: staged where an email comes back, else ready.
+            from harvey import campaigns
+
+            await db.execute(
+                "UPDATE campaign_member SET status = CASE WHEN EXISTS (SELECT 1 FROM outbox o "
+                "WHERE o.campaign_id = campaign_member.campaign "
+                "AND o.prospect_id = campaign_member.prospect_id AND o.status = 'cancelled' "
+                "AND o.error = ?) THEN ? ELSE ? END, ended_at = NULL, end_reason = '' "
+                "WHERE prospect_id = ? AND status = ? AND end_reason = ?",
+                (reason, campaigns.M["staged"], campaigns.M["ready"], prospect_id,
+                 campaigns.M["stopped"], reason))
             if not rows:
+                await db.commit()
                 return 0
             now = _utcnow()
 
@@ -1608,6 +1643,44 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def promote_for_autopilot(self, due_before: str, limit: int) -> int:
+        """Autopilot approves staged cold email when it is about to go, not
+        when it was staged: due, waiting with no note (nothing held it), in
+        an active campaign that doesn't ask to review everything, and a
+        follow-up only once the step before it went out. So what was staged
+        while sending was paused, or before autopilot was turned on, is
+        approved by the drain that sends it (after the autopilot review),
+        never by the act of staging. Returns how many."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'approved', approved_by = 'autopilot', updated_at = ? "
+                "WHERE id IN (SELECT o.id FROM outbox o LEFT JOIN campaigns c "
+                "ON c.id = o.campaign_id WHERE o.status = 'pending_review' "
+                "AND o.kind = 'sequence' AND COALESCE(o.approved_by, '') = '' "
+                "AND COALESCE(o.error, '') = '' AND (o.send_at IS NULL OR o.send_at <= ?) "
+                "AND (c.id IS NULL OR (c.status = 'active' "
+                "AND COALESCE(c.review, 'inherit') != 'always')) "
+                "AND NOT (o.step > 1 AND EXISTS (SELECT 1 FROM outbox p "
+                "WHERE p.prospect_id = o.prospect_id AND p.campaign_id = o.campaign_id "
+                "AND p.kind = 'sequence' AND p.step = o.step - 1 AND p.status != 'sent')) "
+                "ORDER BY o.send_at, o.created_at LIMIT ?)",
+                (_utcnow().isoformat(), due_before, int(limit)),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def count_queued_first_emails(self) -> int:
+        """First cold emails staged and not yet sent (waiting for review or
+        approved) in active campaigns: what the campaign cycle has already
+        written ahead of the send cap."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox o JOIN campaigns c ON c.id = o.campaign_id "
+                "WHERE o.kind = 'sequence' AND o.step <= 1 "
+                "AND o.status IN ('pending_review', 'approved') AND c.status = 'active'",
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
     async def count_held_for_review(self) -> int:
         """Emails autopilot sent back for a human, still waiting."""
         async with self._connect() as db:
@@ -1655,6 +1728,16 @@ class StateManager:
                 f"WHERE p.id = ? AND {_colleagues('p', 'c')})",
                 (f"{COLLEAGUE_REPLIED} ({who})", _utcnow().isoformat(), prospect_id),
             )
+            # Their colleagues' places in every campaign stop too.
+            from harvey import campaigns
+
+            await db.execute(
+                "UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? "
+                "WHERE prospect_id IN (SELECT c.id FROM prospects c, prospects p "
+                f"WHERE p.id = ? AND {_colleagues('p', 'c')}) "
+                f"AND status IN ({','.join('?' * len(campaigns.OPEN_MEMBER))})",
+                (campaigns.M["stopped"], int(time.time()), f"{COLLEAGUE_REPLIED} ({who})"[:200],
+                 prospect_id, *campaigns.OPEN_MEMBER))
             await db.commit()
             return cursor.rowcount
 
@@ -1735,6 +1818,17 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def sent_cold_email_to(self, email: str) -> bool:
+        """Whether Harvey's outbox has sent cold email to this address."""
+        if not email:
+            return False
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT 1 FROM outbox WHERE lower(to_email) = ? AND kind = 'sequence' "
+                "AND status = 'sent' LIMIT 1", (email.strip().lower(),)
+            ) as cursor:
+                return await cursor.fetchone() is not None
 
     async def find_outbox_by_unsub_token(self, token: str) -> dict | None:
         """The sent cold email whose unsubscribe header carried ``token``."""
@@ -2473,23 +2567,116 @@ class StateManager:
     # ── Campaigns ──
 
     async def add_campaign(self, campaign: Campaign) -> str:
+        """A campaign the Writer made ('auto'): its prospects become its
+        members (campaign_member), in the same write."""
+        from harvey.overlay import schema
+
         if not campaign.id:
             campaign.id = _new_id()
-        async with self._connect() as db:
-            await db.execute(
+
+        def run(con):
+            con.execute(
                 """INSERT INTO campaigns
                    (id, name, channel, instantly_campaign_id, sequence_json,
-                    prospect_ids_json, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    prospect_ids_json, status, created_at, origin, account_id, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                 (
                     campaign.id, campaign.name, campaign.channel,
                     campaign.instantly_campaign_id, campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
-                    campaign.created_at.isoformat(),
+                    campaign.created_at.isoformat(), campaign.origin, int(time.time()),
                 ),
             )
-            await db.commit()
+            schema.members_from_prospects(con, campaign.id, campaign.prospect_ids,
+                                          schema.MEMBER_ADDED_BY["writer"])
+
+        await self._in_tx(run)
         return campaign.id
+
+    # ── Audiences, campaigns made by the user, members (harvey/campaigns.py) ──
+
+    async def campaigns_call(self, fn, *args, write: bool = True, **kwargs):
+        """harvey.campaigns' ``fn(connection, *args, **kwargs)`` in one
+        transaction of its own."""
+        return await self._in_tx(lambda con: fn(con, *args, **kwargs), write=write)
+
+    async def campaign_members(self, campaign_id: str, status: str = "",
+                               limit: int = 500) -> list[dict]:
+        from harvey import campaigns
+
+        return await self.campaigns_call(campaigns.members, campaign_id, status, limit,
+                                         write=False)
+
+    async def campaign_member(self, campaign_id: str, email: str) -> dict | None:
+        from harvey import campaigns
+
+        return await self.campaigns_call(campaigns.member, campaign_id or "", email, write=False)
+
+    async def set_campaign_member(self, campaign_id: str, email: str, status: str,
+                                  reason: str = "", **fields) -> bool:
+        from harvey import campaigns
+
+        return await self.campaigns_call(campaigns.set_member, campaign_id, email, status,
+                                         reason, **fields)
+
+    async def end_memberships(self, email: str, status: str, reason: str) -> int:
+        """Every open membership of an address ends (replied, suppressed,
+        bounced), in every campaign."""
+        from harvey import campaigns
+
+        return await self.campaigns_call(campaigns.end_memberships, email, status, reason)
+
+    async def member_sent(self, campaign_id: str, email: str, step: int) -> None:
+        """A member's email went out: in sequence, or done after its last step."""
+        from harvey import campaigns
+
+        def run(con):
+            m = campaigns.member(con, campaign_id or "", email)
+            if m is None or m["status"] not in (campaigns.M["staged"], campaigns.M["in_sequence"]):
+                return
+            c = campaigns.get_campaign(con, campaign_id)
+            last = max([int(s.get("step") or 0) for s in (c or {}).get("sequence") or []] or [0])
+            status = "done" if last and int(step) >= last else "in_sequence"
+            campaigns.set_member(con, campaign_id, email, status, "every step sent",
+                                 last_step=max(int(step), m["last_step"]),
+                                 last_sent_at=int(time.time()))
+            if status == "done":
+                campaigns.finish_if_done(con, campaign_id)
+
+        await self._in_tx(run)
+
+    async def campaign_record(self, campaign_id: str) -> dict | None:
+        from harvey import campaigns
+
+        return await self.campaigns_call(campaigns.get_campaign, campaign_id or "", write=False)
+
+    async def sync_sending_account(self, config) -> int:
+        """Sending account 1 as the settings say (campaigns.sync_account)."""
+        from harvey import campaigns
+
+        email = config.channels.email
+        address = getattr(getattr(config, "persona", None), "email", "") or ""
+        return await self.campaigns_call(campaigns.sync_account, email.provider or "", address)
+
+    async def find_campaign_for_reply(self, email: str, in_reply_to: str = "",
+                                      references: str = "") -> dict | None:
+        """The sent cold email a reply answers: its In-Reply-To or
+        References name it (outbox.message_id), else the latest one sent to
+        that address (a provider that couldn't read the Message-ID kept its
+        own id instead). None when Harvey never wrote to them."""
+        for ref in [in_reply_to or ""] + (references or "").split():
+            item = await self.find_outbox_by_message_id(ref.strip())
+            if item and item.get("campaign_id"):
+                return item
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE to_email = ? AND kind = 'sequence' "
+                "AND status = 'sent' AND campaign_id != '' ORDER BY sent_at DESC LIMIT 1",
+                (_norm(email),),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def get_campaigns_by_status(self, status: str) -> list[Campaign]:
         async with self._connect() as db:
@@ -2806,12 +2993,15 @@ class StateManager:
             async with db.execute(
                 """SELECT
                      SUM(CASE WHEN status = 'draft' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
+                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN status = 'draft' AND COALESCE(origin, 'auto') = 'auto'
+                         THEN 1 ELSE 0 END)
                    FROM campaigns"""
             ) as cursor:
                 row = await cursor.fetchone()
                 draft_campaigns = row[0] or 0
                 active_campaigns = row[1] or 0
+                writer_drafts = row[2] or 0
             async with db.execute(
                 "SELECT COUNT(*) FROM conversations WHERE status = 'open'"
             ) as cursor:
@@ -2833,6 +3023,8 @@ class StateManager:
             # prospecting for the day when these alone fill the backlog.
             "recent_unusable_prospects": await self.count_recent_unusable_prospects(),
             "draft_campaigns": draft_campaigns,
+            # The Writer's drafts, the only ones Instantly deploys.
+            "writer_drafts": writer_drafts,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
             "usage_today": usage_today,  # Claude calls (kept for compatibility)

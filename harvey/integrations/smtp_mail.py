@@ -235,7 +235,9 @@ class SmtpImapProvider(MailProvider):
             pass
 
         message_id = str(msg.get("Message-ID", "")).strip()
-        headers = {"references": str(msg.get("References", "") or "").strip()}
+        # The thread, and what marks mail sent to a list (Handler: is_bulk).
+        headers = {name.lower(): str(msg.get(name, "") or "").strip()
+                   for name in ("References", "List-Unsubscribe", "List-Id", "Precedence")}
         return InboundMessage(
             provider_id=message_id or f"{from_email}:{subject}",
             from_email=from_email,

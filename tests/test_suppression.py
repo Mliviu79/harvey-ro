@@ -136,18 +136,20 @@ def test_a_file_a_newer_harvey_made_is_refused_by_name(tmp_path):
     assert not upgrade.needed(tmp_path)
 
 
-def test_an_older_build_refuses_a_schema_26_file_with_the_newer_harvey_message(tmp_path,
-                                                                               monkeypatch):
+def test_an_older_build_refuses_a_newer_file_with_the_newer_harvey_message(tmp_path,
+                                                                          monkeypatch):
     path = tmp_path / "harvey.db"
-    asyncio.run(StateManager(str(path)).init_db())           # schema 26
-    # The release before this one: it reads up to 25.
+    asyncio.run(StateManager(str(path)).init_db())           # the latest schema
+    latest = schema.LATEST
+    # A release that reads up to 25.
     monkeypatch.setattr(schema, "LATEST", 25)
     monkeypatch.setattr(schema, "VERSION", 25)
     monkeypatch.setattr(schema, "STEPS", ())
     with pytest.raises(UpgradeNeeded) as e:
         asyncio.run(StateManager(str(path)).init_db())
     assert isinstance(e.value, NewerBuild)
-    assert "made by a newer Harvey (schema 26; this one reads up to schema 25)" in str(e.value)
+    assert (f"made by a newer Harvey (schema {latest}; this one reads "
+            "up to schema 25)") in str(e.value)
     assert "harvey upgrade" not in str(e.value)
 
 

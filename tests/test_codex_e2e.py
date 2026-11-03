@@ -235,10 +235,20 @@ async def test_approved_email_is_delivered_once_across_cycles(harvey):
 
 @pytest.mark.asyncio
 async def test_writer_drafts_through_codex_and_waits_for_approval(harvey):
+    from harvey import campaigns, contacts
+    from harvey.models import Company
+
     await harvey.state.init_db()
-    await seed_prospect(harvey.state, email="jane@acme.example", status="new")
-    # One cycle: the writer drafts, then (send phase, after it) the sender
-    # stages the drafts for approval. Nothing is sent.
+    firm = await harvey.state.add_company(Company(name="Acme", domain="acme.example"))
+    await harvey.state.add_contacts(firm, [contacts.Found(
+        "email", "jane@acme.example", status="verified", source="website", trust="confirmed")])
+    cid = await harvey.state.campaigns_call(
+        campaigns.create_campaign, provider="smtp", address="", name="Acme",
+        query="kind=email", li_note="Interes legitim: " + "o notă de test destul de lungă. " * 4,
+        sequence=[{"subject": "hi", "body": "Hi {{first_name}}, a question?"}])
+    await campaigns.start(harvey.state, harvey.config, cid)
+    # One cycle: after reading and draining, the campaign's member gets a
+    # first email drafted by the model, staged for approval. Nothing is sent.
     await harvey.run_cycles(1)
     drafts = await harvey.state.get_outbox(status="pending_review")
     assert drafts and all(d["to_email"] == "jane@acme.example" for d in drafts)

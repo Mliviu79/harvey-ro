@@ -2,12 +2,13 @@
 configured mail provider (Gmail / SMTP) through the outbox approval ladder.
 
 Native flow:
-  1. Draft campaigns are STAGED: merge variables rendered per prospect,
-     one outbox row per (prospect, step) with a scheduled send_at.
-     Rows start as pending_review (copilot) or approved (autopilot).
-  2. Each heartbeat DRAINS due approved rows: kill-switch check, stop-on-
-     reply check, deterministic pre-send gate, then provider.send_email
-     with jittered pacing and the daily cap.
+  1. An active campaign's ready members are STAGED: merge variables
+     rendered per member, one outbox row per (member, step) with a
+     scheduled send_at, always waiting for review.
+  2. Each heartbeat DRAINS due approved rows (on autopilot it first
+     approves the due staged ones it may send): kill-switch check, the
+     campaign and member, stop-on-reply check, deterministic pre-send gate,
+     then provider.send_email with jittered pacing and the daily cap.
 """
 
 import asyncio
@@ -30,7 +31,8 @@ from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provide
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
 from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
-    ACK_NEEDED, AUTOPILOT_OFF_REASON, COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
+    ACK_NEEDED, AUTOPILOT_OFF_REASON, CAMPAIGN_NOT_STARTED, CAMPAIGN_PAUSED, CAMPAIGN_REVIEWS,
+    COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
     MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, NO_SENDER_ADDRESS, NOTE_ADDED, READ_GAP_HELD,
     READ_GAP_KEY, RECHECK_PREFIX, StateManager,
 )
@@ -218,9 +220,11 @@ class Sender:
             return False
         now = _utcnow()
         due_before = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        await self._promote(due_before, QUIET_HOURS_SCAN)
         due = await self.state.get_outbox(
             status="approved", due_before=due_before,
-            limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, kind="sequence",
+            limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, skip_held_campaigns=True,
+            kind="sequence",
         )
         if self.compliance_held and self.precleared is not None:
             # Match the drain's separate follow-up scan: waiting first emails
@@ -228,7 +232,8 @@ class Sender:
             seen = {item["id"] for item in due}
             follow_ups = await self.state.get_outbox(
                 status="approved", due_before=due_before,
-                limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, follow_ups_only=True,
+                limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, skip_held_campaigns=True,
+                follow_ups_only=True,
             )
             due += [item for item in follow_ups if item["id"] not in seen]
         for item in due:
@@ -270,7 +275,10 @@ class Sender:
             return
 
         logger.info("Sender: Checking for campaigns to deploy...")
-        draft_campaigns = await self.state.get_campaigns_by_status("draft")
+        # Only the Writer's drafts: a campaign the user made starts by hand,
+        # on a native provider (campaigns.start), never deployed from here.
+        draft_campaigns = [c for c in await self.state.get_campaigns_by_status("draft")
+                           if c.origin == "auto"]
         if not draft_campaigns:
             logger.info("Sender: No draft campaigns to deploy.")
             return
@@ -561,6 +569,20 @@ class Sender:
                 f"Sender: {stale} email(s) were interrupted mid-send and won't be "
                 "retried. Check your Sent folder; they're under Didn't send."
             )
+        # The Writer's campaigns ('auto') had their first emails drafted when
+        # they were made: their members are staged here. A campaign made by
+        # the user is staged by the campaign cycle, after its drafts are
+        # written (agents/campaigner.py). Staging goes on while sending is
+        # paused: it only fills the review queue (nothing is approved until
+        # a drain that sends it, promote_for_autopilot).
+        for campaign in await self.state.get_campaigns_by_status("active"):
+            if campaign.origin != "auto" or campaign.instantly_campaign_id:
+                continue
+            try:
+                await self._stage_campaign_native(campaign)
+            except Exception as e:
+                logger.error(f"Sender: staging '{campaign.name}' failed: {e}")
+
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -568,12 +590,6 @@ class Sender:
                 "or `harvey sending resume` once the cause is fixed."
             )
             return
-
-        for campaign in await self.state.get_campaigns_by_status("draft"):
-            try:
-                await self._stage_campaign_native(campaign)
-            except Exception as e:
-                logger.error(f"Sender: staging '{campaign.name}' failed: {e}")
 
         await self._drain_due()
 
@@ -598,17 +614,45 @@ class Sender:
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
 
-    async def _stage_campaign_native(self, campaign):
-        """Render + schedule a draft campaign's emails into the outbox."""
+    async def stageable(self, campaign_id: str, member: dict, prospect,
+                        sendable_email) -> tuple[str, str] | None:
+        """Why a ready member can't be staged now, as (its new member
+        status, why), or None when it can: the checks staging always made
+        (a usable address that may be sent to, nobody at the company has
+        answered, not on the do-not-contact list), plus their own answer, a
+        hand-sent email, and another campaign holding the address."""
+        from harvey import campaigns
+
+        if prospect is None or not prospect.email or not EMAIL_RE.match(prospect.email.strip()):
+            return "skipped", "no usable address"
+        if prospect.status in campaigns.ANSWERED:
+            return "replied", f"prospect status '{prospect.status}'"
+        if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
+            return "stopped", HAND_SENT_REASON
+        estatus = prospect.email_status or "guess"
+        if estatus not in sendable_email:
+            if estatus in ("", "unchecked"):
+                return "waiting", "not checked yet"
+            return "skipped", f"email status '{estatus}'"
+        if colleague := await self.state.colleague_who_replied(prospect.id):
+            return "stopped", f"{COLLEAGUE_REPLIED} ({colleague})"
+        if hit := await self.state.suppression_check(prospect.email, firm=prospect.company_id,
+                                                     config=self.config):
+            return "suppressed", hit.text
+        held = await self.state.campaigns_call(campaigns.overlap, prospect.email, campaign_id,
+                                               write=False)
+        if held:
+            return "stopped", f"overlap: {held}"
+        return None
+
+    async def _stage_campaign_native(self, campaign, emails=None):
+        """Render + schedule an active campaign's ready members into the
+        outbox (``emails``: only those). Always waiting for review: autopilot
+        approves when a drain is about to send it (promote_for_autopilot)."""
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
             return
 
-        await sync_sending_mode(self.config, self.state)
-        require_approval = getattr(
-            self.config.channels.email, "require_approval", True
-        )
-        initial_status = "pending_review" if require_approval else "approved"
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sendable_email = (
             SENDABLE_EMAIL_STATUSES_WITH_RISKY if allow_risky
@@ -616,33 +660,22 @@ class Sender:
         )
 
         staged = 0
-        skipped = 0
-        answered = 0
-        listed = 0
+        held: dict[str, int] = {}
         now = _utcnow()
-        seen_emails: set[str] = set()
         window = send_window_of(self.config)
+        wanted = {e.strip().lower() for e in emails} if emails is not None else None
 
-        for prospect_id in campaign.prospect_ids:
-            prospect = await self.state.get_prospect(prospect_id)
-            if not prospect or not prospect.email:
+        for member in await self.state.campaign_members(campaign.id, status="ready", limit=10_000):
+            email = member["email"]
+            if wanted is not None and email not in wanted:
                 continue
-            email = prospect.email.strip().lower()
-            if not EMAIL_RE.match(email) or email in seen_emails:
+            prospect = await self.state.get_prospect(member["prospect_id"]) \
+                if member["prospect_id"] else await self.state.get_prospect_by_email(email)
+            why = await self.stageable(campaign.id, member, prospect, sendable_email)
+            if why is not None:
+                await self.state.set_campaign_member(campaign.id, email, why[0], why[1])
+                held[why[0]] = held.get(why[0], 0) + 1
                 continue
-            if prospect.status not in SENDABLE_STATUSES:
-                continue
-            if (prospect.email_status or "guess") not in sendable_email:
-                skipped += 1
-                continue
-            if await self.state.colleague_who_replied(prospect.id):
-                answered += 1     # their company already answered
-                continue
-            if await self.state.suppression_check(email, firm=prospect.company_id,
-                                                  config=self.config):
-                listed += 1       # on the do-not-contact list
-                continue
-            seen_emails.add(email)
             # A first email to a personal address carries where the address
             # was found (email_rules), decided now and kept on the row.
             _, note = await self.state.personal_address(email)
@@ -666,35 +699,22 @@ class Sender:
                     subject=self._render(step.subject, prospect),
                     body=email_rules.with_note(body, note) if first else body,
                     send_at=send_at.isoformat(),
-                    status=initial_status,
+                    status="pending_review",
                     provider=self.provider.name,
-                    approved_by="" if require_approval else "autopilot",
                     source_note=note if first else "",
+                    account_id=campaign.account_id or 1,
                 )
                 if item_id:
                     staged += 1
+            await self.state.set_campaign_member(campaign.id, email, "staged")
             # Conditional: never overwrite a status set while staging
             # (marked sent by hand, a reply).
             await self.state.queue_prospect_if_unsent(prospect.id)
 
-        await self.state.update_campaign(campaign.id, status="active")
-        if skipped:
-            logger.info(
-                f"Sender: held back {skipped} prospect(s) with unverified "
-                f"emails from '{campaign.name}'."
-            )
-        if answered:
-            logger.info(
-                f"Sender: left out {answered} prospect(s) from '{campaign.name}': "
-                f"{COLLEAGUE_REPLIED} at their company."
-            )
-        if listed:
-            logger.info(
-                f"Sender: left out {listed} prospect(s) from '{campaign.name}': on the "
-                "do-not-contact list."
-            )
+        for status, n in held.items():
+            logger.info(f"Sender: {n} member(s) of '{campaign.name}' not staged ({status}).")
         if staged:
-            mode = "awaiting your approval" if require_approval else "approved"
+            mode = "awaiting your approval"
             logger.info(
                 f"Sender: staged {staged} email(s) for '{campaign.name}' "
                 f"({mode}). Review in the dashboard Outbox tab."
@@ -704,6 +724,7 @@ class Sender:
                 agent="sender",
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
+        return staged
 
     def _with_footer(self, body: str) -> str:
         """A cold email as it leaves: the postal address and opt-out line
@@ -773,12 +794,53 @@ class Sender:
             error=f"{RECHECK_PREFIX}{retry_at:%Y-%m-%d %H:%M} UTC: {reason}"[:300])
         return retry_at
 
+    async def _campaign_hold(self, item: dict) -> tuple[str, str] | None:
+        """A cold email's campaign and its member, checked first: the
+        campaign must be active (paused: the email waits, approved; ended:
+        cancelled) and the member still open there. None for an email of no
+        campaign Harvey keeps (or a member it never kept)."""
+        from harvey import campaigns
+
+        campaign = await self.state.campaign_record(item.get("campaign_id") or "")
+        if campaign is None:
+            return None
+        if campaign["status"] == "paused":
+            return "approved", CAMPAIGN_PAUSED
+        if campaign["status"] == "draft":
+            return "approved", CAMPAIGN_NOT_STARTED
+        if campaign["status"] != "active":
+            return "cancelled", f"campaign {campaign['status']}"
+        member = await self.state.campaign_member(campaign["id"], item["to_email"])
+        if member is not None and member["end_reason"] == HAND_SENT_REASON:
+            return "cancelled", HAND_SENT_REASON     # what undoing a hand send restores
+        if member is not None and member["status"] not in campaigns.OPEN_MEMBER:
+            return "cancelled", (f"member {member['status_name']}"
+                                 + (f": {member['end_reason']}" if member["end_reason"] else ""))
+        return None
+
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
-        """Why this email must not go out, as (status, error), or None."""
+        """Why this email must not go out, as (status, error), or None.
+
+        In this order, for cold email: its campaign is active and the
+        member still open there (_campaign_hold); the person hasn't answered
+        or opted out; nobody emailed them by hand (MANUAL_SEND_KEY); a first
+        email isn't a second one (this campaign sent one already, another
+        campaign holds the address, or the prospect was contacted outside
+        any campaign); nobody at their company answered (COMPANY_STOP_KEY,
+        any campaign). Then, for every email: the do-not-contact list; the
+        acknowledgement, sending address and source note for cold email; the
+        gate; autopilot still on (and the campaign not asking for review);
+        the autopilot review. The drain also checks a follow-up's order, the
+        compliance check, and all of this again once it has claimed the row."""
+        from harvey import campaigns
+
         await sync_sending_mode(self.config, self.state)   # "Turn off autopilot" counts at once
         if prospect is None:
             return "failed", "prospect missing"
         if item["kind"] == "sequence":
+            held = await self._campaign_hold(item)
+            if held is not None:
+                return held
             # Stop-on-reply / opt-out: never continue a sequence after contact.
             if prospect.status in STOP_STATUSES:
                 return "cancelled", f"prospect status '{prospect.status}'"
@@ -787,8 +849,17 @@ class Sender:
             if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
                 return "cancelled", HAND_SENT_REASON
             # A first email to someone already contacted is always a duplicate.
-            if item["step"] == 1 and prospect.status == "contacted":
-                return "cancelled", "already contacted"
+            if int(item["step"]) <= 1:
+                member = await self.state.campaign_member(item.get("campaign_id") or "",
+                                                          item["to_email"])
+                if member is None and prospect.status == "contacted":
+                    return "cancelled", "already contacted"
+                if member is not None:
+                    why = await self.state.campaigns_call(
+                        campaigns.already_contacted, item["to_email"], item["campaign_id"],
+                        item["id"], write=False)
+                    if why:
+                        return "cancelled", why
             # Someone else at their company answered: the rest of the
             # company gets no more cold email.
             colleague = await self.state.colleague_who_replied(prospect.id)
@@ -839,6 +910,11 @@ class Sender:
                 and getattr(self.config.channels.email, "require_approval", True)):
             # Autopilot approved it, and autopilot has since been turned off.
             return "pending_review", AUTOPILOT_OFF_REASON
+        if (item.get("approved_by") == "autopilot" and item["kind"] == "sequence"
+                and await self.state.campaigns_call(campaigns.review_always,
+                                                    item.get("campaign_id") or "", write=False)):
+            # The campaign asks for every email to be reviewed, autopilot or not.
+            return "pending_review", CAMPAIGN_REVIEWS
         if item.get("approved_by") != "you":
             # Nobody approved this one (autopilot): what a planted
             # instruction would add sends it back to you instead.
@@ -880,6 +956,30 @@ class Sender:
             await self.state.update_outbox_item(item["id"], unsub_token=token)
         return {"headers": unsubscribe.headers(address, token)}
 
+    async def _record_block(self, item: dict, blocked: tuple[str, str]) -> None:
+        """Keep why an email didn't go; a cancelled or failed cold email
+        also ends its member's place in the campaign, with the same reason
+        (undoing a hand send finds it by that reason). A failed one is never
+        retried, so its member would otherwise stay open for good."""
+        await self.state.update_outbox_item(item["id"], status=blocked[0], error=blocked[1])
+        if blocked[0] in ("cancelled", "failed") and item["kind"] == "sequence" \
+                and item.get("campaign_id"):
+            member = await self.state.campaign_member(item["campaign_id"], item["to_email"])
+            if member is not None and member["status_name"] in ("staged", "in_sequence"):
+                await self.state.set_campaign_member(item["campaign_id"], item["to_email"],
+                                                     "stopped", blocked[1])
+
+    async def _promote(self, due_before: str, limit: int) -> None:
+        """On autopilot, approve the staged cold email this drain may send
+        (state.promote_for_autopilot): approval happens at send time, after
+        the autopilot review, never when the email was staged."""
+        await sync_sending_mode(self.config, self.state)
+        if getattr(self.config.channels.email, "require_approval", True):
+            return
+        promoted = await self.state.promote_for_autopilot(due_before, limit)
+        if promoted:
+            logger.info(f"Sender: autopilot approved {promoted} staged email(s) to send now.")
+
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
         if self.precleared is None:
@@ -908,11 +1008,15 @@ class Sender:
             since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        # No more than the cold cap leaves for today: what it would hold
+        # stays waiting for review, not shown approved.
+        await self._promote(now, max(min(budget * 3, cold_left), 0))
         # In quiet hours only cold email can go, so only cold email is
         # fetched: replies due ahead of it can't fill the page.
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3,
-            skip_unready_follow_ups=True, kind="sequence" if self.cold_only else None,
+            skip_unready_follow_ups=True, skip_held_campaigns=True,
+            kind="sequence" if self.cold_only else None,
         )
         # Cold emails held (by an unavailable compliance check, the cold
         # cap, a follow-up's spacing) stay approved and could fill the
@@ -932,7 +1036,8 @@ class Sender:
             seen.update(item["id"] for item in extra)
             follow_ups = await self.state.get_outbox(
                 status="approved", due_before=now, limit=budget * 3,
-                skip_unready_follow_ups=True, follow_ups_only=True,
+                skip_unready_follow_ups=True, skip_held_campaigns=True,
+                follow_ups_only=True,
             )
             extra += [item for item in follow_ups if item["id"] not in seen]
         if extra:
@@ -986,8 +1091,7 @@ class Sender:
             prospect = await self.state.get_prospect(item["prospect_id"])
             blocked = await self._blocked(item, prospect, allow_risky)
             if blocked:
-                await self.state.update_outbox_item(
-                    item["id"], status=blocked[0], error=blocked[1])
+                await self._record_block(item, blocked)
                 continue
             order = await self._follow_up_order(item, prospect)
             if order == "wait":
@@ -1101,8 +1205,7 @@ class Sender:
             prospect = await self.state.get_prospect(item["prospect_id"])
             blocked = await self._blocked(item, prospect, allow_risky)
             if blocked:
-                await self.state.update_outbox_item(
-                    item["id"], status=blocked[0], error=blocked[1])
+                await self._record_block(item, blocked)
                 continue
 
             body = self._outgoing_body(item)
@@ -1141,6 +1244,8 @@ class Sender:
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
+            if item["kind"] == "sequence" and item.get("campaign_id"):
+                await self.state.member_sent(item["campaign_id"], item["to_email"], item["step"])
 
             # A sent reply belongs in its conversation thread.
             if item["kind"] == "reply" and item.get("conversation_id"):

@@ -241,6 +241,15 @@ def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
     return None
 
 
+def is_bulk(msg) -> bool:
+    """Mail sent to a list, not written to Harvey: it carries its own
+    List-Unsubscribe or List-Id, or says Precedence: bulk, list or junk."""
+    headers = {str(k).lower(): str(v or "") for k, v in (msg.headers or {}).items()}
+    if headers.get("list-unsubscribe", "").strip() or headers.get("list-id", "").strip():
+        return True
+    return headers.get("precedence", "").strip().lower() in ("bulk", "list", "junk")
+
+
 def _own_words(body: str) -> str:
     """What a message's body says of its own: the quote and a phone's
     signature taken out ("" for an empty body or a signature only)."""
@@ -545,6 +554,13 @@ class Handler:
         if not prospect:
             await self._unknown_sender(lead_email, reply_text, reply_meta or {})
             return
+        if not campaign_id and self.is_native:
+            # The campaign this answers: the email its In-Reply-To names,
+            # else the last cold email sent to them.
+            meta = reply_meta or {}
+            item = await self.state.find_campaign_for_reply(
+                prospect.email, meta.get("in_reply_to", ""), meta.get("references", ""))
+            campaign_id = (item or {}).get("campaign_id") or ""
 
         # Their words, without what we sent them. The keyword checks below
         # read every line they wrote, even under or between quoted lines;
@@ -576,6 +592,8 @@ class Handler:
             self._stop_pending = False
         else:
             await self.state.update_prospect_status(prospect.id, "replied")
+            # They answered: every campaign they are in ends for them.
+            await self.state.end_memberships(prospect.email, "replied", "they replied")
         # Stop-on-reply: a human answered, so every queued sequence email
         # for them is now wrong to send.
         try:
@@ -612,6 +630,8 @@ class Handler:
         )
         if stored is not None:
             convo = stored.model_copy(deep=True)
+            if campaign_id and not convo.campaign_id:
+                convo.campaign_id = campaign_id
         else:
             convo = Conversation(
                 id="",
@@ -648,6 +668,7 @@ class Handler:
                 thread_json=convo.thread_json(),
                 intent=intent,
                 stage=convo.stage,
+                campaign_id=convo.campaign_id,
             )
         if convo.stage != old_stage:
             logger.info(f"Handler: Stage for {lead_email}: {old_stage} -> {convo.stage}")
@@ -870,6 +891,15 @@ class Handler:
                     text = self._subject_opt_out(msg.subject) or text
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
+                elif text and is_bulk(msg) and not await self._answers_us(msg):
+                    # A newsletter or a mailing list (its own unsubscribe
+                    # header, List-Id, Precedence: bulk) that doesn't answer
+                    # one of Harvey's emails, from an address Harvey never
+                    # sent cold email to: its "dezabonare" or "stop" is
+                    # its own, not a reply. No keyword opt-out, no model, no
+                    # answer; read, and left alone.
+                    logger.info(f"Handler: bulk mail from {msg.from_email} that doesn't "
+                                "answer Harvey's emails: left alone.")
                 elif text:
                     await self._process_reply(
                         msg.from_email,
@@ -913,6 +943,17 @@ class Handler:
             self.provider.confirm_read()
             await self._record_coverage(mailbox, since, started)
         return complete
+
+    async def _answers_us(self, msg) -> bool:
+        """Whether a message's In-Reply-To or References names an email
+        Harvey sent, or it comes from an address Harvey sent cold email to
+        (a reply whose thread headers don't match what was stored, Gmail's
+        own message id say, is still theirs: its opt-out counts)."""
+        refs = [msg.in_reply_to or ""] + ((msg.headers or {}).get("references") or "").split()
+        for ref in refs:
+            if ref.strip() and await self.state.find_outbox_by_message_id(ref.strip()):
+                return True
+        return await self.state.sent_cold_email_to(msg.from_email or "")
 
     async def _retry_stop(self, dedup_key: str, sender: str, preview: str,
                           error: Exception) -> bool:
@@ -1045,11 +1086,12 @@ class Handler:
         newsletter with its own "dezabonare" link, a stranger) is left
         alone. Either way the message is marked processed: it never holds
         sending."""
-        prospect, how = None, ""
+        prospect, how, campaign_id = None, "", ""
         for ref in [reply_meta.get("in_reply_to", "")] + (reply_meta.get("references") or "").split():
             item = await self.state.find_outbox_by_message_id(ref.strip())
             if item:
                 prospect, how = await self.state.get_prospect(item["prospect_id"]), "thread"
+                campaign_id = item.get("campaign_id") or ""
                 break
         if prospect is None:
             domain = lead_email.rpartition("@")[2].lower()
@@ -1081,8 +1123,8 @@ class Handler:
                                                  status="needs_human")
         else:
             await self.state.add_conversation(Conversation(
-                id="", prospect_id=prospect.id, channel="email", thread=[message],
-                intent="escalate", status="needs_human"))
+                id="", prospect_id=prospect.id, campaign_id=campaign_id, channel="email",
+                thread=[message], intent="escalate", status="needs_human"))
         await self.state.log_action(
             action_type="reply_from_someone_else", agent="handler",
             details={"from": lead_email, "prospect_email": prospect.email, "matched": how,
@@ -1101,6 +1143,7 @@ class Handler:
             await self.state.update_prospect_email(
                 prospect.id, prospect.email, "invalid"
             )
+            await self.state.end_memberships(prospect.email, "bounced", "the email bounced")
             cancelled = await self.state.cancel_pending_outbox_for_prospect(
                 prospect.id, reason="bounced"
             )

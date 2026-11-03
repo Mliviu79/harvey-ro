@@ -3388,6 +3388,67 @@ class Reader:
                         "domain": card.get("domain", "")})
         return out
 
+    def audience_rows(self, f=None, emails=None) -> list[dict]:
+        """The email contacts a campaign could take (campaigns.add_members
+        decides): those the Contacts filter ``f`` keeps (its kind forced to
+        email), or the addresses ``emails`` (ticked rows, typed ones). Each
+        with its status, do-not-contact flag, and the one link it is read
+        through: a live firm, through a person first, then the surest, then
+        the oldest (trust None when it reaches no live firm). Its company,
+        person and evidence come with it."""
+        ids: list[int] = []
+        if emails is not None:
+            for e in dict.fromkeys((e or "").strip().lower() for e in emails):
+                cid = self.one("SELECT id FROM contact WHERE kind = ? AND value = ?", (EMAIL, e))
+                if cid is not None:
+                    ids.append(cid)
+        elif f is not None:
+            from dataclasses import replace
+
+            f = replace(f, kind="email")
+            if not f.nothing:
+                ids = self._contact_ids(f, self.firm_set(f), self.predicates(f))
+        rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", ids)}
+        ids = [c for c in ids if c in rows and rows[c][11] == EMAIL]
+        links = list(self._by_ids("overlay.read.links_of_contacts", ids))
+        lives = self.live_of([l[1] for l in links])
+        best: dict[int, tuple] = {}
+        for contact, firm, trust, person, location, first in links:
+            if firm not in lives:
+                continue
+            key = (person == 0, trust, first or 0, firm)
+            if contact not in best or key < best[contact][0]:
+                best[contact] = (key, firm, trust, person)
+        cards = {r["id"]: r for r in self.company_rows(
+            list(dict.fromkeys(lives[b[1]] for b in best.values())))}
+        persons = {r[0]: r for r in self._by_ids("overlay.read.persons",
+                                                 [b[3] for b in best.values() if b[3]])}
+        evidence = {}
+        for firm, contact, src, trust, url, first, person, location in self._by_ids(
+                "overlay.read.evidence", [[b[1], c] for c, b in best.items()], 500):
+            evidence.setdefault((firm, contact), (src, url))
+        out = []
+        for c in ids:
+            r = rows[c]
+            row = {"contact_id": c, "email": r[2], "status": STATUS_NAMES.get(r[5], "") or "",
+                   "do_not_contact": bool(r[6]), "trust": None, "firm": None,
+                   "company_id": None, "person_id": 0, "person": "", "role": "",
+                   "person_source": "", "source": "", "evidence_url": "", "company": "",
+                   "industry": "", "domain": ""}
+            if c in best:
+                _, firm, trust, person = best[c]
+                card = cards.get(str(lives[firm]), {})
+                src, url = evidence.get((firm, c), ("", ""))
+                p = persons.get(person)
+                row.update(trust=TRUST_NAMES.get(trust, ""), firm=firm,
+                           company_id=card.get("id"), person_id=person or 0,
+                           person=p[2] if p else "", role=(p[4] or "") if p else "",
+                           person_source=(p[5] or "") if p else "", source=src or "",
+                           evidence_url=url or "", company=card.get("name", ""),
+                           industry=card.get("industry", ""), domain=card.get("domain", ""))
+            out.append(row)
+        return out
+
     # ── The Writer's brief ──
 
     def company_brief(self, cid, codes) -> tuple[str, str, list[dict]] | None:

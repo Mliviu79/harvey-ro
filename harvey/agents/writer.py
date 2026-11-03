@@ -21,7 +21,6 @@ from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager, brief_note, poorly_scored
-from harvey.sending_mode import sync_sending_mode
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
@@ -54,6 +53,9 @@ class Writer:
         self.state = state
         self.config = config
         self.env = env
+        # The campaign being written for (its offer: campaigns._offer), set
+        # by write_for_members and write_templates; {} for the Writer's own.
+        self.offer: dict = {}
 
     @property
     def is_native(self) -> bool:
@@ -163,6 +165,53 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
+    # ── Campaigns made by the user (harvey/campaigns.py) ──
+
+    def _use_campaign(self, campaign) -> None:
+        """Write for this campaign: its offer, and the brain of its AI
+        profile (the caller puts its own brain back afterwards)."""
+        try:
+            self.offer = json.loads(getattr(campaign, "offer_json", "") or "{}")
+        except (TypeError, ValueError):
+            self.offer = {}
+        self.brain = self.brain.for_profile(getattr(campaign, "profile_id", "") or "")
+
+    def _offer_block(self) -> str:
+        """The campaign's offer as prompt text ("" for none)."""
+        labels = (("offer", "What this campaign offers"), ("goal", "The goal of the emails"),
+                  ("booking_link", "Booking link (only if the goal is a meeting)"),
+                  ("language", "Language to write in"))
+        offer = getattr(self, "offer", None) or {}
+        lines = [f"- {label}: {offer[k]}" for k, label in labels if offer.get(k)]
+        if not lines:
+            return ""
+        return "\n\nTHIS CAMPAIGN (set by the person running Harvey):\n" + "\n".join(lines)
+
+    async def write_for_members(self, campaign, prospects: list) -> int:
+        """A grounded first email for each of these members (all of them can
+        be sent to: the campaign cycle checked), drafted for review. Returns
+        how many were drafted; one that fails falls back to the template."""
+        self.skills = self.brain.load_skills_for_agent("writer")
+        brain = self.brain
+        self._use_campaign(campaign)
+        try:
+            return await self._personalize_first_emails(campaign.id, prospects)
+        finally:
+            self.offer, self.brain = {}, brain
+
+    async def write_templates(self, campaign, prospects: list) -> list[EmailStep]:
+        """The campaign's step templates, written from its offer and a few
+        of its addresses (the wizard's "Generează secvența"): returned for
+        the user to edit, not saved here. [] when the model gave nothing
+        usable."""
+        self.skills = self.brain.load_skills_for_agent("writer")
+        brain = self.brain
+        self._use_campaign(campaign)
+        try:
+            return await self._write_sequence(prospects)
+        finally:
+            self.offer, self.brain = {}, brain
+
     async def _count_failed_attempt(self, batch_name: str, prospects: list):
         """Count one unusable sequence against each prospect in the batch.
 
@@ -195,7 +244,7 @@ class Writer:
                 f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list) -> int:
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
@@ -203,11 +252,9 @@ class Writer:
         (campaign, prospect, step 1) slot. If a draft fails, the slot stays
         empty and the sender falls back to the campaign template.
         """
-        await sync_sending_mode(self.config, self.state)
-        require_approval = getattr(
-            self.config.channels.email, "require_approval", True
-        )
-        status = "pending_review" if require_approval else "approved"
+        # Always for review: on autopilot the drain that sends it approves
+        # it then (Sender._promote), never the act of drafting.
+        status = "pending_review"
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
@@ -243,7 +290,6 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
-                approved_by="" if require_approval else "autopilot",
             )
             if item_id:
                 drafted += 1
@@ -251,8 +297,9 @@ class Writer:
         if drafted:
             logger.info(
                 f"Writer: drafted {drafted} personalized first email(s) "
-                f"({'awaiting approval' if require_approval else 'approved'})."
+                "(awaiting approval)."
             )
+        return drafted
 
     async def _startup(self, company_id) -> list[str] | None:
         """Fact lines when the company is a startup (YC, another accelerator,
@@ -344,6 +391,7 @@ class Writer:
         if startup is not None:
             prompt += self._startup_playbook()
         prompt += await self._feedback_block([prospect.id])
+        prompt += self._offer_block()
 
         prompt += f"""
 
@@ -433,6 +481,7 @@ Pricing: {self.config.product.pricing}"""
         # Campaign notes only: this template goes to the whole batch, so a
         # note about one person ("met her at the expo") must never reach it.
         prompt += await self._feedback_block([])
+        prompt += self._offer_block()
 
         prompt += f"""
 

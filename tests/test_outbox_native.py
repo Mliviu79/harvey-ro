@@ -129,7 +129,7 @@ async def seed_campaign(state, prospect_ids):
             EmailStep(step=1, subject="hi {{first_name}}", body="Body for {{company}}. Question?", delay_days=0),
             EmailStep(step=2, subject="follow", body="Another angle {{first_name}}.", delay_days=3),
         ],
-        prospect_ids=prospect_ids, status="draft",
+        prospect_ids=prospect_ids, status="active",
     )
     campaign.id = await state.add_campaign(campaign)
     return campaign
@@ -218,7 +218,7 @@ async def test_drain_sends_approved_due_items(state):
     provider = FakeProvider()
     sender = make_sender(state, provider, require_approval=False)
 
-    await sender._run_native()  # stage as approved + drain in one pass
+    await sender._run_native()  # stage for review; autopilot approves what is due, and sends it
 
     sent = await state.get_outbox(status="sent")
     assert len(sent) == 1                     # step 1 due now; step 2 in 3 days
@@ -226,8 +226,10 @@ async def test_drain_sends_approved_due_items(state):
     assert provider.sent[0]["subject"] == "hi Jane"
     prospect = await state.get_prospect(pid)
     assert prospect.status == "contacted"
-    approved_left = await state.get_outbox(status="approved")
-    assert len(approved_left) == 1 and approved_left[0]["step"] == 2
+    # Step 2 isn't due: it waits for review until a drain may send it.
+    assert await state.get_outbox(status="approved") == []
+    waiting = await state.get_outbox(status="pending_review")
+    assert len(waiting) == 1 and waiting[0]["step"] == 2 and waiting[0]["approved_by"] == ""
 
 
 @pytest.mark.asyncio

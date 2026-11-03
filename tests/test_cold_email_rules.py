@@ -172,13 +172,17 @@ async def test_a_suppressed_address_is_never_sent_to_reply_or_not(state):
 
 
 @pytest.mark.asyncio
-async def test_staging_while_paused_is_unchanged_for_now(state):
+async def test_staging_while_paused_only_fills_the_review_queue(state):
     pid = await seed_prospect(state, email="office@exemplu.example.com")
     campaign = await seed_campaign(state, [pid])
     await state.set_setting("sending_paused", "paused manually")
-    await make_sender(state, FakeProvider(), require_approval=False)._run_native()
-    assert await state.get_outbox(limit=10) == []
-    assert [c.id for c in await state.get_campaigns_by_status("draft")] == [campaign.id]
+    provider = FakeProvider()
+    await make_sender(state, provider, require_approval=False)._run_native()
+    rows = await state.get_outbox(limit=10)
+    # Staged, even on autopilot, for review: nothing approved, nothing sent.
+    assert rows and {(r["status"], r["approved_by"]) for r in rows} == {("pending_review", "")}
+    assert provider.sent == []
+    assert [c.id for c in await state.get_campaigns_by_status("active")] == [campaign.id]
 
 
 # ── Which addresses are personal ──

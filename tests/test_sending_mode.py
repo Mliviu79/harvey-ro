@@ -196,8 +196,9 @@ def test_turning_it_off_is_one_click_and_holds_what_autopilot_queued(client, das
 
 @pytest.mark.asyncio
 async def test_each_autopilot_path_marks_what_it_queues(state, monkeypatch):
-    """Writer first emails, sender staging and handler replies: approved on
-    autopilot means approved_by 'autopilot'; with approval on, nothing."""
+    """Sender staging waits for review even on autopilot (the drain that
+    sends it approves it); a handler reply on autopilot is approved by
+    'autopilot'."""
     from tests.test_outbox_native import (Cfg, FakeProvider, InboundMessage, make_handler,
                                           make_sender, seed_campaign, seed_prospect)
     monkeypatch.setattr(Cfg.channels.email, "require_approval", False)
@@ -210,15 +211,18 @@ async def test_each_autopilot_path_marks_what_it_queues(state, monkeypatch):
                                        subject="Re: hi", body="What does it cost?")]
     await make_handler(state, provider)._run_native()
     rows = await state.get_outbox()
-    assert rows and {r["approved_by"] for r in rows} == {"autopilot"}
     assert {r["prospect_id"] for r in rows} == {pid, replier}
+    # (Staged for review; then cancelled: a colleague at the same domain replied.)
+    assert {r["approved_by"] for r in rows if r["prospect_id"] == pid} == {""}
+    assert {r["approved_by"] for r in rows if r["prospect_id"] == replier} == {"autopilot"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("require_approval,status,approved_by", [
-    (False, "approved", "autopilot"), (True, "pending_review", ""),
+    (False, "pending_review", ""), (True, "pending_review", ""),
 ])
-async def test_the_writers_first_emails_are_marked_too(state, require_approval, status, approved_by):
+async def test_the_writers_first_emails_wait_for_review_either_way(state, require_approval,
+                                                                   status, approved_by):
     from tests.test_writer_feedback import RecordingBrain, prospect, writer
     pid = await prospect(state, "Ana")
     w = writer(RecordingBrain({"subject": "hi", "body": "Hi Ana, who answers the phones?"}), state, "gmail")

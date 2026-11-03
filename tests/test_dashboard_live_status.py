@@ -34,6 +34,9 @@ def env(tmp_path, monkeypatch):
     # No mailbox connected: the user sends by hand. Tests that need Harvey
     # to be able to send set this back.
     monkeypatch.setattr(dash, "_harvey_can_send", lambda: False)
+    # No worker inside the dashboard: it would open (and so create again)
+    # the database a test deletes.
+    monkeypatch.setenv("HARVEY_DASHBOARD_WORKER", "off")
     async def _init():
         state = StateManager(db_path=str(db))
         await state.init_db()

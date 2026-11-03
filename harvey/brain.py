@@ -110,6 +110,12 @@ class Brain:
             from harvey.integrations.quota import QuotaClient
             self.quota = QuotaClient()
 
+    def for_profile(self, profile_id: str = "") -> "Brain":
+        """The brain that writes for a campaign's AI profile. One profile
+        exists today, so every id (and "", none) gets this brain. The
+        Writer asks by the campaign's profile; the Handler doesn't yet."""
+        return self
+
     @property
     def provider_label(self) -> str:
         return PROVIDER_LABELS[self.provider]

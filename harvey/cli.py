@@ -2855,6 +2855,150 @@ def cmd_suppress(args):
     asyncio.run(_run())
 
 
+def _counts_line(counts: dict) -> str:
+    """A snapshot's or preview's counts, for the terminal."""
+    personal = counts.get("personal") or {}
+    return (f"{counts.get('ready', 0)} ready, {counts.get('risky', 0)} catch-all, "
+            f"{counts.get('to_verify', 0)} to check (a verifier credit each); left out: "
+            f"{counts.get('left_out', 0)} invalid or guess, {counts.get('untrusted', 0)} "
+            f"untrusted, {counts.get('suppressed', 0)} do-not-contact, "
+            f"{counts.get('overlap', 0)} in another campaign or emailed lately, "
+            f"{counts.get('answered', 0)} answered, {counts.get('risky_held', 0)} catch-all "
+            f"held (send_to_risky off); personal: {sum(personal.values())}; "
+            f"~{counts.get('days_at_cap', 0)} day(s) at today's cap")
+
+
+def cmd_audiences(args):
+    """Saved Contacts filters: list, show (with its counts), save, archive."""
+    from harvey import campaigns
+    from harvey.config import load_config
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        action = args.audiences_action
+        try:
+            if action == "save":
+                query = args.query or _contacts_query(args)
+                aid = await state.campaigns_call(campaigns.save_audience, args.name, query)
+                print(f"\n  Saved audience {aid}: "
+                      f"{(await state.campaigns_call(campaigns.get_audience, aid))['query']}\n")
+            elif action == "show":
+                a = await state.campaigns_call(campaigns.get_audience, args.id, write=False)
+                if a is None:
+                    print("\n  No such audience.\n")
+                    sys.exit(1)
+                print(f"\n  {a['id']}  {a['name']}\n  filter: {a['query']}")
+                counts = await campaigns.preview(state, load_config(), query=a["query"])
+                print(f"  {_counts_line(counts)}\n")
+            elif action == "archive":
+                if not await state.campaigns_call(campaigns.update_audience, args.id,
+                                                  archived=True):
+                    print("\n  No such audience.\n")
+                    sys.exit(1)
+                print("\n  Archived.\n")
+            else:
+                rows = await state.campaigns_call(campaigns.audiences, args.all, write=False)
+                print(f"\n  {len(rows)} audience(s).")
+                for a in rows:
+                    print(f"    {a['id']:>4}  {a['name']:<30} {a['campaigns']} campaign(s)  "
+                          f"{a['query']}")
+                print()
+        except (campaigns.Refused, ValueError) as e:
+            print(f"\n  {e}\n")
+            sys.exit(1)
+
+    asyncio.run(_run())
+
+
+def _contacts_query(args) -> str:
+    """`harvey audiences save`'s filter flags as the Contacts page's query string."""
+    from urllib.parse import urlencode
+
+    keys = ("county", "locality", "website", "q", "require", "exclude", "status", "trust",
+            "source", "caen")
+    return urlencode({k: getattr(args, k) for k in keys if getattr(args, k, None)})
+
+
+def cmd_campaigns(args):
+    """Campaigns made by the user: list, show, new, start, pause, resume,
+    stop, members, add, remove."""
+    import json
+
+    from harvey import campaigns
+    from harvey.config import load_config
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        action = args.campaigns_action
+        config = load_config()
+        try:
+            if action == "new":
+                note = args.note or ""
+                if args.note_file:
+                    note = Path(args.note_file).read_text(encoding="utf-8")
+                sequence = None
+                if args.sequence_file:
+                    sequence = json.loads(Path(args.sequence_file).read_text(encoding="utf-8"))
+                cid = await state.campaigns_call(
+                    campaigns.create_campaign, provider=config.channels.email.provider,
+                    address=config.persona.email, name=args.name, audience_id=args.audience,
+                    query=args.query or "", rolling=args.rolling, sequence=sequence,
+                    li_note=note, review="always" if args.review_always else "inherit")
+                print(f"\n  Draft campaign {cid} made. Start it with harvey campaigns start "
+                      f"{cid}.\n")
+            elif action == "start":
+                counts = await campaigns.start(state, config, args.id)
+                print(f"\n  Started: {counts.get('added', 0)} member(s) taken.\n"
+                      f"  {_counts_line(counts)}\n")
+            elif action in ("pause", "resume", "stop", "archive"):
+                c = await state.campaigns_call(campaigns.set_status, args.id, action)
+                print(f"\n  {c['name']}: {c['status']}.\n")
+            elif action == "show":
+                c = next((x for x in await state.campaigns_call(campaigns.list_campaigns,
+                                                                 write=False)
+                          if x["id"] == args.id), None)
+                if c is None:
+                    print("\n  No such campaign.\n")
+                    sys.exit(1)
+                print(f"\n  {c['name']}  [{c['status']}, {c['origin']}]"
+                      + ("  rolling" if c["rolling"] else ""))
+                print(f"  filter: {await state.campaigns_call(campaigns.frozen_query, c)}")
+                print(f"  members: {c['members'] or '-'}  sent: {c['sent']}  "
+                      f"replies: {c['replies']}")
+                print(f"  steps: {len(c['sequence'])}  account: {c['account_id']}")
+                print(f"  legitimate interest: {c['li_note'] or '(none yet)'}\n")
+            elif action == "members":
+                rows = await state.campaigns_call(campaigns.members, args.id, args.status or "",
+                                                  500, write=False)
+                for m in rows:
+                    print(f"    {m['email']:<40} {m['status_name']:<12} step {m['last_step']}"
+                          + (f"  ({m['end_reason']})" if m["end_reason"] else ""))
+                print(f"\n  {len(rows)} member(s).\n")
+            elif action == "add":
+                counts = await campaigns.add_by_hand(state, config, args.id, args.emails)
+                print(f"\n  Added {counts['added']}. {_counts_line(counts)}\n")
+            elif action == "remove":
+                n = await campaigns.remove_by_hand(state, args.id, args.emails)
+                print(f"\n  Taken out: {n}.\n")
+            else:
+                rows = await state.campaigns_call(campaigns.list_campaigns, write=False)
+                print(f"\n  {len(rows)} campaign(s).")
+                for c in rows:
+                    print(f"    {c['id']}  {c['name'][:30]:<30} {c['status']:<9} "
+                          f"{c['origin']:<5} {c['member_total']:>5} member(s) {c['sent']:>5} "
+                          f"sent {c['replies']:>4} replies")
+                print()
+        except (campaigns.Refused, ValueError, OSError) as e:
+            print(f"\n  {e}\n")
+            sys.exit(1)
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.textio import utf8_stdio
     utf8_stdio()
@@ -3336,6 +3480,54 @@ def main():
     r.add_argument("id", type=int)
     r.add_argument("--note", default="", help="Why (required when they asked to stop)")
     sub.set_defaults(func=cmd_suppress, suppress_action="list", all=False, csv=False)
+
+    sub = subparsers.add_parser(
+        "audiences", help="Saved Contacts filters a campaign takes its members from")
+    asub = sub.add_subparsers(dest="audiences_action")
+    r = asub.add_parser("list", help="The saved audiences")
+    r.add_argument("--all", action="store_true", help="Archived ones too")
+    r = asub.add_parser("show", help="One audience, with what a campaign would take")
+    r.add_argument("id", type=int)
+    r = asub.add_parser("save", help="Save a filter: the Contacts page's flags, or --query")
+    r.add_argument("name")
+    r.add_argument("--query", default="", help="The Contacts page's query string")
+    for flag in ("county", "locality", "website", "q", "require", "exclude", "status", "trust",
+                 "source", "caen"):
+        r.add_argument(f"--{flag}", default="")
+    r = asub.add_parser("archive", help="Hide an audience (never deleted)")
+    r.add_argument("id", type=int)
+    sub.set_defaults(func=cmd_audiences, audiences_action="list", all=False)
+
+    sub = subparsers.add_parser(
+        "campaigns", help="Campaigns you make: list, show, new, start, pause, resume, stop, "
+                          "members, add, remove")
+    csub = sub.add_subparsers(dest="campaigns_action")
+    csub.add_parser("list", help="Every campaign")
+    for name, text in (("show", "One campaign"), ("start", "Start a draft (takes its audience)"),
+                       ("pause", "Pause"), ("resume", "Resume"),
+                       ("stop", "Stop: what waits to go out is cancelled"),
+                       ("archive", "Hide a finished campaign")):
+        csub.add_parser(name, help=text).add_argument("id")
+    r = csub.add_parser("new", help="A draft campaign (Gmail, SMTP or Microsoft only)")
+    r.add_argument("--name", required=True)
+    r.add_argument("--audience", type=int, default=None, help="A saved audience's id")
+    r.add_argument("--query", default="", help="Or a Contacts query string")
+    r.add_argument("--rolling", action="store_true", help="Take new matches as they appear")
+    r.add_argument("--note", default="", help="The legitimate-interest note (80+ characters)")
+    r.add_argument("--note-file", default="", help="Or a file holding it")
+    r.add_argument("--sequence-file", default="",
+                   help="A JSON list of {subject, body, delay_days}")
+    r.add_argument("--review-always", action="store_true",
+                   help="Every email waits for you, even on autopilot")
+    r = csub.add_parser("members", help="Its members")
+    r.add_argument("id")
+    r.add_argument("--status", default="")
+    for name, text in (("add", "Add addresses (through every rule)"),
+                       ("remove", "Take addresses out")):
+        r = csub.add_parser(name, help=text)
+        r.add_argument("id")
+        r.add_argument("emails", nargs="+")
+    sub.set_defaults(func=cmd_campaigns, campaigns_action="list")
 
     sub = subparsers.add_parser(
         "sending", help="Kill switch: pause/resume sending; accept-gap: let cold email go "

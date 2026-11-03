@@ -27,6 +27,13 @@ class Campaign(BaseModel):
     status: str = "draft"  # draft/active/paused/completed
     prospect_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
+    # 'user': made on the Campaigns page; 'auto': made by the Writer (and
+    # every campaign from before campaigns were made by hand).
+    origin: str = "auto"
+    account_id: int | None = None
+    profile_id: str = ""
+    offer_json: str = "{}"
+    review: str = "inherit"
 
     def sequence_json(self) -> str:
         return json.dumps([s.model_dump() for s in self.sequence])

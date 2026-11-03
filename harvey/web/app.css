@@ -1369,3 +1369,10 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .upgrade-stage.failed, .upgrade-stage.stopped { color: var(--bad); }
 .upgrade-stage.todo { color: var(--text-2); }
 #old-files-note { align-items: center; justify-content: space-between; flex-wrap: wrap; }
+
+/* Campaigns: what a campaign would take, counted (the wizard and Audiences). */
+.preview-counts { margin: var(--sp-2) 0; padding-left: 18px; columns: 2 220px; color: var(--text-2); }
+.preview-counts li { margin: 2px 0; break-inside: avoid; }
+#campaign-wizard .card, #campaign-detail .card { margin-bottom: var(--sp-4); }
+#campaign-wizard .card .card { margin: var(--sp-3) 0; }
+#campaigns-table + #campaigns-list .subhead:first-child { margin-top: var(--sp-5); }

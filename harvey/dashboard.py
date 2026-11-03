@@ -870,7 +870,7 @@ async def _overlay_companies(request: Request, limit, offset, sort: str, dir: st
             "sources": sources, "financials": has_fin, "paged_by": how, "ms": took}
 
 
-_CUI_QUERY = re.compile(r"\s*(?:RO\s*)?(\d{2,10})\s*", re.IGNORECASE)
+from harvey.contact_query import CUI_QUERY as _CUI_QUERY  # noqa: E402
 
 
 async def _company_search(state, q: str, limit: int, offset: int) -> tuple[int, list[dict]]:
@@ -1768,108 +1768,12 @@ CONTACT_PAGE_MAX = 200
 CONTACT_EXPORT_MAX = 500_000
 
 
-def _number_arg(raw):
-    """A bound typed in a filter box: a number, or None when empty."""
-    if raw is None or str(raw).strip() == "":
-        return None
-    return _range_bound(str(raw).strip())
-
-
-def _caen_arg(raw: str) -> tuple[str, ...]:
-    """CAEN codes from a filter box: 4-digit codes (also written 86.23 or
-    8623/3) and words, turned into the classes they name. ValueError when
-    words name no class."""
-    if not raw:
-        return ()
-    from harvey import caen
-
-    text = re.sub(r"\b(\d{2})\.(\d{2})\b", r"\1\2", raw)
-    text = re.sub(r"\b(\d{4})/\d+\b", r"\1", text)
-    codes, words = [], []
-    for token in re.split(r"[\s,;]+", text):
-        if re.fullmatch(r"\d{4}", token):
-            codes.append(token)
-        elif re.fullmatch(r"\d{3}", token):
-            # A CAEN group (47.1): every class in it.
-            group = sorted({code for code, _ in caen._classes() if code.startswith(token)})
-            if not group:
-                raise ValueError(f"No CAEN class is in group {token}")
-            codes += group
-        elif token:
-            words.append(token)
-    if words:
-        named = sorted(caen.codes_for(" ".join(words)))
-        if not named:
-            raise ValueError(f"No CAEN class matches \"{' '.join(words)}\"")
-        codes += named
-    return tuple(dict.fromkeys(codes))
-
-
-def _contact_arg(raw: str) -> str:
-    """has-contact filter: any, none, mobile or a contact kind."""
-    if raw and not re.fullmatch(r"[a-z_]{1,32}", raw):
-        raise ValueError("contact must be any, none, mobile or a contact kind")
-    return raw
-
-
-def _search_arg(raw: str) -> tuple[str, str, bool]:
-    """(CUI digits, full-text expression, nothing) from the Companies search
-    box. A number typed on its own ("10004070", "RO 10004070"; a bare
-    four-digit number stays a CAEN code) gives both: the CUI when a company
-    has it, else the words (the caller decides, _contact_filter). Only
-    single letters or common words: ``nothing`` (no company matches).
-    ValueError when only -words are typed (nothing to look for)."""
-    if not raw.strip():
-        return "", "", False
-    from harvey.state import search_terms
-
-    match, _ = search_terms(raw)
-    m = _CUI_QUERY.fullmatch(raw)
-    if m and (len(m.group(1)) != 4 or raw.strip().upper().startswith("RO")):
-        return m.group(1), match, False
-    if not match:
-        if all(t.startswith("-") for t in raw.split()):
-            raise ValueError("Type a word to look for: a word with a minus only leaves things out.")
-        return "", "", True
-    return "", match, False
-
-
-async def _contact_filter(state, args) -> tuple[object, bool]:
-    """The ContactFilter the query string asks for, and whether the
-    financials database must be attached. Raises ValueError (or ModuleOff
-    for a hidden signal) on a bad argument."""
-    from harvey import contacts
-
-    get = lambda k: (args.get(k) or "").strip()[:200]  # noqa: E731
-    f = contacts.ContactFilter(
-        kind=get("kind"), status=get("status"), trust=get("trust"),
-        has_person=get("person"), source=get("source"), county=get("county"),
-        locality=get("locality"), website=get("website"), q=get("q"),
-        caen=_caen_arg(get("caen")), contact=_contact_arg(get("contact")),
-        found_in=get("found_in"))
-    f.cui, f.search, f.nothing = _search_arg(get("search"))
-    return await _overlay_filter(state, f, args, get), False
-
-
-async def _overlay_filter(state, f, args, get):
-    """The rest of _contact_filter on the overlay: the words typed, the
-    cohort's signals and the figures' bounds, as the overlay reads them."""
-    f.words = get("search") if (f.search or f.cui) else ""
-    if f.cui and not await state.read("cui_set_size", f.cui):
-        # No company has that number: it is a word ("24").
-        f.cui = ""
-        f.nothing = not f.search
-    if f.cui:
-        f.words = ""
-    require, exclude = _codes(args.get("require") or ""), _codes(args.get("exclude") or "")
-    if require or exclude:
-        await _refuse_hidden_signals(state, [*require, *exclude])
-        f.signals = (tuple(require), tuple(exclude))
-    bounds = {k: _number_arg(args.get(k)) for k in
-              ("min_turnover", "max_turnover", "min_employees", "max_employees")}
-    if any(v is not None for v in bounds.values()):
-        f.bounds = {**bounds, "unknown": "include" if get("unknown") == "include" else "exclude"}
-    return f
+from harvey.contact_query import (  # noqa: E402  (the page's filters, shared)
+    caen_arg as _caen_arg, codes as _codes, contact_arg as _contact_arg,
+    filter_from_query as _contact_filter, number_arg as _number_arg,
+    range_bound as _range_bound, refuse_hidden_signals as _refuse_hidden_signals,
+    search_arg as _search_arg,
+)
 
 
 @asynccontextmanager
@@ -3043,7 +2947,21 @@ async def _sending_summary(config) -> dict:
 
 @app.get("/api/campaigns")
 async def get_campaigns():
+    """Every campaign (the newest 100), as before, plus each one's members
+    by status, emails sent, replies, origin, audience and note. Its
+    recipients are its members (and, for a campaign from before members,
+    its prospect list)."""
+    from harvey import campaigns
+
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
+    if rows:
+        state = await _campaign_state()
+        extra = {c["id"]: c for c in await state.campaigns_call(campaigns.list_campaigns,
+                                                                 write=False)}
+        member_ids = {}
+        for r in await query_db("SELECT campaign, prospect_id FROM campaign_member "
+                                "WHERE prospect_id != ''"):
+            member_ids.setdefault(r["campaign"], []).append(r["prospect_id"])
     harvey_sends = _harvey_can_send()
     send_as = "" if harvey_sends else _send_as()
     footer = _compliance_view()["footer"]
@@ -3058,6 +2976,11 @@ async def get_campaigns():
             row["prospect_ids"] = json.loads(row.get("prospect_ids_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["prospect_ids"] = []
+        row["prospect_ids"] = list(dict.fromkeys(row["prospect_ids"]
+                                                 + member_ids.get(row["id"], [])))
+        info = extra.get(row["id"], {})
+        for key in ("members", "member_total", "sent", "replies", "offer", "rolling"):
+            row[key] = info.get(key)
         # Who each draft goes to, so the UI can open it in the user's own mail client.
         ids = row["prospect_ids"]
         row["recipients"] = await query_db(
@@ -3277,6 +3200,336 @@ async def undo_suppression(entry_id: int, request: Request):
     await state.undo_suppression(entry_id, by="you", note=note)
     return {"success": True}
 
+
+# ── Audiences and campaigns made by the user (harvey/campaigns.py) ──
+
+def _campaign_config():
+    """The settings a campaign action reads (the provider, send_to_risky,
+    the do-not-contact list), or a refusal when they can't be read."""
+    config = _load_config_quietly()
+    if config is None:
+        raise ValueError("harvey.local.yaml can't be read: fix it first")
+    return config
+
+
+def _campaign_refusal(e) -> JSONResponse:
+    """A campaigns.Refused (or a bad filter) as the page reads it: 409 with
+    ``need`` when something must be done first (the acknowledgement, the
+    note, a native provider), else 400."""
+    need = getattr(e, "need", "")
+    body = {"success": False, "message": str(e)}
+    if need:
+        body["need"] = need
+    return JSONResponse(body, status_code=409 if need else 400)
+
+
+async def _campaign_state():
+    state = _state()
+    await state.init_db()
+    return state
+
+
+@app.get("/api/audiences")
+async def list_audiences(archived: bool = False):
+    """The saved audiences (a Contacts filter each), with how many
+    campaigns name each."""
+    from harvey import campaigns
+
+    state = await _campaign_state()
+    return {"audiences": await state.campaigns_call(campaigns.audiences, archived, write=False)}
+
+
+@app.post("/api/audiences")
+async def save_audience(request: Request):
+    """Save the Contacts page's current filter: {"name", "query"} (its query
+    string; kind is always email)."""
+    from harvey import campaigns
+    from harvey.contact_query import filter_from_query
+
+    body = await _json_body(request)
+    state = await _campaign_state()
+    query = str(body.get("query") or "")
+    try:
+        await filter_from_query(state, query)       # a filter the page can't read isn't saved
+        audience_id = await state.campaigns_call(campaigns.save_audience,
+                                                 str(body.get("name") or ""), query)
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+    except Exception as e:
+        return _campaign_refusal(ValueError(str(e)))
+    return {"success": True, "id": audience_id,
+            "audience": await state.campaigns_call(campaigns.get_audience, audience_id,
+                                                   write=False)}
+
+
+@app.patch("/api/audiences/{audience_id}")
+async def edit_audience(audience_id: int, request: Request):
+    """Rename ({"name"}) or archive ({"archived": true}) an audience."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    state = await _campaign_state()
+    try:
+        changed = await state.campaigns_call(
+            campaigns.update_audience, audience_id, name=body.get("name"),
+            archived=body.get("archived") if isinstance(body.get("archived"), bool) else None)
+    except campaigns.Refused as e:
+        return _campaign_refusal(e)
+    if not changed:
+        return _refuse("no such audience, or nothing to change", 404)
+    return {"success": True}
+
+
+async def _preview_counts(state, query: str = "", emails=None, campaign_id: str = ""):
+    from harvey import campaigns
+
+    return await campaigns.preview(state, _campaign_config(), query=query, emails=emails,
+                                   campaign_id=campaign_id)
+
+
+@app.get("/api/audiences/{audience_id}/preview")
+async def preview_audience(audience_id: int):
+    """What a campaign would take from this audience, counted: ready,
+    catch-all, to check (a verifier credit each), left out (invalid or a
+    guess, untrusted, do-not-contact, in another campaign, answered),
+    personal addresses by reason, firms, days at today's cap."""
+    from harvey import campaigns
+
+    state = await _campaign_state()
+    audience = await state.campaigns_call(campaigns.get_audience, audience_id, write=False)
+    if audience is None:
+        return _refuse("no such audience", 404)
+    try:
+        return {"audience": audience, "counts": await _preview_counts(state, audience["query"])}
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+
+
+@app.post("/api/audiences/preview")
+async def preview_query(request: Request):
+    """The same counts for a filter not saved yet: {"query"} (the Contacts
+    page's current filter)."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    state = await _campaign_state()
+    try:
+        return {"counts": await _preview_counts(state, str(body.get("query") or ""))}
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+
+
+@app.get("/api/campaigns/setup")
+async def campaign_setup():
+    """What the new-campaign wizard needs: whether new campaigns can be made
+    (a native provider) and why not, the sending accounts, the saved
+    audiences, the acknowledgement's state, the note's template and
+    minimum, and the product as the settings describe it (the offer's
+    default)."""
+    from harvey import campaigns
+    from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+
+    config = _load_config_quietly()
+    state = await _campaign_state()
+    provider = (getattr(getattr(getattr(config, "channels", None), "email", None),
+                        "provider", "") or "").lower()
+    if config is not None:
+        await state.sync_sending_account(config)
+    product = getattr(config, "product", None)
+    return {
+        "native": provider in NATIVE_PROVIDERS, "provider": provider,
+        "refusal": "" if provider in NATIVE_PROVIDERS else campaigns.NATIVE_ONLY,
+        "accounts": await state.campaigns_call(campaigns.accounts, write=False),
+        "audiences": await state.campaigns_call(campaigns.audiences, write=False),
+        "acknowledged": await state.acknowledged(),
+        "li_note_min": campaigns.LI_NOTE_MIN,
+        "li_note_template": campaigns.li_note_template(getattr(product, "name", "") or ""),
+        "offer": {"offer": getattr(product, "description", "") or ""},
+        "max_daily_sends": getattr(getattr(getattr(config, "channels", None), "email", None),
+                                   "max_daily_sends", 0) or 0,
+    }
+
+
+@app.post("/api/campaigns")
+async def create_campaign(request: Request):
+    """A new draft campaign: {"name", "audience_id" or "query", "rolling",
+    "offer": {offer, goal, booking_link}, "sequence": [{subject, body,
+    delay_days}], "li_note", "review": "inherit" | "always"}. Refused
+    (409, need native_provider) on Instantly."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    try:
+        config = _campaign_config()
+        state = await _campaign_state()
+        address = getattr(getattr(config, "persona", None), "email", "") or ""
+        campaign_id = await state.campaigns_call(
+            campaigns.create_campaign, provider=config.channels.email.provider,
+            address=address, name=str(body.get("name") or ""),
+            audience_id=body.get("audience_id"), query=str(body.get("query") or ""),
+            rolling=bool(body.get("rolling")), offer=body.get("offer"),
+            sequence=body.get("sequence") or None, li_note=str(body.get("li_note") or ""),
+            review=str(body.get("review") or "inherit"))
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+    return {"success": True, "id": campaign_id,
+            "campaign": await state.campaign_record(campaign_id)}
+
+
+@app.get("/api/campaigns/{campaign_id}")
+async def campaign_detail(campaign_id: str, status: str = "", limit: int = 200,
+                          offset: int = 0):
+    """One campaign: its record, members by status, a page of members
+    (``status`` filters), its note and frozen filter."""
+    from harvey import campaigns
+
+    state = await _campaign_state()
+    c = next((x for x in await state.campaigns_call(campaigns.list_campaigns, write=False)
+              if x["id"] == campaign_id), None)
+    if c is None:
+        return _refuse("no such campaign", 404)
+    try:
+        rows = await state.campaigns_call(campaigns.members, campaign_id, status,
+                                          max(1, min(int(limit), 500)), max(0, int(offset)),
+                                          write=False)
+    except campaigns.Refused as e:
+        return _campaign_refusal(e)
+    c["query"] = await state.campaigns_call(campaigns.frozen_query, c, write=False)
+    return {"campaign": c, "members": rows}
+
+
+@app.patch("/api/campaigns/{campaign_id}")
+async def edit_campaign(campaign_id: str, request: Request):
+    """Edit a campaign (campaigns.update_campaign)."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    allowed = ("name", "offer", "sequence", "li_note", "review", "rolling", "audience_id", "query")
+    state = await _campaign_state()
+    try:
+        c = await state.campaigns_call(campaigns.update_campaign, campaign_id,
+                                       **{k: body[k] for k in allowed if k in body})
+    except campaigns.Refused as e:
+        return _campaign_refusal(e)
+    return {"success": True, "campaign": c}
+
+
+@app.post("/api/campaigns/{campaign_id}/templates")
+async def generate_templates(campaign_id: str):
+    """"Generează secvența": the model writes the campaign's steps from its
+    offer and a few of its addresses; returned for editing, saved with PUT
+    (or PATCH sequence)."""
+    from harvey import campaigns
+    from harvey.agents.audience import Audience
+    from harvey.models.campaign import Campaign
+
+    state = await _campaign_state()
+    c = await state.campaign_record(campaign_id)
+    if c is None:
+        return _refuse("no such campaign", 404)
+    try:
+        config = _campaign_config()
+        query = await state.campaigns_call(campaigns.frozen_query, c, write=False)
+        rows = [r for r in await campaigns.candidate_rows(state, query=query)
+                if r["trust"] in ("confirmed", "likely")][:5] if query else []
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+    sample = [Audience._prospect(r, r["status"]) for r in rows]
+    model = Campaign(id=campaign_id, name=c["name"], profile_id=c["profile_id"] or "",
+                     offer_json=json.dumps(c["offer"], ensure_ascii=False))
+    steps = await _campaign_writer(state, config).write_templates(model, sample)
+    if not steps:
+        return _refuse("The model gave no usable sequence; try again or write it yourself.", 502)
+    return {"success": True, "sequence": [s.model_dump() for s in steps]}
+
+
+@app.put("/api/campaigns/{campaign_id}/templates")
+async def save_templates(campaign_id: str, request: Request):
+    """Save the edited steps: {"sequence": [...]}."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    state = await _campaign_state()
+    try:
+        c = await state.campaigns_call(campaigns.update_campaign, campaign_id,
+                                       sequence=body.get("sequence"))
+    except campaigns.Refused as e:
+        return _campaign_refusal(e)
+    return {"success": True, "campaign": c}
+
+
+def _campaign_writer(state, config):
+    """The Writer that generates a campaign's templates (tests replace it)."""
+    from harvey.agents.writer import Writer
+    from harvey.brain import Brain
+
+    return Writer(Brain(state, config.brain), state, config)
+
+
+@app.get("/api/campaigns/{campaign_id}/members")
+async def campaign_members(campaign_id: str, status: str = "", limit: int = 200,
+                           offset: int = 0):
+    from harvey import campaigns
+
+    state = await _campaign_state()
+    try:
+        return {"members": await state.campaigns_call(
+            campaigns.members, campaign_id, status, max(1, min(int(limit), 500)),
+            max(0, int(offset)), write=False)}
+    except campaigns.Refused as e:
+        return _campaign_refusal(e)
+
+
+@app.post("/api/campaigns/{campaign_id}/members")
+async def add_campaign_members(campaign_id: str, request: Request):
+    """"Adaugă în campanie…": {"emails": [...]} (the ticked Contacts rows),
+    each through every rule; the counts say what was taken and why not."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    emails = body.get("emails")
+    if not isinstance(emails, list) or not emails or len(emails) > 5000 \
+            or any(not isinstance(e, str) for e in emails):
+        return _refuse('expected {"emails": [...]} (at most 5000)', 400)
+    state = await _campaign_state()
+    try:
+        counts = await campaigns.add_by_hand(state, _campaign_config(), campaign_id, emails)
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+    return {"success": True, "counts": counts}
+
+
+@app.delete("/api/campaigns/{campaign_id}/members")
+async def remove_campaign_members(campaign_id: str, request: Request):
+    """"Scoate din campanie": {"emails": [...]}."""
+    from harvey import campaigns
+
+    body = await _json_body(request)
+    emails = body.get("emails")
+    if not isinstance(emails, list) or not emails or any(not isinstance(e, str) for e in emails):
+        return _refuse('expected {"emails": [...]}', 400)
+    state = await _campaign_state()
+    return {"success": True, "removed": await campaigns.remove_by_hand(state, campaign_id, emails)}
+
+
+@app.post("/api/campaigns/{campaign_id}/{action}")
+async def campaign_action(campaign_id: str, action: str):
+    """start (the note, the acknowledgement, a sequence first; then the
+    audience is frozen and taken), pause, resume, stop, archive."""
+    from harvey import campaigns
+
+    if action not in ("start", "pause", "resume", "stop", "archive"):
+        return _refuse("unknown action", 404)
+    state = await _campaign_state()
+    try:
+        if action == "start":
+            counts = await campaigns.start(state, _campaign_config(), campaign_id)
+            return {"success": True, "counts": counts,
+                    "campaign": await state.campaign_record(campaign_id)}
+        c = await state.campaigns_call(campaigns.set_status, campaign_id, action)
+    except (campaigns.Refused, ValueError) as e:
+        return _campaign_refusal(e)
+    return {"success": True, "campaign": c}
 
 @app.get("/api/conversations")
 async def get_conversations():
@@ -5056,16 +5309,6 @@ async def _cohort_companies(require: list[str], exclude: list[str],
                                        offset=offset, limit=limit)
 
 
-async def _refuse_hidden_signals(state, codes) -> None:
-    """A signal of a module that is off can't be filtered on: it is hidden,
-    and its data stops at the day the module went off."""
-    hidden = {r["code"]: r for r in await state.get_signal_codes() if not r.get("available", 1)}
-    for code in codes:
-        if code in hidden:
-            from harvey.modules.switches import ModuleOff
-            raise ModuleOff(hidden[code].get("module") or "", f"The signal {code}")
-
-
 COHORT_VERDICTS = ("match", "possible", "no_match")
 
 
@@ -5087,32 +5330,7 @@ def _verdicts(raw) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _codes(raw) -> list[str]:
-    """Accept lists or CSV strings, with bounded SQL parameter counts."""
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        raw = raw.split(",")
-    if not isinstance(raw, list) or any(not isinstance(c, str) for c in raw):
-        raise ValueError("signals must be a list of strings or comma-separated string")
-    codes = list(dict.fromkeys(c.strip() for c in raw if c.strip()))
-    if len(codes) > 200 or any(len(c) > 128 for c in codes):
-        raise ValueError("too many or oversized signal codes")
-    return codes
-
-
 COHORT_MAX_RANGES = 20
-
-
-def _range_bound(raw):
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
-        raise ValueError("range bounds must be numbers")
-    value = float(raw)
-    if value != value or abs(value) > 1e12:
-        raise ValueError("range bound is out of bounds")
-    return value
 
 
 def _ranges(raw) -> list[dict]:

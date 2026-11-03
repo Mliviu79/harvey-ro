@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 26).
+"""The overlay's tables (harvey.db schema 27).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -19,12 +19,13 @@ earlier release made, takes the steps it lacks in one transaction.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 26
+LATEST = 27
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -622,9 +623,140 @@ def _to_26(con: sqlite3.Connection) -> None:
         ON CONFLICT DO NOTHING""")
 
 
+# ── Schema 27: sending accounts, audiences, campaigns made by the user ──
+
+SCHEMA_27 = """
+-- The mailbox a campaign sends from, and the AI profile that writes for it
+-- (one account per profile). Row 1 mirrors today's settings
+-- (channels.email.provider, persona.email): caps, warmup, persona and the
+-- reply reader still read those (harvey/campaigns.py: sync_account).
+CREATE TABLE sending_account (
+  id INTEGER PRIMARY KEY, label TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL DEFAULT '', profile_id TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX sending_account_profile ON sending_account(profile_id) WHERE profile_id != '';
+-- A saved Contacts filter: the page's query string, read by the same code
+-- as /api/contacts (contacts.filter_from_query).
+CREATE TABLE audience (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, filter_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE campaigns ADD COLUMN audience_id INTEGER;
+ALTER TABLE campaigns ADD COLUMN audience_query TEXT DEFAULT '';
+ALTER TABLE campaigns ADD COLUMN rolling INTEGER DEFAULT 0;
+ALTER TABLE campaigns ADD COLUMN rolled_at INTEGER;
+ALTER TABLE campaigns ADD COLUMN account_id INTEGER;
+ALTER TABLE campaigns ADD COLUMN profile_id TEXT DEFAULT '';
+ALTER TABLE campaigns ADD COLUMN offer_json TEXT DEFAULT '{}';
+ALTER TABLE campaigns ADD COLUMN li_note TEXT DEFAULT '';
+ALTER TABLE campaigns ADD COLUMN review TEXT DEFAULT 'inherit';
+ALTER TABLE campaigns ADD COLUMN origin TEXT DEFAULT 'auto';
+ALTER TABLE campaigns ADD COLUMN started_at INTEGER;
+ALTER TABLE campaigns ADD COLUMN ended_at INTEGER;
+ALTER TABLE campaigns ADD COLUMN updated_at INTEGER;
+-- Who a campaign writes to and how far each got: keyed on the address (a
+-- contact found again has a new id; the member and its history stay).
+-- firm is the record picked when added, read through firm.live.
+CREATE TABLE campaign_member (
+  campaign TEXT NOT NULL, email TEXT NOT NULL, contact INTEGER, firm INTEGER,
+  person INTEGER NOT NULL DEFAULT 0, prospect_id TEXT NOT NULL DEFAULT '',
+  status INTEGER NOT NULL, personal INTEGER NOT NULL DEFAULT 0,
+  added_by INTEGER NOT NULL, added_at INTEGER NOT NULL,
+  last_step INTEGER NOT NULL DEFAULT 0, last_sent_at INTEGER,
+  ended_at INTEGER, end_reason TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (campaign, email)
+) WITHOUT ROWID;
+CREATE INDEX campaign_member_status ON campaign_member(campaign, status);
+CREATE INDEX campaign_member_email ON campaign_member(email, status);
+CREATE INDEX campaign_member_prospect ON campaign_member(prospect_id);
+ALTER TABLE outbox ADD COLUMN account_id INTEGER;
+ALTER TABLE conversations ADD COLUMN account_id INTEGER;
+"""
+
+# campaign_member.status
+MEMBER_STATUS = {"waiting": 0, "ready": 1, "staged": 2, "in_sequence": 3, "done": 4,
+                 "replied": 5, "stopped": 6, "suppressed": 7, "bounced": 8, "skipped": 9,
+                 "removed": 10}
+# campaign_member.added_by
+MEMBER_ADDED_BY = {"snapshot": 1, "rolling": 2, "by_hand": 3, "migrated": 4, "writer": 5}
+
+
+def _to_27(con: sqlite3.Connection) -> None:
+    """Schema 27: sending accounts (row 1, today's mailbox, filled from the
+    settings when Harvey next reads them), audiences, the campaigns'
+    new columns and their members. Every campaign on file was made by the
+    Writer ('auto'): its prospects become members, as far as each got;
+    nothing is staged or sent by this."""
+    _script(con, SCHEMA_27)
+    con.execute("INSERT INTO sending_account (id, label, created_at) "
+                "VALUES (1, 'settings', CAST(strftime('%s', 'now') AS INTEGER))")
+    con.execute("UPDATE campaigns SET account_id = 1, origin = 'auto', "
+                "updated_at = CAST(strftime('%s', 'now') AS INTEGER)")
+    con.execute("UPDATE outbox SET account_id = 1")
+    for campaign, ids in con.execute("SELECT id, prospect_ids_json FROM campaigns").fetchall():
+        try:
+            prospect_ids = [str(p) for p in json.loads(ids or "[]")]
+        except (ValueError, TypeError):
+            prospect_ids = []
+        members_from_prospects(con, campaign, prospect_ids, MEMBER_ADDED_BY["migrated"])
+
+
+def members_from_prospects(con: sqlite3.Connection, campaign: str, prospect_ids,
+                           added_by: int) -> int:
+    """Members for a campaign's prospect cards (the Writer's campaigns, and
+    the ones on file when schema 27 came): each where its card and the
+    campaign's outbox say it got. Returns how many were added."""
+    m = MEMBER_STATUS
+    added = 0
+    row = con.execute("SELECT sequence_json FROM campaigns WHERE id = ?", (campaign,)).fetchone()
+    try:
+        last = max([int(s.get("step") or 0) for s in json.loads((row and row[0]) or "[]")
+                    if isinstance(s, dict)] or [0])
+    except (ValueError, TypeError):
+        last = 0
+    for pid in dict.fromkeys(prospect_ids):
+        row = con.execute("SELECT email, status, email_status, company_id FROM prospects "
+                          "WHERE id = ?", (pid,)).fetchone()
+        if row is None or "@" not in (row[0] or ""):
+            continue
+        email, pstatus, estatus, firm = (row[0] or "").strip().lower(), row[1] or "new", \
+            row[2] or "", row[3]
+        sent = con.execute("SELECT MAX(step), MAX(sent_at) FROM outbox WHERE campaign_id = ? "
+                           "AND prospect_id = ? AND kind = 'sequence' AND status = 'sent'",
+                           (campaign, pid)).fetchone()
+        queued = con.execute("SELECT 1 FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
+                             "AND kind = 'sequence' AND status IN "
+                             "('pending_review', 'approved', 'sending') LIMIT 1",
+                             (campaign, pid)).fetchone()
+        if pstatus == "opted_out":
+            status = m["suppressed"]
+        elif pstatus in ("replied", "meeting", "closed", "lost"):
+            status = m["replied"]
+        elif sent and sent[0] and last and int(sent[0]) >= last and not queued:
+            status = m["done"]          # every step went out already
+        elif (sent and sent[0]) or pstatus == "contacted":
+            status = m["in_sequence"]
+        elif queued:
+            status = m["staged"]
+        elif estatus in ("verified", "risky"):
+            status = m["ready"]
+        elif estatus in ("", "unchecked"):
+            status = m["waiting"]
+        else:
+            status = m["skipped"]
+        cur = con.execute(
+            "INSERT OR IGNORE INTO campaign_member (campaign, email, firm, prospect_id, status, "
+            "added_by, added_at, last_step) VALUES (?, ?, ?, ?, ?, ?, "
+            "CAST(strftime('%s', 'now') AS INTEGER), ?)",
+            (campaign, email, firm, pid, status, added_by, int(sent[0] or 0) if sent else 0))
+        added += cur.rowcount
+    return added
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26),)
+STEPS = ((26, _to_26), (27, _to_27))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

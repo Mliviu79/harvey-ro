@@ -1,10 +1,12 @@
 """Harvey's main heartbeat loop. Always Be Closing.
 
 The heartbeat is the Email module's: it reads replies, writes, and sends.
-Finding companies, reading their sites and loading public data are jobs
-the worker runs (harvey/modules/worker.py); when there is nobody left to
-write to, the heartbeat queues a contact search as one. With the Email
-module off it does nothing at all.
+With a native mail provider each cycle reads replies, drains the outbox,
+then works through the campaigns the user made (agents/campaigner.py);
+Instantly keeps its one-action-per-cycle flow. Finding companies, reading
+their sites and loading public data are jobs the worker runs
+(harvey/modules/worker.py). With the Email module off it does nothing at
+all.
 """
 
 import asyncio
@@ -165,7 +167,8 @@ async def decide_next_action(
     # Only prospects the Writer can draft for trigger writing: one with a
     # guessed email stays 'new' for good, and counting it starved the cycle.
     new_prospects, writable = _new_counts(summary)
-    draft_campaigns = summary.get("draft_campaigns", 0) or 0
+    # The Writer's drafts: a campaign the user made is never deployed here.
+    draft_campaigns = summary.get("writer_drafts", summary.get("draft_campaigns", 0)) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 
     # Held Instantly drafts can't deploy; choosing send_campaign for them
@@ -300,12 +303,14 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
     from harvey.agents.audience import Audience
+    from harvey.agents.campaigner import CampaignCycle
 
     audience = Audience(state, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
     analyst = Analyst(state)
+    campaigner = CampaignCycle(state, config, env, writer, sender)
 
     interval = config.usage.heartbeat_interval_minutes * 60
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
@@ -401,6 +406,14 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                             "in recipients' own time zones.")
                 summary = {}
                 action = "quiet_hours_send"
+            elif sender.is_native:
+                # Native providers: read replies, drain the outbox, then the
+                # campaigns the user made (agents/campaigner.py). Nothing is
+                # chosen: each step is bounded and runs every cycle, so an
+                # open conversation never starves writing, and a pause never
+                # starves staging.
+                summary = {}
+                action = "campaign_cycle"
             else:
                 # The email contacts the finder found, as prospects to write
                 # to (the finder itself never depends on email).
@@ -467,6 +480,15 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 else:
                     await record_send_phase(state, send_hold_reason([], "", ""))
                     await _run_agents([(name, run()) for name, run in send_tasks])
+
+            # Then (native providers): roll, verify, write and stage each active
+            # campaign. Staging only fills the review queue, so it runs
+            # whether or not this cycle could send. The analyst when nothing
+            # was done.
+            if action == "campaign_cycle":
+                done = await _run_agents([("campaigns", campaigner.run())])
+                if done.get("campaigns") is not True:
+                    await _run_agents([("analyze", analyst.run())])
 
             # 6. Log the action (best-effort; never kills the loop)
             try:

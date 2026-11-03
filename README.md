@@ -19,13 +19,12 @@ $ harvey run
 ============================================================
 Harvey is online. Always Be Closing.
 ============================================================
-Checking pipeline state...
-Decision: handle_replies (2 new replies)
+Handler: processed 2 inbound message(s).
   handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
   handler   → Priya Nair, Highline Roofing         objection, answer drafted
-Decision: write_campaign (3 new prospects with no drafts)
-  writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
-  outbox    → 5 emails waiting for your approval
+Campaigns: 'Phoenix HVAC' took 3 new address(es).
+  writer    → 3 first emails: Phoenix HVAC hiring a dispatcher
+  outbox    → 6 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
 ```
 
@@ -93,23 +92,23 @@ Harvey runs locally with your own login. Check the terms and usage limits of the
 
 ## What Harvey actually does
 
-Harvey runs a heartbeat: wake up, check the budget, decide what most needs doing, do it, log it, sleep. Every 15 minutes by default.
+Harvey runs a heartbeat: wake up, check the budget, read replies, send what's due, work the campaigns, log it, sleep. Every 15 minutes by default.
 
 ```
                  ┌──────────────────────────────────────┐
                  ↓                                      │
-   Wake  →  Quiet hours?  →  Budget OK?  →  Decide  →  Act  →  Log  →  Sleep
+   Wake  →  Quiet hours?  →  Budget OK?  →  Read  →  Send  →  Campaigns  →  Log  →  Sleep
                  │               │
               (sleep)         (sleep)
 ```
 
-It decides deterministically, not by asking a model what to do — that would burn a call on something derivable from four counts:
+With Gmail, SMTP or Microsoft 365 nothing is chosen: every cycle does the same bounded steps, in order, so an open conversation or paused sending never stops writing:
 
 ```
-handle replies  >  send campaigns  >  write campaigns  >  prospect  >  idle (analyze)
+read replies  →  drain the Outbox  →  each active campaign: roll, check, write, stage  →  idle (analyze) if nothing was done
 ```
 
-Outbox draining rides along on **every** cycle regardless, because it has to happen on schedule.
+Sending waits when replies couldn't all be read (a reply that wasn't read can't have cancelled its follow-ups). Instantly keeps the old flow: `handle replies > send campaigns > write campaigns > idle`.
 
 The heartbeat is the Email module's: it reads replies, writes and sends, and with the Email module off it does nothing. Finding companies, reading their sites, finding contacts and loading public data are **jobs** the worker runs (see [The queue](#the-queue-background-jobs)), whatever the Email switch says. The heartbeat never looks for people: the [contact finder](#the-contact-finder) does, on its own.
 
@@ -710,7 +709,7 @@ The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeli
 - **Companies** — everything found, one row per company with its phone, email, activities, latest turnover and headcount, contact count, source, when it was found and last searched. Sort by newest found, name, town and county, turnover, employees, number of contacts or last searched, either way (a search adds best match). Filters: county, town, activity (CAEN codes or words), has a website, has a contact (any, phone, mobile, email, none), source, signals the company has or lacks, turnover and employees when the financial statements are loaded, and the search box (words, or a CUI). Exact total, page numbers, a page-number box and the page size; a jump to page 10,000 is as quick as page 1. A filtered or figure-sorted list is ordered once (a few seconds for a signal filter or a turnover sort over a million companies) and kept, so the pages after it are instant; a company that gains a contact or a search leaves or moves in the list at once. A number no company has as its CUI is searched as a word. The Actions menu (CSV, JSON, ANAF check, Find contacts) takes the selection or the whole filtered list in its order. A company's panel shows everything on file: its CUIs (a second one a source gave too), legal form, status and registered office, every financial year (turnover, employees, profit, equity, debts), the trade registry's classes and administrators, ANAF's kept answer, the taxpayer file, contacts with kind, trust, source and status, each person with their own contacts, places, sources, signals and the search log, with **Find contacts** and **Search again** for that company. A register that isn't loaded, or has nothing on the company, says so.
 - **Registry** — the whole trade registry (`data/registry.db`, every firm in Romania, operating or not), each firm beside its latest financial statements. Filters are the registry source's own, the ones Discover shows for it: activity (words or CAEN codes), county, town, status (operating, or every registration), turnover and employee bounds (firms with no figures left out or kept), employer, VAT, micro-enterprise tax. Sort by name, turnover, employees, net profit or registration date, either way. The total is exact, with page numbers and a page box; the first page takes about a second over 4 million firms, a sort or broad filter one to four the first time it is asked (less once the background rankings are ready, a few seconds after the page opens), and every page after it is instant. A search of only excluded words ("-auto") lists every firm but those. Each firm says whether it is already in Harvey (by CUI, or by registration number for a firm with none). Ticks are cleared when the filter changes. Its panel shows every financial year side by side, the registry's record with every CAEN class and the administrators, the taxpayer file's row and ANAF's kept answer. **Pull into Harvey** takes the ticked firms (up to 10,000) or the whole list: counted first, free, and queued as a registry pull, followed by the ANAF checks and the contact finder like any Discover run.
 - **Contacts** — every way to reach a company, one row per distinct email or phone (a chain's shared number is one row reaching all its companies; expand it to see them), with its kind, phone line type (mobile, fixed, VoIP), status, trust and sources. Filters: kind (email, phone, mobile), status, trust, has a person, source, county or town, company has a website, signals the company has or lacks (the cohort rules), turnover and employees when the financial statements are loaded, and text. Paged on the server; past 100,000 the count says "over N". **People to search** lists everyone named at a company (a registry's administrators, a team page) with no email or phone of their own yet. **Find contacts** runs the [contact finder](#the-contact-finder) over the current filters, priced first and under the cap you type; tick **Search again** to also search those already searched. Above the list, the finder's backlog. CSV and JSON exports list each contact once and leave do-not-contact ones out. The Email module's outreach list is a third view while that module is on.
-- **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
+- **Campaigns** — the campaigns you made and the ones Harvey made earlier: status, members, emails sent, replies; open one for its members and where each got, its filter (**Open in Contacts**) and its legitimate-interest note; pause, resume, stop, archive. **Publicuri** lists the saved audiences (preview, rename, open in Contacts, archive). **Campanie nouă** is the wizard: an audience (a saved one, or the Contacts page's current filter) with a preview of what each rule leaves out and how many days the first step takes at today's cap; *roll* to take new matches as they appear; the offer, goal and booking link; the sequence, written by you or generated (**Generează secvența**) and edited; the sending account; *always review*; the legitimate-interest note; then **Pornește**. New campaigns need Gmail, SMTP or Microsoft 365. Each sequence, step by step, is listed under the table, with per-campaign feedback for the writer.
 
 **System**
 - **Queue** — every background job per lane: running (with progress), waiting, paused, done, failed; pause a lane, cancel, retry or resume a job.
@@ -827,7 +826,17 @@ harvey contacts find --website no --max-spend 2.00   # look up companies with no
 harvey contacts find --force --limit 50        # search again, even what was searched before
 ```
 
-**From contacts to the Email module.** The finder knows nothing about email campaigns. While the Email module is on, each heartbeat takes the email contacts it could write to (not do-not-contact, trust confirmed or likely) that aren't prospects yet and makes them prospects for the Writer; an address a site published and nobody checked is checked first (a credit from the same monthly checks), and one that comes back a guess or invalid stays a contact only. What the company's record says (its town and activity, and the latest reading of the signals the site read and other sources collected: tools on the site, open roles, ads, employees) goes into the prospect's notes, and the Writer reads the same facts from the record when it writes to one person.
+**From contacts to the Email module.** The finder knows nothing about email campaigns. A campaign takes its members from an audience: a Contacts filter you saved (Contacts → Actions → *Salvează ca public*, or `harvey audiences save`), read by the same code as the page, so the campaign gets exactly what the page showed. Ticked email rows can be added to a campaign by hand (*Adaugă în campanie…*). Whichever way an address comes in (the start, a roll, by hand) it goes through the same rules: verified, catch-all (with `send_to_risky`) or not yet checked; linked to a live firm with trust confirmed or likely; not on the do-not-contact list; not in another active campaign's sequence, nor sent cold email in the last 90 days (an address marked contacted with no cold email on file, as Instantly leaves it, counts as recent); nobody there already answered. The preview counts what each rule left out. Each cycle writes at most 8 first emails across all campaigns, and only while the first emails waiting to go are fewer than two days of today's cold cap, so the model isn't called for drafts that would sit in the queue. An address nobody checked is checked before anything is written for it (a credit from the same monthly checks; a rolling campaign's new ones at most 50 a day), and one that comes back a guess or invalid is skipped. What the company's record says (its town and activity, and the latest reading of the signals the site read and other sources collected: tools on the site, open roles, ads, employees) goes into the address's card, and the Writer reads the same facts from the record when it writes its first email.
+
+```bash
+harvey audiences save "Stomatologi BV" --county BV --q stomatologie
+harvey audiences show 1                         # what a campaign would take, counted
+harvey campaigns new --name "Stomatologi BV" --audience 1 --note-file nota.txt --sequence-file secventa.json
+harvey campaigns start <id>                     # needs the note (80+ characters), a sequence and harvey ack
+harvey campaigns members <id> --status replied
+```
+
+Staged email always waits in the Outbox; on autopilot the drain that sends an email approves it then, after the autopilot review, so a pause never turns into a burst nobody looked at.
 
 Every row says which company it was found for before any merge, so a merge moves them to the survivor (a link the survivor already has stays parked with its provenance) and undoing it sends back exactly what was found for the other record.
 
