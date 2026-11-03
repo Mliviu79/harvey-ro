@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from harvey import classify, site_match
+from harvey import classify, classify_decision, site_match
 from harvey.modules import lanes, switches
 from harvey.state import StateManager
 from tests import slim
@@ -896,8 +896,8 @@ def test_the_site_bars_are_fixed_and_the_contacts_bar_is_the_one_setting(tmp_pat
     before, after, settings = run(go())
     assert before.value["yes"] is True and after.value["yes"] is True
     assert settings.yes == 0.95 and "site_own" not in settings.public()
-    assert classify.SITE_NEEDS == (("names", 0.5), ("own", 0.4))
-    assert classify.SITE_VETOES == (("directory", 0.7), ("institution", 0.7))
+    assert classify_decision.SITE_NEEDS == (("names", 0.5), ("own", 0.4))
+    assert classify_decision.SITE_VETOES == (("directory", 0.7), ("institution", 0.7))
 
 
 def test_a_site_answer_missing_a_question_is_invalid(tmp_path, monkeypatch):
@@ -922,7 +922,8 @@ def test_decision_answers_naming_nothing_asked_are_invalid(tmp_path, monkeypatch
 
     ans = run(go())
     assert ans.value is None and ans.why == "invalid answer" and len(fake.requests) == 1
-    assert classify.asked_answers({"own": 1.5, "names": 0.2}, ["own", "names"]) == {"names": 0.2}
+    assert classify_decision.asked_answers({"own": 1.5, "names": 0.2},
+                                           ["own", "names"]) == {"names": 0.2}
 
 
 def _contact_card():
@@ -1126,8 +1127,8 @@ def test_the_decision_questions_and_bars_are_the_measured_ones():
     _, qs = classify.TASKS["site"].decision(_site_payload(),
                                             classify.TASKS["site"].max_input_tokens)
     assert qs == MEASURED_SITE
-    assert classify.SITE_NEEDS == (("names", 0.5), ("own", 0.4))
-    assert classify.SITE_VETOES == (("directory", 0.7), ("institution", 0.7))
+    assert classify_decision.SITE_NEEDS == (("names", 0.5), ("own", 0.4))
+    assert classify_decision.SITE_VETOES == (("directory", 0.7), ("institution", 0.7))
     assert classify.Settings().yes == classify.YES_DEFAULT == 0.7
     # (The state budgets the measured renders used.)
     assert classify.TASKS["contacts"].max_input_tokens == 1800
@@ -1136,7 +1137,7 @@ def test_the_decision_questions_and_bars_are_the_measured_ones():
                           "criteria": dict(MEASURED_OWNERS)}
     assert list(cq["ch_0"]["criteria"].items()) == MEASURED_OWNERS     # order matters
     # (Sent as plain JSON, the criteria in their order.)
-    assert list(classify._plain(cq)["ch_0"]["criteria"]) == [k for k, _ in MEASURED_OWNERS]
+    assert list(classify_decision.plain(cq)["ch_0"]["criteria"]) == [k for k, _ in MEASURED_OWNERS]
 
 
 def test_a_decision_model_on_a_site_with_no_contacts_answers_without_a_call(tmp_path,

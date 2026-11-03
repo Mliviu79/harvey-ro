@@ -30,6 +30,10 @@ def env(tmp_path, monkeypatch):
     # No mailbox connected: the user sends by hand. Tests that need Harvey
     # to be able to send set this back.
     monkeypatch.setattr(dash, "_harvey_can_send", lambda: False)
+    # No in-process worker: taking its leases holds the write lock across
+    # awaits, and a hook that writes with plain sqlite3 on the event loop
+    # would then wait out the lock ("database is locked", a 500).
+    monkeypatch.setenv("HARVEY_DASHBOARD_WORKER", "off")
     asyncio.run(StateManager(db_path=str(db)).init_db())
     return {"db": db, "token": dash.token_store.get()}
 

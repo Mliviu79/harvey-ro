@@ -11,6 +11,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -612,32 +613,49 @@ def test_registry_administrators_are_people_to_search_whatever_is_confirmed(tmp_
     assert _rows(db, "SELECT COUNT(*) FROM obs") == [(0,)]
 
 
-def test_a_start_waits_for_another_process_creating_the_database(tmp_path, monkeypatch):
+def test_a_start_waits_for_another_process_creating_the_database(tmp_path):
+    import threading
+
     import harvey.state as state_mod
     from harvey.overlay import schema
 
     path = tmp_path / "harvey.db"
+    other = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    other.execute("PRAGMA journal_mode=WAL")
+    other.execute("BEGIN IMMEDIATE")        # another process is creating it
 
-    class Busy:
-        """Another process holds the new file while it creates it."""
-        VERSION = schema.VERSION
+    def finish():
+        schema.create(other)
+        other.execute("COMMIT")
+        other.close()
 
-        @staticmethod
-        def create(con):
-            raise sqlite3.OperationalError("database is locked")
-
-    slept = []
-
-    def sleep(seconds):
-        slept.append(seconds)
-        if len(slept) == 3:             # the other process is done
-            with sqlite3.connect(path) as other:
-                other.execute(f"PRAGMA user_version = {schema.VERSION}")
-
-    monkeypatch.setattr(state_mod.time, "sleep", sleep)
-    assert state_mod._open_or_create(str(path), Busy) == schema.VERSION
-    assert len(slept) == 3
+    timer = threading.Timer(0.3, finish)
+    timer.start()
+    try:
+        assert state_mod._open_or_create(str(path), schema) == schema.VERSION
+    finally:
+        timer.join()
+    assert _rows(path, "SELECT COUNT(*) FROM tally") == [(len(schema.TALLIES),)]
     assert state_mod.MIGRATION_TIMEOUT_SECONDS > state_mod.BUSY_TIMEOUT_SECONDS
+
+
+def test_a_failed_creation_raises_at_once_and_leaves_the_file_empty(tmp_path, monkeypatch):
+    import harvey.state as state_mod
+    from harvey.overlay import schema
+
+    path = tmp_path / "harvey.db"
+    broken = schema.STEPS[:-1] + ((schema.STEPS[-1][0], lambda con: con.execute(
+        "CREATE TABLE firm (id INTEGER)")),)     # fails part-way: firm exists
+    monkeypatch.setattr(schema, "STEPS", broken)
+    monkeypatch.setattr(state_mod.time, "sleep", lambda s: pytest.fail("waited"))
+    started = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        state_mod._open_or_create(str(path), schema)
+    assert time.monotonic() - started < state_mod.BUSY_TIMEOUT_SECONDS
+    # Nothing half-made is left behind: the next start creates the schema.
+    assert _rows(path, "SELECT COUNT(*) FROM sqlite_master") == [(0,)]
+    monkeypatch.undo()
+    assert state_mod._open_or_create(str(path), schema) == schema.VERSION
 
 
 # ── The Email module's campaigns: contacts the Writer can write to ──

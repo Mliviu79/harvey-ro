@@ -837,13 +837,19 @@ def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | Non
     contact kinds and roles, zeroed tallies, and the kept-value triggers
     (``triggers=False`` leaves them out, for a bulk load that recounts
     and installs them at the end). ``version``: LATEST by default; the
-    upgrade asks for UPGRADE_TARGET (schema 25 as released)."""
+    upgrade asks for UPGRADE_TARGET (schema 25 as released). All of it in
+    one write transaction, the caller's when one is open: a creation that
+    fails leaves the file empty (its DDL would otherwise commit statement
+    by statement)."""
     version = LATEST if version is None else version
     if not UPGRADE_TARGET <= version <= LATEST:
         raise ValueError(f"schema {version} isn't one this release creates")
-    if con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0]:
-        raise ValueError(f"schema {version} is created in an empty database only")
-    with con:
+    own = not con.in_transaction
+    if own:
+        con.execute("BEGIN IMMEDIATE")
+    try:
+        if con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0]:
+            raise ValueError(f"schema {version} is created in an empty database only")
         for part in PARTS:
             _script(con, part)
         con.executemany("INSERT INTO contact_kinds (id, kind, label, channel) VALUES (?, ?, ?, ?)",
@@ -853,11 +859,17 @@ def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | Non
         for target, step in STEPS:
             if target <= version:
                 step(con)
-        con.execute(f"PRAGMA user_version = {version}")
-    if triggers:
-        from harvey.overlay import triggers as kept
+        if triggers:
+            from harvey.overlay import triggers as kept
 
-        kept.install(con)
+            kept.install(con)
+        con.execute(f"PRAGMA user_version = {version}")
+        if own:
+            con.execute("COMMIT")
+    except BaseException:
+        if own and con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
 
 
 def step_up(con: sqlite3.Connection) -> int:

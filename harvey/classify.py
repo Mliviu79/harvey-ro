@@ -24,8 +24,9 @@ models answer its statements yes or no (``render``, ``check``); a
 decision model (the System One format: a state and atomic questions, each
 answered with a probability), which is not a chat model, gets its own
 state and questions (``decision``) and code combines the probabilities it
-gives (``decision_check``, with the contacts bar). A task with no
-``decision`` is not asked through one ("task off").
+gives (``decision_check``, with the contacts bar): harvey/
+classify_decision.py holds that provider and those tasks' questions. A
+task with no ``decision`` is not asked through one ("task off").
 
 Providers: ``off`` (the default: every ask returns no answer at once),
 ``openai_compatible`` (the official openai SDK with a base URL: Ollama,
@@ -63,6 +64,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from harvey import classify_decision as decision
 
 logger = logging.getLogger("harvey.classify")
 
@@ -570,7 +573,7 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
         # (Nothing to ask: no call.)
         out.value = t.decision_check({}, payload, s.yes) if system_one else t.check({}, payload)
         return out
-    missing = system_one and _decision_missing(s)
+    missing = system_one and decision.missing(s)
     if missing:
         # (No key, endpoint or model: nothing is sent, and the service
         # waits for them.)
@@ -581,7 +584,7 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
     error = ""
     for attempt in range(1 if system_one else 2):
         if system_one:
-            send = lambda: _decision(s, d_state, questions)  # noqa: E731
+            send = lambda: decision.send(s, d_state, questions)  # noqa: E731
         else:
             send = _sender(state, s, t, text, statements, error, config)
         try:
@@ -611,7 +614,7 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
         out.model = used.get("model") or out.model
         try:
             if system_one:
-                out.value = t.decision_check(asked_answers(reply, ids), payload, s.yes)
+                out.value = t.decision_check(decision.asked_answers(reply, ids), payload, s.yes)
             else:
                 out.value = t.check(answered(yes_no(reply), ids), payload)
             return out
@@ -706,25 +709,6 @@ def _sender(state, s: Settings, t: Task, text: str, statements: list[Statement],
         raise _Held(f"unknown provider {s.provider!r}")
 
     return unknown
-
-
-def asked_answers(reply: dict, ids: list[str]) -> dict:
-    """A System One reply's answers to the questions asked (``ids``): a
-    Noul's probability, a Choice's {option: probability}, each within 0..1;
-    anything else it names is ignored. NoAnswer when none was answered."""
-    def prob(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
-
-    out = {}
-    for i in ids:
-        v = (reply or {}).get(i)
-        if prob(v):
-            out[i] = float(v)
-        elif isinstance(v, dict) and v and all(prob(x) for x in v.values()):
-            out[i] = {str(k): float(x) for k, x in v.items()}
-    if not out:
-        raise NoAnswer(f"no answer to {', '.join(ids[:20])}")
-    return out
 
 
 async def _call(state, s: Settings, t: Task, send) -> tuple[Any, dict]:
@@ -964,85 +948,6 @@ def _http(timeout: float, **kw):
     return httpx.AsyncClient(timeout=timeout, **kw)
 
 
-def _decision_missing(s: Settings) -> str:
-    """What a decision call lacks ("" when nothing): its key, endpoint or
-    model. None is filled in for the user."""
-    if not s.base_url:
-        return "no endpoint: enter the decision model's full URL"
-    if not s.model:
-        return "no model: enter the decision model's name"
-    if not _key(s):
-        return f"no key in {s.key_name}"
-    return ""
-
-
-def _plain(questions: dict) -> dict:
-    """The questions as the System One format sends them: {"type",
-    "instructions"} and "criteria" when a question has them."""
-    out = {}
-    for qid, q in questions.items():
-        q = dict(q)
-        item = {"type": str(q["type"]), "instructions": str(q["instructions"])}
-        if q.get("criteria"):
-            item["criteria"] = {str(k): str(v) for k, v in dict(q["criteria"]).items()}
-        out[str(qid)] = item
-    return out
-
-
-async def _decision(s: Settings, d_state, questions: dict) -> tuple[dict, dict]:
-    """One System One request: POST {"state", "model", "questions"} to the
-    base URL as given (the full endpoint), with the key as a bearer token.
-    ({question id: a Noul's probability, or a Choice's {option:
-    probability}}, usage). Refused key, payment, unknown model or endpoint,
-    429 or a spent quota: _Held (a 429 for its retry-after-ms or
-    retry-after); timeouts, lost connections and 5xx: _Transient; _call
-    retries and records each attempt."""
-    import httpx
-
-    why = base_url_problem(s.base_url) or _decision_missing(s)
-    if why:
-        raise _Held(why)
-    body = {"state": d_state, "model": s.model, "questions": _plain(questions)}
-    try:
-        async with _http(s.timeout) as client:
-            r = await client.post(s.base_url, json=body,
-                                  headers={"Authorization": f"Bearer {_key(s)}"})
-    except httpx.TimeoutException as e:
-        raise _Transient(f"{type(e).__name__}") from e
-    except httpx.TransportError as e:
-        raise _Transient(f"{type(e).__name__}") from e
-    status = r.status_code
-    if status in (401, 402, 403, 404, 429) or (status >= 400 and "quota" in r.text.lower()):
-        raise _Held(f"HTTP {status}", _wait_header(r.headers) if status == 429 else None)
-    if status >= 500:
-        raise _Transient(f"HTTP {status}")
-    if status >= 400:
-        raise ValueError(f"HTTP {status}: {r.text[:200]}")
-    try:
-        data = r.json()
-    except ValueError as e:
-        raise ValueError("a reply that isn't JSON") from e
-    data = data if isinstance(data, dict) else {}
-    reply = {}
-    for qid, a in (data.get("answers") or {}).items():
-        if not isinstance(a, dict):
-            continue
-        kind = a.get("type", "noul" if "noul" in a else "")
-        if kind == "noul":
-            reply[qid] = a.get("noul")
-        elif kind == "choice":
-            probs = a.get("probabilities")
-            reply[qid] = dict(probs) if isinstance(probs, dict) else None
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-
-    def count(name):
-        value = usage.get(name)
-        return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
-
-    return reply, {"in": count("input_tokens"), "out": count("output_tokens"),
-                   "model": str(data.get("model") or s.model)}
-
-
 async def _brain(state, t: Task, user: str, config) -> tuple[str, dict]:
     """Harvey's own model (Claude CLI or Codex, as configured): within its
     budget only; it records its own usage, under the task's label."""
@@ -1160,94 +1065,6 @@ def _check_contacts(said: dict, p: dict) -> dict:
             "no": [j for j, v in seen.items() if not v]}
 
 
-# ── The same tasks asked of a decision model (the System One format) ──
-#
-# A decision model is not a chat model: it answers each question with a
-# probability, every question of a request in isolation against the same
-# state. Its questions are atomic and code combines them. The wording and
-# the bars below were chosen on half of a labelled set of real
-# firms and scored once on the other half: change one and measure it again.
-
-DECISION_COMPANY = "the company (COMPANY)"
-DECISION_PAGE = "The website between <page> and </page>"
-DECISION_FORM = "Ignore the legal form (SRL, S.R.L., SA, PFA, II, IF), letter case and diacritics."
-
-# A site is the firm's when it names the firm and presents its own
-# business (each at least its bar), and isn't a directory or an
-# institution (each below its veto).
-SITE_NEEDS = (("names", 0.5), ("own", 0.4))
-SITE_VETOES = (("directory", 0.7), ("institution", 0.7))
-
-# Whose a contact read on the firm's site is: the firm's own first (the
-# order matters to the model).
-OWNERS = {
-    "company_own": "The company's own phone, email, contact form or social profile",
-    "agency_or_theme": "The web agency's, developer's or website theme's",
-    "other_office": "Another office, branch or company of a group, in another country",
-    "platform": "A platform, marketplace, booking or hosting service's",
-    "partner_or_other": "A partner's, supplier's, client's or another business's",
-    "placeholder_or_hotline": "A placeholder, example value, or a public hotline or institution",
-}
-
-
-def _decision_site(p: dict, budget: int) -> tuple[str, dict]:
-    text, _ = _render_site(p, budget)
-    c, w = DECISION_COMPANY, DECISION_PAGE
-    return text, {
-        "names": {"type": "noul",
-                  "instructions": f"{w} names {c}: the company's distinctive name appears in "
-                                  f"the website's domain, title or text. {DECISION_FORM}",
-                  "criteria": {"true": "the distinctive words of the company's name appear "
-                                       "together as the name of the business the site "
-                                       "presents.",
-                               "false": "only one common word is shared, the name is "
-                                        "different, or it appears only in a list of many "
-                                        "companies."}},
-        "own": {"type": "noul",
-                "instructions": f"{w} presents the business of {c} itself: its own products "
-                                f"or services, written by that business, under its name."},
-        "directory": {"type": "noul",
-                      "instructions": f"{w} is a company-information site, business "
-                                      f"directory, listing, marketplace, classifieds, job "
-                                      f"board or comparison site that lists many businesses."},
-        "institution": {"type": "noul",
-                        "instructions": f"{w} belongs to a city hall, public institution, "
-                                        f"government body, school, association, or a news or "
-                                        f"media outlet."},
-    }
-
-
-def _decision_check_site(said: dict, p: dict, yes: float) -> dict:
-    # (Every question is needed; ``p`` is how surely the site presents the
-    # firm's own business, kept with the decision.)
-    probs = {q: said[q] for q, _ in SITE_NEEDS + SITE_VETOES}
-    if any(not isinstance(v, float) for v in probs.values()):
-        raise NoAnswer("a site question answered with options")
-    ok = all(probs[q] >= at for q, at in SITE_NEEDS) and \
-        all(probs[q] < below for q, below in SITE_VETOES)
-    return {"yes": ok, "p": round(probs["own"], 2)}
-
-
-def _decision_contacts(p: dict, budget: int) -> tuple[str, dict]:
-    text, statements = _render_contacts(p, budget)
-    # (ch_<j>: card.contacts[j], shown to the model as c<j+1>.)
-    return text, {f"ch_{j}": {"type": "choice", "instructions": f"Whose is contact c{j + 1}?",
-                              "criteria": dict(OWNERS)}
-                  for j in range(len(statements))}
-
-
-def _decision_check_contacts(said: dict, p: dict, yes: float) -> dict:
-    # (A contact is the firm's when the model's probability that it is
-    # reaches its bar; one not shown or not answered is in neither list.)
-    n = min(len(p["cards"][0].contacts), p.get("shown_contacts", 12))
-    seen = {j: said[f"ch_{j}"]["company_own"] for j in range(n)
-            if isinstance(said.get(f"ch_{j}"), dict) and "company_own" in said[f"ch_{j}"]}
-    if not seen and n:
-        raise NoAnswer("no contact answered")
-    return {"contacts": [j for j, v in seen.items() if v >= yes],
-            "no": [j for j, v in seen.items() if v < yes]}
-
-
 register(Task(
     name="results", prompt=RESULTS_PROMPT, yes=RESULTS_YES, no=RESULTS_NO,
     render=_render_results, check=_check_results,
@@ -1257,10 +1074,10 @@ register(Task(
     name="site", prompt=SITE_PROMPT, yes=SITE_YES, no=SITE_NO,
     render=_render_site, check=_check_site,
     max_input_tokens=2000, max_output_tokens=30, per_day=3000,
-    decision=_decision_site, decision_check=_decision_check_site))
+    decision=decision.site, decision_check=decision.check_site))
 
 register(Task(
     name="contacts", prompt=CONTACTS_PROMPT, yes=CONTACTS_YES, no=CONTACTS_NO,
     render=_render_contacts, check=_check_contacts,
     max_input_tokens=1800, max_output_tokens=120, per_day=1500,
-    decision=_decision_contacts, decision_check=_decision_check_contacts))
+    decision=decision.contacts, decision_check=decision.check_contacts))

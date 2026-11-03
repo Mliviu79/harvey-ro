@@ -409,8 +409,11 @@ def _open_or_create(path: str, overlay_schema) -> int:
     file (WAL, so readers never block the writer), and taking a file the
     upgrade wrote (schema 25) or an earlier release made through the steps
     it lacks, in place. Two processes starting on a new file at once: one
-    creates it, the other waits for it."""
-    con = sqlite3.connect(path, isolation_level=None, timeout=BUSY_TIMEOUT_SECONDS)
+    creates it under the write lock, the other waits for that lock (up to
+    MIGRATION_TIMEOUT_SECONDS) and finds it made. A creation that fails
+    rolls back and raises its own error; one whose process dies releases
+    the lock and leaves the file empty for the next."""
+    con = sqlite3.connect(path, isolation_level=None, timeout=MIGRATION_TIMEOUT_SECONDS)
     try:
         version = con.execute("PRAGMA user_version").fetchone()[0]
         first = getattr(overlay_schema, "UPGRADE_TARGET", overlay_schema.VERSION)
@@ -421,21 +424,22 @@ def _open_or_create(path: str, overlay_schema) -> int:
         except sqlite3.OperationalError:
             pass    # another process is setting the new file up right now
         con.execute("PRAGMA synchronous=NORMAL")
-        if version and version < overlay_schema.VERSION:
-            return overlay_schema.step_up(con)
-        if version:
-            return version
-        try:
-            overlay_schema.create(con)
-        except (ValueError, sqlite3.OperationalError):
-            # Created by another process meanwhile (or being created).
-            for _ in range(int(MIGRATION_TIMEOUT_SECONDS * 10)):
+        if not version:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                # Read again under the lock: another process may have made it.
                 version = con.execute("PRAGMA user_version").fetchone()[0]
-                if version:
-                    return version
-                time.sleep(0.1)
-            raise
-        return overlay_schema.VERSION
+                if not version:
+                    overlay_schema.create(con)
+                    version = overlay_schema.VERSION
+                con.execute("COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        if first <= version < overlay_schema.VERSION:
+            return overlay_schema.step_up(con)
+        return version
     finally:
         con.close()
 
@@ -1961,48 +1965,16 @@ class StateManager:
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 
-    async def upsert_signal_code(
-        self,
-        code: str,
-        *,
-        label: str = "",
-        description: str = "",
-        category: str = "",
-        value_type: str = "text",
-        collector: str = "",
-        cost_note: str = "",
-        confidence_floor: float = 0.0,
-        status: str | None = None,
-        module: str = "",
-        subject: str = "company",
-        unit: str = "",
-        cardinality: str = "one",
-        keyed_by: str = "",
-        absence: str = "unknown",
-        when_known: str = "enrich",
-        available: bool = True,
-    ):
-        """Register a signal in the vocabulary. Never downgrades a user's
-        decision: an existing row's ``status`` is preserved unless explicitly
-        passed, so re-seeding can't silently re-enable a rejected signal."""
-        async with self._connect() as db:
-            await db.execute(_UPSERT_SIGNAL_CODE, _signal_code_params(
-                code, label=label, description=description, category=category,
-                value_type=value_type, collector=collector, cost_note=cost_note,
-                confidence_floor=confidence_floor, status=status, module=module,
-                subject=subject, unit=unit, cardinality=cardinality, keyed_by=keyed_by,
-                absence=absence, when_known=when_known, available=available))
-            await db.commit()
-
     async def write_vocabulary(self, rows_for, settings_prefix: str) -> int:
         """Upsert the whole vocabulary in one write transaction.
 
         ``rows_for(settings)`` gets the settings under ``settings_prefix``
         (the module switches), read inside the transaction, and returns one
-        dict of upsert_signal_code arguments per signal. A switch flipped by
-        another process lands before this reads or after it commits, never
-        in between, so the availability written always matches the
-        switches. Returns how many rows were written."""
+        dict per signal: its ``code``, the vocabulary columns
+        (overlay.store.write_vocabulary) and, optionally, a ``status`` to
+        set. A switch flipped by another process lands before this reads or
+        after it commits, never in between, so the availability written
+        always matches the switches. Returns how many rows were written."""
         return await self._on_overlay("write_vocabulary", rows_for, settings_prefix)
 
     async def write_contact_kinds(self, rows_for, settings_prefix: str) -> None:
