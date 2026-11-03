@@ -379,9 +379,13 @@ async def get_setup_status():
         provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
         provider_help = "Enter your SMTP host, username, and password in Settings."
     else:
-        instantly_key = env_vars.get("INSTANTLY_API_KEY", "") or os.getenv("INSTANTLY_API_KEY", "")
-        provider_done = bool(instantly_key) and instantly_key != "your_instantly_api_key_here"
-        provider_help = "Enter your Instantly API key in Settings."
+        # Instantly (removed) or a name Harvey doesn't know: nothing is sent
+        # or read until another provider is chosen.
+        from harvey.config import provider_notice
+
+        provider_done = False
+        provider_help = provider_notice(_load_config_quietly()) or (
+            "Set channels.email.provider to gmail, smtp or microsoft.")
     checks.append({
         "id": "email_provider", "label": f"Email provider configured ({provider})",
         "provider": provider,
@@ -459,8 +463,7 @@ async def get_setup_status():
                   "other": "Warmup: your own warmup service"}.get(choice, "Warm up your mailbox"),
         "done": bool(choice),
         "choice": choice or "",
-        # Instantly warms its own accounts, so there it's a suggestion, not a step.
-        "required": provider != "instantly",
+        "required": True,
         "help": ("A new mailbox needs 2-4 weeks of warmup before cold email, and warmup "
                  "keeps it out of spam after that. We recommend TrulyInbox: connect it and "
                  "Harvey shows whether your mailbox is warmed."),
@@ -486,9 +489,9 @@ def _current_provider() -> str:
     """Read channels.email.provider from the active config (best-effort)."""
     try:
         cfg = yaml.safe_load(read_user_text(_resolve_config_file())) or {}
-        return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
+        return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "gmail")
     except Exception:
-        return "instantly"
+        return "gmail"
 
 
 # Keys a module reads that Settings never writes: TrulyInbox's are saved by
@@ -539,7 +542,6 @@ async def get_settings():
         "provider": _current_provider(),
         # Non-secret values echo back so fields repopulate; secrets are
         # presence-only so keys never leave the box.
-        "instantly_api_key_set": is_set("INSTANTLY_API_KEY"),
         "cloudflare_account_id": env_vars.get("CLOUDFLARE_ACCOUNT_ID", ""),
         "cloudflare_api_token_set": is_set("CLOUDFLARE_API_TOKEN"),
         "gmail_client_id": env_vars.get("GMAIL_CLIENT_ID", ""),
@@ -663,31 +665,6 @@ async def trulyinbox_other():
     await state.init_db()
     await ti.set_choice(state, "other")
     return {"success": True}
-
-
-@app.post("/api/settings/test-instantly")
-async def test_instantly(request: Request):
-    """Test an Instantly API key."""
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    api_key = str(data.get("api_key", "") or "")
-    if not api_key:
-        return {"success": False, "message": "No API key provided."}
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://api.instantly.ai/api/v2/accounts",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            if resp.status_code == 200:
-                return {"success": True, "message": "Connected to Instantly."}
-            else:
-                return {"success": False, "message": f"API returned {resp.status_code}. Check your key."}
-    except Exception as e:
-        return {"success": False, "message": f"Connection failed: {str(e)}"}
 
 
 # ── Companies ──
@@ -2316,7 +2293,7 @@ HAND_SENDABLE_EMAIL = ("verified", "risky")
 
 
 def _harvey_can_send() -> bool:
-    """Can Harvey send email itself (a connected mailbox, or Instantly)?
+    """Can Harvey send email itself (a connected mailbox)?
 
     Sending by hand from the dashboard is only offered when it can't: with
     two senders, any timing gap between them emails someone twice. If the
@@ -2326,14 +2303,11 @@ def _harvey_can_send() -> bool:
         from harvey.config import load_config, load_env
         from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
         config, env = load_config(), load_env()
-        from harvey.config import legacy_sending_held
         email = config.channels.email
-        if not email.enabled or legacy_sending_held(config):
+        if not email.enabled or (email.provider or "").strip().lower() not in NATIVE_PROVIDERS:
             return False
-        if (email.provider or "").strip().lower() in NATIVE_PROVIDERS:
-            provider = get_mail_provider(config, env)
-            return bool(provider and provider.is_configured())
-        return bool(env.instantly_api_key)
+        provider = get_mail_provider(config, env)
+        return bool(provider and provider.is_configured())
     except Exception:
         return True
 
@@ -2360,7 +2334,8 @@ def _compliance_view() -> dict:
 
 
 async def _harvey_committed_ids() -> set[str]:
-    """Everyone Harvey has approved or sent mail for (Outbox or Instantly).
+    """Everyone Harvey has approved or sent mail for (the Outbox, or an
+    Instantly campaign an earlier release deployed).
 
     Approved mail can be going out at this moment, so these people are past
     the point where a hand send can be recorded safely. So is anyone whose
@@ -2390,7 +2365,8 @@ async def _hand_sent_ids() -> set[str]:
 
 
 async def _harvey_sent_to(prospect_id: str) -> bool:
-    """Did Harvey itself email this person (native send, or an Instantly campaign)?
+    """Did Harvey itself email this person (the Outbox, or an Instantly
+    campaign an earlier release deployed)?
 
     A send in flight, or cut off mid-way, counts: it may have reached them.
     """
@@ -3355,7 +3331,8 @@ async def create_campaign(request: Request):
     """A new draft campaign: {"name", "audience_id" or "query", "rolling",
     "offer": {offer, goal, booking_link}, "sequence": [{subject, body,
     delay_days}], "li_note", "review": "inherit" | "always"}. Refused
-    (409, need native_provider) on Instantly."""
+    (409, need native_provider) unless the provider is Gmail, SMTP or
+    Microsoft 365."""
     from harvey import campaigns
 
     body = await _json_body(request)
@@ -3510,6 +3487,26 @@ async def remove_campaign_members(campaign_id: str, request: Request):
         return _refuse('expected {"emails": [...]}', 400)
     state = await _campaign_state()
     return {"success": True, "removed": await campaigns.remove_by_hand(state, campaign_id, emails)}
+
+
+@app.get("/api/campaigns/{campaign_id}/record.{fmt}")
+async def campaign_record_export(campaign_id: str, fmt: str):
+    """The campaign's record (evidență) as JSON or CSV: its legitimate-
+    interest note, the acknowledgement it started under, every member with
+    how it was added and why it ended, the emails sent and the opt-outs."""
+    from harvey import campaigns
+
+    if fmt not in ("json", "csv"):
+        return _refuse("record.json or record.csv", 404)
+    state = await _campaign_state()
+    try:
+        rec = await state.campaigns_call(campaigns.record, campaign_id, write=False)
+    except campaigns.Refused as e:
+        return _refuse(str(e), 404)
+    name = f"evidenta-{campaign_id}-{date.today().isoformat()}.{fmt}"
+    if fmt == "csv":
+        return _csv_download(campaigns.record_csv(rec), name)
+    return JSONResponse(rec, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.post("/api/campaigns/{campaign_id}/{action}")
@@ -4670,6 +4667,17 @@ async def get_today():
                 "action": "Open the log", "tab": "controls",
             })
 
+        # A provider Harvey can't send or read through (Instantly, removed).
+        from harvey.config import provider_notice
+        provider_problem = provider_notice(_load_config_quietly())
+        if provider_problem:
+            items.append({
+                "key": "provider", "tone": "bad",
+                "title": "Choose Gmail, SMTP or Microsoft 365 to send email",
+                "detail": provider_problem, "provider": _current_provider(),
+                "action": "Open settings", "tab": "settings",
+            })
+
         hold = await state.current_sends_held()
         if hold:
             from harvey.sending_mode import held_message
@@ -4701,8 +4709,8 @@ async def get_today():
                 "key": "ack", "tone": "bad",
                 "title": "Cold email waits for your acknowledgement",
                 "detail": ("Read what sending cold email to firms means and confirm it once: "
-                           "run harvey ack in a terminal."),
-                "action": "Open the decisions desk", "tab": "outbox",
+                           "Settings → Sending, or harvey ack in a terminal."),
+                "action": "Read and confirm", "tab": "settings",
             })
 
         if paused:

@@ -174,7 +174,8 @@ class Analyst:
         if total_queued > 0 and total_contacted == 0:
             insights.append(
                 f"BLOCKED: {total_queued} prospects are queued but nothing has been sent. "
-                "Check the Instantly API key and Sender logs — campaigns may be failing to deploy."
+                "Check the Outbox (waiting for approval?), the mail provider in Settings and the "
+                "Sender logs."
             )
         if total_new < 10 and total_queued == 0:
             insights.append(

@@ -95,7 +95,8 @@ def test_env_example_names_no_removed_feature():
     # LinkedIn prospecting, the keyless search scraper and the agent that used
     # them are gone; their keys and fallbacks must not be promised.
     documented = (ROOT / ".env.example").read_text()
-    for gone in ("LINKEDIN_", "DuckDuckGo", "Scout"):
+    # Instantly was removed too: no key, and no option naming it.
+    for gone in ("LINKEDIN_", "DuckDuckGo", "Scout", "INSTANTLY_", "instantly"):
         assert gone not in documented, gone
 
 

@@ -46,9 +46,9 @@ icp:
 channels:
   email:
     enabled: true
-    provider: "gmail"          # gmail (recommended) | microsoft | smtp | instantly
+    provider: "gmail"          # gmail (recommended) | microsoft | smtp
     max_daily_sends: 50
-    require_approval: true      # native: review in Outbox; Instantly: sending held
+    require_approval: true      # every email waits for you in the Outbox
     # link_domains: ["mainsite.com"]   # your own sites besides the sending
     #                                  # domain and booking link; on autopilot,
     #                                  # an email linking elsewhere waits for you
@@ -57,7 +57,7 @@ channels:
     # New sending domain? Set start_date to the day your warmup service went
     # on: no cold email for min_days, then the cold cap climbs from
     # start_sends by daily_increase a day up to max_daily_sends. Replies are
-    # never held. Gmail/Microsoft/SMTP only (Instantly has its own warmup).
+    # never held.
     # Check readiness any time with `harvey warmup`.
     # We recommend TrulyInbox for warmup: https://trulyinbox.com/?via=harvey
     # Connect it (`harvey trulyinbox connect`) and `harvey warmup` reads
@@ -115,6 +115,14 @@ compliance:
   do_not_contact: []
   #   - "competitor.example"
   #   - "jane@acme.example"
+  # Your privacy page (who you are, why you write, the legal basis, how to
+  # object), added after the line saying where the address was found, in the
+  # first email to a personal address only. It is a link, so that email
+  # carries no other. Blank = left off.
+  privacy_url: ""
+  # Under an answer autopilot sent by itself (never cold email, never an
+  # answer you approved). Blank = left off.
+  ai_disclosure_line: "Acest răspuns a fost scris cu ajutorul unui asistent AI."
   precleared:
     enabled: false
     sender_country: ""          # GB or US: where your business is based

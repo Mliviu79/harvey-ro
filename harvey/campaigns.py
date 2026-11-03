@@ -42,6 +42,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from harvey.overlay.schema import MEMBER_ADDED_BY, MEMBER_STATUS
+from harvey.overlay.schema import SUPPRESSION_REASON as SUPPRESSION_REASON_CODES
 
 logger = logging.getLogger("harvey.campaigns")
 
@@ -69,8 +70,16 @@ LI_NOTE_TEMPLATE = (
     "mult {followups} reveniri, fiecare cu dezabonare. Cine se opune nu mai este contactat "
     "niciodată.")
 
-NATIVE_ONLY = ("Campaniile noi au nevoie de un cont Gmail, SMTP sau Microsoft (Setări → "
-               "Trimitere). New campaigns need a Gmail, SMTP or Microsoft account.")
+NATIVE_ONLY = ("Campaniile au nevoie de un cont Gmail, SMTP sau Microsoft (Setări → "
+               "Trimitere). Campaigns need a Gmail, SMTP or Microsoft account.")
+
+# Why a member ended when you rejected one of its emails, or its send was
+# cut off mid-way or raised (it may have gone out, so nothing after it is
+# sent).
+REJECTED = "rejected"
+CUT_OFF = "cut off mid-send"
+# ...or the mailbox refused it (never retried, so nothing after it goes).
+SEND_FAILED = "send failed"
 
 # overlap's reason for an address contacted with no cold email on file.
 CONTACTED_ELSEWHERE = "contacted outside the outbox"
@@ -198,7 +207,7 @@ def update_audience(con: sqlite3.Connection, audience_id, *, name: str | None = 
 CAMPAIGN_COLS = ("id", "name", "status", "sequence_json", "created_at", "audience_id",
                  "audience_query", "rolling", "rolled_at", "account_id", "profile_id",
                  "offer_json", "li_note", "review", "origin", "started_at", "ended_at",
-                 "updated_at", "instantly_campaign_id")
+                 "updated_at")
 
 
 def _campaign(row) -> dict:
@@ -281,8 +290,7 @@ def create_campaign(con: sqlite3.Connection, *, provider: str, address: str, nam
                     offer: dict | None = None, sequence=None, li_note: str = "",
                     review: str = "inherit", account_id: int | None = None) -> str:
     """A draft campaign made by the user. Refused unless the mail provider
-    is a native one (Gmail, SMTP, Microsoft): Instantly can't carry the
-    source note, the unsubscribe token or the check at send."""
+    is one Harvey sends through (Gmail, SMTP, Microsoft 365)."""
     from harvey.integrations.mail_provider import NATIVE_PROVIDERS
     from harvey.state import _new_id
 
@@ -322,8 +330,9 @@ def _offer(offer) -> dict:
 
 
 def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict:
-    """Edit a campaign: name, offer, sequence, note, review and rolling at
-    any time before it finishes; its audience only while it is a draft."""
+    """Edit a campaign: name, offer, sequence, review and rolling at any
+    time before it finishes; its audience and its legitimate-interest note
+    only while it is a draft."""
     c = get_campaign(con, campaign_id)
     if c is None:
         raise Refused("Campania nu există. No such campaign.")
@@ -339,12 +348,15 @@ def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict
     if fields.get("sequence") is not None:
         out["sequence_json"] = json.dumps(validate_sequence(fields["sequence"]), ensure_ascii=False)
     if fields.get("li_note") is not None:
-        out["li_note"] = str(fields["li_note"]).strip()[:4000]
-        # Start asked for the note; once started it stays one.
-        if c["status"] != "draft" and len(out["li_note"]) < LI_NOTE_MIN:
-            raise Refused(f"Nota de interes legitim are cel puțin {LI_NOTE_MIN} de caractere. "
-                          f"The legitimate-interest note needs at least {LI_NOTE_MIN} "
-                          "characters.", need="li_note")
+        note = str(fields["li_note"]).strip()[:4000]
+        # The campaign started under its note, and the record shows that
+        # one: it is written while the campaign is a draft only.
+        if c["status"] != "draft" and note != (c["li_note"] or "").strip():
+            raise Refused("Nota de interes legitim se scrie înainte de pornire. The "
+                          "legitimate-interest note is written before the campaign starts.",
+                          need="li_note")
+        if c["status"] == "draft":
+            out["li_note"] = note
     if fields.get("review") is not None:
         if fields["review"] not in ("inherit", "always"):
             raise Refused("review is inherit or always")
@@ -489,6 +501,26 @@ def set_member(con: sqlite3.Connection, campaign_id: str, email: str, status: st
                        (*sets.values(), campaign_id, normalize(email))).rowcount == 1
 
 
+def stop_after(con: sqlite3.Connection, campaign_id: str, email: str, step: int,
+               reason: str) -> bool:
+    """One of a member's emails won't go (you rejected it, or its send was
+    cut off and may have reached them): what it still had queued after it
+    in this campaign is cancelled, and its place ends with ``reason``, so a
+    campaign that doesn't roll can finish. True when the member ended."""
+    con.execute("UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                "WHERE campaign_id = ? AND to_email = ? AND kind = 'sequence' AND step > ? "
+                "AND status IN ('pending_review', 'approved')",
+                (f"step {int(step)} {reason}"[:300],
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), campaign_id,
+                 normalize(email), int(step)))
+    m = member(con, campaign_id, email)
+    if m is None or m["status"] not in OPEN_MEMBER:
+        return False
+    set_member(con, campaign_id, email, "stopped", reason)
+    finish_if_done(con, campaign_id)
+    return True
+
+
 def end_memberships(con: sqlite3.Connection, email: str, status: str, reason: str) -> int:
     """Every open membership of an address ends (it replied, was suppressed
     or bounced): in every campaign, whatever its state."""
@@ -530,8 +562,9 @@ def overlap(con: sqlite3.Connection, email: str, campaign_id: str) -> str:
                       (email, campaign_id, since)).fetchone()
     if row and row[0]:
         return f"cold email sent {str(row[0])[:10]}"
-    # Contacted with no cold email on file (Instantly sent it, before a
-    # switch to a native provider): when is unknown, so it counts as recent.
+    # Contacted with no cold email on file (an earlier release sent it
+    # through Instantly, or it was sent by hand): when is unknown, so it
+    # counts as recent.
     if con.execute("SELECT 1 FROM prospects p WHERE p.email = ? AND p.status = 'contacted' "
                    "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id "
                    "AND o.kind = 'sequence' AND o.status = 'sent') LIMIT 1",
@@ -813,6 +846,146 @@ async def roll_checks_left(state, campaign_id: str) -> int:
 async def count_roll_check(state, campaign_id: str) -> None:
     key = f"{ROLL_CHECKS_KEY}{campaign_id}:{datetime.now(timezone.utc):%Y-%m-%d}"
     await state.increment_setting(key)
+
+
+# ── The record (evidență): what a campaign did, for the operator's file ──
+
+# The do-not-contact reasons that are the person's own objection.
+OPT_OUT_REASONS = ("unsubscribe", "opt_out", "objection", "complaint")
+ADDED_BY_NAMES = {v: k for k, v in MEMBER_ADDED_BY.items()}
+
+
+def _iso(seconds) -> str:
+    if seconds in (None, ""):
+        return ""
+    try:
+        return datetime.fromtimestamp(int(seconds), timezone.utc).replace(
+            tzinfo=None).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(seconds)
+
+
+def record(con: sqlite3.Connection, campaign_id: str) -> dict:
+    """A campaign's record: its legitimate-interest note, the cold-email
+    acknowledgement it started under (version and time), every member with
+    how it was added and why it ended, every email sent, and the opt-outs
+    of its addresses. Read only; the operator's evidence of the balancing
+    test and of honouring objections."""
+    from harvey import acknowledgement, email_rules
+
+    c = get_campaign(con, campaign_id)
+    if c is None:
+        raise Refused("Campania nu există. No such campaign.")
+    acks = con.execute("SELECT version, text_sha, at, by FROM acknowledgement WHERE kind = ? "
+                       "ORDER BY at", (acknowledgement.KIND,)).fetchall()
+    started = c["started_at"]
+    # The one in force when it started (else, a draft, the latest given).
+    ack = next((a for a in reversed(acks) if started and a[2] <= int(started)), None) \
+        or (acks[-1] if acks else None)
+    members_out = []
+    for m in members(con, campaign_id, limit=1_000_000):
+        members_out.append({
+            "email": m["email"], "status": m["status_name"],
+            "added_by": ADDED_BY_NAMES.get(m["added_by"], str(m["added_by"])),
+            "added_at": _iso(m["added_at"]),
+            "personal": email_rules.REASON_NAMES.get(m["personal"], ""),
+            "last_step": m["last_step"], "last_sent_at": _iso(m["last_sent_at"]),
+            "ended_at": _iso(m["ended_at"]), "end_reason": m["end_reason"]})
+    # Its cold email, and the answers sent in its conversations.
+    sends = [{"email": r[0], "step": r[1], "subject": r[2], "sent_at": r[3] or "",
+              "source_note": r[4] or "", "message_id": r[5] or "", "kind": r[6]}
+             for r in con.execute(
+                 "SELECT to_email, step, subject, sent_at, source_note, message_id, kind "
+                 "FROM outbox WHERE status = 'sent' AND ((campaign_id = ? AND kind = 'sequence') "
+                 "OR (kind = 'reply' AND conversation_id IN "
+                 "(SELECT id FROM conversations WHERE campaign_id = ?))) "
+                 "ORDER BY sent_at, step", (campaign_id, campaign_id))]
+    opt_outs = _opt_outs(con, campaign_id, members_out)
+    return {
+        "campaign": {"id": c["id"], "name": c["name"], "status": c["status"],
+                     "origin": c["origin"], "audience_query": frozen_query(con, c),
+                     "rolling": c["rolling"], "created_at": str(c["created_at"] or ""),
+                     "started_at": _iso(c["started_at"]), "ended_at": _iso(c["ended_at"]),
+                     "steps": len(c["sequence"]), "review": c["review"]},
+        "li_note": c["li_note"] or "",
+        "acknowledgement": ({"version": ack[0], "text_sha": ack[1], "at": _iso(ack[2]),
+                             "by": ack[3], "current": ack[0] == acknowledgement.VERSION
+                             and ack[1] == acknowledgement.text_sha()} if ack else None),
+        "members": members_out, "sends": sends, "opt_outs": opt_outs,
+        "counts": {"members": len(members_out), "sends": len(sends),
+                   "opt_outs": len(opt_outs)},
+        "exported_at": _iso(_now()),
+    }
+
+
+def _opt_outs(con: sqlite3.Connection, campaign_id: str, members_out: list[dict]) -> list[dict]:
+    """The opt-outs that reach this campaign's members: an entry for their
+    address, their domain (or a parent of it) or their firm, and any made
+    in this campaign. ``email``: the member addresses it covers."""
+    from harvey import suppression
+
+    scopes = suppression.SUPPRESSION_SCOPE
+    codes = [SUPPRESSION_REASON_CODES[r] for r in OPT_OUT_REASONS]
+    rows = con.execute(
+        f"SELECT scope, value, reason, campaign, at, by, undone_at, undo_note FROM suppression "
+        f"WHERE reason IN ({','.join('?' * len(codes))}) ORDER BY at, id", codes).fetchall()
+    if not rows:
+        return []
+    firm_rows = any(r[0] == scopes["firm"] for r in rows)
+    covers: dict[tuple[int, str], set[str]] = {}
+    firms = {r[0]: r[1] for r in con.execute(
+        "SELECT email, firm FROM campaign_member WHERE campaign = ?", (campaign_id,))}
+    for m in members_out:
+        email = m["email"]
+        local, _, host = email.rpartition("@")
+        keys = {(scopes["address"], email), (scopes["address"], f"{local.split('+', 1)[0]}@{host}")}
+        keys.update((scopes["domain"], d) for d in suppression._parents(host))
+        if firm_rows:
+            ids = [f for f in (firms.get(email),) if f not in (None, "")]
+            ids += suppression.firms_of_address(con, email)
+            keys.update((scopes["firm"], v) for v in suppression.firm_values(con, ids))
+        for key in keys:
+            covers.setdefault(key, set()).add(email)
+    out = []
+    for scope, value, reason, campaign, at, by, undone_at, undo_note in rows:
+        reached = covers.get((scope, value), set())
+        if not reached and campaign != campaign_id:
+            continue
+        out.append({"email": " ".join(sorted(reached)) or value,
+                    "reason": suppression.REASON_NAMES.get(reason, ""),
+                    "here": campaign == campaign_id, "at": _iso(at), "by": by,
+                    "undone_at": _iso(undone_at), "undo_note": undo_note or "",
+                    "scope": suppression.SCOPE_NAMES.get(scope, str(scope)), "value": value})
+    return out
+
+
+def record_csv(rec: dict) -> str:
+    """The record as one CSV: a section per part (campaign, note,
+    acknowledgement, members, sends, opt-outs), each with its own header."""
+    import csv
+    import io
+
+    from harvey.export import csv_cell
+
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["section", "field", "value"])
+    for k, v in rec["campaign"].items():
+        w.writerow(["campaign", k, csv_cell(v)])
+    w.writerow(["campaign", "li_note", csv_cell(rec["li_note"])])
+    for k, v in (rec["acknowledgement"] or {"version": "", "at": ""}).items():
+        w.writerow(["acknowledgement", k, csv_cell(v)])
+    w.writerow(["campaign", "exported_at", rec["exported_at"]])
+    for section, rows in (("members", rec["members"]), ("sends", rec["sends"]),
+                          ("opt_outs", rec["opt_outs"])):
+        w.writerow([])
+        if not rows:
+            w.writerow([section, "(none)"])
+            continue
+        w.writerow([section, *rows[0].keys()])
+        for r in rows:
+            w.writerow([section, *[csv_cell(v) for v in r.values()]])
+    return out.getvalue()
 
 
 def li_note_template(offer: str = "", criteria: str = "", followups: int = 2) -> str:

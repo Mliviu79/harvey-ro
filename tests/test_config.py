@@ -44,7 +44,6 @@ def test_config_from_dict():
 def test_env_config_defaults():
     """EnvConfig has sensible defaults when env vars are unset."""
     env = EnvConfig()
-    assert env.instantly_api_key == ""
     assert env.serper_api_key == ""
     assert env.tinyfish_api_key == ""
 

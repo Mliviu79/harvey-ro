@@ -176,20 +176,6 @@ def _ask_brain_config() -> BrainConfig:
             print("    (that doesn't look like a model name — try again or leave blank)")
 
 
-async def _test_instantly(api_key: str) -> bool:
-    """Test the Instantly API key."""
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://api.instantly.ai/api/v2/accounts",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
 class SetupWizard:
     def __init__(self):
         self.env_vars: dict[str, str] = {}
@@ -199,6 +185,8 @@ class SetupWizard:
         self.precleared: dict | None = None
         # Whether _write_config saved the config, for the summary.
         self.config_saved = False
+        # The mailbox chosen (channels.email.provider); "" leaves it alone.
+        self.provider = ""
 
     async def run(self):
         """Run the full interactive setup."""
@@ -221,7 +209,7 @@ class SetupWizard:
         await self._check_prerequisites()
 
         # Step 2: Connect email platform
-        _print_step(2, total_steps, "Email Platform (Instantly)")
+        _print_step(2, total_steps, "Sending Mailbox")
         await self._setup_email_platform()
 
         # Step 3: Cloudflare crawling (optional)
@@ -353,31 +341,38 @@ class SetupWizard:
         _print_harvey("Prerequisites look good. Let's keep going.")
 
     async def _setup_email_platform(self):
-        """Configure Instantly API."""
-        _print_harvey("I need a cold email platform to send campaigns through.")
-        _print_harvey("Right now I support Instantly (recommended) and Woodpecker.")
+        """Choose the mailbox Harvey sends from and reads replies in (Gmail,
+        SMTP or Microsoft 365), and keep its keys for .env."""
+        from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 
-        has_instantly = _ask_yes_no("Do you have an Instantly account?")
-
-        if has_instantly:
-            api_key = _ask("Instantly API key (from Settings → Integrations; input hidden)", secret=True)
-            self.env_vars["INSTANTLY_API_KEY"] = api_key
-
-            # Test the key
-            print("\n  Testing API key...", end=" ", flush=True)
-            if await _test_instantly(api_key):
-                print("✓ Connected")
-                _print_harvey("Perfect. I can send campaigns through Instantly now.")
-            else:
-                print("✗ Failed")
-                _print_harvey("Couldn't connect. The key might be wrong, or you might")
-                _print_harvey("need the Growth plan for API access. I'll save it anyway —")
-                _print_harvey("you can fix it later in .env.")
+        _print_harvey("I send from a real mailbox you own and read the replies there:")
+        print("    gmail     — Gmail / Google Workspace (recommended)")
+        print("    smtp      — any SMTP + IMAP mailbox (AgentMail, Fastmail, ...)")
+        print("    microsoft — Microsoft 365 / Outlook")
+        _print_harvey("Use a dedicated secondary domain for cold email, never your main one.")
+        choice = ""
+        while choice not in NATIVE_PROVIDERS:
+            choice = _ask("Mailbox (gmail/smtp/microsoft)", default="gmail").strip().lower()
+        self.provider = choice
+        if choice == "gmail":
+            _print_harvey("Make an OAuth client (Desktop app) in Google Cloud Console.")
+            self.env_vars["GMAIL_CLIENT_ID"] = _ask("Gmail OAuth client ID", required=False)
+            self.env_vars["GMAIL_CLIENT_SECRET"] = _ask(
+                "Gmail OAuth client secret (input hidden)", required=False, secret=True)
+            _print_harvey("Then run 'harvey gmail auth' once to sign in.")
+        elif choice == "smtp":
+            self.env_vars["SMTP_HOST"] = _ask("SMTP server", required=False)
+            self.env_vars["SMTP_PORT"] = _ask("SMTP port", default="587", required=False)
+            self.env_vars["SMTP_USERNAME"] = _ask("SMTP username", required=False)
+            self.env_vars["SMTP_PASSWORD"] = _ask("SMTP password (input hidden)",
+                                                  required=False, secret=True)
+            _print_harvey("Replies are read over IMAP with the same server and login;")
+            _print_harvey("set IMAP_HOST in .env (or Settings) if they differ.")
         else:
-            _print_harvey("No problem. You'll need one eventually to send emails.")
-            _print_harvey("Sign up at https://instantly.ai (Growth plan for API access).")
-            _print_harvey("Add your API key to .env later as INSTANTLY_API_KEY.")
-            self.env_vars["INSTANTLY_API_KEY"] = ""
+            self.env_vars["M365_CLIENT_ID"] = _ask("Application (client) ID", required=False)
+            self.env_vars["M365_TENANT_ID"] = _ask("Directory (tenant) ID", required=False)
+            _print_harvey("Then run 'harvey microsoft auth' once to sign in.")
+        _print_harvey("You can change any of it later in Settings.")
 
     def _setup_cloudflare(self):
         """Configure Cloudflare Browser Rendering for deep crawling."""
@@ -422,6 +417,9 @@ class SetupWizard:
             self.config = await trainer.train(url, str(_save_file())) or {}
 
             if self.config:
+                if self.provider:
+                    self.config.setdefault("channels", {}).setdefault("email", {})[
+                        "provider"] = self.provider
                 _print_harvey("Training complete! I've got a solid understanding")
                 _print_harvey(f"of your product now. Check {_save_file().name} to review")
                 _print_harvey("what I learned — tweak anything that looks off.")
@@ -541,7 +539,7 @@ class SetupWizard:
             "channels": {
                 "email": {
                     "enabled": True,
-                    "provider": "instantly",
+                    "provider": self.provider or "gmail",
                     "max_daily_sends": 50,
                 },
             },
@@ -635,7 +633,7 @@ class SetupWizard:
         _print_harvey("sole trader needs consent where a limited company doesn't,")
         _print_harvey("and the address alone won't tell you which. Totally optional.")
         print("\n  Anything that isn't a clear yes waits in the Outbox with the reason.")
-        print("  It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly.")
+        print("  It checks mail sent through Gmail, Microsoft 365 or SMTP.")
         print("  Precleared receives each new recipient's address, your country, how")
         print("  the address was found, your product description and the recipient's")
         print("  country when the company's location makes it certain, else your")
@@ -796,6 +794,8 @@ class SetupWizard:
         if isinstance(email, dict):
             changes.append((("channels", "email", "max_daily_sends"),
                             email.get("max_daily_sends", 50)))
+        if self.provider:
+            changes.append((("channels", "email", "provider"), self.provider))
         if self.precleared:
             leaves(("compliance", "precleared"), dict(self.precleared))
 
@@ -856,7 +856,7 @@ class SetupWizard:
             ("Codex CLI (ChatGPT plan)" if self.brain_config.provider == "codex"
              else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
                                       else _check_claude_cli()),
-            "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
+            f"Sending mailbox ({self.provider or 'unchanged'})": bool(self.provider),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),
             "Product trained": _config_file().exists(),
             "Cold-email check (Precleared)": bool(
@@ -884,9 +884,10 @@ class SetupWizard:
   Before you send a single email:
     1. Use a dedicated sending domain (not your main domain) with
        SPF, DKIM, and DMARC configured.
-    2. Warm it up 2-4 weeks before real volume (Instantly has warmup).
-    3. Make sure your Instantly campaigns include an unsubscribe
-       option and your physical mailing address (CAN-SPAM).
+    2. Warm it up 2-4 weeks before real volume (harvey trulyinbox).
+    3. Set compliance.postal_address: every cold email carries it,
+       with the opt-out line and an unsubscribe header.
+    4. Read and confirm the cold-email acknowledgement: harvey ack.
     See the "Legal & Deliverability" section of the README.
 """)
         _print_harvey("I'm ready. Run 'harvey run' and I'll start closing.")

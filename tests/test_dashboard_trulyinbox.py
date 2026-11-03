@@ -72,7 +72,7 @@ def test_connect_without_a_sending_address_is_refused(client, monkeypatch):
     assert r.status_code == 400 and "sends from" in r.json()["message"] and not written
 
 
-def test_the_step_is_optional_on_instantly(client, monkeypatch):
-    monkeypatch.setattr(dash, "_current_provider", lambda: "instantly")
+def test_the_step_is_required_whatever_the_provider(client, monkeypatch):
+    monkeypatch.setattr(dash, "_current_provider", lambda: "smtp")
     step = _step(client)
-    assert not step["required"] and step["link"] == ti.AFFILIATE_URL
+    assert step["required"] and step["link"] == ti.AFFILIATE_URL

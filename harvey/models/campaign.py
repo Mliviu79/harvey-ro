@@ -22,13 +22,15 @@ class Campaign(BaseModel):
     id: str
     name: str = ""
     channel: str = "email"  # Harvey sends email only
+    # Set on a campaign an earlier release deployed to Instantly: it goes on
+    # there, never through Harvey's own mailbox.
     instantly_campaign_id: str = ""
     sequence: list[EmailStep] = Field(default_factory=list)
     status: str = "draft"  # draft/active/paused/completed
     prospect_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
-    # 'user': made on the Campaigns page; 'auto': made by the Writer (and
-    # every campaign from before campaigns were made by hand).
+    # 'user': made on the Campaigns page; 'auto': made by the Writer before
+    # campaigns were made by hand (kept readable, never made any more).
     origin: str = "auto"
     account_id: int | None = None
     profile_id: str = ""

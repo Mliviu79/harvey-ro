@@ -1,7 +1,6 @@
-"""Sender — deploys campaigns via Instantly, or sends natively via the
-configured mail provider (Gmail / SMTP) through the outbox approval ladder.
+"""Sender — sends through the configured mail provider (Gmail, SMTP,
+Microsoft 365) by way of the outbox approval ladder.
 
-Native flow:
   1. An active campaign's ready members are STAGED: merge variables
      rendered per member, one outbox row per (member, step) with a
      scheduled send_at, always waiting for review.
@@ -16,24 +15,24 @@ import logging
 import random
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of, operator_timezone, send_window_of,
+    compliance_of, operator_timezone, provider_notice, send_window_of,
 )
 from harvey import email_rules, unsubscribe
 from harvey.gate import autopilot_review, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
-from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
 from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
     ACK_NEEDED, AUTOPILOT_OFF_REASON, CAMPAIGN_NOT_STARTED, CAMPAIGN_PAUSED, CAMPAIGN_REVIEWS,
     COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
-    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, NO_SENDER_ADDRESS, NOTE_ADDED, READ_GAP_HELD,
+    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, NO_SENDER_ADDRESS, NOTE_ADDED, PRIVACY_LINK_HELD,
+    READ_GAP_HELD,
     READ_GAP_KEY, RECHECK_PREFIX, StateManager,
 )
 
@@ -67,10 +66,6 @@ BOUNCE_COUNT_KEY = "bounce_count"
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
-# Only prospects in these statuses may be added as leads. This guarantees
-# we never re-send to someone already contacted, replied, opted out, or lost.
-SENDABLE_STATUSES = {"new", "queued"}
-
 # Email confidence levels safe to send to. "verified" only by default;
 # "risky" (catch-all domains) is opt-in via config. Never send to a "guess"
 # or "invalid" address — that bounces and burns the sending domain.
@@ -94,7 +89,6 @@ class Sender:
         self.brain = brain
         self.state = state
         self.config = config
-        self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         # Optional per-recipient compliance check; None unless enabled.
         self.precleared = PreclearedClient.from_config(config, env)
@@ -265,37 +259,15 @@ class Sender:
         return True
 
     async def run(self):
-        """Deploy campaigns — natively through the outbox, or via Instantly."""
+        """Drain the outbox through the mail provider (nothing with a
+        provider Harvey doesn't support: config.provider_notice)."""
         if not self.config.channels.email.enabled:
             logger.info("Sender: Email channel disabled. Skipping.")
             return
-
-        if self.is_native:
-            await self._run_native()
+        if not self.is_native:
+            logger.warning(f"Sender: {provider_notice(self.config)}")
             return
-
-        logger.info("Sender: Checking for campaigns to deploy...")
-        # Only the Writer's drafts: a campaign the user made starts by hand,
-        # on a native provider (campaigns.start), never deployed from here.
-        draft_campaigns = [c for c in await self.state.get_campaigns_by_status("draft")
-                           if c.origin == "auto"]
-        if not draft_campaigns:
-            logger.info("Sender: No draft campaigns to deploy.")
-            return
-
-        # Enforce daily send limit
-        max_sends = self.config.channels.email.max_daily_sends
-        sends_today = await self._count_sends_today()
-        remaining = max_sends - sends_today
-        if remaining <= 0:
-            logger.info(f"Sender: Daily send limit reached ({sends_today}/{max_sends}). Skipping.")
-            return
-
-        for campaign in draft_campaigns:
-            try:
-                await self._deploy_campaign(campaign)
-            except Exception as e:
-                logger.error(f"Sender: Failed to deploy campaign {campaign.name}: {e}")
+        await self._run_native()
 
     def _validate_sequence(self, campaign) -> bool:
         """Never deploy a broken or empty sequence."""
@@ -316,248 +288,7 @@ class Sender:
                 return False
         return True
 
-    async def _reviewed_leads(self, prospects: list) -> list:
-        """The prospects whose merge fields pass the autopilot review, and
-        that the do-not-contact list doesn't bar."""
-        kept = []
-        for p in prospects:
-            fields = " \n".join(str(v or "") for v in (
-                p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
-            held = autopilot_review("", fields, self.config, recipient=p.email)
-            if hit := await self.state.suppression_check(p.email, firm=p.company_id,
-                                                         config=self.config):
-                held = [hit.text, *held]
-            if held:
-                logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
-            else:
-                kept.append(p)
-        return kept
-
-    async def _deploy_campaign(self, campaign):
-        """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
-        # Instantly owns campaign scheduling and has no per-message outbox
-        # approval here. Fail closed rather than silently bypass the setting,
-        # including retries of an already-created remote campaign.
-        await sync_sending_mode(self.config, self.state)
-        if getattr(self.config.channels.email, "require_approval", True):
-            logger.warning(
-                "Sender: Instantly campaign held because require_approval is true. "
-                "Use a native mail provider for outbox review, or explicitly set "
-                "channels.email.require_approval: false for Instantly autopilot."
-            )
-            return
-        logger.info(f"Sender: Deploying campaign '{campaign.name}'...")
-
-        # 0. Validate before touching the network
-        if not self._validate_sequence(campaign):
-            await self.state.update_campaign(campaign.id, status="failed")
-            return
-        # Instantly only deploys on autopilot, so nobody has read these
-        # templates: what a planted instruction would add holds the campaign.
-        held = [f"step {s.step} {r}" for s in campaign.sequence
-                for r in autopilot_review(s.subject, s.body, self.config)]
-        if held:
-            logger.warning(f"Sender: Instantly campaign '{campaign.name}' held for review: {held}")
-            key = "instantly_review_hold:" + campaign.id
-            if not await self.state.get_setting(key):
-                await self.state.set_setting(key, "1")
-                await self.state.log_action(
-                    action_type="escalation", agent="sender",
-                    details={"campaign_name": campaign.name,
-                             "reason": "campaign held: " + "; ".join(held)[:200]},
-                )
-            return
-
-        # 1. Create campaign in Instantly — or resume one from a previous
-        # partially-failed deploy. Never create a duplicate.
-        campaign_id = campaign.instantly_campaign_id
-        if campaign_id:
-            logger.info(
-                f"Sender: Campaign '{campaign.name}' already has Instantly ID "
-                f"{campaign_id}. Resuming deploy instead of recreating."
-            )
-        else:
-            instantly_campaign = await self.instantly.create_campaign(campaign.name)
-            if not instantly_campaign or not isinstance(instantly_campaign, dict):
-                logger.error(f"Sender: Failed to create Instantly campaign: {campaign.name}")
-                return
-
-            campaign_id = instantly_campaign.get("id")
-            if not campaign_id:
-                logger.error("Sender: No campaign ID returned from Instantly.")
-                return
-
-            # Persist the ID immediately so a crash mid-deploy resumes this
-            # campaign instead of creating a second one (double-send guard).
-            await self.state.update_campaign(campaign.id, instantly_campaign_id=campaign_id)
-            campaign.instantly_campaign_id = campaign_id
-
-        # 2. Set email sequence
-        sequences = [
-            {
-                "subject": step.subject.strip(),
-                "body": self._with_footer(step.body.strip()),
-                "wait": step.delay_days,
-            }
-            for step in campaign.sequence
-        ]
-
-        await self.state.remember_footer_lines(compliance_footer_lines(self.config))
-        result = await self.instantly.set_campaign_emails(campaign_id, sequences)
-        if result is None:
-            logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
-            return
-
-        # 3. Add leads — validated, deduped, never-contacted, deliverable-only
-        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
-        sendable_email = (
-            SENDABLE_EMAIL_STATUSES_WITH_RISKY if allow_risky
-            else SENDABLE_EMAIL_STATUSES
-        )
-        prospects = []
-        seen_emails: set[str] = set()
-        skipped_unverified = 0
-        for prospect_id in campaign.prospect_ids:
-            prospect = await self.state.get_prospect(prospect_id)
-            if not prospect or not prospect.email:
-                continue
-            email = prospect.email.strip().lower()
-            if not EMAIL_RE.match(email):
-                logger.warning(f"Sender: Skipping invalid email '{prospect.email}'")
-                continue
-            if email in seen_emails:
-                continue
-            if prospect.status not in SENDABLE_STATUSES:
-                # Already contacted / replied / opted out — never double-send.
-                logger.debug(
-                    f"Sender: Skipping {email} (status '{prospect.status}' is not sendable)."
-                )
-                continue
-            if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
-                continue  # the user emailed them by hand
-            # Deliverability gate: never send to unverified/guessed addresses —
-            # bounces are the fastest way to torch a sending domain.
-            if (prospect.email_status or "guess") not in sendable_email:
-                skipped_unverified += 1
-                logger.debug(
-                    f"Sender: Skipping {email} (email_status "
-                    f"'{prospect.email_status or 'guess'}' not deliverable)."
-                )
-                continue
-            seen_emails.add(email)
-            prospects.append(prospect)
-
-        if skipped_unverified:
-            logger.info(
-                f"Sender: Held back {skipped_unverified} prospect(s) with "
-                f"unverified emails from '{campaign.name}'."
-            )
-
-        if not prospects:
-            # Retry path: leads were already staged and marked 'contacted'
-            # on a previous cycle but activation failed. Just activate.
-            already_staged = False
-            for pid in campaign.prospect_ids:
-                p = await self.state.get_prospect(pid)
-                if p and p.status == "contacted":
-                    already_staged = True
-                    break
-            if already_staged:
-                logger.info(
-                    f"Sender: Leads for '{campaign.name}' already staged. Retrying activation."
-                )
-                if await self.instantly.activate_campaign(campaign_id) is not None:
-                    await self.state.update_campaign(campaign.id, status="active")
-                    logger.info(f"Sender: Campaign '{campaign.name}' activated on retry.")
-                return
-            logger.warning(f"Sender: No valid prospects for campaign {campaign.name}")
-            return
-
-        # Check remaining daily send budget
-        max_sends = self.config.channels.email.max_daily_sends
-        sends_today = await self._count_sends_today()
-        remaining = max_sends - sends_today
-        if remaining <= 0:
-            logger.info(f"Sender: Daily limit reached. Deferring campaign '{campaign.name}'.")
-            return
-        if len(prospects) > remaining:
-            logger.info(f"Sender: Capping leads from {len(prospects)} to {remaining} (daily limit).")
-            prospects = prospects[:remaining]
-
-        # Instantly fills these into the templates on its side, unseen:
-        # scraped text carrying a planted link keeps that lead out.
-        prospects = await self._reviewed_leads(prospects)
-        if not prospects:
-            return
-        leads = [
-            {
-                "email": p.email.strip().lower(),
-                "first_name": p.first_name,
-                "last_name": p.last_name,
-                "company_name": p.company,
-                "variables": {
-                    "title": p.title,
-                    "personalization": p.personalization_notes,
-                },
-            }
-            for p in prospects
-        ]
-
-        result = await self.instantly.add_leads(campaign_id, leads)
-        if result is None:
-            logger.error(f"Sender: Failed to add leads to campaign {campaign_id}")
-            return
-
-        # Mark prospects as contacted BEFORE activation: if activation
-        # succeeds but this write failed, a retry would re-add the same
-        # leads. Better to under-count than double-send.
-        for prospect in prospects:
-            await self.state.update_prospect_status(prospect.id, "contacted")
-
-        # 4. Activate campaign
-        result = await self.instantly.activate_campaign(campaign_id)
-        if result is None:
-            logger.error(
-                f"Sender: Failed to activate campaign {campaign_id}. "
-                "Leads are staged; will retry activation next cycle."
-            )
-            return
-
-        # 5. Update our records
-        await self.state.update_campaign(
-            campaign.id,
-            instantly_campaign_id=campaign_id,
-            status="active",
-        )
-
-        await self.state.log_action(
-            action_type="send_campaign",
-            agent="sender",
-            details={
-                "campaign_name": campaign.name,
-                "instantly_campaign_id": campaign_id,
-                "leads_added": len(leads),
-            },
-        )
-
-        logger.info(
-            f"Sender: Campaign '{campaign.name}' deployed to Instantly "
-            f"with {len(leads)} leads. Campaign ID: {campaign_id}"
-        )
-
-    async def _count_sends_today(self) -> int:
-        """Count how many prospects were contacted today."""
-        import aiosqlite
-        today = date.today().isoformat()
-        async with aiosqlite.connect(self.state.db_path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM prospects WHERE status = 'contacted' AND updated_at LIKE ?",
-                (f"{today}%",),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else 0
-
-    # ── Native provider flow (Gmail / SMTP via the outbox) ──
+    # ── The outbox ──
 
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
@@ -574,7 +305,8 @@ class Sender:
         # the user is staged by the campaign cycle, after its drafts are
         # written (agents/campaigner.py). Staging goes on while sending is
         # paused: it only fills the review queue (nothing is approved until
-        # a drain that sends it, promote_for_autopilot).
+        # a drain that sends it, promote_for_autopilot). One an earlier
+        # release deployed to Instantly goes on there, never from here.
         for campaign in await self.state.get_campaigns_by_status("active"):
             if campaign.origin != "auto" or campaign.instantly_campaign_id:
                 continue
@@ -678,7 +410,8 @@ class Sender:
                 continue
             # A first email to a personal address carries where the address
             # was found (email_rules), decided now and kept on the row.
-            _, note = await self.state.personal_address(email)
+            _, note = await self.state.personal_address(
+                email, privacy_url=compliance_of(self.config).privacy_url)
 
             # With a send window, each email is planned for the recipient's
             # office hours; follow-ups keep their delay, then move into it.
@@ -691,18 +424,22 @@ class Sender:
                     send_at = next_send_time(send_at, zone, window)
                 body = self._render(step.body, prospect)
                 first = int(step.step) <= 1
+                if first:
+                    body = email_rules.with_note(body, note)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
                     step=step.step,
                     to_email=email,
                     subject=self._render(step.subject, prospect),
-                    body=email_rules.with_note(body, note) if first else body,
+                    body=body,
                     send_at=send_at.isoformat(),
                     status="pending_review",
                     provider=self.provider.name,
                     source_note=note if first else "",
                     account_id=campaign.account_id or 1,
+                    error=PRIVACY_LINK_HELD if first and note and email_rules.privacy_crowded(
+                        body, compliance_of(self.config).privacy_url) else "",
                 )
                 if item_id:
                     staged += 1
@@ -736,10 +473,19 @@ class Sender:
             return body
         return body.rstrip() + "\n\n" + footer
 
+    def _disclosure(self) -> str:
+        return compliance_of(self.config).ai_disclosure_line.strip()
+
     def _outgoing_body(self, item: dict) -> str:
-        """The exact body that goes out: cold email gets the footer, replies don't."""
+        """The exact body that goes out: cold email gets the footer; an
+        answer autopilot approved (nobody read it) gets the AI disclosure
+        line; an answer you approved goes as you approved it."""
         if item["kind"] == "sequence":
             return self._with_footer(item["body"])
+        line = self._disclosure()
+        if (item["kind"] == "reply" and item.get("approved_by") == "autopilot" and line
+                and not item["body"].rstrip().endswith(line)):
+            return item["body"].rstrip() + "\n\n" + line
         return item["body"]
 
     async def _follow_up_order(self, item: dict, prospect=None) -> str | tuple[str, str] | None:
@@ -881,7 +627,8 @@ class Sender:
                     and not await self._sending_address():
                 return "approved", NO_SENDER_ADDRESS
             if int(item["step"]) <= 1:
-                personal, note = await self.state.personal_address(item["to_email"])
+                personal, note = await self.state.personal_address(
+                    item["to_email"], privacy_url=compliance_of(self.config).privacy_url)
                 note = item.get("source_note") or note
                 if personal and not (item.get("source_note")
                                      and item["source_note"] in (item["body"] or "")):
@@ -892,6 +639,10 @@ class Sender:
                         item["id"], body=email_rules.with_note(item["body"], note),
                         source_note=note)
                     return "pending_review", NOTE_ADDED
+                if personal and email_rules.privacy_crowded(
+                        item["body"], compliance_of(self.config).privacy_url):
+                    # The gate would fail it for good: it waits for you.
+                    return "pending_review", PRIVACY_LINK_HELD
         gate = pre_send_check(
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
@@ -920,9 +671,12 @@ class Sender:
             # instruction would add sends it back to you instead.
             # (The source note is Harvey's fixed line, naming the site the
             # address was found on: not a link a model added.)
+            # (Nor is the disclosure line under an answer: the operator's.)
             body = self._outgoing_body(item)
             if item.get("source_note"):
                 body = body.replace(item["source_note"], "")
+            if item["kind"] == "reply" and self._disclosure():
+                body = body.replace(self._disclosure(), "")
             held = autopilot_review(item["subject"], body, self.config,
                                     recipient=item["to_email"])
             if held:
@@ -969,16 +723,32 @@ class Sender:
                 await self.state.set_campaign_member(item["campaign_id"], item["to_email"],
                                                      "stopped", blocked[1])
 
-    async def _promote(self, due_before: str, limit: int) -> None:
-        """On autopilot, approve the staged cold email this drain may send
-        (state.promote_for_autopilot): approval happens at send time, after
-        the autopilot review, never when the email was staged."""
+    async def _end_after_failed_send(self, item: dict, *, maybe_sent: bool) -> None:
+        """A failed send is never retried, so a cold email's member ends
+        there (campaigns.stop_after), as when a send is cut off: nothing
+        follows an email that may have arrived, or one that never went, and
+        a campaign that doesn't roll can finish."""
+        if item["kind"] != "sequence" or not item.get("campaign_id"):
+            return
+        from harvey import campaigns
+
+        await self.state.campaigns_call(
+            campaigns.stop_after, item["campaign_id"], item["to_email"],
+            int(item.get("step") or 1),
+            campaigns.CUT_OFF if maybe_sent else campaigns.SEND_FAILED)
+
+    async def _promote(self, due_before: str, limit: int, kind: str = "sequence") -> None:
+        """On autopilot, approve the staged email of ``kind`` this drain may
+        send (state.promote_for_autopilot): approval happens at send time,
+        after the autopilot review, never when the email was staged or the
+        Handler queued its answer."""
         await sync_sending_mode(self.config, self.state)
         if getattr(self.config.channels.email, "require_approval", True):
             return
-        promoted = await self.state.promote_for_autopilot(due_before, limit)
+        promoted = await self.state.promote_for_autopilot(due_before, limit, kind=kind)
         if promoted:
-            logger.info(f"Sender: autopilot approved {promoted} staged email(s) to send now.")
+            what = "answer(s)" if kind == "reply" else "staged email(s)"
+            logger.info(f"Sender: autopilot approved {promoted} {what} to send now.")
 
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
@@ -1011,6 +781,8 @@ class Sender:
         # No more than the cold cap leaves for today: what it would hold
         # stays waiting for review, not shown approved.
         await self._promote(now, max(min(budget * 3, cold_left), 0))
+        if not self.cold_only:
+            await self._promote(now, budget * 3, kind="reply")
         # In quiet hours only cold email can go, so only cold email is
         # fetched: replies due ahead of it can't fill the page.
         due = await self.state.get_outbox(
@@ -1222,12 +994,14 @@ class Sender:
                     item["id"], status="failed",
                     error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
                 )
+                await self._end_after_failed_send(item, maybe_sent=True)
                 logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
                 continue
             if not result.ok:
                 await self.state.update_outbox_item(
                     item["id"], status="failed", error=result.error[:300]
                 )
+                await self._end_after_failed_send(item, maybe_sent=False)
                 continue
 
             sent += 1
@@ -1236,8 +1010,11 @@ class Sender:
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             # A note that the check moved it back no longer applies.
             # Nor one that it waited for a complete mailbox read.
+            # Nor one that its campaign was paused or not started yet.
             note = {"error": ""} if ((item.get("error") or "").startswith(RECHECK_PREFIX)
-                                     or item.get("error") == READ_GAP_HELD) else {}
+                                     or item.get("error") in (
+                                         READ_GAP_HELD, CAMPAIGN_PAUSED,
+                                         CAMPAIGN_NOT_STARTED)) else {}
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body,
                 message_id=result.message_id, thread_ref=result.thread_ref, **note,
@@ -1254,7 +1031,7 @@ class Sender:
                     if convo:
                         from harvey.models.conversation import Message
                         convo.thread.append(
-                            Message(sender="harvey", content=item["body"])
+                            Message(sender="harvey", content=body)
                         )
                         await self.state.update_conversation(
                             convo.id, thread_json=convo.thread_json()

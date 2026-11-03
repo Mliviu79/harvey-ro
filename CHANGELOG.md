@@ -9,6 +9,33 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The cold-email acknowledgement on the dashboard.** Settings → Sending
+  shows whether it was given (version, when, from where) and opens a dialog
+  with the whole text, in the page's language, where you type `accept`;
+  starting your first campaign opens the same dialog instead of a browser
+  prompt, and starts it once confirmed. Today's card sends you there. The
+  text says that the line naming an address's source isn't all GDPR
+  art. 14 asks for.
+- **A campaign's record (evidență).** Its legitimate-interest note, the
+  acknowledgement it started under (version and time), every address with
+  how it joined (start, roll, by hand) and why it left, every email sent
+  (the answers in its conversations too) and the opt-outs that reach its
+  addresses (their own, their domain's or their firm's), as CSV or JSON: **Evidența** in the
+  campaign's panel, `harvey campaigns export ID`, or
+  `/api/campaigns/{id}/record.csv|json`. The note can be edited in the
+  panel while the campaign is a draft; once it has started the note stays
+  the one it started under, whatever asks to change it.
+- **A line under answers autopilot sent.** An answer that went out with
+  nobody reading it carries `compliance.ai_disclosure_line` (*Acest
+  răspuns a fost scris cu ajutorul unui asistent AI.* by default; blank
+  turns it off). Cold email and answers you approved go as they are.
+- **Your privacy page after the source line.** `compliance.privacy_url` is
+  added after the line saying where a personal address was found (*Cine
+  suntem și cum vă puteți opune: …*), in its first email only. It counts as
+  that email's one link: a first email that has another (a booking link,
+  say) waits for you in the Outbox, from staging, instead of failing at
+  send.
+
 - **Campaigns you make.** The Campaigns page has a new-campaign wizard: an
   audience (a saved Contacts filter, or the page's current one), the offer
   and its sequence (write it, or have it generated and edit it), the
@@ -17,16 +44,14 @@ minor versions can still change behaviour.
   note, a sequence and the cold-email acknowledgement, and takes the
   audience as it is then; a rolling campaign takes new matches at most
   hourly. Each campaign has its members and their progress, pause, resume,
-  stop and archive; once started, its note can be edited but not shortened
-  below 80 characters. A campaign that doesn't roll finishes when no member
+  stop and archive; once started, its note stays as it was. A campaign that doesn't roll finishes when no member
   is left open, also when its audience matched no one. Each cycle writes
   at most 8 first emails across all campaigns, and only while the first
   emails waiting to go are fewer than two days of today's cold cap, so
   drafting (a model call each) never runs ahead of sending. A paused
   campaign's approved emails wait without holding up other campaigns'.
-  `harvey campaigns` does the same from the terminal. New campaigns need
-  Gmail, SMTP or Microsoft 365; on Instantly they are refused, and a draft
-  you made is never deployed there.
+  `harvey campaigns` does the same from the terminal. Campaigns need
+  Gmail, SMTP or Microsoft 365.
 - **Audiences.** Contacts → Actions → *Salvează ca public* keeps the page's
   filters under a name (Campaigns → Publicuri, `harvey audiences`), read by
   the same code as the page, so a campaign gets exactly what the page
@@ -37,8 +62,8 @@ minor versions can still change behaviour.
   catch-all (with `send_to_risky`) or not yet checked, linked to a live
   firm with trust confirmed or likely, not on the do-not-contact list, not
   in another active campaign's sequence or sent cold email in the last 90
-  days (or marked contacted with no cold email on file, as Instantly
-  leaves it), and neither its person nor anyone at its firm has answered;
+  days (or marked contacted with no cold email on file, as an earlier
+  release's Instantly campaigns or a hand send leave it), and neither its person nor anyone at its firm has answered;
   the preview counts what each rule
   left out. Unchecked addresses are checked by a verifier before anything
   is written for them (a roll's, at most 50 a campaign a day).
@@ -272,10 +297,7 @@ minor versions can still change behaviour.
   `Jane Doe <jane@acme.example>` (that address) and `acme.example` behave
   alike; an entry that names nothing is a config error, not a silent no-op.
   An edit counts at once in a running Harvey. A listed person who writes
-  back goes to you without a draft, and `harvey export` leaves them out. On
-  Instantly, which has no Outbox, listed leads are left out of the upload
-  and a reply to one goes to you; a lead Instantly already has must be
-  removed there.
+  back goes to you without a draft, and `harvey export` leaves them out.
 
 - **Discovery skips do-not-contact companies too.** The same
   `compliance.do_not_contact` list is now applied while discovering, before a
@@ -410,13 +432,12 @@ minor versions can still change behaviour.
 - **A cold-email ramp for new domains** (`channels.email.warmup`). From
   `start_date`, no cold email goes out for `min_days`; then the cold cap starts
   at `start_sends` and climbs by `daily_increase` a day up to
-  `max_daily_sends`, counted per local day. Gmail, Microsoft and SMTP only:
-  Instantly has its own warmup and per-account limits. Replies are never
+  `max_daily_sends`, counted per local day. Replies are never
   held. Off unless `start_date` is set. Both based on #18 by Tariz Shahid.
 - **A postal address and opt-out line under every cold email** (CAN-SPAM).
   Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
   defaults to *Not interested? Reply "no thanks" and I won't email again.*
-  Both are added when the email sends (native providers and Instantly), never
+  Both are added when the email sends, never
   to replies, and the Outbox shows them under each draft; "Open in Gmail"
   includes them too. Without an address (or with the opt-out line turned
   off), cold email still sends, and `harvey run`, `harvey status` and the
@@ -504,6 +525,21 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Autopilot approves an answer when it goes, as it does cold email.** The
+  Handler's answers always wait in the Outbox; on autopilot the drain that
+  sends one approves it then, after the autopilot review, so an answer
+  queued while sending was paused isn't sent on resume without that
+  review. The first answer after you undo an opt-out still waits for you.
+- **A rejected cold email ends that address's place in its campaign**, and
+  so does one whose send was cut off mid-way (it may have arrived): what it
+  had queued after it is cancelled, the reason shows on the campaign
+  (*respins de tine*, *trimitere întreruptă*), and a campaign that doesn't
+  roll can finish.
+- **An email you approve while its campaign is paused says why it waits**,
+  like the ones the pause found approved; resuming clears it.
+- **`harvey setup` asks which mailbox you send from** (Gmail, SMTP or
+  Microsoft 365) and its keys, instead of Instantly; training writes
+  `provider: gmail`, and a config with no provider means Gmail.
 - **The opt-out line is Romanian by default** (*Nu vă interesează?
   Răspundeți „stop" și nu vă mai scriu.*), and Romanian opt-out words
   (*dezabonare*, *nu mai doresc să primesc*, *nu ne mai trimiteți*,
@@ -552,11 +588,10 @@ minor versions can still change behaviour.
   while sending is paused, and resuming never sends a backlog nobody
   looked at without that review.
 - **Each heartbeat reads replies, drains the Outbox, then works the
-  campaigns** (Gmail, SMTP, Microsoft 365): no action is chosen any more,
-  so an open conversation or paused sending no longer stops writing. The
-  Writer no longer makes campaigns of its own on these providers, and the
-  audience no longer fills a global pool: campaigns take their members.
-  Instantly keeps its old flow.
+  campaigns**: no action is chosen any more, so an open conversation or
+  paused sending no longer stops writing. The Writer no longer makes
+  campaigns of its own, and the audience no longer fills a global pool:
+  campaigns take their members.
 - **Schema 27, in place.** Sending accounts, audiences, campaign members
   and the campaigns' new columns are added when Harvey opens the file. A
   campaign the Writer made earlier stays as it was ('made by Harvey'), its
@@ -743,6 +778,18 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Conversations from before replies were attributed land in their
+  campaign** (schema 28, in place): the campaign of the cold email each one
+  answers, sent before it began (one older than every cold email stays
+  without a campaign).
+- **A send that failed ends its member.** A send that raised (it may have
+  gone out) or that the mailbox refused is never retried, so its member
+  ends there and what it had queued after it is cancelled, as for a send
+  cut off mid-way: a campaign that doesn't roll can finish.
+- **What waits for you stays waiting.** Approve all leaves the first answer
+  since you undid an opt-out for a look of its own; what an undone hand
+  send brings back waits for you even on autopilot; an answer an earlier
+  release queued after an undo gets the same note on upgrade.
 - **`git pull` no longer refuses because Harvey changed `harvey.yaml`.**
   Every config change now goes to `harvey.local.yaml`: `harvey setup`
   (including the training it runs), the dashboard's sending switch and
@@ -862,8 +909,7 @@ minor versions can still change behaviour.
   or send cold email to them later; the Outbox and log say which colleague
   replied. Colleagues are the same company; or, when Harvey has no company
   for one of them, the same email domain, and only if it's that company's
-  own domain, never a shared one like gmail.com or rr.com. Instantly
-  campaigns Harvey creates turn on Instantly's own `stop_for_company`.
+  own domain, never a shared one like gmail.com or rr.com.
 
 - **DataForSEO SERP sends a location.** It sent only a keyword, but
   DataForSEO requires a location on every task, so searches failed or came
@@ -926,9 +972,7 @@ minor versions can still change behaviour.
   address at a domain that isn't yours (sending domain, booking link, or
   `channels.email.link_domains`), or quotes Harvey's own instructions.
   Bare domains like `example.com/x` count as links. Approving it yourself
-  sends it. On Instantly, replies now run the pre-send gate too and a held
-  one goes to you; a campaign template that would be held isn't deployed.
-  The model never had tools, files or network to act with, so this was
+  sends it. The model never had tools, files or network to act with, so this was
   never more than what it wrote.
 - **Opted-out contacts are no longer in the prospect CSV.** Someone who
   replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
@@ -948,8 +992,7 @@ minor versions can still change behaviour.
   their row in Contacts (or on the conversation) shows it, and **Undo
   opt-out** reverses a mistaken one after a confirm: they become *replied*,
   so nothing is sent on its own, and Harvey's answer to their next reply
-  waits for your approval even with `require_approval: false` (on
-  Instantly, which can't hold a reply, that conversation comes to you). Opt-outs from before this show their last message instead, and
+  waits for your approval even with `require_approval: false`. Opt-outs from before this show their last message instead, and
   every undo is logged.
 - **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
   wrote a CR/LF inside an address straight to the SMTP server, so an address
@@ -1000,13 +1043,6 @@ minor versions can still change behaviour.
   `HTTP_PROXY`/`HTTPS_PROXY`, so it can't be routed around that boundary; mail
   and API integrations are unchanged. `harvey train` refuses local or intranet
   URLs and says so.
-- **Instantly users: check `require_approval`.** Instantly has no per-email
-  approval queue, so with `channels.email.require_approval: true` (the default)
-  Harvey now holds campaign deployment and hands replies to a human instead of
-  silently bypassing the setting. `harvey run` and `harvey status` say when this
-  is happening; prospecting and drafting carry on (drafts wait, using model
-  quota, until sending is allowed). Set `require_approval: false` for
-  Instantly autopilot.
 - Disable LinkedIn by default in the model, sample config, and product trainer;
   save the setup wizard's explicit LinkedIn choice when updating a config.
   Answering "no" to LinkedIn when re-running `harvey setup` now turns it off
@@ -1019,6 +1055,26 @@ minor versions can still change behaviour.
 
 ### Removed
 
+- **Instantly.** Harvey sends and reads mail through Gmail, SMTP or
+  Microsoft 365 only, where every email passes the Outbox, the
+  do-not-contact list, the source note and the unsubscribe header. Gone:
+  the Instantly client, deploying campaigns and reading replies there,
+  `INSTANTLY_API_KEY` in setup and Settings (a key left in `.env` is kept
+  and ignored), and the Instantly test. A config that still says
+  `provider: instantly` loads; nothing is sent or read, and the log,
+  `harvey status`, Today and the setup checklist say, in Romanian and
+  English, to choose gmail, smtp or microsoft. Finding contacts and
+  everything outside email keep working. Campaigns an earlier Harvey
+  deployed to Instantly keep running there until you stop them in
+  Instantly, and are never staged through your own mailbox: the people
+  it never wrote to leave it (*deployed to Instantly*); its others still
+  count as contacted. A prospect it couldn't write for is new again.
+- **The Writer's automatic campaigns.** The heartbeat's one-action-per-cycle
+  choice, the Writer grouping new prospects into a campaign per industry,
+  the Audience turning every email contact into a prospect each cycle, and
+  `harvey retry-writes` (only that flow gave up on a prospect). Every cold
+  email now comes from a campaign you made; one the Writer made earlier
+  stays readable, and an active one is still sent.
 - **The old prospecting code the contact finder replaced.** Nothing called it
   any more: the Scout agent (`harvey/agents/scout.py`: its search-engine,
   Hunter, LinkedIn, job-board and company-website strategies and its contact

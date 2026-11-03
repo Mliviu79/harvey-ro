@@ -164,6 +164,29 @@ def source_note(facts: dict) -> str:
     return NOTE_OTHER
 
 
+# After the source line, for a personal address, when compliance.privacy_url is set.
+NOTE_PRIVACY = "Cine suntem și cum vă puteți opune: {url}"
+
+
+def with_privacy(note: str, privacy_url: str = "") -> str:
+    """The source note with the operator's privacy page after it (only a
+    personal address gets a note, so only it gets the link)."""
+    url = (privacy_url or "").strip()
+    if not note or not url or url in note:
+        return note
+    return note + " " + NOTE_PRIVACY.format(url=url)
+
+
+def privacy_crowded(body: str, privacy_url: str = "") -> bool:
+    """True when a first email carries the privacy page and another link:
+    the page counts against the gate's one link (gate.MAX_LINKS), so such
+    an email would fail at send. It waits for you to take the other out."""
+    from harvey.gate import MAX_LINKS, URL_RE
+
+    url = (privacy_url or "").strip()
+    return bool(url) and url in (body or "") and len(URL_RE.findall(body or "")) > MAX_LINKS
+
+
 def with_note(body: str, note: str) -> str:
     """A first email's body with its source note as the last paragraph
     (the footer goes under it at send time); unchanged when it has it."""

@@ -882,7 +882,7 @@ What prospects do instead of buying a solution like ours:
             "channels": {
                 "email": {
                     "enabled": True,
-                    "provider": "instantly",
+                    "provider": "gmail",
                     "max_daily_sends": 50,
                     # The trained site is yours: autopilot may link to it.
                     "link_domains": [email_domain],

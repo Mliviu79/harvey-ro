@@ -87,7 +87,7 @@ class WarmupConfig(BaseModel):
     """Cold-email ramp for a new domain or mailbox.
 
     Harvey doesn't run a warmup network itself; that needs a pool of real
-    inboxes (Instantly, Lemwarm, Mailreach...). This is the other half: no
+    inboxes (TrulyInbox, Lemwarm, Mailreach...). This is the other half: no
     cold email goes out for ``min_days`` after ``start_date``, then the cold
     cap climbs from ``start_sends`` by ``daily_increase`` a day until it
     reaches ``max_daily_sends``. Replies are never held. Empty
@@ -212,18 +212,18 @@ def operator_timezone(config) -> str:
 
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
-    # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
-    # "microsoft" (Microsoft 365 / Outlook via Graph), or "smtp" (any
-    # SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
-    provider: str = "instantly"
+    # "gmail" (Gmail/Workspace via API — recommended), "microsoft"
+    # (Microsoft 365 / Outlook via Graph), or "smtp" (any SMTP+IMAP mailbox:
+    # AgentMail, Fastmail, ...). Anything else (Instantly, which Harvey no
+    # longer supports) sends and reads nothing: provider_notice says why.
+    provider: str = "gmail"
     max_daily_sends: int = 50
     # When True, also send to catch-all ("risky") domains, not just verified
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
     send_to_risky: bool = False
-    # Native providers queue mail for approval. Instantly cannot use that
-    # outbox, so it holds campaigns and escalates replies while this is true.
-    # Set false explicitly for full autopilot once you trust the output.
+    # Every email waits in the Outbox for approval. Set false explicitly for
+    # autopilot once you trust the output.
     require_approval: bool = True
     # Your own domains besides the sending address's and the booking link's
     # (e.g. your main site when you send from a secondary domain). On
@@ -232,12 +232,10 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
-    # New domain? Ramp cold email up slowly (see WarmupConfig). Native
-    # providers only: Instantly has its own warmup and per-account limits.
+    # New domain? Ramp cold email up slowly (see WarmupConfig).
     warmup: WarmupConfig = WarmupConfig()
     # Send cold email only in office hours, in each recipient's own time
-    # zone (see SendWindowConfig). None: no window, as before. Native
-    # providers only; Instantly schedules its own sends.
+    # zone (see SendWindowConfig). None: no window, as before.
     send_window: SendWindowConfig | None = None
 
     @field_validator("warmup", mode="before")
@@ -266,27 +264,42 @@ def cold_daily_cap(email_config, today: _date | None = None) -> int:
     return email_config.max_daily_sends
 
 
-def legacy_sending_held(config) -> bool:
-    """True when Instantly is the provider and approval is required.
+def provider_notice(config) -> str:
+    """Why no email can go out or be read with the configured provider, or
+    "" when it is one Harvey supports. Instantly was removed: a config still
+    naming it keeps everything outside email working, and says what to pick."""
+    from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 
-    Instantly has no per-email approval queue, so with require_approval on
-    Harvey holds campaign deployment and hands replies to a human.
-    """
     email = getattr(getattr(config, "channels", None), "email", None)
-    return (getattr(email, "provider", "") == "instantly"
-            and bool(getattr(email, "require_approval", True)))
+    if not getattr(email, "enabled", False):
+        return ""
+    provider = (getattr(email, "provider", "") or "").strip().lower()
+    if provider in NATIVE_PROVIDERS:
+        return ""
+    if provider == "instantly":
+        return (
+            "Instantly nu mai e suportat: alege gmail, smtp sau microsoft la "
+            "channels.email.provider (Setări → Trimitere, sau harvey.local.yaml). Până "
+            "atunci nu se trimite și nu se citește niciun email; restul lui Harvey merge "
+            "mai departe. Campaniile pornite deja în Instantly continuă acolo până le "
+            "oprești în Instantly. / Instantly is no longer supported: set "
+            "channels.email.provider to gmail, smtp or microsoft (Settings → Sending, or "
+            "harvey.local.yaml). Until then no email is sent or read; the rest of Harvey "
+            "keeps working. Campaigns already running in Instantly go on there until you "
+            "stop them in Instantly."
+        )
+    return (
+        f"Furnizorul de email „{provider}” nu e cunoscut: alege gmail, smtp sau microsoft "
+        "la channels.email.provider. Până atunci nu se trimite și nu se citește niciun "
+        f"email. / The email provider '{provider}' isn't one Harvey knows: set "
+        "channels.email.provider to gmail, smtp or microsoft. Until then no email is "
+        "sent or read."
+    )
 
 
 def sending_notice(config) -> str:
     """A plain-language warning when outbound sending is held by config, or ""."""
-    if not legacy_sending_held(config):
-        return ""
-    return (
-        "Instantly sending is held: channels.email.require_approval is true, and "
-        "Instantly has no approval queue. Campaigns stay as drafts and replies go to "
-        "a human (dashboard Activity tab). Set require_approval: false to let Instantly "
-        "send automatically, or switch to gmail, microsoft or smtp to approve each email."
-    )
+    return provider_notice(config)
 
 
 class ChannelsConfig(BaseModel):
@@ -376,6 +389,8 @@ class PreclearedConfig(BaseModel):
 # recognised as its own text in a quoted reply.
 DEFAULT_OPT_OUT_LINE = 'Nu vă interesează? Răspundeți \u201estop" și nu vă mai scriu.'
 ENGLISH_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# Under an answer autopilot sent with no one reading it first.
+DEFAULT_AI_DISCLOSURE_LINE = "Acest răspuns a fost scris cu ajutorul unui asistent AI."
 # The replies the Handler always honours as an opt-out on their own; an
 # opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"',
 # 'Răspundeți „stop"').
@@ -403,11 +418,36 @@ class ComplianceConfig(BaseModel):
     # send time, so it holds for an email a human already approved, and for
     # replies as well as cold mail — "never contact" means never.
     do_not_contact: list[str] = []
+    # Your privacy page, added after the source line of a first email to a
+    # personal address only (GDPR art. 14 asks for more than the source: who
+    # you are, the purpose, the legal basis, the right to object). It is a
+    # link, so it counts against the gate's one link. "" leaves it off.
+    privacy_url: str = ""
+    # The line under an answer that autopilot sent by itself (never under
+    # cold email, or an answer you approved). "" leaves it off.
+    ai_disclosure_line: str = DEFAULT_AI_DISCLOSURE_LINE
 
-    @field_validator("postal_address", "opt_out_line", mode="before")
+    @field_validator("postal_address", "opt_out_line", "privacy_url", "ai_disclosure_line",
+                     mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
         return "" if v is None else v
+
+    @field_validator("privacy_url")
+    @classmethod
+    def _privacy_link(cls, v: str) -> str:
+        v = v.strip()
+        if v and not re.fullmatch(r"https?://[^\s<>\"']+\.[^\s<>\"']+", v):
+            raise ValueError("privacy_url must be a web address (https://...), or empty")
+        return v
+
+    @field_validator("ai_disclosure_line")
+    @classmethod
+    def _plain_disclosure(cls, v: str) -> str:
+        v = " ".join(v.split())
+        if any(bit in v.lower() for bit in ("http", "www.", "@")):
+            raise ValueError("ai_disclosure_line can't contain a link or an email address")
+        return v[:300]
 
     @field_validator("do_not_contact", mode="before")
     @classmethod
@@ -636,7 +676,6 @@ class EnvConfig(BaseModel):
     # come in as extra fields, lower case: a new module needs no edit here.
     model_config = ConfigDict(extra="allow")
 
-    instantly_api_key: str = ""
     # Discovery providers
     dataforseo_login: str = ""
     dataforseo_password: str = ""
@@ -769,7 +808,6 @@ def load_env() -> EnvConfig:
     """Load environment variables from .env file."""
     load_dotenv()
     env = EnvConfig(
-        instantly_api_key=os.getenv("INSTANTLY_API_KEY", "").strip(),
         dataforseo_login=os.getenv("DATAFORSEO_LOGIN", "").strip(),
         dataforseo_password=os.getenv("DATAFORSEO_PASSWORD", "").strip(),
         dataforseo_sandbox=os.getenv("DATAFORSEO_SANDBOX", "").strip(),

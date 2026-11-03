@@ -6,15 +6,12 @@ Based on community PR #13 by Camilo Cruz.
 
 from contextlib import closing
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
-from harvey.agents.sender import Sender
-from harvey.config import ComplianceConfig, EnvConfig, compliance_notice
+from harvey.config import ComplianceConfig, compliance_footer_lines, compliance_notice
 from harvey.gate import pre_send_check
 from harvey.integrations.mail_provider import InboundMessage, strip_quoted_reply
-from harvey.models.campaign import Campaign, EmailStep
 from tests.test_outbox_native import (  # noqa: F401  (state is a fixture)
     FakeProvider, StubBrain, make_handler, make_sender, seed_prospect, state,
 )
@@ -114,24 +111,6 @@ def test_the_gate_refuses_cold_email_missing_its_configured_address():
     # Replies never need it.
     assert pre_send_check("jane@acme.example", "hello there", "Sure, Tuesday works.",
                           kind="reply", postal_address=ADDRESS)
-
-
-@pytest.mark.asyncio
-async def test_instantly_sequences_carry_the_footer(state):
-    config = SimpleNamespace(
-        channels=SimpleNamespace(email=SimpleNamespace(
-            enabled=True, provider="instantly", require_approval=False,
-            max_daily_sends=50, send_to_risky=False)),
-        compliance=ComplianceConfig(postal_address=ADDRESS),
-    )
-    sender = Sender(None, state, config, EnvConfig())
-    sender.instantly = AsyncMock()
-    sender.instantly.set_campaign_emails.return_value = None  # stop after the upload
-    campaign = Campaign(id="c", name="Draft", instantly_campaign_id="existing",
-                        sequence=[EmailStep(step=1, subject="a note", body="Would this help?")])
-    await sender._deploy_campaign(campaign)
-    uploaded = sender.instantly.set_campaign_emails.await_args.args[1]
-    assert uploaded[0]["body"] == "Would this help?\n\n" + ADDRESS + "\n" + LINE
 
 
 def test_the_notice_asks_for_an_address_only_when_email_is_on():
@@ -459,7 +438,8 @@ async def test_outlook_mailto_annotations_dont_hide_our_line(state):
 
 @pytest.mark.asyncio
 async def test_campaign_text_counts_as_ours_without_an_outbox_row(state):
-    # Instantly sends and hand sends never pass through the Outbox.
+    # Hand sends (and what an earlier release sent through Instantly) never
+    # pass through the Outbox.
     import json
     import sqlite3
     old = 'Reply "unsubscribe" to stop hearing from me.'
@@ -522,19 +502,10 @@ def test_opt_out_line_must_ask_for_a_reply_harvey_catches():
 
 @pytest.mark.asyncio
 async def test_every_footer_harvey_used_stays_ours_after_the_line_changes(state):
-    # Instantly keeps the footer in its own copy; Harvey remembers what it used.
+    # Harvey remembers every footer it sent with (the drain records them).
     old = 'Reply "unsubscribe" to stop hearing from me.'
-    config = SimpleNamespace(
-        channels=SimpleNamespace(email=SimpleNamespace(
-            enabled=True, provider="instantly", require_approval=False,
-            max_daily_sends=50, send_to_risky=False)),
-        compliance=ComplianceConfig(postal_address=ADDRESS, opt_out_line=old))
-    sender = Sender(None, state, config, EnvConfig())
-    sender.instantly = AsyncMock()
-    sender.instantly.set_campaign_emails.return_value = None
-    await sender._deploy_campaign(Campaign(
-        id="c", name="Draft", instantly_campaign_id="existing",
-        sequence=[EmailStep(step=1, subject="a note", body="Would this help?")]))
+    config = SimpleNamespace(compliance=ComplianceConfig(postal_address=ADDRESS, opt_out_line=old))
+    await state.remember_footer_lines(compliance_footer_lines(config))
     # The line is changed afterwards; a reply quotes the old one.
     status, _ = await _reply(state, "Yes let's talk.\n\nOn Tue Harvey wrote:\n> Would this help?\n> " + old)
     assert status != "opted_out"

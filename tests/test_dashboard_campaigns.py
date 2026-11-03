@@ -149,3 +149,15 @@ def test_bad_input_is_refused(client, gmail):
     assert bad.status_code == 400
     assert client.get("/api/campaigns/nimic").status_code == 404
     assert client.post(f"/api/campaigns/{cid}/explode").status_code == 404
+
+
+def test_a_started_campaigns_note_is_refused_through_patch(client, gmail):
+    _seed(client.db_path, "office@alfa.example.com")
+    cid = client.post("/api/campaigns", json={"name": "X", "li_note": NOTE,
+                                              "sequence": SEQUENCE}).json()["id"]
+    assert client.post(f"/api/campaigns/{cid}/start").json()["campaign"]["status"] == "active"
+    r = client.patch(f"/api/campaigns/{cid}", json={"li_note": NOTE + " Altă notă, după pornire."})
+    assert r.status_code == 409 and r.json()["need"] == "li_note"
+    assert client.get(f"/api/campaigns/{cid}").json()["campaign"]["li_note"] == NOTE
+    record = client.get(f"/api/campaigns/{cid}/record.json").json()
+    assert record["li_note"] == NOTE

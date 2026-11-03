@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 27
+LATEST = 28
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -754,9 +754,52 @@ def members_from_prospects(con: sqlite3.Connection, campaign: str, prospect_ids,
     return added
 
 
+def _to_28(con: sqlite3.Connection) -> None:
+    """Schema 28, data only. A conversation recorded before replies were
+    attributed to their campaign gets the campaign of the email it answers:
+    an outbox row of the conversation that names one, else the last cold
+    email sent to that prospect before the conversation began (none: it
+    stays without one). A campaign an earlier release deployed to
+    Instantly goes on there: its members Harvey never wrote to stop, so
+    Harvey's own mailbox never starts on them. An answer queued for review
+    after you undid their opt-out gets the note that keeps it waiting for
+    you (state.REVIEW_AFTER_UNDO): autopilot now approves answers at send
+    time, and one with no note would go. A prospect the Writer's automatic
+    campaigns couldn't write for ('write_failed', which nothing sets any
+    more and nothing could reset) is 'new' again, so it can be added to a
+    campaign or written to by hand."""
+    sent = ("SELECT o.campaign_id FROM outbox o WHERE o.prospect_id = c.prospect_id "
+            "AND o.kind = 'sequence' AND o.status = 'sent' AND COALESCE(o.campaign_id, '') != ''")
+    rows = con.execute(f"""
+        SELECT c.id, COALESCE(
+          (SELECT o.campaign_id FROM outbox o WHERE o.conversation_id = c.id
+             AND COALESCE(o.campaign_id, '') != '' ORDER BY o.created_at DESC LIMIT 1),
+          ({sent} AND datetime(o.sent_at) <= datetime(c.created_at)
+             ORDER BY datetime(o.sent_at) DESC LIMIT 1))
+        FROM conversations c
+        WHERE COALESCE(c.campaign_id, '') = '' AND COALESCE(c.prospect_id, '') != ''""").fetchall()
+    con.executemany("UPDATE conversations SET campaign_id = ? WHERE id = ?",
+                    [(campaign, cid) for cid, campaign in rows if campaign])
+    m = MEMBER_STATUS
+    con.execute(
+        "UPDATE campaign_member SET status = ?, end_reason = 'deployed to Instantly', "
+        "ended_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE status IN (?, ?) "
+        "AND campaign IN (SELECT id FROM campaigns WHERE origin = 'auto' "
+        "AND COALESCE(instantly_campaign_id, '') != '')",
+        (m["stopped"], m["waiting"], m["ready"]))
+    con.execute(
+        "UPDATE outbox SET error = 'waiting for you: the first answer since you undid their "
+        "opt-out' WHERE kind = 'reply' AND status = 'pending_review' "
+        "AND COALESCE(error, '') = '' AND COALESCE(approved_by, '') = '' "
+        "AND EXISTS (SELECT 1 FROM actions a WHERE a.action_type = 'opt_out_undone' "
+        "AND json_extract(a.details_json, '$.prospect_id') = outbox.prospect_id "
+        "AND datetime(a.created_at) <= datetime(outbox.created_at))")
+    con.execute("UPDATE prospects SET status = 'new' WHERE status = 'write_failed'")
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26), (27, _to_27))
+STEPS = ((26, _to_26), (27, _to_27), (28, _to_28))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

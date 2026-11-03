@@ -7,8 +7,8 @@ trader needs consent where a limited company does not. Precleared looks them
 up live (Companies House, the domain, the website) and applies the rules of
 the recipient's country.
 
-Off by default. One check per address, for mail sent through Gmail,
-Microsoft 365 or SMTP. Instantly campaigns and replies are never checked.
+Off by default. One check per address, for cold email sent through Gmail,
+Microsoft 365 or SMTP. Replies are never checked.
 
 ## Turning it on
 
@@ -124,9 +124,6 @@ company, and anything else gets one fresh check with them. The country
 Precleared found is kept with the verdict and feeds the send window.
 
 ## FAQ
-
-**Does it work with Instantly?** No. Instantly deploys whole campaigns, so
-Harvey cannot hold single emails there.
 
 **Why do I get unknown?** Usually the recipient's country could not be worked
 out, and Harvey was not sure of it either (see "What is sent"). If your

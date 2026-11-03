@@ -1,15 +1,12 @@
 """Poorly scored prospects are kept; the score only orders them.
 
-They stay on file, ranked last, and only the Writer leaves them out of
-campaigns (a score of 0 means never scored, which is still written to).
+They stay on file, ranked last, and aren't counted as ready to write for
+(a score of 0 means never scored, which is).
 """
-
-from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
-from harvey.agents.writer import Writer
 from harvey.models.prospect import Prospect
 from harvey.state import LOW_SCORE, StateManager, poorly_scored
 
@@ -39,27 +36,6 @@ async def test_low_scored_contacts_stay_on_file_but_are_not_writable(state):
     assert await state.count_writable_prospects() == 2
     assert poorly_scored(LOW_SCORE - 1) and not poorly_scored(0)
     assert not poorly_scored(LOW_SCORE) and not poorly_scored(None)
-
-
-@pytest.mark.asyncio
-async def test_the_writer_leaves_poorly_scored_contacts_out(state, monkeypatch):
-    for first, score in (("Ana", 80), ("Bogdan", 10), ("Carmen", 0)):
-        p = _person(first)
-        p.score = score
-        await state.add_prospect(p)
-    brain = SimpleNamespace(load_skills_for_agent=lambda name: "")
-    cfg = SimpleNamespace(
-        channels=SimpleNamespace(email=SimpleNamespace(provider="smtp", require_approval=True)),
-        product=SimpleNamespace(name="P", description="D", key_benefits=[], pricing=""),
-        persona=SimpleNamespace(name="S", company="C", role="R", tone="t"),
-        humanizer=SimpleNamespace(enabled=False),
-    )
-    writer = Writer(brain, state, cfg)
-    grouped = []
-    monkeypatch.setattr(writer, "_group_prospects",
-                        lambda ps: grouped.extend(p.first_name for p in ps) or {})
-    await writer.run()
-    assert sorted(grouped) == ["Ana", "Carmen"]
 
 
 @pytest.mark.asyncio

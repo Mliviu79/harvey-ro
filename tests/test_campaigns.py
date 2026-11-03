@@ -99,7 +99,7 @@ def make_sender(state, cfg, monkeypatch, provider=None):
     provider = provider or FakeProvider()
     monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: provider)
     s = sender_mod.Sender(brain=None, state=state, config=cfg,
-                          env=SimpleNamespace(instantly_api_key=""))
+                          env=SimpleNamespace())
     s.send_pacing = False
     return s, provider
 
@@ -137,7 +137,7 @@ async def test_a_draft_on_file_becomes_an_auto_draft_with_members_and_sends_noth
     state = StateManager(str(path))
     await state.init_db()
     con = sqlite3.connect(path)
-    assert schema.version(con) == schema.LATEST == 27 and schema.missing(con) == []
+    assert schema.version(con) == schema.LATEST == 28 and schema.missing(con) == []
     con.close()
     c = await state.campaign_record("c1")
     assert (c["status"], c["origin"], c["account_id"]) == ("draft", "auto", 1)
@@ -696,7 +696,7 @@ async def test_writing_waits_while_two_days_of_first_emails_are_queued(state, mo
 @pytest.mark.asyncio
 async def test_a_prospect_contacted_with_no_cold_email_on_file_counts_as_overlap(
         state, monkeypatch):
-    """Contacted outside the outbox (Instantly, before a switch to Gmail):
+    """Contacted outside the outbox (an earlier release's Instantly, or by hand):
     left out and counted, and a first email staged before is cancelled."""
     cfg = config()
     firm = await contact(state, "office@alfa.example.com")
@@ -725,47 +725,23 @@ async def test_a_prospect_contacted_with_no_cold_email_on_file_counts_as_overlap
 
 
 @pytest.mark.asyncio
-async def test_a_started_campaigns_note_cant_be_cleared(state):
+async def test_a_started_campaigns_note_cant_be_changed(state):
+    """The record shows the note the campaign started under: only a draft's
+    note is written, whatever calls update_campaign (PATCH included)."""
     await contact(state, "office@alfa.example.com")
     draft, _ = await new_campaign(state, start=False, name="Ciornă")
     assert (await state.campaigns_call(campaigns.update_campaign, draft,
                                        li_note=""))["li_note"] == ""
     cid, _ = await new_campaign(state, name="Pornită")
-    for note in ("", "prea scurtă"):
+    longer = NOTE + " Cine cere, primește lista surselor."
+    for note in ("", "prea scurtă", longer):
         with pytest.raises(campaigns.Refused) as e:
             await state.campaigns_call(campaigns.update_campaign, cid, li_note=note)
         assert e.value.need == "li_note"
     assert (await state.campaign_record(cid))["li_note"] == NOTE
-    longer = NOTE + " Cine cere, primește lista surselor."
-    assert (await state.campaigns_call(campaigns.update_campaign, cid,
-                                       li_note=longer))["li_note"] == longer
-
-
-@pytest.mark.asyncio
-async def test_instantly_deploys_only_the_writers_drafts(state, monkeypatch):
-    from harvey.models.campaign import Campaign, EmailStep
-
-    await contact(state, "office@alfa.example.com")
-    mine, _ = await new_campaign(state, start=False, name="A mea")
-    auto = await state.add_campaign(Campaign(
-        id="", name="Scrisă de Harvey", status="draft",
-        sequence=[EmailStep(step=1, subject="s", body="b", delay_days=0)]))
-    cfg = config(provider="instantly", autopilot=True)
-    sender, _ = make_sender(state, cfg, monkeypatch)
-    deployed = []
-
-    async def deploy(campaign):
-        deployed.append(campaign.id)
-
-    async def none_today():
-        return 0
-    monkeypatch.setattr(sender, "_deploy_campaign", deploy)
-    monkeypatch.setattr(sender, "_count_sends_today", none_today)
-    await sender.run()
-    assert deployed == [auto]
-    summary = await state.get_state_summary()
-    assert (summary["draft_campaigns"], summary["writer_drafts"]) == (2, 1)
-    assert (await state.campaign_record(mine))["status"] == "draft"
+    # The same note (a save of the whole form) is no change, so it passes.
+    assert (await state.campaigns_call(campaigns.update_campaign, cid, li_note=NOTE,
+                                       name="Redenumită"))["name"] == "Redenumită"
 
 
 @pytest.mark.asyncio

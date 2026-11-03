@@ -19,7 +19,6 @@ import pytest
 
 import harvey.integrations.email_finder as ef
 from harvey import finder, public_http
-from harvey.agents.audience import Audience
 from harvey.agents.writer import Writer
 from harvey.browser import PageReader, Renderer
 from harvey.collectors import people as people_mod
@@ -455,7 +454,10 @@ def test_the_audience_and_the_writer_get_the_companys_facts(tmp_path, monkeypatc
             "email", "ioana.vranceanu@clinica-exemplu.example", status="verified",
             person="Ioana Vrânceanu", role="Medic primar stomatolog, fondator",
             source="website", trust="confirmed")])
-        made = await Audience(s, env={}).run()
+        from tests.test_campaigns import new_campaign
+
+        _, counts = await new_campaign(s, query="kind=email")
+        made = counts["added"]
         [p] = await s.get_prospects_by_status("new")
         brain = RecordingBrain()
         config = SimpleNamespace(

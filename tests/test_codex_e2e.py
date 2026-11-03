@@ -477,59 +477,6 @@ async def test_fixture_transport_is_the_only_mail_path(harvey):
     assert len(harvey.mail.sent) == 1
 
 
-class _DownBrain:
-    """A brain whose provider just became unusable mid-cycle."""
-    paused_reason = "Your Codex login has expired or is due for renewal."
-
-    def load_skills_for_agent(self, *_):
-        return ""
-
-    def load_prompt(self, *_a, **_k):
-        return ""
-
-    async def think(self, *a, **k):
-        return ""
-
-
-@pytest.mark.asyncio
-async def test_instantly_path_leaves_the_reply_unprocessed_when_the_brain_is_down(tmp_path):
-    """Legacy Instantly replies get the same protection as native ones."""
-    from harvey.agents.handler import Handler
-    from harvey.brain import BrainUnavailable
-    from harvey.models.campaign import Campaign
-
-    state = StateManager(str(tmp_path / "i.db"))
-    await state.init_db()
-    _, convo_id = await _open_thread(state)
-    config = HarveyConfig(**{**BASE, "channels": {"email": {"provider": "instantly"}}})
-    handler = Handler(brain=_DownBrain(), state=state, config=config, env=EnvConfig())
-    campaign = Campaign(id="c1", name="c", channel="email", sequence=[], prospect_ids=[],
-                        status="active", instantly_campaign_id="ic-1")
-
-    class Instantly:
-        async def get_replies(self, campaign_id):
-            return [{"uuid": "r-1", "lead_email": "jane@acme.example",
-                     "body": "Could you share pricing details?"}]
-
-        async def send_reply(self, *a):
-            raise AssertionError("must not reply")
-
-    handler.instantly = Instantly()
-    with pytest.raises(BrainUnavailable):
-        await handler._handle_reply({"uuid": "r-1", "lead_email": "jane@acme.example",
-                                     "body": "Could you share pricing details?"}, campaign)
-    assert not await state.is_reply_processed("r-1")
-    convo = await state.get_conversation(convo_id)
-    assert convo.status == "open" and len(convo.thread) == 1
-
-    async def active(status):
-        return [campaign]
-
-    state.get_campaigns_by_status = active
-    await handler.run()  # the loop stops cleanly instead of escalating
-    assert not await state.is_reply_processed("r-1")
-
-
 # ── outages part-way through a reply, and sends waiting on replies ──
 
 
@@ -562,54 +509,6 @@ async def test_outage_while_drafting_the_reply_loses_nothing_and_duplicates_noth
     assert len(replies) == 1 and replies[0]["kind"] == "reply"
     assert await harvey.state.is_reply_processed("in-1")
     assert (await harvey.status())["status"] == "ok"
-
-
-@pytest.mark.asyncio
-async def test_instantly_reply_survives_an_outage_while_drafting(harvey):
-    """Legacy Instantly path: same guarantee, and the reply is sent once."""
-    from harvey.agents.handler import Handler
-    from harvey.brain import Brain
-    from harvey.models.campaign import Campaign
-
-    await harvey.state.init_db()
-    _, convo_id = await _open_thread(harvey.state)
-    config = HarveyConfig(**{**BASE, "channels": {"email": {
-                                "provider": "instantly", "require_approval": False}},
-                             "brain": {"provider": "codex", "model": "gpt-5.5"}})
-    brain = Brain(harvey.state, config.brain)
-    handler = Handler(brain=brain, state=harvey.state, config=config, env=EnvConfig())
-    campaign = Campaign(id="c1", name="c", channel="email", sequence=[], prospect_ids=[],
-                        status="active", instantly_campaign_id="ic-1")
-    sent = []
-
-    class Instantly:
-        async def get_replies(self, campaign_id):
-            return [{"uuid": "r-1", "lead_email": "jane@acme.example",
-                     "body": "Could you share pricing details?"}]
-
-        async def send_reply(self, reply_uuid, body):
-            sent.append((reply_uuid, body))
-            return {"ok": True}
-
-    async def active(status):
-        return [campaign]
-
-    handler.instantly = Instantly()
-    harvey.state.get_campaigns_by_status = active
-    harvey.fail_from_call(2)
-    assert await brain.preflight() == ""
-    await handler.run()
-    convo = await harvey.state.get_conversation(convo_id)
-    assert (sent, len(convo.thread), convo.stage) == ([], 1, "initial_outreach")
-    assert not await harvey.state.is_reply_processed("r-1")
-
-    harvey.recover()
-    assert await brain.preflight() == ""
-    await handler.run()
-    await handler.run()  # already processed: no second reply
-    convo = await harvey.state.get_conversation(convo_id)
-    assert [m.sender for m in convo.thread] == ["harvey", "prospect", "harvey"]
-    assert convo.stage == "engaged" and len(sent) == 1 and sent[0][0] == "r-1"
 
 
 @pytest.mark.asyncio

@@ -831,7 +831,7 @@ def _patch_heartbeat_real_sender(monkeypatch, cfg, state, calls, stop, provider)
     monkeypatch.setattr(sender_mod, "Sender", real_sender)
     monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: provider)
     monkeypatch.setattr(sender_mod, "SEND_JITTER_SECONDS", (0, 0))
-    monkeypatch.setattr(main_mod, "load_env", lambda: SimpleNamespace(instantly_api_key=""))
+    monkeypatch.setattr(main_mod, "load_env", lambda: SimpleNamespace())
     return main_mod
 
 

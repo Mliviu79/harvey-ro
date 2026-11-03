@@ -1,7 +1,7 @@
 """Retraining replaces what training learns and keeps every other setting.
 
 `harvey train` used to rewrite the config from scratch, so retraining reset
-the email provider to instantly, quiet hours to New York and turned the
+the email provider to the trainer's default, quiet hours to New York and turned the
 Precleared check off. These tests pin down what training owns.
 """
 
@@ -27,7 +27,7 @@ LEARNED = {
         "titles": ["Owner"], "geography": ["United States"],
     },
     "channels": {
-        "email": {"enabled": True, "provider": "instantly", "max_daily_sends": 50},
+        "email": {"enabled": True, "provider": "gmail", "max_daily_sends": 50},
     },
     "usage": {
         "max_daily_claude_percent": 80, "heartbeat_interval_minutes": 15,

@@ -328,17 +328,24 @@ async def test_an_opt_out_and_its_undo_go_through_the_list_in_one_write(state):
 
 
 @pytest.mark.asyncio
-async def test_the_audience_never_offers_a_suppressed_address(state, monkeypatch):
+async def test_a_campaign_never_takes_a_suppressed_address(state, monkeypatch):
+    from harvey import campaigns
+    from tests.test_campaigns import config
+
     a, _ = await _listing(state, _hit(name="Unu Exemplu", n=1, domain="unu.example.com"))
     for value in ("office@unu.example.com", "vanzari@unu.example.com"):
         await state.add_contacts(a, [contacts.Found("email", value, source="website",
                                                     status="verified", trust="confirmed")])
-    before = {r["email"] for r in await state.email_audience(50)}
-    assert before == {"office@unu.example.com", "vanzari@unu.example.com"}
+
+    async def counts():
+        c = await campaigns.preview(state, config(), query="kind=email")
+        return c["ready"], c["suppressed"]
+
+    assert await counts() == (2, 0)
     await state.suppress("address", "office@unu.example.com", "by_hand", by="you")
-    assert {r["email"] for r in await state.email_audience(50)} == {"vanzari@unu.example.com"}
+    assert await counts() == (1, 1)
     await state.suppress("firm", a, "by_hand", by="you")
-    assert await state.email_audience(50) == []
+    assert await counts() == (0, 2)
 
 
 # ── Free-mail domains never key a firm ──

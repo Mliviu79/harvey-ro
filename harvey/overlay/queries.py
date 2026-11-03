@@ -494,9 +494,6 @@ statement("overlay.read.contact_summary",
 statement("overlay.read.contact_first",
           "SELECT l.firm, l.person FROM link l WHERE l.contact = ? "
           "ORDER BY l.trust, l.first_seen, l.firm LIMIT 1", params=(1,), bounded=True)
-statement("overlay.read.prospected_emails",
-          f"SELECT j.value FROM {_J} CROSS JOIN prospects p WHERE p.email = j.value",
-          params=('["office@example.com"]',), drives="j")
 statement("overlay.read.person_firms", "SELECT DISTINCT firm FROM person")
 statement("overlay.read.unkeyed",
           "SELECT f.id FROM firm f WHERE f.live = 0 AND NOT EXISTS (SELECT 1 FROM firm_ident fi "

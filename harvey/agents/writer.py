@@ -1,12 +1,12 @@
-"""Writer — crafts personalized email sequences.
+"""Writer — crafts personalized email sequences for the campaigns the user makes.
 
-With a native mail provider (Gmail/SMTP), email 1 is written PER PROSPECT
-from grounded facts — the company's own description, detected tech stack,
+Email 1 is written PER MEMBER from grounded facts — the company's own description, detected tech stack,
 and buying signals — instead of one merge-tag template shared by a whole
 batch. Mass-templated "token-swap" mail is exactly what inbox filters now
 cluster and junk; a specific, verifiable first line is what earns replies.
-Steps 2-3 stay campaign-level (proof point + breakup are less personal by
-design). Every draft still passes the deterministic pre-send gate.
+The campaign's step templates (the wizard's "Generează secvența") stay
+campaign-level (proof point + breakup are less personal by design). Every
+draft still passes the deterministic pre-send gate.
 """
 
 import json
@@ -16,29 +16,17 @@ from datetime import datetime, timezone
 
 from harvey import email_rules
 from harvey.brain import Brain
-from harvey.config import HarveyConfig
+from harvey.config import HarveyConfig, compliance_of
 from harvey.humanize import humanize, humanizer_enabled
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS
-from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager, brief_note, poorly_scored
+from harvey.models.campaign import EmailStep
+from harvey.state import PRIVACY_LINK_HELD, StateManager, brief_note
 from harvey.startups import startup_facts
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
 
-# How many times the model may fail to write a usable sequence for a
-# prospect before Harvey stops trying (status 'write_failed'). A provider
-# outage never counts; only a reply that came back unusable does.
-MAX_WRITE_ATTEMPTS = 3
-WRITE_ATTEMPTS_KEY = "write_attempts:"
-
 # Merge variables that name a person; a company inbox has none of them.
 PERSON_VAR = re.compile(r"\{\{\s*(first_?name|last_?name|title)\s*\}\}", re.IGNORECASE)
-
-# Native mode: one Claude call per prospect for email 1, so batches stay
-# small — the rest of the 'new' pool is picked up on later cycles.
-NATIVE_BATCH_CAP = 8
-LEGACY_BATCH_CAP = 50
 
 
 class Writer:
@@ -54,118 +42,9 @@ class Writer:
         self.config = config
         self.env = env
         # The campaign being written for (its offer: campaigns._offer), set
-        # by write_for_members and write_templates; {} for the Writer's own.
+        # by write_for_members and write_templates.
         self.offer: dict = {}
-
-    @property
-    def is_native(self) -> bool:
-        return self.config.channels.email.provider in NATIVE_PROVIDERS
-
-    async def run(self):
-        """Create email campaigns for prospects that need outreach."""
-        logger.info("Writer: Crafting email campaigns...")
-
-        # Load foundational skills for this agent
-        self.skills = self.brain.load_skills_for_agent("writer")
-
-        # Get prospects that haven't been contacted yet
-        new_prospects = await self.state.get_prospects_by_status("new")
-        if not new_prospects:
-            logger.info("Writer: No new prospects to write for.")
-            return
-
-        # Only write for prospects we can actually deliver to. Guessed and
-        # invalid addresses are skipped so we don't spend Claude calls (or
-        # sending reputation) on mail that will bounce.
-        prospects_with_email = [
-            p for p in new_prospects
-            if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
-        ]
-        # Contacts scored poorly when they were found (older prospects) stay
-        # on file, ranked last; they are not worth a cold email.
-        prospects_with_email = [p for p in prospects_with_email if not poorly_scored(p.score)]
-        # Someone at their company already replied: no cold email to write.
-        prospects_with_email = [
-            p for p in prospects_with_email
-            if not await self.state.colleague_who_replied(p.id)
-        ]
-        # On the do-not-contact list: never spend a model call on them.
-        prospects_with_email = [
-            p for p in prospects_with_email
-            if not await self.state.suppression_check(p.email, firm=p.company_id,
-                                                      config=self.config)
-        ]
-        if not prospects_with_email:
-            logger.info(
-                "Writer: No prospects with deliverable (verified/risky) emails yet."
-            )
-            return
-
-        # Batch prospects into campaign groups (by industry/title for relevance)
-        batches = self._group_prospects(prospects_with_email)
-
-        for batch_name, prospects in batches.items():
-            if not prospects:
-                continue
-
-            logger.info(
-                f"Writer: Creating campaign '{batch_name}' for "
-                f"{len(prospects)} prospects."
-            )
-
-            # Generate the email sequence
-            self._no_reply = False
-            sequence = await self._write_sequence(prospects)
-            if not sequence:
-                paused = getattr(self.brain, "paused_reason", "") or (
-                    "no reply from the model" if self._no_reply else "")
-                if paused:
-                    # The provider failed (outage, logout, rate limit,
-                    # timeout), not the draft: no attempt is counted, and the
-                    # other batches would fail the same way.
-                    logger.warning(f"Writer: {paused}; leaving '{batch_name}' for later.")
-                    return
-                logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
-                await self._count_failed_attempt(batch_name, prospects)
-                continue
-
-            # Create the campaign
-            campaign = Campaign(
-                id="",
-                name=batch_name,
-                channel="email",
-                sequence=sequence,
-                prospect_ids=[p.id for p in prospects],
-                status="draft",
-            )
-            campaign_id = await self.state.add_campaign(campaign)
-
-            # Mark prospects so they aren't picked up again
-            for p in prospects:
-                await self.state.queue_prospect_if_unsent(p.id)
-                await self.state.delete_setting(WRITE_ATTEMPTS_KEY + p.id)
-
-            # Native providers: replace the shared template for email 1 with
-            # a per-prospect draft grounded in that company's actual facts.
-            if self.is_native:
-                await self._personalize_first_emails(campaign_id, prospects)
-
-            await self.state.log_action(
-                action_type="write_campaign",
-                agent="writer",
-                details={
-                    "campaign_id": campaign_id,
-                    "campaign_name": batch_name,
-                    "prospect_count": len(prospects),
-                    "steps": len(sequence),
-                },
-            )
-            logger.info(
-                f"Writer: Campaign '{batch_name}' created with "
-                f"{len(sequence)} emails for {len(prospects)} prospects."
-            )
-
-    # ── Campaigns made by the user (harvey/campaigns.py) ──
+        self.skills = ""
 
     def _use_campaign(self, campaign) -> None:
         """Write for this campaign: its offer, and the brain of its AI
@@ -212,38 +91,6 @@ class Writer:
         finally:
             self.offer, self.brain = {}, brain
 
-    async def _count_failed_attempt(self, batch_name: str, prospects: list):
-        """Count one unusable sequence against each prospect in the batch.
-
-        A prospect left 'new' makes the heartbeat choose write_campaign every
-        cycle, so after MAX_WRITE_ATTEMPTS it moves to 'write_failed': visible
-        in status and the dashboard, and out of the way of prospecting.
-        """
-        given_up = []
-        for p in prospects:
-            key = WRITE_ATTEMPTS_KEY + p.id
-            try:
-                attempts = int(await self.state.get_setting(key) or 0) + 1
-            except ValueError:
-                attempts = 1
-            if attempts >= MAX_WRITE_ATTEMPTS:
-                await self.state.update_prospect_status(p.id, "write_failed")
-                await self.state.delete_setting(key)
-                given_up.append(p.email)
-            else:
-                await self.state.set_setting(key, str(attempts))
-        if given_up:
-            await self.state.log_action(
-                action_type="write_failed",
-                agent="writer",
-                details={"campaign_name": batch_name, "prospects": given_up,
-                         "attempts": MAX_WRITE_ATTEMPTS},
-            )
-            logger.warning(
-                f"Writer: Gave up on {len(given_up)} prospect(s) in '{batch_name}' after "
-                f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
-            )
-
     async def _personalize_first_emails(self, campaign_id: str, prospects: list) -> int:
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
@@ -278,15 +125,21 @@ class Writer:
         for (prospect, _), draft in zip(pending, polished):
             # A personal address's first email says where the address was
             # found: a fixed line (email_rules), never the model's words.
-            _, note = await self.state.personal_address(prospect.email)
+            privacy_url = compliance_of(self.config).privacy_url
+            _, note = await self.state.personal_address(prospect.email, privacy_url=privacy_url)
+            body = email_rules.with_note(draft["body"], note)
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
                 step=1,
                 to_email=prospect.email,
                 subject=draft["subject"],
-                body=email_rules.with_note(draft["body"], note),
+                body=body,
                 source_note=note,
+                # The privacy page is the one link it may have: with another,
+                # it waits for you instead of failing at send.
+                error=PRIVACY_LINK_HELD if note and email_rules.privacy_crowded(
+                    body, privacy_url) else "",
                 send_at=now,
                 status=status,
                 provider=provider,
@@ -511,8 +364,6 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="harvey-writer",
             agent="writer", task="write_sequence",
         )
-        # Read right after the call, before anything else can use the brain.
-        self._no_reply = result is None and bool(getattr(self.brain, "last_reply_empty", False))
         steps = self._parse_sequence(result)
         if inbox_batch and any(
             PERSON_VAR.search(s.subject + s.body) for s in steps
@@ -578,25 +429,3 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         if len(steps) < 3:
             logger.warning(f"Writer: Expected 3 emails, got {len(steps)}.")
         return steps
-
-    def _group_prospects(self, prospects: list) -> dict[str, list]:
-        """Group prospects into campaign batches by industry/title combo."""
-        batches: dict[str, list] = {}
-
-        for prospect in prospects:
-            # Group by industry + rough title category
-            industry = prospect.industry or "general"
-            # Inbox prospects get their own campaign: their templates can't
-            # greet anyone by name.
-            kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
-            key = f"{industry}-{kind}"
-
-            if key not in batches:
-                batches[key] = []
-            batches[key].append(prospect)
-
-        # Cap batch size. Native mode stays small because email 1 is drafted
-        # per prospect (one Claude call each); leftovers ride the next cycle.
-        # Small segments also outperform blasts on deliverability.
-        cap = NATIVE_BATCH_CAP if self.is_native else LEGACY_BATCH_CAP
-        return {key: group[:cap] for key, group in batches.items()}

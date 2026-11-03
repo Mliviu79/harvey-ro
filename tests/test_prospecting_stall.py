@@ -1,22 +1,13 @@
-"""Prospects the Writer can't use must not stop Harvey from prospecting.
-
-The Writer only drafts for verified or risky addresses; a guessed, invalid or
-missing email leaves the prospect 'new'. The heartbeat used to count every
-'new' prospect, so a single guessed address made it choose write_campaign
-every cycle, the Writer had nothing to do, and Scout never ran again.
+"""Prospects with no address Harvey can write to are counted apart, and
+`harvey status` says why nothing is written when only they came in for a
+day (no verifier key, or its credits ran out), never for good.
 """
-
-from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
-from harvey.main import decide_next_action
 from harvey.models.prospect import Prospect
 from harvey.state import StateManager
-
-CONFIG = SimpleNamespace(channels=SimpleNamespace(email=SimpleNamespace(
-    provider="gmail", require_approval=True)))
 
 
 @pytest_asyncio.fixture
@@ -45,15 +36,6 @@ async def test_summary_counts_only_prospects_the_writer_can_use(state):
     assert summary["writable_prospects"] == 2
 
 
-@pytest.mark.asyncio
-async def test_guessed_emails_alone_leave_nothing_to_write(state):
-    for n in range(3):
-        await add(state, n, f"p{n}@co{n}.test", "guess")
-    summary = await state.get_state_summary()
-    # Finding people isn't the heartbeat's (the contact finder runs on its own).
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
-
-
 async def age_all(state, days):
     """Pretend every prospect was found ``days`` ago."""
     import aiosqlite
@@ -72,7 +54,6 @@ async def test_a_day_of_unusable_prospects_says_why_nothing_is_written(state):
     for n in range(PROSPECT_BACKLOG):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     notice = unusable_backlog_notice(summary)
     assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice and "about a day" in notice
     assert "paused prospecting" not in notice
@@ -87,25 +68,7 @@ async def test_the_notice_never_becomes_permanent(state):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     await age_all(state, days=2)
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     assert unusable_backlog_notice(summary) == ""
-
-
-@pytest.mark.asyncio
-async def test_old_guesses_do_not_stop_a_mixed_setup_writing(state):
-    for n in range(25):
-        await add(state, n, f"p{n}@co{n}.test", "guess")
-    await age_all(state, days=3)
-    await add(state, 100, "v@verified.test", "verified")
-    summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "write_campaign"
-    # Email off: nothing for the heartbeat to decide (it doesn't run a cycle).
-    assert await decide_next_action(None, state, CONFIG, summary=summary,
-                                    email_on=False) == "idle"
-    [verified] = [p for p in await state.get_prospects_by_status("new") if p.email_status == "verified"]
-    await state.update_prospect_status(verified.id, "queued")  # what the Writer does
-    summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
 
 
 @pytest.mark.asyncio
@@ -117,21 +80,3 @@ async def test_no_backlog_notice_while_things_are_moving(state):
     for n in range(3, 30):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     assert unusable_backlog_notice(await state.get_state_summary()) == ""
-
-
-@pytest.mark.asyncio
-async def test_a_deliverable_prospect_is_still_written_for(state):
-    await add(state, 1, "p1@co1.test", "guess")
-    await add(state, 2, "p2@co2.test", "verified")
-    summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "write_campaign"
-    # Email off: nothing for the heartbeat to decide (it doesn't run a cycle).
-    assert await decide_next_action(None, state, CONFIG, summary=summary,
-                                    email_on=False) == "idle"
-
-
-@pytest.mark.asyncio
-async def test_a_summary_without_the_new_count_keeps_the_old_rule():
-    # Callers that build their own summary (older tests, scripts) still work.
-    summary = {"prospects": {"new": 3}, "draft_campaigns": 0, "open_conversations": 0}
-    assert await decide_next_action(None, None, CONFIG, summary=summary) == "write_campaign"

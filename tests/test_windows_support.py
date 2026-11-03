@@ -186,8 +186,10 @@ def test_a_cp1252_config_loads(tmp_path):
     from harvey.config import load_config
     data = yaml.safe_load((HARVEY.parent / "harvey.yaml").read_text(encoding="utf-8"))
     data["persona"]["company"] = "Caf\u00e9 \u2014 Studio"
-    # (The template's Romanian opt-out line has letters cp1252 hasn't got.)
+    # (The template's Romanian opt-out and disclosure lines have letters
+    # cp1252 hasn't got.)
     data["compliance"]["opt_out_line"] = 'Not interested? Reply "no thanks".'
+    data["compliance"]["ai_disclosure_line"] = "Written with an AI assistant."
     config = tmp_path / "harvey.yaml"
     config.write_bytes(yaml.safe_dump(data, allow_unicode=True).encode("cp1252"))
     company = load_config(str(config)).persona.company

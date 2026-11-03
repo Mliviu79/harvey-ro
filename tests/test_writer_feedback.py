@@ -72,7 +72,7 @@ async def test_sequence_prompt_gets_campaign_notes_but_never_one_contacts(state)
     await state.add_feedback("contact", other, "Not relevant to Ana.")
 
     brain = RecordingBrain(SEQ)
-    await writer(brain, state, "instantly")._write_sequence([await state.get_prospect(pid)])
+    await writer(brain, state, "gmail")._write_sequence([await state.get_prospect(pid)])
     [prompt] = brain.prompts
     assert "OWNER FEEDBACK" in prompt
     assert "on campaign 'Denver roofers': Too long. Drop the question about reviews." in prompt

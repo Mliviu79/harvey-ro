@@ -267,32 +267,6 @@ async def test_autopilot_mail_with_a_foreign_link_goes_back_to_the_outbox():
 
 
 @pytest.mark.asyncio
-async def test_on_instantly_a_reply_with_a_foreign_link_goes_to_you(state, monkeypatch):
-    import harvey.agents.handler as handler_mod
-    from tests.test_outbox_native import Cfg, Env, FakeProvider, seed_prospect
-    from harvey.agents.handler import Handler
-    monkeypatch.setattr(handler_mod, "legacy_sending_held", lambda cfg: False)
-    pid = await seed_prospect(state, status="contacted")
-    handler = Handler(brain=RecordingBrain(text_reply="Details at evil.example/x"),
-                      state=state, config=Cfg(), env=Env())
-    handler.provider = None
-    sent = []
-
-    async def send_reply(uuid, body):
-        sent.append(body)
-        return {"ok": True}
-    handler.instantly.send_reply = send_reply
-    monkeypatch.setattr(handler, "_classify_intent", lambda *a: _async("question"))
-    await handler._process_reply("jane@acme.example", "What does it cost?", "u1")
-    assert sent == []
-    assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
-
-
-async def _async(v):
-    return v
-
-
-@pytest.mark.asyncio
 async def test_outbox_rows_remember_who_approved_them(state):
     pid = await state.add_prospect(Prospect(email="jane@acme.example", first_name="Jane",
                                             email_status="verified"))
@@ -304,36 +278,6 @@ async def test_outbox_rows_remember_who_approved_them(state):
     assert await state.approve_outbox(mine) == 1
     assert (await state.get_outbox_item(auto))["approved_by"] == "autopilot"
     assert (await state.get_outbox_item(mine))["approved_by"] == "you"
-
-
-@pytest.mark.asyncio
-async def test_an_instantly_campaign_with_a_foreign_link_is_not_deployed(state):
-    from harvey.agents.sender import Sender
-    from harvey.models.campaign import Campaign, EmailStep
-    from tests.test_outbox_native import Cfg, Env
-    cfg = Cfg()
-    sender = Sender(brain=None, state=state, config=cfg, env=Env())
-    calls = []
-
-    class Instantly:
-        async def create_campaign(self, name):
-            calls.append(name)
-            return {"id": "x"}
-    sender.instantly = Instantly()
-    campaign = Campaign(id="c1", name="roofers", sequence=[
-        EmailStep(step=1, subject="quick one", body="Hi {{first_name}}, see evil.example/deal", delay_days=0)])
-    old = Cfg.channels.email.require_approval
-    Cfg.channels.email.require_approval = False
-    try:
-        await sender._deploy_campaign(campaign)
-        await sender._deploy_campaign(campaign)
-    finally:
-        Cfg.channels.email.require_approval = old
-    assert calls == []
-    import aiosqlite
-    async with aiosqlite.connect(state.db_path) as db:
-        async with db.execute("SELECT COUNT(*) FROM actions WHERE action_type = 'escalation'") as c:
-            assert (await c.fetchone())[0] == 1          # flagged once, not every cycle
 
 
 @pytest.mark.parametrize("body", [
@@ -385,21 +329,10 @@ async def test_approve_all_leaves_held_emails_for_one_by_one(state):
     assert await state.approve_outbox(held) == 1          # one by one, it goes
 
 
-@pytest.mark.asyncio
-async def test_instantly_leads_whose_fields_carry_a_foreign_link_are_left_out(state):
-    from harvey.agents.sender import Sender
-    from tests.test_outbox_native import Cfg, Env
-    sender = Sender(brain=None, state=state, config=Cfg(), env=Env())
-    clean = Prospect(first_name="Al", last_name="B", company="Co", email="al@co.test")
-    dirty = Prospect(first_name="Bo", last_name="C", company="Co", email="bo@co.test",
-                     personalization_notes="mention evil.example/deal")
-    assert await sender._reviewed_leads([clean, dirty]) == [clean]
-
-
 def test_training_on_your_site_marks_its_domain_as_yours():
     from harvey.trainer import merge_trained_config
     learned = {"persona": {"company": "Acme"},
-               "channels": {"email": {"provider": "instantly", "link_domains": ["acme.example"]}}}
+               "channels": {"email": {"provider": "smtp", "link_domains": ["acme.example"]}}}
     fresh = merge_trained_config(learned, None)
     assert fresh["channels"]["email"]["link_domains"] == ["acme.example"]
     existing = {"persona": {"company": "Acme", "email": "s@send-acme.example"},

@@ -190,10 +190,6 @@ def cmd_status(args):
         print(f"  Prospects:            {summary['prospects']}")
         print(f"  Ready to write for:   {summary.get('writable_prospects', 0)} "
               "(new, with a verified or catch-all email)")
-        write_failed = (summary.get("prospects") or {}).get("write_failed", 0)
-        if write_failed:
-            print(f"  Couldn't write for:   {write_failed} (the model's drafts kept coming back "
-                  "unusable; `harvey retry-writes` tries again)")
         print(f"  Draft campaigns:      {summary['draft_campaigns']}")
         print(f"  Active campaigns:     {summary['active_campaigns']}")
         print(f"  Open conversations:   {summary['open_conversations']}")
@@ -2540,24 +2536,6 @@ def cmd_duplicates(args):
     asyncio.run(_duplicates())
 
 
-def cmd_retry_writes(args):
-    """Put prospects the Writer gave up on back in line for another try."""
-    from harvey.agents.writer import MAX_WRITE_ATTEMPTS
-    from harvey.state import StateManager
-
-    async def _run():
-        state = StateManager()
-        await state.init_db()
-        count = await state.retry_write_failed()
-        if count:
-            print(f"\n  {count} prospect(s) are back in line. The Writer will try each "
-                  f"up to {MAX_WRITE_ATTEMPTS} more times.\n")
-        else:
-            print("\n  No prospects are waiting on a retry.\n")
-
-    asyncio.run(_run())
-
-
 def cmd_warmup(args):
     """Check whether the sending domain is ready for cold email."""
     import os
@@ -2599,8 +2577,7 @@ def cmd_warmup(args):
                             d.check_dmarc(domain)]),
         ("Reputation", [d.check_domain_age(domain), *d.check_domain_blocklists(domain)]
          + (d.check_ip_blocklists(smtp_host) if smtp_host else [])),
-        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends,
-                                             provider=email.provider),
+        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends),
                               _warmup_service_check(sender, email.warmup),
                               d.check_send_history(*asyncio.run(_history()))]),
     ]
@@ -2923,7 +2900,7 @@ def _contacts_query(args) -> str:
 
 def cmd_campaigns(args):
     """Campaigns made by the user: list, show, new, start, pause, resume,
-    stop, members, add, remove."""
+    stop, members, add, remove, export (the record)."""
     import json
 
     from harvey import campaigns
@@ -2978,6 +2955,19 @@ def cmd_campaigns(args):
                     print(f"    {m['email']:<40} {m['status_name']:<12} step {m['last_step']}"
                           + (f"  ({m['end_reason']})" if m["end_reason"] else ""))
                 print(f"\n  {len(rows)} member(s).\n")
+            elif action == "export":
+                rec = await state.campaigns_call(campaigns.record, args.id, write=False)
+                fmt = args.format
+                out = Path(args.out or f"evidenta-{args.id}.{fmt}")
+                text = (campaigns.record_csv(rec) if fmt == "csv"
+                        else json.dumps(rec, ensure_ascii=False, indent=2))
+                out.write_text(text, encoding="utf-8")
+                ack = rec["acknowledgement"]
+                print(f"\n  The record of {rec['campaign']['name']} is in {out}: "
+                      f"{rec['counts']['members']} member(s), {rec['counts']['sends']} email(s) "
+                      f"sent, {rec['counts']['opt_outs']} opt-out(s); acknowledgement "
+                      + (f"version {ack['version']} of {ack['at']}" if ack else "not given")
+                      + ".\n")
             elif action == "add":
                 counts = await campaigns.add_by_hand(state, config, args.id, args.emails)
                 print(f"\n  Added {counts['added']}. {_counts_line(counts)}\n")
@@ -3437,10 +3427,6 @@ def main():
     sub.set_defaults(func=cmd_doctor)
 
     sub = subparsers.add_parser(
-        "retry-writes", help="Retry prospects the Writer couldn't write an email for")
-    sub.set_defaults(func=cmd_retry_writes)
-
-    sub = subparsers.add_parser(
         "jobs", help="The queue of background work: list, cancel, retry, resume; pause a lane",
         description="Searches, site reads, registry and public-data loads and ANAF checks run "
                     "as jobs, one lane per source: a lane runs its jobs in order, lanes run "
@@ -3500,7 +3486,7 @@ def main():
 
     sub = subparsers.add_parser(
         "campaigns", help="Campaigns you make: list, show, new, start, pause, resume, stop, "
-                          "members, add, remove")
+                          "members, add, remove, export")
     csub = sub.add_subparsers(dest="campaigns_action")
     csub.add_parser("list", help="Every campaign")
     for name, text in (("show", "One campaign"), ("start", "Start a draft (takes its audience)"),
@@ -3522,6 +3508,11 @@ def main():
     r = csub.add_parser("members", help="Its members")
     r.add_argument("id")
     r.add_argument("--status", default="")
+    r = csub.add_parser("export", help="Its record: the legitimate-interest note, the "
+                                       "acknowledgement, members, sends and opt-outs")
+    r.add_argument("id")
+    r.add_argument("--format", choices=("csv", "json"), default="csv")
+    r.add_argument("--out", default="", help="The file to write (evidenta-ID.csv by default)")
     for name, text in (("add", "Add addresses (through every rule)"),
                        ("remove", "Take addresses out")):
         r = csub.add_parser(name, help=text)

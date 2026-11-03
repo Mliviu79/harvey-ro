@@ -12,7 +12,7 @@ import pytest_asyncio
 from harvey.gate import pre_send_check
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.models.prospect import Prospect
-from harvey.state import StateManager
+from harvey.state import REVIEW_AFTER_UNDO, StateManager
 from harvey.integrations.mail_provider import (
     InboundMessage,
     MailProvider,
@@ -78,7 +78,7 @@ class Cfg:
 
 
 class Env:
-    instantly_api_key = ""
+    """The .env settings: the fakes need none."""
 
 
 def make_sender(state, provider, require_approval=True):
@@ -486,7 +486,10 @@ async def test_on_autopilot_the_first_reply_after_an_undo_still_waits(state, mon
         body="Sorry, wrong button. What does it cost?",
     )]
     await make_handler(state, provider)._run_native()
-    assert [d["status"] for d in await state.get_outbox()] == ["pending_review"]
+    [first] = await state.get_outbox()
+    assert (first["status"], first["error"]) == ("pending_review", REVIEW_AFTER_UNDO)
+    # Autopilot never approves it, at queue time or when a drain runs.
+    assert await state.promote_for_autopilot(_now_iso(), 10, kind="reply") == 0
 
     # Only the first one: after that, autopilot is autopilot again.
     provider.inbound = [InboundMessage(
@@ -495,28 +498,12 @@ async def test_on_autopilot_the_first_reply_after_an_undo_still_waits(state, mon
     )]
     await make_handler(state, provider)._run_native()
     # (Their newer reply also cancels the draft still waiting, as always.)
-    assert sorted(d["status"] for d in await state.get_outbox()) == ["approved", "cancelled"]
-
-
-@pytest.mark.asyncio
-async def test_on_instantly_the_first_reply_after_an_undo_goes_to_you(state, monkeypatch):
-    import harvey.agents.handler as handler_mod
-    monkeypatch.setattr(handler_mod, "legacy_sending_held", lambda cfg: False)
-    pid = await seed_prospect(state, status="opted_out")
-    assert await state.undo_opt_out(pid) is True
-
-    handler = make_handler(state, FakeProvider())
-    handler.provider = None                      # legacy Instantly path
-    sent = []
-
-    async def send_reply(uuid, body):
-        sent.append(body)
-        return {"ok": True}
-    handler.instantly.send_reply = send_reply
-    await handler._process_reply("jane@acme.example", "Sorry, wrong button. What does it cost?", "u1")
-
-    assert sent == []
-    assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
+    # Queued for review; the drain that sends it approves it.
+    rows = {r["id"]: r for r in await state.get_outbox()}
+    assert sorted(r["status"] for r in rows.values()) == ["cancelled", "pending_review"]
+    assert await state.promote_for_autopilot(_now_iso(), 10, kind="reply") == 1
+    [approved] = await state.get_outbox(status="approved")
+    assert approved["approved_by"] == "autopilot" and approved["id"] != first["id"]
 
 
 @pytest.mark.asyncio

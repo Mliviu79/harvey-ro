@@ -1376,3 +1376,22 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 #campaign-wizard .card, #campaign-detail .card { margin-bottom: var(--sp-4); }
 #campaign-wizard .card .card { margin: var(--sp-3) 0; }
 #campaigns-table + #campaigns-list .subhead:first-child { margin-top: var(--sp-5); }
+
+/* ── A dialog (the cold-email acknowledgement) ─────────────────── */
+
+.modal {
+  width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 0;
+  border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--surface); color: var(--text); box-shadow: var(--shadow-pop);
+}
+.modal::backdrop { background: rgb(15 17 17 / 0.28); }
+.modal[open] { display: flex; flex-direction: column; }
+#ack-body { display: flex; flex-direction: column; min-height: 0; max-height: calc(100vh - 50px); }
+.modal-head { display: flex; align-items: baseline; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line); }
+.modal-head h2 { flex: 1; font-size: var(--fs-h3); font-weight: 600; line-height: 1.3; }
+.modal-head .meta { font-size: var(--fs-caption); color: var(--text-3); white-space: nowrap; }
+.modal-scroll { overflow-y: auto; overscroll-behavior: contain; padding: var(--sp-3) var(--sp-5); }
+.modal-scroll p { margin: 0 0 var(--sp-3); font-size: var(--fs-ui); line-height: 1.6; max-width: 72ch; }
+.modal-foot { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5) var(--sp-4); border-top: 1px solid var(--line); }
+.ack-card p { max-width: 72ch; }
+

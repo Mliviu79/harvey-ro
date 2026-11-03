@@ -719,8 +719,8 @@ async def test_company_and_its_history_read_on_the_overlay(state):
 @pytest.mark.asyncio
 async def test_prospects_are_made_read_and_stopped_on_the_overlay(state, monkeypatch, tmp_path):
     from harvey import export
-    from harvey.agents.audience import Audience
     from harvey.models.prospect import Prospect
+    from tests.test_campaigns import new_campaign
 
     a, _ = await _listing(state, _hit(name="Exemplu Unu", n=101, domain="unu.example.com"))
     await state.add_contacts(a, [
@@ -729,9 +729,11 @@ async def test_prospects_are_made_read_and_stopped_on_the_overlay(state, monkeyp
                        status="verified"),
         contacts.Found("email", "dan@unu.example.com", source="website", capability="read_site",
                        person="Dan Exemplu", trust="likely", status="verified")])
-    # The audience makes prospects of the addresses the Writer can use.
-    assert await Audience(state).run() == 2
-    assert await Audience(state).run() == 0
+    # A campaign makes prospect cards of the addresses it takes.
+    _, counts = await new_campaign(state, query="kind=email")
+    assert counts["added"] == 2
+    _, again = await new_campaign(state, query="kind=email", name="Again")
+    assert (again["added"], again["overlap"]) == (0, 2)
     made = await state.get_prospects_by_status("new")
     assert {p.company_id for p in made} == {a} and {p.email for p in made} == {
         "ana@unu.example.com", "dan@unu.example.com"}

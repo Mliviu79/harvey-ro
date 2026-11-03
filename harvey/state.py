@@ -44,8 +44,8 @@ BUSY_TIMEOUT_SECONDS = 30.0
 # migration over a full registry holds the database for a minute or more.
 MIGRATION_TIMEOUT_SECONDS = 900.0
 
-# Email statuses the Writer drafts for. Shared with the heartbeat so it only
-# chooses write_campaign when there is something the Writer will act on.
+# Email statuses that can be written to (`harvey status` counts the
+# prospects ready to write for by them).
 WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 # Prospects scored below this when they were found are kept, ranked last, but
 # not written to. A score of 0 means never scored (the contact finder's
@@ -206,6 +206,12 @@ def _company_answered(p: str) -> str:
             f"WHERE s.key = '{COMPANY_STOP_KEY}' || c.id AND {_colleagues(p, 'c')})")
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
+# Outbox error on the first answer since an opt-out was undone: it waits for
+# you even on autopilot (the undo panel promises it).
+REVIEW_AFTER_UNDO = "waiting for you: the first answer since you undid their opt-out"
+# Outbox error on what an undone hand send brought back: a human decides
+# again, so autopilot never approves it (promote_for_autopilot).
+RESTORED_FOR_REVIEW = "waiting for you: back after you undid a hand send"
 # Outbox errors on cold email whose campaign is paused or not started yet
 # (it waits, approved), or asks for every email to be reviewed.
 CAMPAIGN_PAUSED = "waiting: its campaign is paused"
@@ -222,6 +228,10 @@ NO_SENDER_ADDRESS = ("waiting: the sending address isn't known, so the unsubscri
 # note: the note was added, and it waits for you to approve it as it is now.
 NOTE_ADDED = ("waiting for you: the address is personal, so the line saying where it was "
               "found was added")
+# Outbox error on a first email to a personal address that carries the
+# privacy page and another link: one link is all a cold email may have.
+PRIVACY_LINK_HELD = ("waiting for you: the privacy page is this email's one link; take the "
+                     "other link out")
 # Outbox error on cold email that waits, approved, while the mailbox read
 # hasn't covered the time Harvey was off (READ_GAP_KEY).
 READ_GAP_HELD = "waiting: the mailbox hasn't been read back to the last complete read"
@@ -331,7 +341,7 @@ BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 
 _CAMPAIGN_COLUMNS = frozenset({
-    "name", "channel", "instantly_campaign_id",
+    "name", "channel",
     "sequence_json", "prospect_ids_json", "status",
 })
 _CONVERSATION_COLUMNS = frozenset({
@@ -1122,15 +1132,17 @@ class StateManager:
 
         return await self._in_tx(acknowledgement.status, write=False)
 
-    async def personal_address(self, email: str) -> tuple[int, str]:
+    async def personal_address(self, email: str, privacy_url: str = "") -> tuple[int, str]:
         """(email_rules' reason the address is personal, 0 when it isn't;
         the source note a first email to it carries, "" when none is
-        needed). Read from every firm the address is linked to."""
+        needed, with ``privacy_url`` after it when given). Read from every
+        firm the address is linked to."""
         from harvey import email_rules
 
         facts = await self._read("address_facts", email)
         reason = email_rules.personal_reason(email, facts)
-        return reason, email_rules.source_note(facts) if reason else ""
+        note = email_rules.with_privacy(email_rules.source_note(facts), privacy_url)
+        return reason, note if reason else ""
 
     async def opt_out_history(self, prospect_id: str) -> list[dict]:
         """Every opt-out and undo recorded for this person, oldest first."""
@@ -1269,12 +1281,13 @@ class StateManager:
         approved_by: str = "",
         source_note: str = "",
         account_id: int | None = 1,
+        error: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
-        ``approved_by="autopilot"`` when it's queued approved on autopilot.
         ``source_note``: the line a first email to a personal address was
-        staged with (email_rules; it is in the body too)."""
+        staged with (email_rules; it is in the body too). ``error``: why it
+        waits for you (autopilot never approves a row with one)."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -1294,6 +1307,8 @@ class StateManager:
             if cursor.rowcount > 0 and source_note:
                 await db.execute("UPDATE outbox SET source_note = ? WHERE id = ?",
                                  (source_note, item_id))
+            if cursor.rowcount > 0 and error:
+                await db.execute("UPDATE outbox SET error = ? WHERE id = ?", (error[:300], item_id))
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
 
@@ -1351,8 +1366,9 @@ class StateManager:
     async def get_texts_for_prospect(self, prospect_id: str, limit: int = 50) -> list[str]:
         """Everything Harvey wrote for this person, which a reply may quote
         back: their Outbox emails (a sent one with its footer, whatever it
-        said then) and the templates of campaigns they're in (Instantly and
-        hand sends never pass through the Outbox; merge tags unfilled)."""
+        said then) and the templates of campaigns they're in (hand sends,
+        and what an earlier release sent through Instantly, never passed
+        through the Outbox; merge tags unfilled)."""
         texts: list[str] = []
         async with self._connect() as db:
             async with db.execute(
@@ -1488,17 +1504,31 @@ class StateManager:
         """Items claimed long ago and never finished (Harvey stopped mid-send).
 
         Whether they went out is unknown, so they are never retried: they
-        become failed with a note to check the Sent folder.
+        become failed with a note to check the Sent folder. A cold email's
+        member ends there too (campaigns.stop_after): what it had queued
+        after it is cancelled, so nothing follows an email that may or may
+        not have arrived, and its campaign can finish.
         """
+        from harvey import campaigns
+
         cutoff = (_utcnow() - older_than).isoformat()
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
+
+        def run(con):
+            rows = con.execute(
+                "SELECT id, kind, campaign_id, to_email, step FROM outbox "
                 "WHERE status = 'sending' AND datetime(updated_at) < datetime(?)",
-                (STALE_SENDING_ERROR, _utcnow().isoformat(), cutoff),
-            )
-            await db.commit()
-            return cursor.rowcount
+                (cutoff,)).fetchall()
+            now = _utcnow().isoformat()
+            for item_id, kind, campaign_id, to_email, step in rows:
+                con.execute("UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
+                            "WHERE id = ? AND status = 'sending'",
+                            (STALE_SENDING_ERROR, now, item_id))
+                if kind == "sequence" and campaign_id:
+                    campaigns.stop_after(con, campaign_id, to_email, int(step or 1),
+                                         campaigns.CUT_OFF)
+            return len(rows)
+
+        return await self._in_tx(run)
 
     async def edit_outbox_draft(self, item_id: str, subject: str, body: str) -> int:
         """Rewrite a draft's subject and body — only while it awaits review.
@@ -1519,8 +1549,9 @@ class StateManager:
     async def restore_hand_cancelled_outbox(self, prospect_id: str, reason: str) -> int:
         """Undo a cancel made with `reason`: those items go back for review.
 
-        Always to pending_review, even if they were approved before: a human
-        decides again. They're rescheduled from now with their original gaps,
+        Always to pending_review, even if they were approved before, with a
+        note (RESTORED_FOR_REVIEW) that keeps autopilot from approving them:
+        a human decides again. They're rescheduled from now with their original gaps,
         so a late undo never releases a whole sequence at once. Items
         cancelled for any other reason stay cancelled.
         """
@@ -1558,51 +1589,76 @@ class StateManager:
             for r in rows:
                 send_at = now + max(timedelta(0), _at(r["send_at"]) - first)
                 await db.execute(
-                    "UPDATE outbox SET status = 'pending_review', error = '', send_at = ?, "
-                    "updated_at = ? WHERE id = ?",
-                    (send_at.isoformat(), now.isoformat(), r["id"]),
+                    "UPDATE outbox SET status = 'pending_review', error = ?, approved_by = '', "
+                    "send_at = ?, updated_at = ? WHERE id = ?",
+                    (RESTORED_FOR_REVIEW, send_at.isoformat(), now.isoformat(), r["id"]),
                 )
             await db.commit()
             return len(rows)
 
     async def reject_outbox_item(self, item_id: str) -> int:
         """Reject an item still waiting to go out. Mail already on its way
-        or sent is never relabelled. Returns rows changed (0/1)."""
-        async with self._connect() as db:
+        or sent is never relabelled. A rejected cold email ends its member
+        in the campaign (campaigns.stop_after: its later steps would never
+        go after it anyway), so a campaign that doesn't roll can finish.
+        Returns rows changed (0/1)."""
+        from harvey import campaigns
+
+        def run(con):
             # A note that the check will try it again no longer applies.
-            cursor = await db.execute(
+            n = con.execute(
                 "UPDATE outbox SET status = 'rejected', updated_at = ?, "
                 "error = CASE WHEN substr(COALESCE(error, ''), 1, ?) = ? THEN '' ELSE error END "
                 "WHERE id = ? AND status IN ('pending_review', 'approved')",
                 (_utcnow().isoformat(), len(RECHECK_PREFIX), RECHECK_PREFIX, item_id),
-            )
-            await db.commit()
-            return cursor.rowcount
+            ).rowcount
+            row = con.execute("SELECT kind, campaign_id, to_email, step FROM outbox "
+                              "WHERE id = ?", (item_id,)).fetchone() if n else None
+            if row and row[0] == "sequence" and row[1]:
+                campaigns.stop_after(con, row[1], row[2], int(row[3] or 1), campaigns.REJECTED)
+            return n
+
+        return await self._in_tx(run)
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None.
 
         A human's approval (dashboard or CLI): marked approved_by 'you', so
         the autopilot review (gate.autopilot_review) doesn't hold it again,
-        and any reason it was held is cleared."""
+        and any reason it was held is cleared. Cold email whose campaign is
+        paused gets the note saying why it waits, as the pause gives the
+        rows it finds approved (a draft has no emails to approve)."""
         async with self._connect() as db:
+            now = _utcnow().isoformat()
             if item_id:
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
                     "updated_at = ? WHERE id = ? AND status = 'pending_review'",
-                    (_utcnow().isoformat(), item_id),
+                    (now, item_id),
                 )
             else:
                 # Not the ones autopilot held for a look (possible planted
-                # links or a leak): those are approved one at a time.
+                # links or a leak), the first answer since an opt-out was
+                # undone, nor a first email the privacy page leaves no room
+                # for its other link: those are looked at one at a time.
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
                     "updated_at = ? WHERE status = 'pending_review' "
-                    "AND COALESCE(error, '') NOT LIKE ?",
-                    (_utcnow().isoformat(), HELD_FOR_REVIEW + "%"),
+                    "AND COALESCE(error, '') NOT LIKE ? AND COALESCE(error, '') NOT IN (?, ?)",
+                    (now, HELD_FOR_REVIEW + "%", REVIEW_AFTER_UNDO, PRIVACY_LINK_HELD),
+                )
+            approved = cursor.rowcount
+            if approved:
+                await db.execute(
+                    "UPDATE outbox SET error = ? "
+                    "WHERE status = 'approved' AND approved_by = 'you' AND kind = 'sequence' "
+                    "AND updated_at = ? AND COALESCE(error, '') = '' AND campaign_id IN "
+                    "(SELECT id FROM campaigns WHERE status = 'paused')"
+                    + (" AND id = ?" if item_id else ""),
+                    (CAMPAIGN_PAUSED, now, *((item_id,) if item_id else ())),
                 )
             await db.commit()
-            return cursor.rowcount
+            return approved
 
     async def note_sends_held(self, reason: str):
         """The heartbeat held sending this cycle. Keeps when it started."""
@@ -1643,28 +1699,30 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
-    async def promote_for_autopilot(self, due_before: str, limit: int) -> int:
-        """Autopilot approves staged cold email when it is about to go, not
-        when it was staged: due, waiting with no note (nothing held it), in
-        an active campaign that doesn't ask to review everything, and a
-        follow-up only once the step before it went out. So what was staged
-        while sending was paused, or before autopilot was turned on, is
-        approved by the drain that sends it (after the autopilot review),
-        never by the act of staging. Returns how many."""
+    async def promote_for_autopilot(self, due_before: str, limit: int,
+                                    kind: str = "sequence") -> int:
+        """Autopilot approves staged email when it is about to go, not when
+        it was staged: due, waiting with no note (nothing held it), and for
+        cold email (``kind`` sequence) in an active campaign that doesn't
+        ask to review everything, a follow-up only once the step before it
+        went out. So what was staged while sending was paused, or before
+        autopilot was turned on, is approved by the drain that sends it
+        (after the autopilot review), never by the act of staging. The same
+        holds for the Handler's answers (``kind`` reply). Returns how many."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'approved', approved_by = 'autopilot', updated_at = ? "
                 "WHERE id IN (SELECT o.id FROM outbox o LEFT JOIN campaigns c "
                 "ON c.id = o.campaign_id WHERE o.status = 'pending_review' "
-                "AND o.kind = 'sequence' AND COALESCE(o.approved_by, '') = '' "
+                "AND o.kind = ? AND COALESCE(o.approved_by, '') = '' "
                 "AND COALESCE(o.error, '') = '' AND (o.send_at IS NULL OR o.send_at <= ?) "
                 "AND (c.id IS NULL OR (c.status = 'active' "
                 "AND COALESCE(c.review, 'inherit') != 'always')) "
-                "AND NOT (o.step > 1 AND EXISTS (SELECT 1 FROM outbox p "
+                "AND NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS (SELECT 1 FROM outbox p "
                 "WHERE p.prospect_id = o.prospect_id AND p.campaign_id = o.campaign_id "
                 "AND p.kind = 'sequence' AND p.step = o.step - 1 AND p.status != 'sent')) "
                 "ORDER BY o.send_at, o.created_at LIMIT ?)",
-                (_utcnow().isoformat(), due_before, int(limit)),
+                (_utcnow().isoformat(), kind, due_before, int(limit)),
             )
             await db.commit()
             return cursor.rowcount
@@ -2233,14 +2291,6 @@ class StateManager:
         return await self._read("companies_needing_prospects", limit, module, capability,
                                 cutoff)
 
-    async def email_audience(self, limit: int = 200) -> list[dict]:
-        """Email contacts the Email module can write to and has no prospect
-        for yet: a verified, catch-all or not yet checked address, not
-        do-not-contact, reaching a live company with trust confirmed or
-        likely. Each comes with one link (through a person first, then the
-        best trust): its company, person and source. Oldest first."""
-        return await self._read("email_audience", limit)
-
     async def record_search(self, target: str, target_id, module: str, capability: str,
                             **done) -> None:
         """A search done for a record (contacts.record_search), whatever it
@@ -2351,17 +2401,6 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else default
-
-    async def retry_write_failed(self) -> int:
-        """Give every 'write_failed' prospect another try. Returns how many."""
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE prospects SET status = 'new', updated_at = ? "
-                "WHERE status = 'write_failed'",
-                (_utcnow().isoformat(),),
-            )
-            await db.commit()
-            return cursor.rowcount
 
     async def settings_with_prefix(self, prefix: str) -> dict[str, str]:
         """Every setting whose key starts with ``prefix``."""
@@ -2567,7 +2606,8 @@ class StateManager:
     # ── Campaigns ──
 
     async def add_campaign(self, campaign: Campaign) -> str:
-        """A campaign the Writer made ('auto'): its prospects become its
+        """A campaign in the shape the Writer made them before campaigns
+        were made by hand ('auto', still read): its prospects become its
         members (campaign_member), in the same write."""
         from harvey.overlay import schema
 
@@ -2577,12 +2617,11 @@ class StateManager:
         def run(con):
             con.execute(
                 """INSERT INTO campaigns
-                   (id, name, channel, instantly_campaign_id, sequence_json,
+                   (id, name, channel, sequence_json,
                     prospect_ids_json, status, created_at, origin, account_id, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                 (
-                    campaign.id, campaign.name, campaign.channel,
-                    campaign.instantly_campaign_id, campaign.sequence_json(),
+                    campaign.id, campaign.name, campaign.channel, campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
                     campaign.created_at.isoformat(), campaign.origin, int(time.time()),
                 ),
@@ -2993,15 +3032,12 @@ class StateManager:
             async with db.execute(
                 """SELECT
                      SUM(CASE WHEN status = 'draft' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN status = 'draft' AND COALESCE(origin, 'auto') = 'auto'
-                         THEN 1 ELSE 0 END)
+                     SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
                    FROM campaigns"""
             ) as cursor:
                 row = await cursor.fetchone()
                 draft_campaigns = row[0] or 0
                 active_campaigns = row[1] or 0
-                writer_drafts = row[2] or 0
             async with db.execute(
                 "SELECT COUNT(*) FROM conversations WHERE status = 'open'"
             ) as cursor:
@@ -3015,16 +3051,13 @@ class StateManager:
 
         return {
             "prospects": prospect_counts,
-            # The 'new' prospects the Writer can act on. A guessed or invalid
-            # address stays 'new' forever, so deciding from the raw count
-            # would keep choosing write_campaign with nothing to write.
+            # The 'new' prospects with an address that can be written to (a
+            # guessed or invalid one stays 'new' for good).
             "writable_prospects": await self.count_writable_prospects(),
-            # Unusable ones found in the last day: the heartbeat pauses
-            # prospecting for the day when these alone fill the backlog.
+            # Unusable ones found in the last day: `harvey status` says why
+            # nothing can be written when these alone fill the backlog.
             "recent_unusable_prospects": await self.count_recent_unusable_prospects(),
             "draft_campaigns": draft_campaigns,
-            # The Writer's drafts, the only ones Instantly deploys.
-            "writer_drafts": writer_drafts,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
             "usage_today": usage_today,  # Claude calls (kept for compatibility)

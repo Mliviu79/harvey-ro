@@ -95,20 +95,20 @@ Harvey runs locally with your own login. Check the terms and usage limits of the
 Harvey runs a heartbeat: wake up, check the budget, read replies, send what's due, work the campaigns, log it, sleep. Every 15 minutes by default.
 
 ```
-                 ┌──────────────────────────────────────┐
-                 ↓                                      │
+    ┌─────────────────────────────────────────────────────────────────────────────────┐
+    ↓                                                                                 │
    Wake  →  Quiet hours?  →  Budget OK?  →  Read  →  Send  →  Campaigns  →  Log  →  Sleep
-                 │               │
-              (sleep)         (sleep)
+                  │               │
+               (sleep)         (sleep)
 ```
 
-With Gmail, SMTP or Microsoft 365 nothing is chosen: every cycle does the same bounded steps, in order, so an open conversation or paused sending never stops writing:
+Nothing is chosen: every cycle does the same bounded steps, in order, so an open conversation or paused sending never stops writing:
 
 ```
 read replies  →  drain the Outbox  →  each active campaign: roll, check, write, stage  →  idle (analyze) if nothing was done
 ```
 
-Sending waits when replies couldn't all be read (a reply that wasn't read can't have cancelled its follow-ups). Instantly keeps the old flow: `handle replies > send campaigns > write campaigns > idle`.
+Sending waits when replies couldn't all be read (a reply that wasn't read can't have cancelled its follow-ups). Harvey sends through Gmail, SMTP or Microsoft 365 only: with any other `channels.email.provider` (Instantly, which Harvey no longer supports) the heartbeat sends and reads nothing and says why, in the log, on Today and in `harvey status`, while finding contacts and everything else goes on.
 
 The heartbeat is the Email module's: it reads replies, writes and sends, and with the Email module off it does nothing. Finding companies, reading their sites, finding contacts and loading public data are **jobs** the worker runs (see [The queue](#the-queue-background-jobs)), whatever the Email switch says. The heartbeat never looks for people: the [contact finder](#the-contact-finder) does, on its own.
 
@@ -607,7 +607,6 @@ The dashboard's Outbox is a decisions desk: one email fills the pane, the rest w
 harvey outbox                 # review from the terminal
 harvey outbox --approve-all
 harvey sending pause          # kill switch, stops everything mid-flight
-harvey retry-writes           # retry prospects the Writer gave up on after 3 unusable drafts
 ```
 
 Before anything leaves, a **deterministic pre-send gate** — no model involved — rejects: unrendered merge tags, banned phrases, emails over the length cap, too many links, HTML bodies, non-deliverable addresses, and any mismatch between the recipient and the database record.
@@ -626,7 +625,8 @@ top of the Outbox, and Settings → Sending explains both and switches them.
 | First emails, follow-ups, replies | Wait in the Outbox until you approve each one | Go out on their own, on schedule |
 | Daily limit, quiet hours, warmup ramp, opt-outs, bounces, Pause all sending | Apply | Apply the same |
 | An email with a link that isn't yours, or quoting Harvey's instructions | You see it like any other | Held in the Outbox, marked **Held**, until you approve it |
-| On Instantly | Campaigns aren't deployed at all (Instantly can't hold single emails) | Campaigns deploy; held replies come to you |
+| When it is approved | When you approve it | When the drain that sends it runs, after its review: never while sending is paused, so resuming sends nothing unreviewed |
+| An answer to a reply | As you approved it | With `compliance.ai_disclosure_line` under it ("Acest răspuns a fost scris cu ajutorul unui asistent AI." by default; blank turns it off) |
 
 **Turning autopilot on.** Approve a batch or two by hand first and read what
 Harvey writes. Then either go to Settings → Sending → *Turn on autopilot…* and
@@ -639,8 +639,7 @@ Settings), or `require_approval: true` in the config. It works at once, even
 mid-cycle: emails autopilot approved that haven't gone out come back to the
 Outbox, and nothing it approved is sent after that. Emails you approved
 yourself stay approved. (Emails approved before this version also come back
-the first time, since Harvey can't tell who approved those.) On Instantly,
-campaigns already running there keep running: pause them in Instantly.
+the first time, since Harvey can't tell who approved those.)
 
 **What autopilot still holds for you.** Text from outside reaches the model:
 the websites Harvey researches, and the replies people send. Either can carry
@@ -664,16 +663,17 @@ reason, instead of out, when it:
 
 The first reply after you undo someone's opt-out waits for you too. Approving
 a held email yourself sends it. **Approve all** leaves held emails out, so
-each one gets read before it goes. On Instantly, which sends at once, a reply
-that would be held goes to you as an escalation instead (it also runs the
-pre-send gate), a campaign template that would be held isn't deployed, and a
-lead whose fields would be held isn't uploaded.
+each one gets read before it goes.
 
-**Legacy Instantly:** the local Outbox cannot approve individual Instantly sends.
-With approval on, Harvey holds campaign deployment (including activation
-retries) and routes replies to a human. Choose Gmail, Microsoft 365, or SMTP
-for the approval queue. Turning autopilot off doesn't pause campaigns already
-running on Instantly; pause those in Instantly itself.
+**Instantly is no longer supported.** Harvey sends and reads mail through
+Gmail, Microsoft 365 or SMTP, where every email passes the Outbox, the
+do-not-contact list, the source note and the unsubscribe header. A config
+that still says `provider: instantly` loads, but nothing is sent or read: the
+log, `harvey status` and the dashboard's Today page say to choose gmail, smtp
+or microsoft (Settings → Sending), and finding contacts and everything else
+keeps working. Campaigns an earlier Harvey deployed to Instantly keep running
+there until you stop them in Instantly; Harvey still counts their people as
+contacted, so no campaign here writes to them again within 90 days.
 
 ---
 
@@ -826,7 +826,7 @@ harvey contacts find --website no --max-spend 2.00   # look up companies with no
 harvey contacts find --force --limit 50        # search again, even what was searched before
 ```
 
-**From contacts to the Email module.** The finder knows nothing about email campaigns. A campaign takes its members from an audience: a Contacts filter you saved (Contacts → Actions → *Salvează ca public*, or `harvey audiences save`), read by the same code as the page, so the campaign gets exactly what the page showed. Ticked email rows can be added to a campaign by hand (*Adaugă în campanie…*). Whichever way an address comes in (the start, a roll, by hand) it goes through the same rules: verified, catch-all (with `send_to_risky`) or not yet checked; linked to a live firm with trust confirmed or likely; not on the do-not-contact list; not in another active campaign's sequence, nor sent cold email in the last 90 days (an address marked contacted with no cold email on file, as Instantly leaves it, counts as recent); nobody there already answered. The preview counts what each rule left out. Each cycle writes at most 8 first emails across all campaigns, and only while the first emails waiting to go are fewer than two days of today's cold cap, so the model isn't called for drafts that would sit in the queue. An address nobody checked is checked before anything is written for it (a credit from the same monthly checks; a rolling campaign's new ones at most 50 a day), and one that comes back a guess or invalid is skipped. What the company's record says (its town and activity, and the latest reading of the signals the site read and other sources collected: tools on the site, open roles, ads, employees) goes into the address's card, and the Writer reads the same facts from the record when it writes its first email.
+**From contacts to the Email module.** The finder knows nothing about email campaigns. A campaign takes its members from an audience: a Contacts filter you saved (Contacts → Actions → *Salvează ca public*, or `harvey audiences save`), read by the same code as the page, so the campaign gets exactly what the page showed. Ticked email rows can be added to a campaign by hand (*Adaugă în campanie…*). Whichever way an address comes in (the start, a roll, by hand) it goes through the same rules: verified, catch-all (with `send_to_risky`) or not yet checked; linked to a live firm with trust confirmed or likely; not on the do-not-contact list; not in another active campaign's sequence, nor sent cold email in the last 90 days (an address marked contacted with no cold email on file, as an earlier release's Instantly campaigns or a hand send leave it, counts as recent); nobody there already answered. The preview counts what each rule left out. Each cycle writes at most 8 first emails across all campaigns, and only while the first emails waiting to go are fewer than two days of today's cold cap, so the model isn't called for drafts that would sit in the queue. An address nobody checked is checked before anything is written for it (a credit from the same monthly checks; a rolling campaign's new ones at most 50 a day), and one that comes back a guess or invalid is skipped. What the company's record says (its town and activity, and the latest reading of the signals the site read and other sources collected: tools on the site, open roles, ads, employees) goes into the address's card, and the Writer reads the same facts from the record when it writes its first email.
 
 ```bash
 harvey audiences save "Stomatologi BV" --county BV --q stomatologie
@@ -834,7 +834,10 @@ harvey audiences show 1                         # what a campaign would take, co
 harvey campaigns new --name "Stomatologi BV" --audience 1 --note-file nota.txt --sequence-file secventa.json
 harvey campaigns start <id>                     # needs the note (80+ characters), a sequence and harvey ack
 harvey campaigns members <id> --status replied
+harvey campaigns export <id> --format csv       # its record: note, acknowledgement, members, sends, opt-outs
 ```
+
+**The record (evidență).** Each campaign keeps your record of the balancing test and of what it did: its legitimate-interest note (edited in the campaign's panel while it is a draft, then kept as it started), the acknowledgement it started under (version and time), every address with how it joined (start, roll, by hand) and why it left (replied, opted out, rejected by you, bounced, cut off mid-send, send failed...), every email sent (the answers in its conversations too), and the opt-outs that reach its addresses (their own, their domain's or their firm's). The campaign's panel has **Evidența (CSV)** and **(JSON)**; `harvey campaigns export ID` writes the same. A first email you reject ends that address's place in the campaign (its follow-ups would never follow it), and so does one whose send was cut off mid-way or failed (it may have arrived, and is never retried), so a campaign that doesn't roll still finishes.
 
 Staged email always waits in the Outbox; on autopilot the drain that sends an email approves it then, after the autopilot review, so a pause never turns into a burst nobody looked at.
 
@@ -935,9 +938,11 @@ persona:      { name, company, role, email, tone }
 product:      { name, description, pricing, key_benefits, objection_responses, offer }
 icp:          { industries, titles, company_size, geography, hiring_signals, geo_coordinates }
 channels:
-  email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, require_approval,
+  email:      { provider: gmail | microsoft | smtp, max_daily_sends, require_approval,
                 send_to_risky, max_bounce_rate, warmup, send_window }
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
+compliance:   { postal_address, opt_out_line, do_not_contact, privacy_url, ai_disclosure_line,
+                precleared }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
 writer:       { humanizer }   # optional; true adds one editing pass per batch using ~/.claude/skills/humanizer/SKILL.md
 ```
@@ -996,7 +1001,7 @@ harvey sending pause|resume  # kill switch
 harvey sending accept-gap    # let cold email go after a read that couldn't reach back
 harvey warmup [domain]       # is the sending domain ready? (SPF/DKIM/DMARC, age, blocklists, warmup)
 harvey trulyinbox connect    # connect TrulyInbox so Harvey reads the mailbox's warmup
-harvey retry-writes          # retry prospects the Writer gave up on
+harvey campaigns export ID   # a campaign's record (CSV or --format json)
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
@@ -1104,7 +1109,7 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Nu vă interesează? Răspundeți „stop" și nu vă mai scriu.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Nothing Harvey does later moves someone off *opted out*: a later message from them is kept for you to read, never answered, and a complaint still goes to you. To see why someone was opted out (the rule that fired, the words, and their message), click **Why?** on their row in Contacts. If it was a mistake, **Undo opt-out** there marks them as replied: Harvey sends nothing on its own, and their next reply gets a draft for your approval. Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.local.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Răspundeți „stop"`, `Reply "no thanks"`, `Reply STOP`, also "dezabonare", "nu mai doresc", "unsubscribe", "remove me", "opt out") and can't contain a link or email address. Romanian opt-outs ("nu mă mai contactați", "nu mai scrieți", "dezabonare", with or without diacritics) are honoured by these keyword rules, never left to the model.
 
-**Do not contact.** List competitors, existing customers, or anyone else Harvey must never email under `compliance.do_not_contact`, one address or domain per line, in `harvey.local.yaml` (copy `harvey.yaml` to it first if you don't have one yet). A domain covers its subdomains (`acme.example` also blocks `mail.acme.example`, not `notacme.example`), an address covers its plus-tags (`jane@` also blocks `jane+news@`), and a pasted link such as `https://www.acme.example/about` or `Jane Doe <jane@acme.example>` counts as what it names. An entry that is neither an address nor a domain stops Harvey from starting, with the entry named, rather than quietly protecting nobody. A running Harvey picks up an edit at once, and the send gate checks the list as each email leaves, cold or reply, so it holds even for an email you already approved. If someone on the list writes back, Harvey doesn't draft an answer: the conversation comes to you. `harvey export` and the dashboard's Export buttons leave them out too. On Instantly, listed leads are left out of the upload and a reply to one comes to you, but Harvey can't take back a lead Instantly already has: remove it there.
+**Do not contact.** List competitors, existing customers, or anyone else Harvey must never email under `compliance.do_not_contact`, one address or domain per line, in `harvey.local.yaml` (copy `harvey.yaml` to it first if you don't have one yet). A domain covers its subdomains (`acme.example` also blocks `mail.acme.example`, not `notacme.example`), an address covers its plus-tags (`jane@` also blocks `jane+news@`), and a pasted link such as `https://www.acme.example/about` or `Jane Doe <jane@acme.example>` counts as what it names. An entry that is neither an address nor a domain stops Harvey from starting, with the entry named, rather than quietly protecting nobody. A running Harvey picks up an edit at once, and the send gate checks the list as each email leaves, cold or reply, so it holds even for an email you already approved. If someone on the list writes back, Harvey doesn't draft an answer: the conversation comes to you. `harvey export` and the dashboard's Export buttons leave them out too.
 
 **The do-not-contact list.** Everyone who asked not to be contacted, and anything you add by hand, is on one list in `harvey.db` (`harvey suppress list`, `--csv` to keep it beside an export; `harvey suppress add ADDRESS|DOMAIN`, `--firm ID` for a whole firm; `harvey suppress undo ID`). An entry names an address, a domain (its subdomains too; a free-mail domain such as gmail.com is refused, it would bar everyone there), or a firm (by its tax code when it has one, so it holds after the firm is removed and pulled again), never a contact row, so it holds through merges and their undo, and an address found again comes back barred. The send gate, the Writer, the audience, the exports and the reply handler all check it, next to `compliance.do_not_contact`. Undoing an entry keeps its history; undoing one the person asked for (an unsubscribe, an opt-out, an objection) asks you to type `confirm` and say why. The one-click "Undo opt-out" on a contact lifts only an opt-out Harvey read in their reply's words (a keyword or the model can be wrong); an unsubscribe, an objection or a complaint is undone on the list. A firm entry for a firm with no tax code bars its own domain too (never a free-mail one), so it holds after the firm is removed and pulled again. No export ever includes a barred address, `--all` included; an export is what was true when it was made, so send the list with it.
 
@@ -1112,9 +1117,9 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Reading every reply.** Each read goes back at least to the last complete one: if Harvey was off for longer than the usual week, the next read reaches back that far (IMAP reads by date without marking anything read, so a message you opened first is still read). A mailbox that got more mail since then than one read takes (5,000 IMAP messages, 40 pages on Gmail or Microsoft 365) is read newest first. If a read can't cover the gap, cold email waits, with a card on Today, until one does or you accept the gap (`harvey sending accept-gap`, typing `accept`: an unsubscribe sent in that time may stay unread); replies still go out. A message from someone Harvey has no card for is marked read and never holds sending; if it answers one of Harvey's emails, or comes from a firm Harvey wrote to, it comes to you as a conversation, that firm's cold email stops, and the sender goes on the list when their own words ask to stop (a stranger's newsletter with a "dezabonare" link is left alone). Cold email also waits when the address it goes out from isn't known (no `persona.email`, and Gmail or Microsoft 365 couldn't say), since its unsubscribe header names it.
 
-**Before the first cold email: the acknowledgement.** Cold email waits until you have read what sending it to firms means (Law 506/2004, GDPR legitimate interest, the information a person is owed and their right to object) and confirmed it once with `harvey ack` (the text is versioned: a new version asks again). Today shows a card while cold email waits for it. It is not legal advice.
+**Before the first cold email: the acknowledgement.** Cold email waits until you have read what sending it to firms means (Law 506/2004, GDPR legitimate interest, the information a person is owed and their right to object) and confirmed it once: Settings → Sending → *Citește și confirmă* (a dialog with the text; you type `accept`), the same dialog when you start your first campaign, or `harvey ack` (the text is versioned: a new version asks again). Today shows a card while cold email waits for it. It is not legal advice, and it says what Harvey's source line doesn't cover.
 
-**Personal addresses.** An address that belongs to a named person, is on a free-mail domain, or belongs to a natural-person business (PFA, II, IF, from the trade registry's legal form, else ANAF's) gets a fixed line in its first email saying where the address was found (for example *Am găsit adresa pe site-ul dumneavoastră (exemplu.ro).*), added when the email is staged so the draft you approve is what goes. It is decided over every firm the address is linked to. The send gate refuses a first email to a personal address without it; one staged before the address was known to be personal gets the line and waits for your approval again.
+**Personal addresses.** An address that belongs to a named person, is on a free-mail domain, or belongs to a natural-person business (PFA, II, IF, from the trade registry's legal form, else ANAF's) gets a fixed line in its first email saying where the address was found (for example *Am găsit adresa pe site-ul dumneavoastră (exemplu.ro).*), added when the email is staged so the draft you approve is what goes. It is decided over every firm the address is linked to. The send gate refuses a first email to a personal address without it; one staged before the address was known to be personal gets the line and waits for your approval again. The line names the source only; GDPR art. 14 also asks for who you are, the purpose, the legal basis and the right to object. Set `compliance.privacy_url` to a page that says it, and the line gets *Cine suntem și cum vă puteți opune: https://…* after it, for personal addresses only. It is a link, so that first email carries no other one (the gate allows one): one that has another (a booking link in the first step, say) waits for you in the Outbox from staging, marked, until you take the other link out.
 
 **GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
 
@@ -1122,14 +1127,14 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **If the check is held up.** When Precleared can't answer (the day's free checks are used up, the key is out of checks, was rejected or is being rate limited, or Precleared can't be reached), cold email to new addresses waits and replies still go out; email to people Precleared has already cleared keeps going. If Precleared can't check one address, that email is tried again six hours later and the rest carry on, unless that happens at two different domains with no answer in between, which holds new addresses as above. The Today page and `harvey status` say how many cold emails are waiting on the check and what fixes it.
 
-**Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
+**Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise. An answer autopilot sends with nobody reading it first also carries `compliance.ai_disclosure_line` under it (*Acest răspuns a fost scris cu ajutorul unui asistent AI.* by default; blank turns it off). An answer you approved, and cold email, go as they are.
 
 **Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
 
 1. Buy a **dedicated sending domain** (`getacme.example`, not `acme.example`).
 2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you. `harvey warmup` checks them, plus domain age, blocklists, your warmup progress and bounce rate, and ends with READY / NOT READY. It only reads public DNS and Harvey's own records.
 3. **Warm up for 2–4 weeks** before real volume, and keep warmup running after. We recommend [TrulyInbox](https://trulyinbox.com/?via=harvey); see [Warmup with TrulyInbox](#warmup-with-trulyinbox).
-4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target. Set `channels.email.warmup.start_date` and Harvey does this for you (Gmail, Microsoft, SMTP; Instantly has its own warmup): no cold email for `min_days`, then a cold-email cap that climbs by `daily_increase` a day. Replies always go out.
+4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target. Set `channels.email.warmup.start_date` and Harvey does this for you: no cold email for `min_days`, then a cold-email cap that climbs by `daily_increase` a day. Replies always go out.
 5. **Watch bounces.** Above ~3%, stop and fix list quality. Harvey trips its own kill switch past your configured threshold.
 
 *None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*

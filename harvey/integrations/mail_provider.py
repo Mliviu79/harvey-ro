@@ -1,4 +1,4 @@
-"""Mail provider abstraction — Harvey owns its sending, Instantly optional.
+"""Mail provider abstraction — Harvey owns its sending.
 
 A MailProvider gives Harvey full inbox control: send, read replies,
 thread. Two native providers ship:
@@ -11,8 +11,8 @@ thread. Two native providers ship:
 - ``smtp``   — any mailbox that speaks SMTP + IMAP (AgentMail, Fastmail,
   a Workspace app-mailbox, self-hosted). Configuration via .env.
 
-``instantly`` remains supported through the legacy Sender/Handler path —
-it isn't a MailProvider because Instantly owns sequencing/sending itself.
+Any other provider name (Instantly, which Harvey no longer supports) has no
+MailProvider: nothing is sent or read, and config.provider_notice says why.
 """
 
 import logging
@@ -227,7 +227,8 @@ class MailProvider(ABC):
 
 
 def get_mail_provider(config, env) -> MailProvider | None:
-    """Build the configured native provider, or None for instantly/unknown."""
+    """Build the configured native provider, or None for any other name
+    (config.provider_notice says why nothing can be sent)."""
     provider = (config.channels.email.provider or "").strip().lower()
     if provider == "gmail":
         from harvey.integrations.gmail import GmailProvider

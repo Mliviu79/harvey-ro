@@ -90,29 +90,6 @@ async def test_after_warming_cold_email_is_capped_at_todays_ramp(state, monkeypa
     assert len(provider.sent) == 2
 
 
-@pytest.mark.asyncio
-async def test_the_ramp_leaves_instantly_alone(state, monkeypatch):
-    # Instantly runs its own warmup and per-account limits; capping uploads
-    # here would strand the rest of a campaign's prospects.
-    from harvey.agents.sender import Sender
-    from harvey.config import EnvConfig
-    from harvey.models.campaign import Campaign, EmailStep
-    ids = [await seed_prospect(state, email=f"p{n}@acme.example", status="queued") for n in range(6)]
-    warm_start = (date.today() - timedelta(days=14)).isoformat()
-    config = SimpleNamespace(channels=SimpleNamespace(email=EmailChannelConfig(
-        provider="instantly", require_approval=False, max_daily_sends=50,
-        warmup=WarmupConfig(start_date=warm_start, min_days=14, start_sends=3))))
-    sender = Sender(None, state, config, EnvConfig())
-    sender.instantly = AsyncMock()
-    sender.instantly.set_campaign_emails.return_value = {}
-    sender.instantly.add_leads.return_value = {}
-    await sender._deploy_campaign(Campaign(
-        id="c", name="Draft", instantly_campaign_id="existing", prospect_ids=ids,
-        sequence=[EmailStep(step=1, subject="a note", body="Would this help?")]))
-    leads = sender.instantly.add_leads.await_args.args[1]
-    assert len(leads) == 6
-
-
 # ── The checks (DNS stubbed) ──
 
 def _txt(records):
@@ -216,10 +193,9 @@ def test_punycode_domains_are_checked(domain):
     assert d.DOMAIN_RE.match(domain)
 
 
-def test_timestamp_start_date_and_instantly_note():
+def test_timestamp_start_date():
     import yaml
     email = EmailChannelConfig(**yaml.safe_load("warmup:\n  start_date: 2026-10-01 09:00\n"))
     assert email.warmup.start_date == "2026-10-01"
     w = WarmupConfig(start_date="2026-10-01", min_days=0, start_sends=0, daily_increase=2)
     assert d.check_warmup(w, 30, date(2026, 10, 1)).status != d.WARN  # 0 today, grows
-    assert d.check_warmup(w, 30, provider="instantly").status == d.INFO

@@ -1,11 +1,7 @@
-"""A batch the model can't write for must not loop forever.
-
-When _write_sequence comes back empty (unparseable output, or an inbox
-sequence that used a person's name), the batch's prospects stayed 'new', so
-every heartbeat chose write_campaign again, spent a Claude call, and Scout
-never ran. Now each prospect gets a few attempts; after that it is moved to
-'write_failed', which is visible and no longer blocks the pipeline. A
-provider outage is not the model's fault and never counts as an attempt.
+"""The model's reply, or its absence: a draft that comes back unusable is
+told apart from no reply at all (an outage, a logout, a rate limit), so the
+caller never mistakes one for the other, and a campaign's "Generează
+secvența" returns nothing usable rather than a broken sequence.
 """
 
 from types import SimpleNamespace
@@ -13,13 +9,10 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from harvey.agents.writer import MAX_WRITE_ATTEMPTS, Writer
-from harvey.main import decide_next_action
+from harvey.agents.writer import Writer
+from harvey.models.campaign import Campaign
 from harvey.models.prospect import Prospect
 from harvey.state import StateManager
-
-GOOD = [{"step": 1, "subject": "quick one", "body": "Hi {{first_name}}, who answers at {{company}}?",
-         "delay_days": 0}]
 
 
 class FakeBrain:
@@ -34,13 +27,16 @@ class FakeBrain:
     def load_prompt(self, name, **kw):
         return "prompt"
 
+    def for_profile(self, profile_id):
+        return self
+
     async def think_json(self, prompt, **kw):
         self.calls += 1
         return None if self.paused_reason else self.reply
 
 
 CONFIG = SimpleNamespace(
-    channels=SimpleNamespace(email=SimpleNamespace(provider="instantly", require_approval=False)),
+    channels=SimpleNamespace(email=SimpleNamespace(provider="gmail", require_approval=False)),
     product=SimpleNamespace(name="P", description="D", key_benefits=[], pricing=""),
     persona=SimpleNamespace(name="S", company="C", role="R", tone="t"),
 )
@@ -53,80 +49,16 @@ async def state(tmp_path):
     return state
 
 
-async def add(state, n):
-    return await state.add_prospect(Prospect(
-        first_name=f"P{n}", last_name="Doe", title="Owner", company=f"Co{n}",
-        industry="Roofing", email=f"p{n}@co{n}.test", email_status="verified",
-    ))
-
-
-async def status(state, pid):
-    return (await state.get_prospect(pid)).status
-
-
 @pytest.mark.asyncio
-async def test_a_batch_that_keeps_failing_stops_after_a_few_attempts(state):
-    pid = await add(state, 1)
+async def test_an_unusable_sequence_is_returned_as_nothing(state):
+    pid = await state.add_prospect(Prospect(
+        first_name="Ana", last_name="Pop", title="Owner", company="Alfa",
+        email="ana@alfa.example.com", email_status="verified"))
     brain = FakeBrain(reply="not a sequence")
     writer = Writer(brain, state, CONFIG, None)
-    for _ in range(MAX_WRITE_ATTEMPTS - 1):
-        await writer.run()
-        assert await status(state, pid) == "new"
-    await writer.run()
-    assert await status(state, pid) == "write_failed"
-    # The heartbeat stops writing for it (and leaves finding people to the
-    # contact finder).
-    summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
-    calls = brain.calls
-    await writer.run()
-    assert brain.calls == calls  # no more model calls for it
-
-
-@pytest.mark.asyncio
-async def test_a_provider_outage_never_counts_as_an_attempt(state):
-    pid = await add(state, 1)
-    writer = Writer(FakeBrain(paused="Claude usage limit reached"), state, CONFIG, None)
-    for _ in range(MAX_WRITE_ATTEMPTS + 2):
-        await writer.run()
-    assert await status(state, pid) == "new"
-
-
-@pytest.mark.asyncio
-async def test_success_after_a_failure_writes_normally(state):
-    pid = await add(state, 1)
-    brain = FakeBrain(reply="not a sequence")
-    writer = Writer(brain, state, CONFIG, None)
-    await writer.run()
-    brain.reply = GOOD
-    await writer.run()
-    assert await status(state, pid) == "queued"
-
-
-@pytest.mark.asyncio
-async def test_attempts_are_counted_per_prospect(state):
-    # Someone who joins a failing batch late gets their own full set of tries.
-    early = await add(state, 1)
-    writer = Writer(FakeBrain(reply="not a sequence"), state, CONFIG, None)
-    for _ in range(MAX_WRITE_ATTEMPTS - 1):
-        await writer.run()
-    late = await add(state, 2)
-    await writer.run()
-    assert await status(state, early) == "write_failed"
-    assert await status(state, late) == "new"
-
-
-@pytest.mark.asyncio
-async def test_an_empty_reply_is_an_outage_not_a_bad_draft(state):
-    # On Claude a logout, rate limit, timeout or missing CLI returns "" without
-    # pausing the brain. Only a reply that came back unusable may count.
-    pid = await add(state, 1)
-    brain = FakeBrain(reply=None)
-    brain.last_reply_empty = True
-    writer = Writer(brain, state, CONFIG, None)
-    for _ in range(MAX_WRITE_ATTEMPTS + 2):
-        await writer.run()
-    assert await status(state, pid) == "new"
+    steps = await writer.write_templates(Campaign(id="c", name="Test"),
+                                         [await state.get_prospect(pid)])
+    assert steps == [] and brain.calls == 1
 
 
 @pytest.mark.asyncio
@@ -145,18 +77,6 @@ async def test_the_real_brain_reports_whether_the_model_replied(state, monkeypat
     assert await brain.think_json("x") is None and brain.last_reply_empty is True
     monkeypatch.setattr(brain, "think", chatty)
     assert await brain.think_json("x") is None and brain.last_reply_empty is False
-
-
-@pytest.mark.asyncio
-async def test_given_up_prospects_can_be_retried(state, capsys):
-    pid = await add(state, 1)
-    writer = Writer(FakeBrain(reply="not a sequence"), state, CONFIG, None)
-    for _ in range(MAX_WRITE_ATTEMPTS):
-        await writer.run()
-    assert await status(state, pid) == "write_failed"
-    assert await state.retry_write_failed() == 1
-    assert await status(state, pid) == "new"
-    assert await state.retry_write_failed() == 0
 
 
 class _ClaudeProcess:

@@ -224,17 +224,3 @@ async def test_the_writer_skips_and_doesn_t_count_people_whose_company_answered(
     assert await state.count_writable_prospects() == 1
     await state.stop_company(ann)
     assert await state.count_writable_prospects() == 0
-
-
-@pytest.mark.asyncio
-async def test_instantly_campaigns_stop_for_the_whole_company():
-    from harvey.integrations.instantly import InstantlyClient
-    client = InstantlyClient.__new__(InstantlyClient)
-    sent = {}
-
-    async def fake_request(method, path, body=None, **kw):
-        sent.update(body or {})
-        return {"id": "c1"}
-    client._request = fake_request
-    await client.create_campaign("x")
-    assert sent["stop_for_company"] is True

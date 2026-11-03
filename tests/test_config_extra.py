@@ -179,17 +179,17 @@ def test_offer_override():
 def test_load_env_reads_environment(monkeypatch):
     # Don't read a developer's real .env — its keys would leak into the test.
     monkeypatch.setattr("harvey.config.load_dotenv", lambda *a, **k: False)
-    monkeypatch.setenv("INSTANTLY_API_KEY", "key-123")
+    monkeypatch.setenv("HUNTER_API_KEY", "key-123")
     monkeypatch.setenv("SERPER_API_KEY", "  serp-456  ")
     monkeypatch.setenv("TINYFISH_API_KEY", "  tiny-789  ")
-    monkeypatch.delenv("HUNTER_API_KEY", raising=False)
+    monkeypatch.delenv("REOON_API_KEY", raising=False)
     env = load_env()
-    assert env.instantly_api_key == "key-123"
+    assert env.hunter_api_key == "key-123"
     assert env.serper_api_key == "serp-456"
     assert env.tinyfish_api_key == "tiny-789"
-    assert env.hunter_api_key == ""
+    assert env.reoon_api_key == ""
 
 
 def test_env_config_rejects_non_string():
     with pytest.raises(ValidationError):
-        EnvConfig(instantly_api_key=["not", "a", "string"])
+        EnvConfig(hunter_api_key=["not", "a", "string"])

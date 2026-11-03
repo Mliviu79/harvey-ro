@@ -95,7 +95,7 @@ class _Cfg:
     class channels:
         class email:
             enabled = True
-            provider = "instantly"
+            provider = "smtp"
             max_daily_sends = 50
             send_to_risky = False
 
@@ -115,10 +115,11 @@ async def test_sender_only_sends_verified(state, monkeypatch):
         ids[status] = await state.add_prospect(p)
 
     class Env:
-        instantly_api_key = "k"
+        pass
     sender = Sender(brain=None, state=state, config=_Cfg(), env=Env())
+    assert sender.is_native
 
-    # Filter logic mirrors _deploy_campaign's lead selection.
+    # The statuses staging and the campaign cycle accept.
     from harvey.agents.sender import (
         SENDABLE_EMAIL_STATUSES, SENDABLE_EMAIL_STATUSES_WITH_RISKY,
     )

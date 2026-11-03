@@ -236,12 +236,9 @@ async def test_handler_holds_sends_when_graph_is_down(graph, tmp_path):
     from harvey.state import StateManager
     from tests.test_outbox_native import Cfg, StubBrain
 
-    class E(Env):
-        instantly_api_key = ""
-
     state = StateManager(os.path.join(tmp_path, "t.db"))
     await state.init_db()
-    handler = Handler(brain=StubBrain(), state=state, config=Cfg(), env=E())
+    handler = Handler(brain=StubBrain(), state=state, config=Cfg(), env=Env())
     handler.provider = provider(graph)
     graph.fail[("GET", "/inbox/messages")] = 500
 

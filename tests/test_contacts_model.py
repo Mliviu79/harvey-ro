@@ -640,7 +640,7 @@ def test_a_start_waits_for_another_process_creating_the_database(tmp_path, monke
     assert state_mod.MIGRATION_TIMEOUT_SECONDS > state_mod.BUSY_TIMEOUT_SECONDS
 
 
-# ── The Email module's audience: contacts the Writer can write to ──
+# ── The Email module's campaigns: contacts the Writer can write to ──
 
 
 def _audience_db(db, monkeypatch, status="verified"):
@@ -677,20 +677,36 @@ def _audience_db(db, monkeypatch, status="verified"):
     return s, alfa, checked
 
 
-def test_the_audience_makes_prospects_of_the_contacts_the_writer_can_use(tmp_path, monkeypatch):
-    from harvey.agents.audience import Audience
+async def _campaign_takes(s):
+    """A campaign over every email contact, started: its members and their
+    prospect cards, then a cycle's checks of the addresses nobody verified."""
+    from harvey import campaigns
+    from harvey.agents.campaigner import CampaignCycle
+    from tests.test_campaigns import config, new_campaign
 
+    cfg = config()
+    cid, counts = await new_campaign(s, cfg, query="kind=email")
+    active = await s.campaigns_call(campaigns.list_campaigns, ["active"], write=False)
+    cyc = CampaignCycle(s, cfg, {}, None, None)
+    await cyc._verify(active)
+    await cyc._verify(active)            # checked once: no longer waiting
+    return cid, counts
+
+
+def test_a_campaign_makes_prospect_cards_of_the_contacts_it_can_write_to(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     s, alfa, checked = _audience_db(db, monkeypatch)
 
     async def go():
-        made = await Audience(s, {}).run()
-        again = await Audience(s, {}).run()
-        return made, again, await s.get_prospects_by_status("new")
+        cid, counts = await _campaign_takes(s)
+        members = {m["email"]: m["status_name"] for m in await s.campaign_members(cid)}
+        return counts, members, await s.get_prospects_by_status("new")
 
-    made, again, new = run(go())
-    assert (made, again) == (2, 0)
+    counts, members, new = run(go())
+    # The unconfirmed and the opted-out addresses are left out.
+    assert counts["added"] == 2 and (counts["untrusted"], counts["suppressed"]) == (1, 1)
     assert checked == ["office@alfa.example"]
+    assert members == {"ion.popescu@alfa.example": "ready", "office@alfa.example": "ready"}
     by_email = {p.email: p for p in new}
     assert set(by_email) == {"ion.popescu@alfa.example", "office@alfa.example"}
     ion = by_email["ion.popescu@alfa.example"]
@@ -702,19 +718,16 @@ def test_the_audience_makes_prospects_of_the_contacts_the_writer_can_use(tmp_pat
     assert _rows(db, "SELECT name FROM person") == [("POPESCU ION",)]
 
 
-def test_the_audience_never_makes_a_prospect_of_an_address_that_checks_out_bad(tmp_path,
-                                                                              monkeypatch):
-    from harvey.agents.audience import Audience
-
+def test_an_address_that_checks_out_bad_is_never_written_to(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
     s, alfa, checked = _audience_db(db, monkeypatch, status="invalid")
 
     async def go():
-        await Audience(s, {}).run()
-        await Audience(s, {}).run()
-        return [p.email for p in await s.get_prospects_by_status("new")]
+        cid, _ = await _campaign_takes(s)
+        return await s.campaign_member(cid, "office@alfa.example")
 
-    assert run(go()) == ["ion.popescu@alfa.example"]
+    member = run(go())
+    assert (member["status_name"], member["end_reason"]) == ("skipped", "email status 'invalid'")
     # Checked once: graded invalid, it stays a contact and isn't asked again.
     assert checked == ["office@alfa.example"]
     from harvey.overlay import schema

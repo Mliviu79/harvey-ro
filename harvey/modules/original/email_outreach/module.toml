@@ -16,7 +16,6 @@ secrets = [
     "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
     "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
     "M365_CLIENT_ID", "M365_TENANT_ID",
-    "INSTANTLY_API_KEY",
     "PRECLEARED_API_KEY",
     "TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID",
     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
@@ -25,7 +24,7 @@ secrets = [
 [cost]
 as_of = 2026-10-30
 usd = 0.0
-note = "model calls use your Claude or ChatGPT plan; Instantly, TrulyInbox and Precleared bill you directly"
+note = "model calls use your Claude or ChatGPT plan; TrulyInbox and Precleared bill you directly"
 
 [settings.max_daily_sends]
 type = "int"

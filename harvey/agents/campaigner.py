@@ -151,7 +151,6 @@ class CampaignCycle:
             picked.append(prospect)
         if not picked:
             return 0
-        if self.writer.is_native:
-            await self.writer.write_for_members(campaign, picked)
+        await self.writer.write_for_members(campaign, picked)
         await self.sender._stage_campaign_native(campaign, emails=[p.email for p in picked])
         return len(picked)

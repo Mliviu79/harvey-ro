@@ -3333,61 +3333,6 @@ class Reader:
                 out["evidence_urls"].append(url)
         return out
 
-    def email_audience(self, limit: int = 200) -> list[dict]:
-        """StateManager.email_audience on the overlay: email contacts the
-        Email module can write to and has no prospect for yet (verified,
-        catch-all or not checked; not do-not-contact), each with one link to
-        a live firm trusted confirmed or likely (through a person first,
-        then the surest, oldest): its company, person and source."""
-        ok = {schema.CONTACT_STATUS[s] for s in ("verified", "risky", "unchecked")}
-        ids = [r[0] for r in self.x("overlay.read.contacts.of_kind", (EMAIL,))]
-        rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", ids)}
-        cands = [c for c in sorted(ids) if c in rows and not rows[c][6] and rows[c][5] in ok]
-        taken = {r[0] for r in self._by_ids("overlay.read.prospected_emails",
-                                            [rows[c][2] for c in cands])}
-        cands = [c for c in cands if rows[c][2] not in taken]
-        # The do-not-contact list's domain and firm entries (an address
-        # entry flags the contact already): left out before the limit, so
-        # they never crowd out addresses that can be written to.
-        from harvey import suppression
-
-        index = suppression.Index(self.con)
-        if index:
-            cands = [c for c in cands if index.hit(rows[c][2]) is None]
-        cands.sort(key=lambda c: (rows[c][5] == schema.CONTACT_STATUS["unchecked"], c))
-        links = list(self._by_ids("overlay.read.links_of_contacts", cands))
-        lives = self.live_of([l[1] for l in links])
-        best: dict[int, tuple] = {}
-        for contact, firm, trust, person, location, first in links:
-            if trust > schema.TRUST["likely"] or firm not in lives:
-                continue
-            key = (person == 0, trust != 0, first or 0, firm)
-            if contact not in best or key < best[contact][0]:
-                best[contact] = (key, firm, trust, person)
-        chosen = [c for c in cands if c in best][:int(limit)]
-        cards = {r["id"]: r for r in self.company_rows(
-            list(dict.fromkeys(lives[best[c][1]] for c in chosen)))}
-        persons = {r[0]: r for r in self._by_ids("overlay.read.persons",
-                                                 [best[c][3] for c in chosen if best[c][3]])}
-        evidence = {}
-        for firm, contact, src, trust, url, first, person, location in self._by_ids(
-                "overlay.read.evidence", [[best[c][1], c] for c in chosen], 500):
-            evidence.setdefault((firm, contact), (src, url))
-        out = []
-        for c in chosen:
-            _, firm, trust, person = best[c]
-            card = cards.get(str(lives[firm]), {})
-            src, url = evidence.get((firm, c), ("", ""))
-            p = persons.get(person)
-            out.append({"contact_id": c, "email": rows[c][2],
-                        "status": STATUS_NAMES.get(rows[c][5], ""), "company_id": card.get("id"),
-                        "source": src or "", "evidence_url": url or "",
-                        "trust": TRUST_NAMES.get(trust, ""), "person": p[2] if p else "",
-                        "role": (p[4] or "") if p else "", "person_source": (p[5] or "") if p else "",
-                        "company": card.get("name", ""), "industry": card.get("industry", ""),
-                        "domain": card.get("domain", "")})
-        return out
-
     def audience_rows(self, f=None, emails=None) -> list[dict]:
         """The email contacts a campaign could take (campaigns.add_members
         decides): those the Contacts filter ``f`` keeps (its kind forced to

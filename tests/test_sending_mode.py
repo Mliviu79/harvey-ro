@@ -196,9 +196,8 @@ def test_turning_it_off_is_one_click_and_holds_what_autopilot_queued(client, das
 
 @pytest.mark.asyncio
 async def test_each_autopilot_path_marks_what_it_queues(state, monkeypatch):
-    """Sender staging waits for review even on autopilot (the drain that
-    sends it approves it); a handler reply on autopilot is approved by
-    'autopilot'."""
+    """Sender staging waits for review even on autopilot, and so does a
+    handler reply: the drain that sends either approves it, as 'autopilot'."""
     from tests.test_outbox_native import (Cfg, FakeProvider, InboundMessage, make_handler,
                                           make_sender, seed_campaign, seed_prospect)
     monkeypatch.setattr(Cfg.channels.email, "require_approval", False)
@@ -214,7 +213,12 @@ async def test_each_autopilot_path_marks_what_it_queues(state, monkeypatch):
     assert {r["prospect_id"] for r in rows} == {pid, replier}
     # (Staged for review; then cancelled: a colleague at the same domain replied.)
     assert {r["approved_by"] for r in rows if r["prospect_id"] == pid} == {""}
-    assert {r["approved_by"] for r in rows if r["prospect_id"] == replier} == {"autopilot"}
+    assert {(r["status"], r["approved_by"]) for r in rows if r["prospect_id"] == replier} == {
+        ("pending_review", "")}
+    sender = make_sender(state, provider, require_approval=False)
+    await sender._drain_due()
+    [sent] = [r for r in await state.get_outbox() if r["prospect_id"] == replier]
+    assert (sent["status"], sent["approved_by"]) == ("sent", "autopilot")
 
 
 @pytest.mark.asyncio
@@ -261,8 +265,6 @@ def test_the_outbox_says_which_mode_and_offers_the_way_out():
     assert "Approval mode" in approval and "waits here until you approve it" in approval
     auto = _render("sendingModeBanner", {**MODE, "mode": "autopilot", "held": 2})
     assert "Autopilot is on" in auto and "(2 now)" in auto and "Turn off autopilot" in auto
-    instantly = _render("sendingModeBanner", {**MODE, "provider": "instantly"})
-    assert "campaigns aren’t sent to Instantly" in instantly
 
 
 def test_settings_explains_both_and_asks_for_the_word():
@@ -339,7 +341,7 @@ def test_the_writer_keeps_a_symlinked_config_a_symlink(tmp_path, yaml_file):
 
 def test_a_file_that_isnt_utf8_is_refused_not_mangled(tmp_path, yaml_file):
     path = tmp_path / "latin.yaml"
-    path.write_bytes(yaml_file.read_bytes().replace(b"# native", "# café native".encode("latin-1")))
+    path.write_bytes(yaml_file.read_bytes().replace(b"# every email", "# café every email".encode("latin-1")))
     before = path.read_bytes()
     with pytest.raises(ConfigError):
         set_require_approval(False, path)

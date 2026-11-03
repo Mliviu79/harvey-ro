@@ -450,6 +450,7 @@
   <div data-module="email" hidden>
   <div class="subhead" data-i18n="set.sending">Trimitere</div>
   <div id="sending-mode-card"></div>
+  <div id="ack-card"></div>
 
   <div class="subhead"><span data-i18n="set.provider">Furnizor de email</span> <span class="hint"><span data-i18n="set.provider_active">Activ:</span> <b id="active-provider">…</b> &middot; <span data-i18n-html="set.provider_hint"></span></span></div>
   <div class="card">
@@ -515,21 +516,6 @@
         <div class="form-group"><label class="form-label" for="m365-tenant">Directory (tenant) ID</label>
           <input type="text" class="form-input" id="m365-tenant" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"></div>
         <button class="btn btn-primary btn-sm" onclick="saveMicrosoft()" data-i18n="set.save_m365">Salvează Microsoft 365</button>
-      </div>
-    </div>
-
-    <div class="settings-row">
-      <div>
-        <h3>Instantly <span class="tag" data-i18n="set.legacy">Vechi</span></h3>
-        <p class="desc" data-i18n-html="set.instantly_desc"></p>
-      </div>
-      <div class="fields">
-        <div class="form-group"><label class="form-label" for="instantly-key" data-i18n="set.api_key">Cheie API</label>
-          <div class="with-btn"><input type="password" class="form-input" id="instantly-key" autocomplete="off">
-            <button class="btn btn-secondary" onclick="toggleVisibility('instantly-key')" data-i18n="common.show">Arată</button>
-            <button class="btn btn-secondary" onclick="testInstantly()" data-i18n="set.test">Testează</button></div>
-          <div id="instantly-test-result"></div></div>
-        <button class="btn btn-primary btn-sm" onclick="saveInstantly()" data-i18n="set.save_instantly">Salvează Instantly</button>
       </div>
     </div>
   </div>
@@ -612,6 +598,11 @@
 </div>
 </main>
 </div>
+
+<!-- The cold-email acknowledgement -->
+<dialog class="modal" id="ack-dialog" aria-labelledby="ack-title" onclose="_ackDone = null">
+  <div id="ack-body"></div>
+</dialog>
 
 <!-- Company detail panel -->
 <div class="drawer-backdrop" id="drawer-backdrop" onclick="closeDrawer()" hidden></div>

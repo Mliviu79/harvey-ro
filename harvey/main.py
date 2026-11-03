@@ -1,12 +1,12 @@
 """Harvey's main heartbeat loop. Always Be Closing.
 
 The heartbeat is the Email module's: it reads replies, writes, and sends.
-With a native mail provider each cycle reads replies, drains the outbox,
-then works through the campaigns the user made (agents/campaigner.py);
-Instantly keeps its one-action-per-cycle flow. Finding companies, reading
+Each cycle reads replies, drains the outbox, then works through the
+campaigns the user made (agents/campaigner.py). Finding companies, reading
 their sites and loading public data are jobs the worker runs
 (harvey/modules/worker.py). With the Email module off it does nothing at
-all.
+all, and with a mail provider Harvey doesn't support (Instantly, removed)
+it sends and reads nothing, says why, and leaves the worker running.
 """
 
 import asyncio
@@ -20,8 +20,8 @@ import pytz
 from harvey.brain import Brain
 from harvey.sending_mode import sync_sending_mode
 from harvey.config import (
-    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
-    compliance_notice, send_window_of, config_to_edit,
+    ConfigError, load_config, load_env, HarveyConfig, provider_notice, compliance_notice,
+    send_window_of, config_to_edit,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.modules import switches
@@ -55,8 +55,8 @@ CYCLE_TIMEOUT_SECONDS = 600
 # quiet hours actually ended.
 QUIET_HOURS_POLL_SECONDS = 300
 
-# Phase-1 tasks that read replies; sending waits for all of them to succeed.
-REPLY_READERS = ("handle_replies", "read_replies")
+# The task that reads replies; sending waits for it to succeed.
+REPLY_READERS = ("read_replies",)
 
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
@@ -140,56 +140,6 @@ def unusable_backlog_notice(summary: dict) -> str:
         "in .env) or check it still has credits. `harvey export --all` exports the "
         "list as it is."
     )
-
-
-async def decide_next_action(
-    brain: Brain,
-    state: StateManager,
-    config: HarveyConfig,
-    summary: dict | None = None,
-    email_on: bool = True,
-) -> str:
-    """Decide what Harvey should do next based on current state.
-
-    With the Email module off there is nothing to decide: "idle" (the
-    heartbeat doesn't run its cycle at all).
-
-    Uses deterministic priority rules (handle_replies > send_campaign >
-    write_campaign > idle) instead of burning a Claude call on a decision
-    that is fully derivable from pipeline counts. This saves budget every
-    cycle and removes a fragile LLM string-parsing step. Finding people to
-    write to isn't the heartbeat's: the contact finder (harvey/finder.py)
-    runs on its own, whatever the Email switch says.
-    """
-    if summary is None:
-        summary = await state.get_state_summary()
-
-    # Only prospects the Writer can draft for trigger writing: one with a
-    # guessed email stays 'new' for good, and counting it starved the cycle.
-    new_prospects, writable = _new_counts(summary)
-    # The Writer's drafts: a campaign the user made is never deployed here.
-    draft_campaigns = summary.get("writer_drafts", summary.get("draft_campaigns", 0)) or 0
-    open_conversations = summary.get("open_conversations", 0) or 0
-
-    # Held Instantly drafts can't deploy; choosing send_campaign for them
-    # every cycle would starve the writer forever.
-    deployable = 0 if legacy_sending_held(config) else draft_campaigns
-
-    if not email_on:
-        action, reason = "idle", "the Email module is off"
-    elif open_conversations > 0:
-        action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
-    elif deployable > 0:
-        action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
-    elif writable > 0:
-        action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
-    else:
-        action, reason = "idle", f"{new_prospects} new prospect(s), none ready to write for"
-        if unusable_backlog_notice(summary):
-            logger.warning(unusable_backlog_notice(summary))
-
-    logger.info(f"Decision: {action} ({reason})")
-    return action
 
 
 async def _run_agents(tasks: list) -> dict:
@@ -285,7 +235,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         + (f" ({brain.model})" if brain.model else "")
         + f". Change brain.provider in {config_to_edit()} to switch."
     )
-    for notice in (sending_notice(config), compliance_notice(config)):
+    for notice in (provider_notice(config), compliance_notice(config)):
         if notice:
             logger.warning("=" * 60)
             logger.warning(notice)
@@ -302,10 +252,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.sender import Sender
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
-    from harvey.agents.audience import Audience
     from harvey.agents.campaigner import CampaignCycle
 
-    audience = Audience(state, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
@@ -329,6 +277,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 if await _interruptible_sleep(interval, stop_event):
                     break
                 continue
+            # A provider Harvey can't send or read through (Instantly, removed):
+            # nothing to do but say so; the worker keeps finding contacts.
+            if not sender.is_native:
+                logger.warning(provider_notice(config) or "No mail provider: nothing to send.")
+                if await _interruptible_sleep(interval, stop_event):
+                    break
+                continue
 
             # 0. Approval or autopilot, as the config file says now: the
             # dashboard can switch it while Harvey runs.
@@ -338,8 +293,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # zones, quiet hours only stop prospecting and writing: a cycle
             # still reads replies and sends what's due (sends_through_quiet_hours).
             quiet = in_quiet_hours(config)
-            send_only = (email_on and quiet and sender.is_native
-                         and sends_through_quiet_hours(config))
+            send_only = email_on and quiet and sends_through_quiet_hours(config)
             if quiet and not send_only:
                 sleep_for = seconds_until_quiet_hours_end(config)
                 logger.info(f"Quiet hours. Sleeping for {sleep_for // 60} minutes.")
@@ -400,91 +354,46 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     break
                 continue
 
-            # 4. Decide what to do (in quiet hours: only read replies and send)
+            # 4. In quiet hours, only read replies and send. Otherwise read
+            # replies, drain the outbox, then the campaigns the user made
+            # (agents/campaigner.py). Nothing is chosen: each step is bounded
+            # and runs every cycle, so an open conversation never starves
+            # writing, and a pause never starves staging.
             if send_only:
                 logger.info("Quiet hours: reading replies, then sending what's due "
                             "in recipients' own time zones.")
-                summary = {}
                 action = "quiet_hours_send"
-            elif sender.is_native:
-                # Native providers: read replies, drain the outbox, then the
-                # campaigns the user made (agents/campaigner.py). Nothing is
-                # chosen: each step is bounded and runs every cycle, so an
-                # open conversation never starves writing, and a pause never
-                # starves staging.
-                summary = {}
-                action = "campaign_cycle"
             else:
-                # The email contacts the finder found, as prospects to write
-                # to (the finder itself never depends on email).
-                try:
-                    await audience.run()
-                except Exception as e:
-                    logger.warning(f"Audience: couldn't pick prospects from the contacts: {e}")
-                logger.info("Checking pipeline state...")
-                summary = await state.get_state_summary()
-                action = await decide_next_action(brain, state, config, summary=summary,
-                                                  email_on=email_on)
+                action = "campaign_cycle"
 
-            # 5. Execute — run independent agents in parallel where possible
-            # Handler is always safe to run alongside other agents
-            tasks = []
-            has_open_convos = summary.get("open_conversations", 0) > 0
-
-            if action == "handle_replies":
-                tasks.append(("handle_replies", handler.run()))
-            elif action == "write_campaign":
-                tasks.append(("write_campaign", writer.run()))
-                if has_open_convos:
-                    tasks.append(("handle_replies", handler.run()))
-            elif action == "idle":
-                # Analyst is cheap (no Claude calls) — keep analytics fresh
-                tasks.append(("analyze", analyst.run()))
-
-            # Sending happens in a second phase, after every agent above has
-            # finished: the handler's stop-on-reply must cancel follow-ups to
-            # people who just replied before anything is sent. Native mail
-            # providers drain the outbox every cycle, so their mailbox is
-            # read every cycle too (handle_replies above only runs when a
-            # conversation is already open).
-            send_tasks = []
-            if not email_on:
-                pass
-            elif action == "send_campaign":
-                send_tasks.append(("send_campaign", sender.run))
-            elif sender.is_native:
-                send_tasks.append(("send_outbox", sender.run))
-            if email_on and sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
-                tasks.append(("read_replies", handler.run()))
-
+            # 5. Read replies first. Sending waits until every reply this cycle
+            # was read and handled: the handler's stop-on-reply must cancel
+            # follow-ups to people who just replied before anything is sent.
+            tasks = [("read_replies", handler.run())]
             outcomes = await _run_agents(tasks)
 
-            # Phase 2: send — only after every reply-reading task this cycle
-            # finished reading and handling replies (it returns True; a
+            # Then send, only if the read finished (it returns True; a
             # failure, exception or timeout doesn't), and only if the brain
             # didn't stop being usable meanwhile. Otherwise a reply may be
             # unread, so its stop-on-reply hasn't run: queued emails wait.
-            if send_tasks:
-                unread = [n for n, _ in tasks
-                          if n in REPLY_READERS and outcomes.get(n) is not True]
-                paused = brain.paused_reason
-                if paused or unread:
-                    reason = paused or "replies couldn't all be read and handled."
-                    logger.error(
-                        f"Not sending this cycle: {reason} Queued emails wait "
-                        "until replies can be read again."
-                    )
-                    held = send_hold_reason(unread, paused, getattr(handler, "last_read_problem", ""))
-                    if held is not None:
-                        await record_send_phase(state, held)
-                else:
-                    await record_send_phase(state, send_hold_reason([], "", ""))
-                    await _run_agents([(name, run()) for name, run in send_tasks])
+            unread = [n for n, _ in tasks if n in REPLY_READERS and outcomes.get(n) is not True]
+            paused = brain.paused_reason
+            if paused or unread:
+                reason = paused or "replies couldn't all be read and handled."
+                logger.error(
+                    f"Not sending this cycle: {reason} Queued emails wait "
+                    "until replies can be read again."
+                )
+                held = send_hold_reason(unread, paused, getattr(handler, "last_read_problem", ""))
+                if held is not None:
+                    await record_send_phase(state, held)
+            else:
+                await record_send_phase(state, send_hold_reason([], "", ""))
+                await _run_agents([("send_outbox", sender.run())])
 
-            # Then (native providers): roll, verify, write and stage each active
-            # campaign. Staging only fills the review queue, so it runs
-            # whether or not this cycle could send. The analyst when nothing
-            # was done.
+            # Then roll, verify, write and stage each active campaign.
+            # Staging only fills the review queue, so it runs whether or not
+            # this cycle could send. The analyst when nothing was done.
             if action == "campaign_cycle":
                 done = await _run_agents([("campaigns", campaigner.run())])
                 if done.get("campaigns") is not True:

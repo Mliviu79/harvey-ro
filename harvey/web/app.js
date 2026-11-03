@@ -516,7 +516,7 @@ function loadCurrentTab() {
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); if (_modules.email) loadSendingModeCard(); break;
+    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -1050,7 +1050,7 @@ function checkLabel(c) {
 }
 
 function checkHelp(c) {
-  const key = c.id === 'email_provider' ? 'check.help.email_provider.' + (c.provider || 'instantly')
+  const key = c.id === 'email_provider' ? 'check.help.email_provider.' + (c.provider || 'gmail')
     : 'check.help.' + c.id;
   const help = t(key);
   return help === key ? (c.help || '') : help;
@@ -1134,7 +1134,11 @@ function todayItemText(it, stats) {
       /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
-    case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.outbox_action'));
+    case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
+    case 'provider': return tr(t('today.item.provider'),
+      // Instantly (removed) has its own words; any other name isn't one Harvey knows.
+      String(it.provider || '').toLowerCase() === 'instantly' ? t('today.item.provider_detail')
+        : t('today.item.provider_unknown', {provider: it.provider || ''}), t('today.item.provider_action'));
   }
   if (/Open the log/.test(it.action || '')) same.action = t('today.item.open_log');
   return same;
@@ -1229,11 +1233,8 @@ function renderFigures(stats) {
     '<div class="kpi-main"><span class="kpi-value' + (value ? '' : ' zero') + '">' + value + '</span>' + spark + '</div>' +
     '<span class="kpi-note">' + note + '</span></div>';
 
-  // Instantly sends from its own servers, so the Outbox never sees them.
-  const sent = stats.email_provider === 'instantly'
-    ? card(t('kpi.sent'), '&mdash;', '', escHtml(t('kpi.sent_instantly')))
-    : card(t('kpi.sent'), fmtN(sum(tr.sent)), sparkBars(tr.sent, t('kpi.sent_spark')),
-           tBold('kpi.sent_note', stats.outbox_approved || 0));
+  const sent = card(t('kpi.sent'), fmtN(sum(tr.sent)), sparkBars(tr.sent, t('kpi.sent_spark')),
+                    tBold('kpi.sent_note', stats.outbox_approved || 0));
   const waiting = (stats.outbox_pending || 0) + (stats.needs_human || 0);
   const waitNote = [
     stats.outbox_pending ? t('kpi.to_approve', {n: stats.outbox_pending}) : '',
@@ -2172,7 +2173,7 @@ async function loadSettings() {
 
   applyEnvKeys(data.env_keys);
 
-  const prov = data.provider || 'instantly';
+  const prov = data.provider || 'gmail';
   const provEl = document.getElementById('active-provider');
   if (provEl) provEl.textContent = prov;
 
@@ -2205,7 +2206,6 @@ async function loadSettings() {
   savedPh('smtp-pass', data.smtp_password_set, 'set.ph.smtp_pass');
   savedPh('imap-pass', data.imap_password_set, 'set.same_smtp_pass');
   document.getElementById('imap-same-pass').checked = !data.imap_password_set;
-  savedPh('instantly-key', data.instantly_api_key_set, 'set.ph.instantly');
   savedPh('reoon-key', data.reoon_api_key_set, 'set.ph.reoon');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, 'set.ph.zerobounce');
   savedPh('hunter-key', data.hunter_api_key_set, 'set.ph.hunter');
@@ -2291,33 +2291,11 @@ async function saveEnv(payload, okMsg) {
   else showToast((data && data.message) || t('set.save_failed'), 'error');
 }
 
-// Secrets are only sent when typed: an empty box means "keep the saved one".
-function saveInstantly() {
-  const key = document.getElementById('instantly-key').value.trim();
-  if (!key) { showToast(t('set.need_new_key'), 'error'); return; }
-  saveEnv({INSTANTLY_API_KEY: key}, t('set.saved_instantly'));
-}
-
 function saveCloudflare() {
   const payload = {CLOUDFLARE_ACCOUNT_ID: document.getElementById('cf-account-id').value.trim()};
   const token = document.getElementById('cf-api-token').value.trim();
   if (token) payload.CLOUDFLARE_API_TOKEN = token;
   saveEnv(payload, t('set.saved_cf'));
-}
-
-async function testInstantly() {
-  const key = document.getElementById('instantly-key').value.trim();
-  const el = document.getElementById('instantly-test-result');
-  el.innerHTML = '<div class="test-result pending">' + escHtml(t('set.testing')) + '</div>';
-  const data = await api('/api/settings/test-instantly', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({api_key: key})
-  });
-  if (!data) {
-    el.innerHTML = '<div class="test-result error">' + escHtml(t(failedOnServer() ? 'offline.server_short' : 'set.unreachable')) + '</div>';
-    return;
-  }
-  el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(failMsg(data, '')) + '</div>';
 }
 
 // ── Controls ──
@@ -2689,26 +2667,23 @@ function sendingModeBanner(m) {
       '<button class="btn btn-secondary btn-sm" onclick="setSendingMode(\'approval\')"' +
         (_modeBusy ? ' disabled' : '') + '>' + t('mode.turn_off') + '</button></div>';
   }
-  const instantly = m.provider === 'instantly';
   return '<div class="banner mode-banner">' + icon('check') + '<div><b>' + t('mode.approval') + '</b>' +
-    '<p>' + (instantly ? t('mode.approval_instantly') : t('mode.approval_detail')) +
+    '<p>' + t('mode.approval_detail') +
     ' <a href="#" onclick="goTab(\'settings\');return false">' + t('mode.about') + '</a></p></div></div>';
 }
 
 function sendingModeCard(m) {
   if (!m) return '<div class="card muted">' + t('mode.unreadable') + '</div>';
   const auto = m.mode === 'autopilot';
-  const instantly = m.provider === 'instantly';
   const domains = (m.your_domains || []).map(escHtml).join(', ') || t('mode.no_domains');
   let html = '<div class="card mode-card"><h3>' + t('mode.card_title', {mode: auto ? t('mode.autopilot') : t('mode.approval_word')}) + '</h3>' +
-    '<p>' + t('mode.explain_approval') + (instantly ? ' ' + t('mode.explain_instantly') : '') + '</p>' +
+    '<p>' + t('mode.explain_approval') + '</p>' +
     '<p>' + t('mode.explain_auto') + '</p>' +
     '<p class="muted">' + t('mode.yours', {domains: domains}) +
       (m.booking_page ? t('mode.booking', {page: escHtml(m.booking_page)}) : '') +
       t('mode.add_others', {file: escHtml(m.file)}) + '</p>';
   if (auto) {
-    html += '<div class="convo-actions"><span class="muted">' + t('mode.off_now') +
-      (instantly ? ' ' + t('mode.off_instantly') : '') + '</span>' +
+    html += '<div class="convo-actions"><span class="muted">' + t('mode.off_now') + '</span>' +
       '<button class="btn btn-primary btn-sm" onclick="setSendingMode(\'approval\')"' +
         (_modeBusy ? ' disabled' : '') + '>' + t('mode.turn_off') + '</button></div>';
   } else if (_autopilotArmed) {
@@ -2755,8 +2730,7 @@ async function setSendingMode(mode) {
       _autopilotArmed = false;
       showToast(mode === 'autopilot'
         ? t('mode.toast_on')
-        : t('mode.toast_off') + (res.requeued ? ' ' + t('mode.toast_requeued', {n: res.requeued}) : '') +
-          (_sendingMode && _sendingMode.provider === 'instantly' ? ' ' + t('mode.toast_instantly') : ''), 'success');
+        : t('mode.toast_off') + (res.requeued ? ' ' + t('mode.toast_requeued', {n: res.requeued}) : ''), 'success');
     } else {
       showToast(failMsg(res, t('mode.toast_failed')), 'error');
     }
@@ -2765,6 +2739,89 @@ async function setSendingMode(mode) {
   }
   loadSendingModeCard();
   loadOutbox();
+}
+
+// ── The cold-email acknowledgement (harvey/acknowledgement.py) ──
+// Cold email waits until the operator has read the versioned text and typed
+// the word once. The text comes from the server, in both languages; the
+// page shows the one it is in.
+let _ack = null, _ackDone = null, _ackBusy = false;
+
+async function loadAck() {
+  const a = await api('/api/acknowledgement');
+  _ack = a && a.kind ? a : null;
+  return _ack;
+}
+
+function ackWhen(a) {
+  return a && a.at ? new Date(a.at * 1000).toLocaleString(intlLocale()) : '';
+}
+
+async function loadAckCard() {
+  const el = document.getElementById('ack-card');
+  if (!el) return;
+  const a = await loadAck();
+  if (!a) { el.innerHTML = '<div class="card muted">' + escHtml(t('ack.unreadable')) + '</div>'; return; }
+  el.innerHTML = '<div class="card ack-card"><h3>' + escHtml(t('ack.card_title')) +
+    ' <span class="email-tag ' + (a.given ? 'verified' : 'guess') + '">' + escHtml(t(a.given ? 'ack.given_tag' : 'ack.missing_tag')) + '</span></h3>' +
+    '<p>' + escHtml(a.given ? t('ack.given', {v: a.version, when: ackWhen(a), by: a.by || '-'}) : t('ack.missing', {v: a.version})) + '</p>' +
+    '<div class="convo-actions"><button class="btn ' + (a.given ? 'btn-ghost' : 'btn-primary') + ' btn-sm" onclick="openAckDialog()">' +
+      escHtml(t(a.given ? 'ack.read' : 'ack.open')) + '</button></div></div>';
+}
+
+// The dialog: the text, and (until it is given) a box for the word.
+// ``onDone`` runs once it is confirmed (the wizard's start).
+async function openAckDialog(onDone) {
+  const a = await loadAck();
+  if (!a) { showToast(t('ack.unreadable'), 'error'); return; }
+  _ackDone = typeof onDone === 'function' ? onDone : null;
+  const lines = String((getLang() === 'en' ? a.text_en : a.text_ro) || '').split('\n');
+  const title = lines.shift() || t('ack.card_title');
+  const paras = lines.join('\n').trim().split(/\n\s*\n/).filter(Boolean);
+  const word = String(a.confirm_word || 'accept');
+  const foot = a.given
+    ? '<p class="small muted">' + escHtml(t('ack.given', {v: a.version, when: ackWhen(a), by: a.by || '-'})) + '</p>' +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="closeAckDialog()">' + escHtml(t('common.close')) + '</button></div>'
+    : '<label class="form-label" for="ack-typed">' + escHtml(t('ack.type', {word: word})) + '</label>' +
+      '<input class="form-input" id="ack-typed" autocomplete="off" spellcheck="false" ' +
+        'oninput="document.getElementById(\'ack-go\').disabled = this.value.trim().toLowerCase() !== ' + jsq(word) + '" ' +
+        'onkeydown="if (event.key === \'Enter\' && !document.getElementById(\'ack-go\').disabled) confirmAck()">' +
+      '<div class="btn-row"><button class="btn btn-primary btn-sm" id="ack-go" disabled onclick="confirmAck()">' + escHtml(t('ack.confirm')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeAckDialog()">' + escHtml(t('common.cancel')) + '</button></div>';
+  document.getElementById('ack-body').innerHTML =
+    '<div class="modal-head"><h2 id="ack-title">' + escHtml(title) + '</h2>' +
+      '<span class="meta">' + escHtml(t('ack.version', {v: a.version})) + '</span></div>' +
+    '<div class="modal-scroll">' + paras.map(p => '<p>' + escHtml(p) + '</p>').join('') + '</div>' +
+    '<div class="modal-foot">' + foot + '</div>';
+  const dlg = document.getElementById('ack-dialog');
+  if (!dlg.open) { if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', ''); }
+  const input = document.getElementById('ack-typed');
+  if (input) input.focus();
+}
+
+function closeAckDialog() {
+  const dlg = document.getElementById('ack-dialog');
+  if (dlg && dlg.open) { if (dlg.close) dlg.close(); else dlg.removeAttribute('open'); }
+  _ackDone = null;
+}
+
+async function confirmAck() {
+  const input = document.getElementById('ack-typed');
+  if (_ackBusy || !input) return;
+  _ackBusy = true;
+  try {
+    const res = await api('/api/acknowledgement', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                   body: JSON.stringify({typed: input.value.trim()})});
+    if (!res || !res.success) { showToast(t('cw.ack_failed'), 'error'); return; }
+    const done = _ackDone;
+    closeAckDialog();
+    if (_cp.setup) _cp.setup.acknowledged = true;
+    showToast(t('ack.done'), 'success');
+    loadAckCard();
+    if (done) await done();
+  } finally {
+    _ackBusy = false;
+  }
 }
 
 // Why autopilot sent this back for a human (sender: gate.autopilot_review).
@@ -5585,6 +5642,8 @@ const MEMBER_REASONS = [
   [/^(overlap: |already contacted \()cold email sent /, 'cp.why.sent_lately'],
   [/^(overlap: |already contacted \()contacted outside the outbox/, 'cp.why.contacted_elsewhere'],
   [/^already contacted/, 'cp.why.already'], [/^gate: /, 'cp.why.gate'],
+  [/^rejected$/, 'cp.why.rejected'], [/^cut off mid-send$/, 'cp.why.cut_off'],
+  [/^send failed$/, 'cp.why.send_failed'], [/^deployed to Instantly$/, 'cp.why.instantly'],
   [/ is on the do-not-contact list/, 'cp.why.suppressed'],
 ];
 
@@ -5627,12 +5686,45 @@ async function loadCampaignDetail() {
     '<div class="subhead">' + escHtml(t('cp.filter')) + '</div>' +
     '<p class="small"><code>' + escHtml(c.query || t('cp.no_filter')) + '</code>' +
       (c.query ? ' <button class="btn btn-ghost btn-sm" onclick="openQueryInContacts(' + jsq(c.query) + ')">' + escHtml(t('cp.open_in_contacts')) + '</button>' : '') + '</p>' +
-    '<div class="subhead">' + escHtml(t('cw.li_title')) + '</div>' +
-    '<p class="small" style="white-space:pre-wrap">' + escHtml(c.li_note || t('cp.no_note')) + '</p>' +
+    '<div class="subhead">' + escHtml(t('cw.li_title')) + '</div>' + campaignNoteHtml(c) +
     (rows ? '<div class="table-card"><table class="data"><thead><tr><th>' + escHtml(t('cp.col.address')) + '</th><th>' + escHtml(t('cp.col.status')) +
       '</th><th>' + escHtml(t('cp.col.step')) + '</th><th>' + escHtml(t('cp.col.why')) + '</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '') +
-    '<div class="btn-row" style="margin-top:12px"><button class="btn btn-ghost btn-sm" onclick="_cp.open=null;document.getElementById(\'campaign-detail\').innerHTML=\'\'">' +
-      escHtml(t('common.close')) + '</button></div></div>';
+    '<div class="btn-row" style="margin-top:12px">' +
+      '<button class="btn btn-secondary btn-sm" onclick="downloadCampaignRecord(\'csv\', this)">' + escHtml(t('cp.record_csv')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="downloadCampaignRecord(\'json\', this)">' + escHtml(t('cp.record_json')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_cp.open=null;document.getElementById(\'campaign-detail\').innerHTML=\'\'">' +
+      escHtml(t('common.close')) + '</button></div>' +
+    '<p class="small muted">' + escHtml(t('cp.record_note')) + '</p></div>';
+}
+
+// The legitimate-interest note: editable while the campaign is a draft,
+// shown as it was kept once it has started.
+function campaignNoteHtml(c) {
+  if (c.status !== 'draft') {
+    return '<p class="small" style="white-space:pre-wrap">' + escHtml(c.li_note || t('cp.no_note')) + '</p>';
+  }
+  const min = (_cp.setup && _cp.setup.li_note_min) || 80;
+  const n = String(c.li_note || '').trim().length;
+  return '<textarea class="form-input" rows="4" id="cp-li" aria-label="' + escHtml(t('cw.li_title')) + '" ' +
+      'oninput="document.getElementById(\'cp-li-n\').textContent=this.value.trim().length">' + escHtml(c.li_note || '') + '</textarea>' +
+    '<div class="btn-row"><span class="small muted"><span id="cp-li-n">' + n + '</span> / ' + min + '</span>' +
+    '<button class="btn btn-secondary btn-sm" onclick="saveCampaignNote()">' + escHtml(t('cp.save_note')) + '</button></div>';
+}
+
+async function saveCampaignNote() {
+  const el = document.getElementById('cp-li');
+  if (!el || !_cp.open) return;
+  const res = await api('/api/campaigns/' + encodeURIComponent(_cp.open), {
+    method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({li_note: el.value})});
+  if (res && res.success) { showToast(t('cp.note_saved'), 'success'); loadCampaigns(); }
+  else showToast(failMsg(res, t('camp.save_failed')), 'error');
+}
+
+// The campaign's record (evidență), as the server builds it.
+function downloadCampaignRecord(format, btn) {
+  if (!_cp.open) return;
+  downloadCsv('/api/campaigns/' + encodeURIComponent(_cp.open) + '/record.' + format,
+              'evidenta-' + _cp.open + '-' + stamp() + '.' + format, btn);
 }
 
 async function removeCampaignMember(i) {
@@ -5884,12 +5976,9 @@ async function cwStart() {
   const w = _cp.wiz;
   if (!w || !(await cwSave(true))) return;
   if (_cp.setup && !_cp.setup.acknowledged) {
-    const typed = prompt(t('cw.ack_prompt'));
-    if (!typed) return;
-    const ack = await api('/api/acknowledgement', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                                   body: JSON.stringify({typed: typed.trim()})});
-    if (!ack || !ack.success) { showToast(t('cw.ack_failed'), 'error'); return; }
-    _cp.setup.acknowledged = true;
+    // Started once it is confirmed; closing the dialog starts nothing.
+    openAckDialog(cwStart);
+    return;
   }
   const res = await api('/api/campaigns/' + encodeURIComponent(w.id) + '/start', {method: 'POST'});
   if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }

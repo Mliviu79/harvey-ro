@@ -157,7 +157,7 @@ def test_unticking_someone_harvey_emailed_is_refused(client, env):
     assert _status(env, "prospects", "p1") == "contacted"
 
 
-def test_unticking_someone_sent_through_instantly_is_refused(client, env):
+def test_unticking_someone_an_earlier_instantly_campaign_sent_is_refused(client, env):
     _prospect(env, "p1", "a@acme.test", status="contacted")
     _campaign(env, "c1", ["p1"])
     _sql(env, "UPDATE campaigns SET instantly_campaign_id = 'inst-1', status = 'active'")
@@ -311,8 +311,7 @@ class _Cfg:
 
 
 class _Env:
-    def __init__(self, instantly=""):
-        self.instantly_api_key = instantly
+    pass
 
 
 class _Provider:
@@ -327,9 +326,7 @@ class _Provider:
     (_Cfg(enabled=False), _Env(), True, False),                 # email off: hand sends only
     (_Cfg(provider="smtp"), _Env(), False, False),              # mailbox not connected
     (_Cfg(provider="gmail"), _Env(), True, True),               # connected: Harvey sends
-    (_Cfg(provider="instantly"), _Env(instantly="k"), True, True),
-    (_Cfg(provider="instantly"), _Env(), True, False),
-    (_Cfg(provider="instantly", approval=True), _Env(instantly="k"), True, False),  # held
+    (_Cfg(provider="instantly"), _Env(), True, False),          # not supported: sends nothing
 ])
 def test_harvey_can_send(monkeypatch, cfg, env, provider_ok, expected):
     import harvey.config
