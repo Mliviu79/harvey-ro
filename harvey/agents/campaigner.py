@@ -7,8 +7,11 @@ campaign, in turn from where the last cycle stopped:
      (campaigns.roll: the frozen filter, every rule of add_members);
   2. has its waiting members checked by a verification tier, oldest first
      across campaigns, CHECKS_PER_CYCLE in all, inside email_verify's
-     monthly allowance (and, for addresses a roll added, ROLL_CHECKS_PER_DAY
-     a campaign);
+     monthly allowance and the install's day and month spend limits (and,
+     for addresses a roll added, ROLL_CHECKS_PER_DAY a campaign); a check
+     those refuse leaves the address waiting and holds the checks, with
+     why (campaigns.checks_held), until the services it needed could be
+     asked again;
   3. gets a grounded first email drafted for ready members that can be
      sent to (Sender.stageable checks them first, so no model call is
      spent on an address that would be refused): WRITE_PER_CYCLE in all,
@@ -89,6 +92,12 @@ class CampaignCycle:
         if VERIFY[0] not in enabled:
             return False
         allow_risky = bool(getattr(self.config.channels.email, "send_to_risky", False))
+        self.audience.spend = verify_costs.InstallSpend.of(self.state, self.config)
+        held = await campaigns.checks_held(self.state)
+        if held:
+            if await self.audience.still_waits(held, enabled):
+                return False
+            await campaigns.hold_checks(self.state, None)
         checks = 0
         for c in active:
             roll_left = await campaigns.roll_checks_left(self.state, c["id"])
@@ -103,11 +112,16 @@ class CampaignCycle:
                     await self.state.set_campaign_member(c["id"], m["email"], "skipped",
                                                          "no trusted link any more")
                     continue
+                status = await self.audience._check(rows[0], enabled)
+                if not status:
+                    # Refused (no price past a free tier, a spend limit):
+                    # it stays waiting, and so does every check after it.
+                    await campaigns.hold_checks(self.state, self.audience.wait)
+                    return checks > 0
                 checks += 1
                 if rolled:
                     roll_left -= 1
                     await campaigns.count_roll_check(self.state, c["id"])
-                status = await self.audience._check(rows[0], enabled)
                 if m["prospect_id"]:
                     await self.state.update_prospect_email(m["prospect_id"], m["email"], status)
                 if status == "verified" or (status == "risky" and allow_risky):

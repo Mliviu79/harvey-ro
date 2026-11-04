@@ -638,6 +638,17 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Campaign address checks count against the spend limits.** The Email
+  module's checks of waiting addresses follow the contact finder's rule: a
+  priced request is reserved from `spend.per_day_usd` / `per_month_usd` and
+  recorded where those limits read every job's spend (a day ledger in the
+  settings table for spend no job makes), so the finder's, the
+  classifier's and the campaigns' add up once. With either limit set, a
+  request past a free tier with no price is refused and the address stays
+  waiting, checked once there is a price, a new day or month, or room; the
+  campaign page, Today and `harvey campaigns show` say why. Free checks are
+  never refused. With no limit set, they are made and counted unpriced, as
+  before.
 - **Each classifier profile has its own pace and its own pause.** The
   pace is the profile's requests a minute; the classify lane adds no
   one-second floor under it (it named none of the services). A 429 or

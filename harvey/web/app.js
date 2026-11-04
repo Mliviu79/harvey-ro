@@ -1137,6 +1137,8 @@ function todayItemText(it, stats) {
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
+    case 'campaign-checks': return tr(t('today.item.campaign_checks', {n: s.campaign_checks_waiting || 0}),
+      checksHeldText(it.code, it.detail), t('today.item.campaign_checks_action'));
     case 'provider': return tr(t('today.item.provider'),
       // Instantly (removed) has its own words; any other name isn't one Harvey knows.
       String(it.provider || '').toLowerCase() === 'instantly' ? t('today.item.provider_detail')
@@ -6698,6 +6700,11 @@ function memberReason(text) {
   return s;
 }
 
+// Why campaign addresses wait for a check (campaigns.checks_held's code).
+function checksHeldText(code, fallback) {
+  return ['no_price', 'day', 'month'].includes(code) ? t('cp.checks_held.' + code) : String(fallback || '');
+}
+
 function openCampaign(id) {
   _cp.open = id;
   loadCampaignDetail();
@@ -6721,6 +6728,8 @@ async function loadCampaignDetail() {
     '</td></tr>').join('');
   el.innerHTML = '<div class="card"><div class="card-head"><h3>' + escHtml(c.name) + '</h3><span class="meta">' + badge(c.status) + '</span></div>' +
     '<p class="small">' + (counts || escHtml(t('cp.no_members'))) + '</p>' +
+    (data.checks_held ? '<p class="small"><b>' + escHtml(t('cp.checks_held', {n: fmtN((c.members || {}).waiting || 0)})) + '</b> ' +
+      escHtml(checksHeldText(data.checks_held.code, data.checks_held.why)) + '</p>' : '') +
     '<div class="subhead">' + escHtml(t('cp.filter')) + '</div>' +
     '<p class="small"><code>' + escHtml(c.query || t('cp.no_filter')) + '</code>' +
       (c.query ? ' <button class="btn btn-ghost btn-sm" onclick="openQueryInContacts(' + jsq(c.query) + ')">' + escHtml(t('cp.open_in_contacts')) + '</button>' : '') + '</p>' +

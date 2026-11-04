@@ -62,6 +62,8 @@ ROLL_EVERY_SECONDS = 3600
 # day (a roll can add many unchecked addresses; each check costs a credit).
 ROLL_CHECKS_PER_DAY = 50
 ROLL_CHECKS_KEY = "campaign_roll_checks:"
+# Why waiting addresses aren't being checked (checks_held).
+CHECKS_HELD_KEY = "campaign_checks_held"
 # The legitimate-interest note a campaign needs before it starts.
 LI_NOTE_MIN = 80
 LI_NOTE_TEMPLATE = (
@@ -846,6 +848,28 @@ async def roll_checks_left(state, campaign_id: str) -> int:
 async def count_roll_check(state, campaign_id: str) -> None:
     key = f"{ROLL_CHECKS_KEY}{campaign_id}:{datetime.now(timezone.utc):%Y-%m-%d}"
     await state.increment_setting(key)
+
+
+async def checks_held(state) -> dict | None:
+    """Why waiting addresses aren't checked now, every campaign alike, or
+    None: {"code": "no_price" | "day" | "month" | "other"
+    (verify_costs.hold_code), "why", "services" (those refused),
+    "configured" (the services a check could ask then), "at"}.
+    The campaign cycle sets it when a check was refused and clears it once
+    those services could be asked again."""
+    try:
+        held = json.loads(await state.get_setting(CHECKS_HELD_KEY) or "null")
+    except (TypeError, ValueError):
+        return None
+    return held if isinstance(held, dict) and held.get("code") else None
+
+
+async def hold_checks(state, wait: dict | None) -> None:
+    if wait:
+        await state.set_setting(CHECKS_HELD_KEY, json.dumps(
+            {**wait, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}))
+    elif await state.get_setting(CHECKS_HELD_KEY):
+        await state.delete_setting(CHECKS_HELD_KEY)
 
 
 # ── The record (evidență): what a campaign did, for the operator's file ──

@@ -3281,6 +3281,10 @@ def cmd_campaigns(args):
                 print(f"  members: {c['members'] or '-'}  sent: {c['sent']}  "
                       f"replies: {c['replies']}")
                 print(f"  steps: {len(c['sequence'])}  account: {c['account_id']}")
+                held = await campaigns.checks_held(state)
+                if held and (c["members"] or {}).get("waiting"):
+                    print(f"  {c['members']['waiting']} address(es) wait for a check: "
+                          f"{held.get('why') or held['code']}")
                 print(f"  legitimate interest: {c['li_note'] or '(none yet)'}\n")
             elif action == "members":
                 rows = await state.campaigns_call(campaigns.members, args.id, args.status or "",

@@ -14,9 +14,10 @@ service's module setting ``usd_<id>`` (Settings -> Email verification, or
 
 A request is $0 inside the service's free allowance and its price past
 it. Past it with no price, it is refused when a USD cap applies (a run's
-cap, or spend.per_day_usd / per_month_usd for background work): a cap
-can't stop what it can't count. With no USD cap anywhere (the Email
-module's audience) it is made and counted unpriced, and said so.
+cap, or spend.per_day_usd / per_month_usd for background work and for the
+Email module's audience, InstallSpend): a cap can't stop what it can't
+count. With no USD cap anywhere it is made and counted unpriced, and said
+so. A free one is never refused for money.
 
 The month's requests are counted per service in the settings table,
 whoever asked (the contact finder, the audience); the month is the
@@ -188,10 +189,11 @@ class Meter(api.Budget):
     as it is about to go out (api.Budget: email_finder calls ``ask`` before
     each service and ``take("hunter")`` before a domain search).
 
-    ``spend``: the run's finder.Spend, whose cap (``spend.cap``) makes a
-    request past its free allowance with no price refused, and from which
-    a priced one is reserved before and recorded after; None: no USD cap
-    (counted, priced where a price is known, made either way). ``made``,
+    ``spend``: the run's finder.Spend (or the audience's InstallSpend),
+    whose cap (``spend.cap``) makes a request past its free allowance with
+    no price refused, and from which a priced one is reserved before and
+    recorded after; None: no USD cap (counted, priced where a price is
+    known, made either way). ``made``,
     ``usd`` and ``unpriced`` per service; ``refused``: (service, why) for
     each request not made, in order (``mark`` gives where a check's own
     begin)."""
@@ -242,6 +244,21 @@ class Meter(api.Budget):
         _, priced = _price(spec, await used(self.state, service))
         if not priced and self.capped:
             return no_price(service)
+        return ""
+
+    async def blocked(self, service: str) -> str:
+        """refusal(), or why the install's limits couldn't pay for one
+        request to ``service`` now (an InstallSpend's ``room``; a run's
+        Spend is asked only as the request is made). Read only."""
+        why = await self.refusal(service)
+        room = getattr(self.spend, "room", None)
+        if why or room is None:
+            return why
+        cost, _ = _price(self.specs.get(service), await used(self.state, service))
+        if cost > 0:
+            left, limit = await room()
+            if cost > left + 1e-9:
+                return limit
         return ""
 
     async def ask(self, service: str) -> bool:
@@ -319,6 +336,92 @@ class Meter(api.Budget):
         return {"made": dict(self.made), "usd": dict(self.usd),
                 "unpriced": dict(self.unpriced),
                 "refused": [f"{s}: {why}" for s, why in self.refused]}
+
+
+class InstallSpend:
+    """What paid address checks no job runs (the Email module's audience)
+    may spend: the install's limits for the UTC day and month
+    (spend.per_day_usd / per_month_usd), against what jobs.spent_since
+    counts (every job's spend, the classifier's calls included, and its
+    job-less ledger), and what they spend is reserved in that ledger as
+    each request is about to go out (jobs.spend_within), so the finder's,
+    the classifier's and these add up in one place. ``cap``: a limit is set, day or month (a request past
+    a free tier with no price is refused then); with none, nothing is
+    refused for money and what is priced is still recorded. The same
+    interface as finder.Spend (``allow``, ``record``, ``refused``)."""
+
+    def __init__(self, state, per_day: float | None = None, per_month: float | None = None):
+        self.state = state
+        self.per_day, self.per_month = per_day, per_month
+        self.cap = per_day is not None or per_month is not None
+        self.spent = 0.0
+        self.by: dict[str, float] = {}
+        self.refused = ""
+        # What ``allow`` wrote to the ledger that ``record`` hasn't used.
+        self._reserved = 0.0
+
+    @classmethod
+    def of(cls, state, config) -> "InstallSpend":
+        spend = getattr(config, "spend", None)
+        return cls(state, getattr(spend, "per_day_usd", None),
+                   getattr(spend, "per_month_usd", None))
+
+    async def room(self) -> tuple[float, str]:
+        """(USD left under the tighter limit, why when it runs out)."""
+        from harvey.modules import jobs
+
+        left, why = float("inf"), ""
+        for limit, since, what in ((self.per_day, "start of day", "day"),
+                                   (self.per_month, "start of month", "month")):
+            if limit is None:
+                continue
+            room = float(limit) - await jobs.spent_since(self.state, since)
+            if room < left:
+                left, why = room, f"the spend limit for the {what} (${float(limit):.2f}) is reached"
+        return max(0.0, left), why
+
+    async def allow(self, estimate: float, first: float | None = None) -> float | None:
+        """Reserve ``first`` (one request's price) before it is made: it is
+        written to the ledger in the same transaction that finds room for
+        it under the limits (jobs.spend_within), so two at once can't both
+        take the last of it. None (``refused`` says why) when there isn't."""
+        from harvey.modules import jobs
+
+        first = estimate if first is None else first
+        limits = [(limit, since, what) for limit, since, what in
+                  ((self.per_day, "start of day", "day"),
+                   (self.per_month, "start of month", "month")) if limit is not None]
+        why = await jobs.spend_within(self.state, max(float(first or 0.0), 0.0), limits)
+        if why:
+            self.refused = why
+            return None
+        self._reserved += max(float(first or 0.0), 0.0)
+        left, _ = await self.room()
+        return left
+
+    async def record(self, amount: float, what: str = "checks") -> None:
+        """What a request allowed cost (already in the ledger, reserved
+        by ``allow``; what is more than that is added)."""
+        from harvey.modules import jobs
+
+        amount = float(amount or 0.0)
+        self.spent += amount
+        self.by[what] = round(self.by.get(what, 0.0) + amount, 10)
+        taken = min(amount, self._reserved)
+        self._reserved -= taken
+        await jobs.record_spend(self.state, amount - taken)
+
+
+def hold_code(why: str) -> str:
+    """What a refusal's reason is, for the page: "no_price" (past a free
+    tier with no price under a limit), "day" / "month" (that spend limit
+    reached), "other"."""
+    if why.startswith("no price for "):
+        return "no_price"
+    for what in ("day", "month"):
+        if f"spend limit for the {what} " in why:
+            return what
+    return "other"
 
 
 async def projection(state, wants: dict[str, int], *, capped: bool = True) -> dict:

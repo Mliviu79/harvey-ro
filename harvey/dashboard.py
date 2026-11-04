@@ -3974,7 +3974,10 @@ async def campaign_detail(campaign_id: str, status: str = "", limit: int = 200,
     except campaigns.Refused as e:
         return _campaign_refusal(e)
     c["query"] = await state.campaigns_call(campaigns.frozen_query, c, write=False)
-    return {"campaign": c, "members": rows}
+    # Why its waiting addresses aren't being checked, when that is so.
+    held = await campaigns.checks_held(state) if (c.get("members") or {}).get("waiting") \
+        else None
+    return {"campaign": c, "members": rows, "checks_held": held}
 
 
 @app.patch("/api/campaigns/{campaign_id}")
@@ -5257,6 +5260,17 @@ def _require_approval_now() -> bool:
         return True
 
 
+# Why campaign addresses wait for a check (campaigns.checks_held's code).
+_CHECKS_HELD = {
+    "no_price": ("A verification service is past its free tier and has no price entered, "
+                 "and a spend limit is set, so the check isn't made. Enter its price in "
+                 "Settings → Email verification; the addresses are checked then."),
+    "day": "Today's spend limit (spend.per_day_usd) is reached. Checks go on tomorrow (UTC).",
+    "month": ("This month's spend limit (spend.per_month_usd) is reached. Checks go on next "
+              "month, or when the limit is raised."),
+}
+
+
 @app.get("/api/today")
 async def get_today():
     """What needs a human, right now.
@@ -5456,6 +5470,22 @@ async def get_today():
                            "start it."),
                 "action": "Review the check", "tab": "settings",
             })
+
+        # Campaign addresses waiting for a check the spend rules refuse.
+        from harvey import campaigns
+        held = await campaigns.checks_held(state)
+        if held:
+            n = await _scalar(
+                "SELECT COUNT(*) FROM campaign_member m JOIN campaigns c ON c.id = m.campaign "
+                "WHERE c.status = 'active' AND m.status = ?", (campaigns.M["waiting"],))
+            if n:
+                stats["campaign_checks_waiting"], stats["campaign_checks_held"] = n, held["code"]
+                items.append({
+                    "key": "campaign-checks", "tone": "warn", "code": held["code"],
+                    "title": f"{n} campaign address(es) wait for a check",
+                    "detail": _CHECKS_HELD.get(held["code"], held.get("why") or ""),
+                    "action": "Open Settings", "tab": "settings",
+                })
 
         if needs_human:
             items.append({

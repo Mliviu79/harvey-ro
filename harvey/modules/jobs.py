@@ -378,16 +378,74 @@ async def pool_spent(state, batch_id: str, pool: str, *, exclude: str = "") -> f
     return float(spent or 0.0)
 
 
+# What paid steps no job runs spent (the Email module's address checks),
+# in USD per UTC day: a settings row LEDGER_KEY + 'YYYY-MM-DD' each, read
+# by spent_since with the jobs' own, so the install's day and month limits
+# count both in one place.
+LEDGER_KEY = "spend_ledger:"
+
+
+async def record_spend(state, usd: float) -> None:
+    """Add ``usd`` spent outside any job to today's ledger row (one
+    statement: two at once never lose one)."""
+    if not usd or usd <= 0:
+        return
+    async with state._connect() as db:
+        await _add_to_ledger(db, usd)
+        await db.commit()
+
+
+async def spend_within(state, usd: float, limits) -> str:
+    """Add ``usd`` spent outside any job to today's ledger row if every one
+    of ``limits`` ((USD, since, "day" | "month"), spent_since's ``since``)
+    has room for it, else why not, nothing written. The check and the write
+    are one transaction, so two of these at once can't both take the last
+    room."""
+    async with state._connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            for limit, since, what in limits:
+                if float(usd) > float(limit) - await _spent_since(db, since) + 1e-9:
+                    await db.rollback()
+                    return f"the spend limit for the {what} (${float(limit):.2f}) is reached"
+            if usd and usd > 0:
+                await _add_to_ledger(db, usd)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return ""
+
+
+async def _add_to_ledger(db, usd: float) -> None:
+    await db.execute(
+        "INSERT INTO settings (key, value, updated_at) "
+        "VALUES (? || date('now'), ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET "
+        "value = CAST(CAST(value AS REAL) + ? AS TEXT), updated_at = CURRENT_TIMESTAMP",
+        (LEDGER_KEY, str(float(usd)), float(usd)))
+
+
 async def spent_since(state, since: str, *, exclude: str = "") -> float:
     """What every job started since ``since`` (a SQLite datetime modifier
-    such as 'start of day') spent, plus what running ones hold reserved."""
+    such as 'start of day') spent, plus what running ones hold reserved,
+    plus the ledger's days since then (spend no job made)."""
     async with state._connect() as db:
-        async with db.execute(
-                "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
-                f"THEN {HELD} ELSE 0 END), 0) FROM jobs "
-                "WHERE started_at >= datetime('now', ?) AND id != ?", (since, exclude)) as cur:
-            (spent,) = await cur.fetchone()
-    return float(spent or 0.0)
+        return await _spent_since(db, since, exclude=exclude)
+
+
+async def _spent_since(db, since: str, *, exclude: str = "") -> float:
+    async with db.execute(
+            "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
+            f"THEN {HELD} ELSE 0 END), 0) FROM jobs "
+            "WHERE started_at >= datetime('now', ?) AND id != ?", (since, exclude)) as cur:
+        (spent,) = await cur.fetchone()
+    # (';' sorts right after ':': every ledger key from that day on.)
+    async with db.execute(
+            "SELECT COALESCE(SUM(CAST(value AS REAL)), 0) FROM settings "
+            "WHERE key >= ? || date('now', ?) AND key < ?",
+            (LEDGER_KEY, since, LEDGER_KEY[:-1] + ";")) as cur:
+        (ledger,) = await cur.fetchone()
+    return float(spent or 0.0) + float(ledger or 0.0)
 
 
 async def reserve(state, job: Job, estimate: float, first: float, *,
