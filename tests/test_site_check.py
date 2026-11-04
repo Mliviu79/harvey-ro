@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import harvey.dashboard as dash
-from harvey import classify, contacts, site_check
+from harvey import classify, classify_profiles as profiles, contacts, site_check
 from harvey.models import Company
 from harvey.modules import api, lanes, switches
 from harvey.signals import sync_vocabulary
@@ -47,6 +47,18 @@ async def _state(path) -> StateManager:
     await s.init_db()
     await sync_vocabulary(s)
     return s
+
+
+async def _legacy(s, key, value) -> None:
+    """One classifier setting as an earlier Harvey kept it (the install's
+    caps are the contact finder's settings still): the first ask makes the
+    rest the "settings" profile, once."""
+    from tests.test_classify import CAPS, _raw
+
+    if key in CAPS:
+        await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+    else:
+        await s.set_setting(f"{profiles.LEGACY_PREFIX}{key}", _raw(value))
 
 
 def _rows(db, sql, *args):
@@ -470,9 +482,8 @@ def test_judge_test_scores_the_built_in_set(tmp_path, monkeypatch, reply):
 
     async def go():
         s = await _state(tmp_path / "harvey.db")
-        await switches.set_module_setting(s, "contact_finder", "classify_provider",
-                                          "openai_compatible")
-        await switches.set_module_setting(s, "contact_finder", "classify_model", "fake-3b")
+        await _legacy(s, "provider", "openai_compatible")
+        await _legacy(s, "model", "fake-3b")
         return await site_check.judge_test(s, cases)
 
     r = run(go())
@@ -556,8 +567,7 @@ def test_judge_test_asks_only_what_todays_code_would_ask(tmp_path, monkeypatch):
 
     async def go():
         s = await _state(tmp_path / "harvey.db")
-        await switches.set_module_setting(s, "contact_finder", "classify_provider",
-                                          "openai_compatible")
+        await _legacy(s, "provider", "openai_compatible")
         return await site_check.judge_test(s, rows)
 
     r = run(go())
@@ -574,7 +584,7 @@ def test_judge_test_runs_with_a_decision_model_and_shows_its_bar_and_spend(tmp_p
 
     FakeHTTP(default=said(OWN_SITE, tokens=(1000, 0))).install(monkeypatch)
 
-    async def wait_gap(lane, seconds):
+    async def wait_gap(lane, seconds, key=""):
         pass
 
     monkeypatch.setattr(lanes, "wait_gap", wait_gap)
@@ -587,7 +597,7 @@ def test_judge_test_runs_with_a_decision_model_and_shows_its_bar_and_spend(tmp_p
                            ("base_url", DECISION_URL), ("model", "decision-test-1"),
                            ("yes", 0.8), ("price_in_per_m", "1"),
                            ("price_out_per_m", "0")):
-            await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+            await _legacy(s, key, value)
         return await site_check.judge_test(s, cases)
 
     r = run(go())
@@ -626,24 +636,28 @@ def client(monkeypatch, tmp_path):
 
 
 def test_the_classifier_settings_name_the_key_never_its_value(client, monkeypatch):
-    monkeypatch.setenv("CLASSIFY_API_KEY", "secret-classifier-value")
+    monkeypatch.setenv("LOCALTEST_API_KEY", "secret-classifier-value")
     run(_state(client.db_path))
     assert client.get("/api/classify").json()["provider"] == "off"
     assert client.post("/api/classify/test").status_code == 409
-    bad = client.post("/api/classify/settings", json={"key_name": "sk-secret-value"})
-    assert bad.status_code == 400
-    assert client.post("/api/classify/settings", json={"provider": "gpt"}).status_code == 400
-    assert client.post("/api/classify/settings", json={"color": "red"}).status_code == 400
-    r = client.post("/api/classify/settings", json={
-        "provider": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",
-        "model": "small-3b", "per_minute": 10, "tasks": {"results": {"on": False, "per_day": 9}}})
+    # (The settings are the install's caps only: a setup is a profile's.)
+    for field in ({"provider": "openai_compatible"}, {"model": "small-3b"},
+                  {"key_name": "LOCALTEST_API_KEY"}, {"color": "red"}):
+        assert client.post("/api/classify/settings", json=field).status_code == 400
+    caps = client.post("/api/classify/settings", json={"tasks": {"results": {"per_day": 9}}})
+    assert caps.status_code == 200 and caps.json()["tasks"]["results"]["per_day"] == 9
+    mine = client.post("/api/classify/profiles", json={
+        "name": "Local", "kind": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1",
+        "model": "small-3b", "key_name": "LOCALTEST_API_KEY", "per_minute": 10}).json()
+    r = client.post("/api/classify/use", json={"site": mine["profile"]["id"],
+                                               "contacts": mine["profile"]["id"]})
     data = r.json()
     assert r.status_code == 200 and data["success"]
     assert (data["provider"], data["model"], data["per_minute"]) == (
         "openai_compatible", "small-3b", 10)
-    assert data["key_name"] == "CLASSIFY_API_KEY" and data["key_set"] is True
+    assert data["key_name"] == "LOCALTEST_API_KEY" and data["key_set"] is True
     assert data["tasks"]["results"] == {"on": False, "per_day": 9}
-    assert data["tasks"]["site"]["on"] is True
+    assert data["tasks"]["site"]["on"] is True and data["held"] == {}
     assert "secret-classifier-value" not in r.text
     assert "secret-classifier-value" not in client.get("/api/classify").text
     test = client.post("/api/classify/test").json()
@@ -688,48 +702,35 @@ def _node():
 
 
 def test_the_classifier_card_and_why_a_site_was_taken_read_in_both_languages():
+    """The card's caps and spend, the found websites waiting for a check,
+    and why a site was taken (the profiles themselves:
+    tests/test_classifier_card.py)."""
     node = _node()
     web = Path(dash.__file__).resolve().parent / "web"
-    script = r'''
+    script = r"""
 const fs = require('fs'), vm = require('vm');
 const app = fs.readFileSync(process.argv[1], 'utf8');
 global.localStorage = {getItem: () => process.argv[3]};
 vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
 const els = {};
-['classify-card', 'rejudge-box', 'cls-test-result'].forEach(id => els[id] = {innerHTML: ''});
+['classify-card', 'rejudge-box'].forEach(id => els[id] = {innerHTML: ''});
 global.document = {getElementById: id => els[id] || null};
 global.escHtml = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+global.jsq = s => escHtml(JSON.stringify(String(s)));
 global.failMsg = (d, f) => f;
 global.tServer = (k, d) => d;
 let mode = '';
 const metrics = {today: {calls: 3, usd: 0.0012, unpriced: 0, avg_tokens: 610}, month: {calls: 40, usd: 0.02, unpriced: 0, avg_tokens: 620},
                  per_task: {site: {calls: 30, usd: 0.015, avg_tokens: 615}}, sites: 30, cost_per_site: 0.0005};
-global.api = async (path) => path === '/api/classify' && mode === 'dm'
-  ? {provider: 'decision', providers: ['off', 'openai_compatible', 'anthropic', 'brain', 'decision'],
-     base_url: 'https://decisions.example.com/v1/systemone', host: 'decisions.example.com', model: 'decision-test-1',
-     key_name: 'CLASSIFY_DECISION_KEY', key_set: true, deepinfra: false, price_list: false, account: false,
-     json_mode: true, per_day: 2000, per_minute: 20, timeout_seconds: 30, yes: 0.75,
-     price_in_per_m: 0.06, price_out_per_m: 0, usd_per_day: 1.5, usd_per_month: null, budget_reached: true,
-     cost: {known: true, source: 'entered', in_per_m: 0.06, out_per_m: 0}, metrics: metrics,
-     tasks: {site: {on: true, per_day: 1500}}, calls_today: 0, held_seconds: 0, waiting: 0}
-  : path === '/api/classify' && mode === 'di'
-  ? {provider: 'openai_compatible', providers: ['off', 'openai_compatible', 'anthropic', 'brain', 'decision'],
-     base_url: 'https://api.deepinfra.com/v1/openai', host: 'api.deepinfra.com', model: 'vendor/chat-1',
-     key_name: 'CLASSIFY_API_KEY', key_set: true, deepinfra: true, price_list: true, account: true,
-     json_mode: true, per_day: 2000, per_minute: 20, timeout_seconds: 30,
-     price_in_per_m: null, price_out_per_m: null, usd_per_day: 1.5, usd_per_month: null, budget_reached: true,
-     cost: {known: true, source: 'deepinfra', in_per_m: 0.06, out_per_m: 0}, metrics: metrics,
-     tasks: {site: {on: true, per_day: 1500}}, calls_today: 0, held_seconds: 0, waiting: 0}
-  : path === '/api/classify'
-  ? {provider: 'openai_compatible', providers: ['off', 'openai_compatible', 'anthropic', 'brain'],
-     base_url: 'http://127.0.0.1:11434/v1', host: '127.0.0.1', model: 'small-3b', key_name: 'CLASSIFY_API_KEY',
-     key_set: false, json_mode: true, per_day: 2000, per_minute: 20, timeout_seconds: 30,
-     tasks: {results: {on: true, per_day: 1500}, site: {on: true, per_day: 1500},
-             contacts: {on: false, per_day: 500}}, usd_per_day: 2, usd_per_month: null,
-     cost: {known: false, source: '', why: 'cost unknown: the USD cap can\'t be checked'},
-     metrics: {today: {calls: 12, usd: 0, unpriced: 12, avg_tokens: 400}, month: {calls: 12, usd: 0, unpriced: 12, avg_tokens: 400},
-               per_task: {}, sites: 12, cost_per_site: null},
-     calls_today: 12, held_seconds: 0, waiting: 3}
+const unpriced = {today: {calls: 12, usd: 0, unpriced: 12, avg_tokens: 400}, month: {calls: 12, usd: 0, unpriced: 12, avg_tokens: 400},
+                  per_task: {}, sites: 12, cost_per_site: null};
+global.api = async (path) => path === '/api/classify'
+  ? {provider: mode ? 'decision' : 'openai_compatible', per_day: 2000, usd_per_day: 1.5, usd_per_month: null,
+     budget_reached: !!mode, metrics: mode ? metrics : unpriced,
+     held: mode ? {local: {seconds: 600, why: '', scope: 'profile', name: 'Local model'}} : {},
+     tasks: {results: {on: true, per_day: 1500}, site: {on: true, per_day: 1500}, contacts: {on: false, per_day: 500}},
+     calls_today: 12, waiting: mode ? 0 : 3, use: {results: 'off', site: 'off', contacts: 'off'}}
+  : path === '/api/classify/profiles' ? {profiles: [], use: {}, tasks: {}, hidden: []}
   : {firms: 3, unconfirmed: 2, likely: 1, ruled_out_by_address: 2, to_read: 1,
      provider: 'openai_compatible', days: 1};
 const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
@@ -738,19 +739,16 @@ vm.runInThisContext(pick('// Settings: the classifier (a small language model)',
   await loadClassifyCard();
   await new Promise(r => setTimeout(r, 0));
   const card = els['classify-card'].innerHTML, box = els['rejudge-box'].innerHTML;
-  mode = 'dm';
+  mode = 'spent';
   await loadClassifyCard();
-  const dmCard = els['classify-card'].innerHTML;
-  mode = 'di';
-  await loadClassifyCard();
-  console.log(JSON.stringify({card: card, box: box, dm_card: dmCard, di_card: els['classify-card'].innerHTML,
+  console.log(JSON.stringify({card: card, box: box, spent: els['classify-card'].innerHTML,
     dm: siteBasisText({by: 'judge', model: 'dm-1', p: 0.88, found_by: 'tinyfish', trust: 'likely'}),
     plain: siteBasisText({by: 'judge', model: 'small-3b', found_by: 'tinyfish', trust: 'likely'}),
     cui: siteBasisText({by: 'cui', found_by: 'tinyfish', trust: 'confirmed'}),
     open: siteBasisText({found_by: 'tinyfish', trust: 'unconfirmed'}),
     declared: siteBasisText({})}));
 })().catch(e => {console.error(e); process.exit(1);});
-'''
+"""
     out = {}
     for lang in ("ro", "en"):
         res = subprocess.run([node, "-e", script, str(web / "app.js"), str(web / "i18n.js"), lang],
@@ -759,43 +757,24 @@ vm.runInThisContext(pick('// Settings: the classifier (a small language model)',
         out[lang] = json.loads(res.stdout)
     ro, en = out["ro"], out["en"]
     assert "Clasificator" in ro["card"] and "Classifier" in en["card"]
-    assert 'value="CLASSIFY_API_KEY"' in en["card"] and "holds no value" in en["card"]
-    # Where the questions and the key go, plainly.
-    assert "the key CLASSIFY_API_KEY go to: 127.0.0.1" in en["card"]
-    assert 'id="cls-task-contacts">' in en["card"] and 'id="cls-task-site" checked' in en["card"]
-    assert "12" in en["card"] and "2,000" in en["card"]
+    assert "Today: 12 calls of 2,000." in en["card"] and 'value="1.5"' in en["card"]
+    assert "Contacts on the site: 500 calls a day" in en["card"]
     assert "2 ruled out by their address, 1 to read again" in en["box"]
     assert "Check them" in en["box"] and "Verifică-le" in ro["box"]
     assert en["plain"] == ("found by a search (tinyfish) · likely: the classifier said yes "
                            "(small-3b)")
     assert ro["plain"].endswith("probabil: clasificatorul a spus da (small-3b)")
-    assert 'id="cls-yes"' not in en["card"]
     assert en["dm"] == "found by a search (tinyfish) · likely: the classifier said yes, 88% (dm-1)"
     assert ro["dm"].endswith("probabil: clasificatorul a spus da, 88% (dm-1)")
-    assert 'id="cls-yes"' in en["dm_card"] and 'value="0.75"' in en["dm_card"]
-    assert "cls-site_" not in en["dm_card"]       # the site's bars are fixed, not fields
-    assert "the key CLASSIFY_DECISION_KEY go to: decisions.example.com" in en["dm_card"]
-    assert "Decision model (TypeSafe System One format)" in en["dm_card"]
-    assert "Model de decizie" in ro["dm_card"]
-    assert "https://api.typesafe.ai/v1/systemone" in en["dm_card"] and "jev-latest" in ro["dm_card"]
-    # A decision model: only the price entered, no price list, no account box.
-    assert "Price entered: $0.0600 in" in en["dm_card"]
-    assert "loadClassifyModels()" not in en["dm_card"] and "loadClassifyAccount()" not in en["dm_card"]
-    # The price, where it comes from, the budget, the spend, DeepInfra's list and account.
-    assert "Price from DeepInfra&#39;s list" in en["di_card"] or \
-        "Price from DeepInfra's list" in en["di_card"]
-    assert "$0.0600 in" in en["di_card"] and 'id="cls-usd_day"' in en["di_card"]
-    assert 'value="1.5"' in en["di_card"] and 'id="cls-budget"' in en["di_card"]
-    assert "this month: 40 calls, $0.0200" in en["di_card"] and "per site checked: $0.0005" in en["di_card"]
-    assert "loadClassifyModels()" in en["di_card"] and "loadClassifyAccount()" in en["di_card"]
-    assert 'id="cls-yes"' not in en["di_card"]
+    # The spend, the USD cap reached, the pause a server asked for.
+    assert 'id="cls-budget"' in en["spent"] and "Local model: paused for 10 more min" in en["spent"]
+    assert "paused" not in en["card"]
+    assert "this month: 40 calls, $0.0200" in en["spent"] and "per site checked: $0.0005" in en["spent"]
     # An unknown price says the USD cap can't count, in both languages.
     assert "cost unknown: the USD cap can&#39;t be checked" in en["card"] or \
         "cost unknown: the USD cap can't be checked" in en["card"]
-    assert "Until the price is known, only the call caps count." in en["card"]
     assert "per site checked: –" in en["card"]
     assert "cost necunoscut: plafonul în USD nu poate fi verificat" in ro["card"]
-    assert "loadClassifyModels()" not in en["card"] and "loadClassifyAccount()" not in en["card"]
     assert ro["cui"] == "găsit prin căutare (tinyfish) · confirmat: CUI-ul firmei e pe site"
     assert en["open"].endswith("not checked yet") and en["declared"] == ""
 
@@ -1003,29 +982,37 @@ def test_a_waiting_site_is_judged_with_every_candidate_and_moved_to_the_one_take
 
 def test_the_endpoint_and_key_settings_refuse_what_could_leak_a_secret(client):
     run(_state(client.db_path))
+    base = {"name": "Hosted", "kind": "openai_compatible", "model": "m"}
     for body in ({"key_name": "SMTP_PASSWORD"}, {"key_name": "TINYFISH_API_KEY"},
                  {"key_name": "GMAIL_CLIENT_SECRET"}, {"base_url": "file:///etc/passwd"},
-                 {"base_url": "http://169.254.169.254/latest/"},
-                 {"tasks": {"site": {"per_day": "many"}}}):
-        assert client.post("/api/classify/settings", json=body).status_code == 400, body
+                 {"base_url": "http://169.254.169.254/latest/"}):
+        assert client.post("/api/classify/profiles", json={**base, **body}).status_code == 400, \
+            body
+    assert client.post("/api/classify/settings", json={
+        "tasks": {"site": {"per_day": "many"}}}).status_code == 400
+    # (The provider's own keys, as the built-ins name them, are taken.)
+    for key in ("DEEPINFRA_API_KEY", "TYPESAFE_API_KEY", "GROQ_API_KEY"):
+        assert classify.key_name_problem(key) == "", key
+    mine = client.post("/api/classify/profiles", json={
+        **base, "key_name": "GROQ_API_KEY", "base_url": "https://api.exemplu.test/openai/v1"}
+    ).json()["profile"]
+    client.post("/api/classify/use", json={"site": mine["id"]})
     r = client.post("/api/classify/settings", json={
-        "provider": "openai_compatible", "key_name": "GROQ_API_KEY",
-        "base_url": "https://api.exemplu.test/openai/v1",
-        "tasks": {"site": {"on": True, "per_day": 10 ** 9}}}).json()
+        "tasks": {"site": {"per_day": 10 ** 9}}}).json()
     assert r["success"] and r["key_name"] == "GROQ_API_KEY" and r["host"] == "api.exemplu.test"
     assert r["tasks"]["site"]["per_day"] == classify.MAX_PER_DAY
-    # A decision model's contacts bar: a number, clamped; the site's bars aren't settings.
-    assert client.post("/api/classify/settings", json={"yes": "high"}).status_code == 400
-    assert client.post("/api/classify/settings", json={"site_own": 0.5}).status_code == 400
-    r = client.post("/api/classify/settings", json={
-        "provider": "decision", "yes": 2, "key_name": "CLASSIFY_DECISION_KEY",
-        "base_url": "https://decisions.exemplu.test/v1/decide"}).json()
+    # A decision model's contacts bar is its profile's, clamped; the site's
+    # bars aren't settings.
+    for body in ({"yes": 0.9}, {"site_own": 0.5}):
+        assert client.post("/api/classify/settings", json=body).status_code == 400
+    d = client.post("/api/classify/profiles", json={
+        "name": "Decide", "kind": "decision", "model": "decision-test-1",
+        "key_name": "CLASSIFY_DECISION_KEY", "base_url": "https://decisions.exemplu.test/v1/decide",
+        "questions": {"contacts": {"bar": 2}}}).json()["profile"]
+    r = client.post("/api/classify/use", json={"site": d["id"]}).json()
     assert r["success"] and r["yes"] == 0.99 and r["host"] == "decisions.exemplu.test"
     assert "site_own" not in r and "site_names" not in r
     assert "decision" in r["providers"] and "typesafe" not in r["providers"]
-    # No endpoint or model of its own: blank stays blank.
-    assert r["model"] == "" and client.post("/api/classify/settings", json={
-        "base_url": ""}).json()["host"] == ""
 
 
 def test_the_check_asks_before_it_starts_and_says_what_happens_with_no_classifier():
@@ -1085,7 +1072,7 @@ def test_the_day_cap_counts_a_call_for_each_candidate_asked(tmp_path, monkeypatc
         s = await _state(tmp_path / "harvey.db")
         for key, value in (("provider", "openai_compatible"), ("model", "fake-3b"),
                            ("per_day", 2)):
-            await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+            await _legacy(s, key, value)
         d = await finder.decide(s, facts, cards)
         return d, await classify.calls_today(s), await classify.calls_today(s, "site")
 
@@ -1119,7 +1106,11 @@ def test_two_yes_leave_the_site_as_it_is_and_the_same_classifier_isnt_asked_agai
                               outcome="nothing", detail=site_match.waiting_detail([SITE, other]))
         first = await site_check.recheck_one(s, cid, batch="b")
         second = await site_check.recheck_one(s, cid, batch="b")
-        await switches.set_module_setting(s, "contact_finder", "classify_model", "fake-other")
+        # (Another classifier: a profile of another model, here the one the
+        # older settings make.)
+        other_profile = await profiles.save(s, {"name": "Other", "kind": "openai_compatible",
+                                                "model": "fake-other"})
+        await profiles.set_use(s, {"site": other_profile["id"]})
         third = await site_check.recheck_one(s, cid, batch="b")
         return cid, first, second, third
 
@@ -1142,7 +1133,7 @@ def test_the_count_says_at_most_how_many_days_at_the_tighter_cap(tmp_path):
                                         website=f"https://exemplu-{i}.test/")
         for key, value in (("provider", "openai_compatible"), ("model", "fake-3b"),
                            ("per_day", 8)):
-            await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+            await _legacy(s, key, value)
         return await site_check.count(s)
 
     c = run(go())
@@ -1155,17 +1146,26 @@ def test_the_count_says_at_most_how_many_days_at_the_tighter_cap(tmp_path):
 
 def test_the_prices_and_usd_caps_are_amounts_or_blank(client):
     run(_state(client.db_path))
-    for body in ({"usd_per_day": -1}, {"usd_per_month": "lots"}, {"price_in_per_m": True},
-                 {"price_out_per_m": "-0.5"}):
+    for body in ({"usd_per_day": -1}, {"usd_per_month": "lots"}, {"usd_per_day": True},
+                 {"price_in_per_m": "0.1"}):
         assert client.post("/api/classify/settings", json=body).status_code == 400, body
-    r = client.post("/api/classify/settings", json={
-        "provider": "decision", "price_in_per_m": "0,06", "price_out_per_m": 0,
-        "usd_per_day": 1.5, "usd_per_month": "20"}).json()
+    bad = {"name": "Decide", "kind": "decision", "model": "d", "key_name": "TYPESAFE_API_KEY",
+           "base_url": "https://decisions.exemplu.test/v1/decide"}
+    for prices in ({"in_per_m": True}, {"out_per_m": "-0.5"}):
+        assert client.post("/api/classify/profiles", json={**bad, "prices": prices}
+                           ).status_code == 400, prices
+    d = client.post("/api/classify/profiles", json={
+        **bad, "prices": {"in_per_m": "0,06", "out_per_m": 0}}).json()["profile"]
+    client.post("/api/classify/use", json={"site": d["id"]})
+    r = client.post("/api/classify/settings", json={"usd_per_day": 1.5,
+                                                    "usd_per_month": "20"}).json()
     assert r["success"] and (r["price_in_per_m"], r["price_out_per_m"]) == (0.06, 0.0)
     assert (r["usd_per_day"], r["usd_per_month"]) == (1.5, 20.0)
     assert r["cost"]["known"] and r["cost"]["source"] == "entered"
     assert r["budget_reached"] is False and r["metrics"]["month"]["calls"] == 0
-    r = client.post("/api/classify/settings", json={"price_in_per_m": "", "usd_per_day": None,
+    client.post(f"/api/classify/profiles/{d['id']}", json={"prices": {"in_per_m": None,
+                                                                       "out_per_m": None}})
+    r = client.post("/api/classify/settings", json={"usd_per_day": None,
                                                     "usd_per_month": ""}).json()
     assert r["price_in_per_m"] is None and r["usd_per_day"] is None
     assert r["usd_per_month"] is None and not r["cost"]["known"]
@@ -1181,7 +1181,7 @@ def test_harvey_contacts_status_says_the_spend_and_the_budget(tmp_path, monkeypa
         for key, value in (("provider", "decision"), ("model", "decision-test-1"),
                            ("price_in_per_m", "1"), ("price_out_per_m", "0"),
                            ("usd_per_day", "0.001")):
-            await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+            await _legacy(s, key, value)
         await s.record_usage_event(agent="classify", task="classify.site", model="decision-test-1",
                                    input_tokens=1000, cost_usd=0.001, source="classify",
                                    provider="decision")
@@ -1191,6 +1191,17 @@ def test_harvey_contacts_status_says_the_spend_and_the_budget(tmp_path, monkeypa
     out = capsys.readouterr().out
     assert "today 1 calls $0.0010, this month 1 calls $0.0010; per site $0.0010" in out
     assert "USD cap: $0.0010 a day; reached: the firms wait unlinked" in out
+
+
+def _use(client, profile_id: str = "", **fields) -> str:
+    """A profile of one's own (or ``profile_id`` changed) set for every
+    task it answers, through the API, as the Classifier card does."""
+    body = {"name": "Mine", "kind": "openai_compatible", "model": "m", **fields}
+    r = client.post(f"/api/classify/profiles/{profile_id}" if profile_id
+                    else "/api/classify/profiles", json=fields if profile_id else body).json()
+    p = r["profile"]
+    assert client.post("/api/classify/use", json={t: p["id"] for t in p["tasks"]}).json()["success"]
+    return p["id"]
 
 
 def _models_reply():
@@ -1212,8 +1223,7 @@ def test_the_price_list_is_fetched_here_filtered_by_kind_sorted_and_kept(client,
 
     fake = FakeHTTP(default=httpx.Response(200, json=_models_reply())).install(monkeypatch)
     run(_state(client.db_path))
-    client.post("/api/classify/settings", json={
-        "provider": "openai_compatible", "base_url": "https://api.deepinfra.com/v1/openai"})
+    _use(client, base_url="https://api.deepinfra.com/v1/openai")
     status = client.get("/api/classify").json()
     assert status["deepinfra"] and status["price_list"]
     r = client.get("/api/classify/models").json()
@@ -1272,12 +1282,11 @@ def _account_replies(usage=200, limits=200, balance=200):
 def _deepinfra_account(client, monkeypatch, **replies):
     from tests.test_classify import FakeHTTP
 
-    monkeypatch.setenv("CLASSIFY_DEEPINFRA_KEY", "secret-deepinfra-value")
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "secret-deepinfra-value")
     fake = FakeHTTP(default=_account_replies(**replies)).install(monkeypatch)
     run(_state(client.db_path))
-    client.post("/api/classify/settings", json={
-        "provider": "openai_compatible", "base_url": "https://api.deepinfra.com/v1/openai",
-        "key_name": "CLASSIFY_DEEPINFRA_KEY", "price_in_per_m": "1", "price_out_per_m": "1"})
+    _use(client, base_url="https://api.deepinfra.com/v1/openai", key_name="DEEPINFRA_API_KEY",
+         prices={"in_per_m": 1, "out_per_m": 1})
     return fake
 
 
@@ -1321,14 +1330,14 @@ def test_the_account_box_needs_deepinfra_and_a_key(client, monkeypatch):
 
     fake = FakeHTTP().install(monkeypatch)
     run(_state(client.db_path))
-    client.post("/api/classify/settings", json={"provider": "openai_compatible",
-                                                "base_url": "https://llm.exemplu.test/v1"})
+    pid = _use(client, base_url="https://llm.exemplu.test/v1", key_name="DEEPINFRA_API_KEY")
     assert client.get("/api/classify/account").json()["code"] == "not_deepinfra"
     monkeypatch.setitem(sys.modules, "dotenv", SimpleNamespace(load_dotenv=lambda *a, **k: None))
-    monkeypatch.delenv("CLASSIFY_API_KEY", raising=False)
-    client.post("/api/classify/settings", json={"base_url": "https://api.deepinfra.com/v1/openai"})
+    monkeypatch.delenv("DEEPINFRA_API_KEY", raising=False)
+    _use(client, pid, base_url="https://api.deepinfra.com/v1/openai")
     assert client.get("/api/classify/account").json()["code"] == "no_key"
-    assert fake.requests == []
+    # (The account is never read: at most the public price list is.)
+    assert all(not q.url.path.startswith("/payment") for q in fake.requests)
 
 
 def _classifier_texts() -> dict:

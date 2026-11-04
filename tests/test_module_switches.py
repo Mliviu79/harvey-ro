@@ -319,6 +319,32 @@ def test_cli_enable_disable_and_list(tmp_path, monkeypatch):
     assert rows["startups"]["enabled"] is False and rows["osm"]["enabled"] is True
 
 
+def test_cli_shows_and_sets_a_modules_settings_and_refuses_a_bad_price(tmp_path, monkeypatch):
+    db = tmp_path / "harvey.db"
+    code, out = _cli(monkeypatch, db, "modules", "set", "email_verify", "usd_reoon", "0.004")
+    assert code == 0 and "email_verify.usd_reoon = 0.004" in out
+    code, out = _cli(monkeypatch, db, "modules", "set", "email_verify", "usd_reoon", "abc")
+    assert code == 2 and "must be a number" in out
+    code, out = _cli(monkeypatch, db, "modules", "settings", "email_verify")
+    assert code == 0 and "usd_reoon" in out and "0.004" in out and "(blank)" in out
+    code, out = _cli(monkeypatch, db, "modules", "set", "email_verify", "usd_reoon", "")
+    assert code == 0 and "(blank)" in out
+    code, out = _cli(monkeypatch, db, "modules", "set", "email_verify", "nothing", "1")
+    assert code == 2 and "no setting" in out
+
+
+def test_the_classify_lane_has_no_pace_of_its_own_only_each_profiles(monkeypatch):
+    # (A profile's per_minute is the pace; the lane adds none under it.)
+    from harvey.modules import lanes
+
+    turns = []
+    monkeypatch.setattr(lanes, "_turn", lambda key, gap: turns.append((key, gap)))
+    assert lanes.interval("classify") == 0.0
+    asyncio.run(lanes.wait_gap("classify", 0.1, key="classify.local"))
+    asyncio.run(lanes.wait_gap("classify", 0, key="classify.fast"))
+    assert turns == [("classify.local", 0.1)]
+
+
 # ── Dashboard ──
 
 

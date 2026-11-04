@@ -25,9 +25,14 @@ search, whichever source brought it in. For one company at a time (the
 3. A person named at a company with a website, reached by no contact of
    their own, gets one address built from the domain's pattern and checked
    by a verification tier (email_verify), inside the same cap and the
-   month's address checks (a credit each: a cap in dollars can't see a
-   free tier running out). An address the site publishes as the person's
-   own is linked to them as it is, with no check, cap or not.
+   month's checks (each service it asks is one). Each request is $0 inside
+   its service's free allowance and its price past it (entered by the user,
+   else declared: harvey/verify_costs.py), reserved from the run's cap
+   before it is made and recorded after; past a free allowance with no
+   price it is refused (the cap can't count it), and a check that needed
+   it is an error, not a check done (the report counts it). An address the
+   site publishes as the person's own is linked to them as it is, with no
+   check, cap or not.
 
 A website found by searching is the company's only on evidence. Code
 decides what a register fact settles (site_match.hard): the firm's CUI or
@@ -153,6 +158,10 @@ class Spend:
         self.cap = cap
         self.per_day, self.per_month = per_day, per_month
         self.spent = 0.0
+        # What each kind of paid step spent: "searches" (website lookups),
+        # "checks" (address checks), "lookups" (Hunter's pattern lookups),
+        # for the run's report.
+        self.by: dict[str, float] = {}
         self.refused = ""
 
     async def allow(self, estimate: float, first: float | None = None) -> float | None:
@@ -174,8 +183,9 @@ class Spend:
             self.refused = str(e)
             return None
 
-    async def record(self, amount: float) -> None:
+    async def record(self, amount: float, what: str = "searches") -> None:
         self.spent += float(amount or 0.0)
+        self.by[what] = round(self.by.get(what, 0.0) + float(amount or 0.0), 10)
         if self._record is not None and amount:
             await self._record(amount)
 
@@ -305,11 +315,31 @@ class Found:
     cost: float = 0.0
     skipped: list[str] = field(default_factory=list)
     failed: int = 0
+    # Requests made to verification services (each a check at that
+    # service, what its allowance and bill count), address checks refused
+    # (a service past its free tier with no price, a month's cap, the
+    # run's money), Hunter's pattern lookups made, what the paid steps
+    # spent by kind (Spend.by), and how long the company took.
+    checks: int = 0
+    checks_refused: int = 0
+    lookups: int = 0
+    services: dict = field(default_factory=dict)
+    spend: dict = field(default_factory=dict)
+    ms: int = 0
 
     def as_dict(self) -> dict:
         return {"company_id": self.company_id, "steps": self.steps, "contacts": self.contacts,
                 "people": self.people, "website": self.website, "trust": self.trust,
-                "cost": round(self.cost, 4), "skipped": self.skipped}
+                "cost": round(self.cost, 4), "skipped": self.skipped,
+                "spend": {"searches": round(self.spend.get("searches", 0.0), 6),
+                          "checks": round(self.spend.get("checks", 0.0), 6),
+                          "checks_made": self.checks,
+                          "checks_refused": self.checks_refused,
+                          "lookups": round(self.spend.get("lookups", 0.0), 6),
+                          "lookups_made": self.lookups,
+                          "services": {k: n for k, n in self.services.items()
+                                       if k != "hunter_search"}},
+                "ms": self.ms}
 
 
 async def find(state, company_id: str, *, spend: Spend, since: str | None = None,
@@ -324,6 +354,19 @@ async def find(state, company_id: str, *, spend: Spend, since: str | None = None
     run's "find websites"). ``addresses`` False: no address is built and
     checked (a verification credit each), only sites read and searched and
     the addresses a site publishes as a person's own linked to them."""
+    import time
+
+    started = time.monotonic()
+    out = await _find(state, company_id, spend=spend, since=since, batch_id=batch_id,
+                      config=config, env=env, run_id=run_id, background=background,
+                      want_website=want_website, addresses=addresses)
+    out.spend = dict(spend.by)
+    out.ms = int((time.monotonic() - started) * 1000)
+    return out
+
+
+async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config, env,
+                run_id, background, want_website, addresses) -> Found:
     from harvey.modules import switches
 
     out = Found(company_id)
@@ -545,7 +588,7 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
                 draft = api.Draft(failed=str(e))
             # Inside the free allowance a search costs nothing.
             cost = 0.0 if gratis else draft.cost
-            await spend.record(cost)
+            await spend.record(cost, "searches")
             out.cost += cost
             if draft.failed is None:
                 out.steps.append(f"search:{s.module}")
@@ -881,6 +924,7 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
     guess, kept no surer than "likely". ``verify`` False (no cap): only the
     published addresses are linked, for everyone named there, and nobody
     else is marked searched."""
+    from harvey import verify_costs
     from harvey.integrations import email_finder as ef
 
     if EMAIL[0] not in enabled:
@@ -896,7 +940,9 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
     except Exception:
         cached = None
     cap = api.capability(*EMAIL)
-    credits = ingest.Allowance(state)
+    meter = await verify_costs.Meter.start(state, spend)
+    out.services = meter.made
+    configured = ef.configured_verifiers(env, enabled)
     named = await _named_at(state, company_id)
     twins = _twins(named)
     searching = {p["id"] for p in people}
@@ -976,7 +1022,7 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         readings = list(dict.fromkeys(
             r for first, last in orders
             for r in ((first, last), (contacts.short_given(first), last))))
-        draft, tried, same_as = None, [], ""
+        draft, tried, same_as, paid, no_check = None, [], "", 0.0, False
         for first, last in readings:
             key = _reading_key(first, last)
             if key in checked:
@@ -988,18 +1034,27 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
                     continue
                 same_as = who
                 break
-            # A verification credit each, counted against the month's checks
-            # (email_verify's monthly_searches): free tiers run out, and a
-            # cap in dollars can't see them. The other order is checked only
-            # when the likelier one comes back invalid.
-            if await credits.left(EMAIL[0]) <= 0:
-                _skip(out, "address check skipped: this month's address checks are "
-                           "used (EMAIL_VERIFY_MONTHLY_CHECKS)")
+            # Each service a check asks is one of the month's checks
+            # (EMAIL_VERIFY_MONTHLY_CHECKS), priced as it is asked and,
+            # past its free allowance, refused with no price (the Meter).
+            # None left to ask: the check isn't made. The other order is
+            # checked only when the likelier one comes back invalid.
+            why = await _no_check(meter, configured)
+            if why:
+                _skip(out, f"address check skipped: {why}")
                 if draft is None:
-                    return
+                    # (An error isn't a search done: searched again later.
+                    # The people after this one are still gone through:
+                    # one whose own address the site publishes costs nothing.)
+                    out.checks_refused += 1
+                    await state.record_search(
+                        "person", person["id"], *EMAIL, looked_for="email", outcome="error",
+                        batch_id=batch_id, origin=company_id, detail=why)
+                    no_check = True
                 break
-            await credits.take(EMAIL[0])
-            ctx = api.Context(env=env, enabled=frozenset(enabled), budget=credits)
+            mark, spent, made = meter.mark(), meter.spent(), meter.total()[0]
+            looked = meter.total("search")[0]
+            ctx = api.Context(env=env, enabled=frozenset(enabled), budget=meter)
             try:
                 draft = await cap(api.Input(domain=domain, facts={"EMAIL_PATTERN": cached},
                                             extra={"first_name": first, "last_name": last,
@@ -1010,6 +1065,27 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
             except Exception as e:
                 draft = api.Draft(failed=str(e))
             tried.append(f"{first} {last}")
+            # What it cost: each request $0 inside its service's free
+            # allowance, its price past it (recorded by the Meter as made).
+            usd = round(meter.spent() - spent, 6)
+            out.checks += meter.total()[0] - made
+            out.lookups += meter.total("search")[0] - looked
+            out.cost += usd
+            paid += usd
+            refused = meter.refused[mark:]
+            for service, why in refused:
+                if meter.specs.get(service, {}).get("kind") == "search":
+                    _skip(out, f"pattern lookup skipped: {why}")
+            stopped = "; ".join(dict.fromkeys(
+                why for service, why in refused
+                if meter.specs.get(service, {}).get("kind") != "search"))
+            if stopped and draft.failed is None and not any(
+                    c.status and c.status != "guess" for c in draft.contacts):
+                # A service the check would have asked next was refused:
+                # it isn't a check done, and nothing it guessed is kept.
+                _skip(out, f"address check stopped: {stopped}")
+                out.checks_refused += 1
+                draft = api.Draft(failed=stopped, values=draft.values)
             await ingest.learned_pattern(state, domain, draft.values.get("email_pattern"))
             if draft.values.get("email_pattern"):
                 try:
@@ -1021,6 +1097,8 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
             checked[key] = (person["name"], invalid)
             if not invalid:
                 break
+        if no_check:
+            continue
         if draft is None:
             await state.record_search(
                 "person", person["id"], *EMAIL, looked_for="email", outcome="nothing",
@@ -1042,8 +1120,19 @@ async def _addresses(state, company: dict, domain: str, out: Found, trust: str, 
         await state.record_search(
             "person", person["id"], *EMAIL, looked_for="email",
             outcome="error" if draft.failed is not None else "found" if kept else "nothing",
-            found=kept, batch_id=batch_id,
+            found=kept, cost=paid, batch_id=batch_id,
             detail="; ".join(x for x in (draft.failed or "", order) if x), origin=company_id)
+
+
+async def _no_check(meter, configured: list[str]) -> str:
+    """Why no address check can be made now, or "": the month's checks
+    are used, or every service it may ask would be refused."""
+    from harvey import verify_costs
+
+    if await verify_costs.checks_left(meter.state, meter.specs) <= 0:
+        return "this month's address checks are used (EMAIL_VERIFY_MONTHLY_CHECKS)"
+    whys = [await meter.refusal(v) for v in configured]
+    return whys[0] if whys and all(whys) else ""
 
 
 def _guess_trust(found, trust: str) -> str:
@@ -1259,16 +1348,127 @@ async def select(state, f: contacts.ContactFilter | None = None, *, ids=None,
                             int(limit))
 
 
+async def plan(state, selected: list[dict], enabled, env: dict, *,
+               force: bool = False) -> list[dict]:
+    """``selected`` with what a run over it will do to each company, as
+    _find decides it (a forced run counts nothing as searched; otherwise a
+    search counts while younger than its capability's refresh_days):
+    ``reread``, a website a search found and the evidence took, read again
+    (its classifier questions asked again) only when not read since;
+    ``look_with``, the searches a company with no website still goes
+    through (those that haven't searched it), cheapest first. The
+    estimates read both."""
+    found = searchers(enabled, env)
+    since = contacts.now() if force else None
+    again = [c["id"] for c in selected
+             if c["site"] and c.get("website_found") and not c.get("website_waiting")]
+    no_site = [c["id"] for c in selected if not c["site"]]
+    read = set()
+    if again and not force:
+        read = await state.read("finder_searched_many", again, *SITE,
+                                contacts.search_cutoff(*SITE), SITE_WANTS)
+    looked = {}
+    for x in found:
+        looked[(x.module, x.capability)] = set() if force or not no_site else await state.read(
+            "finder_searched_many", no_site, x.module, x.capability,
+            contacts.search_cutoff(x.module, x.capability, since))
+    again_set = set(again)
+    return [{**c, "reread": c["id"] in again_set and c["id"] not in read,
+             "look_with": [] if c["site"] else
+             [x for x in found if c["id"] not in looked[(x.module, x.capability)]]}
+            for c in selected]
+
+
 def estimate(selected: list[dict], enabled, env: dict) -> dict:
     """What a Find-contacts run over ``selected`` would cost: a website
     read is free; a company with no website costs one lookup through the
-    cheapest search that can find it (more when that one finds nothing and
-    the next is tried: the cap stops it)."""
+    cheapest search that can find it and hasn't searched it (``plan``'s
+    ``look_with``; every search when the rows weren't planned), more when
+    that one finds nothing and the next is tried (the cap stops it)."""
     found = searchers(enabled, env)
-    paid = sum(1 for c in selected if not c["site"])
-    cheapest = found[0].estimate if found else 0.0
-    return {"companies": len(selected), "with_site": len(selected) - paid,
-            "to_look_up": paid, "estimated_cost": round(paid * cheapest, 4),
-            "most": round(paid * sum(s.estimate for s in found), 4),
+
+    def through(c):
+        return c["look_with"] if "look_with" in c else found
+
+    paid = [through(c) for c in selected if not c["site"] and through(c)]
+    return {"companies": len(selected), "with_site": sum(1 for c in selected if c["site"]),
+            "to_look_up": len(paid),
+            "estimated_cost": round(sum(ways[0].estimate for ways in paid), 4),
+            "most": round(sum(x.estimate for ways in paid for x in ways), 4),
             "searchers": [{"module": s.module, "capability": s.capability,
                            "provider": s.provider, "cost": s.estimate} for s in found]}
+
+
+async def checks_estimate(state, selected: list[dict], enabled, env: dict) -> dict:
+    """The address checks a Find-contacts run over ``selected`` may make
+    (only with a spend cap: MAX_PEOPLE_PER_COMPANY a company at most), each
+    asking every verification service at worst, and Hunter's pattern
+    lookups (one a company at most), with what they may cost past each
+    service's free allowance this month at its price (entered, else
+    declared: verify_costs.projection, ``usd_high``). ``refused``: the
+    services past their allowance with no price, whose requests the run
+    will refuse; ``checks_left``: the month's checks, every service's
+    together. A planned company (``plan``) that can't reach a domain the
+    run would build addresses at (a found site waiting for its check, no
+    website and no search left to find one) is left out. An estimate: the
+    run's cap is what is enforced, request by request."""
+    from harvey import verify_costs
+    from harvey.integrations import email_finder as ef
+
+    def reaches(c) -> bool:
+        if c["site"]:
+            return not c.get("website_waiting")
+        return "look_with" not in c or bool(c["look_with"])
+
+    on = EMAIL[0] in enabled
+    configured = ef.configured_verifiers(env, enabled) if on else []
+    firms = sum(1 for c in selected if reaches(c)) if on else 0
+    checks = firms * MAX_PEOPLE_PER_COMPANY
+    wants = {v: checks for v in configured}
+    lookups = firms if on and ef._module_on(enabled, "hunter") \
+        and ef._hunter_api_key(env) else 0
+    if lookups:
+        wants[verify_costs.HUNTER_SEARCH] = lookups
+    out = await verify_costs.projection(state, wants)
+    return {**out, "checks": checks, "lookups": lookups, "verifiers": configured,
+            "per_company": MAX_PEOPLE_PER_COMPANY}
+
+
+async def classify_estimate(state, selected: list[dict]) -> dict:
+    """What a Find-contacts run over ``selected`` may ask the classifier
+    and what that may cost, before anything is sent: a company looked up
+    is a results question, one per candidate read (MAX_CANDIDATES at most)
+    and one about the chosen site's contacts; a website a search found
+    and read again (``plan``'s ``reread``: not waiting for the re-check,
+    and not read since, unless forced) a site question and a contacts one;
+    a website the company declares needs none. The cost is a range per task (classify.projection: typical and
+    high, at its profile's price), never a limit: the run's classifier cap
+    is what is enforced, call by call (``note``). ``price_known`` False: a
+    profile has no price, so the USD figures leave its calls out."""
+    per = {"results": 0, "site": 0, "contacts": 0}
+    for c in selected:
+        if not c["site"]:
+            if "look_with" in c and not c["look_with"]:
+                continue            # (every search that can find it already did)
+            per["results"] += 1
+            per["site"] += MAX_CANDIDATES
+            per["contacts"] += 1
+        elif c.get("reread", c.get("website_found") and not c.get("website_waiting")):
+            per["site"] += 1
+            per["contacts"] += 1
+    seen = await classify.sizes(state)
+    out = {"calls": 0, "usd_typical": 0.0, "usd_high": 0.0, "price_known": True,
+           "per_task": {}, "note": classify.ESTIMATE_NOTE}
+    for task, n in per.items():
+        s = (await classify.settings(state, task)).for_task(task)
+        if not n or not s.task_on(task) or s.provider == "off":
+            out["per_task"][task] = {"calls": 0, "usd_typical": 0.0, "usd_high": 0.0,
+                                     "profile": s.profile}
+            continue
+        p = await classify.projection(state, s, task, n, seen)
+        out["per_task"][task] = p
+        out["calls"] += n
+        out["usd_typical"] = round(out["usd_typical"] + p["usd_typical"], 6)
+        out["usd_high"] = round(out["usd_high"] + p["usd_high"], 6)
+        out["price_known"] = out["price_known"] and p["price_known"]
+    return out

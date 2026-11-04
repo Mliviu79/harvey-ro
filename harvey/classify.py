@@ -2,10 +2,14 @@
 
 One service, several named tasks. Every task asks the same kind of
 request: a state (the text the questions are about) and a list of
-statements with ids, each answered yes or no. The tasks share one
-provider (the contact finder's ``classify_*`` settings), one pace, one
-held state, one parser, one usage ledger and one budget; each has its own
-switch and day cap:
+statements with ids, each answered yes or no. Each task is set to a
+profile (harvey/classify_profiles.py: one complete setup, its endpoint,
+model, key's name, prices and the questions' texts) or off. Each profile
+has its own pace and its own held state (a 429 from one endpoint never
+pauses another's model; a refused key or a spent balance holds every
+profile on that account: see ``held``); the tasks share one parser, one
+usage ledger and the install's caps (calls a day, USD a day and a month),
+and each has its own day cap:
 
 - ``results``: before anything is visited, which of a search's results
   is a company's own website (one statement per result, one request);
@@ -47,14 +51,23 @@ listed price, else 0 marked unpriced); the USD caps (a day, a month) are
 checked before every attempt next to the call caps, while the price is
 known.
 
+A job sets a Meter (METER) while it runs: every attempt is counted on it,
+its cost charged to the job (the run's report, the install's spend
+limits), and the run's classifier money is checked before each one: the
+request is built, its tokens counted (with TOKEN_MARGIN) and its worst case
+(those tokens and the task's most output tokens, at the price) has to fit
+what is left; the real cost is recorded after. An estimate made before a
+run (finder.classify_estimate) is a projection, never what is enforced.
+
 ``ask`` never raises into its caller: an Answer without a value says why
-(off, the task off, held, the day's calls used, the budget spent, no valid
-answer).
+(off, the task off, held, the day's calls used, the budget spent, the
+run's budget spent, no valid answer).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import ipaddress
 import json
 import logging
@@ -75,14 +88,23 @@ PROVIDERS = ("off", "openai_compatible", "anthropic", "brain", "decision")
 # yes/no statements.
 SYSTEM_ONE = ("decision",)
 # The probability a decision model's "yes" needs for a contact
-# (classify_yes): 0.7 was chosen on labelled data held apart from the data
+# (a profile's contacts bar): 0.7 was chosen on labelled data held apart from the data
 # it was scored on.
 YES_DEFAULT = 0.7
 YES_RANGE = (0.5, 0.99)
 LANE = "classify"
-# How long a 429, a spent quota or a refused key holds the service off
-# when the endpoint doesn't say.
+# How long a 429, a spent quota or a refused key holds a profile (or its
+# account) off when the endpoint doesn't say.
 HOLD_SECONDS = 900.0
+# A request's tokens as counted here (site_match.tokens: characters / 3.3)
+# against what an endpoint bills: digits, URLs and diacritics take more
+# tokens than plain words, and the chat template adds a few per message.
+# The worst case checked before a call is the count times this. On the
+# built-in fictional cases, Qwen2.5's and Mistral-Small's tokenizers
+# (24B-2501, 3.2's tekken) billed at most 1.19 times the count a request.
+TOKEN_MARGIN = 1.25
+# A chat template's tokens per request (two messages' role markers).
+TEMPLATE_TOKENS = 12
 # Waits before the second and third try after a timeout or a 5xx.
 BACKOFF = (2.0, 8.0)
 # A day cap a setting may give (calls), at most.
@@ -137,8 +159,10 @@ class Task:
     max_input_tokens: int = 2500
     max_output_tokens: int = 160
     per_day: int = 2000
-    decision: Callable[[dict, int], tuple[Any, dict]] | None = None
-    decision_check: Callable[[dict, dict, float], Any] | None = None
+    # (Each takes the profile's texts and bars for the task as a last,
+    # optional argument: None is the measured ones.)
+    decision: Callable[..., tuple[Any, dict]] | None = None
+    decision_check: Callable[..., Any] | None = None
 
 
 TASKS: dict[str, Task] = {}
@@ -157,7 +181,7 @@ class Settings:
     provider: str = "off"
     base_url: str = ""
     model: str = ""
-    key_name: str = "CLASSIFY_API_KEY"
+    key_name: str = ""
     json_mode: bool = True
     per_day: int = 2000
     per_minute: int = 20
@@ -172,14 +196,37 @@ class Settings:
     price_out: float | None = None
     usd_per_day: float | None = None
     usd_per_month: float | None = None
+    # The profile this is (harvey/classify_profiles.py): its id and name,
+    # the extra request fields it sends, its texts and bars per task
+    # (empty: the measured ones) and the tasks it answers (empty: every
+    # one its kind can).
+    profile: str = ""
+    profile_name: str = ""
+    request_extra: dict = field(default_factory=dict)
+    questions: dict = field(default_factory=dict)
+    answers: tuple = ()
+    # Every task's settings, as the install assigns them (settings()): a
+    # task asks its own profile's.
+    by_task: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def model_name(self) -> str:
         """The model asked (no provider has one of its own)."""
         return self.model
 
+    def for_task(self, name: str) -> "Settings":
+        """The settings ``name`` is asked through (its profile's)."""
+        return self.by_task.get(name, self) if self.by_task else self
+
     def task_on(self, name: str) -> bool:
-        return bool((self.tasks.get(name) or {}).get("on", True))
+        # (Set to no profile while others are set: off. With none set at
+        # all, ask says "off" itself.)
+        t = self.for_task(name)
+        if t.provider == "off" and any(v.provider != "off" for v in self.by_task.values()):
+            return False
+        if t.answers and name not in t.answers:
+            return False
+        return bool((t.tasks.get(name) or {}).get("on", True))
 
     def task_cap(self, name: str) -> int:
         spec = self.tasks.get(name) or {}
@@ -199,6 +246,7 @@ class Settings:
         except ValueError:
             host = ""
         return {"provider": self.provider, "base_url": self.base_url, "model": self.model,
+                "profile": self.profile, "profile_name": self.profile_name,
                 "host": host, "key_name": self.key_name, "json_mode": self.json_mode,
                 "per_day": self.per_day, "per_minute": self.per_minute,
                 "timeout_seconds": self.timeout, "yes": self.yes,
@@ -237,13 +285,15 @@ def own_secrets() -> set[str]:
 
 
 def key_name_problem(name: str) -> str:
-    """Why ``name`` can't be the classifier's .env key ("" when it can):
-    only CLASSIFY_* or *_API_KEY, and never a key of Harvey's own (a
-    search's, a verifier's, the mailbox's), so no setting can send one of
-    those to an endpoint."""
+    """Why ``name`` can't be a profile's .env key ("" when it can): the
+    provider's own key, named *_API_KEY (DEEPINFRA_API_KEY,
+    TYPESAFE_API_KEY), never a key of Harvey's own (a search's, a
+    verifier's, the mailbox's), so no profile can send one of those to an
+    endpoint. (CLASSIFY_* is taken too: an older install's one setup named
+    CLASSIFY_API_KEY, and its profile keeps working.)"""
     name = (name or "").strip()
     if not _KEY_NAME.fullmatch(name):
-        return "the key's name starts with CLASSIFY_ or ends with _API_KEY"
+        return "the key's name ends with _API_KEY: the provider's own key in .env"
     if name in own_secrets():
         return f"{name} is a key Harvey uses for something else"
     return ""
@@ -290,7 +340,7 @@ def sdk_missing(provider: str) -> str:
 
 
 def yes_setting(raw) -> float:
-    """The ``classify_yes`` setting read and clamped to YES_RANGE."""
+    """A contacts bar (a decision profile's) read and clamped to YES_RANGE."""
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -325,30 +375,35 @@ def tasks_setting(raw) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-async def settings(state) -> Settings:
-    """The service's settings for this install (the contact finder's
-    ``classify_*`` settings)."""
+async def settings(state, task: str = "site") -> Settings:
+    """The settings ``task`` is asked through on this install: its
+    profile's (harvey/classify_profiles.py), with the install's caps; every
+    task's in ``by_task``. Off when nothing can be read."""
+    from harvey import classify_profiles as profiles
+
+    try:
+        by_task = await profiles.resolve(state)
+    except Exception as e:
+        logger.info("classify: the profiles can't be read: %s", e)
+        by_task = {}
+    if not by_task:
+        return Settings(by_task={})
+    return by_task.get(task) or next(iter(by_task.values()))
+
+
+async def install_caps(state) -> Settings:
+    """The install's caps, whatever the profile: the contact finder's
+    ``classify_per_day``, each task's day cap (``classify_tasks``) and the
+    USD caps a day and a month. Everything else is a profile's."""
     from harvey.modules import switches
 
     try:
         s = await switches.module_settings(state, MODULE)
     except Exception:
         s = {}
-    provider = s.get("classify_provider") or "off"
-    provider = provider if provider in PROVIDERS else "off"
-    base_url = (s.get("classify_base_url") or "").strip()
-    model = (s.get("classify_model") or "").strip()
     return Settings(
-        provider=provider, base_url=base_url, model=model,
-        key_name=(s.get("classify_key_name") or "CLASSIFY_API_KEY").strip(),
-        json_mode=bool(s.get("classify_json_mode", True)),
         per_day=min(MAX_PER_DAY, max(0, int(s.get("classify_per_day", 2000) or 0))),
-        per_minute=int(s.get("classify_per_minute") or 0),
-        timeout=float(s.get("classify_timeout_seconds") or 30.0),
         tasks=tasks_setting(s.get("classify_tasks")),
-        yes=yes_setting(s.get("classify_yes", YES_DEFAULT)),
-        price_in=money_setting(s.get("classify_price_in_per_m")),
-        price_out=money_setting(s.get("classify_price_out_per_m")),
         usd_per_day=money_setting(s.get("classify_usd_per_day")),
         usd_per_month=money_setting(s.get("classify_usd_per_month")))
 
@@ -385,9 +440,24 @@ def first_json(text: str):
 
 
 class _Held(Exception):
-    def __init__(self, why: str, retry_after: float | None = None):
+    """The endpoint can't be asked for now: ``scope`` "account" for what
+    holds every profile on the same account (a refused key, a payment, a
+    spent quota), "profile" for what holds this one only (a 429, an
+    unknown model, a setup that can't be sent)."""
+
+    def __init__(self, why: str, retry_after: float | None = None, scope: str = "profile"):
         super().__init__(why)
         self.retry_after = retry_after
+        self.scope = scope
+
+
+def held_scope(status: int, name: str = "", text: str = "") -> str:
+    """The scope of a refusal (_Held.scope): the account's for a refused
+    key, a payment or a spent quota, else the profile's."""
+    if status in (401, 402, 403) or "Authentication" in name or "PermissionDenied" in name \
+            or "quota" in (text or "").lower():
+        return "account"
+    return "profile"
 
 
 class _Transient(Exception):
@@ -402,6 +472,115 @@ class _Capped(Exception):
         self.why = why
 
 
+# ── What one job may spend on it ──
+
+# Why a call wasn't made: the run's (or the day's, the month's) money for
+# the classifier is spent; the firm's site waits unlinked, as with no
+# classifier.
+RUN_BUDGET = "run budget"
+
+
+class Meter:
+    """The classifier's calls inside one job (set in METER while it runs):
+    counted (calls, failed ones, tokens, USD, time) and, before every
+    call, allowed or refused by ``room`` (a coroutine: (meter, the call's
+    estimate in USD) -> "" or why not: the run's classifier cap, the
+    install's day and month spend limits). ``charge`` (a coroutine:
+    (meter, USD)) puts each call's cost on the job."""
+
+    def __init__(self, room=None, charge=None):
+        self._room, self._charge = room, charge
+        self.calls = self.errors = self.tokens_in = self.tokens_out = self.ms = 0
+        self.unpriced = 0
+        self.usd = 0.0
+        self.refused = ""
+
+    async def allow(self, estimate: float) -> str:
+        if self._room is None:
+            return ""
+        why = await self._room(self, max(0.0, float(estimate or 0.0)))
+        if why:
+            self.refused = why
+        return why
+
+    async def add(self, used: dict, *, error: bool = False, priced: bool = True) -> None:
+        self.calls += 1
+        self.errors += bool(error)
+        self.tokens_in += int(used.get("in", 0) or 0)
+        self.tokens_out += int(used.get("out", 0) or 0)
+        self.ms += int(used.get("ms", 0) or 0)
+        cost = 0.0 if error else float(used.get("cost") or 0.0)
+        self.unpriced += 0 if error or priced else 1
+        self.usd = round(self.usd + cost, 10)
+        if self._charge is not None and cost:
+            await self._charge(self, cost)
+
+    def as_dict(self) -> dict:
+        out = {"calls": self.calls, "errors": self.errors, "tokens_in": self.tokens_in,
+               "tokens_out": self.tokens_out, "usd": round(self.usd, 6), "ms": self.ms,
+               "unpriced": self.unpriced}
+        if self.refused:
+            out["refused"] = self.refused
+        return out
+
+
+METER: contextvars.ContextVar[Meter | None] = contextvars.ContextVar("classify_meter",
+                                                                     default=None)
+
+
+# ── Each profile's pace and held state ──
+
+
+def pace_key(s: Settings) -> str:
+    """The lane counter a profile's pace and its own hold are kept under
+    (data/lanes/classify.<profile>.*): one per profile."""
+    return f"{LANE}.{s.profile}" if s.profile else LANE
+
+
+def account_key(s: Settings) -> str:
+    """The counter an account's hold is kept under: the endpoint's host
+    and the .env key's name (two profiles of one DeepInfra key share it;
+    a local model has its own)."""
+    import hashlib
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(s.base_url).hostname or "") if s.base_url else ""
+    except ValueError:
+        host = ""
+    raw = f"{s.provider}|{host.lower()}|{s.key_name}"
+    return f"{LANE}.account.{hashlib.sha256(raw.encode()).hexdigest()[:12]}"
+
+
+def hold(s: Settings, seconds: float | None, why: str = "", scope: str = "profile") -> None:
+    """Hold ``s``'s profile (``scope`` "account": every profile on its
+    account) off for ``seconds`` (HOLD_SECONDS when None)."""
+    from harvey.modules import lanes
+
+    key = account_key(s) if scope == "account" else pace_key(s)
+    # (A retry-after of 0 is a second's wait, never the default hour's.)
+    lanes.hold(key, max(1.0, HOLD_SECONDS if seconds is None else float(seconds)), why=why)
+
+
+def held(s: Settings) -> dict:
+    """{"seconds" (0: not held), "why", "scope" ("profile" or "account")}:
+    the longer of the profile's own hold and its account's."""
+    from harvey.modules import lanes
+
+    out = {"seconds": 0.0, "why": "", "scope": ""}
+    for scope, key in (("profile", pace_key(s)), ("account", account_key(s))):
+        seconds, why = lanes.hold_info(key)
+        if seconds > out["seconds"]:
+            out = {"seconds": seconds, "why": why, "scope": scope}
+    return out
+
+
+async def held_seconds(state, task: str, s: Settings | None = None) -> float:
+    """Seconds until the profile ``task`` is set to may be asked again."""
+    s = (s or await settings(state, task)).for_task(task)
+    return (await asyncio.to_thread(held, s))["seconds"]
+
+
 async def calls_today(state, task: str = "") -> int:
     """Calls made today (UTC) by the service, or by one task."""
     return int(await state.read("classify_calls_today", task) or 0)
@@ -409,27 +588,28 @@ async def calls_today(state, task: str = "") -> int:
 
 async def available(state, task: str, s: Settings | None = None) -> str:
     """"" when ``task`` may be asked now, else why not."""
-    from harvey.modules import lanes
-
-    s = s or await settings(state)
+    s = (s or await settings(state, task)).for_task(task)
     if s.provider == "off":
-        return "off"
+        # ("off": no classifier at all; "task off": others are set, not this one.)
+        return "task off" if any(v.provider != "off" for v in s.by_task.values()) else "off"
     if task not in TASKS or not s.task_on(task):
         return "task off"
     if s.provider in SYSTEM_ONE and TASKS[task].decision is None:
         return "task off"
     if sdk_missing(s.provider):
         return "sdk missing"
-    if await asyncio.to_thread(lanes.held, LANE):
+    if (await asyncio.to_thread(held, s))["seconds"] > 0:
         return "held"
     return await _over_cap(state, task, s)
 
 
-async def _over_cap(state, task: str, s: Settings) -> str:
+async def _over_cap(state, task: str, s: Settings, estimate: float = 0.0) -> str:
     """"day cap" when the day's calls (every task's, or this one's) are
     used: per_day 0 means none; "budget" when the USD spent today or this
-    month (UTC) reached its cap, while the price is known (cost_status).
-    Checked before every call an ask makes, retries included."""
+    month (UTC) reached its cap, or the call's worst case (``estimate``,
+    USD) doesn't fit what is left of it, while the price is known
+    (cost_status). Checked before every call an ask makes, retries
+    included."""
     if await calls_today(state) >= s.per_day:
         return "day cap"
     if await calls_today(state, task) >= s.task_cap(task):
@@ -438,10 +618,12 @@ async def _over_cap(state, task: str, s: Settings) -> str:
         return ""
     if not (await cost_status(state, s))["known"]:
         return ""
-    if s.usd_per_day is not None and await spent(state, "day") >= s.usd_per_day:
-        return "budget"
-    if s.usd_per_month is not None and await spent(state, "month") >= s.usd_per_month:
-        return "budget"
+    for cap, period in ((s.usd_per_day, "day"), (s.usd_per_month, "month")):
+        if cap is None:
+            continue
+        used = await spent(state, period)
+        if used >= cap or used + max(0.0, estimate) > cap + 1e-12:
+            return "budget"
     return ""
 
 
@@ -553,42 +735,50 @@ async def ask(state, task: str, payload: dict, *, s: Settings | None = None,
 
 async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
                config=None) -> Answer:
-    from harvey.modules import lanes
-
-    s = s or await settings(state)
+    s = (s or await settings(state, task)).for_task(task)
     why = await available(state, task, s)
     if why:
         return Answer(why=why)
     t = TASKS[task]
+    q = s.questions.get(task) or None
     system_one = s.provider in SYSTEM_ONE
+    unsure = bool(payload.get("unsure"))
+    r = request(s, task, payload)
+    ids, size = r["ids"], r["tokens"]
     if system_one:
-        d_state, questions = t.decision(payload, t.max_input_tokens)
-        ids = list(questions)
+        d_state, questions = r["state"], r["questions"]
     else:
-        budget = max(200, t.max_input_tokens - _tokens(_system(t)))
-        text, statements = t.render(payload, budget)
-        ids = [st.id for st in statements]
+        text, statements = r["text"], r["statements"]
     out = Answer(model=s.model_name)
     if not ids:
         # (Nothing to ask: no call.)
-        out.value = t.decision_check({}, payload, s.yes) if system_one else t.check({}, payload)
+        out.value = t.decision_check({}, payload, s.yes, q) if system_one \
+            else t.check({}, payload)
         return out
     missing = system_one and decision.missing(s)
     if missing:
         # (No key, endpoint or model: nothing is sent, and the service
         # waits for them.)
-        await asyncio.to_thread(lanes.hold, LANE, HOLD_SECONDS)
-        logger.info("classify: held: %s", missing)
+        await asyncio.to_thread(hold, s, HOLD_SECONDS, missing)
+        logger.info("classify: %s held: %s", s.profile or s.provider, missing)
         out.why = "held"
         return out
     error = ""
+    # (The worst case of this very request: its tokens with the margin,
+    # and the most the task may answer.)
+    estimate = await _estimate(state, s, t, worst_tokens(size))
     for attempt in range(1 if system_one else 2):
         if system_one:
             send = lambda: decision.send(s, d_state, questions)  # noqa: E731
         else:
-            send = _sender(state, s, t, text, statements, error, config)
+            send = _sender(state, s, t, text, statements, error, config, unsure=unsure)
+            if error:
+                # (The retry carries the error too: its worst case is counted
+                # with it.)
+                estimate = await _estimate(state, s, t, worst_tokens(
+                    size + _tokens(_retry_note(error))))
         try:
-            reply, used = await _call(state, s, t, send)
+            reply, used = await _call(state, s, t, send, estimate)
         except _Capped as e:
             out.why = e.why
             return out
@@ -598,9 +788,9 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
             out.why = "sdk missing"
             return out
         except _Held as e:
-            await asyncio.to_thread(lanes.hold, LANE, e.retry_after or HOLD_SECONDS)
+            await asyncio.to_thread(hold, s, e.retry_after, str(e), e.scope)
             out.why = "held"
-            logger.info("classify: held: %s", e)
+            logger.info("classify: %s held (%s): %s", s.profile or s.provider, e.scope, e)
             return out
         except Exception as e:
             logger.info("classify: %s gave no answer: %s", task, e)
@@ -614,9 +804,10 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
         out.model = used.get("model") or out.model
         try:
             if system_one:
-                out.value = t.decision_check(decision.asked_answers(reply, ids), payload, s.yes)
+                out.value = t.decision_check(decision.asked_answers(reply, ids), payload, s.yes,
+                                             q)
             else:
-                out.value = t.check(answered(yes_no(reply), ids), payload)
+                out.value = t.check(answered(yes_no(reply, unsure=unsure), ids), payload)
             return out
         except (NoAnswer, KeyError, TypeError, ValueError) as e:
             error = str(e)[:200] or "wrong shape"
@@ -624,10 +815,102 @@ async def _ask(state, task: str, payload: dict, *, s: Settings | None = None,
     return out
 
 
+def request(s: Settings, task: str, payload: dict) -> dict:
+    """The request ``task`` would send about ``payload`` through ``s``
+    (built, never sent): {"ids" (what it asks), "tokens" (its size), and
+    "state" and "questions" (a decision model's) or "text" and
+    "statements" (a language model's)}. An estimate counts calls with it."""
+    t = TASKS[task]
+    q = s.questions.get(task) or None
+    if s.provider in SYSTEM_ONE:
+        d_state, questions = t.decision(payload, t.max_input_tokens, q)
+        return {"ids": list(questions), "state": d_state, "questions": questions,
+                "tokens": _tokens(json.dumps({"state": d_state,
+                                              "questions": decision.plain(questions)},
+                                             ensure_ascii=False))}
+    system = _system(t, q, unsure=bool(payload.get("unsure")))
+    budget = max(200, t.max_input_tokens - _tokens(system))
+    text, statements = t.render(payload, budget)
+    return {"ids": [st.id for st in statements], "text": text, "statements": statements,
+            "tokens": _tokens(system) + _tokens(_user(text, statements))}
+
+
+async def call_cost(state, s: Settings, task: str, tokens_in: int) -> tuple[float, bool]:
+    """(What one ``task`` call of ``tokens_in`` input tokens costs through
+    ``s`` when it answers the most the task may (max_output_tokens);
+    whether the price is known)."""
+    from harvey import classify_prices as prices
+
+    if s.provider in ("off", "brain"):
+        return 0.0, s.provider == "brain"
+    try:
+        per_m, _ = await prices.price(state, s)
+    except Exception:
+        per_m = None
+    if not per_m:
+        return 0.0, False
+    return prices.cost(int(tokens_in), TASKS[task].max_output_tokens, per_m), True
+
+
 def _tokens(text: str) -> int:
     from harvey.site_match import tokens
 
     return tokens(text)
+
+
+def worst_tokens(counted: int) -> int:
+    """The input tokens a request counted at ``counted`` may be billed, at
+    worst: the count with TOKEN_MARGIN, and the chat template's own."""
+    return int(int(counted or 0) * TOKEN_MARGIN) + TEMPLATE_TOKENS
+
+
+# ── Projections before a run ──
+
+# What every estimate says of itself (the API's ``note``, the CLI, docs).
+ESTIMATE_NOTE = ("An estimate, not a limit: a call's size varies with what it reads. What is "
+                 "enforced is the run's classifier cap: before each call its request is built "
+                 "and its tokens counted, and the call is refused when its worst case doesn't "
+                 "fit what is left of the cap; what it really cost is recorded after.")
+# A request's size per task when this month has no answered call to go by.
+TOKENS_GUESS = {"results": 900, "site": 700, "contacts": 900}
+
+
+async def sizes(state) -> dict:
+    """This month's answered calls per task, by the tokens billed
+    (classify_sizes): what a projection goes by."""
+    try:
+        return await state.read("classify_sizes", since("month"))
+    except Exception as e:
+        logger.debug("classify: sizes: %s", e)
+        return {}
+
+
+async def projection(state, s: Settings, task: str, calls: int,
+                     seen: dict | None = None) -> dict:
+    """What ``calls`` requests of ``task`` through ``s`` may cost, as a
+    range: typical (this month's billed input tokens a call on average,
+    else TOKENS_GUESS) and high (this month's largest call, else the most
+    a request of the task is built to, max_input_tokens, at worst_tokens),
+    each with the most the task may answer, at the profile's price. This
+    month's calls are the profile's model's when it has answered any (a
+    model's tokenizer and a decision model's request differ), else every
+    model's. A projection, never a limit (ESTIMATE_NOTE)."""
+    t = TASKS[task]
+    seen = (seen or {}).get(task) or {}
+    mine = (seen.get("models") or {}).get(s.model_name) or {}
+    if mine.get("answered"):
+        seen = mine
+    if seen.get("answered"):
+        typical, high, basis = seen["avg_in"], max(seen["max_in"], seen["avg_in"]), "this month"
+    else:
+        typical, high, basis = (TOKENS_GUESS.get(task, t.max_input_tokens),
+                                worst_tokens(t.max_input_tokens), "guess")
+    low, known = await call_cost(state, s, task, typical)
+    top, _ = await call_cost(state, s, task, high)
+    return {"calls": int(calls), "tokens_typical": int(typical), "tokens_high": int(high),
+            "basis": basis, "usd_typical": round(low * calls, 6),
+            "usd_high": round(top * calls, 6), "price_known": known,
+            "profile": s.profile, "model": s.model_name}
 
 
 # ── Yes and no ──
@@ -643,12 +926,31 @@ No: {no}
 """ + DATA + """
 Answer only JSON with every statement's id: {{"<id>": "yes" or "no", ...}}"""
 
+# The same, where "unsure" is an answer too (a contact's verification).
+YES_NO_UNSURE = """For each statement, answer "yes" when it is true, "no" when it is not, and
+"unsure" when the STATE doesn't say.
+Yes: {yes}
+No: {no}
+""" + DATA + """
+Answer only JSON with every statement's id: {{"<id>": "yes", "no" or "unsure", ...}}"""
+
 _YES_WORDS = {"yes": True, "y": True, "true": True, "da": True,
               "no": False, "n": False, "false": False, "nu": False}
+UNSURE = "unsure"
+_UNSURE_WORDS = {"unsure", "unknown", "not sure", "maybe"}
 
 
-def _system(t: Task) -> str:
-    return f"{t.prompt}\n{YES_NO.format(yes=t.yes, no=t.no)}"
+def texts(t: Task, q: dict | None = None) -> dict:
+    """A language model's texts for ``t``: the profile's (``q``) where it
+    gives them, else the task's own (the measured ones)."""
+    q = q or {}
+    return {"prompt": q.get("prompt") or t.prompt, "yes": q.get("yes") or t.yes,
+            "no": q.get("no") or t.no}
+
+
+def _system(t: Task, q: dict | None = None, *, unsure: bool = False) -> str:
+    x = texts(t, q)
+    return f"{x['prompt']}\n{(YES_NO_UNSURE if unsure else YES_NO).format(yes=x['yes'], no=x['no'])}"
 
 
 def _user(text: str, statements: list[Statement]) -> str:
@@ -656,11 +958,11 @@ def _user(text: str, statements: list[Statement]) -> str:
     return f"STATE:\n{text}\n\nSTATEMENTS:\n{lines}"
 
 
-def yes_no(reply: str) -> dict:
+def yes_no(reply: str, *, unsure: bool = False) -> dict:
     """{id: True for yes, False for no} from the model's reply (the first
     JSON object in it; true/false and 1/0 read as yes/no too); an id whose
-    value is neither is left out. NoAnswer when the reply holds no JSON
-    object."""
+    value is neither is left out. ``unsure``: "unsure" is read too (as
+    UNSURE). NoAnswer when the reply holds no JSON object."""
     parsed = first_json(reply)
     if parsed is None:
         raise NoAnswer("no JSON object")
@@ -669,7 +971,8 @@ def yes_no(reply: str) -> dict:
         if isinstance(value, bool):
             said = value
         elif isinstance(value, str):
-            said = _YES_WORDS.get(value.strip().lower())
+            word = value.strip().lower()
+            said = UNSURE if unsure and word in _UNSURE_WORDS else _YES_WORDS.get(word)
         elif isinstance(value, int) and value in (0, 1):
             said = bool(value)
         else:
@@ -685,25 +988,32 @@ def answered(said: dict, ids: list[str]) -> dict:
     out = {}
     for i in ids:
         v = said.get(i, said.get(i.lower()))
-        if isinstance(v, bool):
+        if isinstance(v, bool) or v == UNSURE:
             out[i] = v
     if not out:
         raise NoAnswer(f"answer each of {', '.join(ids[:20])} with yes or no")
     return out
 
 
+def _retry_note(error: str) -> str:
+    """What a language model's second ask adds to the first: why its
+    answer wasn't valid."""
+    return f"\n\nYour answer was not valid: {error}. Answer only the JSON object."
+
+
 def _sender(state, s: Settings, t: Task, text: str, statements: list[Statement],
-            error: str, config):
+            error: str, config, *, unsure: bool = False):
     """The call that asks a language model ``statements`` about ``text``."""
     user = _user(text, statements)
     if error:
-        user = f"{user}\n\nYour answer was not valid: {error}. Answer only the JSON object."
+        user = f"{user}{_retry_note(error)}"
+    system = _system(t, s.questions.get(t.name) or None, unsure=unsure)
     if s.provider == "brain":
-        return lambda: _brain(state, t, user, config)
+        return lambda: _brain(state, t, system, user, config)
     if s.provider == "openai_compatible":
-        return lambda: _openai(s, t, user)
+        return lambda: _openai(s, t, system, user)
     if s.provider == "anthropic":
-        return lambda: _anthropic(s, t, user)
+        return lambda: _anthropic(s, t, system, user)
 
     async def unknown():
         raise _Held(f"unknown provider {s.provider!r}")
@@ -711,23 +1021,33 @@ def _sender(state, s: Settings, t: Task, text: str, statements: list[Statement],
     return unknown
 
 
-async def _call(state, s: Settings, t: Task, send) -> tuple[Any, dict]:
+async def _call(state, s: Settings, t: Task, send, estimate: float = 0.0) -> tuple[Any, dict]:
     """One answer from the provider through ``send`` (the reply; {"in",
-    "out", "ms", "model"}), each attempt recorded in usage_events. Retries
-    a timeout or a 5xx after BACKOFF; _Held for a 429, a spent quota, a
-    refused key."""
+    "out", "ms", "model"}), each attempt recorded in usage_events and in
+    the job's Meter when one is set (METER). Before every attempt: the
+    call and USD caps, then the run's budget for ``estimate`` (USD).
+    Retries a timeout or a 5xx after BACKOFF; _Held for a 429, a spent
+    quota, a refused key."""
     from harvey.modules import lanes
 
+    meter = METER.get()
     tries = 1 if s.provider == "brain" else len(BACKOFF) + 1
     for attempt in range(tries):
-        why = await _over_cap(state, t.name, s)
+        why = await _over_cap(state, t.name, s, estimate)
         if why:
             raise _Capped(why)
+        if meter is not None and await meter.allow(estimate):
+            raise _Capped(RUN_BUDGET)
         if s.per_minute > 0:
-            await lanes.wait_gap(LANE, 60.0 / s.per_minute)
+            # (The profile's own pace: another profile's calls don't count.)
+            await lanes.wait_gap(LANE, 60.0 / s.per_minute, key=pace_key(s))
         if s.provider == "brain":
             # (Harvey's own model records its own usage.)
-            return await send()
+            started = time.monotonic()
+            reply, used = await send()
+            if meter is not None:
+                await meter.add({"ms": _ms(started)}, priced=True)
+            return reply, used
         started = time.monotonic()
         try:
             reply, used = await send()
@@ -735,6 +1055,8 @@ async def _call(state, s: Settings, t: Task, send) -> tuple[Any, dict]:
             raise
         except (_Held, _Transient) as e:
             await _record(state, s, t, {"ms": _ms(started)}, error=True)
+            if meter is not None:
+                await meter.add({"ms": _ms(started)}, error=True)
             if isinstance(e, _Held) or attempt == tries - 1:
                 raise
             await asyncio.sleep(BACKOFF[attempt])
@@ -743,12 +1065,23 @@ async def _call(state, s: Settings, t: Task, send) -> tuple[Any, dict]:
             # (A refused request, an unknown model: in the ledger and the
             # day's count too, so it can't be sent again without end.)
             await _record(state, s, t, {"ms": _ms(started)}, error=True)
+            if meter is not None:
+                await meter.add({"ms": _ms(started)}, error=True)
             raise
         used["ms"] = _ms(started)
         await _price(state, s, used)
         await _record(state, s, t, used)
+        if meter is not None:
+            await meter.add(used, priced=used.get("priced", True))
         return reply, used
     raise _Transient("no answer")
+
+
+async def _estimate(state, s: Settings, t: Task, tokens_in: int) -> float:
+    """What one call of ``t`` may cost (USD): its request's tokens and the
+    most it may answer, times the profile's price; 0 with the price
+    unknown (only the call caps can hold it then). Never raises."""
+    return (await call_cost(state, s, t.name, tokens_in))[0]
 
 
 def _ms(started: float) -> int:
@@ -849,7 +1182,8 @@ def _sorted_error(e: Exception) -> Exception:
     # (A 404 is an unknown model or endpoint: it won't come right by itself.)
     if status in (401, 402, 403, 404, 429) or "RateLimit" in name or "Authentication" in name \
             or "PermissionDenied" in name or "quota" in str(e).lower():
-        return _Held(f"{name} {status}".strip(), _retry_after(e))
+        return _Held(f"{name} {status}".strip(), _retry_after(e),
+                     held_scope(status, name, str(e)))
     if status >= 500 or "Timeout" in name or "Connection" in name or isinstance(
             e, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
         return _Transient(f"{name} {status}".strip())
@@ -865,7 +1199,7 @@ _COMPLETION_TOKENS: set[tuple[str, str]] = set()
 _NO_TEMPERATURE: set[tuple[str, str]] = set()
 
 
-async def _openai(s: Settings, t: Task, user: str) -> tuple[str, dict]:
+async def _openai(s: Settings, t: Task, system: str, user: str) -> tuple[str, dict]:
     why = base_url_problem(s.base_url)
     if why:
         raise _Held(why)
@@ -873,7 +1207,7 @@ async def _openai(s: Settings, t: Task, user: str) -> tuple[str, dict]:
 
     client = openai.AsyncOpenAI(base_url=s.base_url or None, api_key=_key(s) or "none",
                                 timeout=s.timeout, max_retries=0)
-    messages = [{"role": "system", "content": _system(t)}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     json_mode = s.json_mode and s.base_url not in _NO_JSON_MODE
     model = (s.base_url, s.model)
     for _ in range(4):
@@ -884,6 +1218,10 @@ async def _openai(s: Settings, t: Task, user: str) -> tuple[str, dict]:
             t.max_output_tokens
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if s.request_extra:
+            # (The profile's own fields: classify_profiles.extra_problem
+            # keeps them from replacing any of the above.)
+            kwargs["extra_body"] = dict(s.request_extra)
         try:
             r = await client.chat.completions.create(**kwargs)
         except Exception as e:
@@ -921,15 +1259,16 @@ def _reported_cost(usage) -> float | None:
     return _amount(value)
 
 
-async def _anthropic(s: Settings, t: Task, user: str) -> tuple[str, dict]:
+async def _anthropic(s: Settings, t: Task, system: str, user: str) -> tuple[str, dict]:
     import anthropic
 
     client = anthropic.AsyncAnthropic(api_key=_key(s) or None, timeout=s.timeout,
                                       max_retries=0)
+    extra = {"extra_body": dict(s.request_extra)} if s.request_extra else {}
     try:
         r = await client.messages.create(model=s.model, max_tokens=t.max_output_tokens,
-                                         temperature=0, system=_system(t),
-                                         messages=[{"role": "user", "content": user}])
+                                         temperature=0, system=system,
+                                         messages=[{"role": "user", "content": user}], **extra)
     except Exception as e:
         raise _sorted_error(e) from e
     text = "".join(getattr(b, "text", "") for b in getattr(r, "content", None) or []
@@ -948,7 +1287,7 @@ def _http(timeout: float, **kw):
     return httpx.AsyncClient(timeout=timeout, **kw)
 
 
-async def _brain(state, t: Task, user: str, config) -> tuple[str, dict]:
+async def _brain(state, t: Task, system: str, user: str, config) -> tuple[str, dict]:
     """Harvey's own model (Claude CLI or Codex, as configured): within its
     budget only; it records its own usage, under the task's label."""
     from harvey.brain import Brain
@@ -958,7 +1297,7 @@ async def _brain(state, t: Task, user: str, config) -> tuple[str, dict]:
     if not await brain.is_within_budget(max_percent=percent):
         raise _Held("Harvey's model is over its budget for now")
     started = time.monotonic()
-    text = await brain.think(f"{_system(t)}\n\n{user}\n\nAnswer only with the JSON object.",
+    text = await brain.think(f"{system}\n\n{user}\n\nAnswer only with the JSON object.",
                              agent="classify", task=f"classify.{t.name}")
     if not text:
         raise _Transient("no answer from Harvey's model")
@@ -1058,11 +1397,15 @@ def _render_contacts(p: dict, budget: int) -> tuple[str, list[Statement]]:
 
 def _check_contacts(said: dict, p: dict) -> dict:
     # (Only the contacts the model was shown: the last ones may not have
-    # fit. "no": those it said no to; one it didn't answer is in neither.)
+    # fit. "no": those it said no to; one it didn't answer is in neither.
+    # Asked with "unsure" allowed, a verification: those in "unsure".)
     n = min(len(p["cards"][0].contacts), p.get("shown_contacts", 12))
     seen = {j - 1: said[f"c{j}"] for j in range(1, n + 1) if f"c{j}" in said}
-    return {"contacts": [j for j, v in seen.items() if v],
-            "no": [j for j, v in seen.items() if not v]}
+    out = {"contacts": [j for j, v in seen.items() if v is True],
+           "no": [j for j, v in seen.items() if v is False]}
+    if p.get("unsure"):
+        out["unsure"] = [j for j, v in seen.items() if v == UNSURE]
+    return out
 
 
 register(Task(

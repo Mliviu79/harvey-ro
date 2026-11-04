@@ -38,7 +38,7 @@ from harvey import registers as regs_mod
 from harvey.overlay import queries as _statements  # noqa: F401  (registers them)
 from harvey.overlay import bitmaps, schema
 from harvey.overlay.idents import Schemes
-from harvey.overlay.schema import EMAIL, PHONE, TRUST_NAMES
+from harvey.overlay.schema import EMAIL, PHONE, TRUST, TRUST_NAMES
 
 logger = logging.getLogger("harvey.overlay")
 
@@ -3302,7 +3302,11 @@ class Reader:
             found = [i for i in found
                      if all(w in contacts.name_norm(names.get(i, "")) for w in words)]
         found.sort(key=lambda i: (rows[i][0], i), reverse=True)
-        return [{"id": str(i), "site": bool(rows[i][1])} for i in found[:limit]]
+        # (``website_found``: a search found its site; ``website_waiting``:
+        # unconfirmed, nothing is read off it until the re-check.)
+        return [{"id": str(i), "site": bool(rows[i][1]), "website_found": bool(rows[i][2]),
+                 "website_waiting": bool(rows[i][2]) and rows[i][3] == TRUST["unconfirmed"]}
+                for i in found[:limit]]
 
     def address_facts(self, email: str) -> dict:
         """What email_rules decides an address by, from every firm it is
@@ -3540,6 +3544,31 @@ class Reader:
                 "usd": round(float(usd or 0.0), 6), "unpriced": int(unpriced or 0)}
         return out
 
+    def classify_sizes(self, since: str) -> dict:
+        """{task: {"answered", "avg_in", "max_in", "avg_out", "max_out",
+        "models": {model: the same, of its calls only}}} of the
+        classifier's answered calls since ``since`` (UTC): the tokens the
+        endpoints billed."""
+        out: dict = {}
+        for task, model, n, ain, xin, aout, xout in self.x("overlay.classify.sizes", (since,)):
+            n = int(n or 0)
+            one = {"answered": n, "avg_in": round(float(ain or 0)), "max_in": int(xin or 0),
+                   "avg_out": round(float(aout or 0)), "max_out": int(xout or 0)}
+            t = out.setdefault(str(task).split(".", 1)[-1],
+                               {"answered": 0, "sum_in": 0.0, "max_in": 0, "sum_out": 0.0,
+                                "max_out": 0, "models": {}})
+            t["models"][str(model or "")] = one
+            t["answered"] += n
+            t["sum_in"] += float(ain or 0) * n
+            t["sum_out"] += float(aout or 0) * n
+            t["max_in"] = max(t["max_in"], one["max_in"])
+            t["max_out"] = max(t["max_out"], one["max_out"])
+        for t in out.values():
+            n = t["answered"] or 1
+            t["avg_in"] = round(t.pop("sum_in") / n)
+            t["avg_out"] = round(t.pop("sum_out") / n)
+        return out
+
     def classify_last_source(self, model: str, since: str) -> str:
         """How the last answered call of ``model`` since ``since`` was
         priced (its usage row's source), "" when there is none."""
@@ -3602,6 +3631,60 @@ class Reader:
             f"SELECT COUNT(DISTINCT at / 86400) FROM search WHERE is_person = 0 "
             f"AND target IN ({marks}) AND module = ? AND capability = ? AND outcome = 0 "
             f"AND detail LIKE ?", (*group, mid, cap, prefix + "%")) or 0)
+
+    def contact_checks(self, contact_id: int) -> list[dict]:
+        """The classifier's verdicts on a contact's links, newest first
+        (harvey/contact_check.py)."""
+        from harvey.overlay.schema import CHECK_VERDICT
+
+        names = {v: k for k, v in CHECK_VERDICT.items()}
+        return [{"company_id": str(firm), "verdict": names.get(verdict, ""), "at": at,
+                 "profile": profile, "model": model, "p": p, "note": note or "",
+                 "batch": batch, "undone": undone is not None}
+                for firm, verdict, at, profile, model, p, note, batch, undone in self.x(
+                    "overlay.contact_check.of_contact", (int(contact_id),))]
+
+    def contact_checks_open(self, verdict: str = "unsure", limit: int = 50) -> list[dict]:
+        """Links the classifier gave ``verdict`` that still stand, newest
+        first: the unsure ones are a person's to review."""
+        from harvey.overlay.schema import CHECK_VERDICT
+
+        rows = list(self.x("overlay.contact_check.open",
+                           (CHECK_VERDICT[verdict], int(limit))))
+        values = {r[0]: r for r in self._by_ids("overlay.read.contact_rows",
+                                                 list({r[1] for r in rows}))} if rows else {}
+        cards = {r["id"]: r for r in self.company_rows(list({r[0] for r in rows}))} \
+            if rows else {}
+        return [{"company_id": str(firm), "company": (cards.get(str(firm)) or {}).get("name", ""),
+                 "contact_id": contact,
+                 "kind": values[contact][1] or "" if contact in values else "",
+                 "value": values[contact][2] if contact in values else "",
+                 "verdict": verdict, "at": at, "profile": profile, "model": model, "p": p,
+                 "note": note or "", "batch": batch}
+                for firm, contact, _, at, profile, model, p, note, batch in rows]
+
+    def contact_check_done(self, batch: str, cid) -> set[int]:
+        """The contacts ``batch`` asked about at a company already."""
+        fid = self.live(cid)
+        if fid is None:
+            return set()
+        return {r[0] for r in self.x("overlay.contact_check.done", (batch, fid))}
+
+    def contact_kind_value(self, ids) -> dict[int, tuple[str, str]]:
+        """{contact id: (its kind, its value)}."""
+        return {r[0]: (r[1] or "", r[2] or "")
+                for r in self._by_ids("overlay.read.contact_rows", [int(i) for i in ids])}
+
+    def contact_check_batch(self, batch: str) -> dict:
+        """{verdict: n} of a verification run, and how many were undone."""
+        from harvey.overlay.schema import CHECK_VERDICT
+
+        names = {v: k for k, v in CHECK_VERDICT.items()}
+        out = {"yes": 0, "no": 0, "unsure": 0, "undone": 0}
+        for verdict, n, undone in self.x("overlay.contact_check.batch", (batch,)):
+            out[names.get(verdict, "unsure")] = int(n or 0)
+            out["undone"] += int(undone or 0)
+        return out
 
     def site_check_last(self, cid) -> str:
         """The detail of the re-check's newest search of a firm ("" when
@@ -3674,6 +3757,18 @@ class Reader:
         return bool(self.searched_targets(self.members([fid])[fid], person=False, module=module,
                                           capability=capability, cutoff=cutoff,
                                           looked_for=looked_for))
+
+    def finder_searched_many(self, cids, module: str, capability: str, cutoff=None,
+                             looked_for: str = "") -> set[str]:
+        """finder_searched for many companies at once (an estimate): the
+        ones (as given) one of whose records was searched."""
+        lives = {c: self.live(c) for c in cids}
+        groups = self.members(list(dict.fromkeys(f for f in lives.values() if f is not None)))
+        done = self.searched_targets([m for ms in groups.values() for m in ms], person=False,
+                                     module=module, capability=capability, cutoff=cutoff,
+                                     looked_for=looked_for)
+        return {c for c, f in lives.items()
+                if f is not None and any(m in done for m in groups[f])}
 
     def finder_named(self, cid) -> list[dict]:
         """Everyone named at a company (its records' people), in id order."""

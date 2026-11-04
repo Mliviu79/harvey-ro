@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -124,7 +125,8 @@ def _search_specs(provider_key: str, queries, read_sites: bool) -> list[dict]:
 
 
 async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sites: bool = True,
-                          label: str = "", find_websites: float | None = None):
+                          label: str = "", find_websites: float | None = None,
+                          classify_max_spend: float | None = None):
     """One Discover run over several sources: one batch, one spend cap
     shared by all, a job per search (``{"provider", "queries"}``) and per
     registry pull (``{"source": "<module>.<capability>", "job": kind,
@@ -132,8 +134,10 @@ async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sit
     (dollars; None: off) also looks up a website for each company the run
     saves with none, in the same batch: free searches always, paid ones up
     to that amount, kept apart from the searches' ``max_spend`` (the
-    batch's cap is the two together). Returns (batch id, the new job ids,
-    jobs already waiting); Duplicate when every one is."""
+    batch's cap is the two together). ``classify_max_spend``: what the
+    classifier may cost while the run's companies are worked on (None: no
+    cap of the run's own). Returns (batch id, the new job ids, jobs
+    already waiting); Duplicate when every one is."""
     specs: list[dict] = []
     sources = []
     for part in plan:
@@ -150,6 +154,8 @@ async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sit
         sources.append(part["source"])
     params = {"sources": sources, "provider": sources[0] if len(sources) == 1 else "",
               "queries": [s["label"] for s in specs], "read_sites": read_sites}
+    if classify_max_spend is not None:
+        params["classify_max_spend"] = float(classify_max_spend)
     total = max_spend
     if find_websites is not None and read_sites:
         params["find_websites"] = True
@@ -284,10 +290,6 @@ async def enqueue_site_reads(state, company_ids=None, *, batch_id: str = "",
 
 
 async def _company_to_read(state, company_id: str) -> dict | None:
-    import aiosqlite
-
-    from harvey.state import LIVE_COMPANY
-
     row = await state.read("finder_company", company_id)
     if row is None or not row["domain"]:
         return None
@@ -779,9 +781,7 @@ def _finder_spec(company_id: str, *, force_since: str = "", background: bool = F
 
 async def _labels(state, company_ids) -> dict[str, str]:
     """Each company's name (or domain), for its job's label."""
-    out: dict[str, str] = {}
-    ids = list(company_ids)
-    return await state.read("labels", ids)
+    return await state.read("labels", list(company_ids))
 
 
 async def enqueue_find_contacts(state, company_ids, *, batch_id: str = "", parent_id: str = "",
@@ -907,34 +907,65 @@ async def run_find_contacts(ctx) -> dict:
     config = lane["config"]
     spend = await _spend_for(ctx, config)
     run_id = await ctx.lane_run("contacts", "finder")
-    found = await finder.find(ctx.state, company_id, spend=spend,
-                              since=ctx.params.get("since") or None,
-                              batch_id=ctx.job.batch_id, config=config, run_id=run_id,
-                              background=bool(ctx.params.get("background")),
-                              want_website=bool(ctx.params.get("website")),
-                              # (A Discover run's website lookups check no
-                              # addresses: that is a Find-contacts run's.)
-                              addresses=not ctx.params.get("website"))
+    async with metered(ctx, config) as meter:
+        found = await finder.find(ctx.state, company_id, spend=spend,
+                                  since=ctx.params.get("since") or None,
+                                  batch_id=ctx.job.batch_id, config=config, run_id=run_id,
+                                  background=bool(ctx.params.get("background")),
+                                  want_website=bool(ctx.params.get("website")),
+                                  # (A Discover run's website lookups check no
+                                  # addresses: that is a Find-contacts run's.)
+                                  addresses=not ctx.params.get("website"))
     ctx.count(1)
     for why in found.skipped:
         await ctx.say(f"  {why}")
-    return found.as_dict()
+    if meter.refused:
+        await ctx.say(f"  the classifier wasn't asked: {meter.refused}")
+    return {**found.as_dict(), "classify": meter.as_dict()}
+
+
+@asynccontextmanager
+async def metered(ctx, config):
+    """The job's classifier Meter (JobContext.classify_meter) set while the
+    block runs: every classifier call inside it is counted on the job,
+    charged to it and checked against the run's classifier cap and the
+    install's day and month spend limits (spend.per_day_usd,
+    per_month_usd)."""
+    from harvey import classify
+
+    make = getattr(ctx, "classify_meter", None)
+    meter = make(**_spend_limits(config)) if make else classify.Meter()
+    token = classify.METER.set(meter)
+    try:
+        yield meter
+    finally:
+        classify.METER.reset(token)
+        if isinstance(getattr(ctx, "progress", None), dict):
+            ctx.progress["classify"] = meter.as_dict()
 
 
 async def enqueue_contact_search(state, selected: list[str], *, max_spend: float = 0.0,
-                                 force: bool = False, label: str = "") -> tuple[str, list, list]:
+                                 force: bool = False, label: str = "",
+                                 classify_max_spend: float | None = None
+                                 ) -> tuple[str, list, list]:
     """A Find-contacts run over chosen companies: one batch (capped at
     ``max_spend``; 0 reads websites only), one job per company. ``force``
-    searches again what was searched before this run started. Returns
-    (batch id, new job ids, jobs already waiting); Duplicate when every
-    one is already waiting."""
+    searches again what was searched before this run started.
+    ``classify_max_spend``: what the run's classifier calls may cost in
+    all (None: no cap of the run's own; 0: none is made, a site no
+    register fact settles waits unlinked). Returns (batch id, new job
+    ids, jobs already waiting); Duplicate when every one is already
+    waiting."""
     from harvey import contacts
 
     since = contacts.now() if force else ""
+    params = {"companies": len(selected), "force": force}
+    if classify_max_spend is not None:
+        params["classify_max_spend"] = float(classify_max_spend)
     batch_id = await jobs.new_batch(
         state, "find_contacts", label or ("Find contacts (search again)" if force
                                           else "Find contacts"),
-        params={"companies": len(selected), "force": force}, max_spend=max_spend)
+        params=params, max_spend=max_spend)
     ids, dupes = await enqueue_find_contacts(state, selected, batch_id=batch_id,
                                              force_since=since)
     if not ids and dupes:
@@ -979,17 +1010,23 @@ async def run_recheck_site(ctx) -> dict:
     rests until then (not one job after another); with no classifier set
     up, a site only it could settle is left as it is."""
     from harvey import classify, site_check
-    from harvey.modules import lanes
 
     company_id = ctx.params.get("company_id", "")
     if not company_id:
         raise JobError("recheck_site needs a company_id")
     if "config" not in ctx.lane:
         ctx.lane["config"] = _config()
-    done = await site_check.recheck_one(ctx.state, company_id, batch=ctx.job.batch_id,
-                                        config=ctx.lane["config"])
+    async with metered(ctx, ctx.lane["config"]) as meter:
+        done = await site_check.recheck_one(ctx.state, company_id, batch=ctx.job.batch_id,
+                                            config=ctx.lane["config"])
+    done["classify"] = meter.as_dict()
+    if done.get("outcome") == "waiting" and done.get("why") == classify.RUN_BUDGET \
+            and meter.refused.startswith("the run's"):
+        # (The run's own classifier money: it doesn't come back at
+        # midnight. Raise it, then resume.)
+        raise SpendLimit(meter.refused)
     if done.get("outcome") == "waiting" and done.get("why") in site_check.STOPS:
-        wait = (await asyncio.to_thread(lanes.held, classify.LANE) if done["why"] == "held"
+        wait = (await classify.held_seconds(ctx.state, "site") if done["why"] == "held"
                 else site_check._seconds_to_midnight())
         wait = max(60.0, wait)
         await jobs.rest_lane(ctx.state, ctx.job.lane, wait, but=ctx.job.id)
@@ -1001,15 +1038,147 @@ async def run_recheck_site(ctx) -> dict:
 
 @jobs.kind("classify_test")
 async def run_classify_test(ctx) -> dict:
-    """The classifier over the built-in labelled set (Settings' Test)."""
-    from harvey import site_check
+    """A profile's test (Settings → Classifier): the judge test over the
+    built-in fictional cases or a labelled file on the server
+    (``params.file``), for one task or each the profile answers, under
+    the run's classifier cap; the counts kept on the profile. With no
+    ``profile``, the classifier the install sets the site task to."""
+    from harvey import classify_profiles as profiles, site_check
 
+    p = ctx.params
+    config = _config()
     try:
-        return await site_check.judge_test(ctx.state, site_check.builtin_cases(),
-                                           every=bool(ctx.params.get("every")),
-                                           config=_config())
-    except ValueError as e:
-        raise JobError(str(e))
+        rows = site_check.read_cases(p["file"]) if p.get("file") else site_check.builtin_cases()
+    except (OSError, ValueError) as e:
+        raise JobError(f"the test file can't be read: {type(e).__name__}")
+    s, asks = None, ""
+    if p.get("profile"):
+        s = await profiles.settings_for(ctx.state, p["profile"])
+        if s is None:
+            raise JobError(f"no profile {p['profile']!r}")
+        # (What the profile asks as the test starts: an edit meanwhile
+        # leaves it not tested.)
+        asks = profiles.asks_hash((await profiles.every(ctx.state, with_hidden=True))
+                                  [p["profile"]])
+    tasks = [t for t in (p.get("tasks") or ["site"]) if t in ("site", "results")]
+    out = {"profile": p.get("profile") or "", "test_set": p.get("test_set") or "built-in",
+           "tasks": {}}
+    async with metered(ctx, config) as meter:
+        for task in tasks:
+            try:
+                r = await site_check.judge_test(ctx.state, rows, every=bool(p.get("every")),
+                                                task=task, limit=int(p.get("limit") or 0),
+                                                config=config, s=s)
+            except ValueError as e:
+                raise JobError(str(e))
+            out["tasks"][task] = r
+            await ctx.say(f"  {task}: " + "; ".join(site_check.summary_lines(r)[1:4]))
+            if p.get("profile"):
+                await profiles.record_test(ctx.state, p["profile"], r,
+                                           test_set=out["test_set"], job_id=ctx.job.id,
+                                           asks=asks)
+            if r.get("stopped"):
+                break
+    out["classify"] = meter.as_dict()
+    # (The older card reads one task's result at the top.)
+    first = out["tasks"].get(tasks[0]) if tasks else None
+    return {**(first or {}), **out}
+
+
+async def enqueue_classify_test(state, profile_id: str, *, tasks, max_spend: float | None,
+                                file: str = "", every: bool = False, limit: int = 0,
+                                test_set: str = "") -> tuple[str, str]:
+    """A profile's test run (Settings → Classifier): one batch capped at
+    ``max_spend`` for the classifier (None: no cap of its own), one job on
+    the classifier's lane. Returns (batch id, job id); Duplicate when the
+    same profile's test is waiting."""
+    params = {"profile": profile_id, "tasks": list(tasks), "file": file or "",
+              "every": bool(every), "limit": int(limit or 0),
+              "test_set": test_set or ("your file" if file else "built-in")}
+    bparams = {"profile": profile_id}
+    if max_spend is not None:
+        bparams["classify_max_spend"] = float(max_spend)
+    batch_id = await jobs.new_batch(state, "classify_test", f"Test {profile_id}",
+                                    params=bparams)
+    try:
+        job_id = await jobs.enqueue(state, "classify_test", CLASSIFY_LANE, params,
+                                    dedupe_key=f"classify_test:{profile_id}",
+                                    label=f"Classifier test: {profile_id}",
+                                    module="contact_finder", batch_id=batch_id)
+    except jobs.Duplicate:
+        await jobs.drop_batch(state, batch_id)
+        raise
+    return batch_id, job_id
+
+
+# ── Verifying contacts with the classifier (harvey/contact_check.py) ──
+
+async def enqueue_contact_checks(state, chosen: list[dict], *, max_spend: float | None,
+                                 label: str = "") -> tuple[str, list, list]:
+    """One verification run over ``chosen`` links (contact_check.links): a
+    batch whose classifier cap is ``max_spend`` (None: none of its own),
+    one job per company on the classifier's lane. Returns (batch id, new
+    job ids, jobs already waiting); Duplicate when every one is."""
+    from harvey import contact_check
+
+    groups = contact_check.by_company(chosen)
+    params = {"links": len(chosen), "companies": len(groups)}
+    if max_spend is not None:
+        params["classify_max_spend"] = float(max_spend)
+    batch_id = await jobs.new_batch(state, "verify_contacts", label or "Verify contacts",
+                                    params=params)
+    specs = [dict(kind="verify_contacts", lane=CLASSIFY_LANE, module="contact_finder",
+                  capability="verify_contacts", label=(links[0].get("company") or cid),
+                  params={"company_id": cid,
+                          "links": [{k: link[k] for k in ("contact_id", "kind", "value",
+                                                          "evidence")} for link in links]},
+                  dedupe_key=f"verify_contacts:{cid}") for cid, links in groups.items()]
+    new, dupes = await jobs.enqueue_many(state, specs, batch_id=batch_id)
+    if not new:
+        await jobs.drop_batch(state, batch_id)
+        if dupes:
+            raise jobs.Duplicate(dupes[0])
+    return batch_id, new, dupes
+
+
+@jobs.kind("verify_contacts")
+async def run_verify_contacts(ctx) -> dict:
+    """One company's chosen links asked about (contact_check.verify_company)
+    under the run's classifier cap. The run's money spent: the job pauses
+    (raise the cap, then resume); held or out of the day's calls: the lane
+    rests until then."""
+    from harvey import classify, contact_check, site_check
+
+    company_id = ctx.params.get("company_id", "")
+    if not company_id:
+        raise JobError("verify_contacts needs a company_id")
+    if "config" not in ctx.lane:
+        ctx.lane["config"] = _config()
+    links = [{**link, "company_id": company_id} for link in ctx.params.get("links") or []]
+    async with metered(ctx, ctx.lane["config"]) as meter:
+        done = await contact_check.verify_company(ctx.state, company_id, links,
+                                                  batch=ctx.job.batch_id,
+                                                  config=ctx.lane["config"])
+    done["classify"] = meter.as_dict()
+    why = done.get("why") or ""
+    if why == classify.RUN_BUDGET and meter.refused.startswith("the run's"):
+        raise SpendLimit(meter.refused)
+    if why in site_check.STOPS:
+        wait = (await classify.held_seconds(ctx.state, "contacts") if why == "held"
+                else site_check._seconds_to_midnight())
+        wait = max(60.0, wait)
+        # (Held is the contacts profile's: only the other verifications
+        # wait, never another profile's test on the same lane. The day's
+        # calls and money are the install's: the whole lane rests.)
+        await jobs.rest_lane(ctx.state, ctx.job.lane, wait, but=ctx.job.id,
+                             kind="verify_contacts" if why == "held" else "")
+        raise jobs.LaneExhausted(f"the classifier: {why}", retry_after=wait)
+    if why in ("off", "task off"):
+        raise JobError("the contacts task is set to no profile (Settings → Classifier)")
+    ctx.count(done.get("asked", 0))
+    await ctx.say(f"  {done['yes']} yes, {done['no']} no, {done['unsure']} unsure"
+                  + (f"; {why}" if why else ""))
+    return done
 
 
 # How many background finder jobs wait at most: the backlog is fed a little

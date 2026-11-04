@@ -63,6 +63,48 @@ def _no_checkout_env_file(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(switches, "ENV_FILE", tmp_path_factory.mktemp("env") / ".env")
 
 
+# Keys a classifier, a search or a verifier could be reached with: never
+# taken from the developer's environment into a test.
+_LIVE_KEYS = ("DEEPINFRA_API_KEY", "TYPESAFE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+              "GROQ_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch):
+    """No test loads a .env it didn't write: load_dotenv() with no path
+    (harvey/config.py's load_env, the classifier's key) looks for one from
+    the working directory up and would find the checkout's own, putting the
+    developer's real keys in the test process. A path a test gives (its
+    own tmp .env) still loads, the checkout's never does. The classifier's
+    keys, and any CLASSIFY_* one, are cleared too: no test can reach a
+    live endpoint with them."""
+    import os
+    from pathlib import Path
+
+    import dotenv
+
+    import harvey.config
+    from harvey.paths import PROJECT_ROOT
+
+    real = dotenv.load_dotenv
+    checkout = (PROJECT_ROOT / ".env").resolve()
+
+    def guarded(dotenv_path=None, *args, **kwargs):
+        if dotenv_path is None or kwargs.get("stream") is not None:
+            return False
+        if Path(dotenv_path).resolve() == checkout:
+            return False
+        return real(dotenv_path, *args, **kwargs)
+
+    import harvey.dashboard
+    import harvey.trainer
+
+    for module in (dotenv, harvey.config, harvey.dashboard, harvey.trainer):
+        monkeypatch.setattr(module, "load_dotenv", guarded)
+    for name in [*_LIVE_KEYS, *(k for k in os.environ if k.startswith("CLASSIFY_"))]:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _private_dashboard_token(tmp_path_factory):
     """Never create or read the checkout's real data/dashboard-token."""

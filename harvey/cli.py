@@ -641,6 +641,7 @@ async def _rejudge(state, args) -> None:
             key = j.result.get("outcome") or "done"
             outcomes[key] = outcomes.get(key, 0) + 1
     print("\n  " + (", ".join(f"{n:,} {k}" for k, n in sorted(outcomes.items())) or "nothing done"))
+    print(f"  Run: {jobs.report_line(await jobs.batch_report(state, batch_id))}")
     _job_failures(found)
     print()
 
@@ -648,22 +649,140 @@ async def _rejudge(state, args) -> None:
 async def _judge_test(state, args) -> None:
     """harvey contacts judge-test: the configured classifier over a
     labelled set (the built-in fictional one, or --file)."""
-    from harvey import classify, site_check
+    from harvey import classify, classify_profiles as profiles, site_check
 
     rows = site_check.read_cases(args.file) if args.file else site_check.builtin_cases()
+    s, asks = None, ""
+    if args.profile:
+        s = await profiles.settings_for(state, args.profile)
+        if s is None:
+            print(f"\n  No profile {args.profile!r} (harvey contacts classifier lists them).\n")
+            raise SystemExit(2)
+        asks = profiles.asks_hash((await profiles.every(state, with_hidden=True))[args.profile])
     try:
         r = await site_check.judge_test(state, rows, every=args.all, task=args.task,
-                                        limit=args.limit_checks)
+                                        limit=args.limit_checks, s=s)
     except ValueError as e:
         print(f"\n  {e}\n")
         raise SystemExit(2)
+    if args.profile:
+        await profiles.record_test(state, args.profile, r,
+                                   test_set="your file" if args.file else "built-in",
+                                   asks=asks)
     print()
     for line in site_check.summary_lines(r):
         print(f"  {line}")
-    await _print_classifier_spend(state, await classify.settings(state))
+    await _print_classifier_spend(state, s or await classify.settings(state))
     for f in r["failures"][:10]:
         print(f"    - {f.get('id')}: expected {f.get('expected')}, got "
               f"{f.get('got', f.get('why'))}")
+    print()
+
+
+async def _verify(state, args) -> None:
+    """harvey contacts verify: the classifier's contacts task about chosen
+    links (--contact ID, or the filters), yes / no / unsure, counted and
+    priced first; --undo BATCH puts back what its no's lowered; --review
+    lists the unsure ones."""
+    from harvey import contact_check
+    from harvey.contacts import ContactFilter
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_contact_checks
+
+    if args.undo:
+        done = await state.undo_contact_checks(args.undo)
+        print(f"\n  {done['checks']:,} verdict(s) undone, {done['restored']:,} evidence "
+              "row(s) put back as they were\n")
+        return
+    if args.review:
+        rows = await state.read("contact_checks_open", "unsure", args.limit)
+        print(f"\n  {len(rows):,} link(s) the classifier was unsure of:")
+        for r in rows:
+            print(f"    {r['contact_id']}  {r['kind']} {r['value']}  at {r['company'] or r['company_id']}"
+                  f"  ({r['model'] or r['profile']})")
+        print()
+        return
+    if args.contact:
+        ids = list(args.contact)
+    else:
+        f = ContactFilter(county=args.county, locality=args.locality, website=args.website,
+                          q=args.q)
+        _, _, ids = await state.read("contacts_page", f, "", "desc", args.limit, 0,
+                                     cap=args.limit)
+    chosen = await contact_check.links(state, ids, limit=min(args.limit,
+                                                              contact_check.MAX_LINKS))
+    if not chosen:
+        print("\n  No linked contact matches.\n")
+        return
+    est = await contact_check.estimate(state, chosen)
+    if est["off"]:
+        print("\n  The contacts task is set to no profile: set one first (Settings → "
+              "Classifier, or harvey contacts classifier use contacts PROFILE).\n")
+        raise SystemExit(2)
+    print(f"\n  {est['links']:,} link(s) at {est['companies']:,} companies: "
+          f"{est['calls']:,} calls through {est['profile_name'] or est['profile']}, estimated "
+          f"${est['usd_typical']:.4f} typical to ${est['usd_high']:.4f} high"
+          + ("" if est["price_known"] else " (no price: not counted)")
+          + f" (cap: ${args.max_spend:.2f})")
+    print(f"  {est['note']}")
+    if args.dry_run:
+        print("  Nothing asked (--dry-run).\n")
+        return
+    try:
+        batch_id, new, dupes = await enqueue_contact_checks(state, chosen,
+                                                            max_spend=args.max_spend)
+    except jobs.Duplicate as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(2)
+    print(f"  {len(new):,} queued (batch {batch_id}; harvey contacts verify --undo {batch_id} "
+          "puts back what its no's lowered)")
+    if args.background:
+        await _queued_note(state, batch_id, len(new))
+        return
+    found = await _wait_for(state, batch_id)
+    total = contact_check.summary([j.result for j in found if j.status == jobs.DONE])
+    print(f"\n  {total['yes']:,} yes, {total['no']:,} no ({total['lowered']:,} evidence "
+          f"row(s) lowered to unconfirmed, {total['kept']:,} kept), {total['unsure']:,} unsure "
+          "(harvey contacts verify --review)")
+    print(f"  Run: {jobs.report_line(await jobs.batch_report(state, batch_id))}")
+    _job_failures(found)
+    print()
+
+
+async def _classifier(state, args) -> None:
+    """harvey contacts classifier: the profiles and which task uses which
+    (list), or set a task to a profile (use TASK PROFILE|off)."""
+    from harvey import classify, classify_profiles as profiles
+
+    words = list(args.words or [])
+    if words[:1] == ["use"]:
+        if len(words) != 3:
+            print("\n  harvey contacts classifier use TASK PROFILE (or off)\n")
+            raise SystemExit(2)
+        try:
+            await profiles.set_use(state, {words[1]: words[2]})
+        except ValueError as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+    use = await profiles.uses(state)
+    runs = await profiles.tests(state)
+    base = await classify.install_caps(state)
+    print("\n  Tasks: " + ", ".join(f"{t} → {pid}" for t, pid in use.items()))
+    for p in (await profiles.every(state)).values():
+        m = p.get("measured") or {}
+        last = (runs.get(p["id"]) or [{}])[0]
+        facts = (f"measured: site {m.get('site_right')}/{m.get('scored')}, "
+                 f"{m.get('false_links')} false links" if m else
+                 "tested" if profiles.tested(p) else "not tested")
+        if last.get("at"):
+            facts += f"; last test {last.get('correct')}/{last.get('scored')}"
+        # (Its own hold, or its account's: another profile's never counts.)
+        h = classify.held(profiles.settings_of(p, base))
+        if h["seconds"] > 0:
+            facts += (f"; held {int(h['seconds'] // 60) + 1} min"
+                      + (" (its account)" if h["scope"] == "account" else "")
+                      + (f": {h['why']}" if h["why"] else ""))
+        print(f"    {p['id']:<36} {p['kind']:<17} {p['model'] or '-'}  ({facts})")
     print()
 
 
@@ -689,6 +808,12 @@ def cmd_contacts(args):
         if args.action == "judge-test":
             await _judge_test(state, args)
             return
+        if args.action == "verify":
+            await _verify(state, args)
+            return
+        if args.action == "classifier":
+            await _classifier(state, args)
+            return
         from harvey.contacts import ContactFilter
 
         f = ContactFilter(county=args.county, locality=args.locality, website=args.website,
@@ -702,8 +827,9 @@ def cmd_contacts(args):
             print("\n  Nothing to search: every company that matches has a contact "
                   "already (--force searches them again).\n")
             return
-        est = finder.estimate(selected, await switches.enabled_ids(state),
-                              load_env().model_dump())
+        enabled, env = await switches.enabled_ids(state), load_env().model_dump()
+        planned = await finder.plan(state, selected, enabled, env, force=args.force)
+        est = finder.estimate(planned, enabled, env)
         print(f"\n  {est['companies']:,} companies: {est['with_site']:,} with a website to "
               f"read (free), {est['to_look_up']:,} to look up by name and town")
         if est["to_look_up"] and not args.max_spend:
@@ -712,9 +838,32 @@ def cmd_contacts(args):
             print(f"  Website searches: about ${est['estimated_cost']:.4f} "
                   f"(cap: ${args.max_spend:.2f}; at most ${est['most']:.4f} when the "
                   "cheapest finds nothing and the next is tried)")
+        if args.max_spend:
+            ck = await finder.checks_estimate(state, planned, enabled, env)
+            if ck["checks"]:
+                print(f"  Address checks: up to {ck['checks']:,} ({ck['checks_left']:,} left "
+                      "this month, every service together), estimated "
+                      f"${ck['usd_high']:.4f} high past the verifiers' free allowances "
+                      "(inside the same cap)")
+                if ck["refused"]:
+                    print(f"  {', '.join(ck['refused'])}: no price past the free tier, so "
+                          "those requests are refused (harvey modules set <module> "
+                          "usd_<service> PRICE)")
+        elif est["with_site"]:
+            print("  No --max-spend: addresses aren't checked (a check needs a cap).")
+        ce = await finder.classify_estimate(state, planned)
+        cap = getattr(args, "classify_max_spend", None)
+        if ce["calls"]:
+            print(f"  Classifier: {ce['calls']:,} calls, estimated ${ce['usd_typical']:.4f} "
+                  f"typical to ${ce['usd_high']:.4f} high"
+                  + ("" if ce["price_known"] else " (a profile has no price: not counted)")
+                  + (f" (cap: ${cap:.2f})" if cap is not None else
+                     " (no cap of the run's own: --classify-max-spend)"))
+            print(f"  {ce['note']}")
         try:
             batch_id, ids, dupes = await enqueue_contact_search(
-                state, [c["id"] for c in selected], max_spend=args.max_spend, force=args.force)
+                state, [c["id"] for c in selected], max_spend=args.max_spend, force=args.force,
+                classify_max_spend=cap)
         except jobs.Duplicate as e:
             print(f"\n  {e}\n")
             raise SystemExit(2)
@@ -729,6 +878,7 @@ def cmd_contacts(args):
         cost = sum(float(j.result.get("cost") or 0.0) for j in done)
         print(f"\n  Looked at {len(done):,} companies → {contacts_found:,} contacts found"
               f" (${cost:.4f})")
+        print(f"  Run: {jobs.report_line(await jobs.batch_report(state, batch_id))}")
         _job_failures(found)
         print("  See them: the dashboard's Contacts page, or harvey export --all\n")
 
@@ -1840,6 +1990,7 @@ def cmd_discover(args):
             batch_id, ids, dupes = await enqueue_sources(
                 state, plan, max_spend=args.max_spend, read_sites=not args.no_profile,
                 find_websites=find_websites,
+                classify_max_spend=getattr(args, "classify_max_spend", None),
                 label=" + ".join(PROVIDERS[part["provider"]].label for part in plan))
         except jobs.Duplicate as e:
             print(f"\n  {e}\n")
@@ -1933,6 +2084,12 @@ def _job_line(job) -> str:
         bits.append(f"{progress['results']} results")
     if job.actual_cost:
         bits.append(f"${job.actual_cost:.4f}")
+    c = progress.get("classify") or {}
+    if c.get("calls"):
+        bits.append(f"classifier {c['calls']} call{'' if c['calls'] == 1 else 's'} "
+                    f"${float(c.get('usd') or 0):.4f}")
+    if job.result.get("ms"):
+        bits.append(f"{job.result['ms'] / 1000:.1f} s")
     if job.status == jobs.PAUSED:
         bits.append(f"paused: {job.paused_reason or job.error}")
     elif job.status == jobs.FAILED:
@@ -1953,7 +2110,8 @@ def cmd_jobs(args):
 
     action = args.jobs_action or "list"
     if action != "list" and not args.target:
-        what = "a lane" if action in ("pause", "resume-lane") else "a job id"
+        what = "a lane" if action in ("pause", "resume-lane") else \
+            "a run's id" if action == "report" else "a job id"
         print(f"\n  Say which: harvey jobs {action} <{what}> (harvey jobs list shows them).\n")
         raise SystemExit(2)
 
@@ -1982,6 +2140,24 @@ def cmd_jobs(args):
                 # Running first, then in the order the worker takes them.
                 for job in sorted(reversed(found), key=lambda j: j.status != jobs.RUNNING):
                     print(_job_line(job))
+            print()
+            return
+        if action == "report":
+            batch = await jobs.get_batch(state, args.target)
+            if batch is None:
+                job = await jobs.find(state, args.target)
+                batch = await jobs.get_batch(state, job.batch_id) if job and job.batch_id \
+                    else None
+            if batch is None:
+                print(f"\n  No run {args.target!r} (a job's run: harvey jobs list).\n")
+                raise SystemExit(2)
+            r = await jobs.batch_report(state, batch["id"])
+            print(f"\n  {batch.get('label') or batch['kind']} ({batch['id']}): "
+                  + ", ".join(f"{n} {k}" for k, n in sorted(r["statuses"].items())))
+            print(f"  {jobs.report_line(r)}")
+            for job in await jobs.list_jobs(state, batch_id=batch["id"], limit=args.limit,
+                                            oldest_first=True):
+                print(_job_line(job))
             print()
             return
         if action in ("pause", "resume-lane"):
@@ -2206,6 +2382,9 @@ def cmd_modules(args):
             sys.exit(2)
         _switch_module(args.module_id, args.modules_action == "enable")
         return
+    if args.modules_action in ("settings", "set"):
+        _module_settings(args)
+        return
 
     on = asyncio.run(_modules_on())
     rows = [{**m.summary(), "enabled": m.id in on} for m in manifests]
@@ -2221,7 +2400,8 @@ def cmd_modules(args):
         print(f"  {r['id']:<18} {r['set']:<9} {r['kind']:<10} {r['version']:<8} "
               f"{r['signals']:>7}  {default:<8} {now}{pack}")
     print(f"\n  {len(rows)} modules, {sum(r['signals'] for r in rows)} signals."
-          "\n  Turn one on or off: harvey modules enable|disable <id>\n")
+          "\n  Turn one on or off: harvey modules enable|disable <id>"
+          "\n  Its settings: harvey modules settings <id>; harvey modules set <id> KEY VALUE\n")
 
 
 def _cost_text(cost: dict) -> str:
@@ -2309,6 +2489,53 @@ def _require_module(module_id: str, what: str) -> None:
 
     if module_id not in asyncio.run(_modules_on()):
         raise switches.ModuleOff(module_id, what)
+
+
+def _module_settings(args):
+    """``settings <id>``: a module's settings as stored for this install
+    (else their defaults); ``set <id> KEY VALUE``: store one (typed and
+    clamped as its manifest says; "" leaves one with no default blank)."""
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    m = switches.by_id().get(args.module_id)
+    if m is None:
+        print(f"\n  No module {args.module_id!r} (see: harvey modules list)\n")
+        raise SystemExit(2)
+
+    async def go():
+        state = StateManager()
+        await state.init_db()
+        if args.modules_action == "set":
+            if not args.setting or args.value is None:
+                print(f"\n  harvey modules set {m.id} KEY VALUE (see: harvey modules "
+                      f"settings {m.id})\n")
+                raise SystemExit(2)
+            from harvey import verify_costs
+
+            service = args.setting.removeprefix("usd_")
+            price = verify_costs.verifiers().get(service, {}).get("module") == m.id \
+                and args.setting == verify_costs.PRICE_SETTING.format(service)
+            try:
+                # (A price that isn't a number is refused, never stored blank.)
+                value = await (verify_costs.set_price(state, service, args.value) if price
+                               else switches.set_module_setting(state, m.id, args.setting,
+                                                                args.value))
+            except ValueError as e:
+                print(f"\n  {e}\n")
+                raise SystemExit(2)
+            print(f"\n  {m.id}.{args.setting} = {'(blank)' if value is None else value}\n")
+            return
+        values = await switches.module_settings(state, m.id)
+        if not values:
+            print(f"\n  {m.name or m.id} has no settings.\n")
+            return
+        print(f"\n  {m.name or m.id}:")
+        for key, value in values.items():
+            print(f"    {key:<24} {'(blank)' if value is None else value}")
+        print()
+
+    asyncio.run(go())
 
 
 def _switch_module(module_id: str, on: bool):
@@ -3234,6 +3461,9 @@ def main():
                           "--max-spend (default: 0, free searches only)")
     sub.add_argument("--no-find-websites", action="store_true",
                      help="Don't look up websites for the companies found with none")
+    sub.add_argument("--classify-max-spend", type=_dollars, default=None,
+                     help="Dollars the classifier may cost while the companies found are "
+                          "worked on (default: no cap of the run's own; 0: none)")
     _background_arg(sub)
     sub.set_defaults(func=cmd_discover)
 
@@ -3256,10 +3486,14 @@ def main():
                     "for those with no website and one checked address per person "
                     "named there. 'status' shows the backlog.")
     sub.add_argument("action", nargs="?", default="find",
-                     choices=["find", "status", "rejudge", "judge-test"],
+                     choices=["find", "status", "rejudge", "judge-test", "verify",
+                              "classifier"],
                      help="find (default), status, rejudge (check the websites a search "
-                          "found before: counts unless --run) or judge-test (the "
-                          "classifier over a labelled set)")
+                          "found before: counts unless --run), judge-test (the "
+                          "classifier over a labelled set), verify (ask the classifier "
+                          "about contacts: yes, no or unsure) or classifier (its profiles; "
+                          "classifier use TASK PROFILE)")
+    sub.add_argument("words", nargs="*", help=argparse.SUPPRESS)
     sub.add_argument("--county", default="", help="Only companies in this county")
     sub.add_argument("--locality", default="", help="Only companies in this town")
     sub.add_argument("--website", default="", choices=["", "yes", "no"],
@@ -3272,16 +3506,27 @@ def main():
                      help="Most companies to search, newest first (default: 200)")
     sub.add_argument("--max-spend", type=_dollars, default=0.0,
                      help="Cap in dollars for website searches and address checks "
-                          "(default: 0, nothing paid: websites are read only)")
+                          "(default: 0, nothing paid: websites are read only); verify: "
+                          "for the classifier's calls")
+    sub.add_argument("--classify-max-spend", type=_dollars, default=None,
+                     help="find: dollars the run's classifier calls may cost (default: no "
+                          "cap of the run's own; 0: none, a site no register fact settles "
+                          "waits unlinked)")
+    sub.add_argument("--contact", type=int, action="append", default=[], metavar="ID",
+                     help="verify: this contact's links (repeat for more)")
+    sub.add_argument("--review", action="store_true",
+                     help="verify: list the links the classifier was unsure of")
+    sub.add_argument("--profile", default="",
+                     help="judge-test: test this classifier profile (and keep the result on it)")
     sub.add_argument("--force", action="store_true",
                      help="Search again companies already searched (each search is "
                           "kept; the company drawer shows where and when)")
     sub.add_argument("--dry-run", action="store_true",
-                     help="rejudge: count only (the default)")
+                     help="rejudge: count only (the default); verify: count and price only")
     sub.add_argument("--run", action="store_true",
                      help="rejudge: check them (one firm per job on a lane of its own)")
     sub.add_argument("--undo", default="", metavar="BATCH",
-                     help="rejudge: put back what that check's batch took off")
+                     help="rejudge / verify: put back what that run's batch took off")
     sub.add_argument("--file", default="",
                      help="judge-test: your own labelled file (one JSON object a line); "
                           "default: the built-in fictional set")
@@ -3500,8 +3745,12 @@ def main():
     sub = subparsers.add_parser(
         "modules", help="The modules Harvey is made of, from their manifests")
     sub.add_argument("modules_action", nargs="?", default="list",
-                     choices=["list", "enable", "disable"])
-    sub.add_argument("module_id", nargs="?", default="", help="The module to turn on or off")
+                     choices=["list", "enable", "disable", "settings", "set"])
+    sub.add_argument("module_id", nargs="?", default="",
+                     help="The module to turn on or off, or whose settings to show or set")
+    sub.add_argument("setting", nargs="?", default="", help="set: the setting's name")
+    sub.add_argument("value", nargs="?", default=None,
+                     help="set: its value (\"\" leaves a price blank: none)")
     sub.add_argument("--json", action="store_true", help="Print JSON")
     sub.set_defaults(func=cmd_modules)
 
@@ -3558,8 +3807,10 @@ def main():
                     "as jobs, one lane per source: a lane runs its jobs in order, lanes run "
                     "side by side. The dashboard's worker runs them (or harvey worker).")
     sub.add_argument("jobs_action", nargs="?", default="list",
-                     choices=("list", "cancel", "retry", "resume", "pause", "resume-lane"),
-                     help="list (default); cancel/retry/resume ID; pause/resume-lane LANE")
+                     choices=("list", "cancel", "retry", "resume", "pause", "resume-lane",
+                              "report"),
+                     help="list (default); cancel/retry/resume ID; pause/resume-lane LANE; "
+                          "report RUN (how long a run took and what it cost)")
     sub.add_argument("target", nargs="?", default="", help="A job id (or its start), or a lane")
     sub.add_argument("--lane", default="", help="list: only this lane")
     sub.add_argument("--all", action="store_true", help="list: done and cancelled jobs too")

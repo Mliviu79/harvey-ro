@@ -1,0 +1,340 @@
+{
+ "version": 1,
+ "about": "Classifier setups that tested well in Harvey's own judge test, with what it measured (counts). None is put above another. Read-only: editing one in Settings makes a copy of your own.",
+ "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+ "question_sets": {
+  "yes_no": {
+   "results": {
+    "prompt": "The STATE is one Romanian company's facts from the official registers (they\nare true), then the results of a web search for it. Each statement says that one result is the\ncompany's own official website.",
+    "yes": "the result is the company's own site: its own domain, under its name (Romanian names carry a legal form, SRL, S.R.L., SA, PFA, II, IF, that listings often leave out), and nothing in it points to another company or another town.",
+    "no": "company-information sites, directories, listings, marketplaces, social networks, city halls and institutions, news, other companies' sites, and a namesake in another town or abroad are never the company's own site."
+   },
+   "site": {
+    "prompt": "The STATE is one Romanian company's facts from the official registers (they\nare true), then what was read on one website: the register facts found on it, other companies'\ncodes (CUI), the phones' countries, an excerpt and the contacts. The statement says that this\nwebsite is the company's own.",
+    "yes": "the same name AND the same town or street, or the company's CUI, registration number, phone or email, are on the website, and nothing makes it another's.",
+    "no": "a shared word is not enough. Company-information sites, directories, marketplaces, city halls, news, a web agency's portfolio, other companies' sites and a namesake in another town or abroad are never the company's own. A PFA, II or IF is one person's business, usually without a site."
+   },
+   "contacts": {
+    "prompt": "The STATE is one Romanian company's facts from the official registers (they\nare true), then what was read on the company's own website, with the contacts found there\n(c1, c2...: phones, emails, profiles). Each statement says that one contact is the company's\nown.",
+    "yes": "the phone, email or profile is this company's own way to be reached.",
+    "no": "a web agency's or a theme's, another office abroad, a partner's, a platform's, a placeholder or a public hotline is not the company's own."
+   }
+  },
+  "system_one": {
+   "site": {
+    "questions": {
+     "names": {
+      "instructions": "The website between <page> and </page> names the company (COMPANY): the company's distinctive name appears in the website's domain, title or text. Ignore the legal form (SRL, S.R.L., SA, PFA, II, IF), letter case and diacritics.",
+      "criteria": {
+       "true": "the distinctive words of the company's name appear together as the name of the business the site presents.",
+       "false": "only one common word is shared, the name is different, or it appears only in a list of many companies."
+      }
+     },
+     "own": {
+      "instructions": "The website between <page> and </page> presents the business of the company (COMPANY) itself: its own products or services, written by that business, under its name."
+     },
+     "directory": {
+      "instructions": "The website between <page> and </page> is a company-information site, business directory, listing, marketplace, classifieds, job board or comparison site that lists many businesses."
+     },
+     "institution": {
+      "instructions": "The website between <page> and </page> belongs to a city hall, public institution, government body, school, association, or a news or media outlet."
+     }
+    },
+    "needs": {
+     "names": 0.5,
+     "own": 0.4
+    },
+    "vetoes": {
+     "directory": 0.7,
+     "institution": 0.7
+    }
+   },
+   "contacts": {
+    "instructions": "Whose is contact c{n}?",
+    "options": {
+     "company_own": "The company's own phone, email, contact form or social profile",
+     "agency_or_theme": "The web agency's, developer's or website theme's",
+     "other_office": "Another office, branch or company of a group, in another country",
+     "platform": "A platform, marketplace, booking or hosting service's",
+     "partner_or_other": "A partner's, supplier's, client's or another business's",
+     "placeholder_or_hotline": "A placeholder, example value, or a public hotline or institution"
+    },
+    "bar": 0.7
+   }
+  }
+ },
+ "keys": {
+  "DEEPINFRA_API_KEY": {
+   "provider": "DeepInfra",
+   "make_at": "https://deepinfra.com/dash/api_keys",
+   "scopes": {
+    "inference": "on by default: the classifier's questions",
+    "models:read": "on by default",
+    "account:read": "on by default",
+    "billing:read": "off by default, add it by hand when making the key: Settings shows this month's spend, the key's limit and the balance with it",
+    "metrics": "off by default, add it by hand when making the key: usage metrics"
+   },
+   "not_needed": [
+    "compute:*",
+    "batch",
+    "lora",
+    "voice",
+    "account_scoped_jwt"
+   ],
+   "note": "Leave the scopes Harvey doesn't need off. Every reply carries its own cost (usage.estimated_cost, USD), which Harvey records."
+  },
+  "TYPESAFE_API_KEY": {
+   "provider": "TypeSafe",
+   "note": "No price list and no billing API: enter the price (0.042 USD a million input tokens, output free) and keep the USD caps."
+  }
+ },
+ "profiles": [
+  {
+   "id": "deepinfra-gemma-3-27b",
+   "name": "DeepInfra: Gemma 3 27B",
+   "kind": "openai_compatible",
+   "base_url": "https://api.deepinfra.com/v1/openai",
+   "model": "google/gemma-3-27b-it",
+   "key_name": "DEEPINFRA_API_KEY",
+   "json_mode": true,
+   "per_minute": 20,
+   "timeout_seconds": 30,
+   "prices": {
+    "from_list": true
+   },
+   "tasks": [
+    "results",
+    "site",
+    "contacts"
+   ],
+   "questions": "yes_no",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 29,
+    "false_links": 0,
+    "misses": 3,
+    "invalid": 0,
+    "contacts_right": 39,
+    "contacts_picked": 39,
+    "contacts_expected": 40,
+    "median_ms": 899,
+    "p90_ms": 3864,
+    "unsure": 7,
+    "calls": 50,
+    "tokens_in": 38972,
+    "tokens_out": 644,
+    "cost_usd": 0.003221,
+    "cost_per_1000_sites": 0.0615
+   }
+  },
+  {
+   "id": "deepinfra-mistral-small-3.2",
+   "name": "DeepInfra: Mistral Small 3.2 24B",
+   "kind": "openai_compatible",
+   "base_url": "https://api.deepinfra.com/v1/openai",
+   "model": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+   "key_name": "DEEPINFRA_API_KEY",
+   "json_mode": true,
+   "per_minute": 20,
+   "timeout_seconds": 30,
+   "prices": {
+    "from_list": true
+   },
+   "tasks": [
+    "results",
+    "site",
+    "contacts"
+   ],
+   "questions": "yes_no",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 30,
+    "false_links": 0,
+    "misses": 2,
+    "invalid": 0,
+    "contacts_right": 41,
+    "contacts_picked": 41,
+    "contacts_expected": 45,
+    "median_ms": 797,
+    "p90_ms": 2025,
+    "unsure": 7,
+    "calls": 51,
+    "tokens_in": 38850,
+    "tokens_out": 877,
+    "cost_usd": 0.003089,
+    "cost_per_1000_sites": 0.0572
+   }
+  },
+  {
+   "id": "deepinfra-mistral-small-24b-2501",
+   "name": "DeepInfra: Mistral Small 24B (2501)",
+   "kind": "openai_compatible",
+   "base_url": "https://api.deepinfra.com/v1/openai",
+   "model": "mistralai/Mistral-Small-24B-Instruct-2501",
+   "key_name": "DEEPINFRA_API_KEY",
+   "json_mode": true,
+   "per_minute": 20,
+   "timeout_seconds": 30,
+   "prices": {
+    "from_list": true
+   },
+   "tasks": [
+    "results",
+    "site",
+    "contacts"
+   ],
+   "questions": "yes_no",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 29,
+    "false_links": 0,
+    "misses": 3,
+    "invalid": 0,
+    "contacts_right": 37,
+    "contacts_picked": 37,
+    "contacts_expected": 40,
+    "median_ms": 1674,
+    "p90_ms": 3993,
+    "unsure": 7,
+    "calls": 50,
+    "tokens_in": 37980,
+    "tokens_out": 644,
+    "cost_usd": 0.001951,
+    "cost_per_1000_sites": 0.0374
+   }
+  },
+  {
+   "id": "deepinfra-qwen3.8-27b-no-thinking",
+   "name": "DeepInfra: Qwen3.8 27B, thinking off",
+   "kind": "openai_compatible",
+   "base_url": "https://api.deepinfra.com/v1/openai",
+   "model": "Qwen/Qwen3.8-27B",
+   "key_name": "DEEPINFRA_API_KEY",
+   "request_extra": {
+    "reasoning_effort": "none"
+   },
+   "json_mode": true,
+   "per_minute": 20,
+   "timeout_seconds": 60,
+   "prices": {
+    "from_list": true
+   },
+   "tasks": [
+    "results",
+    "site",
+    "contacts"
+   ],
+   "questions": "yes_no",
+   "notes": "Only with thinking off (the extra request field reasoning_effort: none): without it the model returns nothing.",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 29,
+    "false_links": 0,
+    "misses": 3,
+    "invalid": 0,
+    "contacts_right": 39,
+    "contacts_picked": 39,
+    "contacts_expected": 40,
+    "median_ms": 918,
+    "p90_ms": 2918,
+    "cost_usd": 0.007621,
+    "unsure": 7,
+    "calls": 52,
+    "tokens_in": 40655,
+    "tokens_out": 812,
+    "cost_per_1000_sites": 0.1253
+   }
+  },
+  {
+   "id": "typesafe-jev",
+   "name": "TypeSafe: Jev (decision model)",
+   "kind": "decision",
+   "base_url": "https://api.typesafe.ai/v1/systemone",
+   "model": "jev-latest",
+   "key_name": "TYPESAFE_API_KEY",
+   "json_mode": false,
+   "per_minute": 60,
+   "timeout_seconds": 30,
+   "prices": {
+    "in_per_m": 0.042,
+    "out_per_m": 0.0
+   },
+   "tasks": [
+    "site",
+    "contacts"
+   ],
+   "questions": "system_one",
+   "notes": "A decision model, not a chat model: atomic questions, each answered with a probability; Harvey combines them. Site and contacts only (no search-results design). No price list and no billing API: the price is the one entered.",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 32,
+    "false_links": 0,
+    "misses": 0,
+    "invalid": 0,
+    "contacts_right": 53,
+    "contacts_picked": 54,
+    "contacts_expected": 54,
+    "median_ms": 213,
+    "unsure": 7,
+    "calls": 53,
+    "tokens_in": 61605,
+    "tokens_out": 7598,
+    "p90_ms": 528,
+    "cost_usd": 0.002587,
+    "cost_per_1000_sites": 0.0415
+   }
+  },
+  {
+   "id": "ollama-qwen2.5-3b",
+   "name": "Your own hardware: Ollama, qwen2.5:3b",
+   "kind": "openai_compatible",
+   "base_url": "http://127.0.0.1:11434/v1",
+   "model": "qwen2.5:3b",
+   "key_name": "",
+   "json_mode": true,
+   "per_minute": 60,
+   "timeout_seconds": 120,
+   "prices": {
+    "in_per_m": 0.0,
+    "out_per_m": 0.0
+   },
+   "tasks": [
+    "results",
+    "site",
+    "contacts"
+   ],
+   "questions": "yes_no",
+   "notes": "A local model on your own machine (Ollama: ollama pull qwen2.5:3b). In Docker the address is the Ollama service's (http://ollama:11434/v1), outside it http://127.0.0.1:11434/v1. About 18 s a question on a CPU, under a second on a GPU. The contacts task wasn't measured with today's questions.",
+   "measured": {
+    "measured_at": "2026-11-03",
+    "test_set": "200 hand-labelled firms (developers' test, not shipped)",
+    "cases": 200,
+    "asked": 39,
+    "scored": 32,
+    "site_right": 28,
+    "false_links": 0,
+    "misses": 4
+   }
+  }
+ ]
+}

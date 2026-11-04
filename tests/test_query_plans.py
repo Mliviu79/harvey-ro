@@ -98,6 +98,13 @@ OVERLAY_STATS = {
     "reading": [("reading", "9000 3 2 1"), ("reading_signal", "9000 300 150 10 1")],
     "firm_signal": [("firm_signal", "8000 300 1"), ("firm_signal_firm", "8000 2")],
     "legacy_id": [("legacy_id", "1790000 1")],
+    "contact_check": [("contact_check", "20000 2000 1 1"), ("contact_check_link", "20000 2 1 1"),
+                      ("contact_check_open", "15000 5000 1")],
+    "campaign_member": [("campaign_member", "200000 20 1"),
+                        ("campaign_member_status", "200000 20 3"),
+                        ("campaign_member_email", "200000 1 1"),
+                        ("campaign_member_prospect", "200000 1"),
+                        ("campaign_member_contact", "180000 1")],
 }
 
 # The registers whose loads analyse their file (registry.build and the

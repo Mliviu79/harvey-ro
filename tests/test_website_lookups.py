@@ -13,7 +13,7 @@ import sqlite3
 import httpx
 import pytest
 
-from harvey import classify, contacts, finder
+from harvey import classify, contacts, finder, verify_costs
 from harvey.collectors import discover as D
 from harvey.models import Company
 from harvey.modules import api, ingest, job_kinds, jobs, lanes, switches
@@ -560,6 +560,7 @@ def _verifier(monkeypatch, answers):
     async def find_email(inp, ctx):
         first, last = inp.extra["first_name"], inp.extra["last_name"]
         asked.append((first, last))
+        await ctx.budget.ask("reoon")           # (one service asked, as the real check)
         address = f"{first}.{last}@alfa-dent.example".lower()
         return api.Draft(contacts=[api.Contact("email", address,
                                                status=answers.get((first, last), "invalid"))])
@@ -592,7 +593,7 @@ def test_the_other_order_is_checked_only_when_the_likelier_one_is_invalid(tmp_pa
         cid = await _company(s, name="ALFA DENT SRL", domain="alfa-dent.example")
         await s.add_people(cid, [("POPESCU ION MIHAI", "administrator")], source="onrc")
         out = await _addresses(s, cid)
-        left = await ingest.Allowance(s).left("email_verify")
+        left = await verify_costs.checks_left(s)
         return out, left
 
     out, left = run(go())

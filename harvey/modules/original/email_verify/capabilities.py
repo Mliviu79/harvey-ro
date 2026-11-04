@@ -10,9 +10,12 @@ async def _find_email(inp, ctx) -> Draft:
     ``inp.domain``), honestly graded: the domain's pattern (what was learned
     before is ``facts["EMAIL_PATTERN"]``, the email_patterns row), then one
     candidate checked. ``values["email_pattern"]`` is what the lookup
-    learned, kept even when verification fails."""
+    learned, kept even when verification fails; ``values["verifiers"]``
+    the paid verification services it asked (a credit each, each counted
+    and priced by ``ctx.budget`` as it was asked)."""
     x = inp.extra
     learned: dict = {}
+    asked: list = []
     draft = Draft()
     try:
         result = await ef.find_email(
@@ -21,12 +24,13 @@ async def _find_email(inp, ctx) -> Draft:
             known_emails=x.get("known_emails"),
             default_pattern=x.get("default_pattern", ef.DEFAULT_PATTERN),
             other_people=x.get("other_people"), cached=inp.facts.get("EMAIL_PATTERN"),
-            budget=ctx.budget, enabled=ctx.enabled, learned=learned)
+            budget=ctx.budget, enabled=ctx.enabled, learned=learned, asked=asked)
     except Exception as e:
         draft.failed = str(e)
         result = None
     if learned:
         draft.values["email_pattern"] = learned
+    draft.values["verifiers"] = asked
     if result is not None:
         draft.contacts.append(Contact("email", result.email, status=result.status))
     return draft
@@ -34,10 +38,14 @@ async def _find_email(inp, ctx) -> Draft:
 
 async def _verify_address(inp, ctx) -> Draft:
     """An address the company publishes (``extra["email"]``), graded like
-    any other."""
+    any other (``values["verifiers"]``: the paid services asked, each
+    allowed by ``ctx.budget``)."""
     email = inp.extra.get("email", "")
-    status = await ef.verify_published_address(email, env=ctx.env, enabled=ctx.enabled)
-    return Draft(contacts=[Contact("email", email, status=status)])
+    asked: list = []
+    status = await ef.verify_published_address(email, env=ctx.env, enabled=ctx.enabled,
+                                               asked=asked, budget=ctx.budget)
+    return Draft(contacts=[Contact("email", email, status=status)],
+                 values={"verifiers": asked})
 
 
 CAPABILITIES = {

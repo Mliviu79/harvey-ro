@@ -5,14 +5,15 @@ and knows nothing about email campaigns. A campaign takes its members from
 the contacts (harvey/campaigns.py: add_members); these are its two helpers:
 the prospect card made the first time an address joins a campaign (the
 person's role is its title; state.company_brief the rest), and the check of
-an address nobody verified yet by a verification tier (a credit each,
-counted against the month's allowance, email_verify's monthly_searches,
-by the campaign cycle).
+an address nobody verified yet by a verification tier (each service it
+asks counted and priced as it is asked, harvey/verify_costs.py, against
+the month's checks, email_verify's monthly_searches; no USD cap applies
+here, so one past a free tier with no price is made and counted unpriced).
 """
 
 import logging
 
-from harvey import contacts
+from harvey import contacts, verify_costs
 from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.modules import api
 from harvey.state import StateManager
@@ -34,10 +35,16 @@ class Audience:
         the contact ("guess" when the check failed)."""
         domain = row["email"].rpartition("@")[2]
         try:
+            # (Each service asked uses its free allowance: counted, whoever asks.)
+            meter = await verify_costs.Meter.start(self.state)
             graded = await api.capability(*VERIFY)(
                 api.Input(domain=domain, extra={"email": row["email"]}),
-                api.Context(env=self.env, enabled=enabled))
+                api.Context(env=self.env, enabled=enabled, budget=meter))
             status = graded.contacts[0].status or "guess"
+            if meter.total()[2]:
+                logger.warning(f"Audience: checking {row['email']} asked a service past its "
+                               "free tier with no price entered (Settings: Email "
+                               "verification): counted, not priced")
         except Exception as e:
             logger.debug(f"Audience: checking {row['email']} failed: {e}")
             status = "guess"

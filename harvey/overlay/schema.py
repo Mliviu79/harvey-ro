@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 29).
+"""The overlay's tables (harvey.db schema 30).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 29
+LATEST = 30
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -827,9 +827,44 @@ def _to_29(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_29)
 
 
+# ── Schema 30: contacts verified by the classifier, and their undo ──
+
+SCHEMA_30 = """
+-- A link (firm, contact) the classifier was asked about (harvey/
+-- contact_check.py): its verdict (CHECK_VERDICT), the profile and model
+-- that gave it, and for a no the evidence's trust it lowered (payload),
+-- so ``harvey contacts verify --undo BATCH`` puts it back. Nothing is
+-- deleted.
+CREATE TABLE contact_check (
+  firm INTEGER NOT NULL, contact INTEGER NOT NULL, batch TEXT NOT NULL, at INTEGER NOT NULL,
+  verdict INTEGER NOT NULL, profile TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+  p REAL, note TEXT, payload TEXT, undone_at INTEGER,
+  PRIMARY KEY (batch, firm, contact)
+) WITHOUT ROWID;
+CREATE INDEX contact_check_link ON contact_check(contact, firm, at);
+CREATE INDEX contact_check_open ON contact_check(verdict, at) WHERE undone_at IS NULL;
+-- A campaign's members by contact: a no never lowers a member's link.
+CREATE INDEX campaign_member_contact ON campaign_member(contact) WHERE contact IS NOT NULL;
+-- A finished run's report (harvey/modules/jobs.py batch_report), with what
+-- it was made from; NULL until the run finishes, and again when a job of
+-- it is retried or resumed.
+ALTER TABLE job_batches ADD COLUMN report_json TEXT;
+"""
+# contact_check.verdict
+CHECK_VERDICT = {"no": 0, "yes": 1, "unsure": 2}
+
+
+def _to_30(con: sqlite3.Connection) -> None:
+    """Schema 30: contact_check, campaign members by contact, and runs'
+    stored reports. Nothing on file changes: a verification runs only when
+    the user starts it, and a run's report is stored the next time it is
+    read."""
+    _script(con, SCHEMA_30)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29))
+STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

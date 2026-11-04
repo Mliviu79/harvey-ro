@@ -460,8 +460,10 @@ async def derive_pattern(
     key = _hunter_api_key(env)
     if key and not _module_on(enabled, "hunter"):
         key = ""
-    if key and not hunter_tried and await budget.left("hunter") > 0:
-        await budget.take("hunter")
+    # (take() False: refused, by the month's allowance or for want of a
+    # price past the free tier under a USD cap; nothing is asked.)
+    if key and not hunter_tried and await budget.left("hunter") > 0 \
+            and await budget.take("hunter"):
         try:
             result = await _hunter_domain_pattern(domain, key)
             answered = True
@@ -623,19 +625,41 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
     return None  # unknown / risky-unknown — inconclusive
 
 
-async def _verify_candidate(email: str, mx_type: str, env,
-                            enabled=None) -> tuple[Optional[str], bool]:
+def configured_verifiers(env, enabled=None) -> list[str]:
+    """The paid verification services a check may ask (each a credit of
+    its own), in the order _verify_candidate asks them on a big provider:
+    those with a key whose module is on. SMTP is free and isn't one."""
+    verifiers = _module_on(enabled, "email_verify")
+    out = []
+    if verifiers and _secret(env, "zerobounce_api_key"):
+        out.append("zerobounce")
+    if verifiers and _secret(env, "reoon_api_key"):
+        out.append("reoon")
+    if _module_on(enabled, "hunter") and _hunter_api_key(env):
+        out.append("hunter")
+    return out
+
+
+async def _verify_candidate(email: str, mx_type: str, env, enabled=None,
+                            asked: Optional[list] = None,
+                            budget=None) -> tuple[Optional[str], bool]:
     """Run the best available verifier for this domain type.
 
     Returns (status_or_None, catch_all_seen). Order is chosen so scarce
     paid-ish credits are spent only where they actually resolve the domain.
     Reoon, ZeroBounce and the SMTP check run only while the email_verify
-    module is on, Hunter's check only while hunter is.
+    module is on, Hunter's check only while hunter is. ``asked``: each paid
+    service asked is appended to it as it is asked ("zerobounce", "reoon",
+    "hunter"). ``budget.ask(name)`` is asked before each (core's Meter
+    counts and prices it, harvey/verify_costs.py): one it refuses is
+    skipped, as if it had no key.
     """
     verifiers = _module_on(enabled, "email_verify")
+    budget = budget if budget is not None else Budget()
     reoon_key = _secret(env, "reoon_api_key") if verifiers else ""
     zerobounce_key = _secret(env, "zerobounce_api_key") if verifiers else ""
     hunter_key = _hunter_api_key(env) if _module_on(enabled, "hunter") else ""
+    asked = asked if asked is not None else []
 
     catch_all_seen = False
 
@@ -644,12 +668,15 @@ async def _verify_candidate(email: str, mx_type: str, env,
     if mx_type in ("google", "microsoft", "gateway"):
         channels = []
         if zerobounce_key:
-            channels.append(lambda: verify_zerobounce(email, zerobounce_key))
+            channels.append(("zerobounce", lambda: verify_zerobounce(email, zerobounce_key)))
         if reoon_key:
-            channels.append(lambda: verify_reoon(email, reoon_key))
+            channels.append(("reoon", lambda: verify_reoon(email, reoon_key)))
         if hunter_key:
-            channels.append(lambda: verify_hunter(email, hunter_key))
-        for channel in channels:
+            channels.append(("hunter", lambda: verify_hunter(email, hunter_key)))
+        for name, channel in channels:
+            if not await budget.ask(name):
+                continue
+            asked.append(name)
             verdict = await channel()
             if verdict is None:
                 continue
@@ -661,7 +688,8 @@ async def _verify_candidate(email: str, mx_type: str, env,
         return None, catch_all_seen
 
     # Small / self-hosted: Reoon → SMTP (still works here) → Hunter.
-    if reoon_key:
+    if reoon_key and await budget.ask("reoon"):
+        asked.append("reoon")
         verdict = await verify_reoon(email, reoon_key)
         if verdict:
             if verdict.get("catch_all"):
@@ -679,7 +707,8 @@ async def _verify_candidate(email: str, mx_type: str, env,
     if smtp is False:
         return "invalid", catch_all_seen
 
-    if hunter_key:
+    if hunter_key and await budget.ask("hunter"):
+        asked.append("hunter")
         verdict = await verify_hunter(email, hunter_key)
         if verdict:
             if verdict.get("catch_all"):
@@ -691,7 +720,8 @@ async def _verify_candidate(email: str, mx_type: str, env,
     return None, catch_all_seen
 
 
-async def verify_published_address(email: str, env=None, enabled=None) -> str:
+async def verify_published_address(email: str, env=None, enabled=None,
+                                   asked: Optional[list] = None, budget=None) -> str:
     """Grade an address the company publishes on its own website.
 
     Graded like any other address: a catch-all verdict stays "risky", so
@@ -706,7 +736,8 @@ async def verify_published_address(email: str, env=None, enabled=None) -> str:
     mx_host = await get_mx_host(domain)
     if not mx_host:
         return "invalid"
-    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, enabled)
+    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, enabled, asked,
+                                        budget)
     return status or "guess"
 
 
@@ -738,6 +769,7 @@ async def find_email(
     budget=None,
     enabled=None,
     learned: Optional[dict] = None,
+    asked: Optional[list] = None,
 ) -> EmailResult:
     """Find and honestly grade one email for a person at a company.
 
@@ -753,11 +785,13 @@ async def find_email(
     this person: a verifier would confirm the other person's mailbox.
 
     ``cached`` is what Harvey learned about the domain before (its
-    email_patterns row), ``budget`` what Hunter lookups it may spend,
+    email_patterns row), ``budget`` what Hunter lookups and verification
+    requests it may make (derive_pattern, _verify_candidate),
     ``enabled`` the modules that are on (None: all). Nothing is written:
     what the lookup learned comes back in ``learned`` (also filled into
     the ``learned`` dict passed in as it is learned, so a caller keeps it
-    even when verification fails), for core to keep.
+    even when verification fails), for core to keep. ``asked``: the paid
+    verification services asked are appended to it (_verify_candidate).
     """
     learned = learned if learned is not None else {}
     domain = _clean_domain(domain)
@@ -799,7 +833,8 @@ async def find_email(
         return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type,
                            learned=learned)
 
-    status, catch_all = await _verify_candidate(candidate, mx_type, env, enabled)
+    status, catch_all = await _verify_candidate(candidate, mx_type, env, enabled, asked,
+                                                budget)
 
     if catch_all:
         learned["is_catch_all"] = 1

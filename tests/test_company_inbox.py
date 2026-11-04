@@ -60,7 +60,7 @@ async def test_published_address_grading(monkeypatch, graded, expected):
     async def mx(domain):
         return "smtp.google.com"
 
-    async def check(email, mx_type, env, enabled=None):
+    async def check(email, mx_type, env, enabled=None, asked=None, budget=None):
         return graded, graded == "risky"
 
     monkeypatch.setattr(ef, "get_mx_host", mx)

@@ -172,15 +172,19 @@ async def wait(lane: str) -> None:
         await asyncio.to_thread(_turn, lane, gap)
 
 
-async def wait_gap(lane: str, seconds: float) -> None:
+async def wait_gap(lane: str, seconds: float, key: str = "") -> None:
     """wait() with a pace a setting gives (a requests-per-minute limit the
-    user sets) rather than a manifest's: the lane still has to be declared,
-    and the turns are shared between processes the same way."""
+    user sets) rather than a manifest's: the lane still has to be declared
+    (a pace it declares is not added: the setting's is the one used), and
+    the turns are shared between processes the same way. ``key``: the
+    turns are counted under it rather than the lane's name (one pace per
+    classifier profile, all in the classify lane)."""
     interval(lane)
     if seconds <= 0:
         return
-    async with _lock(lane):
-        await asyncio.to_thread(_turn, lane, float(seconds))
+    key = key or lane
+    async with _lock(key):
+        await asyncio.to_thread(_turn, key, float(seconds))
 
 
 # ── Free allowances: what a service gives free each period ──
@@ -389,16 +393,24 @@ def free_left(module_id: str, share: float = 1.0) -> int | None:
 HOLD_SECONDS = 3600.0
 
 
-def hold(module_id: str, seconds: float | None = None) -> None:
-    """Leave ``module_id`` out of the background for ``seconds``."""
+def hold(module_id: str, seconds: float | None = None, why: str = "") -> None:
+    """Leave ``module_id`` out of the background for ``seconds`` (``why``:
+    what the service said, kept for the status)."""
     until = time.time() + max(float(seconds or HOLD_SECONDS), 1.0)
-    _uses_file(module_id, lambda counts: {**counts, "held_until": until})
+    _uses_file(module_id, lambda counts: {**counts, "held_until": until,
+                                          "held_why": str(why or "")[:200]})
+
+
+def hold_info(module_id: str) -> tuple[float, str]:
+    """(seconds still held, why): (0, "") when not held."""
+    counts = _uses_file(module_id, lambda counts: None)
+    try:
+        left = max(0.0, float(counts.get("held_until") or 0) - time.time())
+    except (TypeError, ValueError):
+        left = 0.0
+    return left, (str(counts.get("held_why") or "") if left else "")
 
 
 def held(module_id: str) -> float:
     """Seconds the module is still left out of the background (0: not)."""
-    counts = _uses_file(module_id, lambda counts: None)
-    try:
-        return max(0.0, float(counts.get("held_until") or 0) - time.time())
-    except (TypeError, ValueError):
-        return 0.0
+    return hold_info(module_id)[0]

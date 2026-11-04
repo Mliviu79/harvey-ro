@@ -67,7 +67,8 @@ class Fakes:
 
         async def find_email(inp, ctx):
             self.checked.append((inp.extra["first_name"], inp.extra["last_name"], inp.domain))
-            if not self.email:
+            # (One verification service asked, as the real check does.)
+            if not await ctx.budget.ask("reoon") or not self.email:
                 return api.Draft()
             return api.Draft(contacts=[api.Contact("email", self.email, status="verified")])
 

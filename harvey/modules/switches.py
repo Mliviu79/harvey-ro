@@ -194,7 +194,9 @@ async def set_module_setting(state, module_id: str, key: str, value):
     if not isinstance(spec, dict) or key == "enabled":
         raise ValueError(f"{module_id} has no setting {key!r}")
     typed = setting_value(spec, value)
-    stored = ("on" if typed else "off") if spec.get("type") == "bool" else (
+    # (A setting with no default left blank is stored blank: none.)
+    stored = "" if typed is None else ("on" if typed else "off") \
+        if spec.get("type") == "bool" else (
         ",".join(typed) if isinstance(typed, list) else str(typed))
     await state.set_setting(SETTING_KEY.format(module_id, key), stored)
     return typed

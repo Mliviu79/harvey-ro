@@ -281,7 +281,6 @@ def _write_env_file(updates: dict[str, str]):
 
 def _check_harvey_pid() -> int | None:
     """Check if there's a running Harvey process from a PID file."""
-    global _harvey_process, _harvey_started_at
     if _harvey_process and _harvey_process.poll() is None:
         return _harvey_process.pid
     if PID_FILE.exists():
@@ -716,10 +715,6 @@ async def _enrich_companies(rows: list[dict], config=None) -> list[dict]:
     email addresses on file (most deliverable first, bounced ones left out),
     the activities in words, and how many contacts and named people each has.
     Additive: every key the row already had stays."""
-    from harvey.collectors.phones import phone_region
-    from harvey.export import _EMAIL_STATUS_RANK, _phone_columns
-    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
-
     if not rows:
         return rows
     # The same suppression as the exports: an address (or a whole domain) on
@@ -794,8 +789,6 @@ async def get_companies(request: Request, limit: int | None = None, offset: int 
     the phone/email-first table (see _enrich_companies) and carries its
     latest turnover and headcount, its contact count and last search.
     Paging: harvey/companies.py."""
-    from harvey import companies
-
     if not DB_PATH.exists():
         if not request.query_params:
             return []
@@ -1277,7 +1270,7 @@ async def start_harvey():
                 "message": "Harvey isn't set up yet. Run `harvey setup` in a terminal first."}
 
     # Ensure data dir exists
-    (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     # The native Claude CLI installer puts claude in ~/.local/bin without
     # always adding it to PATH; the heartbeat can't think without it.
@@ -1746,10 +1739,8 @@ CONTACT_EXPORT_MAX = 500_000
 
 
 from harvey.contact_query import (  # noqa: E402  (the page's filters, shared)
-    caen_arg as _caen_arg, codes as _codes, contact_arg as _contact_arg,
-    filter_from_query as _contact_filter, number_arg as _number_arg,
-    range_bound as _range_bound, refuse_hidden_signals as _refuse_hidden_signals,
-    search_arg as _search_arg,
+    codes as _codes, filter_from_query as _contact_filter, range_bound as _range_bound,
+    refuse_hidden_signals as _refuse_hidden_signals,
 )
 
 
@@ -1778,8 +1769,6 @@ async def get_contacts(request: Request, view: str = "contacts", limit: int = 50
     require/exclude (signal codes, the cohort rules), min/max_turnover,
     min/max_employees and unknown (include/exclude), q. ``total`` stops at
     contacts.COUNT_CAP (``more`` says there are more)."""
-    from harvey import contacts
-
     limit = max(1, min(int(limit or 50), CONTACT_PAGE_MAX))
     offset = max(0, int(offset or 0))
     people = view == "people"
@@ -1852,20 +1841,30 @@ async def _json_body(request: Request) -> dict:
 
 @app.post("/api/contacts/find/estimate")
 async def estimate_find_contacts(request: Request):
-    """What a Find-contacts run over the current filter would do and cost:
-    how many companies (with no contact, or all with ``force``), how many
-    have a website to read (free), how many need a website search, and its
-    price through the cheapest search module that can find a company."""
+    """What a Find-contacts run over the current filter would do and may
+    cost: how many companies (with no contact, or all with ``force``), how
+    many have a website to read (free), how many need a website search, and
+    its price through the cheapest search module that can find a company;
+    ``checks``: the address checks it may make and what they may cost past
+    the verifiers' free allowances (finder.checks_estimate); ``classifier``:
+    its calls and their cost as a range (finder.classify_estimate). Both
+    are estimates: the run's caps are what is enforced, step by step."""
     from harvey import finder
     from harvey.modules import switches
 
-    state, selected, error = await _find_selection(await _json_body(request))
+    body = await _json_body(request)
+    state, selected, error = await _find_selection(body)
     if error:
         return JSONResponse({"error": error}, status_code=400)
     from harvey.config import load_env
 
-    out = finder.estimate(selected, await switches.enabled_ids(state), load_env().model_dump())
-    return {**out, "more": len(selected) >= FIND_MAX}
+    enabled, env = await switches.enabled_ids(state), load_env().model_dump()
+    # (What the run will do to each: searched already counts, unless forced.)
+    selected = await finder.plan(state, selected, enabled, env, force=bool(body.get("force")))
+    out = finder.estimate(selected, enabled, env)
+    return {**out, "more": len(selected) >= FIND_MAX,
+            "checks": await finder.checks_estimate(state, selected, enabled, env),
+            "classifier": await finder.classify_estimate(state, selected)}
 
 
 @app.post("/api/contacts/find")
@@ -1873,9 +1872,12 @@ async def find_contacts(request: Request):
     """Queue the contact finder for the current filter ({"filter", "force",
     "max_spend", "limit"}, or "company_ids"): one batch, one job per
     company. ``max_spend`` caps the website searches and address checks
-    (0, the default: websites are read, nothing is paid for). A company
-    already searched by a module's capability is skipped by it, unless
-    ``force`` (searched again, once in this run)."""
+    (0, the default: websites are read, nothing is paid for);
+    ``classify_max_spend`` what the run's classifier calls may cost (absent
+    or null: no cap of the run's own; 0: none, a site no register fact
+    settles waits unlinked). A company already searched by a module's
+    capability is skipped by it, unless ``force`` (searched again, once in
+    this run). The run's report: GET /api/jobs/batches/{batch_id}/report."""
     from harvey.modules import jobs
     from harvey.modules.job_kinds import enqueue_contact_search
 
@@ -1885,6 +1887,13 @@ async def find_contacts(request: Request):
     except (TypeError, ValueError):
         return JSONResponse({"success": False, "message": "max_spend must be a number of "
                              "dollars, 0 or more", "code": "bad_cap"}, status_code=400)
+    try:
+        classify_cap = None if body.get("classify_max_spend") in (None, "") \
+            else _money(body.get("classify_max_spend"))
+    except (TypeError, ValueError):
+        return JSONResponse({"success": False, "message": "classify_max_spend must be a "
+                             "number of dollars, 0 or more", "code": "bad_cap"},
+                            status_code=400)
     state, selected, error = await _find_selection(body)
     if error:
         return JSONResponse({"success": False, "message": error}, status_code=400)
@@ -1893,12 +1902,13 @@ async def find_contacts(request: Request):
     try:
         batch_id, ids, dupes = await enqueue_contact_search(
             state, [c["id"] for c in selected], max_spend=max_spend,
-            force=bool(body.get("force")))
+            force=bool(body.get("force")), classify_max_spend=classify_cap)
     except jobs.Duplicate as e:
         return JSONResponse(_duplicate_body(e), status_code=409)
     return {"success": True, "batch_id": batch_id, "queued": len(ids),
             "already_waiting": len(dupes), "companies": len(selected),
-            "max_spend": max_spend, "force": bool(body.get("force"))}
+            "max_spend": max_spend, "classify_max_spend": classify_cap,
+            "force": bool(body.get("force"))}
 
 
 @app.get("/api/contacts/finder")
@@ -1918,6 +1928,50 @@ async def contact_finder_status():
     spend = getattr(config, "spend", None)
     out["day_budget"] = getattr(spend, "per_day_usd", None)
     return out
+
+
+@app.get("/api/verify/prices")
+async def get_verify_prices():
+    """Each verification service and Hunter's pattern lookup this month
+    (harvey/verify_costs.py status): its free allowance, the requests made
+    and how many were past it, and its price (entered, declared); with the
+    month's checks against EMAIL_VERIFY_MONTHLY_CHECKS."""
+    from harvey import verify_costs
+
+    state = _state()
+    await state.init_db()
+    return await verify_costs.status(state)
+
+
+@app.post("/api/verify/prices")
+async def set_verify_prices(request: Request):
+    """Enter what one request past a service's free allowance costs, in
+    USD ({service: amount, or null to clear}). A run with a USD cap refuses
+    a request past the allowance with no price."""
+    from harvey import verify_costs
+
+    body = await _json_body(request)
+    known = verify_costs.verifiers()
+    if not body or any(k not in known for k in body):
+        return JSONResponse({"success": False, "message": "expected prices for "
+                             + ", ".join(sorted(known))}, status_code=400)
+    prices = {}
+    for key, value in body.items():
+        try:
+            if isinstance(value, bool):
+                raise ValueError(key)
+            prices[key] = None if value is None or value == "" else _money(value)
+            if prices[key] is not None and prices[key] > verify_costs.MAX_USD:
+                raise ValueError(key)
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": f"{key}: a number of dollars "
+                                 f"from 0 to {verify_costs.MAX_USD:g} (one request), or "
+                                 "blank"}, status_code=400)
+    state = _state()
+    await state.init_db()
+    for key, value in prices.items():
+        await verify_costs.set_price(state, key, value)
+    return {"success": True, **await verify_costs.status(state)}
 
 
 @app.post("/api/contacts/finder/settings")
@@ -1958,32 +2012,45 @@ async def set_contact_finder_settings(request: Request):
 
 # ── The classifier (harvey/classify.py) and the found websites' check ──
 
-# Settings the Classifier card may change: (the setting, how it is typed).
-CLASSIFY_FIELDS = {"provider": "classify_provider", "base_url": "classify_base_url",
-                   "model": "classify_model", "key_name": "classify_key_name",
-                   "json_mode": "classify_json_mode", "per_day": "classify_per_day",
-                   "per_minute": "classify_per_minute",
-                   "timeout_seconds": "classify_timeout_seconds", "tasks": "classify_tasks",
-                   "yes": "classify_yes",
-                   "price_in_per_m": "classify_price_in_per_m",
-                   "price_out_per_m": "classify_price_out_per_m",
+# The install's caps the Classifier card may change, whatever the profile
+# (the setup itself is a profile's: /api/classify/profiles).
+CLASSIFY_FIELDS = {"per_day": "classify_per_day", "tasks": "classify_tasks",
                    "usd_per_day": "classify_usd_per_day", "usd_per_month": "classify_usd_per_month"}
 # The ones that are USD amounts (blank or null: none).
-CLASSIFY_MONEY = ("price_in_per_m", "price_out_per_m", "usd_per_day", "usd_per_month")
+CLASSIFY_MONEY = ("usd_per_day", "usd_per_month")
+
+
+async def _classify_holds(state, by_task: dict) -> dict:
+    """{profile id: {"seconds", "why", "scope"}} of every profile a task is
+    set to that is held now (its own hold, or its account's)."""
+    from harvey import classify
+
+    out = {}
+    for s in {id(v): v for v in by_task.values()}.values():
+        if s.provider == "off" or not s.profile:
+            continue
+        h = await asyncio.to_thread(classify.held, s)
+        if h["seconds"] > 0:
+            out[s.profile] = {**h, "seconds": int(h["seconds"]), "name": s.profile_name}
+    return out
 
 
 async def _classify_status(state) -> dict:
     from harvey import classify, site_check
     from harvey import classify_prices as prices
-    from harvey.modules import lanes
 
     s = await classify.settings(state)
-    held = await asyncio.to_thread(lanes.held, classify.LANE)
+    holds = await _classify_holds(state, s.by_task or {"site": s})
     key_set = bool(s.key_name) and bool(classify._key(s)) if s.provider in (
         "openai_compatible", "anthropic", "decision") else None
+    from harvey import classify_profiles as profiles
+
     deepinfra = prices.is_deepinfra(s.base_url)
     return {**s.public(), "providers": list(classify.PROVIDERS),
-            "calls_today": await classify.calls_today(state), "held_seconds": int(held),
+            "use": await profiles.uses(state),
+            "calls_today": await classify.calls_today(state),
+            # (Each profile's own hold: one held never stops another.)
+            "held": holds, "held_seconds": int((holds.get(s.profile) or {}).get("seconds", 0)),
             "key_set": key_set, "sdk_missing": classify.sdk_missing(s.provider),
             "waiting": await site_check.waiting(state),
             "cost": await classify.cost_status(state, s),
@@ -1997,11 +2064,13 @@ async def _classify_status(state) -> dict:
 
 @app.get("/api/classify")
 async def get_classify():
-    """The classifier's settings (the key's name, never a value; whether
-    the .env holds one), today's calls, whether it is held, and how many
-    found websites wait for a check."""
+    """The classifier as the site task is set (its profile's settings: the
+    key's name, never a value; whether the .env holds one), the install's
+    caps, today's calls, which profiles are held and until when (``held``:
+    {profile: {seconds, why, scope}}), and how many found websites wait
+    for a check."""
     if not DB_PATH.exists():
-        return {"provider": "off", "waiting": 0, "calls_today": 0}
+        return {"provider": "off", "waiting": 0, "calls_today": 0, "held": {}}
     state = _state()
     await state.init_db()
     return await _classify_status(state)
@@ -2009,12 +2078,11 @@ async def get_classify():
 
 @app.post("/api/classify/settings")
 async def set_classify(request: Request):
-    """Change the classifier's settings: any of provider, base_url, model,
-    key_name (the .env key's name), json_mode, per_day, per_minute,
-    timeout_seconds, tasks ({"site": {"on": true, "per_day": 500}, ...}),
-    yes (a decision model's contacts bar, 0.5 to 0.99), price_in_per_m and
-    price_out_per_m (USD a million tokens), usd_per_day and usd_per_month
-    (the USD caps): a number of at least 0, or blank / null for none."""
+    """Change the install's caps on every profile's calls: per_day (calls a
+    day), tasks ({"site": {"per_day": 500}, ...}: each task's day cap),
+    usd_per_day and usd_per_month (a number of at least 0, or blank / null
+    for none). A classifier's setup is a profile's
+    (/api/classify/profiles)."""
     from harvey import classify, finder
     from harvey.modules import switches
 
@@ -2024,26 +2092,8 @@ async def set_classify(request: Request):
         body = None
     if not isinstance(body, dict) or not body or any(k not in CLASSIFY_FIELDS for k in body):
         return JSONResponse({"success": False, "message": "expected any of "
-                             + ", ".join(CLASSIFY_FIELDS)}, status_code=400)
-    if "provider" in body and body["provider"] not in classify.PROVIDERS:
-        return JSONResponse({"success": False, "message": "provider must be one of "
-                             + ", ".join(classify.PROVIDERS)}, status_code=400)
-    # (The Test button sends the named key to the base URL: only a key
-    # meant for a classifier, never one of Harvey's own, and only http(s).)
-    if "key_name" in body:
-        why = classify.key_name_problem(str(body["key_name"]))
-        if why:
-            return JSONResponse({"success": False, "message": f"key_name is the name of a .env "
-                                 f"key, never the key: {why}"}, status_code=400)
-    if "base_url" in body:
-        why = classify.base_url_problem(str(body["base_url"] or ""))
-        if why:
-            return JSONResponse({"success": False, "message": why}, status_code=400)
-    if "yes" in body:
-        if isinstance(body["yes"], bool) or not isinstance(body["yes"], (int, float)):
-            return JSONResponse({"success": False, "message": "yes is a number from "
-                                 "0.5 to 0.99"}, status_code=400)
-        body["yes"] = classify.yes_setting(body["yes"])
+                             + ", ".join(CLASSIFY_FIELDS) + " (a classifier's setup is a "
+                             "profile's: /api/classify/profiles)"}, status_code=400)
     for money in CLASSIFY_MONEY:
         if money in body:
             raw = body[money]
@@ -2058,12 +2108,11 @@ async def set_classify(request: Request):
     if "tasks" in body:
         if not isinstance(body["tasks"], dict) or any(
                 k not in classify.TASKS or not isinstance(v, dict) for k, v in body["tasks"].items()):
-            return JSONResponse({"success": False, "message": "tasks: {name: {on, per_day}} "
+            return JSONResponse({"success": False, "message": "tasks: {name: {per_day}} "
                                  "for " + ", ".join(classify.TASKS)}, status_code=400)
         try:
             body["tasks"] = json.dumps({
-                k: {"on": bool(v.get("on", True)),
-                    "per_day": min(classify.MAX_PER_DAY, max(0, int(v.get("per_day") or 0)))}
+                k: {"per_day": min(classify.MAX_PER_DAY, max(0, int(v.get("per_day") or 0)))}
                 for k, v in body["tasks"].items()})
         except (TypeError, ValueError):
             return JSONResponse({"success": False, "message": "tasks: per_day is a number"},
@@ -2096,16 +2145,20 @@ async def get_classify_models(provider: str = ""):
 
 
 @app.get("/api/classify/account")
-async def get_classify_account(refresh: bool = False):
+async def get_classify_account(refresh: bool = False, profile: str = ""):
     """The classifier key's DeepInfra account, read here with the key
     (never sent to the browser): this month's usage per model, the key's
-    limit and spend, the balance; each part says when it can't be read."""
-    from harvey import classify
+    limit and spend, the balance; each part says when it can't be read.
+    ``profile``: that profile's key (else the site task's)."""
+    from harvey import classify, classify_profiles as profiles
     from harvey import classify_prices as prices
 
     state = _state()
     await state.init_db()
-    return await prices.account(await classify.settings(state), refresh=refresh)
+    s = await profiles.settings_for(state, profile) if profile else await classify.settings(state)
+    if s is None:
+        return JSONResponse({"error": "no such profile"}, status_code=404)
+    return await prices.account(s, refresh=refresh)
 
 
 @app.post("/api/classify/test")
@@ -2143,6 +2196,343 @@ async def get_classify_test(job_id: str):
     return {"status": job.status, "error": job.error, "result": job.result}
 
 
+# ── Classifier profiles (harvey/classify_profiles.py) ──
+
+def _bad(message: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"success": False, "message": message}, status_code=status)
+
+
+async def _profiles_view(state) -> dict:
+    from harvey import classify, classify_prices, classify_profiles as profiles
+
+    use = await profiles.uses(state)
+    gone = set(await profiles.hidden(state))
+    runs = await profiles.tests(state)
+    base = await classify.install_caps(state)
+    out = []
+    for p in (await profiles.every(state, with_hidden=True)).values():
+        row = profiles.public(p, use=use, runs=runs.get(p["id"]) or [],
+                              key_set=profiles.key_set(p), hidden_=p["id"] in gone)
+        # (Its own hold, or its account's: {seconds, why, scope}; 0 not held.)
+        h = await asyncio.to_thread(classify.held, profiles.settings_of(p, base))
+        row["held"] = {**h, "seconds": int(h["seconds"])}
+        out.append(row)
+    return {"profiles": out, "use": use, "hidden": sorted(gone),
+            "tasks": {t: {**profiles.TASK_DOCS.get(t, {}),
+                          "kinds": [k for k in profiles.KINDS if t in profiles.kind_tasks(k)]}
+                      for t in classify.TASKS},
+            "kinds": list(profiles.KINDS), "test_set": profiles.catalog().get("test_set"),
+            "about": profiles.catalog().get("about"),
+            "keys": profiles.catalog().get("keys") or {},
+            # (The host a base URL must have, exactly, for DeepInfra's
+            # price list and account: classify_prices.is_deepinfra.)
+            "deepinfra_host": classify_prices.DEEPINFRA_HOST}
+
+
+@app.get("/api/classify/profiles")
+async def get_classify_profiles():
+    """Every classifier profile (the built-ins with what they measured, and
+    yours), which task is set to which, and what each task is for and
+    when it is asked. A key is named, never shown."""
+    state = _state()
+    await state.init_db()
+    return await _profiles_view(state)
+
+
+@app.post("/api/classify/profiles")
+async def add_classify_profile(request: Request):
+    """A new profile of your own: {name, kind, base_url, model, key_name,
+    request_extra, json_mode, per_minute, timeout_seconds, prices:
+    {in_per_m, out_per_m} | {from_list: true}, tasks, questions, notes}.
+    It is "not tested" until a test run records results on it."""
+    from harvey import classify_profiles as profiles
+
+    state = _state()
+    await state.init_db()
+    try:
+        p = await profiles.save(state, await _json_body(request))
+    except ValueError as e:
+        return _bad(str(e))
+    return {"success": True, "profile": p, **await _profiles_view(state)}
+
+
+@app.post("/api/classify/profiles/{profile_id}")
+async def change_classify_profile(profile_id: str, request: Request):
+    """Change a profile (any of its fields): a built-in's change is saved as
+    a copy of your own, based on it (the reply's ``profile`` is the copy).
+    A change to what it asks marks it not tested."""
+    from harvey import classify_profiles as profiles
+
+    state = _state()
+    await state.init_db()
+    try:
+        p = await profiles.save(state, await _json_body(request), profile_id=profile_id)
+    except KeyError:
+        return _bad("no such profile", 404)
+    except ValueError as e:
+        return _bad(str(e))
+    return {"success": True, "profile": p, "copied_from": profile_id
+            if p["id"] != profile_id else "", **await _profiles_view(state)}
+
+
+@app.post("/api/classify/use")
+async def set_classify_use(request: Request):
+    """{task: profile id or "off"}: which profile answers each task. A
+    profile that can't answer a task (a decision model: search results)
+    can't be set for it."""
+    from harvey import classify_profiles as profiles
+
+    state = _state()
+    await state.init_db()
+    try:
+        use = await profiles.set_use(state, await _json_body(request))
+    except ValueError as e:
+        return _bad(str(e))
+    return {"success": True, "use": use, **await _classify_status(state)}
+
+
+def _test_request(body: dict) -> tuple[dict, str]:
+    """A test run's {tasks, file, every, limit} checked: ``file`` is a
+    labelled JSONL file on the server (the judge-test format)."""
+    import os
+
+    tasks = body.get("tasks") or ["site"]
+    if tasks == "all":
+        tasks = ["site", "results"]
+    if not isinstance(tasks, list) or not tasks or any(t not in ("site", "results")
+                                                       for t in tasks):
+        return {}, "tasks: site and/or results (the contacts task is scored with site)"
+    path = body.get("file") or ""
+    if path:
+        if not isinstance(path, str) or len(path) > 1000:
+            return {}, "file is a path on the server"
+        # (A labelled .jsonl file only, its link followed: never .env or
+        # another file whose lines would be sent to the profile's endpoint.)
+        real = os.path.realpath(path)
+        if not real.endswith(".jsonl") or not os.path.isfile(real):
+            return {}, "no such .jsonl file on the server"
+        path = real
+        if os.path.getsize(path) > 50_000_000:
+            return {}, "the file is over 50 MB"
+    try:
+        limit = max(0, int(body.get("limit") or 0))
+    except (TypeError, ValueError):
+        return {}, "limit is a number"
+    return {"tasks": tasks, "file": path, "every": bool(body.get("every")),
+            "limit": limit}, ""
+
+
+async def _test_estimate(state, profile_id: str, req: dict) -> dict:
+    from harvey import classify_profiles as profiles, site_check
+
+    s = await profiles.settings_for(state, profile_id)
+    rows = site_check.read_cases(req["file"]) if req["file"] else site_check.builtin_cases()
+    est = await site_check.estimate_test(state, rows, s=s, tasks=req["tasks"],
+                                         every=req["every"], limit=req["limit"])
+    return {**est, "profile": profile_id, "test_set": "your file" if req["file"] else "built-in"}
+
+
+@app.post("/api/classify/profiles/{profile_id}/test/estimate")
+async def estimate_classify_test(profile_id: str, request: Request):
+    """What a test run of a profile would ask and may cost, counted before
+    anything is sent: {tasks, file, every, limit} → {calls, tokens_in,
+    usd_typical, usd_high, price_known, by_task, note}. An estimate: the
+    run's USD cap is what is enforced, call by call."""
+    from harvey import classify_profiles as profiles
+
+    req, error = _test_request(await _json_body(request))
+    if error:
+        return _bad(error)
+    state = _state()
+    await state.init_db()
+    if await profiles.settings_for(state, profile_id) is None:
+        return _bad("no such profile", 404)
+    try:
+        return await _test_estimate(state, profile_id, req)
+    except (OSError, ValueError) as e:
+        return _bad(f"the file can't be read: {type(e).__name__}")
+
+
+@app.post("/api/classify/profiles/{profile_id}/test")
+async def start_profile_test(profile_id: str, request: Request):
+    """Test a profile with Harvey's judge test, as a job on the classifier's
+    lane: {tasks, file, every, limit, max_spend} (max_spend: USD the run's
+    classifier calls may cost; required, 0 or more). The result is kept on
+    the profile (GET /api/classify/profiles shows its tests)."""
+    from harvey import classify_profiles as profiles
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_classify_test
+
+    body = await _json_body(request)
+    req, error = _test_request(body)
+    if error:
+        return _bad(error)
+    try:
+        cap = _money(body.get("max_spend"))
+    except (TypeError, ValueError):
+        return _bad("max_spend: the USD the test may spend, 0 or more")
+    state = _state()
+    await state.init_db()
+    if await profiles.settings_for(state, profile_id) is None:
+        return _bad("no such profile", 404)
+    try:
+        batch_id, job_id = await enqueue_classify_test(
+            state, profile_id, tasks=req["tasks"], max_spend=cap, file=req["file"],
+            every=req["every"], limit=req["limit"])
+    except jobs.Duplicate as e:
+        return JSONResponse(_duplicate_body(e), status_code=409)
+    jobs.notify()
+    return {"success": True, "job_id": job_id, "batch_id": batch_id, "max_spend": cap}
+
+
+@app.post("/api/classify/profiles/{profile_id}/{action}")
+async def act_on_classify_profile(profile_id: str, action: str):
+    """remove (one of your own: the tasks set to it are off), hide or
+    restore (a built-in)."""
+    from harvey import classify_profiles as profiles
+
+    if action not in ("remove", "hide", "restore"):
+        return _bad(f"unknown action {action!r}")
+    state = _state()
+    await state.init_db()
+    try:
+        if action == "remove":
+            done = await profiles.remove(state, profile_id)
+        else:
+            done = await profiles.hide(state, profile_id, shown=action == "restore")
+    except KeyError:
+        return _bad("no such profile of yours" if action == "remove" else "no such built-in",
+                    404)
+    return {"success": True, **done, **await _profiles_view(state)}
+
+
+# ── Verifying contacts with the classifier (harvey/contact_check.py) ──
+
+async def _verify_selection(state, body: dict) -> tuple[list[dict], str]:
+    """The links a verification takes: {"contact_ids": [...]} or {"filter":
+    {the Contacts page's filters}, "limit"}; at most contact_check.MAX_LINKS."""
+    from harvey import contact_check
+
+    try:
+        limit = max(1, min(int(body.get("limit") or 200), contact_check.MAX_LINKS))
+    except (TypeError, ValueError):
+        return [], "limit must be a number"
+    ids = body.get("contact_ids")
+    if ids is not None:
+        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+            return [], "contact_ids is a list of contact ids"
+    else:
+        raw = body.get("filter") if isinstance(body.get("filter"), dict) else {}
+        try:
+            f, _ = await _contact_filter(state, {k: str(v) for k, v in raw.items()
+                                                 if v is not None})
+        except ValueError as e:
+            return [], str(e)
+        _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
+    return await contact_check.links(state, ids[:limit], limit=limit), ""
+
+
+@app.post("/api/contacts/verify/estimate")
+async def estimate_contact_verify(request: Request):
+    """What verifying the chosen links may cost, before anything is sent:
+    {links, companies, calls, tokens_typical, tokens_high, basis,
+    usd_typical, usd_high, price_known, profile, model, off, note}. An
+    estimate: the run's cap is what is enforced, call by call."""
+    from harvey import contact_check
+
+    state = _state()
+    await state.init_db()
+    chosen, error = await _verify_selection(state, await _json_body(request))
+    if error:
+        return _bad(error)
+    return await contact_check.estimate(state, chosen)
+
+
+@app.post("/api/contacts/verify")
+async def start_contact_verify(request: Request):
+    """Verify the chosen links with the classifier's contacts task (yes /
+    no / unsure), one job per company: the selection's fields and
+    ``max_spend`` (USD the run's classifier calls may cost, required).
+    Its batch id undoes what its no's lowered (POST /api/contacts/verify/undo)."""
+    from harvey import classify
+    from harvey.modules import jobs
+    from harvey.modules.job_kinds import enqueue_contact_checks
+
+    body = await _json_body(request)
+    try:
+        cap = _money(body.get("max_spend"))
+    except (TypeError, ValueError):
+        return _bad("max_spend: the USD the run may spend on the classifier, 0 or more")
+    state = _state()
+    await state.init_db()
+    if await classify.available(state, "contacts") in ("off", "task off"):
+        return _bad("set a profile for the contacts task first (Settings → Classifier)", 409)
+    chosen, error = await _verify_selection(state, body)
+    if error:
+        return _bad(error)
+    if not chosen:
+        return {"success": True, "queued": 0, "links": 0}
+    try:
+        batch_id, ids, dupes = await enqueue_contact_checks(state, chosen, max_spend=cap)
+    except jobs.Duplicate as e:
+        return JSONResponse(_duplicate_body(e), status_code=409)
+    jobs.notify()
+    return {"success": True, "batch_id": batch_id, "queued": len(ids),
+            "already_waiting": len(dupes), "links": len(chosen), "max_spend": cap}
+
+
+@app.post("/api/contacts/verify/undo")
+async def undo_contact_verify(request: Request):
+    """{"batch": id}: put back the trust a verification's no's lowered."""
+    body = await _json_body(request)
+    if not isinstance(body.get("batch"), str) or not body["batch"]:
+        return _bad("batch: the verification run's id")
+    state = _state()
+    await state.init_db()
+    return {"success": True, **await state.undo_contact_checks(body["batch"])}
+
+
+@app.get("/api/contacts/verify/review")
+async def contact_verify_review(verdict: str = "unsure", limit: int = 50):
+    """The links the classifier gave ``verdict`` (unsure: for your review),
+    newest first, still standing."""
+    from harvey import contact_check
+
+    if verdict not in contact_check.VERDICTS:
+        return _bad("verdict: yes, no or unsure")
+    state = _state()
+    await state.init_db()
+    return {"verdict": verdict,
+            "links": await state.read("contact_checks_open", verdict, max(1, min(limit, 500)))}
+
+
+@app.get("/api/contacts/verify/verdicts")
+async def contact_verify_verdicts(ids: str = ""):
+    """The classifier's newest verdict still standing on each of ``ids``
+    (comma-separated contact ids, 200 at most): {"verdicts": {id: check}},
+    a contact with none left out (the Contacts rows)."""
+    try:
+        wanted = list(dict.fromkeys(int(i) for i in ids.split(",") if i.strip()))[:200]
+    except ValueError:
+        return _bad("ids: contact ids, comma-separated")
+    state = _state()
+    await state.init_db()
+    out = {}
+    for cid in wanted:
+        standing = [c for c in await state.read("contact_checks", cid) if not c["undone"]]
+        if standing:
+            out[str(cid)] = standing[0]
+    return {"verdicts": out}
+
+
+@app.get("/api/contacts/{contact_id}/checks")
+async def get_contact_checks(contact_id: int):
+    """The classifier's verdicts on a contact's links, newest first."""
+    state = _state()
+    await state.init_db()
+    return {"checks": await state.read("contact_checks", contact_id)}
+
+
 @app.get("/api/contacts/site-checks")
 async def get_site_checks():
     """What checking the found websites would do (counted, nothing changed)."""
@@ -2176,8 +2566,6 @@ async def start_site_checks():
 @app.get("/api/contacts/{contact_id}")
 async def get_contact_reach(contact_id: int):
     """Every live company a contact reaches, through whom and where."""
-    from harvey import contacts
-
     if not DB_PATH.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     return await _state().read("reach", contact_id)
@@ -2189,9 +2577,6 @@ async def _contact_export_rows(request: Request) -> tuple[list[dict], int]:
     out (an opt-out, an address on compliance.do_not_contact, and every
     contact of a company whose domain is on it: its phones too). ConfigError
     when the list can't be read."""
-    from harvey import contacts
-    from harvey.gate import do_not_contact_domain_match, do_not_contact_match
-
     state = _state()
     await state.init_db()
     f, attach = await _contact_filter(state, request.query_params)
@@ -4263,6 +4648,15 @@ async def start_discovery(request: Request):
             return JSONResponse({"success": False, "message": "websites_max_spend must be a "
                                  "number of dollars, 0 or more", "code": "bad_cap"},
                                 status_code=400)
+        try:
+            # (What the classifier may cost on the companies the run saves:
+            # absent, no cap of the run's own.)
+            classify_cap = None if body.get("classify_max_spend") in (None, "") \
+                else _money(body.get("classify_max_spend"))
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "classify_max_spend must be a "
+                                 "number of dollars, 0 or more", "code": "bad_cap"},
+                                status_code=400)
 
         state = _state()
         await state.init_db()
@@ -4272,6 +4666,7 @@ async def start_discovery(request: Request):
         try:
             batch_id, ids, dupes = await enqueue_sources(
                 state, plan, max_spend=max_spend, find_websites=find_websites,
+                classify_max_spend=classify_cap,
                 label=" + ".join(p_.get("name") or p_["label"] for p_ in plan))
         except jobs.Duplicate as e:
             return JSONResponse(_duplicate_body(e), status_code=409)
@@ -4432,6 +4827,7 @@ async def get_jobs(batch: str = ""):
             "paused": counts.get(jobs.PAUSED, 0), "failed": counts.get(jobs.FAILED, 0),
             "worker": {"pid": holder.get("pid"), "host": holder.get("host")} if holder else None,
             "batch": await jobs.get_batch(state, batch) if batch else None,
+            "report": await jobs.batch_report(state, batch) if batch else None,
         }
     except Exception as e:
         logger.exception("jobs failed")
@@ -4488,28 +4884,67 @@ async def act_on_lane(lane: str, action: str):
     return {"success": True, "lane": lane, "paused": action == "pause"}
 
 
+@app.get("/api/jobs/batches")
+async def get_recent_batches(limit: int = 5):
+    """The newest runs, each with its report (Today: what each run took
+    and cost)."""
+    from harvey.modules import jobs
+
+    state = _state()
+    await state.init_db()
+    return {"runs": [{**b, "report": await jobs.batch_report(state, b["id"])}
+                     for b in await jobs.recent_batches(state, max(1, min(limit, 20)))]}
+
+
+@app.get("/api/jobs/batches/{batch_id}/report")
+async def get_batch_report(batch_id: str):
+    """How long a run took and what it cost, split: {jobs, statuses,
+    seconds (first start to last finish), job_seconds, searches_usd,
+    checks_made, checks_usd, classify: {calls, errors, tokens_in,
+    tokens_out, usd, unpriced, refused}, other_usd, total_usd}; each job's
+    own figures are in its result (``spend``, ``ms``, ``classify``)."""
+    from harvey.modules import jobs
+
+    state = _state()
+    await state.init_db()
+    batch = await jobs.get_batch(state, batch_id)
+    if batch is None:
+        return JSONResponse({"error": "no such run"}, status_code=404)
+    return {**await jobs.batch_report(state, batch_id), "batch": batch}
+
+
 @app.post("/api/jobs/batches/{batch_id}/cap")
 async def raise_batch_cap(batch_id: str, request: Request):
-    """{"max_spend": n}: a new spend limit for a run; its jobs the old
-    limit paused go back to the queue and carry on from where they stopped.
-    A run with amounts of its own (a Discover run's searches and website
-    lookups) gives the change to ``pool`` ("websites"), else its searches."""
+    """{"max_spend": n} and/or {"classify_max_spend": n}: a new spend limit
+    for a run (its searches', its classifier's); its jobs the old limit
+    paused go back to the queue and carry on from where they stopped. A
+    run with amounts of its own (a Discover run's searches and website
+    lookups) gives a max_spend change to ``pool`` ("websites"), else its
+    searches."""
     from harvey.modules import jobs
 
     try:
         body = await request.json()
-        cap = _money((body or {}).get("max_spend"))
-        pool = (body or {}).get("pool") or ""
+        body = body if isinstance(body, dict) else {}
+        cap = _money(body.get("max_spend")) if "max_spend" in body else None
+        classify_cap = _money(body.get("classify_max_spend")) \
+            if "classify_max_spend" in body else None
+        if cap is None and classify_cap is None:
+            raise ValueError("nothing to change")
+        pool = body.get("pool") or ""
         if not isinstance(pool, str):
             raise ValueError(pool)
     except Exception:
-        return JSONResponse({"success": False, "message": "expected max_spend, a number >= 0"},
-                            status_code=400)
+        return JSONResponse({"success": False, "message": "expected max_spend or "
+                             "classify_max_spend, a number >= 0"}, status_code=400)
     state = _state()
     await state.init_db()
     if await jobs.get_batch(state, batch_id) is None:
         return JSONResponse({"success": False, "message": "no such run"}, status_code=404)
-    await jobs.set_batch_cap(state, batch_id, cap, pool=pool)
+    if cap is not None:
+        await jobs.set_batch_cap(state, batch_id, cap, pool=pool)
+    if classify_cap is not None:
+        await jobs.set_classify_cap(state, batch_id, classify_cap)
     resumed = 0
     for job in await jobs.list_jobs(state, statuses=(jobs.PAUSED,), batch_id=batch_id,
                                     limit=100000):

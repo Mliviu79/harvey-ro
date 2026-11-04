@@ -956,6 +956,71 @@ class Store:
             done += 1
         return {"restored": done, "refused": refused}
 
+    def check_link(self, company_id, contact: int, *, verdict: str, batch: str,
+                   profile: str = "", model: str = "", p: float | None = None,
+                   note: str = "") -> dict:
+        """The classifier's verdict on one link (harvey/contact_check.py),
+        kept under ``batch``. yes and unsure change nothing but this row
+        (an unsure one waits for a person's review); no lowers the link's
+        evidence from a website's read to unconfirmed, its trust before
+        kept in the row for the undo. Evidence an official source gave
+        (a register, ANAF, the taxpayer file, a listing) is never lowered,
+        nor a contact in a campaign; nothing is deleted. Returns
+        {"verdict", "lowered", "kept"}."""
+        from harvey.overlay.reads import SITE_SOURCES
+        from harvey.queries import sql
+
+        fid = self.live(company_id)
+        if fid is None:
+            return {"verdict": verdict, "lowered": 0, "kept": "no such company"}
+        if self.one("SELECT 1 FROM contact_check WHERE batch = ? AND firm = ? AND contact = ?",
+                    (batch, fid, contact)):
+            # (Asked already in this run: its first verdict, and its undo, stand.)
+            return {"verdict": verdict, "lowered": 0, "kept": "checked already in this run"}
+        lowered, kept, payload = 0, "", None
+        if verdict == "no":
+            site = {self.source(n) for n in SITE_SOURCES}
+            group = self._group(fid)
+            marks = ",".join("?" * len(group))
+            rows = self.x(f"SELECT firm, source, person, trust FROM link_evidence "
+                          f"WHERE firm IN ({marks}) AND contact = ?", (*group, contact)).fetchall()
+            value = self.one("SELECT value FROM contact WHERE id = ?", (contact,)) or ""
+            if any(r[1] not in site for r in rows):
+                kept = "an official source gives it"
+            elif self.one(sql("overlay.contact_check.in_campaign"), (contact, value)):
+                kept = "it is in a campaign"
+            else:
+                payload = [list(r) for r in rows if r[3] != TRUST["unconfirmed"]]
+                for f, source, person, _ in payload:
+                    self.x("UPDATE link_evidence SET trust = ? WHERE firm = ? AND contact = ? "
+                           "AND source = ? AND person = ?",
+                           (TRUST["unconfirmed"], f, contact, source, person))
+                lowered = len(payload)
+        self.x("INSERT OR REPLACE INTO contact_check (firm, contact, batch, at, verdict, profile, "
+               "model, p, note, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (fid, contact, batch, int(time.time()), schema.CHECK_VERDICT[verdict], profile,
+                model, p, ((note + "; " if note else "") + (f"kept: {kept}" if kept else ""))
+                [:500] or None, json.dumps(payload) if payload else None))
+        return {"verdict": verdict, "lowered": lowered, "kept": kept}
+
+    def undo_contact_checks(self, batch: str) -> dict:
+        """Put back what a verification's no took in ``batch`` (each
+        evidence row's trust, while it is still unconfirmed: a later read
+        that made it surer stands), and mark its rows undone."""
+        restored, rows = 0, 0
+        for fid, contact, raw in self.x("SELECT firm, contact, payload FROM contact_check "
+                                        "WHERE batch = ? AND undone_at IS NULL",
+                                        (batch,)).fetchall():
+            rows += 1
+            for f, source, person, trust in json.loads(raw) if raw else []:
+                restored += self.x(
+                    "UPDATE link_evidence SET trust = ? WHERE firm = ? AND contact = ? "
+                    "AND source = ? AND person = ? AND trust = ?",
+                    (trust, f, contact, source, person, TRUST["unconfirmed"])).rowcount
+        self.x("UPDATE contact_check SET undone_at = ? WHERE batch = ? AND undone_at IS NULL",
+               (int(time.time()), batch))
+        return {"checks": rows, "restored": restored}
+
     def mark_company_profiled(self, company_id) -> None:
         fid = self.live(company_id)
         if fid is not None:

@@ -489,6 +489,7 @@ global.tServer = (k, d) => d;
 global.searchPh = () => 'cl.search_ph';
 global.own = (o, k) => Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined;
 global.statusMeta = s => ({label: s});
+global._modules = {email: false};
 let calls = [];
 global.api = async (path, opts) => { calls.push([path, opts && opts.body]);
   if (path === '/api/contacts/find/estimate') return {companies: 2, with_site: 1, to_look_up: 1,

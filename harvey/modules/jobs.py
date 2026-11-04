@@ -266,6 +266,20 @@ async def new_batch(state, kind_: str, label: str = "", params: dict | None = No
     return batch_id
 
 
+async def recent_batches(state, limit: int = 5) -> list[dict]:
+    """The newest runs that queued a job, newest first (Today's list of
+    what each run took and cost)."""
+    import aiosqlite
+
+    async with state._connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+                "SELECT b.id, b.kind, b.label, b.max_spend, b.created_at FROM job_batches b "
+                "WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.batch_id = b.id) "
+                "ORDER BY b.created_at DESC, b.rowid DESC LIMIT ?", (int(limit),)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
 async def drop_batch(state, batch_id: str) -> None:
     """Forget a batch none of whose jobs was queued (all were duplicates)."""
     async with state._connect() as db:
@@ -312,13 +326,41 @@ async def set_batch_cap(state, batch_id: str, max_spend: float, pool: str = "") 
         await db.commit()
 
 
+# What a job's classifier calls cost (harvey/classify.py's Meter, kept in
+# its progress): part of its actual_cost, so the day's and the month's
+# spend limits count it, but drawn from the run's classifier cap
+# (``classify_max_spend``), never from its searches' cap.
+CLASSIFY_USD = "COALESCE(json_extract(progress_json, '$.classify.usd'), 0)"
+# What a running job still holds of its reservation: ``reserved`` is for
+# its searches and checks (reserve), so its classifier calls don't use it up.
+HELD = f"MAX(reserved - (actual_cost - {CLASSIFY_USD}), 0)"
+
+
+def classify_usd(job: "Job") -> float:
+    """What ``job``'s classifier calls cost so far."""
+    try:
+        return float(((job.progress or {}).get("classify") or {}).get("usd") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+async def set_classify_cap(state, batch_id: str, max_spend: float) -> None:
+    """A run's new classifier limit (its params' ``classify_max_spend``)."""
+    async with state._connect() as db:
+        await db.execute("UPDATE job_batches SET params_json = json_set(COALESCE(params_json, "
+                         "'{}'), '$.classify_max_spend', ?) WHERE id = ?",
+                         (float(max_spend), batch_id))
+        await db.commit()
+
+
 async def batch_spent(state, batch_id: str, *, exclude: str = "") -> float:
-    """What a batch's jobs other than ``exclude`` spent, plus what its
-    other running jobs hold reserved."""
+    """What a batch's jobs other than ``exclude`` spent on searches and
+    checks (their classifier calls left out: those have a cap of their
+    own), plus what its other running jobs hold reserved."""
     async with state._connect() as db:
         async with db.execute(
-                "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
-                "THEN MAX(reserved - actual_cost, 0) ELSE 0 END), 0) "
+                f"SELECT COALESCE(SUM(actual_cost - {CLASSIFY_USD}), 0) + COALESCE(SUM(CASE "
+                f"WHEN status = 'running' THEN {HELD} ELSE 0 END), 0) "
                 "FROM jobs WHERE batch_id = ? AND id != ?", (batch_id, exclude)) as cur:
             (spent,) = await cur.fetchone()
     return float(spent or 0.0)
@@ -328,8 +370,8 @@ async def pool_spent(state, batch_id: str, pool: str, *, exclude: str = "") -> f
     """batch_spent, of the batch's jobs in one pool (``params.pool``) only."""
     async with state._connect() as db:
         async with db.execute(
-                "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
-                "THEN MAX(reserved - actual_cost, 0) ELSE 0 END), 0) "
+                f"SELECT COALESCE(SUM(actual_cost - {CLASSIFY_USD}), 0) + COALESCE(SUM(CASE "
+                f"WHEN status = 'running' THEN {HELD} ELSE 0 END), 0) "
                 "FROM jobs WHERE batch_id = ? AND id != ? "
                 "AND json_extract(params_json, '$.pool') = ?", (batch_id, exclude, pool)) as cur:
             (spent,) = await cur.fetchone()
@@ -342,7 +384,7 @@ async def spent_since(state, since: str, *, exclude: str = "") -> float:
     async with state._connect() as db:
         async with db.execute(
                 "SELECT COALESCE(SUM(actual_cost), 0) + COALESCE(SUM(CASE WHEN status = 'running' "
-                "THEN MAX(reserved - actual_cost, 0) ELSE 0 END), 0) FROM jobs "
+                f"THEN {HELD} ELSE 0 END), 0) FROM jobs "
                 "WHERE started_at >= datetime('now', ?) AND id != ?", (since, exclude)) as cur:
             (spent,) = await cur.fetchone()
     return float(spent or 0.0)
@@ -355,15 +397,19 @@ async def reserve(state, job: Job, estimate: float, first: float, *,
     and of the install's limits for the day and the month (UTC;
     ``per_day`` / ``per_month``, none when None). Returns the money it may
     spend; SpendLimit when what is left can't pay for even its ``first``
-    request. A job with no cap anywhere may spend without limit."""
+    request. A job with no cap anywhere may spend without limit. (The
+    run's cap and its pools are for searches and checks: the job's
+    classifier calls are left out of them, and counted in the day's and
+    the month's.)"""
     own = float(job.actual_cost or 0.0)
+    own_paid = max(0.0, own - classify_usd(job))
     left = float("inf")
     batch = await get_batch(state, job.batch_id) if job.batch_id else None
     cap = batch.get("max_spend") if batch else None
     limits = []
     if cap is not None:
-        limits.append((float(cap) - await batch_spent(state, job.batch_id, exclude=job.id) - own,
-                       f"the run's spend limit (${float(cap):.2f}) is reached"))
+        limits.append((float(cap) - await batch_spent(state, job.batch_id, exclude=job.id)
+                       - own_paid, f"the run's spend limit (${float(cap):.2f}) is reached"))
         # A run with amounts of its own inside its cap (``pools``: a
         # Discover run's searches and its website lookups): a job draws
         # from its own pool only.
@@ -372,7 +418,7 @@ async def reserve(state, job: Job, estimate: float, first: float, *,
         if pool in pools:
             amount = float(pools[pool])
             limits.append((amount - await pool_spent(state, job.batch_id, pool, exclude=job.id)
-                           - own, f"the run's amount for {pool} (${amount:.2f}) is reached"))
+                           - own_paid, f"the run's amount for {pool} (${amount:.2f}) is reached"))
     for limit, since, what in ((per_day, "start of day", "day"),
                                (per_month, "start of month", "month")):
         if limit is not None:
@@ -389,9 +435,178 @@ async def reserve(state, job: Job, estimate: float, first: float, *,
         return left
     hold = min(max(estimate, first), left)
     async with state._connect() as db:
-        await db.execute("UPDATE jobs SET reserved = ? WHERE id = ?", (own + hold, job.id))
+        await db.execute("UPDATE jobs SET reserved = ? WHERE id = ?", (own_paid + hold, job.id))
         await db.commit()
     return left
+
+
+async def classify_spent(state, batch_id: str, *, exclude: str = "") -> float:
+    """What a batch's jobs other than ``exclude`` spent on the classifier."""
+    async with state._connect() as db:
+        async with db.execute(f"SELECT COALESCE(SUM({CLASSIFY_USD}), 0) FROM jobs "
+                              "WHERE batch_id = ? AND id != ?", (batch_id, exclude)) as cur:
+            (spent,) = await cur.fetchone()
+    return float(spent or 0.0)
+
+
+async def classify_room(state, job: Job, estimate: float, *, own_classify: float,
+                        own: float, per_day: float | None = None,
+                        per_month: float | None = None) -> str:
+    """"" when ``job`` may make a classifier call that may cost
+    ``estimate`` (USD), else why not: its run's classifier cap
+    (``classify_max_spend`` in its batch's params: None is no cap, 0 no
+    calls) or the install's limits for the day and the month (every job's
+    spend, its classifier calls included). ``own_classify`` / ``own``:
+    what the job spent on the classifier / in all so far."""
+    batch = await get_batch(state, job.batch_id) if job.batch_id else None
+    cap = ((batch or {}).get("params") or {}).get("classify_max_spend")
+    if cap is not None:
+        cap = float(cap)
+        left = cap - await classify_spent(state, job.batch_id, exclude=job.id) - own_classify
+        if cap <= 0 or estimate > left + 1e-12 or left <= 0:
+            return f"the run's classifier limit (${cap:.2f}) is reached"
+    for limit, since, what in ((per_day, "start of day", "day"),
+                               (per_month, "start of month", "month")):
+        if limit is not None:
+            mine = own if job.started_at and await _started_since(state, job.id, since) else 0.0
+            left = float(limit) - await spent_since(state, since, exclude=job.id) - mine
+            if estimate > left + 1e-12 or left <= 0:
+                return f"the spend limit for the {what} (${float(limit):.2f}) is reached"
+    return ""
+
+
+async def batch_report(state, batch_id: str) -> dict:
+    """How long a run took and what it cost, split: its jobs by status,
+    the time from its first start to its last finish and the jobs' own
+    time added up, the paid searches, the address checks (``checks_made``:
+    requests to verification services, each a check at that service, per
+    service in ``services``; ``checks_usd``: those past a service's free
+    allowance at its price; ``checks_refused``: checks refused, a service
+    past its free tier with no price among the reasons), Hunter's pattern
+    lookups (``lookups_made``, ``lookups_usd``) and the classifier (calls,
+    tokens, USD) its jobs record (a finder job's result ``spend``, every
+    job's progress ``classify``). A finished run's report is stored on its
+    batch row (``report_json``, with what it was made from: the jobs'
+    statuses and last finish) and read from there while none of its jobs
+    changed; retrying or resuming one clears it. A running run's is
+    computed each time."""
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT status, COUNT(*), MAX(finished_at) FROM jobs WHERE batch_id = ? "
+                "GROUP BY status", (batch_id,)) as cur:
+            rows = await cur.fetchall()
+        async with db.execute("SELECT report_json FROM job_batches WHERE id = ?",
+                              (batch_id,)) as cur:
+            stored = await cur.fetchone()
+    statuses = {k: n for k, n, _ in rows}
+    mark = [sorted([k, n] for k, n in statuses.items()),
+            max((f or "" for *_, f in rows), default="")]
+    finished = bool(rows) and not any(k in ACTIVE for k in statuses)
+    if finished and stored and stored[0]:
+        try:
+            kept = json.loads(stored[0])
+            if kept.get("mark") == mark:
+                return kept["report"]
+        except (TypeError, ValueError, KeyError, AttributeError):
+            pass
+    out = await _batch_report(state, batch_id, statuses)
+    if finished:
+        async with state._connect() as db:
+            await db.execute("UPDATE job_batches SET report_json = ? WHERE id = ?",
+                             (json.dumps({"mark": mark, "report": out}), batch_id))
+            await db.commit()
+    return out
+
+
+async def _forget_report(state, batch_id: str) -> None:
+    """A run's stored report, cleared: a job of it runs again."""
+    if not batch_id:
+        return
+    async with state._connect() as db:
+        await db.execute("UPDATE job_batches SET report_json = NULL WHERE id = ?", (batch_id,))
+        await db.commit()
+
+
+async def _batch_report(state, batch_id: str, statuses: dict) -> dict:
+    out = {"batch_id": batch_id, "jobs": 0, "statuses": statuses, "seconds": None,
+           "job_seconds": 0.0, "searches_usd": 0.0, "checks_usd": 0.0, "checks_made": 0,
+           "checks_refused": 0, "services": {}, "lookups_usd": 0.0, "lookups_made": 0,
+           "other_usd": 0.0,
+           "classify": {"calls": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0, "usd": 0.0,
+                        "unpriced": 0, "refused": 0},
+           "total_usd": 0.0}
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT (julianday(MAX(finished_at)) - julianday(MIN(started_at))) * 86400, "
+                "SUM((julianday(finished_at) - julianday(started_at)) * 86400), "
+                "SUM(actual_cost), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.searches'), 0)), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.checks'), 0)), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.checks_made'), 0)), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.checks_refused'), 0)), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.lookups'), 0)), "
+                "SUM(COALESCE(json_extract(result_json, '$.spend.lookups_made'), 0)), "
+                "SUM(COALESCE(json_extract(progress_json, '$.classify.calls'), 0)), "
+                "SUM(COALESCE(json_extract(progress_json, '$.classify.errors'), 0)), "
+                "SUM(COALESCE(json_extract(progress_json, '$.classify.tokens_in'), 0)), "
+                "SUM(COALESCE(json_extract(progress_json, '$.classify.tokens_out'), 0)), "
+                f"SUM({CLASSIFY_USD}), "
+                "SUM(COALESCE(json_extract(progress_json, '$.classify.unpriced'), 0)), "
+                "SUM(json_extract(progress_json, '$.classify.refused') IS NOT NULL) "
+                "FROM jobs WHERE batch_id = ?", (batch_id,)) as cur:
+            row = await cur.fetchone()
+        # (Each service's requests: what its free allowance and bill count.)
+        async with db.execute(
+                "SELECT s.key, SUM(s.value) FROM jobs j, "
+                "json_each(json_extract(j.result_json, '$.spend.services')) s "
+                "WHERE j.batch_id = ? AND json_valid(j.result_json) GROUP BY s.key "
+                "ORDER BY s.key", (batch_id,)) as cur:
+            services = {k: int(n or 0) for k, n in await cur.fetchall()}
+    out["jobs"] = sum(out["statuses"].values())
+    (wall, work, total, searches, checks, made, refused_checks, lookups, looked, calls, errors,
+     tin, tout, cusd, unpriced, refused) = [x or 0 for x in row]
+    out["seconds"] = round(float(wall), 1) if row[0] is not None else None
+    out["job_seconds"] = round(float(work), 1)
+    out["searches_usd"] = round(float(searches), 6)
+    out["checks_usd"] = round(float(checks), 6)
+    out["checks_made"] = int(made)
+    out["checks_refused"] = int(refused_checks)
+    out["services"] = services
+    out["lookups_usd"] = round(float(lookups), 6)
+    out["lookups_made"] = int(looked)
+    out["classify"] = {"calls": int(calls), "errors": int(errors), "tokens_in": int(tin),
+                       "tokens_out": int(tout), "usd": round(float(cusd), 6),
+                       "unpriced": int(unpriced), "refused": int(refused)}
+    out["total_usd"] = round(float(total), 6)
+    # (Anything else a job spent: a Discover search's pages, a lookup's.)
+    out["other_usd"] = round(max(0.0, out["total_usd"] - out["searches_usd"]
+                                 - out["checks_usd"] - out["lookups_usd"]
+                                 - out["classify"]["usd"]), 6)
+    return out
+
+
+def report_line(r: dict) -> str:
+    """batch_report as one line for a terminal."""
+    c = r["classify"]
+    took = f"{r['seconds']:.0f} s" if r.get("seconds") is not None else "not started"
+    parts = [f"{r['jobs']:,} jobs in {took}",
+             f"searches ${r['searches_usd']:.4f}",
+             f"{r['checks_made']:,} address checks ${r['checks_usd']:.4f}"
+             + (f" ({', '.join(f'{k} {n:,}' for k, n in r['services'].items())})"
+                if r.get("services") else "")
+             + (f", {r['checks_refused']:,} refused (a month's cap, the run's money, or no "
+                "price past a free tier)" if r.get("checks_refused") else ""),
+             *([f"{r['lookups_made']:,} pattern lookups ${r['lookups_usd']:.4f}"]
+               if r.get("lookups_made") else []),
+             f"classifier {c['calls']:,} calls, {c['tokens_in'] + c['tokens_out']:,} tokens, "
+             f"${c['usd']:.4f}" + (f" ({c['unpriced']} unpriced)" if c["unpriced"] else "")]
+    if r.get("other_usd"):
+        parts.append(f"other ${r['other_usd']:.4f}")
+    parts.append(f"total ${r['total_usd']:.4f}")
+    line = "; ".join(parts)
+    if c.get("refused"):
+        line += f"; the classifier's money ran out for {c['refused']:,} job(s)"
+    return line
 
 
 async def _started_since(state, job_id: str, since: str) -> bool:
@@ -724,6 +939,7 @@ async def resume(state, job_id: str) -> Job:
     job = await _act(state, job_id, lambda j: _set_status(
         state, j, QUEUED, allowed=(PAUSED,),
         extra=", paused_reason = '', error = '', not_before = NULL"))
+    await _forget_report(state, job.batch_id)
     notify()
     return job
 
@@ -748,6 +964,7 @@ async def retry(state, job_id: str) -> Job:
         if there is not None:
             raise Duplicate(there)
         raise
+    await _forget_report(state, job.batch_id)
     notify()
     return job
 
@@ -758,16 +975,17 @@ async def pause_lane(state, lane: str, reason: str = PAUSED_BY_HAND) -> None:
     await state.set_setting(LANE_PAUSED_KEY.format(lane), reason or PAUSED_BY_HAND)
 
 
-async def rest_lane(state, lane: str, seconds: float, *, but: str = "") -> int:
-    """Hold a lane's queued jobs (all but ``but``) for ``seconds``: none
-    starts before then, and one held longer already keeps its own time.
-    For a service that is busy for everyone, not for one job. How many."""
+async def rest_lane(state, lane: str, seconds: float, *, but: str = "", kind: str = "") -> int:
+    """Hold a lane's queued jobs (all but ``but``; of one ``kind`` only,
+    when given) for ``seconds``: none starts before then, and one held
+    longer already keeps its own time. For a service that is busy for
+    everyone, not for one job. How many."""
     async with state._connect() as db:
         cur = await db.execute(
             "UPDATE jobs SET not_before = datetime('now', ?), updated_at = CURRENT_TIMESTAMP "
-            "WHERE lane = ? AND status = 'queued' AND id != ? "
+            "WHERE lane = ? AND status = 'queued' AND id != ? AND (? = '' OR kind = ?) "
             "AND (not_before IS NULL OR not_before < datetime('now', ?))",
-            (f"+{int(seconds)} seconds", lane, but, f"+{int(seconds)} seconds"))
+            (f"+{int(seconds)} seconds", lane, but, kind, kind, f"+{int(seconds)} seconds"))
         await db.commit()
         return cur.rowcount
 

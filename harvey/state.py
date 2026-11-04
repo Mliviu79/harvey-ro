@@ -2305,6 +2305,19 @@ class StateManager:
         """Put back what a re-check's rejections took off (overlay.store)."""
         return await self._on_overlay("undo_site_checks", batch)
 
+    async def check_link(self, company_id: str, contact_id: int, *, verdict: str, batch: str,
+                         profile: str = "", model: str = "", p: float | None = None,
+                         note: str = "") -> dict:
+        """The classifier's verdict on one link, kept for an undo
+        (overlay.store.check_link)."""
+        return await self._on_overlay("check_link", company_id, int(contact_id),
+                                      verdict=verdict, batch=batch, profile=profile, model=model,
+                                      p=p, note=note)
+
+    async def undo_contact_checks(self, batch: str) -> dict:
+        """Put back what a verification's no took (overlay.store)."""
+        return await self._on_overlay("undo_contact_checks", batch)
+
     async def add_people(self, company_id: str, people: list[tuple[str, str]], *,
                          source: str = "", origin: str = "") -> int:
         """People named at a company ((name, role) pairs), each kept once
@@ -2425,13 +2438,23 @@ class StateManager:
             await db.commit()
 
     async def increment_setting(self, key: str, by: int = 1) -> int:
-        current = await self.get_setting(key, "0")
-        try:
-            value = int(current) + by
-        except ValueError:
-            value = by
-        await self.set_setting(key, str(value))
-        return value
+        """Add ``by`` to a counting setting (a value that isn't a number
+        counts as 0) and return the new count: one statement, so two
+        callers at once never both read the same count."""
+        async with self._connect() as db:
+            async with db.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = CAST(CASE WHEN CAST(value AS INTEGER) || '' = TRIM(value)
+                                         THEN CAST(value AS INTEGER) ELSE 0 END + ? AS TEXT),
+                       updated_at = CURRENT_TIMESTAMP
+                   RETURNING value""",
+                (key, str(int(by)), int(by)),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await db.commit()
+        return int(row[0])
 
     async def prospect_exists(
         self, email: str = "", linkedin_url: str = "",

@@ -72,12 +72,18 @@ class Budget:
     ``left(what)`` reads a counted allowance (Hunter's monthly domain
     searches), and a caller checks it first; ``take(what)`` then draws one
     unit before the request, so a call that fails mid-flight is still
-    counted. Core gives a real one; this default allows everything and counts
-    nothing (a one-off call outside an install)."""
+    counted, and False means the request isn't made. ``ask(service)``: the
+    same before each request to a paid verification service ("reoon",
+    "zerobounce", "hunter"). Core gives a real one (harvey/verify_costs.py's
+    Meter prices both); this default allows everything and counts nothing
+    (a one-off call outside an install)."""
 
     remaining: float = float("inf")
 
     async def take(self, what: str) -> bool:
+        return True
+
+    async def ask(self, service: str) -> bool:
         return True
 
     async def left(self, what: str) -> int:

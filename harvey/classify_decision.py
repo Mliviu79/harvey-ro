@@ -61,7 +61,9 @@ async def send(s, d_state, questions: dict) -> tuple[dict, dict]:
     why = classify.base_url_problem(s.base_url) or missing(s)
     if why:
         raise classify._Held(why)
-    body = {"state": d_state, "model": s.model, "questions": plain(questions)}
+    # (A profile's extra request fields first: they never replace these.)
+    body = {**dict(getattr(s, "request_extra", None) or {}),
+            "state": d_state, "model": s.model, "questions": plain(questions)}
     try:
         async with classify._http(s.timeout) as client:
             r = await client.post(s.base_url, json=body,
@@ -73,7 +75,8 @@ async def send(s, d_state, questions: dict) -> tuple[dict, dict]:
     status = r.status_code
     if status in (401, 402, 403, 404, 429) or (status >= 400 and "quota" in r.text.lower()):
         raise classify._Held(f"HTTP {status}",
-                             classify._wait_header(r.headers) if status == 429 else None)
+                             classify._wait_header(r.headers) if status == 429 else None,
+                             classify.held_scope(status, text=r.text[:500]))
     if status >= 500:
         raise classify._Transient(f"HTTP {status}")
     if status >= 400:
@@ -128,7 +131,9 @@ def asked_answers(reply: dict, ids: list[str]) -> dict:
 #
 # The wording and the bars below were chosen on half of a labelled set of
 # real firms and scored once on the other half: change one and measure it
-# again.
+# again. A profile (harvey/classify_profiles.py) may carry its own texts
+# and bars: the question ids, the options' keys and how the answers are
+# combined stay code's.
 
 COMPANY = "the company (COMPANY)"
 PAGE = "The website between <page> and </page>"
@@ -139,6 +144,8 @@ FORM = "Ignore the legal form (SRL, S.R.L., SA, PFA, II, IF), letter case and di
 # institution (each below its veto).
 SITE_NEEDS = (("names", 0.5), ("own", 0.4))
 SITE_VETOES = (("directory", 0.7), ("institution", 0.7))
+# The range a profile's site bars are kept in.
+BAR_RANGE = (0.05, 0.99)
 
 # Whose a contact read on the firm's site is: the firm's own first (the
 # order matters to the model).
@@ -150,69 +157,102 @@ OWNERS = {
     "partner_or_other": "A partner's, supplier's, client's or another business's",
     "placeholder_or_hotline": "A placeholder, example value, or a public hotline or institution",
 }
+OWN = "company_own"
+# What a contact's question says ({n}: the contact's number on the page).
+WHOSE = "Whose is contact c{n}?"
+
+SITE_QUESTIONS = {
+    "names": {"instructions": f"{PAGE} names {COMPANY}: the company's distinctive name appears "
+                              f"in the website's domain, title or text. {FORM}",
+              "criteria": {"true": "the distinctive words of the company's name appear "
+                                   "together as the name of the business the site "
+                                   "presents.",
+                           "false": "only one common word is shared, the name is "
+                                    "different, or it appears only in a list of many "
+                                    "companies."}},
+    "own": {"instructions": f"{PAGE} presents the business of {COMPANY} itself: its own "
+                            f"products or services, written by that business, under its name."},
+    "directory": {"instructions": f"{PAGE} is a company-information site, business "
+                                  f"directory, listing, marketplace, classifieds, job "
+                                  f"board or comparison site that lists many businesses."},
+    "institution": {"instructions": f"{PAGE} belongs to a city hall, public institution, "
+                                    f"government body, school, association, or a news or "
+                                    f"media outlet."},
+}
 
 
-def site(p: dict, budget: int) -> tuple[str, dict]:
+def default_questions() -> dict:
+    """The measured texts and bars, as a profile holds them: {"site":
+    {"questions", "needs", "vetoes"}, "contacts": {"instructions",
+    "options", "bar"}}."""
+    import copy
+
+    from harvey.classify import YES_DEFAULT
+
+    return {"site": {"questions": copy.deepcopy(SITE_QUESTIONS), "needs": dict(SITE_NEEDS),
+                     "vetoes": dict(SITE_VETOES)},
+            "contacts": {"instructions": WHOSE, "options": dict(OWNERS), "bar": YES_DEFAULT}}
+
+
+def _site_q(q: dict | None) -> dict:
+    return q if q else default_questions()["site"]
+
+
+def site(p: dict, budget: int, q: dict | None = None) -> tuple[str, dict]:
     from harvey.classify import _render_site
 
     text, _ = _render_site(p, budget)
-    c, w = COMPANY, PAGE
-    return text, {
-        "names": {"type": "noul",
-                  "instructions": f"{w} names {c}: the company's distinctive name appears in "
-                                  f"the website's domain, title or text. {FORM}",
-                  "criteria": {"true": "the distinctive words of the company's name appear "
-                                       "together as the name of the business the site "
-                                       "presents.",
-                               "false": "only one common word is shared, the name is "
-                                        "different, or it appears only in a list of many "
-                                        "companies."}},
-        "own": {"type": "noul",
-                "instructions": f"{w} presents the business of {c} itself: its own products "
-                                f"or services, written by that business, under its name."},
-        "directory": {"type": "noul",
-                      "instructions": f"{w} is a company-information site, business "
-                                      f"directory, listing, marketplace, classifieds, job "
-                                      f"board or comparison site that lists many businesses."},
-        "institution": {"type": "noul",
-                        "instructions": f"{w} belongs to a city hall, public institution, "
-                                        f"government body, school, association, or a news or "
-                                        f"media outlet."},
-    }
+    out = {}
+    for qid, item in _site_q(q)["questions"].items():
+        one = {"type": "noul", "instructions": item["instructions"]}
+        if item.get("criteria"):
+            one["criteria"] = dict(item["criteria"])
+        out[qid] = one
+    return text, out
 
 
-def check_site(said: dict, p: dict, yes: float) -> dict:
+def check_site(said: dict, p: dict, yes: float, q: dict | None = None) -> dict:
     # (Every question is needed; ``p`` is how surely the site presents the
     # firm's own business, kept with the decision.)
     from harvey.classify import NoAnswer
 
-    probs = {q: said[q] for q, _ in SITE_NEEDS + SITE_VETOES}
+    q = _site_q(q)
+    needs, vetoes = list(q["needs"].items()), list(q["vetoes"].items())
+    probs = {k: said[k] for k, _ in needs + vetoes}
     if any(not isinstance(v, float) for v in probs.values()):
         raise NoAnswer("a site question answered with options")
-    ok = all(probs[q] >= at for q, at in SITE_NEEDS) and \
-        all(probs[q] < below for q, below in SITE_VETOES)
-    return {"yes": ok, "p": round(probs["own"], 2)}
+    ok = all(probs[k] >= at for k, at in needs) and all(probs[k] < below for k, below in vetoes)
+    return {"yes": ok, "p": round(probs["own"], 2) if "own" in probs else None}
 
 
-def contacts(p: dict, budget: int) -> tuple[str, dict]:
+def contacts(p: dict, budget: int, q: dict | None = None) -> tuple[str, dict]:
     from harvey.classify import _render_contacts
 
+    q = q or default_questions()["contacts"]
     text, statements = _render_contacts(p, budget)
     # (ch_<j>: card.contacts[j], shown to the model as c<j+1>.)
-    return text, {f"ch_{j}": {"type": "choice", "instructions": f"Whose is contact c{j + 1}?",
-                              "criteria": dict(OWNERS)}
+    return text, {f"ch_{j}": {"type": "choice",
+                              "instructions": q["instructions"].replace("{n}", str(j + 1)),
+                              "criteria": dict(q["options"])}
                   for j in range(len(statements))}
 
 
-def check_contacts(said: dict, p: dict, yes: float) -> dict:
+def check_contacts(said: dict, p: dict, yes: float, q: dict | None = None) -> dict:
     # (A contact is the firm's when the model's probability that it is
-    # reaches its bar; one not shown or not answered is in neither list.)
+    # reaches its bar; one not shown or not answered is in neither list.
+    # Asked about one contact with "unsure" allowed (p["unsure"], a
+    # contact's verification): no at 1 - bar or below, unsure between.)
     from harvey.classify import NoAnswer
 
     n = min(len(p["cards"][0].contacts), p.get("shown_contacts", 12))
-    seen = {j: said[f"ch_{j}"]["company_own"] for j in range(n)
-            if isinstance(said.get(f"ch_{j}"), dict) and "company_own" in said[f"ch_{j}"]}
+    seen = {j: said[f"ch_{j}"][OWN] for j in range(n)
+            if isinstance(said.get(f"ch_{j}"), dict) and OWN in said[f"ch_{j}"]}
     if not seen and n:
         raise NoAnswer("no contact answered")
+    if p.get("unsure"):
+        return {"contacts": [j for j, v in seen.items() if v >= yes],
+                "no": [j for j, v in seen.items() if v <= 1.0 - yes],
+                "unsure": [j for j, v in seen.items() if 1.0 - yes < v < yes],
+                "p": {j: round(v, 3) for j, v in seen.items()}}
     return {"contacts": [j for j, v in seen.items() if v >= yes],
             "no": [j for j, v in seen.items() if v < yes]}

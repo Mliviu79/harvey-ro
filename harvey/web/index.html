@@ -221,6 +221,10 @@
         <div class="subhead" data-i18n="today.runs">Rulări</div>
         <div class="card" id="today-runs" style="padding-top:8px;padding-bottom:8px"></div>
       </div>
+      <div id="today-jobruns-block" style="display:none">
+        <div class="subhead" data-i18n="today.jobruns">Lucrări recente: timp și cost</div>
+        <div class="card" id="today-jobruns"></div>
+      </div>
     </aside>
   </div>
 </div>
@@ -447,6 +451,12 @@
           <input type="password" class="form-input" id="hunter-key" autocomplete="off"></div>
         <button class="btn btn-primary btn-sm" onclick="saveVerifiers()" data-i18n="set.save_verifiers">Salvează cheile</button>
       </div>
+    </div>
+    <div class="settings-row">
+      <div>
+        <h3 data-i18n="set.vp_title">Prețuri peste cele gratuite</h3>
+      </div>
+      <div class="fields" id="verify-prices"></div>
     </div>
   </div>
   </div>

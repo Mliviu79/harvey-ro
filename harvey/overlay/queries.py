@@ -242,8 +242,13 @@ statement("overlay.read.passing",
           params=(*_IDS, *_WALK_PARAMS), drives="j")
 # A Find-contacts run's firms: when each was added and whether it has a
 # site, those with no contact only when asked (the second param: 1).
+# (Each firm's time, whether it has a site, and whether a search found
+# that site: website_source and a trust, as finder_company reads it, and
+# that trust.)
 statement("overlay.read.finder_rows",
-          f"SELECT f.id, f.created, (f.website IS NOT NULL OR f.domain IS NOT NULL) FROM {_J} "
+          "SELECT f.id, f.created, (f.website IS NOT NULL OR f.domain IS NOT NULL), "
+          "(f.website IS NOT NULL AND f.website_source IS NOT NULL "
+          f"AND f.website_trust IS NOT NULL), f.website_trust FROM {_J} "
           "CROSS JOIN firm f WHERE f.id = j.value AND (? = 0 OR f.n_contacts = 0)",
           params=(*_IDS, 1), drives="j")
 statement("overlay.read.walk.count",
@@ -641,9 +646,41 @@ statement("overlay.classify.by_task",
           "SUM(cost_usd), SUM(source = 'classify:unpriced' AND is_error = 0) "
           "FROM usage_events WHERE created_at >= ? AND task LIKE 'classify.%' GROUP BY task",
           params=("2026-01-01 00:00:00",), bounded=True)
+# The size of its answered calls per task and model since a time (an
+# estimate's typical and high request).
+statement("overlay.classify.sizes",
+          "SELECT task, model, COUNT(*), AVG(input_tokens), MAX(input_tokens), "
+          "AVG(output_tokens), MAX(output_tokens) FROM usage_events WHERE created_at >= ? "
+          "AND task LIKE 'classify.%' AND is_error = 0 AND input_tokens > 0 GROUP BY task, model",
+          params=("2026-01-01 00:00:00",), bounded=True)
 # How the last answered call of a model was priced (a reply carrying its cost).
 statement("overlay.classify.last_source",
           "SELECT source FROM usage_events WHERE created_at >= ? AND task LIKE 'classify.%' "
           "AND model = ? AND is_error = 0 AND input_tokens > 0 "
           "ORDER BY created_at DESC LIMIT 1",
           params=("2026-01-01 00:00:00", "m"))
+
+# ── Contacts the classifier verified (harvey/contact_check.py, schema 30) ──
+# One contact's verdicts, newest first (the contact's panel).
+statement("overlay.contact_check.of_contact",
+          "SELECT firm, verdict, at, profile, model, p, note, batch, undone_at "
+          "FROM contact_check WHERE contact = ? ORDER BY at DESC LIMIT 50", params=(1,))
+# Verdicts still standing of one kind, newest first (the unsure ones wait
+# for a person's review).
+statement("overlay.contact_check.open",
+          "SELECT firm, contact, verdict, at, profile, model, p, note, batch "
+          "FROM contact_check INDEXED BY contact_check_open WHERE verdict = ? "
+          "AND undone_at IS NULL ORDER BY at DESC LIMIT ?", params=(2, 50))
+# A verification run's verdicts, counted.
+statement("overlay.contact_check.batch",
+          "SELECT verdict, COUNT(*), SUM(undone_at IS NOT NULL) FROM contact_check "
+          "WHERE batch = ? GROUP BY verdict", params=("b",))
+# Whether a contact is in a campaign, by its id or its address (a no never
+# lowers a campaign member's link).
+statement("overlay.contact_check.in_campaign",
+          "SELECT EXISTS (SELECT 1 FROM campaign_member WHERE contact = ?) "
+          "OR EXISTS (SELECT 1 FROM campaign_member WHERE email = ?)", params=(1, "a@example.com"))
+# The contacts a verification run asked about at one firm already (a job
+# resumed asks only the rest).
+statement("overlay.contact_check.done",
+          "SELECT contact FROM contact_check WHERE batch = ? AND firm = ?", params=("b", 1))

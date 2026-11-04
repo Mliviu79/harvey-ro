@@ -237,8 +237,43 @@ class JobContext:
         """The money this job may spend; SpendLimit when the run's cap (or
         the day's, the month's) can't pay for its ``first`` request."""
         self.job.actual_cost = self.actual_cost
+        self.job.progress = self.progress
         return await jobs.reserve(self.state, self.job, estimate, first,
                                   per_day=per_day, per_month=per_month)
+
+    def classify_meter(self, *, per_day: float | None = None,
+                       per_month: float | None = None):
+        """A classifier Meter for this job (harvey/classify.py): each call
+        allowed by the run's classifier cap and the install's day and
+        month limits (jobs.classify_room), counted in the job's progress
+        (``classify``) and its cost added to its spend. A job resumed
+        carries on from what it counted before."""
+        from harvey import classify
+
+        def keep(meter) -> None:
+            self.progress["classify"] = meter.as_dict()
+
+        async def room(meter, estimate: float) -> str:
+            keep(meter)
+            why = await jobs.classify_room(
+                self.state, self.job, estimate, own_classify=meter.usd, own=self.actual_cost,
+                per_day=per_day, per_month=per_month)
+            if why:
+                meter.refused = why
+                keep(meter)
+                await self._store()
+            return why
+
+        async def charge(meter, cost: float) -> None:
+            keep(meter)
+            await self.spend(cost)
+
+        meter = classify.Meter(room, charge)
+        was = self.progress.get("classify") or {}
+        for k in ("calls", "errors", "tokens_in", "tokens_out", "ms", "unpriced"):
+            setattr(meter, k, int(was.get(k) or 0))
+        meter.usd = float(was.get("usd") or 0.0)
+        return meter
 
     async def stop_reason(self) -> str:
         """Why the job must stop at the next page, or "": cancelled or

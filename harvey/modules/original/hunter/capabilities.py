@@ -8,10 +8,12 @@ from harvey.modules.api import Capability, Draft, Person
 async def _domain_search(inp, ctx) -> Draft:
     """The people Hunter has on file for ``inp.domain`` (name, title,
     address, its own verdict, in ``fields``). One of the month's domain
-    searches is drawn first: none left stops the run (``stop``)."""
+    searches is drawn first: none left, or one the budget refuses (no
+    price past the free tier under a USD cap), stops the run (``stop``)."""
     if await ctx.budget.left("hunter") <= 0:
         return Draft(stop="Hunter's domain searches for this month are used up")
-    await ctx.budget.take("hunter")
+    if not await ctx.budget.take("hunter"):
+        return Draft(stop="Hunter's domain search was refused: no room for it in the budget")
     key = ef._hunter_api_key(ctx.env)
     found = await ef.hunter_domain_people(inp.domain, key)
     return Draft(people=[Person(

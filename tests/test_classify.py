@@ -24,12 +24,57 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# The install's caps stay the contact finder's settings; every other
+# keyword names the classifier's setup, written the way an earlier Harvey
+# kept its one classifier, so the one-time migration makes it the
+# "settings" profile (classify_profiles.migrate_legacy).
+CAPS = ("per_day", "tasks", "usd_per_day", "usd_per_month")
+
+
+def _raw(value) -> str:
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return json.dumps(value) if isinstance(value, dict) else str(value)
+
+
 async def _state(path, **settings) -> StateManager:
+    from harvey import classify_profiles as profiles
+
     s = StateManager(str(path))
     await s.init_db()
     for key, value in settings.items():
-        await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+        if key in CAPS:
+            await switches.set_module_setting(s, "contact_finder", f"classify_{key}", value)
+        else:
+            await s.set_setting(f"{profiles.LEGACY_PREFIX}{key}", _raw(value))
     return s
+
+
+def _held() -> float:
+    """Seconds any classifier profile (or account) is held."""
+    from pathlib import Path
+
+    return max((lanes.held(p.stem) for p in Path(lanes.LANE_DIR).glob(f"{classify.LANE}*.uses")),
+               default=0.0)
+
+
+async def _change(s, **fields) -> None:
+    """Change the "settings" profile as its editor stores it: kind,
+    base_url, model, ..., ``yes`` (a decision model's contacts bar) and
+    ``price_in_per_m`` / ``price_out_per_m`` ("" for none)."""
+    from harvey import classify_profiles as profiles
+
+    await classify.settings(s)
+    stored = json.loads(await s.get_setting(profiles.PROFILES_KEY))
+    p = stored[profiles.LEGACY_ID]
+    for key, value in fields.items():
+        if key == "yes":
+            p["questions"]["contacts"]["bar"] = value
+        elif key.startswith("price_"):
+            p["prices"][key[len("price_"):]] = classify.money_setting(value)
+        else:
+            p[key] = value
+    await s.set_setting(profiles.PROFILES_KEY, json.dumps(stored))
 
 
 FIRM = {"name": "EXEMPLU CONSTRUCTII SRL", "form": "SRL", "cui": "90000017", "locality": "Brașov",
@@ -63,7 +108,7 @@ def _fresh(monkeypatch):
     classify._NO_TEMPERATURE.clear()
     paced = []
 
-    async def wait_gap(lane, seconds):
+    async def wait_gap(lane, seconds, key=""):
         lanes.interval(lane)            # the lane has to be declared
         paced.append((lane, seconds))
 
@@ -339,7 +384,7 @@ def test_a_429_holds_the_service_and_held_asks_nothing(tmp_path, monkeypatch):
 
     first, again = run(go())
     assert first.why == "held" and again.why == "held" and len(fake.requests) == 1
-    assert lanes.held(classify.LANE) > 0
+    assert _held() > 0
 
 
 def test_timeouts_are_tried_again_after_a_wait_then_give_no_answer(tmp_path, monkeypatch):
@@ -362,7 +407,7 @@ def test_timeouts_are_tried_again_after_a_wait_then_give_no_answer(tmp_path, mon
     assert fake.clients[0]["timeout"] == 120.0
     # Each attempt is on the ledger, as an error.
     assert [r[5] for r in _usage(db)] == [1, 1, 1]
-    assert not lanes.held(classify.LANE)
+    assert not _held()
 
 
 def test_the_days_cap_counts_the_ledger(tmp_path, monkeypatch):
@@ -478,13 +523,16 @@ def test_the_settings_name_the_key_and_never_hold_it(tmp_path, monkeypatch):
     async def go():
         s = await _state(tmp_path / "harvey.db", provider="openai_compatible",
                          base_url="https://llm.exemplu.test/v1", model="fast-small")
-        await switches.set_module_setting(s, "contact_finder", "classify_provider", "nonsense")
-        return await classify.settings(s), await s.settings_with_prefix("modules.")
+        odd = await _state(tmp_path / "odd.db", provider="nonsense", model="fast-small")
+        return (await classify.settings(s), await classify.settings(odd),
+                await s.settings_with_prefix(""))
 
-    settings, stored = run(go())
-    # A choice not on the list keeps the default.
-    assert settings.provider == "off"
+    settings, odd, stored = run(go())
+    # (An older setup with no key name used CLASSIFY_API_KEY; one naming no
+    # provider this Harvey knows makes no profile.)
+    assert settings.provider == "openai_compatible"
     assert settings.public()["key_name"] == "CLASSIFY_API_KEY"
+    assert odd.provider == "off"
     assert "secret-key-value" not in json.dumps(settings.public())
     assert "secret-key-value" not in json.dumps(stored)
 
@@ -684,7 +732,7 @@ def test_refusing_the_key_holds_the_service(tmp_path, monkeypatch, status):
         s = await _state(tmp_path / "harvey.db", provider="openai_compatible", model="m")
         return await classify.ask(s, "site", _site_payload())
 
-    assert run(go()).why == "held" and lanes.held(classify.LANE) > 0
+    assert run(go()).why == "held" and _held() > 0
 
 
 def test_an_unknown_model_holds_the_service(tmp_path, monkeypatch):
@@ -696,7 +744,7 @@ def test_an_unknown_model_holds_the_service(tmp_path, monkeypatch):
         s = await _state(db, provider="openai_compatible", model="m")
         return await classify.ask(s, "site", _site_payload())
 
-    assert run(go()).why == "held" and lanes.held(classify.LANE) > 0
+    assert run(go()).why == "held" and _held() > 0
     assert [r[5] for r in _usage(db)] == [1]
 
 
@@ -710,7 +758,7 @@ def test_a_refused_request_is_in_the_ledger_and_counts_toward_the_cap(tmp_path, 
 
     ans, calls = run(go())
     assert ans.why == "no answer" and len(fake.requests) == 1 and calls == 1
-    assert [r[5] for r in _usage(db)] == [1] and not lanes.held(classify.LANE)
+    assert [r[5] for r in _usage(db)] == [1] and not _held()
 
 
 def test_a_5xx_is_tried_again_after_a_wait(tmp_path, monkeypatch):
@@ -730,7 +778,7 @@ def test_a_5xx_is_tried_again_after_a_wait(tmp_path, monkeypatch):
     ans = run(go())
     assert ans.value == {"yes": False} and len(fake.requests) == 2
     assert slept == [classify.BACKOFF[0]] and [r[5] for r in _usage(db)] == [1, 0]
-    assert not lanes.held(classify.LANE)
+    assert not _held()
 
 
 # ── The language models: yes and no for each id ──
@@ -889,7 +937,7 @@ def test_the_site_bars_are_fixed_and_the_contacts_bar_is_the_one_setting(tmp_pat
     async def go():
         s = await _decision(tmp_path / "harvey.db", monkeypatch)
         before = await classify.ask(s, "site", _site_payload())
-        await switches.set_module_setting(s, "contact_finder", "classify_yes", 0.95)
+        await _change(s, yes=0.95)
         after = await classify.ask(s, "site", _site_payload())
         return before, after, await classify.settings(s)
 
@@ -963,7 +1011,7 @@ def test_the_contacts_bar_is_respected_and_clamped(tmp_path, monkeypatch):
     async def go():
         s = await _decision(tmp_path / "harvey.db", monkeypatch, yes=0.8)
         strict = await classify.ask(s, "contacts", _site_payload(card))
-        await switches.set_module_setting(s, "contact_finder", "classify_yes", 0.1)
+        await _change(s, yes=0.1)
         loose = await classify.ask(s, "contacts", _site_payload(card))
         return strict, loose, (await classify.settings(s)).yes
 
@@ -998,7 +1046,7 @@ def test_no_key_endpoint_or_model_holds_and_nothing_is_sent(tmp_path, monkeypatc
             monkeypatch.delenv("CLASSIFY_DECISION_KEY")
         return await classify.ask(s, "site", _site_payload())
 
-    assert run(go()).why == "held" and lanes.held(classify.LANE) > 0
+    assert run(go()).why == "held" and _held() > 0
     assert fake.requests == [] and _usage(db) == []
 
 
@@ -1009,7 +1057,7 @@ def test_no_key_endpoint_or_model_holds_and_nothing_is_sent(tmp_path, monkeypatc
 ])
 def test_a_decision_429_holds_for_the_servers_retry_after(tmp_path, monkeypatch, headers, wait):
     held = []
-    monkeypatch.setattr(lanes, "hold", lambda lane, seconds: held.append((lane, seconds)))
+    monkeypatch.setattr(lanes, "hold", lambda lane, seconds, why="": held.append((lane, seconds)))
     fake = FakeHTTP(httpx.Response(429, json={"detail": "slow down"},
                                    headers=headers)).install(monkeypatch)
     db = tmp_path / "harvey.db"
@@ -1019,7 +1067,8 @@ def test_a_decision_429_holds_for_the_servers_retry_after(tmp_path, monkeypatch,
         return await classify.ask(s, "site", _site_payload())
 
     assert run(go()).why == "held" and len(fake.requests) == 1
-    assert held == [("classify", wait or classify.HOLD_SECONDS)]
+    # (A 429 holds this profile only, under its own name.)
+    assert held == [("classify.settings", wait or classify.HOLD_SECONDS)]
     assert [r[5] for r in _usage(db)] == [1]
 
 
@@ -1031,7 +1080,7 @@ def test_a_decision_endpoint_refusing_the_key_or_the_model_holds(tmp_path, monke
         s = await _decision(tmp_path / "harvey.db", monkeypatch)
         return await classify.ask(s, "site", _site_payload())
 
-    assert run(go()).why == "held" and lanes.held(classify.LANE) > 0
+    assert run(go()).why == "held" and _held() > 0
 
 
 def test_a_spent_quota_holds(tmp_path, monkeypatch):
@@ -1041,7 +1090,7 @@ def test_a_spent_quota_holds(tmp_path, monkeypatch):
         s = await _decision(tmp_path / "harvey.db", monkeypatch)
         return await classify.ask(s, "site", _site_payload())
 
-    assert run(go()).why == "held" and lanes.held(classify.LANE) > 0
+    assert run(go()).why == "held" and _held() > 0
 
 
 def test_a_decision_5xx_timeout_or_lost_connection_is_tried_again(tmp_path, monkeypatch):
@@ -1062,7 +1111,7 @@ def test_a_decision_5xx_timeout_or_lost_connection_is_tried_again(tmp_path, monk
     ans = run(go())
     assert ans.value == {"yes": True, "p": 0.81} and len(fake.requests) == 3
     assert slept == list(classify.BACKOFF) and [r[5] for r in _usage(db)] == [1, 1, 0]
-    assert not lanes.held(classify.LANE)
+    assert not _held()
 
     fake = FakeHTTP(*[httpx.ConnectError("refused")] * 3).install(monkeypatch)
 
@@ -1084,7 +1133,7 @@ def test_a_refused_request_or_a_reply_that_isnt_json_is_no_answer(tmp_path, monk
 
     a, b = run(go())     # (ask never raises)
     assert a.why == b.why == "no answer" and len(fake.requests) == 2
-    assert [r[5] for r in _usage(db)] == [1, 1] and not lanes.held(classify.LANE)
+    assert [r[5] for r in _usage(db)] == [1, 1] and not _held()
 
 
 # The questions as they were measured on labelled data, word for word: a
@@ -1285,15 +1334,21 @@ def test_a_list_older_than_a_day_keeps_the_price_and_the_cap_when_a_refresh_fail
 
     async def go():
         s = await _state(db, provider="openai_compatible", base_url=DEEPINFRA_OPENAI,
-                         model="vendor/chat-1", usd_per_day="0.0001")
+                         model="vendor/chat-1")
         await s.set_setting(classify_prices.CACHE_KEY,
                             json.dumps({"at": 1.0, "models": [old]}))
+        # (A cap the first call's worst case fits, with $0.0005 to spare.)
+        st = (await classify.settings(s, "site")).for_task("site")
+        worst, _ = await classify.call_cost(s, st, "site", classify.worst_tokens(
+            classify.request(st, "site", _site_payload())["tokens"]))
+        await switches.set_module_setting(s, "contact_finder", "classify_usd_per_day",
+                                          str(round(worst + 0.0005, 6)))
         a = await classify.ask(s, "site", _site_payload())
         b = await classify.ask(s, "site", _site_payload())
         return a, b, await classify.cost_status(s, await classify.settings(s))
 
     a, b, status = run(go())
-    # ($1 a million, 1000 tokens: $0.001, over the $0.0001 cap: the second waits.)
+    # ($1 a million, 1000 tokens: $0.001; with its worst case the second is over the cap.)
     assert a.cost == pytest.approx(0.001) and b.why == "budget"
     assert status["known"] and status["source"] == "deepinfra"
     assert [r.url.path for r in fake.requests].count("/models/list") == 1
@@ -1363,7 +1418,7 @@ def test_a_decision_model_is_priced_only_by_the_price_entered(tmp_path, monkeypa
     async def go():
         s = await _decision(db, monkeypatch, price_in_per_m="5", price_out_per_m="5")
         entered = await classify.ask(s, "site", _site_payload())
-        await switches.set_module_setting(s, "contact_finder", "classify_price_in_per_m", "")
+        await _change(s, price_in_per_m="")
         unknown = await classify.ask(s, "site", _site_payload())
         return entered, unknown, await classify.cost_status(s, await classify.settings(s))
 
@@ -1496,3 +1551,73 @@ def test_the_metrics_count_calls_spend_and_tokens_per_task(tmp_path, monkeypatch
     line = classify.metrics_line(m, status)
     assert line.startswith("today 1 calls $0.0010, this month 1 calls $0.0010; per site $0.0010")
     assert "cost unknown" not in line
+
+
+def test_a_call_whose_worst_case_doesnt_fit_the_days_usd_cap_isnt_made(tmp_path, monkeypatch):
+    fake = FakeHTTP(said(OWN_SITE)).install(monkeypatch)
+
+    async def go():
+        s = await _decision(tmp_path / "harvey.db", monkeypatch, price_in_per_m="1000",
+                            price_out_per_m="0", usd_per_day="0.05")
+        st = (await classify.settings(s, "site")).for_task("site")
+        r = classify.request(st, "site", _site_payload())
+        worst, _ = await classify.call_cost(s, st, "site", classify.worst_tokens(r["tokens"]))
+        return worst, await classify.ask(s, "site", _site_payload())
+
+    worst, ans = run(go())
+    # (Nothing spent today, but this call's worst case is over the $0.05.)
+    assert worst > 0.05 and ans.why == "budget" and fake.requests == []
+
+
+def test_a_retry_after_a_bad_reply_is_allowed_by_its_own_larger_worst_case(tmp_path,
+                                                                             monkeypatch):
+    FakeOpenAI("not json at all", GOOD).install(monkeypatch)
+    asked = []
+
+    async def room(meter, estimate):
+        asked.append(estimate)
+        return ""
+
+    async def go():
+        s = await _state(tmp_path / "harvey.db", provider="openai_compatible", model="m",
+                         price_in_per_m="1", price_out_per_m="1")
+        token = classify.METER.set(classify.Meter(room))
+        try:
+            return await classify.ask(s, "site", _site_payload())
+        finally:
+            classify.METER.reset(token)
+
+    ans = run(go())
+    # (The second ask carries the error: its tokens are counted with it.)
+    assert ans.value["yes"] is True and len(asked) == 2 and asked[1] > asked[0]
+
+
+def test_a_retry_after_of_0_holds_a_second_not_the_default(tmp_path, monkeypatch):
+    held = []
+    monkeypatch.setattr(lanes, "hold", lambda lane, seconds, why="": held.append((lane, seconds)))
+    FakeHTTP(httpx.Response(429, json={"detail": "slow down"},
+                            headers={"retry-after": "0"})).install(monkeypatch)
+
+    async def go():
+        s = await _decision(tmp_path / "harvey.db", monkeypatch)
+        return await classify.ask(s, "site", _site_payload())
+
+    assert run(go()).why == "held" and held == [("classify.settings", 1.0)]
+
+
+def test_an_estimate_goes_by_the_profiles_own_models_calls(tmp_path, monkeypatch):
+    async def go():
+        s = await _decision(tmp_path / "harvey.db", monkeypatch, price_in_per_m="1",
+                            price_out_per_m="0")
+        for model, tokens in (("decision-test-1", 300), ("another-model", 5000)):
+            await s.record_usage_event(agent="classify", task="classify.site", model=model,
+                                       input_tokens=tokens, cost_usd=0.0, source="classify",
+                                       provider="decision")
+        st = (await classify.settings(s, "site")).for_task("site")
+        seen = await classify.sizes(s)
+        return seen, await classify.projection(s, st, "site", 1, seen)
+
+    seen, p = run(go())
+    # (Every model's calls are kept; the profile's own model's are used.)
+    assert seen["site"]["answered"] == 2 and seen["site"]["max_in"] == 5000
+    assert p["basis"] == "this month" and p["tokens_typical"] == p["tokens_high"] == 300

@@ -9,6 +9,73 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Settings → Classifier explains itself, and everything it does is on
+  the page.** The card says what the classifier decides (whether a website
+  a search found is the firm's, which contacts on it are the firm's), when
+  it is asked (Find contacts and a Discover run's follow-up, Search again,
+  the found-websites check, Verify on Contacts), that a model's yes makes a
+  site likely at most, that an off task leaves the site unlinked with
+  nothing guessed, and that it runs only inside the caps. Each task shows
+  what it is for, when it is asked and what off means, with the profile
+  answering it, changeable there. The profiles sit side by side, sorted by
+  name, each with its endpoint, model, key name and whether `.env` holds
+  it, price, extra request fields, pace and its measured counts (or "not
+  tested"), with Use for, Test (counted and priced, then run under a cap,
+  the counts kept on the profile), Edit (every field, the questions' texts
+  and bars per task, the extra fields as JSON, DeepInfra's price list),
+  Duplicate, Hide / Show again or Remove, and the DeepInfra account box.
+  The caps and spend, and the DeepInfra key's scopes (`billing:read` and
+  `metrics` added by hand), are on the card too.
+- **Find contacts prices the classifier and reports the run.** Next to the
+  search cap: how many classifier questions the run may ask, an estimate
+  of what they may cost, and a classifier cap of the run's own. Once started, the
+  run's report follows where it was started: its jobs, how long it took,
+  and the cost split into searches, address checks and the classifier's
+  calls, tokens and USD. The Queue shows an opened run's report and lets
+  its classifier cap be raised; each job row shows its classifier calls and
+  time; Today lists the newest runs with theirs (`GET /api/jobs/batches`).
+- **Verify with the classifier, on Contacts.** Any contacts can be ticked
+  (phones, emails, forms, profiles) and verified, or one from its Details:
+  priced first, run under a cap, each answer (yes, no, unsure) on its row,
+  a no undone with its run. The filter *Classifier's verdict* lists the
+  unsure ones for review (`GET /api/contacts/verify/verdicts` gives the
+  rows' standing verdicts).
+- **Classifier profiles.** Settings → Classifier is now a list of profiles,
+  each one complete setup (kind, endpoint, model, the name of the key it
+  uses, extra request fields, pace, timeout, prices, the tasks it answers,
+  and its questions' texts and bars), and each task (search results,
+  website, contacts on the site) is set to a profile or off. The card says
+  what each task is for and when it is asked. Built-in profiles ship
+  read-only with the counts Harvey's judge test measured on 200
+  hand-labelled firms (the developers' test, not shipped), side by side:
+  four DeepInfra models (Qwen3.8 27B with thinking off through the extra
+  request field `reasoning_effort: none`), TypeSafe's Jev, and a local
+  Ollama model for your own hardware. Editing a built-in saves a copy of
+  your own; built-ins can be hidden and shown again; your own can be
+  added, edited and removed, and say "not tested" until a test run
+  records results on them. **Test** runs the judge test on the built-in
+  fictional cases or your own labelled file, counted and priced first, as
+  a job under a USD cap you type, and keeps its counts on the profile.
+  The older single setup becomes a profile of its own. The DeepInfra
+  key's scopes are documented: `billing:read` and `metrics` are added by
+  hand.
+- **A classifier budget per run, and run reports.** A Find contacts run,
+  a Discover run's follow-up and a test run take a USD cap for the
+  classifier (`classify_max_spend`, `--classify-max-spend`), checked
+  before every call against the call's estimate; its cost is the run's
+  spend, so `spend.per_day_usd` and `per_month_usd` count it too.
+  Reached, a firm's site waits unlinked, as with no classifier. Every run
+  reports how long it took and what it cost, split into paid searches,
+  address checks and the classifier's calls, tokens and USD
+  (`GET /api/jobs/batches/{id}/report`, `harvey jobs report RUN`, at the
+  end of `harvey contacts find` and `rejudge`).
+- **Verify a contact with the classifier** (`harvey contacts verify`,
+  `POST /api/contacts/verify`): yes, no or unsure about one contact at a
+  company, priced first and under a cap. Yes notes it, no drops the
+  link's website evidence to unconfirmed (official sources' never;
+  `--undo BATCH` puts it back), unsure lists it for review. Nothing is
+  deleted (schema 30: `contact_check`).
+
 - **A small model that tells a firm's own website from the rest.** The
   contact finder weighs every search result, not just the best-named one.
   Code rules out directories, listings, profiles of the firm on other sites
@@ -571,6 +638,72 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Each classifier profile has its own pace and its own pause.** The
+  pace is the profile's requests a minute; the classify lane adds no
+  one-second floor under it (it named none of the services). A 429 or
+  an unknown model pauses only the profile it came from, so a hosted
+  model's rate limit never stops a local one; a refused key, a payment
+  needed or a spent quota pauses every profile on that account (the same
+  endpoint host and key name). Settings → Classifier, `GET /api/classify`
+  (`held`: each paused profile, why and for how long) and `harvey contacts
+  classifier` say which profile is paused and until when (on the card,
+  each profile's own and the card's status line). The caps (calls a day,
+  USD a day and a month) stay the install's. A paused contacts profile
+  rests only the other verifications on the classifier's lane, never
+  another profile's test; a server's `retry-after: 0` is a second's pause.
+- **Classifier estimates are a range, and say what is enforced.** Find
+  contacts, verifying contacts and a profile's test give each task's cost
+  as typical (this month's calls on average, by the tokens billed) to high
+  (this month's largest call), with the most a call may answer, instead of
+  one "at most" figure (`usd_typical` / `usd_high` and a `note` in place
+  of `calls_most` / `usd_most`). A website a search found is counted as
+  read again, and this month's calls are the profile's own model's when it
+  has any. The run's classifier cap is what holds: each call's request
+  is built and counted, with a margin for how a tokenizer counts digits
+  and addresses, and refused when its worst case doesn't fit; the same
+  for a second ask after a reply that isn't valid (counted with the error
+  it carries), and for the install's classifier USD caps a day and a
+  month. The dashboard says so in one line under each estimate.
+- **A classifier profile is the only place its setup lives.** The contact
+  finder's older `classify_provider`, `classify_model` and the rest are
+  taken once into the `settings` profile and never read again; they are no
+  longer settings, and `POST /api/classify/settings` takes the install's
+  caps only. A profile names the provider's own key (`DEEPINFRA_API_KEY`,
+  `TYPESAFE_API_KEY`).
+- **Address checks are counted in dollars, as each service bills them.**
+  Each verification service a check asks (Reoon, ZeroBounce, Hunter) is a
+  check at that service, counted per month: $0 inside the free checks its
+  manifest declares (Reoon 600, ZeroBounce 100, Hunter 50), past them the
+  price you enter for it in Settings → Email verification (or `harvey
+  modules set email_verify usd_reoon 0.004`; $0 to $10 a request, more is
+  refused as a typo). Hunter's pattern lookups are
+  counted the same way (25 free a month, `usd_hunter_search`). Under a USD
+  cap (a run's, or `spend.per_day_usd` / `per_month_usd` in the
+  background) a request past a free tier with no price is refused: a cap
+  can't stop what it can't count. A check that needed it is an error, not
+  a check done, so the person is searched again once there is a price or a
+  new month; the Email module's audience, with no USD cap, still checks and
+  counts it unpriced. A priced request is reserved from the run's cap before
+  it is made and recorded after. `EMAIL_VERIFY_MONTHLY_CHECKS` now counts
+  each service asked (every service together) rather than each address,
+  so it agrees with the services' own counts. The find estimate prices the
+  checks and lookups at the entered prices and names the services that
+  would be refused; the run's report gives each service's checks, the
+  refused ones and the pattern lookups. Each service's month is counted in
+  one statement, so two checks at once never both take its last free one.
+- **A finished run's report is stored.** It is kept on the run (schema
+  30), read from there by Today, the Queue, the API and `harvey jobs
+  report`, and made again when a job of the run is retried or resumed.
+- **The find estimate counts what the run will do.** A website a search
+  found and that was read since isn't counted as read again (nor its
+  classifier questions) unless the run searches again, and a company every
+  search already looked up isn't counted as a lookup.
+- **The address-checks line in Find contacts follows the cap.** With a cap
+  of 0, one short line says checks need a cap; above 0, what they may
+  cost.
+- **DeepInfra is recognised by the server's rule.** The price list and
+  account box show for a base URL on `api.deepinfra.com` exactly (a saved
+  profile's `is_deepinfra`), never any `*.deepinfra.com` host.
 - **A website a search found is no longer linked on its name alone.** With
   no classifier set up, a site no register fact confirms is kept with
   nothing linked from it, waiting for a check, instead of linking every
@@ -829,6 +962,18 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Today's run reports are cheap.** A finished run's report is kept and
+  given again while none of its jobs changed, instead of being added up
+  again for five runs every refresh.
+- **Verifying a contact checks campaigns by an index.** Whether a contact
+  is in a campaign is a named statement over a new index on campaign
+  members by contact.
+- **Start writes its log where its log is.** The dashboard's Start made
+  the checkout's `data/` folder rather than its log file's.
+- **Tests never load a `.env` they didn't write.** `load_dotenv()` with no
+  path found the checkout's own file and put a developer's keys in the
+  test process; a test fixture now blocks it and clears the classifier's
+  keys, so no test can reach a live endpoint.
 - **A found website no longer confirms itself.** A second read of a site a
   search found counted the phones and emails its first read had linked as
   "on file" and marked them confirmed (campaign audiences take confirmed

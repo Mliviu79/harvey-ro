@@ -15,9 +15,10 @@ entry = "harvey.modules.original.email_verify.capabilities"
 wraps = ["harvey.integrations.email_finder"]
 secrets = ["REOON_API_KEY", "ZEROBOUNCE_API_KEY", "EMAIL_VERIFY_MONTHLY_CHECKS"]
 
-# The address checks the contact finder and the Email module's audience may
-# make a month (a verification credit each). The default is Reoon's free
-# tier; set it to what your verifier plan allows.
+# The verification requests the contact finder and the Email module's
+# audience may make a month, every service together (Reoon, ZeroBounce and
+# Hunter's address check): each service a check asks is one, as each bills
+# it. The default is Reoon's free tier; set it to what your plans allow.
 [settings.monthly_searches]
 type = "int"
 default = 600
@@ -27,6 +28,30 @@ env = "EMAIL_VERIFY_MONTHLY_CHECKS"
 as_of = 2026-10-30
 free_tier = "Reoon 600 checks a month; ZeroBounce 100 a month"
 note = "1 verification credit per address"
+
+# Each verification service a check may ask (harvey/verify_costs.py): its
+# recurring free checks a month, and what one check past them costs in USD
+# (``usd``). Neither service's paid price is declared here: the user enters
+# what their plan charges (usd_<service> below, Settings -> Email
+# verification). With none, a check past the free allowance is refused
+# under a USD cap, and counted unpriced where no cap applies.
+[cost.verifiers.reoon]
+free_per_month = 600
+
+[cost.verifiers.zerobounce]
+free_per_month = 100
+
+# What one check past the free allowance costs on the user's plan, in USD
+# (blank: no price).
+[settings.usd_reoon]
+type = "float"
+min = 0.0
+max = 10.0
+
+[settings.usd_zerobounce]
+type = "float"
+min = 0.0
+max = 10.0
 
 [[signals]]
 code = "EMAIL_PATTERN"
@@ -48,12 +73,12 @@ cost_note = "1 verification credit (free tiers available)"
 id = "find_email"
 op = "lookup"
 inputs = [["name", "domain"]]
-outputs = { facts = ["EMAIL_PATTERN", "EMAIL_STATUS"], values = ["email_pattern"] }
-cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier" }
+outputs = { facts = ["EMAIL_PATTERN", "EMAIL_STATUS"], values = ["email_pattern", "verifiers"] }
+cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier (cost.verifiers)" }
 
 [[capabilities]]
 id = "verify_address"
 op = "lookup"
 inputs = [["domain"]]
-outputs = { facts = ["EMAIL_STATUS"] }
-cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier" }
+outputs = { facts = ["EMAIL_STATUS"], values = ["verifiers"] }
+cost = { usd = 0.0, per = "address", note = "1 credit from a free or paid verification tier (cost.verifiers)" }

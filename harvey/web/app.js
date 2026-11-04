@@ -503,7 +503,7 @@ function showTab(id, btn) {
 function loadCurrentTab() {
   switch (currentTab) {
     case 'overview': loadOverview(); break;
-    case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
@@ -516,7 +516,7 @@ function loadCurrentTab() {
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
+    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -1354,6 +1354,26 @@ async function loadRuns() {
       '<span class="stats">' + escHtml(t('runs.records_n', {n: r.records || 0})) + ' · ' +
         (r.cost_usd ? escHtml(fmtUsd(r.cost_usd, 4)) : escHtml(t('runs.free'))) + '</span>' +
     '</div>').join('') + '</div>';
+}
+
+// Today: the newest runs of jobs (a Find contacts, a Discover, a check),
+// each with how long it took and what it cost, split.
+async function loadJobRuns() {
+  const el = document.getElementById('today-jobruns');
+  const block = document.getElementById('today-jobruns-block');
+  if (!el) return;
+  const data = await api('/api/jobs/batches?limit=5');
+  const runs = (data && data.runs) || [];
+  if (!runs.length) {
+    if (block) block.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  if (block) block.style.display = '';
+  el.innerHTML = runs.map(r => '<div class="job-run"><div class="run-head"><strong>' + escHtml(r.label || jobKind(r.kind)) + '</strong> ' +
+      '<span class="muted small">' + escHtml(jobKind(r.kind)) + ' &middot; ' + relTime(r.created_at) + '</span> ' +
+      '<button type="button" class="btn btn-ghost btn-sm" onclick="openQueue(' + jsq(r.id) + ')">' + escHtml(t('disc.see_jobs')) + '</button></div>' +
+    runReportHtml(r.report) + '</div>').join('');
 }
 
 // ── Setup checklist (Today, Email module; disappears once it's done) ──
@@ -4656,8 +4676,8 @@ function fbCampaign(i) {
 
 let _cv = { view: 'contacts', q: '', f: {}, sort: '', dir: 'desc', offset: 0, limit: loadPageSize(),
             total: 0, more: false, rows: [], open: null, reach: {}, gen: 0, timer: null, force: false,
-            sources: [], kinds: [], financials: false, signals: null, error: '', sel: new Set(),
-            adding: false };
+            sources: [], kinds: [], financials: false, signals: null, error: '', sel: new Map(),
+            adding: false, checks: {}, check: '', review: [], verify: null };
 const CONTACT_STATUSES = ['verified', 'risky', 'guess', 'unchecked', 'invalid', 'valid'];
 const CONTACT_TRUST = ['confirmed', 'likely', 'unconfirmed'];
 const CONTACT_LINES = ['mobile', 'fixed', 'voip', 'toll_free'];
@@ -4723,7 +4743,7 @@ async function loadContactList() {
         'data-i18n-aria="cl.search_label" placeholder="' + escHtml(t(ph)) + '" aria-label="' + escHtml(t('cl.search_label')) + '" ' +
         'oninput="contactListSearch(this.value)"></label><div id="cl-actions"></div></div>' +
       '<details class="more-fields" id="cl-more"><summary>' + escHtml(t('cl.filters')) + '</summary><div id="cl-filters"></div></details>' +
-      '<div id="cl-finder"></div><div id="cl-addbar"></div><div id="cl-rows"></div>';
+      '<div id="cl-finder"></div><div id="cl-addbar"></div><div id="cl-verify"></div><div id="cl-rows"></div>';
     loadFinderStatus();
     document.getElementById('cl-search').value = _cv.q;
     renderContactFilters();
@@ -4739,6 +4759,7 @@ async function loadContactList() {
     });
   }
   const gen = ++_cv.gen;
+  if (_cv.check && _cv.view === 'contacts') return loadContactReview(gen);
   const res = await api('/api/contacts?' + contactParams(true));
   if (gen !== _cv.gen) return;
   const rowsEl = document.getElementById('cl-rows');
@@ -4751,8 +4772,60 @@ async function loadContactList() {
   if (!_cv.rows.length && _cv.offset > 0 && _cv.total > 0) { _cv.offset = 0; return loadContactList(); }
   if (changed) renderContactFilters();
   renderContactList();
+  if (_cv.view === 'contacts' && _cv.rows.length) loadContactVerdicts(_cv.rows.map(r => r.id), gen);
 }
 
+// The classifier's verdict still standing on each row shown (yes, no,
+// unsure), fetched after the rows so the list never waits for it.
+async function loadContactVerdicts(ids, gen) {
+  const res = await api('/api/contacts/verify/verdicts?ids=' + ids.join(','));
+  if (!res || !res.verdicts || (gen !== undefined && gen !== _cv.gen)) return;
+  ids.forEach(id => { delete _cv.checks[id]; });
+  Object.keys(res.verdicts).forEach(id => { _cv.checks[id] = res.verdicts[id]; });
+  renderContactList();
+}
+
+// The links the classifier gave one verdict, still standing, newest first
+// (unsure: the ones for a person to review).
+async function loadContactReview(gen) {
+  const rowsEl = document.getElementById('cl-rows');
+  renderContactListActions();
+  const res = await api('/api/contacts/verify/review?verdict=' + encodeURIComponent(_cv.check) + '&limit=200');
+  if (gen !== _cv.gen || !rowsEl) return;
+  if (!res) { rowsEl.innerHTML = offlineState(); return; }
+  _cv.review = res.links || [];
+  rowsEl.innerHTML = contactReviewHtml(_cv.review, _cv.check);
+}
+
+function contactReviewHtml(links, verdict) {
+  const head = '<p class="muted small">' + escHtml(t('cl.review_note', {verdict: t('cl.v.' + verdict)})) + '</p>';
+  if (!links.length) return '<div class="table-card">' + head + emptyState(icon('contacts'), escHtml(t('cl.review_empty', {verdict: t('cl.v.' + verdict)})), '') + '</div>';
+  return '<div class="table-card">' + head + '<table class="data ct-table"><thead><tr><th>' + escHtml(t('cl.col.contact')) + '</th><th>' +
+    escHtml(t('cl.col.company')) + '</th><th>' + escHtml(t('cl.col.verdict')) + '</th><th>' + escHtml(t('cl.col.checked')) + '</th></tr></thead><tbody>' +
+    links.map(l => '<tr><td data-label="' + escHtml(t('cl.col.contact')) + '">' + contactValue({kind: l.kind, value: l.value}) + '</td>' +
+      '<td data-label="' + escHtml(t('cl.col.company')) + '"><a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(l.company_id) + ');return false">' +
+        escHtml(l.company || l.company_id) + '</a></td>' +
+      '<td data-label="' + escHtml(t('cl.col.verdict')) + '">' + verdictTag(l) + (l.note ? '<div class="cell-sub">' + escHtml(l.note) + '</div>' : '') + '</td>' +
+      '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.checked')) + '">' + (l.at ? escHtml(new Date(l.at * 1000).toLocaleString(intlLocale())) : '') +
+        '<div class="cell-sub">' + escHtml(l.model || l.profile || '') + '</div></td></tr>').join('') + '</tbody></table></div>';
+}
+
+function setContactCheck(v) {
+  _cv.check = v || '';
+  _cv.offset = 0;
+  loadContactList();
+}
+
+// A verdict as a tag: yes, no (with the undo of its run) or unsure.
+function verdictTag(c, undo) {
+  if (!c || !c.verdict) return '';
+  const tone = {yes: 't-good', no: 't-bad', unsure: 't-warn'}[c.verdict] || '';
+  const p = typeof c.p === 'number' ? ' ' + Math.round(c.p * 100) + '%' : '';
+  return '<span class="tag ' + tone + '" title="' + escHtml(t('cl.v.title', {model: c.model || c.profile || ''})) + '">' +
+      escHtml(t('cl.v.tag', {verdict: t('cl.v.' + c.verdict)}) + p) + '</span>' +
+    (undo && c.verdict === 'no' && c.batch ? ' <button type="button" class="link-btn small" onclick="undoVerify(' + jsq(c.batch) + ')">' +
+      escHtml(t('cl.v.undo')) + '</button>' : '');
+}
 function contactListSearch(value) {
   _cv.q = value;
   _cv.offset = 0;
@@ -4813,7 +4886,10 @@ function renderContactFilters() {
     html += select('kind', 'cl.f.kind', kinds) +
       select('status', 'cl.f.status', CONTACT_STATUSES.map(v => [v, statusMeta(v).label])) +
       select('trust', 'cl.f.trust', CONTACT_TRUST.map(v => [v, statusMeta(v).label])) +
-      select('person', 'cl.f.person', yesNo);
+      select('person', 'cl.f.person', yesNo) +
+      '<div class="form-group"><label class="form-label" for="cl-f-check">' + escHtml(t('cl.f.check')) + '</label>' +
+      '<select class="form-input" id="cl-f-check" onchange="setContactCheck(this.value)">' + opt('', t('cl.f.any'), _cv.check) +
+      ['unsure', 'no', 'yes'].map(v => opt(v, t('cl.v.' + v), _cv.check)).join('') + '</select></div>';
   }
   html += select('source', 'cl.f.source', (_cv.sources || []).map(v => [v, sourceText(v)])) +
     select('website', 'cl.f.website', yesNo) + '</div><div class="form-row">' +
@@ -4873,14 +4949,14 @@ function renderContactList() {
       : emptyState(icon('contacts'), escHtml(t(people ? 'cl.people_empty' : 'ct.empty')), escHtml(t(people ? 'cl.people_empty_copy' : 'ct.empty_copy')))) + '</div>';
     return;
   }
-  // Email addresses can be ticked and added to a campaign (Email module).
-  const ticks = !people && !!_modules.email;
-  const emails = _cv.rows.filter(r => r.kind === 'email');
-  const allOn = emails.length > 0 && emails.every(r => _cv.sel.has(r.value));
+  // Any contact can be ticked to be verified with the classifier; ticked
+  // email addresses can be added to a campaign (Email module).
+  const ticks = !people;
+  const allOn = _cv.rows.length > 0 && _cv.rows.every(r => _cv.sel.has(r.id));
   let head = contactHeader(people ? PEOPLE_COLUMNS : CONTACT_COLUMNS);
   if (ticks) {
     head = head.replace('<tr>', '<tr><th class="sel"><input type="checkbox" aria-label="' + escHtml(t('sel.page')) + '"' +
-      (allOn ? ' checked' : '') + (emails.length ? '' : ' disabled') + ' onchange="selectAddressPage(this.checked)"></th>');
+      (allOn ? ' checked' : '') + ' onchange="selectAddressPage(this.checked)"></th>');
   }
   let html = '<div class="table-card"><table class="data ct-table">' + head + '<tbody>';
   _cv.rows.forEach((r, i) => {
@@ -4897,23 +4973,22 @@ function renderContactList() {
     }
     const open = _cv.open === r.id;
     const co = r.company || {};
-    const reach = r.companies > 1
-      ? '<button type="button" class="link-btn" aria-expanded="' + open + '" onclick="toggleContactReach(' + i + ')">' + escHtml(t('kpi.fact_companies', {n: r.companies})) + '</button>'
-      : '';
-    const tick = !ticks ? '' : '<td class="sel" data-label="">' + (r.kind === 'email'
-      ? '<input type="checkbox" aria-label="' + escHtml(t('sel.row', {name: r.value})) + '"' +
-        (_cv.sel.has(r.value) ? ' checked' : '') + ' onchange="selectAddress(' + i + ', this.checked)">' : '') + '</td>';
+    const reach = '<button type="button" class="link-btn" aria-expanded="' + open + '" onclick="toggleContactReach(' + i + ')">' +
+      escHtml(r.companies > 1 ? t('kpi.fact_companies', {n: r.companies}) : t('cl.details')) + '</button>';
+    const tick = !ticks ? '' : '<td class="sel" data-label=""><input type="checkbox" aria-label="' + escHtml(t('sel.row', {name: r.value})) + '"' +
+        (_cv.sel.has(r.id) ? ' checked' : '') + ' onchange="selectAddress(' + i + ', this.checked)"></td>';
     html += '<tr class="' + (open ? 'selected' : '') + '">' + tick + '<td data-label="' + escHtml(t('cl.col.contact')) + '">' + contactValue(r) + '</td>' +
       '<td data-label="' + escHtml(t('cl.col.status')) + '">' + (r.status ? badge(r.status) : '') + '</td>' +
-      '<td data-label="' + escHtml(t('cl.col.trust')) + '">' + badge(r.trust) + '</td>' +
+      '<td data-label="' + escHtml(t('cl.col.trust')) + '">' + badge(r.trust) +
+        (_cv.checks[r.id] ? '<div class="cell-sub">' + verdictTag(_cv.checks[r.id], true) + '</div>' : '') + '</td>' +
       '<td data-label="' + escHtml(t('cl.col.companies')) + '"><div class="cell-stack">' +
         (co.id ? '<a href="#" class="cell-main co-link" onclick="openCompany(' + jsq(co.id) + ');return false">' + escHtml(co.name) + '</a>' : '') +
-        '<span class="cell-sub">' + (reach || escHtml(String(co.location || '').replace(/,\s*Romania$/i, ''))) + '</span></div></td>' +
+        '<span class="cell-sub">' + (r.companies > 1 ? reach : escHtml(String(co.location || '').replace(/,\s*Romania$/i, '')) + ' ' + reach) + '</span></div></td>' +
       '<td data-label="' + escHtml(t('cl.col.person')) + '">' + escHtml(co.person || '') +
         (r.people > 1 ? '<div class="cell-sub">' + escHtml(t('cl.people_n', {n: r.people})) + '</div>' : '') + '</td>' +
       '<td class="muted" data-label="' + escHtml(t('cl.col.sources')) + '">' + (r.sources || []).map(sourceLabel).join(', ') + '</td>' +
       '<td class="muted nowrap" data-label="' + escHtml(t('cl.col.first_seen')) + '">' + relTime(r.first_seen) + '</td></tr>';
-    if (open) html += '<tr class="detail-row"><td colspan="' + (ticks ? 8 : 7) + '">' + contactReachHtml(_cv.reach[r.id]) + '</td></tr>';
+    if (open) html += '<tr class="detail-row"><td colspan="' + (ticks ? 8 : 7) + '">' + contactReachHtml(_cv.reach[r.id], r) + '</td></tr>';
   });
   rowsEl.innerHTML = html + '</tbody></table></div>' + pagerHtml(_cv, _cv.total, 'pageContactList', {more: _cv.more, jump: true});
 }
@@ -4924,15 +4999,24 @@ async function toggleContactReach(i) {
   _cv.open = _cv.open === r.id ? null : r.id;
   renderContactList();
   if (_cv.open === null || _cv.reach[r.id]) return;
-  const data = await api('/api/contacts/' + encodeURIComponent(r.id));
-  _cv.reach[r.id] = data || {error: true};
+  const [data, checks] = await Promise.all([api('/api/contacts/' + encodeURIComponent(r.id)),
+                                            api('/api/contacts/' + encodeURIComponent(r.id) + '/checks')]);
+  _cv.reach[r.id] = data ? Object.assign({}, data, {checks: (checks && checks.checks) || []}) : {error: true};
   if (_cv.open === r.id) renderContactList();
 }
 
-function contactReachHtml(data) {
+function contactReachHtml(data, r) {
   if (!data) return '<div class="skeleton"></div>';
   if (data.error) return '<p class="none">' + escHtml(t('drawer.error')) + '</p>';
-  return '<table class="data"><tbody>' + (data.links || []).map(l =>
+  // The classifier's verdicts on this contact's links, and verifying it.
+  const checks = (data.checks || []).map(c => '<li>' + verdictTag(c, !c.undone) + ' ' + escHtml(c.company_id ? t('cl.v.at_company', {
+      company: ((data.links || []).find(l => String(l.company_id) === String(c.company_id)) || {}).company || c.company_id}) : '') +
+    (c.at ? ' · ' + escHtml(new Date(c.at * 1000).toLocaleString(intlLocale())) : '') + (c.undone ? ' · ' + escHtml(t('cl.v.undone')) : '') +
+    (c.note ? ' <span class="muted">' + escHtml(c.note) + '</span>' : '') + '</li>').join('');
+  const verify = r ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="openVerify([' + Number(r.id) + '])">' +
+    escHtml(t('cl.verify_one')) + '</button></div>' : '';
+  return (checks ? '<ul class="small cls-list">' + checks + '</ul>' : '') + verify +
+    '<table class="data"><tbody>' + (data.links || []).map(l =>
     '<tr><td><a href="#" class="co-link" onclick="openCompany(' + jsq(l.company_id) + ');return false">' + escHtml(l.company) + '</a>' +
       (l.cui ? ' <span class="muted mono">' + escHtml(l.cui) + '</span>' : '') + '</td>' +
     '<td class="muted">' + escHtml(l.address || String(l.location || '').replace(/,\s*Romania$/i, '')) + '</td>' +
@@ -4953,25 +5037,35 @@ function renderContactListActions() {
   const email = _modules.email ? [
     {sep: true, label: t('cl.campaign_label')},
     {label: t('cl.save_audience'), note: t('cl.save_audience_note'), icon: 'campaigns', action: 'saveAudienceFromContacts()'},
-    {label: t('cl.add_to_campaign', {n: _cv.sel.size}), icon: 'campaigns', action: 'openAddToCampaign()', disabled: !_cv.sel.size},
+    {label: t('cl.add_to_campaign', {n: selectedEmails().length}), icon: 'campaigns', action: 'openAddToCampaign()', disabled: !selectedEmails().length},
   ] : [];
+  // The classifier: verify the ticked contacts; the review list by verdict.
+  const verify = [
+    {sep: true, label: t('cl.verify_label')},
+    {label: t('cl.verify', {n: _cv.sel.size}), note: t('cl.verify_note'), icon: 'check', action: 'openVerify()', disabled: !_cv.sel.size},
+  ];
   el.innerHTML = find + (_cv.view === 'people' ? '' : menuHtml('cl-menu', [
     {sep: true, label: t('cl.export_label')},
     {label: t('actions.csv'), note: t('cl.export_note'), action: 'exportContactList(\'csv\')', disabled: !_cv.total},
     {label: t('cl.export_json'), action: 'exportContactList(\'json\')', disabled: !_cv.total},
-  ].concat(email))) + '</div>';
+  ].concat(verify, email))) + '</div>';
 }
 
+// The ticked contacts, by id ({kind, value}).
 function selectAddress(i, on) {
   const r = _cv.rows[i];
-  if (!r || r.kind !== 'email') return;
-  if (on) _cv.sel.add(r.value); else _cv.sel.delete(r.value);
+  if (!r) return;
+  if (on) _cv.sel.set(r.id, {kind: r.kind, value: r.value}); else _cv.sel.delete(r.id);
   renderContactList();
 }
 
 function selectAddressPage(on) {
-  _cv.rows.forEach(r => { if (r.kind !== 'email') return; if (on) _cv.sel.add(r.value); else _cv.sel.delete(r.value); });
+  _cv.rows.forEach(r => { if (on) _cv.sel.set(r.id, {kind: r.kind, value: r.value}); else _cv.sel.delete(r.id); });
   renderContactList();
+}
+
+function selectedEmails() {
+  return [..._cv.sel.values()].filter(x => x.kind === 'email').map(x => x.value);
 }
 
 async function saveAudienceFromContacts() {
@@ -4986,12 +5080,12 @@ async function saveAudienceFromContacts() {
 // Pick a campaign (one not finished, made on the Campaigns page) for the ticked addresses.
 async function openAddToCampaign() {
   const el = document.getElementById('cl-addbar');
-  if (!el || !_cv.sel.size) return;
+  if (!el || !selectedEmails().length) return;
   const data = await api('/api/campaigns');
   const open = (data || []).filter(c => c.origin === 'user' && ['draft', 'active', 'paused'].includes(c.status));
   if (!open.length) { showToast(t('cl.no_campaign'), 'error'); return; }
   el.innerHTML = '<div class="card"><div class="form-row"><div class="form-group"><label class="form-label" for="cl-add-camp">' +
-    escHtml(t('cl.add_to_campaign', {n: _cv.sel.size})) + '</label><select class="form-input" id="cl-add-camp">' +
+    escHtml(t('cl.add_to_campaign', {n: selectedEmails().length})) + '</label><select class="form-input" id="cl-add-camp">' +
     open.map(c => '<option value="' + escHtml(c.id) + '">' + escHtml(c.name) + ' (' + escHtml(statusMeta(c.status).label) + ')</option>').join('') +
     '</select></div><div class="btn-row"><button class="btn btn-primary btn-sm" onclick="addSelectedToCampaign()">' + escHtml(t('cl.add')) +
     '</button><button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'cl-addbar\').innerHTML=\'\'">' +
@@ -5004,15 +5098,120 @@ async function addSelectedToCampaign() {
   _cv.adding = true;
   try {
     const res = await api('/api/campaigns/' + encodeURIComponent(sel.value) + '/members', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: [..._cv.sel]})});
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: selectedEmails()})});
     if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
     showToast(t('cl.added', {n: res.counts.added, left: res.counts.total - res.counts.added + (res.counts.not_found || 0)}), 'success');
-    _cv.sel.clear();
+    [..._cv.sel.entries()].forEach(([id, x]) => { if (x.kind === 'email') _cv.sel.delete(id); });
     document.getElementById('cl-addbar').innerHTML = '';
     renderContactList();
   } finally {
     _cv.adding = false;
   }
+}
+
+// Verify contacts with the classifier (its contacts task): counted and
+// priced first, then run under a cap; each answer (yes / no / unsure)
+// lands on its row. A no lowers what a website's read gave the link to
+// unconfirmed, and its run's undo puts it back; official sources and
+// contacts in a campaign are never lowered.
+async function openVerify(ids) {
+  const el = document.getElementById('cl-verify');
+  const chosen = ids || [..._cv.sel.keys()];
+  if (!el || !chosen.length) return;
+  _cv.verify = {ids: chosen};
+  el.innerHTML = '<div class="card"><p class="muted small">' + escHtml(t('disc.pricing')) + '</p></div>';
+  const est = await api('/api/contacts/verify/estimate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                          body: JSON.stringify({contact_ids: chosen})});
+  el.innerHTML = verifyEstimateHtml(est);
+}
+
+function verifyEstimateHtml(est) {
+  if (!est || est.success === false || est.error) return '<div class="test-result error">' + escHtml(failMsg(est, t('cls.failed'))) + '</div>';
+  const close = '<button class="btn btn-ghost btn-sm" onclick="closeVerify()">' + escHtml(t('common.cancel')) + '</button>';
+  if (est.off) {
+    return '<div class="card finder-card"><h2>' + escHtml(t('cl.verify_title')) + '</h2><p>' + escHtml(t('cl.verify_off')) + '</p>' +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="goTab(\'settings\')">' + escHtml(t('cl.verify_settings')) + '</button>' + close + '</div></div>';
+  }
+  // (Price unknown: nothing can be counted in USD; a small cap still bounds the run.)
+  const cap = est.price_known ? Math.max(0.01, Math.ceil((est.usd_high || 0) * 100) / 100) : 0.05;
+  return '<div class="card finder-card"><h2>' + escHtml(t('cl.verify_title')) + '</h2>' +
+    '<p>' + escHtml(t('cl.verify_summary', {links: fmtN(est.links || 0), companies: fmtN(est.companies || 0),
+      profile: est.profile_name || est.profile || '', model: est.model || ''})) + '</p>' +
+    '<p class="muted small">' + escHtml(t(est.price_known ? 'cl.verify_cost' : 'cl.verify_cost_unknown',
+      {n: fmtN(est.calls || 0), tok: fmtN(est.tokens_typical || 0), tokh: fmtN(est.tokens_high || 0),
+       basis: t(est.basis === 'guess' ? 'est.basis_guess' : 'est.basis_month'),
+       low: fmtUsd(est.usd_typical || 0, 4), high: fmtUsd(est.usd_high || 0, 4)})) + '</p>' +
+    '<p class="muted small">' + escHtml(t('est.enforced')) + '</p>' +
+    '<p class="muted small">' + escHtml(t('cl.verify_rules')) + '</p>' +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="cl-verify-cap">' + escHtml(t('finder.ccap')) + '</label>' +
+      '<input class="form-input" id="cl-verify-cap" type="number" min="0" step="0.01" value="' + cap + '"></div></div>' +
+    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runVerify(this)"' + (est.links ? '' : ' disabled') + '>' +
+      escHtml(t('cl.verify_run', {n: fmtN(est.links || 0)})) + '</button>' + close + '</div></div>';
+}
+
+function closeVerify() {
+  const el = document.getElementById('cl-verify');
+  if (el) el.innerHTML = '';
+  _cv.verify = null;
+}
+
+async function runVerify(btn) {
+  const v = _cv.verify;
+  if (!v) return;
+  const cap = Number((document.getElementById('cl-verify-cap') || {}).value);
+  if (!(cap >= 0)) { showToast(t('cls.t.cap_bad'), 'error'); return; }
+  if (btn) btn.disabled = true;
+  const res = await api('/api/contacts/verify', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                 body: JSON.stringify({contact_ids: v.ids, max_spend: cap})});
+  if (!res || !res.success) { if (btn) btn.disabled = false; showToast(failMsg(res, t('cls.failed')), 'error'); return; }
+  if (!res.batch_id) { showToast(t('cl.verify_nothing'), 'success'); closeVerify(); return; }
+  showToast(t('cl.verify_queued', {n: fmtN(res.links || 0)}), 'success');
+  v.batch = res.batch_id;
+  const el = document.getElementById('cl-verify');
+  for (let i = 0; i < 2000; i++) {
+    const r = await api('/api/jobs/batches/' + encodeURIComponent(res.batch_id) + '/report');
+    if (_cv.verify !== v || !el) return;
+    if (!r || !r.statuses) break;
+    const active = runActive(r);
+    if (!active) await refreshVerdicts(v);
+    el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t(active ? 'cl.verify_running' : 'cl.verify_done')) + '</h2>' +
+      (active ? '' : verifyCountsHtml(v)) + runReportHtml(r) +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="openQueue(' + jsq(res.batch_id) + ')">' + escHtml(t('disc.see_jobs')) + '</button>' +
+      (!active && v.no ? '<button class="btn btn-secondary btn-sm" onclick="undoVerify(' + jsq(res.batch_id) + ')">' + escHtml(t('cl.v.undo_run')) + '</button>' : '') +
+      '<button class="btn btn-ghost btn-sm" onclick="closeVerify()">' + escHtml(t('common.close')) + '</button></div></div>';
+    if (!active) return;
+    await new Promise(ok => setTimeout(ok, 3000));
+    // (Each verdict on its row as it lands.)
+    await refreshVerdicts(v);
+  }
+}
+
+// The verdicts of a verification's contacts, onto the rows, counted.
+async function refreshVerdicts(v) {
+  const res = await api('/api/contacts/verify/verdicts?ids=' + v.ids.join(','));
+  if (!res || !res.verdicts) return;
+  v.yes = v.no = v.unsure = 0;
+  v.ids.forEach(id => {
+    const c = res.verdicts[id];
+    if (c) { _cv.checks[id] = c; if (c.batch === v.batch) v[c.verdict] = (v[c.verdict] || 0) + 1; }
+  });
+  delete _cv.reach[_cv.open];
+  renderContactList();
+}
+
+function verifyCountsHtml(v) {
+  return '<p>' + escHtml(t('cl.verify_counts', {yes: fmtN(v.yes || 0), no: fmtN(v.no || 0), unsure: fmtN(v.unsure || 0)})) + '</p>';
+}
+
+async function undoVerify(batch) {
+  if (!confirm(t('cl.v.undo_confirm'))) return;
+  const res = await api('/api/contacts/verify/undo', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                      body: JSON.stringify({batch: batch})});
+  showToast(res && res.success ? t('cl.v.undone_toast', {n: fmtN(res.restored || 0)}) : failMsg(res, t('cls.failed')),
+            res && res.success ? 'success' : 'error');
+  _cv.reach = {};
+  if (_cv.verify && _cv.verify.batch === batch) closeVerify();
+  loadContactList();
 }
 
 // Find contacts for the page's filter: priced first (websites to read are
@@ -5074,6 +5273,42 @@ async function loadFinderBgCard() {
       '<span class="switch-label">' + escHtml(t(bg.on ? 'mod.on' : 'mod.off')) + '</span></label></div>';
 }
 
+// Settings: what one request to each verification service (and Hunter's
+// pattern lookup) costs past its free allowance on the user's plan. Blank:
+// no price, and a run with a USD cap refuses those requests.
+async function loadVerifyPrices() {
+  const el = document.getElementById('verify-prices');
+  if (!el) return;
+  const s = await api('/api/verify/prices');
+  if (!s || !s.services) { el.innerHTML = ''; return; }
+  const c = s.checks || {};
+  el.innerHTML = '<p class="desc">' + escHtml(t('set.vp_desc', {used: fmtN(c.used || 0), cap: fmtN(c.cap || 0)})) + '</p>' +
+    s.services.map(v => '<div class="form-group"><label class="form-label" for="vp-' + escHtml(v.id) + '">' +
+      escHtml(t(v.kind === 'search' ? 'set.vp_search' : 'set.vp_check', {name: v.id})) + '</label>' +
+      '<input class="form-input" id="vp-' + escHtml(v.id) + '" type="number" min="0" max="10" step="0.0001" placeholder="' +
+        escHtml(t('set.vp_blank')) + '" value="' + (v.entered === null || v.entered === undefined ? '' : escHtml(String(v.entered))) + '">' +
+      '<div class="muted small">' + escHtml(t('set.vp_used', {free: fmtN(v.free_per_month), used: fmtN(v.used), past: fmtN(v.past_free)})) +
+        (v.past_free && v.usd === null ? ' ' + escHtml(t('set.vp_unpriced')) : '') + '</div></div>').join('') +
+    '<button class="btn btn-primary btn-sm" onclick="saveVerifyPrices()">' + escHtml(t('set.vp_save')) + '</button>';
+  el.dataset.ids = s.services.map(v => v.id).join(',');
+}
+
+async function saveVerifyPrices() {
+  const el = document.getElementById('verify-prices');
+  if (!el || !el.dataset.ids) return;
+  const body = {};
+  el.dataset.ids.split(',').forEach(id => {
+    const v = String((document.getElementById('vp-' + id) || {}).value || '').trim();
+    body[id] = v === '' ? null : Number(v);
+  });
+  const res = await api('/api/verify/prices', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(res && res.success ? t('set.vp_saved') : failMsg(res, t('set.vp_failed')),
+            res && res.success ? 'success' : 'error');
+  loadVerifyPrices();
+}
+
 async function setFinderBg(change) {
   const res = await api('/api/contacts/finder/settings', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(change),
@@ -5084,9 +5319,21 @@ async function setFinderBg(change) {
 }
 
 // Settings: the classifier (a small language model) that says which
-// search results and which read sites are a firm's own; and the check of
-// the websites found before it. The key is named, never shown.
-let _classify = null;
+// search results and which read sites are a firm's own, and which contacts
+// on them are; and the check of the websites found before it. Each task is
+// set to a profile (one complete setup: endpoint, model, the .env key's
+// name, prices, the questions' texts) or off. The built-in profiles carry
+// what Harvey's judge test measured on them, shown side by side, none put
+// first. The key is named, never shown.
+let _classify = null;       // /api/classify: the caps, the spend, what waits
+let _clsProfiles = null;    // /api/classify/profiles
+let _clsList = [];          // the profiles shown, sorted by name
+let _clsEdit = null;        // the profile being edited: {id, builtin, d}
+
+const CLS_TASKS = ['results', 'site', 'contacts'];
+// The questions a decision model's tasks hold (ids and option keys are
+// fixed by the server; only texts and bars change).
+const CLS_SITE_QUESTIONS = ['names', 'own', 'directory', 'institution'];
 
 // A classifier amount: small ones with four decimals.
 function clsUsd(n) {
@@ -5094,99 +5341,633 @@ function clsUsd(n) {
   return fmtUsd(n, Math.abs(Number(n)) >= 1 ? 2 : 4);
 }
 
+// What a task is for, when it is asked and what off means: the server's
+// words, in the viewer's language while the English matches.
+// A task's name ("Website"), with or without the server's words.
+function clsTaskName(task) {
+  return clsTaskText(task, 'label');
+}
+
+function clsTaskText(task, field) {
+  const doc = (((_clsProfiles || {}).tasks || {})[task]) || {};
+  return doc[field] ? tServer('cls.taskdoc.' + task + '.' + field, doc[field]) : t('cls.taskdoc.' + task + '.' + field);
+}
+
 // Its calls and spend today and this month, cost per site, tokens a call.
-function classifyMetricsHtml(m, cost) {
-  if (!m || !m.today || !(m.month && m.month.calls)) return '';
+function classifyMetricsHtml(m) {
+  if (!m || !m.today || !(m.month && m.month.calls)) return '<p class="desc" id="cls-metrics">' + escHtml(t('cls.metrics_none')) + '</p>';
   const tasks = Object.keys(m.per_task || {}).sort().map(k => {
     const v = m.per_task[k];
-    return escHtml(t('cls.metrics.task', {task: t('cls.task.' + k), n: fmtN(v.calls || 0), usd: clsUsd(v.usd),
+    return escHtml(t('cls.metrics.task', {task: clsTaskName(k), n: fmtN(v.calls || 0), usd: clsUsd(v.usd),
       tok: v.avg_tokens === null || v.avg_tokens === undefined ? '–' : fmtN(v.avg_tokens)}));
   }).join(' &middot; ');
   return '<p class="desc" id="cls-metrics">' + escHtml(t('cls.metrics', {
       today: fmtN(m.today.calls || 0), today_usd: clsUsd(m.today.usd), month: fmtN(m.month.calls || 0),
       month_usd: clsUsd(m.month.usd), site: clsUsd(m.cost_per_site),
       tok: m.month.avg_tokens === null || m.month.avg_tokens === undefined ? '–' : fmtN(m.month.avg_tokens)})) +
-    ((m.month.unpriced || (cost && cost.why && !cost.known && _classify && _classify.provider !== 'brain'))
-      ? ' ' + escHtml(t('cls.cost_unknown')) : '') + '</p>' +
+    (m.month.unpriced ? ' ' + escHtml(t('cls.cost_unknown')) : '') + '</p>' +
     (tasks ? '<p class="hint">' + tasks + '</p>' : '');
-}
-
-// Where a call's price comes from, or that it isn't known.
-function classifyCostHtml(c) {
-  const cost = c.cost || {};
-  if (!c.provider || c.provider === 'off' || c.provider === 'brain') return '';
-  if (!cost.known) return '<p class="hint warn" id="cls-cost">' + escHtml(t('cls.cost_unknown')) +
-    (c.usd_per_day !== null && c.usd_per_day !== undefined || c.usd_per_month !== null && c.usd_per_month !== undefined
-      ? ' ' + escHtml(t('cls.cost_unknown_caps')) : '') + '</p>';
-  if (cost.source === 'reply') return '<p class="hint" id="cls-cost">' + escHtml(t('cls.cost.reply')) + '</p>';
-  return '<p class="hint" id="cls-cost">' + escHtml(t('cls.cost.' + cost.source, {
-    pin: clsUsd(cost.in_per_m), pout: clsUsd(cost.out_per_m)})) + '</p>';
 }
 
 async function loadClassifyCard() {
   const el = document.getElementById('classify-card');
   if (!el) return;
-  const c = await api('/api/classify');
+  const [c, p] = await Promise.all([api('/api/classify'), api('/api/classify/profiles')]);
   if (!c || c.error) { el.innerHTML = '<p class="muted small">' + escHtml(failMsg(c, t('cls.failed'))) + '</p>'; return; }
   _classify = c;
-  const on = c.provider && c.provider !== 'off';
-  const opt = (v) => '<option value="' + escHtml(v) + '"' + (v === c.provider ? ' selected' : '') + '>' +
-    escHtml(t('cls.provider.' + v)) + '</option>';
-  const field = (id, label, value, type, extra) => '<div class="form-group"><label class="form-label" for="cls-' + id + '">' +
-    escHtml(label) + '</label><input class="form-input" id="cls-' + id + '" type="' + (type || 'text') + '" value="' +
-    escHtml(String(value === undefined || value === null ? '' : value)) + '"' + (extra || '') + '></div>';
-  const tasks = Object.keys(c.tasks || {}).map(k => '<label class="pd-setting"><input type="checkbox" id="cls-task-' + escHtml(k) + '"' +
-    ((c.tasks[k] || {}).on ? ' checked' : '') + '> ' + escHtml(t('cls.task.' + k)) + '</label>').join(' ');
-  const key = (c.key_set === null || c.key_set === undefined ? '' :
-    '<span class="hint">' + escHtml(t(c.key_set ? 'cls.key_set' : 'cls.key_missing', {name: c.key_name || ''})) + '</span>') +
-    // Where the questions and the key go, plainly.
-    ((c.provider === 'openai_compatible' || c.provider === 'decision') && c.host ? '<p class="hint" id="cls-host">' +
-      escHtml(t('cls.sends_to', {key: c.key_name || '', host: c.host})) + '</p>' : '') +
-    (c.sdk_missing ? '<p class="hint warn">' + escHtml(t('cls.sdk_missing', {sdk: c.sdk_missing})) + '</p>' : '');
-  el.innerHTML = '<div class="settings-row"><div><h3>' + escHtml(t('cls.title')) + '</h3>' +
-      '<p class="desc">' + escHtml(t('cls.desc')) + '</p>' +
-      '<p class="desc">' + escHtml(t('cls.calls_today', {n: fmtN(c.calls_today || 0), of: fmtN(c.per_day || 0)})) +
-      (c.held_seconds ? ' &middot; ' + escHtml(t('cls.held', {min: Math.ceil(c.held_seconds / 60)})) : '') + '</p>' +
-      (c.budget_reached ? '<p class="hint warn" id="cls-budget">' + escHtml(t('cls.budget_reached')) + '</p>' : '') +
-      classifyMetricsHtml(c.metrics, c.cost) +
-      (c.account ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="loadClassifyAccount()">' +
-        escHtml(t('cls.account')) + '</button></div><div id="cls-account"></div>' : '') + '</div>' +
-    '<div class="fields">' +
-      '<div class="form-group"><label class="form-label" for="cls-provider">' + escHtml(t('cls.provider')) + '</label>' +
-        '<select class="form-input" id="cls-provider">' + (c.providers || ['off']).map(opt).join('') + '</select></div>' +
-      '<div class="form-row">' + field('base_url', t('cls.base_url'), c.base_url, 'url', ' placeholder="http://127.0.0.1:11434/v1"') +
-        field('model', t('cls.model'), c.model) + '</div>' +
-      (c.provider === 'decision' ? '<p class="hint">' + escHtml(t('cls.decision_hint')) + '</p>' : '') +
-      // (DeepInfra's own price list to choose a model from: the field stays free text.)
-      (c.price_list ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="loadClassifyModels()">' +
-        escHtml(t('cls.models')) + '</button></div><div id="cls-models"></div>' : '') +
-      '<div class="form-row">' + field('key_name', t('cls.key_name'), c.key_name) + '</div>' + key +
-      // (The contacts bar: only for the provider that answers with probabilities.)
-      (c.provider === 'decision' ? '<div class="form-row">' +
-        field('yes', t('cls.yes'), c.yes, 'number', ' min="0.5" max="0.99" step="0.01"') +
-        '</div><p class="hint">' + escHtml(t('cls.yes_hint')) + '</p>' : '') +
-      (on && c.provider !== 'brain' ? '<div class="form-row">' +
-        field('price_in', t('cls.price_in'), c.price_in_per_m, 'number', ' min="0" step="any"') +
-        field('price_out', t('cls.price_out'), c.price_out_per_m, 'number', ' min="0" step="any"') + '</div>' +
-        '<p class="hint">' + escHtml(t('cls.price_hint')) + '</p>' + classifyCostHtml(c) +
-        '<div class="form-row">' +
-        field('usd_day', t('cls.usd_per_day'), c.usd_per_day, 'number', ' min="0" step="any"') +
-        field('usd_month', t('cls.usd_per_month'), c.usd_per_month, 'number', ' min="0" step="any"') + '</div>' +
-        '<p class="hint">' + escHtml(t('cls.usd_hint')) + '</p>' : '') +
-      '<div class="form-row">' + field('per_day', t('cls.per_day'), c.per_day, 'number', ' min="0"') +
-        field('per_minute', t('cls.per_minute'), c.per_minute, 'number', ' min="1"') +
-        field('timeout', t('cls.timeout'), c.timeout_seconds, 'number', ' min="5"') + '</div>' +
-      '<div class="form-group"><label class="pd-setting"><input type="checkbox" id="cls-json"' + (c.json_mode ? ' checked' : '') + '> ' +
-        escHtml(t('cls.json_mode')) + '</label></div>' +
-      '<div class="form-group"><span class="form-label">' + escHtml(t('cls.tasks')) + '</span>' + tasks + '</div>' +
-      '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="saveClassify()">' + escHtml(t('cls.save')) + '</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="testClassify()"' + (on ? '' : ' disabled') + '>' + escHtml(t('cls.test')) + '</button></div>' +
-      '<div id="cls-test-result"></div>' +
+  _clsProfiles = p && !p.error ? p : {profiles: [], use: c.use || {}, tasks: {}, hidden: []};
+  const all = _clsProfiles.profiles || [];
+  _clsList = all.filter(x => !x.hidden).sort((a, b) => String(a.name).localeCompare(String(b.name), intlLocale()));
+  const hidden = all.filter(x => x.hidden).sort((a, b) => String(a.name).localeCompare(String(b.name), intlLocale()));
+  el.innerHTML = clsAboutHtml() + clsTasksHtml() + clsBudgetHtml(c) +
+    '<div class="settings-row"><div><h3>' + escHtml(t('cls.profiles')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('cls.profiles_desc')) + '</p>' +
+      (_clsProfiles.about ? '<p class="hint">' + escHtml(tServer('cls.about_builtin', _clsProfiles.about)) + '</p>' : '') +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="newClsProfile()">' + escHtml(t('cls.add')) + '</button></div></div>' +
+    '<div class="fields cls-wide"><div id="cls-editor">' + (_clsEdit ? clsEditorHtml() : '') + '</div>' +
+      '<div class="cls-profiles" id="cls-profiles">' + (_clsList.length ? _clsList.map(clsProfileHtml).join('')
+        : '<p class="muted small">' + escHtml(t('cls.no_profiles')) + '</p>') + '</div>' +
+      (hidden.length ? '<details class="more-fields" id="cls-hidden"><summary>' + escHtml(t('cls.hidden_n', {n: hidden.length})) +
+        '</summary><ul class="small">' + hidden.map(h => '<li>' + escHtml(h.name) + ' <button class="btn btn-ghost btn-sm" onclick="clsProfileAction(' +
+          jsq(h.id) + ', \'restore\')">' + escHtml(t('cls.restore')) + '</button></li>').join('') + '</ul></details>' : '') +
     '</div></div>' +
     '<div class="settings-row"><div><h3>' + escHtml(t('rejudge.title')) + '</h3>' +
       '<p class="desc">' + escHtml(t('rejudge.desc')) + '</p></div>' +
     '<div class="fields" id="rejudge-box"><p class="muted small">' + escHtml(t(c.waiting ? 'rejudge.counting' : 'rejudge.none')) + '</p></div></div>';
   if (c.waiting) loadRejudgeCount();
+}
+
+// What the classifier is, when it is asked, and its rules, in plain words.
+function clsAboutHtml() {
+  const li = (k) => '<li>' + escHtml(t(k)) + '</li>';
+  return '<div class="settings-row" id="cls-about"><div><h3>' + escHtml(t('cls.title')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('cls.about.what')) + '</p></div>' +
+    '<div class="fields cls-wide"><p class="form-label">' + escHtml(t('cls.about.when')) + '</p><ul class="cls-list small">' +
+      li('cls.about.when.find') + li('cls.about.when.again') + li('cls.about.when.check') + li('cls.about.when.verify') + '</ul>' +
+      '<p class="form-label">' + escHtml(t('cls.about.rules')) + '</p><ul class="cls-list small">' +
+      li('cls.about.rule.register') + li('cls.about.rule.likely') + li('cls.about.rule.off') + li('cls.about.rule.caps') +
+      li('cls.about.rule.brain') + '</ul></div></div>';
+}
+
+// Each task: what it is for, when it is asked, what off means, and the
+// profile that answers it (or off), changeable here.
+function clsTasksHtml() {
+  const use = (_clsProfiles && _clsProfiles.use) || {};
+  const rows = CLS_TASKS.map(task => {
+    const can = _clsList.filter(p => (p.tasks || []).includes(task));
+    const current = use[task] || 'off';
+    const opts = '<option value="off"' + (current === 'off' ? ' selected' : '') + '>' + escHtml(t('cls.use_off')) + '</option>' +
+      can.map(p => '<option value="' + escHtml(p.id) + '"' + (p.id === current ? ' selected' : '') + '>' + escHtml(p.name) + '</option>').join('');
+    return '<div class="cls-task" id="cls-task-' + task + '"><div class="cls-task-text"><h4>' + escHtml(clsTaskText(task, 'label')) + '</h4>' +
+        '<p class="small">' + escHtml(clsTaskText(task, 'what')) + '</p>' +
+        '<p class="muted small">' + escHtml(clsTaskText(task, 'when')) + '</p>' +
+        '<p class="muted small">' + escHtml(t('cls.if_off', {text: clsTaskText(task, 'off')})) + '</p></div>' +
+      '<div class="form-group"><label class="form-label" for="cls-use-' + task + '">' + escHtml(t('cls.answered_by')) + '</label>' +
+        '<select class="form-input" id="cls-use-' + task + '" onchange="setClassifyUse(\'' + task + '\', this.value)">' + opts + '</select></div></div>';
+  }).join('');
+  return '<div class="settings-row" id="cls-tasks"><div><h3>' + escHtml(t('cls.tasks')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('cls.tasks_desc')) + '</p></div><div class="fields cls-wide">' + rows + '</div></div>';
+}
+
+async function setClassifyUse(task, id) {
+  const res = await api('/api/classify/use', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                             body: JSON.stringify({[task]: id})});
+  showToast(res && res.success ? t('cls.use_saved', {task: clsTaskText(task, 'label')}) : failMsg(res, t('cls.failed')),
+            res && res.success ? 'success' : 'error');
+  loadClassifyCard();
+}
+
+// The install's caps (calls a day, USD a day and a month), today's and this
+// month's spend, and the DeepInfra key's scopes.
+function clsBudgetHtml(c) {
+  const field = (id, label, value, extra) => '<div class="form-group"><label class="form-label" for="cls-' + id + '">' +
+    escHtml(label) + '</label><input class="form-input" id="cls-' + id + '" type="number" value="' +
+    escHtml(String(value === undefined || value === null ? '' : value)) + '"' + (extra || '') + '></div>';
+  const perTask = CLS_TASKS.map(k => t('cls.task_cap', {task: clsTaskName(k), n: fmtN(((c.tasks || {})[k] || {}).per_day || 0)})).join(' · ');
+  return '<div class="settings-row" id="cls-budget-row"><div><h3>' + escHtml(t('cls.budget')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('cls.budget_desc')) + '</p></div>' +
+    '<div class="fields">' +
+      '<p class="desc">' + escHtml(t('cls.calls_today', {n: fmtN(c.calls_today || 0), of: fmtN(c.per_day || 0)})) + '</p>' +
+      Object.keys(c.held || {}).map(id => '<p class="hint warn cls-held">' +
+        escHtml(t('cls.held_named', {name: c.held[id].name || id, text: clsHeldText(c.held[id])})) + '</p>').join('') +
+      (c.budget_reached ? '<p class="hint warn" id="cls-budget">' + escHtml(t('cls.budget_reached')) + '</p>' : '') +
+      classifyMetricsHtml(c.metrics) +
+      '<div class="form-row">' + field('per_day', t('cls.per_day'), c.per_day, ' min="0"') +
+        field('usd_day', t('cls.usd_per_day'), c.usd_per_day, ' min="0" step="any"') +
+        field('usd_month', t('cls.usd_per_month'), c.usd_per_month, ' min="0" step="any"') + '</div>' +
+      '<p class="hint">' + escHtml(t('cls.usd_hint')) + '</p>' +
+      '<p class="hint">' + escHtml(perTask) + '</p>' +
+      '<p class="hint">' + escHtml(t('cls.run_caps')) + '</p>' +
+      '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="saveClassifyCaps()">' + escHtml(t('cls.save')) + '</button></div>' +
+      '<p class="hint" id="cls-scopes">' + escHtml(t('cls.scopes')) + '</p>' +
+    '</div></div>';
+}
+
+async function saveClassifyCaps() {
+  const v = (id) => String((document.getElementById('cls-' + id) || {}).value || '').trim();
+  // (Blank USD cap: none; the call caps stay.)
+  const body = {per_day: Number(v('per_day') || 0), usd_per_day: v('usd_day'), usd_per_month: v('usd_month')};
+  const res = await api('/api/classify/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  showToast(res && res.success ? t('cls.saved') : failMsg(res, t('cls.failed')), res && res.success ? 'success' : 'error');
+  loadClassifyCard();
+}
+
+// ── One profile, as a card ──
+
+// A profile's pause, asked for by its server: its own (a rate limit, an
+// unknown model) or its account's (a refused key, no credit: every profile
+// on the same endpoint and key waits). Each profile keeps its own pace.
+function clsHeldText(h) {
+  const secs = Number((h && h.seconds) || 0);
+  const until = new Date(Date.now() + secs * 1000).toLocaleTimeString(intlLocale(), {hour: '2-digit', minute: '2-digit'});
+  return t(h.scope === 'account' ? 'cls.held_account' : 'cls.held_profile', {min: Math.max(1, Math.ceil(secs / 60)), until: until}) +
+    (h.why ? ' (' + h.why + ')' : '');
+}
+
+function clsKeyText(p) {
+  if (p.kind === 'brain') return t('cls.key_none_brain');
+  if (!p.key_name) return t('cls.key_none');
+  return t(p.key_set ? 'cls.key_set' : 'cls.key_missing', {name: p.key_name});
+}
+
+function clsPriceText(p) {
+  const pr = p.prices || {};
+  if (p.kind === 'brain') return t('cls.price_brain');
+  if (pr.from_list) return t('cls.price_list');
+  if (pr.in_per_m !== null && pr.in_per_m !== undefined && pr.out_per_m !== null && pr.out_per_m !== undefined) {
+    return t('cls.price_entered', {pin: clsUsd(pr.in_per_m), pout: clsUsd(pr.out_per_m)});
+  }
+  return t('cls.price_none');
+}
+
+// DeepInfra's price list and account box: the server's rule (a saved
+// profile's is_deepinfra; a draft's base URL on the host the server names,
+// exactly).
+function clsIsDeepInfra(p) {
+  if (typeof p.is_deepinfra === 'boolean') return p.is_deepinfra;
+  const host = (_clsProfiles && _clsProfiles.deepinfra_host) || '';
+  if (!host) return false;
+  try { return new URL(p.base_url).hostname.toLowerCase() === host.toLowerCase(); } catch { return false; }
+}
+
+// A test's counts in words: the built-in's measured ones or a run of yours.
+function clsCountsHtml(r) {
+  if (!r) return '';
+  const n = (v) => v === null || v === undefined ? '–' : fmtN(v);
+  const parts = [];
+  const right = r.site_right !== undefined ? r.site_right : r.correct;
+  if (right !== undefined && r.scored !== undefined) {
+    parts.push(t(r.task === 'results' ? 'cls.m.results' : 'cls.m.site', {right: n(right), scored: n(r.scored),
+      fl: n(r.false_links), miss: n(r.misses)}));
+  }
+  if (r.contacts_expected) {
+    parts.push(t('cls.m.contacts', {right: n(r.contacts_right), picked: n(r.contacts_picked), expected: n(r.contacts_expected)}));
+  }
+  if (r.median_ms !== null && r.median_ms !== undefined) {
+    parts.push(t(r.p90_ms !== null && r.p90_ms !== undefined ? 'cls.m.time' : 'cls.m.time_median',
+                 {med: n(r.median_ms), p90: n(r.p90_ms)}));
+  }
+  if (r.cost_usd !== null && r.cost_usd !== undefined) {
+    parts.push(r.cost_per_1000_sites !== undefined
+      ? t('cls.m.cost', {usd: clsUsd(r.cost_usd), per: clsUsd(r.cost_per_1000_sites)})
+      : t(r.cost_known === false ? 'cls.m.cost_unknown' : 'cls.m.cost_only', {usd: clsUsd(r.cost_usd)}));
+  }
+  return escHtml(parts.join(' · '));
+}
+
+function clsTestSet(name) {
+  if (name === 'built-in') return t('cls.set.builtin');
+  if (name === 'your file') return t('cls.set.file');
+  return tServer('cls.set.developers', name || '');
+}
+
+function clsResultsHtml(p) {
+  const m = p.measured;
+  let html = '';
+  if (m) {
+    html += '<p class="small cls-counts">' + clsCountsHtml(m) + '</p>' +
+      '<p class="muted small">' + escHtml(t('cls.m.when', {date: m.measured_at || '', set: clsTestSet(m.test_set),
+        cases: fmtN(m.cases || 0), asked: fmtN(m.asked || 0), scored: fmtN(m.scored || 0)})) + '</p>';
+  }
+  const runs = p.tests || [];
+  if (!m && !p.tested) {
+    html += '<p class="muted small cls-untested">' + escHtml(t(runs.length ? 'cls.not_tested_changed' : 'cls.not_tested')) + '</p>';
+  }
+  if (runs.length) {
+    html += '<details class="cls-runs"><summary class="small">' + escHtml(t('cls.tests_yours', {n: runs.length})) + '</summary><ul class="small">' +
+      runs.map(r => '<li>' + escHtml(t('cls.t.line', {task: clsTaskName((r.task || 'site')),
+        when: r.at ? new Date(r.at * 1000).toLocaleDateString(intlLocale()) : '', set: clsTestSet(r.test_set)})) + ' ' +
+        clsCountsHtml(r) + (r.stopped ? ' · ' + escHtml(t('cls.t.stopped', {why: r.stopped})) : '') + '</li>').join('') + '</ul></details>';
+  }
+  return html;
+}
+
+function clsProfileHtml(p) {
+  const line = (label, value) => '<div class="cls-line"><span class="muted">' + escHtml(label) + '</span> ' + value + '</div>';
+  const used = (p.used_for || []).map(k => clsTaskName(k));
+  const free = (p.tasks || []).filter(k => !(p.used_for || []).includes(k));
+  const extra = p.request_extra && Object.keys(p.request_extra).length ? JSON.stringify(p.request_extra) : '';
+  const note = p.notes ? (p.builtin ? tServer('cls.note.' + p.id, p.notes) : p.notes) : '';
+  const keyNote = p.key_name === 'DEEPINFRA_API_KEY' || clsIsDeepInfra(p) ? t('cls.scopes_short')
+    : (p.key_notes && p.key_notes.note ? tServer('cls.keynote.' + p.key_name, p.key_notes.note) : '');
+  const testable = (p.tasks || []).some(k => k === 'site' || k === 'results');
+  const box = 'clsp-' + p.id;
+  return '<div class="cls-profile" id="' + escHtml(box) + '"><div class="cls-profile-head"><h4>' + escHtml(p.name) + '</h4>' +
+      '<span class="muted small">' + escHtml(t(p.builtin ? 'cls.builtin' : (p.based_on ? 'cls.yours_based' : 'cls.yours'),
+        {name: p.based_on || ''})) + '</span></div>' +
+    line(t('cls.f.kind'), escHtml(t('cls.provider.' + p.kind))) +
+    (p.kind !== 'brain' ? line(t('cls.f.endpoint'), p.base_url ? '<span class="mono">' + escHtml(p.base_url) + '</span>' : '–') +
+      line(t('cls.f.model'), p.model ? '<span class="mono">' + escHtml(p.model) + '</span>' : '–') : '') +
+    line(t('cls.f.key'), escHtml(clsKeyText(p))) +
+    line(t('cls.f.price'), escHtml(clsPriceText(p))) +
+    (extra ? line(t('cls.f.extra'), '<span class="mono">' + escHtml(extra) + '</span>') : '') +
+    line(t('cls.f.pace'), escHtml(t('cls.pace', {n: fmtN(p.per_minute || 0), s: fmtN(p.timeout_seconds || 0)}))) +
+    line(t('cls.f.answers'), escHtml((p.tasks || []).map(k => clsTaskName(k)).join(', ') || '–')) +
+    line(t('cls.f.used_for'), escHtml(used.length ? used.join(', ') : t('cls.not_used'))) +
+    (p.held && p.held.seconds > 0 ? '<p class="hint warn cls-held">' + escHtml(clsHeldText(p.held)) + '</p>' : '') +
+    clsResultsHtml(p) +
+    (note ? '<p class="hint">' + escHtml(note) + '</p>' : '') +
+    (keyNote ? '<p class="hint">' + escHtml(keyNote) + '</p>' : '') +
+    (p.sdk_missing ? '<p class="hint warn">' + escHtml(t('cls.sdk_missing', {sdk: p.sdk_missing})) + '</p>' : '') +
+    '<div class="btn-row">' +
+      (free.length ? '<select class="form-input cls-use-for" aria-label="' + escHtml(t('cls.use_for')) + '" onchange="if (this.value) setClassifyUse(this.value, ' +
+        jsq(p.id) + ')"><option value="">' + escHtml(t('cls.use_for')) + '</option>' +
+        free.map(k => '<option value="' + k + '">' + escHtml(clsTaskName(k)) + '</option>').join('') + '</select>' : '') +
+      (testable ? '<button class="btn btn-secondary btn-sm" onclick="openClsTest(' + jsq(p.id) + ')">' + escHtml(t('cls.test')) + '</button>' : '') +
+      '<button class="btn btn-secondary btn-sm" onclick="editClsProfile(' + jsq(p.id) + ')">' + escHtml(t('cls.edit')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="duplicateClsProfile(' + jsq(p.id) + ')">' + escHtml(t('cls.duplicate')) + '</button>' +
+      (p.builtin ? '<button class="btn btn-ghost btn-sm" onclick="clsProfileAction(' + jsq(p.id) + ', \'hide\')">' + escHtml(t('cls.hide')) + '</button>'
+                 : '<button class="btn btn-ghost btn-sm" onclick="clsProfileAction(' + jsq(p.id) + ', \'remove\')">' + escHtml(t('cls.remove')) + '</button>') +
+      (clsIsDeepInfra(p) && p.key_set ? '<button class="btn btn-ghost btn-sm" onclick="loadClassifyAccount(' + jsq(p.id) + ')">' + escHtml(t('cls.account')) + '</button>' : '') +
+    '</div><div id="' + escHtml(box) + '-acct"></div><div id="' + escHtml(box) + '-test"></div></div>';
+}
+
+function clsProfile(id) {
+  return ((_clsProfiles && _clsProfiles.profiles) || []).find(p => p.id === id) || null;
+}
+
+async function clsProfileAction(id, action) {
+  const p = clsProfile(id);
+  if (action === 'remove' && !confirm(t('cls.remove_confirm', {name: p ? p.name : id}))) return;
+  const res = await api('/api/classify/profiles/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
+  showToast(res && res.success ? t('cls.done.' + action, {name: p ? p.name : id}) + ((res.off || []).length
+              ? ' ' + t('cls.now_off', {tasks: res.off.map(k => clsTaskName(k)).join(', ')}) : '')
+            : failMsg(res, t('cls.failed')), res && res.success ? 'success' : 'error');
+  loadClassifyCard();
+}
+
+// A copy of a profile, as one of your own: a built-in's through the
+// server (it keeps "based on"), one of yours with its fields.
+async function duplicateClsProfile(id) {
+  const p = clsProfile(id);
+  if (!p) return;
+  const res = p.builtin
+    ? await api('/api/classify/profiles/' + encodeURIComponent(id), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})
+    : await api('/api/classify/profiles', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                           body: JSON.stringify(Object.assign(clsFields(p), {name: t('cls.copy_name', {name: p.name})}))});
+  showToast(res && res.success ? t('cls.copied', {name: (res.profile || {}).name || ''}) : failMsg(res, t('cls.failed')),
+            res && res.success ? 'success' : 'error');
+  loadClassifyCard();
+}
+
+// The fields a profile is saved with (what the server checks).
+function clsFields(p) {
+  const out = {};
+  ['name', 'kind', 'base_url', 'model', 'key_name', 'request_extra', 'json_mode', 'per_minute', 'timeout_seconds',
+   'prices', 'tasks', 'questions', 'notes'].forEach(k => { if (p[k] !== undefined && p[k] !== null) out[k] = JSON.parse(JSON.stringify(p[k])); });
+  return out;
+}
+
+// ── Editing a profile ──
+
+// The measured texts of a kind's family (a decision model's, or a
+// language model's), from a built-in that carries them.
+function clsDefaultQuestions(kind) {
+  const decision = kind === 'decision';
+  const from = ((_clsProfiles && _clsProfiles.profiles) || []).find(p => p.builtin && (p.kind === 'decision') === decision && p.questions);
+  return from ? JSON.parse(JSON.stringify(from.questions)) : null;
+}
+
+function clsKindTasks(kind) {
+  const docs = (_clsProfiles && _clsProfiles.tasks) || {};
+  const can = CLS_TASKS.filter(k => !docs[k] || !docs[k].kinds || docs[k].kinds.includes(kind));
+  return can.length ? can : (kind === 'decision' ? ['site', 'contacts'] : CLS_TASKS.slice());
+}
+
+function newClsProfile() {
+  _clsEdit = {id: '', builtin: false, d: {name: '', kind: 'openai_compatible', base_url: '', model: '', key_name: '',
+    request_extra: {}, json_mode: true, per_minute: 20, timeout_seconds: 30, prices: {in_per_m: null, out_per_m: null, from_list: false},
+    tasks: clsKindTasks('openai_compatible'), questions: clsDefaultQuestions('openai_compatible'), notes: ''}};
+  renderClsEditor();
+}
+
+function editClsProfile(id) {
+  const p = clsProfile(id);
+  if (!p) return;
+  _clsEdit = {id: p.id, builtin: !!p.builtin, d: clsFields(p)};
+  // (A built-in's edit is saved as a copy: named as one.)
+  if (p.builtin) _clsEdit.d.name = t('cls.copy_name', {name: p.name});
+  renderClsEditor();
+}
+
+function renderClsEditor() {
+  const el = document.getElementById('cls-editor');
+  if (!el) return;
+  el.innerHTML = _clsEdit ? clsEditorHtml() : '';
+  if (_clsEdit && el.scrollIntoView) el.scrollIntoView({block: 'start'});
+}
+
+function closeClsEditor() {
+  _clsEdit = null;
+  renderClsEditor();
+}
+
+// The kind changes what is asked: its tasks and its measured texts.
+function setClsEditorKind(kind) {
+  if (!_clsEdit) return;
+  readClsEditor();
+  _clsEdit.d.kind = kind;
+  _clsEdit.d.tasks = clsKindTasks(kind);
+  _clsEdit.d.questions = clsDefaultQuestions(kind);
+  renderClsEditor();
+}
+
+function clsEditorHtml() {
+  const d = _clsEdit.d;
+  const val = (v) => escHtml(String(v === undefined || v === null ? '' : v));
+  const input = (id, label, value, type, extra) => '<div class="form-group"><label class="form-label" for="clse-' + id + '">' +
+    escHtml(label) + '</label><input class="form-input" id="clse-' + id + '" type="' + (type || 'text') + '" value="' + val(value) + '"' + (extra || '') + '></div>';
+  const area = (id, label, value, rows) => '<div class="form-group"><label class="form-label" for="clse-' + id + '">' + escHtml(label) +
+    '</label><textarea class="form-input" id="clse-' + id + '" rows="' + (rows || 3) + '">' + val(value) + '</textarea></div>';
+  const kinds = ((_clsProfiles && _clsProfiles.kinds) || ['openai_compatible', 'anthropic', 'decision', 'brain']);
+  const pr = d.prices || {};
+  const deepinfra = d.kind === 'openai_compatible' && clsIsDeepInfra(d);
+  const q = d.questions || null;
+  let questions = '';
+  if (!q) {
+    questions = '<p class="hint">' + escHtml(t('cls.e.q_after_save')) + '</p>';
+  } else {
+    questions = (d.tasks || []).map(task => {
+      const tq = q[task] || {};
+      let body = '';
+      if (d.kind !== 'decision') {
+        body = area('q-' + task + '-prompt', t('cls.e.prompt'), tq.prompt, 4) + area('q-' + task + '-yes', t('cls.e.yes'), tq.yes, 2) +
+          area('q-' + task + '-no', t('cls.e.no'), tq.no, 2);
+      } else if (task === 'site') {
+        const qs = tq.questions || {};
+        body = CLS_SITE_QUESTIONS.filter(k => qs[k]).map(k => area('q-site-' + k, t('cls.e.question', {id: k}), qs[k].instructions, 3) +
+            (qs[k].criteria ? '<div class="form-row">' + area('q-site-' + k + '-true', t('cls.e.crit_true'), qs[k].criteria.true, 2) +
+              area('q-site-' + k + '-false', t('cls.e.crit_false'), qs[k].criteria.false, 2) + '</div>' : '')).join('') +
+          '<div class="form-row">' + Object.keys(tq.needs || {}).map(k => input('q-site-needs-' + k, t('cls.e.needs', {id: k}), tq.needs[k], 'number',
+              ' min="0.05" max="0.99" step="0.01"')).join('') +
+            Object.keys(tq.vetoes || {}).map(k => input('q-site-vetoes-' + k, t('cls.e.vetoes', {id: k}), tq.vetoes[k], 'number',
+              ' min="0.05" max="0.99" step="0.01"')).join('') + '</div>' +
+          '<p class="hint">' + escHtml(t('cls.e.bars_hint')) + '</p>';
+      } else if (task === 'contacts') {
+        body = area('q-contacts-instructions', t('cls.e.instructions'), tq.instructions, 2) +
+          Object.keys(tq.options || {}).map(k => input('q-contacts-opt-' + k, t('cls.e.option', {id: k}), tq.options[k])).join('') +
+          input('q-contacts-bar', t('cls.yes'), tq.bar, 'number', ' min="0.5" max="0.99" step="0.01"') +
+          '<p class="hint">' + escHtml(t('cls.yes_hint')) + '</p>';
+      }
+      return '<details class="more-fields cls-q"><summary>' + escHtml(t('cls.e.questions_for', {task: clsTaskName(task)})) + '</summary>' + body + '</details>';
+    }).join('');
+  }
+  return '<div class="card cls-edit"><h4>' + escHtml(t(_clsEdit.id ? (_clsEdit.builtin ? 'cls.e.title_builtin' : 'cls.e.title') : 'cls.e.title_new',
+      {name: d.name || ''})) + '</h4>' +
+    (_clsEdit.builtin ? '<p class="hint">' + escHtml(t('cls.e.copy_note')) + '</p>' : '') +
+    '<div class="form-row">' + input('name', t('cls.e.name'), d.name) +
+      '<div class="form-group"><label class="form-label" for="clse-kind">' + escHtml(t('cls.f.kind')) + '</label>' +
+      '<select class="form-input" id="clse-kind" onchange="setClsEditorKind(this.value)">' + kinds.map(k =>
+        '<option value="' + escHtml(k) + '"' + (k === d.kind ? ' selected' : '') + '>' + escHtml(t('cls.provider.' + k)) + '</option>').join('') +
+      '</select></div></div>' +
+    (d.kind === 'decision' ? '<p class="hint">' + escHtml(t('cls.decision_hint')) + '</p>' : '') +
+    (d.kind !== 'brain' ? '<div class="form-row">' + input('base_url', t('cls.base_url'), d.base_url, 'url', ' placeholder="http://127.0.0.1:11434/v1"') +
+        input('model', t('cls.model'), d.model) + '</div>' +
+      (deepinfra ? '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="loadClassifyModels()">' +
+        escHtml(t('cls.models')) + '</button></div><div id="clse-models"></div>' : '') +
+      '<div class="form-row">' + input('key_name', t('cls.key_name'), d.key_name) + '</div>' +
+      '<p class="hint">' + escHtml(t('cls.e.key_hint')) + '</p>' : '<p class="hint">' + escHtml(t('cls.e.brain_hint')) + '</p>') +
+    '<div class="form-row">' + input('per_minute', t('cls.per_minute'), d.per_minute, 'number', ' min="1" max="600"') +
+      input('timeout', t('cls.timeout'), d.timeout_seconds, 'number', ' min="5" max="600"') + '</div>' +
+    (d.kind !== 'brain' ? (deepinfra ? '<div class="form-group"><label class="pd-setting"><input type="checkbox" id="clse-from_list"' +
+        (pr.from_list ? ' checked' : '') + '> ' + escHtml(t('cls.e.from_list')) + '</label></div>' : '') +
+      '<div class="form-row">' + input('price_in', t('cls.price_in'), pr.in_per_m, 'number', ' min="0" step="any"') +
+        input('price_out', t('cls.price_out'), pr.out_per_m, 'number', ' min="0" step="any"') + '</div>' +
+      '<p class="hint">' + escHtml(t('cls.price_hint')) + '</p>' : '') +
+    (d.kind !== 'decision' && d.kind !== 'brain' ? '<div class="form-group"><label class="pd-setting"><input type="checkbox" id="clse-json"' +
+      (d.json_mode ? ' checked' : '') + '> ' + escHtml(t('cls.json_mode')) + '</label></div>' : '') +
+    (d.kind !== 'brain' ? area('extra', t('cls.e.extra'), d.request_extra && Object.keys(d.request_extra).length ? JSON.stringify(d.request_extra) : '', 2) +
+      '<p class="hint">' + escHtml(t('cls.e.extra_hint')) + '</p>' : '') +
+    '<div class="form-group"><span class="form-label">' + escHtml(t('cls.f.answers')) + '</span>' + clsKindTasks(d.kind).map(k =>
+      '<label class="pd-setting"><input type="checkbox" id="clse-task-' + k + '"' + ((d.tasks || []).includes(k) ? ' checked' : '') + '> ' +
+      escHtml(clsTaskName(k)) + '</label>').join(' ') + '</div>' +
+    '<p class="form-label">' + escHtml(t('cls.e.questions')) + '</p><p class="hint">' + escHtml(t('cls.e.questions_hint')) + '</p>' + questions +
+    area('notes', t('cls.e.notes'), d.notes, 2) +
+    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="saveClsProfile()">' + escHtml(t('cls.save')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeClsEditor()">' + escHtml(t('common.cancel')) + '</button></div></div>';
+}
+
+// The editor's fields into _clsEdit.d; the reason when one can't be read.
+function readClsEditor() {
+  const d = _clsEdit.d;
+  const el = (id) => document.getElementById('clse-' + id);
+  const v = (id) => { const x = el(id); return x ? String(x.value || '').trim() : undefined; };
+  const num = (id) => { const x = v(id); return x === undefined || x === '' ? null : Number(x); };
+  if (v('name') !== undefined) d.name = v('name');
+  ['base_url', 'model', 'key_name', 'notes'].forEach(k => { if (v(k) !== undefined) d[k] = v(k); });
+  if (v('per_minute') !== undefined) d.per_minute = Math.round(num('per_minute') || 1);
+  if (v('timeout') !== undefined) d.timeout_seconds = Math.round(num('timeout') || 30);
+  if (el('json')) d.json_mode = !!el('json').checked;
+  if (v('price_in') !== undefined) {
+    d.prices = {in_per_m: num('price_in'), out_per_m: num('price_out'), from_list: !!(el('from_list') && el('from_list').checked)};
+  }
+  const tasks = clsKindTasks(d.kind).filter(k => el('task-' + k) && el('task-' + k).checked);
+  if (tasks.length || clsKindTasks(d.kind).some(k => el('task-' + k))) d.tasks = tasks;
+  let why = '';
+  if (v('extra') !== undefined) {
+    if (!v('extra')) d.request_extra = {};
+    else {
+      try {
+        const x = JSON.parse(v('extra'));
+        if (!x || typeof x !== 'object' || Array.isArray(x)) why = t('cls.e.extra_bad');
+        else d.request_extra = x;
+      } catch { why = t('cls.e.extra_bad'); }
+    }
+  }
+  const q = d.questions;
+  if (q) {
+    (d.tasks || []).forEach(task => {
+      const tq = q[task];
+      if (!tq) return;
+      if (d.kind !== 'decision') {
+        ['prompt', 'yes', 'no'].forEach(k => { if (v('q-' + task + '-' + k) !== undefined) tq[k] = v('q-' + task + '-' + k); });
+      } else if (task === 'site') {
+        CLS_SITE_QUESTIONS.forEach(k => {
+          if (!tq.questions || !tq.questions[k]) return;
+          if (v('q-site-' + k) !== undefined) tq.questions[k].instructions = v('q-site-' + k);
+          if (tq.questions[k].criteria) {
+            const crit = {};
+            ['true', 'false'].forEach(c => { const x = v('q-site-' + k + '-' + c); if (x) crit[c] = x; });
+            tq.questions[k].criteria = crit;
+          }
+        });
+        ['needs', 'vetoes'].forEach(part => Object.keys(tq[part] || {}).forEach(k => {
+          const x = num('q-site-' + part + '-' + k);
+          if (x !== null) tq[part][k] = x;
+        }));
+      } else if (task === 'contacts') {
+        if (v('q-contacts-instructions') !== undefined) tq.instructions = v('q-contacts-instructions');
+        Object.keys(tq.options || {}).forEach(k => { const x = v('q-contacts-opt-' + k); if (x !== undefined) tq.options[k] = x; });
+        const bar = num('q-contacts-bar');
+        if (bar !== null) tq.bar = bar;
+      }
+    });
+  }
+  return why;
+}
+
+async function saveClsProfile() {
+  if (!_clsEdit) return;
+  const why = readClsEditor();
+  if (why) { showToast(why, 'error'); return; }
+  const d = _clsEdit.d;
+  const body = clsFields(d);
+  if (d.prices && d.prices.from_list) body.prices = {from_list: true};
+  if (body.kind === 'brain') { delete body.base_url; delete body.model; delete body.key_name; delete body.prices; }
+  if (body.questions) {
+    const q = {};
+    (d.tasks || []).forEach(k => { if (body.questions[k]) q[k] = body.questions[k]; });
+    body.questions = q;
+  }
+  const path = _clsEdit.id ? '/api/classify/profiles/' + encodeURIComponent(_clsEdit.id) : '/api/classify/profiles';
+  const res = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!res || !res.success) { showToast(failMsg(res, t('cls.failed')), 'error'); return; }
+  showToast(res.copied_from ? t('cls.saved_copy', {name: (res.profile || {}).name || ''}) : t('cls.saved'), 'success');
+  _clsEdit = null;
+  loadClassifyCard();
+}
+
+// DeepInfra's models with their prices: picking one fills the model field
+// (saved with Save). Sorted by price, nothing else.
+async function loadClassifyModels() {
+  const el = document.getElementById('clse-models');
+  if (!el) return;
+  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
+  const r = await api('/api/classify/models?provider=openai_compatible');
+  const rows = (r && r.models) || [];
+  if (!rows.length) {
+    el.innerHTML = '<p class="muted small">' + escHtml(t(r && r.error ? 'cls.models_failed' : 'cls.models_none')) + '</p>';
+    return;
+  }
+  el.innerHTML = '<div class="table-wrap"><table class="table small"><thead><tr><th>' + escHtml(t('cls.model')) + '</th><th>' +
+    escHtml(t('cls.models.in')) + '</th><th>' + escHtml(t('cls.models.out')) + '</th><th>' + escHtml(t('cls.models.context')) +
+    '</th><th></th></tr></thead><tbody>' + rows.map(m => '<tr><td>' + escHtml(m.model) + '</td><td>' + escHtml(clsUsd(m.in_per_m)) +
+    '</td><td>' + escHtml(clsUsd(m.out_per_m)) + '</td><td>' + (m.context ? escHtml(fmtN(m.context)) : '–') +
+    '</td><td><button class="btn btn-secondary btn-sm" data-model="' + escHtml(m.model) +
+    '" onclick="pickClassifyModel(this.dataset.model)">' + escHtml(t('cls.models.pick')) + '</button></td></tr>').join('') +
+    '</tbody></table></div><p class="hint">' + escHtml(t('cls.models_hint')) + '</p>';
+}
+
+function pickClassifyModel(name) {
+  const input = document.getElementById('clse-model');
+  if (input) input.value = name || '';
+}
+
+// A profile's DeepInfra account, read by the server with its key (the key
+// stays there): this month's usage, the key's limit, the balance.
+async function loadClassifyAccount(id) {
+  const el = document.getElementById('clsp-' + id + '-acct');
+  if (!el) return;
+  const p = clsProfile(id) || {};
+  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
+  const a = await api('/api/classify/account?profile=' + encodeURIComponent(id));
+  if (!a || !a.available) {
+    el.innerHTML = '<p class="muted small">' + escHtml(a && a.code ? t('cls.account.err.' + a.code, {name: p.key_name || ''})
+                                                                   : t('cls.failed')) + '</p>';
+    return;
+  }
+  const part = (x, ok) => x && x.ok ? ok(x) : '<li class="muted">' + escHtml(x && x.code
+    ? t('cls.account.err.' + x.code, {scope: x.scope || '', status: x.status || ''}) : t('cls.failed')) + '</li>';
+  el.innerHTML = '<ul class="small">' +
+    part(a.usage, u => '<li>' + escHtml(t('cls.account.usage', {usd: clsUsd(u.total_usd), period: u.period || ''})) +
+      ((u.models || []).length ? ': ' + u.models.map(m => escHtml(m.model + ' ' + clsUsd(m.usd))).join(', ') : '') + '</li>') +
+    part(a.limits, l => (l.keys || []).map(k => '<li>' + escHtml(t('cls.account.key', {name: k.name,
+      spend: clsUsd(k.spend_usd), limit: k.limit_usd === null || k.limit_usd === undefined ? t('cls.account.no_limit') : clsUsd(k.limit_usd)})) + '</li>').join('')) +
+    part(a.balance, b => '<li>' + escHtml(t('cls.account.balance', {credit: clsUsd(b.credit_usd), owed: clsUsd(b.owed_usd)})) +
+      (b.suspended ? ' &middot; <b>' + escHtml(t('cls.account.suspended')) + '</b>' : '') + '</li>') + '</ul>';
+}
+
+// ── Testing a profile: counted and priced first, then run under a cap ──
+
+function clsTestTasks(id) {
+  return ['site', 'results'].filter(k => {
+    const box = document.getElementById('clsp-' + id + '-t-' + k);
+    return box && box.checked;
+  });
+}
+
+function openClsTest(id) {
+  const p = clsProfile(id);
+  const el = document.getElementById('clsp-' + id + '-test');
+  if (!p || !el) return;
+  const tasks = ['site', 'results'].filter(k => (p.tasks || []).includes(k));
+  el.innerHTML = '<div class="cls-test"><p class="small">' + escHtml(t('cls.t.about')) + '</p>' +
+    '<div class="form-group">' + tasks.map(k => '<label class="pd-setting"><input type="checkbox" id="clsp-' + escHtml(id) + '-t-' + k + '"' +
+      (k === 'site' ? ' checked' : '') + '> ' + escHtml(clsTaskName(k)) + '</label>').join(' ') + '</div>' +
+    '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="estimateClsTest(' + jsq(id) + ')">' + escHtml(t('cls.t.price')) + '</button></div>' +
+    '<div id="clsp-' + escHtml(id) + '-t-est"></div></div>';
+}
+
+async function estimateClsTest(id) {
+  const el = document.getElementById('clsp-' + id + '-t-est');
+  const tasks = clsTestTasks(id);
+  if (!el) return;
+  if (!tasks.length) { el.innerHTML = '<p class="muted small">' + escHtml(t('cls.t.pick')) + '</p>'; return; }
+  el.innerHTML = '<p class="muted small">' + escHtml(t('disc.pricing')) + '</p>';
+  const est = await api('/api/classify/profiles/' + encodeURIComponent(id) + '/test/estimate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tasks: tasks})});
+  el.innerHTML = clsTestEstimateHtml(id, est);
+}
+
+function clsTestEstimateHtml(id, est) {
+  if (!est || est.success === false || est.error) return '<div class="test-result error">' + escHtml(failMsg(est, t('cls.failed'))) + '</div>';
+  // (With the price unknown nothing can be counted in USD: a small cap
+  // still bounds the run, and the call caps hold.)
+  const cap = est.price_known ? Math.max(0.01, Math.ceil((est.usd_high || 0) * 100) / 100) : 0.05;
+  return '<p class="small">' + escHtml(t(est.price_known ? 'cls.t.est' : 'cls.t.est_unknown', {calls: fmtN(est.calls || 0),
+      tok: fmtN(est.tokens_in || 0), low: clsUsd(est.usd_typical || 0), high: clsUsd(est.usd_high || 0), rows: fmtN(est.rows || 0)})) + '</p>' +
+    '<p class="muted small">' + escHtml(t('est.enforced')) + '</p>' +
+    '<div class="form-row"><div class="form-group"><label class="form-label" for="clsp-' + escHtml(id) + '-t-cap">' + escHtml(t('cls.t.cap')) + '</label>' +
+      '<input class="form-input" id="clsp-' + escHtml(id) + '-t-cap" type="number" min="0" step="0.01" value="' + cap + '"></div></div>' +
+    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runClsTest(' + jsq(id) + ', this)"' + (est.calls ? '' : ' disabled') + '>' +
+      escHtml(t('cls.t.run', {n: fmtN(est.calls || 0)})) + '</button></div><div id="clsp-' + escHtml(id) + '-t-out"></div>';
+}
+
+async function runClsTest(id, btn) {
+  const out = document.getElementById('clsp-' + id + '-t-out');
+  const cap = Number((document.getElementById('clsp-' + id + '-t-cap') || {}).value);
+  if (!(cap >= 0)) { showToast(t('cls.t.cap_bad'), 'error'); return; }
+  if (btn) btn.disabled = true;
+  const res = await api('/api/classify/profiles/' + encodeURIComponent(id) + '/test', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tasks: clsTestTasks(id), max_spend: cap})});
+  if (!res || !res.success) { if (btn) btn.disabled = false; showToast(failMsg(res, t('cls.failed')), 'error'); return; }
+  if (out) out.innerHTML = '<p class="muted small">' + escHtml(t('cls.testing')) + '</p>';
+  for (let i = 0; i < 300; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const j = await api('/api/classify/test/' + encodeURIComponent(res.job_id));
+    if (!j || j.error && !j.status) break;
+    if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') {
+      if (j.status !== 'done') {
+        if (out) out.innerHTML = '<div class="test-result error">' + escHtml(j.error || t('cls.failed')) + '</div>';
+        return;
+      }
+      showToast(t('cls.t.done'), 'success');
+      loadClassifyCard();
+      return;
+    }
+  }
 }
 
 async function loadRejudgeCount() {
@@ -5213,101 +5994,6 @@ async function startRejudge(n) {
   loadRejudgeCount();
 }
 
-async function saveClassify() {
-  const v = (id) => (document.getElementById('cls-' + id) || {}).value;
-  const tasks = {};
-  Object.keys((_classify && _classify.tasks) || {}).forEach(k => {
-    const box = document.getElementById('cls-task-' + k);
-    tasks[k] = {on: !!(box && box.checked), per_day: (_classify.tasks[k] || {}).per_day || 0};
-  });
-  const body = {provider: v('provider'), base_url: v('base_url') || '', model: v('model') || '',
-                key_name: v('key_name') || '', per_day: Number(v('per_day') || 0),
-                per_minute: Number(v('per_minute') || 1), timeout_seconds: Number(v('timeout') || 30),
-                json_mode: !!(document.getElementById('cls-json') || {}).checked, tasks: tasks};
-  if (document.getElementById('cls-yes')) body.yes = Number(v('yes') || 0.7);
-  // (Blank: unknown price, no USD cap.)
-  [['price_in', 'price_in_per_m'], ['price_out', 'price_out_per_m'], ['usd_day', 'usd_per_day'],
-   ['usd_month', 'usd_per_month']].forEach(([id, key]) => {
-    if (document.getElementById('cls-' + id)) body[key] = (v(id) || '').trim();
-  });
-  const res = await api('/api/classify/settings', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
-  });
-  showToast(res && res.success ? t('cls.saved') : failMsg(res, t('cls.failed')), res && res.success ? 'success' : 'error');
-  loadClassifyCard();
-}
-
-// DeepInfra's models for this provider, with their prices: picking one
-// fills the model field (saved with Save). No recommendation.
-async function loadClassifyModels() {
-  const el = document.getElementById('cls-models');
-  if (!el) return;
-  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
-  const r = await api('/api/classify/models');
-  const rows = (r && r.models) || [];
-  if (!rows.length) {
-    el.innerHTML = '<p class="muted small">' + escHtml(t(r && r.error ? 'cls.models_failed' : 'cls.models_none')) + '</p>';
-    return;
-  }
-  el.innerHTML = '<div class="table-wrap"><table class="table small"><thead><tr><th>' + escHtml(t('cls.model')) + '</th><th>' +
-    escHtml(t('cls.models.in')) + '</th><th>' + escHtml(t('cls.models.out')) + '</th><th>' + escHtml(t('cls.models.context')) +
-    '</th><th></th></tr></thead><tbody>' + rows.map(m => '<tr><td>' + escHtml(m.model) + '</td><td>' + escHtml(clsUsd(m.in_per_m)) +
-    '</td><td>' + escHtml(clsUsd(m.out_per_m)) + '</td><td>' + (m.context ? escHtml(fmtN(m.context)) : '–') +
-    '</td><td><button class="btn btn-secondary btn-sm" data-model="' + escHtml(m.model) +
-    '" onclick="pickClassifyModel(this.dataset.model)">' + escHtml(t('cls.models.pick')) + '</button></td></tr>').join('') +
-    '</tbody></table></div><p class="hint">' + escHtml(t('cls.models_hint')) + '</p>';
-}
-
-function pickClassifyModel(name) {
-  const input = document.getElementById('cls-model');
-  if (input) input.value = name || '';
-}
-
-// The key's DeepInfra account, read by the server (the key stays there).
-async function loadClassifyAccount() {
-  const el = document.getElementById('cls-account');
-  if (!el) return;
-  el.innerHTML = '<p class="muted small">' + escHtml(t('cls.models_loading')) + '</p>';
-  const a = await api('/api/classify/account');
-  if (!a || !a.available) {
-    el.innerHTML = '<p class="muted small">' + escHtml(a && a.code ? t('cls.account.err.' + a.code, {name: (_classify || {}).key_name || ''})
-                                                                   : t('cls.failed')) + '</p>';
-    return;
-  }
-  const part = (p, ok) => p && p.ok ? ok(p) : '<li class="muted">' + escHtml(p && p.code
-    ? t('cls.account.err.' + p.code, {scope: p.scope || '', status: p.status || ''}) : t('cls.failed')) + '</li>';
-  el.innerHTML = '<ul class="small">' +
-    part(a.usage, u => '<li>' + escHtml(t('cls.account.usage', {usd: clsUsd(u.total_usd), period: u.period || ''})) +
-      ((u.models || []).length ? ': ' + u.models.map(m => escHtml(m.model + ' ' + clsUsd(m.usd))).join(', ') : '') + '</li>') +
-    part(a.limits, l => (l.keys || []).map(k => '<li>' + escHtml(t('cls.account.key', {name: k.name,
-      spend: clsUsd(k.spend_usd), limit: k.limit_usd === null || k.limit_usd === undefined ? t('cls.account.no_limit') : clsUsd(k.limit_usd)})) + '</li>').join('')) +
-    part(a.balance, b => '<li>' + escHtml(t('cls.account.balance', {credit: clsUsd(b.credit_usd), owed: clsUsd(b.owed_usd)})) +
-      (b.suspended ? ' &middot; <b>' + escHtml(t('cls.account.suspended')) + '</b>' : '') + '</li>') + '</ul>';
-}
-
-async function testClassify() {
-  const el = document.getElementById('cls-test-result');
-  const res = await api('/api/classify/test', {method: 'POST'});
-  if (!res || !res.success) { showToast(failMsg(res, t('cls.failed')), 'error'); return; }
-  if (el) el.innerHTML = '<p class="muted small">' + escHtml(t('cls.testing')) + '</p>';
-  for (let i = 0; i < 120; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    const j = await api('/api/classify/test/' + encodeURIComponent(res.job_id));
-    if (!j || j.error) break;
-    if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') {
-      const r = j.result || {};
-      if (el) el.innerHTML = j.status === 'done'
-        ? '<p class="small">' + escHtml(t('cls.test_result', {acc: r.accuracy === null || r.accuracy === undefined ? '–' : r.accuracy,
-            n: fmtN(r.scored || 0), fl: fmtN(r.false_links || 0), miss: fmtN(r.misses || 0), bad: fmtN(r.invalid || 0),
-            ms: (r.latency_ms || {}).median === null || (r.latency_ms || {}).median === undefined ? '–' : fmtN(r.latency_ms.median),
-            tin: fmtN(r.tokens_in || 0), tout: fmtN(r.tokens_out || 0)})) +
-            ' ' + escHtml(t(r.cost_known === false ? 'cls.test_spend_unknown' : 'cls.test_spend', {usd: clsUsd(r.cost_usd || 0)})) + '</p>'
-        : '<div class="test-result error">' + escHtml(j.error || t('cls.failed')) + '</div>';
-      return;
-    }
-  }
-}
-
 // Why a website a search found was taken: the register fact that confirmed
 // it, or the classifier's yes (the company panel).
 function siteBasisText(b) {
@@ -5327,6 +6013,7 @@ async function openFinder(target, body) {
   const el = document.getElementById(target);
   if (!el) return;
   el.dataset.open = '1';
+  delete el.dataset.run;
   el.innerHTML = '<div class="card"><p class="muted small">' + escHtml(t('disc.pricing')) + '</p></div>';
   const est = await api('/api/contacts/find/estimate', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
@@ -5347,17 +6034,60 @@ async function openFinder(target, body) {
                                                             most: fmtUsd(est.most, 4)})) + '</p>'
       : '<p class="muted small">' + escHtml(t('finder.no_search')) + '</p>') : '') +
     '<div class="form-row"><div class="form-group"><label class="form-label" for="finder-cap">' +
-      escHtml(t('finder.cap')) + '</label><input class="form-input" id="finder-cap" type="number" min="0" step="0.01" value="' + cap + '">' +
-      '<div class="muted small">' + escHtml(t('finder.cap_help')) + '</div></div></div>' +
+      escHtml(t('finder.cap')) + '</label><input class="form-input" id="finder-cap" type="number" min="0" step="0.01" value="' + cap + '" oninput="finderCapChanged()">' +
+      '<div class="muted small">' + escHtml(t('finder.cap_help')) + '</div></div>' + finderClassifyField(est.classifier) + '</div>' +
+    '<div id="finder-checks-wrap">' + finderChecksLine(est.checks, cap) + '</div>' + finderClassifyLine(est.classifier) +
     '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runFinder(this)"' + (est.companies ? '' : ' disabled') + '>' +
       escHtml(t('finder.run', {n: fmtN(est.companies)})) + '</button>' +
     '<button class="btn btn-ghost btn-sm" onclick="closeFinder()">' + escHtml(t('common.cancel')) + '</button></div></div>';
 }
 
+// The classifier's part of a Find-contacts run: how many questions it may
+// ask and what they may cost, typical to high (a call's size varies with
+// what it reads), and a cap of the run's own (blank: none, the install's
+// caps hold; 0: no question, a site no register fact settles waits
+// unlinked). Nothing to ask: no field.
+function finderClassifyField(c) {
+  if (!c || !c.calls) return '';
+  const cap = c.price_known ? Math.max(0.01, Math.ceil((c.usd_high || 0) * 100) / 100) : '';
+  return '<div class="form-group"><label class="form-label" for="finder-ccap">' + escHtml(t('finder.ccap')) + '</label>' +
+    '<input class="form-input" id="finder-ccap" type="number" min="0" step="0.01" value="' + cap + '">' +
+    '<div class="muted small">' + escHtml(t('finder.ccap_help')) + '</div></div>';
+}
+
+function finderClassifyLine(c) {
+  if (!c || !c.calls) return '';
+  const per = CLS_TASKS.filter(k => ((c.per_task || {})[k] || {}).calls).map(k =>
+    t('finder.c_task', {task: clsTaskName(k), n: fmtN(c.per_task[k].calls)})).join(', ');
+  return '<p class="muted small" id="finder-classify">' + escHtml(t(c.price_known ? 'finder.c_cost' : 'finder.c_cost_unknown',
+    {n: fmtN(c.calls), per: per, low: fmtUsd(c.usd_typical || 0, 4), high: fmtUsd(c.usd_high || 0, 4)})) + '</p>' +
+    '<p class="muted small">' + escHtml(t('est.enforced')) + '</p>';
+}
+
+// The address checks a run may make (only with a spend cap above 0) and
+// what they may cost past each service's free allowance this month, at the
+// prices entered in Settings; a service past its allowance with no price is
+// named: the run refuses its checks. With no cap, one short line.
+function finderChecksLine(k, cap) {
+  if (!k || !k.checks || !(k.verifiers || []).length) return '';
+  if (!(Number(cap) > 0)) return '<p class="muted small" id="finder-checks">' + escHtml(t('finder.k_need_cap')) + '</p>';
+  const free = Object.keys(k.free_left || {}).map(v => t('finder.k_free', {name: v, n: fmtN(k.free_left[v])})).join(', ');
+  return '<p class="muted small" id="finder-checks">' + escHtml(t(k.usd_high ? 'finder.k_cost' : 'finder.k_free_only',
+      {n: fmtN(k.checks), per: fmtN(k.per_company || 0), usd: fmtUsd(k.usd_high || 0, 4), free: free,
+       left: fmtN(k.checks_left || 0)})) +
+    ((k.refused || []).length ? ' ' + escHtml(t('finder.k_refused', {names: k.refused.join(', ')})) : '') + '</p>';
+}
+
+function finderCapChanged() {
+  const el = document.getElementById('finder-checks-wrap');
+  if (!el || !_finder) return;
+  el.innerHTML = finderChecksLine(_finder.est.checks, (document.getElementById('finder-cap') || {}).value);
+}
+
 function closeFinder() {
   if (!_finder) return;
   const el = document.getElementById(_finder.target);
-  if (el) { delete el.dataset.open; el.innerHTML = ''; }
+  if (el) { delete el.dataset.open; delete el.dataset.run; el.innerHTML = ''; }
   if (_finder.target === 'cl-finder') loadFinderStatus();
   _finder = null;
 }
@@ -5366,17 +6096,70 @@ async function runFinder(btn) {
   if (!_finder) return;
   btn.disabled = true;
   const cap = Number((document.getElementById('finder-cap') || {}).value) || 0;
+  const body = Object.assign({}, _finder.body, {max_spend: cap});
+  // (Blank: no classifier cap of the run's own.)
+  const ccap = document.getElementById('finder-ccap');
+  if (ccap && String(ccap.value).trim() !== '') body.classify_max_spend = Number(ccap.value) || 0;
   const data = await api('/api/contacts/find', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(Object.assign({}, _finder.body, {max_spend: cap})),
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
   if (data && data.success) {
     showToast(t(data.force ? 'cl.find_queued_force' : 'cl.find_queued') + ' ' +
               t('finder.queued', {n: fmtN(data.queued || 0)}), 'success');
-    closeFinder();
+    if (data.batch_id) watchRun(_finder.target, data.batch_id);
+    else closeFinder();
   } else {
     btn.disabled = false;
     showToast(failMsg(data, t('cl.find_failed')), 'error');
+  }
+}
+
+// A run's report in words: its jobs, how long it took, what it cost split
+// (searches, address checks, the classifier, anything else).
+function runReportHtml(r) {
+  if (!r || !r.statuses) return '';
+  const st = r.statuses || {};
+  const c = r.classify || {};
+  const secs = (s) => s === null || s === undefined ? '–' : (s >= 90 ? t('run.min', {n: fmtN(Math.round(s / 60))}) : t('run.sec', {n: fmtN(Math.round(s))}));
+  const state = ['running', 'queued', 'paused', 'done', 'failed', 'cancelled'].filter(k => st[k])
+    .map(k => t('run.st.' + k, {n: fmtN(st[k])})).join(', ');
+  const cost = [t('run.searches', {usd: fmtUsd(r.searches_usd || 0, 4)}),
+    t('run.checks', {n: fmtN(r.checks_made || 0), usd: fmtUsd(r.checks_usd || 0, 4)}) +
+      (Object.keys(r.services || {}).length ? ' (' + Object.keys(r.services).map(k => k + ' ' + fmtN(r.services[k])).join(', ') + ')' : '') +
+      (r.checks_refused ? ' ' + t('run.checks_refused', {n: fmtN(r.checks_refused)}) : ''),
+    t('run.classify', {n: fmtN(c.calls || 0), tok: fmtN((c.tokens_in || 0) + (c.tokens_out || 0)), usd: fmtUsd(c.usd || 0, 4)}) +
+      (c.unpriced ? ' ' + t('run.unpriced', {n: fmtN(c.unpriced)}) : '')];
+  if (r.lookups_made) cost.push(t('run.lookups', {n: fmtN(r.lookups_made), usd: fmtUsd(r.lookups_usd || 0, 4)}));
+  if (r.other_usd) cost.push(t('run.other', {usd: fmtUsd(r.other_usd, 4)}));
+  return '<div class="run-report"><p class="small">' + escHtml(t('run.jobs', {n: fmtN(r.jobs || 0), state: state})) + ' &middot; ' +
+      escHtml(t('run.took', {wall: secs(r.seconds), work: secs(r.job_seconds)})) + '</p>' +
+    '<p class="small">' + escHtml(cost.join(' · ')) + ' &middot; <b>' + escHtml(t('run.total', {usd: fmtUsd(r.total_usd || 0, 4)})) + '</b></p>' +
+    (c.refused ? '<p class="hint warn">' + escHtml(t('run.refused', {n: fmtN(c.refused)})) + '</p>' : '') + '</div>';
+}
+
+function runActive(r) {
+  const st = (r && r.statuses) || {};
+  return !!(st.running || st.queued);
+}
+
+// A run just started, followed where it was started: its report every few
+// seconds while its jobs run, then what it took and cost.
+async function watchRun(target, batchId) {
+  const el = document.getElementById(target);
+  if (!el) return;
+  el.dataset.open = '1';
+  el.dataset.run = batchId;
+  for (let i = 0; i < 2000; i++) {
+    const r = await api('/api/jobs/batches/' + encodeURIComponent(batchId) + '/report');
+    if (el.dataset.run !== batchId) return;
+    if (!r || !r.statuses) { closeFinder(); return; }
+    const active = runActive(r);
+    el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t(active ? 'run.running' : 'run.finished')) + '</h2>' + runReportHtml(r) +
+      '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="openQueue(' + jsq(batchId) + ')">' + escHtml(t('disc.see_jobs')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="closeFinder()">' + escHtml(t('common.close')) + '</button></div></div>';
+    if (!active) return;
+    await new Promise(res => setTimeout(res, 3000));
+    if (el.dataset.run !== batchId) return;
   }
 }
 
@@ -6417,6 +7200,12 @@ function jobRow(j, buttons) {
   if (p.pages) bits.push(t('q.pages', {n: fmtN(p.pages)}));
   if (p.results) bits.push(t('q.results', {n: fmtN(p.results)}));
   if (j.actual_cost) bits.push(t('q.cost', {cost: fmtUsd(j.actual_cost, 4)}));
+  // (The classifier's part of it, and how long a finished job took.)
+  if (p.classify && p.classify.calls) bits.push(t('q.classify', {n: fmtN(p.classify.calls), usd: fmtUsd(p.classify.usd || 0, 4)}));
+  const ck = (j.result && j.result.spend) || {};
+  if (ck.checks_made) bits.push(t('q.checks', {n: fmtN(ck.checks_made), usd: fmtUsd(ck.checks || 0, 4)}) +
+    (ck.checks_refused ? ' ' + t('run.checks_refused', {n: fmtN(ck.checks_refused)}) : ''));
+  if (j.result && j.result.ms) bits.push(t('q.took', {n: fmtN(Math.max(1, Math.round(j.result.ms / 1000)))}));
   if (j.status === 'paused') bits.push(t('q.paused_why', {why: j.paused_reason === 'spend limit'
     ? t('q.why.spend') : j.paused_reason === 'paused' ? t('q.why.hand') : (j.paused_reason || j.error || '')}));
   if (j.status === 'queued' && j.error) bits.push(t('q.retry_at', {why: j.error}));
@@ -6472,15 +7261,23 @@ async function loadQueue() {
   navCount('nav-queue', (data.running || 0) + (data.waiting || 0));
   const batch = data.batch;
   // The 5-second refresh leaves the cap field alone while someone types in it.
-  const capInput = document.getElementById('queue-cap');
+  const capInput = document.getElementById('queue-cap') || document.getElementById('queue-ccap');
   const typing = capInput && (document.activeElement === capInput || capInput.dataset.edited === '1');
+  // (A run's classifier cap: its own, beside the searches' one.)
+  const ccap = batch && batch.params ? batch.params.classify_max_spend : undefined;
   if (!typing) head.innerHTML = (data.worker ? '' : '<div class="test-result error">' + escHtml(t('q.worker_off')) + '</div>') +
     (_queueBatch ? '<div class="card"><p class="desc">' + escHtml(t('q.batch', {label: (batch && batch.label) || ''})) +
       ' <button type="button" class="btn btn-secondary btn-sm" onclick="openQueue(\'\')">' + escHtml(t('q.show_all')) + '</button></p>' +
+      (data.report ? runReportHtml(data.report) : '') +
       (batch && batch.max_spend !== null && batch.max_spend !== undefined
         ? '<div class="form-row"><label class="form-label" for="queue-cap">' + escHtml(t('q.cap')) + '</label>' +
           '<input class="form-input" id="queue-cap" type="number" min="0" step="0.25" value="' + escHtml(String(batch.max_spend)) + '" oninput="this.dataset.edited=\'1\'">' +
           '<button type="button" class="btn btn-primary btn-sm" onclick="raiseCap(' + jsq(_queueBatch) + ')">' + escHtml(t('q.raise')) + '</button></div>'
+        : '') +
+      (ccap !== null && ccap !== undefined
+        ? '<div class="form-row"><label class="form-label" for="queue-ccap">' + escHtml(t('q.ccap')) + '</label>' +
+          '<input class="form-input" id="queue-ccap" type="number" min="0" step="0.01" value="' + escHtml(String(ccap)) + '" oninput="this.dataset.edited=\'1\'">' +
+          '<button type="button" class="btn btn-primary btn-sm" onclick="raiseCap(' + jsq(_queueBatch) + ', true)">' + escHtml(t('q.raise')) + '</button></div>'
         : '') + '</div>' : '');
   if (!(data.lanes || []).length) {
     el.innerHTML = emptyState(icon('queue'), escHtml(t('q.empty')), escHtml(t('q.empty_copy')), true);
@@ -6503,11 +7300,12 @@ async function laneAction(lane, action) {
   loadQueue();
 }
 
-async function raiseCap(batch) {
-  const input = document.getElementById('queue-cap');
+async function raiseCap(batch, classifier) {
+  const input = document.getElementById(classifier ? 'queue-ccap' : 'queue-cap');
   const cap = Number((input || {}).value);
   const res = await api('/api/jobs/batches/' + encodeURIComponent(batch) + '/cap', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({max_spend: cap}),
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(classifier ? {classify_max_spend: cap} : {max_spend: cap}),
   });
   showToast(res && res.success ? t('q.raised', {n: res.resumed}) : failMsg(res, t('q.failed_toast')),
             res && res.success ? 'success' : 'error');
@@ -6732,7 +7530,7 @@ setInterval(() => {
   if (document.hidden || _locked || _upgradeShown || document.querySelector('.menu.open')) return;
   switch (currentTab) {
     case 'overview': loadOverview(); break;
-    case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
     // A page cut from a kept ordering isn't refetched: the ordering is the costly part.
     case 'companies': if (_co.pagedBy !== 'snapshot') loadCompanies(); break;
     // The contacts list isn't refetched (its count is a big query): only

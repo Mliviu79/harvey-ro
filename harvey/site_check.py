@@ -63,7 +63,7 @@ async def count(state) -> dict:
         why = site_match.screen(r["website"], normalize_domain(r["website"]), facts)
         if why:
             ruled[why] = ruled.get(why, 0) + 1
-    s = await classify.settings(state)
+    s = await classify.settings(state, "site")
     to_read = len(rows) - sum(ruled.values())
     calls = await classify.calls_today(state)
     per_day = s.task_cap("site") if s.provider != "off" else 0
@@ -96,7 +96,7 @@ UNREADABLE_DAYS = 3
 # isn't asked the same again (another provider or model is).
 UNSETTLED = "unsettled"
 # Why the classifier can't be asked for a while: nothing is read meanwhile.
-STOPS = ("held", "day cap", "budget")
+STOPS = ("held", "day cap", "budget", classify.RUN_BUDGET)
 
 
 def _asked(s) -> str:
@@ -239,7 +239,7 @@ def _pct(part: int, whole: int) -> float | None:
 
 
 async def judge_test(state, rows: list[dict], *, every: bool = False, task: str = "site",
-                     limit: int = 0, config=None) -> dict:
+                     limit: int = 0, config=None, s=None) -> dict:
     """The configured classifier over ``rows`` (the judge-test format: a
     firm, its search results, its candidates' cards, what is expected):
     accuracy, false links (a site chosen where none is the firm's, or the
@@ -251,23 +251,28 @@ async def judge_test(state, rows: list[dict], *, every: bool = False, task: str 
     yes chosen): results ruled out by their address, a site a register
     fact settles and one every rule rules out are never asked. ``every``
     asks every row about all its candidates. Every call counts against the
-    day's cap. ValueError with the classifier off."""
+    day's cap. ``s``: the settings to test (a profile's,
+    classify_profiles.settings_for), else those the install sets the task
+    to. ValueError with the classifier off for the task."""
     from harvey.collectors.discover import normalize_domain
 
-    s = await classify.settings(state)
+    s = (s or await classify.settings(state, task)).for_task(task)
     if s.provider == "off":
-        raise ValueError("the classifier is off: choose a provider first "
-                         "(Settings, or modules.contact_finder settings)")
-    out = {"provider": s.provider, "model": s.model_name, "task": task, "rows": len(rows),
+        raise ValueError(f"the classifier is off for the {task} task: set a profile for it "
+                         "first (Settings → Classifier)")
+    started = time.monotonic()
+    out = {"provider": s.provider, "model": s.model_name, "profile": s.profile,
+           "task": task, "rows": len(rows),
            "asked": 0, "correct": 0, "false_links": 0, "misses": 0,
            "invalid": 0, "unsure": 0, "not_asked": 0, "stored_cards": 0, "contacts_right": 0,
            "contacts_picked": 0, "contacts_expected": 0, "tokens_in": 0, "tokens_out": 0,
-           "cost_usd": 0.0, "failures": []}
+           "cost_usd": 0.0, "calls": 0, "failures": []}
     if s.provider in classify.SYSTEM_ONE:
         out["yes"] = s.yes
     latency = []
 
     def spent(answers, *, same_row: bool = False) -> None:
+        out["calls"] += sum(a.tries for a in answers)
         out["tokens_in"] += sum(a.tokens_in for a in answers)
         out["tokens_out"] += sum(a.tokens_out for a in answers)
         out["cost_usd"] = round(out["cost_usd"] + sum(a.cost for a in answers), 10)
@@ -376,8 +381,87 @@ async def judge_test(state, rows: list[dict], *, every: bool = False, task: str 
                          "p90": latency[min(len(latency) - 1, int(len(latency) * 0.9))]
                          if latency else None}
     out["failures"] = out["failures"][:20]
+    out["seconds"] = round(time.monotonic() - started, 1)
     # (After the calls: a reply that carries its cost makes it known.)
     out["cost_known"] = (await classify.cost_status(state, s))["known"]
+    return out
+
+
+async def estimate_test(state, rows: list[dict], *, s, tasks=("site",), every: bool = False,
+                        limit: int = 0) -> dict:
+    """What judge_test would ask over ``rows`` through ``s`` (a profile's
+    settings), counted before anything is sent: the calls per task (a
+    row's contacts question only when its site is chosen right), the
+    tokens their requests hold (built as they would be, never sent) and
+    what they may cost at the profile's price, as a range: typical (the
+    tokens counted, and the chat template's) and high (classify.
+    worst_tokens), each with the most the task may answer. An estimate:
+    the run's cap is what is enforced, call by call (``note``).
+    ``price_known`` False: no price, nothing can be counted in USD."""
+    from harvey.collectors.discover import normalize_domain
+
+    out = {"rows": len(rows), "calls": 0, "tokens_in": 0, "usd_typical": 0.0, "usd_high": 0.0,
+           "price_known": True, "by_task": {}, "note": classify.ESTIMATE_NOTE}
+    for task in tasks:
+        st = s.for_task(task)
+        if st.provider == "off" or not st.task_on(task):
+            out["by_task"][task] = {"calls": 0, "tokens_in": 0, "usd_typical": 0.0,
+                                    "usd_high": 0.0, "off": True}
+            continue
+        calls, size, low, high, asked = 0, 0, 0.0, 0.0, 0
+        sizes: list[tuple[str, int]] = []
+        for row in rows:
+            if limit and asked >= limit:
+                break
+            facts = site_match.Facts.of(row.get("firm") or {})
+            expect = row.get("expect") or {}
+            if task == "results":
+                survivors = [r for r in row.get("results") or []
+                             if every or not site_match.screen(_url(r), normalize_domain(_url(r)),
+                                                               facts)]
+                if len(survivors) < 2 or expect.get("results_keep") is None:
+                    continue
+                results = [api.Record(website=_url(r), name=r.get("title") or "",
+                                      snippet=r.get("snippet") or "") for r in survivors]
+                sizes.append(("results", classify.request(
+                    st, "results", {"firm": facts.as_dict(), "results": results})["tokens"]))
+                asked += 1
+                continue
+            kept, _ = _cards(row, facts, screen=not every)
+            cards = [c for _, c in kept]
+            settled, pool, _ = finder.question(cards)
+            if every:
+                settled, pool = None, list(range(len(kept)))
+            if settled is not None or not pool:
+                continue
+            asked += 1
+            for i in pool:
+                sizes.append(("site", classify.request(
+                    st, "site", {"firm": facts.as_dict(), "cards": [cards[i]],
+                                 "region": facts.region})["tokens"]))
+            want = expect.get("candidate")
+            card = next((c for j, c in kept if j == want), None)
+            if card is not None and card.contacts and expect.get("contacts") is not None \
+                    and st.task_on("contacts"):
+                sizes.append(("contacts", classify.request(
+                    st.for_task("contacts"), "contacts",
+                    {"firm": facts.as_dict(), "cards": [card], "region": facts.region})["tokens"]))
+        for name, tokens_in in sizes:
+            sx = st.for_task(name)
+            cost, known = await classify.call_cost(state, sx, name,
+                                                   tokens_in + classify.TEMPLATE_TOKENS)
+            worst, _ = await classify.call_cost(state, sx, name, classify.worst_tokens(tokens_in))
+            calls += 1
+            size += tokens_in
+            low += cost
+            high += worst
+            out["price_known"] = out["price_known"] and known
+        out["by_task"][task] = {"calls": calls, "tokens_in": size, "usd_typical": round(low, 6),
+                                "usd_high": round(high, 6), "rows_asked": asked}
+        out["calls"] += calls
+        out["tokens_in"] += size
+        out["usd_typical"] = round(out["usd_typical"] + low, 6)
+        out["usd_high"] = round(out["usd_high"] + high, 6)
     return out
 
 

@@ -18,6 +18,28 @@ secrets = ["HUNTER_API_KEY", "HUNTER_MONTHLY_SEARCHES"]
 as_of = 2026-10-30
 free_tier = "50 verifications and 25 domain searches a month"
 
+# Hunter's address check, when an address check asks it, and its domain
+# search, when an address check looks a domain's pattern up (harvey/
+# verify_costs.py): the free ones a month. No paid price is declared: the
+# user enters their plan's (usd_hunter, usd_hunter_search); with none, one
+# past the free allowance is refused under a USD cap.
+[cost.verifiers.hunter]
+free_per_month = 50
+
+[cost.verifiers.hunter_search]
+free_per_month = 25
+kind = "search"
+
+[settings.usd_hunter]
+type = "float"
+min = 0.0
+max = 10.0
+
+[settings.usd_hunter_search]
+type = "float"
+min = 0.0
+max = 10.0
+
 [settings.monthly_searches]
 type = "int"
 default = 25

@@ -25,10 +25,9 @@ from __future__ import annotations
 
 import logging
 
-from harvey import campaigns
+from harvey import campaigns, verify_costs
 from harvey.agents.audience import VERIFY, Audience
 from harvey.agents.sender import SENDABLE_EMAIL_STATUSES, SENDABLE_EMAIL_STATUSES_WITH_RISKY
-from harvey.modules import ingest
 
 logger = logging.getLogger("harvey.campaigner")
 
@@ -89,13 +88,12 @@ class CampaignCycle:
         enabled = frozenset(await switches.enabled_ids(self.state))
         if VERIFY[0] not in enabled:
             return False
-        allowance = ingest.Allowance(self.state)
         allow_risky = bool(getattr(self.config.channels.email, "send_to_risky", False))
         checks = 0
         for c in active:
             roll_left = await campaigns.roll_checks_left(self.state, c["id"])
             for m in await self.state.campaign_members(c["id"], status="waiting"):
-                if checks >= CHECKS_PER_CYCLE or await allowance.left(VERIFY[0]) <= 0:
+                if checks >= CHECKS_PER_CYCLE or await verify_costs.checks_left(self.state) <= 0:
                     return checks > 0
                 rolled = m["added_by"] == campaigns.MEMBER_ADDED_BY["rolling"]
                 if rolled and roll_left <= 0:
@@ -106,7 +104,6 @@ class CampaignCycle:
                                                          "no trusted link any more")
                     continue
                 checks += 1
-                await allowance.take(VERIFY[0])
                 if rolled:
                     roll_left -= 1
                     await campaigns.count_roll_check(self.state, c["id"])
