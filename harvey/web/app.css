@@ -1420,3 +1420,21 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .modal-foot { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5) var(--sp-4); border-top: 1px solid var(--line); }
 .ack-card p { max-width: 72ch; }
 
+
+/* ── Chat with Harvey's agent ── */
+.chat-card { display: flex; flex-direction: column; gap: var(--sp-3); }
+.chat-list { display: flex; flex-direction: column; gap: var(--sp-3); max-height: 60vh; overflow-y: auto; }
+.chat-msg { max-width: 85%; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-lg); background: var(--surface-2); }
+.chat-msg.user { align-self: flex-end; background: var(--surface-3); }
+.chat-msg.agent { align-self: flex-start; box-shadow: inset 0 0 0 1px var(--line); background: var(--surface); }
+.chat-msg.error { box-shadow: inset 0 0 0 1px var(--bad-line); }
+.chat-msg.pending { opacity: 0.85; }
+.chat-meta { font-size: var(--fs-caption); color: var(--text-3); margin-bottom: 2px; }
+.chat-text { font-size: var(--fs-ui); white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-calls { margin-top: var(--sp-2); font-size: var(--fs-caption); }
+.chat-calls summary { cursor: pointer; color: var(--text-2); }
+.chat-calls ul { margin: var(--sp-1) 0 0; padding-left: var(--sp-4); }
+.chat-calls li { margin: 2px 0; overflow-wrap: anywhere; }
+.chat-args code { font-size: var(--fs-caption); white-space: pre-wrap; }
+.chat-form { display: flex; gap: var(--sp-2); align-items: flex-end; }
+.chat-form textarea { flex: 1; min-width: 0; resize: vertical; }

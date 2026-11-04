@@ -3,7 +3,7 @@
 Brain's Claude path checks the installed CLI's ``--help`` before sending a
 prompt (harvey/claude_runtime.py). Unit tests stub the subprocess itself, so
 they also get a stand-in CLI here: found as plain ``claude``, with a help
-text listing every isolation flag. Tests of the check itself override these,
+text listing every isolation flag (the agent's too). Tests of the check itself override these,
 and ``@pytest.mark.real_claude_cli`` tests use the real installed CLI. This
 lives in tests/ only; the shipped package has no way to skip the check.
 """
@@ -12,7 +12,8 @@ import pytest
 
 from harvey import claude_runtime
 
-FAKE_HELP = "\n".join(f"  {flag} <value>   test" for flag in claude_runtime.REQUIRED_FLAGS)
+FAKE_HELP = "\n".join(f"  {flag} <value>   test" for flag in
+                      dict.fromkeys((*claude_runtime.REQUIRED_FLAGS, *claude_runtime.AGENT_FLAGS)))
 
 
 def pytest_configure(config):

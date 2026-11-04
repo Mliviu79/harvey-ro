@@ -251,7 +251,7 @@ function sourceText(s) {
 }
 
 const AGENT_ICONS = {scout: 'discover', writer: 'pen', sender: 'campaigns', handler: 'message',
-                     analyst: 'usage', user: 'contacts', main: 'refresh'};
+                     analyst: 'usage', user: 'contacts', main: 'refresh', agent: 'chat'};
 function agentName(agent) {
   const key = 'agent.' + String(agent || '');
   const label = t(key);
@@ -515,6 +515,7 @@ function loadCurrentTab() {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
+    case 'chat': loadChat(); break;
     case 'usage': loadUsage(); break;
     case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
@@ -7176,6 +7177,108 @@ async function loadActivity() {
       '<span class="tl-agent">' + escHtml(agentName(a.agent)) + '</span></div>';
   }
   el.innerHTML = html + '</div></div>';
+}
+
+// ── Chat: questions to Harvey's agent (read only), answered when its turn ends ──
+
+let _chatPoll = null;
+
+function stopChatPoll() {
+  if (_chatPoll) { clearInterval(_chatPoll); _chatPoll = null; }
+}
+
+async function loadChat() {
+  const el = document.getElementById('chat-list');
+  const data = await api('/api/agent/messages?limit=50');
+  if (!data) { el.innerHTML = offlineState(); stopChatPoll(); return; }
+  const note = document.getElementById('chat-note');
+  note.innerHTML = data.refused
+    ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>' : '';
+  document.getElementById('chat-send').disabled = !!data.refused;
+  el.innerHTML = renderChat(data);
+  el.scrollTop = el.scrollHeight;
+  if (data.busy && !_chatPoll) {
+    // Only while a turn waits or runs, and only on this tab.
+    _chatPoll = setInterval(() => {
+      if (currentTab !== 'chat') { stopChatPoll(); return; }
+      if (!document.hidden && !_locked) loadChat();
+    }, 3000);
+  } else if (!data.busy) {
+    stopChatPoll();
+  }
+}
+
+function chatWhen(sec) {
+  return sec ? relTime(new Date(Number(sec) * 1000).toISOString()) : '';
+}
+
+function renderChat(data) {
+  const msgs = data.messages || [];
+  if (!msgs.length) {
+    return emptyState(icon('chat'), escHtml(t('chat.empty')), escHtml(t('chat.empty_copy')));
+  }
+  const calls = data.calls || {};
+  const answered = new Set(msgs.filter(m => m.role === 'agent').map(m => m.turn));
+  let html = '';
+  for (const m of msgs) {
+    if (m.role === 'user') {
+      html += '<div class="chat-msg user"><div class="chat-meta">' + escHtml(t('chat.you')) + ' · ' + chatWhen(m.created_at) + '</div>' +
+        '<div class="chat-text">' + escHtml(m.text) + '</div></div>';
+      if (!answered.has(m.turn)) html += chatPending(m, calls[m.turn] || []);
+      continue;
+    }
+    const err = String(m.status || '').startsWith('error:') ? m.status.slice(6) : '';
+    html += '<div class="chat-msg agent' + (err ? ' error' : '') + '"><div class="chat-meta">' + escHtml(t('chat.harvey')) + ' · ' + chatWhen(m.created_at) + '</div>' +
+      (err ? '<div class="chat-text"><b>' + escHtml(t(own(CHAT_ERRORS, err) ? 'chat.err.' + err : 'chat.err.failed')) + '</b>' +
+               (m.text ? '<div class="muted small">' + escHtml(m.text) + '</div>' : '') + '</div>'
+           : '<div class="chat-text">' + escHtml(m.text) + '</div>') +
+      chatCalls(calls[m.turn] || []) + '</div>';
+  }
+  return html;
+}
+
+const CHAT_ERRORS = {codex: 1, cli: 1, login: 1, max_turns: 1, failed: 1, timeout: 1};
+
+function chatPending(m, list) {
+  const line = m.status === 'held' ? t('chat.held') : m.status === 'running' ? t('chat.thinking')
+    : m.status === 'stopped' ? t('chat.stopped') : t('chat.queued');
+  return '<div class="chat-msg agent pending"><div class="chat-text muted">' + escHtml(line) + '</div>' + chatCalls(list) + '</div>';
+}
+
+// The tool calls a turn made, folded: what the agent read to answer.
+function chatCalls(list) {
+  if (!list.length) return '';
+  const rows = list.map(c => '<li><code>' + escHtml(c.tool) + '</code> ' +
+    '<span class="badge t-' + (c.outcome === 'ok' ? 'good' : c.outcome === 'refused' ? 'note' : 'bad') + '">' +
+    escHtml(t('chat.call.' + (own({ok: 1, refused: 1, error: 1}, c.outcome) ? c.outcome : 'error'))) + '</span> ' +
+    '<span class="muted small">' + escHtml(fmtN(c.ms || 0)) + ' ms</span>' +
+    (c.arguments && Object.keys(c.arguments).length ? '<div class="chat-args"><code>' + escHtml(JSON.stringify(c.arguments)) + '</code></div>' : '') +
+    (c.result ? '<div class="muted small">' + escHtml(c.result) + '</div>' : '') + '</li>').join('');
+  return '<details class="chat-calls"><summary>' + escHtml(t('chat.calls', {n: list.length})) + '</summary><ul>' + rows + '</ul></details>';
+}
+
+function chatKey(ev) {
+  // Enter sends, Shift+Enter is a new line.
+  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sendChat(ev); }
+}
+
+async function sendChat(ev) {
+  if (ev) ev.preventDefault();
+  const box = document.getElementById('chat-input');
+  const btn = document.getElementById('chat-send');
+  const text = (box.value || '').trim();
+  if (!text || btn.disabled) return;
+  btn.disabled = true;
+  const r = await api('/api/agent/messages', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                              body: JSON.stringify({text: text})});
+  btn.disabled = false;
+  if (!r || r.success === false) {
+    showToast((r && r.message) || t('chat.send_failed'), 'error');
+    return;
+  }
+  box.value = '';
+  showToast(t('chat.sent'));
+  loadChat();
 }
 
 // ── Queue (Coadă): the background jobs, per lane ──

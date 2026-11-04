@@ -9,6 +9,19 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Chat with Harvey's agent, read only.** A Chat tab (and `harvey agent ask`,
+  `harvey agent log`) asks a model about Harvey's data. It runs on your Claude
+  plan as a job on its own lane (`agent_turn`), within Harvey's share of the
+  quota, and reads only through Harvey's own MCP server (`python -m
+  harvey.agent.tools`, the official `mcp` SDK): the schema and fact catalog,
+  named views (pipeline, firms by place and activity, coverage, contacts,
+  campaigns, jobs and spend), one SELECT under SQLite's authorizer on a
+  read-only connection (no settings, email text, or text copied from websites
+  and replies; 5 s, 200 rows), the estimates and the queue. It can't act yet.
+  Every tool call is recorded (`agent_tool_call`) and shown under its answer.
+  Schema 31 adds the chat's two tables. The `mcp` package is new: rebuild the
+  Docker image (`docker compose build harvey`). Claude only: with Codex as the
+  brain the chat says so.
 - **Settings → Classifier explains itself, and everything it does is on
   the page.** The card says what the classifier decides (whether a website
   a search found is the firm's, which contacts on it are the firm's), when
@@ -973,6 +986,10 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **CLAUDE.md described the brain's isolation backwards.** It said brain calls
+  pass `--dangerously-skip-permissions`; they run with no tools at all, in safe
+  mode with no settings files, an empty working folder and the prompt on stdin.
+  The doc now says so.
 - **Today's run reports are cheap.** A finished run's report is kept and
   given again while none of its jobs changed, instead of being added up
   again for five runs every refresh.

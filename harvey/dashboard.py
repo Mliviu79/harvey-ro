@@ -4887,6 +4887,46 @@ async def act_on_lane(lane: str, action: str):
     return {"success": True, "lane": lane, "paused": action == "pause"}
 
 
+# ── The chat with Harvey's agent (harvey/agent/chat.py) ──
+
+@app.get("/api/agent/messages")
+async def get_agent_messages(limit: int = 50, before: int = 0):
+    """The chat: the newest messages, oldest first ({id, turn, role, text,
+    status, created_at}), each turn's tool calls (``calls``: {turn: [{tool,
+    arguments, result, ms, outcome}]}), whether a turn waits or runs
+    (``busy``), and why the chat can't run with these settings
+    (``refused``: Codex as the brain)."""
+    from harvey.agent import chat
+
+    state = _state()
+    await state.init_db()
+    found = await chat.messages(state, limit=limit, before=before or None)
+    return {**found, "refused": chat.refusal(_load_config_quietly())}
+
+
+@app.post("/api/agent/messages")
+async def post_agent_message(request: Request):
+    """Send the agent a message: {"text"}. It is queued as a job on the
+    agent lane; the answer comes when the turn ends (GET the messages).
+    409 while Codex is the brain."""
+    from harvey.agent import chat
+    from harvey.modules import jobs
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    config = _load_config_quietly()
+    why = chat.refusal(config)
+    if why:
+        return _refuse(why, 409)
+    try:
+        queued = await chat.ask(state, str(body.get("text") or ""), config=config)
+    except chat.Refused as e:
+        return _bad(str(e))
+    jobs.notify()
+    return {"success": True, **queued}
+
+
 @app.get("/api/jobs/batches")
 async def get_recent_batches(limit: int = 5):
     """The newest runs, each with its report (Today: what each run took

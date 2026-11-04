@@ -533,7 +533,7 @@ async def classify_room(state, job: Job, estimate: float, *, own_classify: float
     return ""
 
 
-async def batch_report(state, batch_id: str) -> dict:
+async def batch_report(state, batch_id: str, *, keep: bool = True) -> dict:
     """How long a run took and what it cost, split: its jobs by status,
     the time from its first start to its last finish and the jobs' own
     time added up, the paid searches, the address checks (``checks_made``:
@@ -547,7 +547,8 @@ async def batch_report(state, batch_id: str) -> dict:
     batch row (``report_json``, with what it was made from: the jobs'
     statuses and last finish) and read from there while none of its jobs
     changed; retrying or resuming one clears it. A running run's is
-    computed each time."""
+    computed each time. ``keep`` False reads without storing (the agent's
+    read-only tools)."""
     async with state._connect() as db:
         async with db.execute(
                 "SELECT status, COUNT(*), MAX(finished_at) FROM jobs WHERE batch_id = ? "
@@ -568,7 +569,7 @@ async def batch_report(state, batch_id: str) -> dict:
         except (TypeError, ValueError, KeyError, AttributeError):
             pass
     out = await _batch_report(state, batch_id, statuses)
-    if finished:
+    if finished and keep:
         async with state._connect() as db:
             await db.execute("UPDATE job_batches SET report_json = ? WHERE id = ?",
                              (json.dumps({"mark": mark, "report": out}), batch_id))

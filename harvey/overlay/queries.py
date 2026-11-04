@@ -684,3 +684,76 @@ statement("overlay.contact_check.in_campaign",
 # resumed asks only the rest).
 statement("overlay.contact_check.done",
           "SELECT contact FROM contact_check WHERE batch = ? AND firm = ?", params=("b", 1))
+
+# ── The agent's views (harvey/agent/views.py) and its chat (schema 31) ──
+# Counts only: the Email module's prospects, campaign members, the outbox
+# (no subject or body) and conversations (no thread) by status.
+statement("overlay.agent.prospects", "SELECT status, COUNT(*) FROM prospects GROUP BY status",
+          bounded=True)
+statement("overlay.agent.members",
+          "SELECT campaign, status, COUNT(*) FROM campaign_member GROUP BY campaign, status",
+          bounded=True,
+          scans={"campaign_member": "every campaign's members counted by status: its "
+                                    "status index read once, when the agent asks"})
+statement("overlay.agent.outbox",
+          "SELECT campaign_id, kind, status, COUNT(*) FROM outbox "
+          "GROUP BY campaign_id, kind, status", bounded=True)
+statement("overlay.agent.conversations",
+          "SELECT status, stage, COUNT(*) FROM conversations GROUP BY status, stage",
+          bounded=True)
+statement("overlay.agent.campaigns",
+          "SELECT id, name, status, origin, rolling, audience_id, started_at, ended_at, "
+          "updated_at FROM campaigns ORDER BY rowid DESC LIMIT ?", params=(50,))
+# Contacts by kind, line, trust and status (with how many are on the
+# do-not-contact list).
+statement("overlay.agent.contacts",
+          "SELECT k.kind, c.line_type, c.best_trust, c.status, COUNT(*), "
+          "SUM(c.do_not_contact != 0) FROM contact c CROSS JOIN contact_kinds k "
+          "WHERE k.id = c.kind GROUP BY k.kind, c.line_type, c.best_trust, c.status",
+          drives="c", bounded=True,
+          scans={"contact": "every contact counted by kind, trust and status, when the "
+                            "agent asks: the table read once"})
+# What a set of firms has had done to it (coverage): sites known and read,
+# searched, found contacts.
+statement("overlay.agent.coverage",
+          "SELECT COUNT(*), SUM(f.website IS NOT NULL OR f.domain IS NOT NULL), "
+          "SUM(f.site_read_at IS NOT NULL), SUM(f.finder_at IS NOT NULL), "
+          "SUM(f.last_search_at IS NOT NULL), SUM(f.n_contacts > 0), SUM(f.n_email > 0), "
+          "SUM(f.n_phone > 0), SUM(f.n_people > 0) "
+          f"FROM {_J} CROSS JOIN firm f WHERE f.id = j.value", params=_IDS, drives="j")
+# The searches made since a time, by module, capability and outcome.
+statement("overlay.agent.searches",
+          "SELECT m.name, c.name, s.outcome, COUNT(*), COALESCE(SUM(s.cost), 0), MAX(s.at) "
+          "FROM search s INDEXED BY search_at CROSS JOIN module m CROSS JOIN capability c "
+          "WHERE s.at >= ? AND m.id = s.module AND c.id = s.capability "
+          "GROUP BY m.name, c.name, s.outcome", params=(1_700_000_000,), drives="s",
+          bounded=True,
+          scans={"search": "the searches of the last days, by their time index"})
+# Harvey's own model calls since a time, by agent and task.
+statement("overlay.agent.usage",
+          "SELECT agent, task, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+          "SUM(num_turns) FROM usage_events WHERE created_at >= ? GROUP BY agent, task",
+          params=("2026-01-01 00:00:00",), bounded=True)
+# The chat: the newest messages, a turn's, and the tool calls of some turns.
+statement("overlay.agent.messages",
+          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
+          "ORDER BY id DESC LIMIT ?", params=(50,))
+statement("overlay.agent.messages_before",
+          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
+          "WHERE id < ? ORDER BY id DESC LIMIT ?", params=(100, 50))
+statement("overlay.agent.turn",
+          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
+          "WHERE turn = ? ORDER BY id", params=("t",))
+statement("overlay.agent.set_status",
+          "UPDATE agent_message SET status = ?, job = COALESCE(NULLIF(?, ''), job), "
+          "updated_at = ? WHERE turn = ? AND role = 'user'", params=("queued", "", 1, "t"))
+statement("overlay.agent.add",
+          "INSERT INTO agent_message (turn, role, text, status, job, created_at, updated_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("t", "user", "", "queued", "", 1, 1))
+statement("overlay.agent.calls",
+          "SELECT c.id, c.turn, c.tool, c.arguments, c.result, c.ms, c.outcome, c.at "
+          f"FROM {_J} CROSS JOIN agent_tool_call c WHERE c.turn = j.value ORDER BY c.id",
+          params=('["t"]',), drives="j", bounded=True)
+statement("overlay.agent.add_call",
+          "INSERT INTO agent_tool_call (turn, tool, arguments, result, ms, outcome, at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("t", "schema", "{}", "", 0, "ok", 1))

@@ -2221,6 +2221,80 @@ def _dollars(text: str) -> float:
     return value
 
 
+def cmd_agent(args):
+    """The chat with Harvey's agent: ask (queue a message and wait for the
+    answer, or --background) and log (the conversation, with each
+    answer's tool calls)."""
+    from harvey.agent import chat
+    from harvey.state import StateManager
+
+    async def _ask():
+        state = StateManager()
+        await state.init_db()
+        try:
+            queued = await chat.ask(state, " ".join(args.text or []))
+        except chat.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        if args.background:
+            await _queued_note(state, queued["batch_id"], 1)
+            return
+        print("\n  Asked. The answer comes when the turn ends (Ctrl-C stops waiting; the "
+              "turn goes on, and harvey agent log shows it).\n", flush=True)
+        await _wait_for(state, queued["batch_id"])
+        found = await chat.messages(state, limit=200)
+        _print_turn([m for m in found["messages"] if m["turn"] == queued["turn"]],
+                    found["calls"].get(queued["turn"], []), every_call=True)
+        answer = next((m for m in found["messages"] if m["turn"] == queued["turn"]
+                       and m["role"] == "agent"), None)
+        if answer is None:
+            print("  No answer yet: the turn waits (harvey jobs list says why).\n")
+        elif answer["status"] != chat.OK:
+            raise SystemExit(1)
+
+    async def _log():
+        state = StateManager()
+        await state.init_db()
+        found = await chat.messages(state, limit=args.limit)
+        if not found["messages"]:
+            print("\n  No messages yet: harvey agent ask \"...\"\n")
+            return
+        turns = list(dict.fromkeys(m["turn"] for m in found["messages"]))
+        for turn in turns:
+            _print_turn([m for m in found["messages"] if m["turn"] == turn],
+                        found["calls"].get(turn, []), every_call=args.calls)
+
+    if args.agent_action == "ask":
+        if not args.text:
+            print('\n  Say what to ask: harvey agent ask "how many firms have a phone?"\n')
+            raise SystemExit(2)
+        asyncio.run(_ask())
+    else:
+        asyncio.run(_log())
+
+
+def _print_turn(rows: list[dict], calls: list[dict], *, every_call: bool = False) -> None:
+    """One turn of the chat: the message, the answer (or its status), and
+    the tool calls it made (each one with ``every_call``, else how many)."""
+    import json
+    import time
+
+    for m in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(m["created_at"] or 0))
+        who = "You" if m["role"] == "user" else "Harvey"
+        shown = ("answered", "ok")
+        status = "" if m["status"] in shown else f" [{m['status']}]"
+        print(f"\n  {who}, {when}{status}:\n    " + m["text"].replace("\n", "\n    "))
+    if every_call:
+        for c in calls:
+            print(f"    · {c['tool']}({json.dumps(c['arguments'], ensure_ascii=False)[:200]}) "
+                  f"{c['outcome']}, {c['ms']} ms: {c['result'][:160]}")
+    elif calls:
+        print(f"    ({len(calls)} tool call{'' if len(calls) == 1 else 's'}: "
+              "harvey agent log --calls)")
+    print()
+
+
 def cmd_worker(args):
     """Run the jobs (searches, site reads, loads, checks) on an install
     without the dashboard. One worker per database: with the dashboard
@@ -3822,6 +3896,20 @@ def main():
     sub.add_argument("--max-spend", type=_dollars, default=None,
                      help="resume: a new spend limit for the job's run (in dollars)")
     sub.set_defaults(func=cmd_jobs)
+
+    sub = subparsers.add_parser(
+        "agent", help="The chat with Harvey's agent (read only): ask, log",
+        description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
+                    "read-only tools, runs on your Claude plan (within "
+                    "usage.max_daily_claude_percent) and can't act yet. A message is a job "
+                    "on the agent lane: the answer comes when the turn ends.")
+    sub.add_argument("agent_action", choices=("ask", "log"),
+                     help="ask TEXT: queue a message and wait for the answer; log: the chat")
+    sub.add_argument("text", nargs="*", help="ask: the message")
+    _background_arg(sub)
+    sub.add_argument("--limit", type=int, default=20, help="log: messages shown (default: 20)")
+    sub.add_argument("--calls", action="store_true", help="log: every tool call of each answer")
+    sub.set_defaults(func=cmd_agent)
 
     sub = subparsers.add_parser(
         "worker", help="Run queued jobs without the dashboard (one worker per database)")

@@ -51,6 +51,9 @@ ACCOUNT_TTL = 300.0
 KINDS = {"openai_compatible": "text-generation"}
 SCOPE = "billing:read"
 NO_LIST = "DeepInfra's price list didn't answer"
+# Never fetch the list (the agent's read-only tools: the copy kept, else
+# the price unknown).
+OFFLINE = False
 
 _failed_at = 0.0
 _lock: asyncio.Lock | None = None
@@ -138,7 +141,7 @@ async def models(state) -> tuple[list[dict], str]:
     def failed():
         return (stale, "") if stale else ([], NO_LIST)
 
-    if time.time() - _failed_at < RETRY_FAILED:
+    if time.time() - _failed_at < RETRY_FAILED or OFFLINE:
         return failed()
     _lock = _lock or asyncio.Lock()
     async with _lock:

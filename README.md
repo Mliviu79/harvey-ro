@@ -713,6 +713,7 @@ The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeli
 
 **System**
 - **Queue** — every background job per lane: running (with progress), waiting, paused, done, failed; pause a lane, cancel, retry or resume a job. A run opened from elsewhere shows its report (time, and cost split into searches, address checks and the classifier) and its caps to raise.
+- **Chat** — ask Harvey's agent about your data ("how many dental firms in Cluj have a phone but no email?", "what did last week's searches cost?"). It reads through Harvey's own tools only, read only, on your Claude plan inside Harvey's share of it, and can't act yet: no searches, spending, edits or email. A message is a job on the agent lane, so the answer shows when its turn ends; each answer folds the tool calls it made under it. Claude only for now (Codex needs a mode of its own). Same from a terminal: `harvey agent ask "..."`, `harvey agent log`.
 - **Activity**, **Usage**, **Controls**, **Settings**, **Help**. Settings → **Classifier** says what the classifier is for and when it is asked, sets each task's profile, lists the profiles side by side with what they measured, and holds its caps ([the classifier](#the-classifier)). Usage shows Claude or Codex quota gauges and per-agent token counts, with no dollar figures: you're on a subscription and aren't billed per token, so showing costs would be made up.
 
 | Outbox | Conversations |
@@ -1012,6 +1013,8 @@ If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real
 harvey run                   # the heartbeat loop (the Email module's: reply, write, send)
 harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock link); runs the job worker
 harvey worker                # run queued jobs without the dashboard (one worker per database)
+harvey agent ask "..."       # ask Harvey's agent about the data (read only); waits for the answer, --background
+harvey agent log             # the chat; --calls: every tool call of each answer
 harvey jobs                  # the queue per lane; cancel|retry|resume ID, pause|resume-lane LANE
                              # (resume ID --max-spend N raises a paused run's cap)
 harvey signals               # review/confirm what to prospect against
@@ -1253,7 +1256,10 @@ another service* on the dashboard) and Harvey stops suggesting it.
 harvey/
 ├── main.py              # heartbeat loop (email only)
 ├── brain.py             # Claude/Codex provider selection + skills + usage
-├── claude_runtime.py    # Isolated Claude CLI calls (safe mode, no tools, clean dir)
+├── claude_runtime.py    # Isolated Claude CLI calls (safe mode, no tools, clean dir;
+│                        #   the agent's: restricted, Harvey's MCP server only)
+├── agent/               # the chat's agent: read-only MCP tools (tools.py), what they
+│                        #   may read (readonly.py), the views, the agent_turn job (chat.py)
 ├── codex.py             # Isolated Codex subscription runtime
 ├── state.py             # the StateManager: Harvey's reads and writes, cohorts
 ├── overlay/             # harvey.db's schema, kept-count triggers, writes, page reads,

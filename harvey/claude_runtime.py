@@ -24,6 +24,13 @@ and MCP servers, and saves a transcript of the prompt under
   an enclosing Claude Code session removed. Login, proxy and provider
   variables are left exactly as they are.
 
+The agent (harvey/agent/chat.py) is the one call that has tools: only
+Harvey's own MCP server, read-only (build_agent_command). It runs with
+``--restricted`` instead of ``--safe-mode``, which would not start the
+server: no built-in tool that runs code or fetches, none of the user,
+project or local settings files, no MCP server but Harvey's
+(``--strict-mcp-config``), and permission for ``mcp__harvey__*`` only.
+
 Before any prompt is sent the CLI's ``--help`` must list every one of those
 flags; if any is missing Harvey refuses to call it (there is no fallback to
 an unisolated call). That check proves the flags exist, not what the CLI
@@ -53,6 +60,22 @@ REQUIRED_FLAGS = (
     "--tools",
     "--output-format",
 )
+
+# The agent's call (build_agent_command): Harvey's MCP server and nothing
+# else. --max-turns isn't listed by --help, so it isn't checked there.
+AGENT_FLAGS = (
+    "--restricted",
+    "--setting-sources",
+    "--tools",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--allowedTools",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+    "--output-format",
+)
+AGENT_TOOLS = "mcp__harvey__*"
+AGENT_ENV = {"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 
 # Inherited variables that add instruction sources or bind the call to an
 # enclosing Claude Code session (e.g. Harvey started from inside Claude Code).
@@ -146,13 +169,21 @@ def find_claude(env: dict | None = None) -> str | None:
         f"re-parses the flags that keep each call isolated. {INSTALL_HINT}")
 
 
-def runtime_env(cwd: str, base: dict | None = None) -> dict:
-    """The child's environment: the operator's, minus instruction sources."""
+def runtime_env(cwd: str, base: dict | None = None, *, safe: bool = True) -> dict:
+    """The child's environment: the operator's, minus instruction sources
+    (``safe`` False: without safe mode, which keeps MCP servers out: the
+    agent's call)."""
     env = dict(os.environ if base is None else base)
     for key in STRIPPED_ENV:
         env.pop(key, None)
+    env.pop("CLAUDE_CODE_SAFE_MODE", None)
     env["PWD"] = cwd
-    env["CLAUDE_CODE_SAFE_MODE"] = "1"
+    if safe:
+        env["CLAUDE_CODE_SAFE_MODE"] = "1"
+    else:
+        # Without safe mode: no CLAUDE.md and no auto memory all the same
+        # (--setting-sources "" already leaves the user's out).
+        env.update(AGENT_ENV)
     return env
 
 
@@ -186,6 +217,32 @@ def build_command(executable: str, model: str = "", session_id: str | None = Non
             cmd += ["--session-id", session_id]
         except ValueError:
             pass
+    return cmd
+
+
+def build_agent_command(executable: str, mcp_config: str, *, max_turns: int,
+                        model: str = "") -> list[str]:
+    """argv for one turn of the agent: print mode, Harvey's MCP server
+    (``mcp_config``, a file) and its tools only. The prompt goes on stdin."""
+    cmd = [
+        executable, "-p",
+        "--output-format", "json",
+        # No built-in tool that runs code or fetches, none of the user,
+        # project or local settings files (managed policy still applies).
+        "--restricted",
+        "--setting-sources", "",
+        # No built-in tools at all, and no MCP server but Harvey's.
+        "--tools", "",
+        "--strict-mcp-config",
+        "--mcp-config", mcp_config,
+        "--allowedTools", AGENT_TOOLS,
+        # No skills or slash commands listed in the prompt.
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--max-turns", str(int(max_turns)),
+    ]
+    if model:
+        cmd += ["--model", model]
     return cmd
 
 
@@ -232,21 +289,21 @@ def _probe_help(executable: str) -> str:
     return (out.stdout or "") + (out.stderr or "")
 
 
-def missing_flags(help_text: str) -> list[str]:
-    return [f for f in REQUIRED_FLAGS
+def missing_flags(help_text: str, flags: tuple[str, ...] = REQUIRED_FLAGS) -> list[str]:
+    return [f for f in flags
             if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", help_text)]
 
 
-def check_cli(env: dict | None = None) -> str:
-    """Path of a Claude CLI that supports every isolation flag, or raise
-    ClaudeRuntimeError saying what to do. A passing result is cached until
-    the executable changes."""
+def check_cli(env: dict | None = None, flags: tuple[str, ...] = REQUIRED_FLAGS) -> str:
+    """Path of a Claude CLI that supports every isolation flag (``flags``:
+    AGENT_FLAGS for the agent's call), or raise ClaudeRuntimeError saying
+    what to do. A passing result is cached until the executable changes."""
     exe = find_claude(env)
     if not exe:
         raise ClaudeRuntimeError(
             "Claude CLI not found on PATH. Install it (https://code.claude.com/docs/en/setup) "
             "and run 'claude login'.")
-    key = _fingerprint(exe)
+    key = (*_fingerprint(exe), tuple(flags))
     with _capable_lock:
         if _capable.get(key):
             return exe
@@ -256,7 +313,7 @@ def check_cli(env: dict | None = None) -> str:
         raise ClaudeRuntimeError(
             f"Could not run '{exe} --help' to check the Claude CLI ({type(e).__name__}). "
             "Harvey sends no prompt until it can confirm the CLI isolates calls.") from e
-    missing = missing_flags(help_text)
+    missing = missing_flags(help_text, flags)
     if missing:
         raise ClaudeRuntimeError(
             f"This Claude CLI ({exe}) lacks {', '.join(missing)}, which Harvey needs "

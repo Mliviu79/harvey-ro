@@ -441,7 +441,7 @@ def test_schema_28_gives_an_old_conversation_the_campaign_it_answers(tmp_path):
         INSERT INTO outbox (id, campaign_id, prospect_id, kind, status, sent_at)
           VALUES ('o4', 'c2', 'p4', 'sequence', 'sent', '2026-10-20T09:00:00');
     """)
-    assert schema.step_up(con) == schema.LATEST == 30
+    assert schema.step_up(con) == schema.LATEST == 31
     got = dict(con.execute("SELECT id, campaign_id FROM conversations").fetchall())
     # The cold email sent before it began; one already attributed is kept;
     # none sent, or none at all, leaves it as it was. A conversation older

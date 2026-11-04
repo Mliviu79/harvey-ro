@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 30).
+"""The overlay's tables (harvey.db schema 31).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 30
+LATEST = 31
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -862,9 +862,40 @@ def _to_30(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_30)
 
 
+# ── Schema 31: the chat with Harvey's agent, and the tools it called ──
+
+SCHEMA_31 = """
+-- The chat on the dashboard's Chat tab (harvey/agent/chat.py): a person's
+-- message and the agent's answer share a turn. status: a user message is
+-- queued, running, held (the plan's quota), answered or failed; an
+-- answer is ok, or error with what went wrong as its text.
+CREATE TABLE agent_message (
+  id INTEGER PRIMARY KEY, turn TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('user', 'agent')),
+  text TEXT NOT NULL, status TEXT NOT NULL DEFAULT '', job TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL, updated_at INTEGER
+);
+CREATE INDEX agent_message_turn ON agent_message(turn);
+-- Every call the agent made to Harvey's tools (harvey/agent/tools.py): its
+-- arguments, a summary of what it returned, how long it took, and how it
+-- ended (ok, refused, error).
+CREATE TABLE agent_tool_call (
+  id INTEGER PRIMARY KEY, turn TEXT NOT NULL, tool TEXT NOT NULL,
+  arguments TEXT NOT NULL DEFAULT '{}', result TEXT NOT NULL DEFAULT '',
+  ms INTEGER NOT NULL DEFAULT 0, outcome TEXT NOT NULL, at INTEGER NOT NULL
+);
+CREATE INDEX agent_tool_call_turn ON agent_tool_call(turn, id);
+"""
+
+
+def _to_31(con: sqlite3.Connection) -> None:
+    """Schema 31: agent_message and agent_tool_call. Nothing on file
+    changes: the chat starts empty."""
+    _script(con, SCHEMA_31)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30))
+STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:
