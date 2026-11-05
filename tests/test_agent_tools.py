@@ -448,9 +448,11 @@ def test_a_call_is_filed_under_the_message_it_started_for_and_none_without_one(d
 
 
 READ_TOOLS = ["schema", "counts", "query", "pipeline", "firms", "coverage", "contacts_summary",
-              "campaigns", "spend", "estimate", "jobs", "plan_status", "sets"]
+              "campaigns", "spend", "estimate", "jobs", "plan_status", "sets", "notes",
+              "read_playbook", "playbooks"]
 ACTION_TOOLS = ["propose_plan", "close_plan", "save_set", "discover", "registry_pull",
-                "find_contacts", "verify_contacts", "cancel_run"]
+                "find_contacts", "verify_contacts", "cancel_run", "schedule_wake", "remember",
+                "forget", "save_playbook"]
 
 
 def test_the_server_offers_its_reading_tools_and_its_actions_only(db):

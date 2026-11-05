@@ -214,12 +214,17 @@ async def status(state, plan_id, chat: str | None = None) -> dict:
 
 async def for_chat(state, chat: str) -> list[dict]:
     """A chat's plans, oldest first, each with its money and runs (the Chat
-    tab's cards)."""
+    tab's cards), and an approved one's wakes to come (wakes.pending)."""
+    from harvey.agent import wakes
+
     out = []
     for plan in reversed(await listed(state, chat, limit=100)):
         m = await money(state, plan["id"])
-        out.append({**plan, **m, "remaining_usd": round(
-            max(0.0, plan["budget_usd"] - m["committed_usd"]), 6)})
+        p = {**plan, **m, "remaining_usd": round(
+            max(0.0, plan["budget_usd"] - m["committed_usd"]), 6)}
+        if plan["status"] == APPROVED:
+            p["wakes"] = await wakes.pending(state, plan["id"])
+        out.append(p)
     return out
 
 
@@ -272,6 +277,10 @@ async def close(state, plan_id, *, cancel: bool, by: str, chat: str | None = Non
         await db.commit()
     if not cur.rowcount:
         raise Refused(f"plan {plan['id']} changed meanwhile")
+    from harvey.agent import wakes
+
+    # (Its wakes still to come go with it.)
+    await wakes.cancel_plan(state, plan["id"])
     out = await get(state, plan["id"])
     out["runs_cancelled"] = 0
     if cancel:

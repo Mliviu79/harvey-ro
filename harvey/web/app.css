@@ -1468,6 +1468,16 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .plan-runs ul { margin: 2px 0 0; padding-left: var(--sp-4); font-size: var(--fs-caption); }
 .plan-runs li { margin: 2px 0; }
 .plan-card .btn-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-1); }
+.plan-wakes ul { margin: 2px 0 0; padding-left: var(--sp-4); font-size: var(--fs-caption); }
+.plan-wakes li { margin: 2px 0; }
+.chat-msg.wake { box-shadow: inset 3px 0 0 var(--line), inset 0 0 0 1px var(--line); }
+.chat-memory { display: flex; flex-direction: column; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.chat-memory[hidden] { display: none; }
+.memory-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.memory-list textarea, .memory-add textarea { width: 100%; resize: vertical; }
+.memory-list summary { cursor: pointer; overflow-wrap: anywhere; }
+.memory-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; margin-top: var(--sp-1); }
+.memory-add { display: flex; gap: var(--sp-2); align-items: flex-end; }
 @media (max-width: 760px) {
   .chat-layout { grid-template-columns: minmax(0, 1fr); }
   .chat-toggle { display: inline-flex; }

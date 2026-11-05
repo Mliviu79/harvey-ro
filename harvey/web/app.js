@@ -1137,6 +1137,7 @@ function todayItemText(it, stats) {
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
+    case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
     case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
     case 'campaign-checks': return tr(t('today.item.campaign_checks', {n: s.campaign_checks_waiting || 0}),
       checksHeldText(it.code, it.detail), t('today.item.campaign_checks_action'));
@@ -7265,10 +7266,34 @@ function renderPlanCard(p) {
       escHtml(t('chat.plan.approve')) + '</button><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'reject\')">' +
       escHtml(t('chat.plan.reject')) + '</button></div>';
   } else if (p.status === 'approved') {
+    html += planWakes(p.wakes);
     html += '<div class="btn-row"><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'cancel\')">' +
       escHtml(t('chat.plan.cancel')) + '</button></div>';
   }
   return html + '</div>';
+}
+
+// An approved plan's wakes to come: each scheduled one with its time, its
+// note and a Cancel; a wake queued now.
+function planWakes(w) {
+  if (!w) return '';
+  const list = w.scheduled || [];
+  if (!list.length && !w.job) return '';
+  let html = '<div class="plan-wakes"><div class="muted small">' + escHtml(t('chat.plan.wakes')) + '</div>';
+  if (w.job) html += '<div class="small">' + escHtml(t('chat.plan.wake_queued')) + '</div>';
+  if (list.length) {
+    html += '<ul>' + list.map(x => '<li>' + escHtml(new Date(x.due_at * 1000).toLocaleString(intlLocale())) +
+      (x.note ? ' · <span class="muted">' + escHtml(x.note) + '</span>' : '') +
+      ' <button type="button" class="btn btn-ghost btn-sm" data-wake="' + escHtml(String(x.id)) + '" onclick="cancelWake(this.dataset.wake)">' +
+      escHtml(t('chat.plan.wake_cancel')) + '</button></li>').join('') + '</ul>';
+  }
+  return html + '</div>';
+}
+
+async function cancelWake(id) {
+  const r = await api('/api/agent/wakes/' + encodeURIComponent(id) + '/cancel', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: '{}'});
+  planDone(r, 'chat.plan.wake_cancelled');
 }
 
 function chatPlan(id) {
@@ -7314,7 +7339,8 @@ function renderChatList(list, current, q) {
   return list.map(c => '<div class="chat-item' + (c.id === current ? ' on' : '') + '" data-chat="' + escHtml(c.id) + '">' +
     '<button type="button" class="chat-open" onclick="openChat(this.parentNode.dataset.chat)"' + (c.id === current ? ' aria-current="true"' : '') + '>' +
     '<span class="chat-item-title">' + escHtml(c.title || t('chat.untitled')) + '</span>' +
-    '<span class="chat-item-when">' + (c.answering ? '<span class="badge t-active">' + escHtml(t('chat.answering')) + '</span> ' : '') + chatWhen(c.last_at) + '</span></button>' +
+    '<span class="chat-item-when">' + (c.answering ? '<span class="badge t-active">' + escHtml(t('chat.answering')) + '</span> ' : '') +
+      (c.unread && !c.answering ? '<span class="badge t-note">' + escHtml(t('chat.wake.unread')) + '</span> ' : '') + chatWhen(c.last_at) + '</span></button>' +
     '<button type="button" class="icon-btn" onclick="renameChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.rename')) + '" aria-label="' + escHtml(t('chat.rename')) + '">' + icon('pen') + '</button>' +
     '<button type="button" class="icon-btn" onclick="deleteChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.delete')) + '" aria-label="' + escHtml(t('chat.delete')) + '">' + icon('x') + '</button>' +
     '</div>').join('');
@@ -7398,7 +7424,9 @@ function renderChat(data, live) {
       continue;
     }
     const err = String(m.status || '').startsWith('error:') ? m.status.slice(6) : '';
-    html += '<div class="chat-msg agent' + (err ? ' error' : '') + '"><div class="chat-meta">' + escHtml(t('chat.harvey')) + ' · ' + chatWhen(m.created_at) + '</div>' +
+    // (An answer Harvey wrote on a wake: who woke it and why.)
+    const who = m.wake ? t('chat.wake.by', {why: wakeLabel(m.wake)}) : t('chat.harvey');
+    html += '<div class="chat-msg agent' + (err ? ' error' : '') + (m.wake ? ' wake' : '') + '"><div class="chat-meta">' + escHtml(who) + ' · ' + chatWhen(m.created_at) + '</div>' +
       (err ? '<div class="chat-text"><b>' + escHtml(t(own(CHAT_ERRORS, err) ? 'chat.err.' + err : 'chat.err.failed')) + '</b>' +
                (m.text ? '<div class="muted small">' + escHtml(m.text) + '</div>' : '') + '</div>'
            : '<div class="chat-text">' + escHtml(m.text) + '</div>') +
@@ -7408,12 +7436,26 @@ function renderChat(data, live) {
     }
   }
   for (const p of plans) if (!shown.has(p.id)) html += renderPlanCard(p);
+  if (data.waking) html += '<div class="chat-msg agent pending"><div class="chat-text muted">' + escHtml(t('chat.waking')) + '</div></div>';
   return html;
+}
+
+// Why a wake woke, in the page's words: the runs that finished, a wake the
+// agent scheduled, another module's event.
+function wakeLabel(w) {
+  const runs = (w && w.runs) || [];
+  const kinds = (w && w.kinds) || [];
+  const parts = [];
+  if (runs.length) parts.push(t('chat.wake.run', {run: runs.slice(0, 3).join(', ')}));
+  if (kinds.indexOf('scheduled') >= 0) parts.push(t('chat.wake.scheduled'));
+  kinds.filter(k => k !== 'run_done' && k !== 'scheduled')
+    .forEach(k => parts.push(t('chat.wake.event', {kind: String(k).replace(/_/g, ' ')})));
+  return parts.join('; ') || t('chat.wake.woken');
 }
 
 const CHAT_ERRORS = {login: 1, max_turns: 1, failed: 1, timeout: 1, stopped: 1};
 const CHAT_REFUSALS = {empty: 1, too_long: 1, codex: 1, budget: 1, busy: 1, elsewhere: 1, cli: 1,
-                       full: 1, missing: 1, retry: 1};
+                       full: 1, missing: 1, retry: 1, waking: 1};
 
 // Send the chat's newest message again (its answer failed or was stopped).
 function chatRetry(turn) {
@@ -7540,6 +7582,9 @@ function openChat(id) {
   _chatId = id || '';
   _chatData = null;
   toggleChats(false);
+  // (Opening it reads its wake answers.)
+  const entry = _chatList && (_chatList.chats || []).find(c => c.id === _chatId);
+  if (entry) entry.unread = 0;
   if (_chatList) document.getElementById('chat-chats').innerHTML =
     renderChatList(_chatList.chats || [], _chatId, (document.getElementById('chat-q').value || '').trim());
   document.getElementById('chat-list').innerHTML = '<p class="muted">' + escHtml(t('common.loading')) + '</p>';
@@ -7623,6 +7668,104 @@ async function retryChat(turn) {
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({turn: turn})});
   if (!r || r.success === false) { chatRefused(r); return; }
   await chatStarted(r);
+}
+
+// While the Chat tab is open (the page's 15 s refresh): the list again (a
+// wake's answer marks its chat), and the open chat when it changed and no
+// answer is being followed here.
+async function pollChat() {
+  if (_chatLive) return;
+  const before = _chatList && (_chatList.chats || []).find(c => c.id === _chatId);
+  await loadChatList();
+  if (!_chatId || _chatLive) return;
+  const now = _chatList && (_chatList.chats || []).find(c => c.id === _chatId);
+  if (now && (!before || now.last_at !== before.last_at || now.unread || now.answering !== before.answering ||
+              (_chatData && _chatData.waking))) loadChatMessages();
+}
+
+// ── The agent's memory: its notes and playbooks, which the user sees and edits ──
+
+let _memory = null;
+
+function toggleMemory(open) {
+  const el = document.getElementById('chat-memory');
+  if (!el) return;
+  const on = open === undefined ? el.hidden : !!open;
+  el.hidden = !on;
+  if (on) loadMemory();
+}
+
+async function loadMemory() {
+  const el = document.getElementById('chat-memory-body');
+  const data = await api('/api/agent/memory');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  _memory = data;
+  el.innerHTML = renderMemory(data);
+}
+
+function renderMemory(data) {
+  const u = data.usage || {};
+  const notes = data.notes || [];
+  const books = data.playbooks || [];
+  const by = a => t(a === 'agent' ? 'chat.memory.by_agent' : 'chat.memory.by_you');
+  let html = '<p class="muted small">' + escHtml(t('chat.memory.lede')) + '</p>' +
+    '<h4 class="chat-side-head">' + escHtml(t('chat.memory.notes')) + ' <span class="muted small">' +
+    escHtml(t('chat.memory.used', {used: fmtN(u.chars || 0), limit: fmtN(u.limit || 0)})) + '</span></h4>';
+  html += notes.length ? '<ul class="memory-list">' + notes.map(n => '<li data-note="' + escHtml(String(n.id)) + '">' +
+    '<textarea class="form-input" rows="2" maxlength="' + escHtml(String(u.note_limit || 300)) + '" aria-label="' + escHtml(t('chat.memory.notes')) + '">' + escHtml(n.text) + '</textarea>' +
+    '<div class="memory-row"><span class="muted small">' + escHtml(by(n.author)) + ' · ' + chatWhen(n.updated_at) + '</span>' +
+    '<button type="button" class="btn btn-sm" onclick="saveNote(this.closest(\'li\').dataset.note)">' + escHtml(t('chat.memory.save')) + '</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="deleteNote(this.closest(\'li\').dataset.note)">' + escHtml(t('chat.memory.delete')) + '</button></div></li>').join('') + '</ul>'
+    : '<p class="muted small">' + escHtml(t('chat.memory.none_notes')) + '</p>';
+  html += '<div class="memory-add"><textarea id="memory-new" class="form-input" rows="2" maxlength="' + escHtml(String(u.note_limit || 300)) + '" placeholder="' +
+    escHtml(t('chat.memory.add_placeholder')) + '" aria-label="' + escHtml(t('chat.memory.add_placeholder')) + '"></textarea>' +
+    '<button type="button" class="btn btn-sm" onclick="addNote()">' + escHtml(t('chat.memory.add')) + '</button></div>';
+  html += '<h4 class="chat-side-head">' + escHtml(t('chat.memory.playbooks')) + '</h4>';
+  html += books.length ? '<ul class="memory-list">' + books.map(p => '<li data-playbook="' + escHtml(String(p.id)) + '"><details><summary>' +
+    escHtml(p.name) + ' <span class="muted small">' + escHtml(by(p.author)) + ' · ' + chatWhen(p.updated_at) + '</span></summary>' +
+    '<textarea class="form-input" rows="8" maxlength="' + escHtml(String(data.playbook_limit || 4000)) + '" aria-label="' + escHtml(p.name) + '">' + escHtml(p.body) + '</textarea>' +
+    '<div class="memory-row"><button type="button" class="btn btn-sm" onclick="savePlaybook(this.closest(\'li\').dataset.playbook)">' + escHtml(t('chat.memory.save')) + '</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="deletePlaybook(this.closest(\'li\').dataset.playbook)">' + escHtml(t('chat.memory.delete')) + '</button></div></details></li>').join('') + '</ul>'
+    : '<p class="muted small">' + escHtml(t('chat.memory.none_playbooks')) + '</p>';
+  return html;
+}
+
+async function memoryDone(r) {
+  if (r && r.success) showToast(t('chat.memory.saved'), 'success');
+  else showToast((r && r.message) || t('chat.plan.failed'), 'error');
+  loadMemory();
+}
+
+async function addNote() {
+  const box = document.getElementById('memory-new');
+  const text = (box && box.value || '').trim();
+  if (!text) return;
+  memoryDone(await api('/api/agent/memory/notes', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                    body: JSON.stringify({text: text})}));
+}
+
+async function saveNote(id) {
+  const box = document.querySelector('#chat-memory li[data-note="' + id + '"] textarea');
+  if (!box) return;
+  memoryDone(await api('/api/agent/memory/notes/' + encodeURIComponent(id), {method: 'PATCH',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: box.value})}));
+}
+
+async function deleteNote(id) {
+  if (!confirm(t('chat.memory.delete_confirm'))) return;
+  memoryDone(await api('/api/agent/memory/notes/' + encodeURIComponent(id), {method: 'DELETE'}));
+}
+
+async function savePlaybook(id) {
+  const box = document.querySelector('#chat-memory li[data-playbook="' + id + '"] textarea');
+  if (!box) return;
+  memoryDone(await api('/api/agent/memory/playbooks/' + encodeURIComponent(id), {method: 'PATCH',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({body: box.value})}));
+}
+
+async function deletePlaybook(id) {
+  if (!confirm(t('chat.memory.delete_confirm'))) return;
+  memoryDone(await api('/api/agent/memory/playbooks/' + encodeURIComponent(id), {method: 'DELETE'}));
 }
 
 async function stopChat() {
@@ -8003,5 +8146,8 @@ setInterval(() => {
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'controls': loadLogs(); loadControlSending(); break;
+    // (A wake's answer lands without a stream: the list and the open chat
+    // are read again.)
+    case 'chat': pollChat(); break;
   }
 }, 15000);

@@ -21,7 +21,10 @@ A job ends done, failed (with the message), cancelled, or paused. A
 passing problem (the network, a 5xx, a 429) is tried again later, waiting
 longer each time; a source out of credit pauses its whole lane.
 
-Quiet hours are the Email module's: the worker runs at any hour.
+Quiet hours are the Email module's: the worker runs at any hour. A full
+worker also looks, every minute, for a wake of Harvey's agent that is due
+(harvey/agent/wakes.py), and a job that finishes its run tells the plans
+that run is of.
 """
 
 from __future__ import annotations
@@ -49,6 +52,8 @@ POLL_SECONDS = 2.0
 DUE_SOURCES_EVERY_SECONDS = 900
 # How often the contact finder's backlog is topped up (job_kinds.enqueue_backlog).
 BACKLOG_EVERY_SECONDS = 60
+# How often the agent's plans are looked at for a wake due (harvey/agent/wakes.py).
+WAKES_EVERY_SECONDS = 60
 # How long a stopping worker lets running jobs reach the end of their page:
 # well inside the 10 s "docker stop" gives before it kills the process, so
 # a restart usually takes the clean path (the page kept, the cursor saved).
@@ -343,6 +348,7 @@ class Worker:
         # The first top-up a minute in: a worker started for a moment (a
         # command's) never feeds the backlog.
         self._next_backlog = time.monotonic() + BACKLOG_EVERY_SECONDS
+        self._next_wakes = 0.0
         self._renewer: _Renewer | None = None
 
     def lost_leases(self) -> set[str]:
@@ -393,6 +399,9 @@ class Worker:
                 if self.due_sources and time.monotonic() >= self._next_backlog:
                     self._next_backlog = time.monotonic() + BACKLOG_EVERY_SECONDS
                     await _enqueue_backlog(self.state)
+                if self.full and time.monotonic() >= self._next_wakes:
+                    self._next_wakes = time.monotonic() + WAKES_EVERY_SECONDS
+                    await _sweep_wakes(self.state)
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(_first(stop, self._wake), timeout=self.poll)
@@ -482,7 +491,13 @@ class Worker:
                 await asyncio.sleep(0.5 * 2 ** attempt)
 
     async def run_job(self, job: jobs.Job, lane_state: dict | None = None) -> None:
-        """Run one claimed job and record how it ended."""
+        """Run one claimed job and record how it ended; one that finished
+        may wake Harvey's agent (the run it ends, or the next wake of a
+        plan)."""
+        await self._run_job(job, lane_state)
+        await _after_job(self.state, job)
+
+    async def _run_job(self, job: jobs.Job, lane_state: dict | None = None) -> None:
         state = self.state
         if self._renewer is None:
             self._renewer = _Renewer(state.db_path, self.name, self.lease_ttl)
@@ -570,6 +585,32 @@ async def _first(*events: asyncio.Event) -> None:
     finally:
         for w in waits:
             w.cancel()
+
+
+async def _after_job(state, job: jobs.Job) -> None:
+    """A job ended: when it finished its run, the plans that run is of get
+    their event (harvey/agent/wakes.py); a wake that finished lets the
+    plan's next one be queued for what came meanwhile."""
+    try:
+        now = await jobs.get(state, job.id)
+        if now is None or now.status not in jobs.FINISHED:
+            return
+        from harvey.agent import wakes
+
+        if job.batch_id:
+            await wakes.run_finished(state, job.batch_id)
+        if job.kind == wakes.WAKE_KIND and job.params.get("plan"):
+            await wakes.enqueue(state, job.params["plan"])
+    except Exception as e:
+        logger.warning("worker: the agent's wakes after job %s: %s", job.id, e)
+
+
+async def _sweep_wakes(state) -> None:
+    try:
+        from harvey.agent import wakes
+        await wakes.sweep(state)
+    except Exception as e:
+        logger.warning("worker: looking for the agent's wakes failed: %s", e)
 
 
 async def _enqueue_backlog(state) -> None:

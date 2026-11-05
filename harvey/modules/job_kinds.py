@@ -1181,6 +1181,18 @@ async def run_verify_contacts(ctx) -> dict:
     return done
 
 
+# ── Harvey's agent woken under an approved plan (harvey/agent/wakes.py) ──
+
+@jobs.kind("agent_wake")
+async def run_agent_wake(ctx) -> dict:
+    """One wake of a plan's agent on the agent's lane: a one-shot Claude
+    run in the plan's chat over the plan's events not yet seen (wakes.run:
+    its limits, its lease on the chat, its answer or its silence)."""
+    from harvey.agent import wakes
+
+    return await wakes.run(ctx)
+
+
 # How many background finder jobs wait at most: the backlog is fed a little
 # at a time, so a person's run never queues behind a million of them.
 BACKLOG_QUEUED = 50

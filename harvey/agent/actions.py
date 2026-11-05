@@ -29,7 +29,7 @@ import time
 from urllib.parse import parse_qsl, urlencode
 
 from harvey import queries
-from harvey.agent import plans, readonly, views
+from harvey.agent import plans, readonly, views, wakes
 
 SET_KINDS = ("filter", "select")
 # What a SELECT set's one column holds: Harvey's firm ids, contact ids, or
@@ -111,6 +111,13 @@ class Actions:
         out["actions"] = [{k: a[k] for k in ("id", "tool", "batch_id", "cap_usd",
                                              "classify_cap_usd", "outcome", "why", "at")}
                           for a in await plans.actions(state, out["id"], limit=20)]
+        # (Its wakes to come, and the events not read yet by kind: counts
+        # only.)
+        pending = await wakes.pending(state, out["id"])
+        out["wakes"] = {"scheduled": [{k: w[k] for k in ("id", "due_at", "note")}
+                                      for w in pending["scheduled"]],
+                        "unseen": pending["unseen"],
+                        "queued": bool(pending["job"])}
         for k in ("chat", "turn"):
             out.pop(k, None)
         return out
@@ -433,6 +440,55 @@ class Actions:
                 "links", "companies", "calls", "usd_typical", "usd_high", "price_known",
                 "note")}, queue
         return await self._act(turn, "verify_contacts", arguments, plan, prepare)
+
+    # ── Wakes and memory ──
+
+    async def schedule_wake(self, turn: str, plan, in_hours=None, at=None, note: str = "") -> dict:
+        """A wake under an approved plan of this chat (wakes.schedule's
+        bounds), recorded as an action, refusals too."""
+        state = await self.state()
+        arguments = {"plan": plan, "in_hours": in_hours, "at": at, "note": note}
+        try:
+            out = await wakes.schedule(state, plan, self.chat, in_hours=in_hours, at=at,
+                                       note_text=note)
+        except wakes.Refused as e:
+            await plans.record(state, plan, self.chat, turn, "schedule_wake", arguments,
+                               plans.REFUSED, str(e))
+            raise readonly.Refused(str(e)) from None
+        await plans.record(state, plan, self.chat, turn, "schedule_wake", arguments, plans.OK,
+                           f"wake {out['wake']} at {out['due']}")
+        return {**out, "note": "the wake comes as a job at its time; the user sees it on the "
+                               "plan's card and can cancel it"}
+
+    async def memory(self, verb: str, *args) -> dict:
+        """The memory tools (memory.py): its refusals said as the tools'."""
+        from harvey.agent import memory
+
+        state = await self.state()
+        try:
+            if verb == "remember":
+                n = await memory.remember(state, args[0])
+                return {"note": n["id"], **await memory.usage(state)}
+            if verb == "forget":
+                return {**await memory.forget(state, args[0], by=memory.BY_AGENT),
+                        **await memory.usage(state)}
+            if verb == "notes":
+                return {"notes": [{k: n[k] for k in ("id", "text", "author", "updated_at")}
+                                  for n in await memory.notes(state)],
+                        **await memory.usage(state)}
+            if verb == "save_playbook":
+                p = await memory.save_playbook(state, args[0], args[1])
+                return {"playbook": p["name"], "chars": len(p["body"]),
+                        "limit": memory.PLAYBOOK_CHARS}
+            if verb == "read_playbook":
+                p = await memory.read_playbook(state, args[0])
+                return {k: p[k] for k in ("name", "body", "author", "updated_at")}
+            if verb == "playbooks":
+                return {"playbooks": [{k: p[k] for k in ("name", "chars", "author", "updated_at")}
+                                      for p in await memory.playbooks(state)]}
+        except memory.Refused as e:
+            raise readonly.Refused(str(e)) from None
+        raise ValueError(verb)
 
     async def cancel_run(self, turn: str, plan, run: str) -> dict:
         """Cancel what is still to finish of one of the plan's runs."""

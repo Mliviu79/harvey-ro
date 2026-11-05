@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 33).
+"""The overlay's tables (harvey.db schema 34).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 33
+LATEST = 34
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -989,10 +989,56 @@ def _to_33(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_33)
 
 
+# ── Schema 34: what wakes the agent, and what it remembers ──
+
+SCHEMA_34 = """
+-- What wakes Harvey's agent under an approved plan (harvey/agent/wakes.py):
+-- a run of the plan finished (kind run_done, ref its batch and its last
+-- finish), a wake the agent scheduled (scheduled, due_at ahead, its note in
+-- data), or what another module adds (any kind: a reply, new members). One
+-- row per (plan, kind, ref). A wake reads the plan's due events not yet
+-- seen; seen_at and wake (the turn it answered) once it has finished;
+-- cancelled_at when the user cancelled it, or the plan or chat went.
+CREATE TABLE agent_event (
+  id INTEGER PRIMARY KEY, plan INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '{}', due_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  seen_at INTEGER, wake TEXT NOT NULL DEFAULT '', cancelled_at INTEGER
+);
+CREATE UNIQUE INDEX agent_event_ref ON agent_event(plan, kind, ref);
+CREATE INDEX agent_event_open ON agent_event(due_at)
+  WHERE seen_at IS NULL AND cancelled_at IS NULL;
+-- The plans whose run a batch is (a run finishing is looked up by it).
+CREATE INDEX agent_action_batch ON agent_action(batch) WHERE batch IS NOT NULL;
+-- The agent's memory, install-wide (harvey/agent/memory.py): short notes
+-- given to every new conversation, and named procedures it reads when it
+-- needs one (only their names are given). author: agent, or the user's
+-- dashboard or terminal.
+CREATE TABLE agent_note (
+  id INTEGER PRIMARY KEY, text TEXT NOT NULL, author TEXT NOT NULL DEFAULT 'agent',
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE agent_playbook (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, body TEXT NOT NULL,
+  author TEXT NOT NULL DEFAULT 'agent', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+-- An answer Harvey wrote on a wake, not to a message: why it woke (JSON);
+-- the chat's wake answers the user hasn't opened yet.
+ALTER TABLE agent_message ADD COLUMN wake TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_chat ADD COLUMN unread INTEGER NOT NULL DEFAULT 0;
+"""
+
+
+def _to_34(con: sqlite3.Connection) -> None:
+    """Schema 34: agent_event, agent_note and agent_playbook, and an
+    answer's wake. Nothing on file changes: the first wake comes with the
+    next run of an approved plan to finish."""
+    _script(con, SCHEMA_34)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
-         (32, _to_32), (33, _to_33))
+         (32, _to_32), (33, _to_33), (34, _to_34))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

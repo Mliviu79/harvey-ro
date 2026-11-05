@@ -9,6 +9,45 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Harvey wakes its agent to follow a plan while you are away.** When a
+  run of an approved plan finishes (every job of it done, failed or
+  cancelled), or at a time the agent scheduled with `schedule_wake` (at
+  least 10 minutes ahead, never past the plan's end, three waiting at
+  most), Harvey wakes the agent as a job on its own lane (`agent_wake` on
+  the `agent` lane, with the worker's leases, fencing and retries). The
+  wake is one Claude run in the plan's chat: it is given the prompt, its
+  memory, the chat so far and what happened as structured data (never a
+  page's or a reply's text), checks the plan's runs, carries on with the
+  plan's next step within its budget, and writes a short report in the
+  chat, marked with why it woke ("Harvey, after run … finished",
+  "scheduled") and shown as new in the chat list until you open it; with
+  nothing to say it answers `[SILENT]` and writes nothing. A plan's events
+  are coalesced (one wake queued or running per plan, reading every event
+  not yet seen), at most 12 wakes a plan a day, only while the plan is
+  approved and open, within Harvey's share of your Claude plan (over it,
+  the wakes wait and the lane rests); Codex refuses wakes. A logged-out CLI
+  pauses the agent's lane, a spent plan limit rests it, with the reason on
+  the Queue page and Today. While you are in the chat the wake waits for
+  you; a chat whose process was given the conversation before a wake
+  answered is given that answer before your next message. The plan card
+  lists the scheduled wakes with Cancel; a wake you cancel on the Queue page
+  doesn't come back for the same events; closing or cancelling a plan, or
+  deleting its chat, drops its wakes. Other modules can add their own kind
+  of event (a reply, new members) with no schema change. Quiet hours don't
+  apply, and no wake can send anything.
+- **The agent remembers.** Short notes it keeps with `remember` (300
+  characters each, 2,200 together, refused past it) are given to every new
+  conversation, chat or wake; playbooks it saves with `save_playbook`
+  (named procedures, 4,000 characters, 50 at most) are listed there by
+  name and read with `read_playbook`. Email addresses and phone numbers are
+  masked as they are written, and memory lives in Harvey's database only.
+  A note or playbook you wrote or edited is given to the agent as yours,
+  and the agent can't drop or replace it.
+  You see, edit and delete both on the Chat tab's **Memory** view and with
+  `harvey agent memory` (`add`, `edit`, `forget`, `playbooks`, `playbook`,
+  `delete-playbook`). Schema 34 adds `agent_event`, `agent_note`,
+  `agent_playbook`, an answer's wake and a chat's unread count.
+
 - **The agent works for you, under a plan you approve.** Asked to do
   something, Harvey's agent looks at the schema and the counts, estimates
   each step and proposes a plan: its goal, its steps, a budget sized from

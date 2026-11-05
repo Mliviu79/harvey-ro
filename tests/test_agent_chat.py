@@ -482,7 +482,7 @@ def test_chats_are_listed_searched_renamed_and_deleted(state, fake):
             await chat.chats(state)
     a, b, listed, found, literal, renamed, empty, missing, gone, after = _run(state, work)
     assert [c["id"] for c in listed] == [b, a]
-    assert set(listed[0]) == {"id", "title", "created_at", "last_at", "answering"}
+    assert set(listed[0]) == {"id", "title", "created_at", "last_at", "unread", "answering"}
     assert [c["id"] for c in found] == [a] and [c["id"] for c in literal] == [b]
     assert renamed["title"] == "Cluj, pe scurt"
     assert (empty.code, missing.code, gone.code) == ("empty", "missing", "missing")

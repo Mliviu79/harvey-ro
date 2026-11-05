@@ -4790,8 +4790,9 @@ async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0
     title, context, hint: past chat.CONTEXT_HINT_TOKENS}), the message
     being answered (``live``: follow it with the stream), ``busy``, and
     ``refused`` (Codex as the brain), and the chat's plans (``plans``,
-    oldest first, each with its committed, spent and runs). 404 for no
-    such chat."""
+    oldest first, each with its committed, spent and runs, an approved
+    one's wakes to come). A wake's answer carries ``wake`` (why it woke);
+    reading the newest page marks them read. 404 for no such chat."""
     from harvey.agent import chat
 
     state = _state()
@@ -4801,6 +4802,9 @@ async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0
     found = await chat.messages(state, chat_id, limit=limit, before=before or None)
     if found["chat"] is None:
         return _bad("no such chat", 404)
+    if not before:
+        # (The newest messages shown: its wake answers are read.)
+        await chat.mark_read(state, chat_id)
     return {**found, "plans": await plans.for_chat(state, chat_id),
             "refused": chat.refusal(_load_config_quietly())}
 
@@ -4936,6 +4940,112 @@ async def decide_agent_plan(plan_id: int, action: str, request: Request):
     except plans.Refused as e:
         return _plan_refused(e)
     return {"success": True, "plan": plan}
+
+
+@app.post("/api/agent/wakes/{event_id}/cancel")
+async def cancel_agent_wake(event_id: int):
+    """Cancel a wake the agent scheduled (one not read yet): {"success",
+    "wake"}."""
+    from harvey.agent import wakes
+
+    state = _state()
+    await state.init_db()
+    try:
+        return {"success": True, "wake": await wakes.cancel_event(state, event_id)}
+    except wakes.Refused as e:
+        return _bad(str(e), 404)
+
+
+# ── The agent's memory (harvey/agent/memory.py): the user sees and edits it ──
+
+@app.get("/api/agent/memory")
+async def get_agent_memory():
+    """The agent's notes ({id, text, author, created_at, updated_at}) with
+    what they use of their room, and its playbooks (their text too)."""
+    from harvey.agent import memory
+
+    state = _state()
+    await state.init_db()
+    return {"notes": await memory.notes(state), "usage": await memory.usage(state),
+            "playbooks": await memory.playbooks(state, bodies=True),
+            "playbook_limit": memory.PLAYBOOK_CHARS}
+
+
+def _memory_refused(e) -> JSONResponse:
+    return JSONResponse({"success": False, "message": str(e)},
+                        status_code=404 if str(e).startswith("no ") else 400)
+
+
+@app.post("/api/agent/memory/notes")
+async def add_agent_note(request: Request):
+    """A note of the user's: {"text"}."""
+    from harvey.agent import memory
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        note = await memory.remember(state, body.get("text"), author=memory.BY_DASHBOARD)
+    except memory.Refused as e:
+        return _memory_refused(e)
+    return {"success": True, "note": note}
+
+
+@app.patch("/api/agent/memory/notes/{note_id}")
+async def edit_agent_note(note_id: int, request: Request):
+    """A note's text changed: {"text"}."""
+    from harvey.agent import memory
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        note = await memory.edit_note(state, note_id, body.get("text"))
+    except memory.Refused as e:
+        return _memory_refused(e)
+    return {"success": True, "note": note}
+
+
+@app.delete("/api/agent/memory/notes/{note_id}")
+async def delete_agent_note(note_id: int):
+    from harvey.agent import memory
+
+    state = _state()
+    await state.init_db()
+    try:
+        await memory.forget(state, note_id)
+    except memory.Refused as e:
+        return _memory_refused(e)
+    return {"success": True}
+
+
+@app.patch("/api/agent/memory/playbooks/{playbook_id}")
+async def edit_agent_playbook(playbook_id: int, request: Request):
+    """A playbook changed: {"name"?, "body"?}."""
+    from harvey.agent import memory
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        p = await memory.edit_playbook(state, playbook_id, name=body.get("name"),
+                                       body=body.get("body"))
+    except memory.Refused as e:
+        return _memory_refused(e)
+    return {"success": True, "playbook": p}
+
+
+@app.delete("/api/agent/memory/playbooks/{playbook_id}")
+async def delete_agent_playbook(playbook_id: int):
+    from harvey.agent import memory
+
+    state = _state()
+    await state.init_db()
+    try:
+        await memory.delete_playbook(state, playbook_id)
+    except memory.Refused as e:
+        return _memory_refused(e)
+    return {"success": True}
 
 
 @app.get("/api/jobs/batches")
@@ -5520,6 +5630,19 @@ async def get_today():
                            "rest again and asks the classifier; nothing changes until you "
                            "start it."),
                 "action": "Review the check", "tab": "settings",
+            })
+
+        # Harvey's agent: its wakes wait (logged out, the plan's share or
+        # limit used).
+        from harvey.agent import wakes
+        agent_held = await wakes.held(state)
+        if agent_held:
+            items.append({
+                "key": "agent-wakes", "tone": "warn", "paused": agent_held["paused"],
+                "title": "Harvey's agent waits to look at its plans",
+                "detail": agent_held["why"] + ("" if not agent_held["paused"] else
+                                               " (the agent's lane is paused)"),
+                "action": "Open the Queue", "tab": "queue",
             })
 
         # Campaign addresses waiting for a check the spend rules refuse.

@@ -393,8 +393,12 @@
 <!-- Chat with Harvey's agent: the chats kept, one open, and the plans it proposed -->
 <div id="chat" class="section">
   <div class="section-head"><div><h2 data-i18n="chat.title">Chat</h2><p data-i18n="chat.lede">Întreabă-l pe Harvey despre datele tale: firme, contacte, căutări, campanii, costuri. Ca să lucreze pentru tine, agentul propune un plan cu un buget; pune în coadă căutări și verificări doar după ce îl aprobi, și niciodată nu trimite emailuri.</p></div>
-    <div class="page-actions"><button type="button" class="btn chat-toggle" id="chat-toggle" onclick="toggleChats()" aria-expanded="false" aria-controls="chat-side" data-i18n="chat.chats">Chaturi</button><button type="button" class="btn btn-primary" id="chat-new" onclick="newChat()" data-i18n="chat.new">Chat nou</button></div></div>
+    <div class="page-actions"><button type="button" class="btn chat-toggle" id="chat-toggle" onclick="toggleChats()" aria-expanded="false" aria-controls="chat-side" data-i18n="chat.chats">Chaturi</button><button type="button" class="btn" id="chat-memory-open" onclick="toggleMemory()" aria-controls="chat-memory" data-i18n="chat.memory">Memorie</button><button type="button" class="btn btn-primary" id="chat-new" onclick="newChat()" data-i18n="chat.new">Chat nou</button></div></div>
   <div id="chat-note"></div>
+  <div id="chat-memory" class="card chat-memory" hidden>
+    <div class="chat-head"><h3 data-i18n="chat.memory">Memorie</h3><button type="button" class="btn btn-ghost btn-sm" onclick="toggleMemory(false)" data-i18n="chat.memory.close">Înapoi la chat</button></div>
+    <div id="chat-memory-body"><p class="muted" data-i18n="common.loading">Se încarcă…</p></div>
+  </div>
   <div class="chat-layout">
     <aside id="chat-side" class="card chat-side">
       <input id="chat-q" type="search" class="form-input" oninput="searchChats()" data-i18n-placeholder="chat.search" data-i18n-aria="chat.search" placeholder="Caută în titluri" aria-label="Caută în titluri">

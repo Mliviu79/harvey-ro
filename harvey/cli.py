@@ -2348,6 +2348,9 @@ def cmd_agent(args):
     if action == "plans":
         _agent_plans(args)
         return
+    if action == "memory":
+        _agent_memory(args)
+        return
     if action == "ask":
         if not question:
             print('\n  Say what to ask: harvey agent ask "how many firms have a phone?"\n')
@@ -2366,6 +2369,77 @@ def cmd_agent(args):
         _run_chat(_delete)
     else:
         asyncio.run(_log())
+
+
+def _agent_memory(args) -> None:
+    """harvey agent memory: the agent's notes (the default) and playbooks,
+    which the user sees, writes and deletes: notes, add TEXT, edit ID TEXT,
+    forget ID; playbooks, playbook NAME (its text), delete-playbook NAME."""
+    import time
+
+    from harvey.agent import memory
+    from harvey.state import StateManager
+
+    verb = args.target or "notes"
+    rest = list(args.text or [])
+    verbs = ("notes", "add", "edit", "forget", "playbooks", "playbook", "delete-playbook")
+    if verb not in verbs:
+        print("\n  harvey agent memory [notes | add TEXT | edit ID TEXT | forget ID | playbooks "
+              "| playbook NAME | delete-playbook NAME]\n")
+        raise SystemExit(2)
+
+    def when(ts):
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts or 0))
+
+    async def main():
+        state = StateManager()
+        await state.init_db()
+        try:
+            if verb == "notes":
+                found = await memory.notes(state)
+                u = await memory.usage(state)
+                print(f"\n  The agent's notes: {u['chars']:,} of {u['limit']:,} characters "
+                      "(given to every new conversation).")
+                for n in found:
+                    print(f"  {n['id']:>4}  {when(n['updated_at'])}  ({n['author']})  {n['text']}")
+                if not found:
+                    print("  None yet.")
+                print()
+            elif verb == "add":
+                n = await memory.remember(state, " ".join(rest), author=memory.BY_CLI)
+                print(f"\n  Note {n['id']} kept.\n")
+            elif verb == "edit":
+                if len(rest) < 2:
+                    print("\n  harvey agent memory edit ID TEXT\n")
+                    raise SystemExit(2)
+                n = await memory.edit_note(state, rest[0], " ".join(rest[1:]),
+                                           author=memory.BY_CLI)
+                print(f"\n  Note {n['id']} changed.\n")
+            elif verb == "forget":
+                await memory.forget(state, rest[0] if rest else "")
+                print("\n  Forgotten.\n")
+            elif verb == "playbooks":
+                found = await memory.playbooks(state)
+                print("\n  The agent's playbooks (only their names go into a conversation):")
+                for p in found:
+                    print(f"  {p['id']:>4}  {when(p['updated_at'])}  {p['chars']:>5} chars  "
+                          f"({p['author']})  {p['name']}")
+                if not found:
+                    print("  None yet.")
+                print()
+            elif verb == "playbook":
+                p = await memory.read_playbook(state, " ".join(rest))
+                print(f"\n  {p['name']} ({p['author']}, {when(p['updated_at'])}):\n")
+                print("    " + p["body"].replace("\n", "\n    ") + "\n")
+            else:
+                p = await memory.read_playbook(state, " ".join(rest))
+                await memory.delete_playbook(state, p["id"])
+                print(f"\n  Playbook {p['name']!r} deleted.\n")
+        except memory.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+
+    asyncio.run(main())
 
 
 def _plan_line(p: dict) -> str:
@@ -2579,7 +2653,8 @@ def _print_turn(rows: list[dict], calls: list[dict], *, every_call: bool = False
 
     for m in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(m["created_at"] or 0))
-        who = "You" if m["role"] == "user" else "Harvey"
+        who = "You" if m["role"] == "user" else (
+            f"Harvey (woke {m['wake'].get('label') or 'on its own'})" if m.get("wake") else "Harvey")
         shown = ("answered", "ok")
         status = "" if m["status"] in shown else f" [{m['status']}]"
         print(f"\n  {who}, {when}{status}:\n    " + m["text"].replace("\n", "\n    "))
@@ -4196,27 +4271,32 @@ def main():
     sub.set_defaults(func=cmd_jobs)
 
     sub = subparsers.add_parser(
-        "agent", help="The chats with Harvey's agent and its plans: chats, chat, ask, "
-                      "rename, delete, log, plans",
+        "agent", help="The chats with Harvey's agent, its plans and its memory: chats, chat, "
+                      "ask, rename, delete, log, plans, memory",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
                     "tools and runs on your Claude plan (within "
                     "usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
                     "only you approve it (here or on the Chat tab), and it queues runs only "
-                    "under it. Chats are kept until you delete them (the dashboard's Chat tab "
-                    "lists the same ones). The answer is printed as it is written; Ctrl-C "
-                    "stops it.")
+                    "under it, and Harvey wakes it when a run of the plan finishes or at a "
+                    "time it scheduled (its answer lands in the plan's chat). Chats are kept "
+                    "until you delete them (the dashboard's Chat tab lists the same ones). The "
+                    "answer is printed as it is written; Ctrl-C stops it.")
     sub.add_argument("agent_action", choices=("chats", "chat", "ask", "rename", "delete", "log",
-                                              "plans"),
+                                              "plans", "memory"),
                      help="chats: the list (--q searches the titles); chat: a conversation in "
                           "the terminal (a new chat, or --chat ID goes on with one); ask TEXT: "
                           "one question, in a chat of its own; rename ID TITLE; delete ID; "
                           "log: the messages (--chat ID: one chat's); plans: the agent's plans "
-                          "(--chat ID: one chat's), plans show|approve|reject|cancel|close ID")
+                          "(--chat ID: one chat's), plans show|approve|reject|cancel|close ID; "
+                          "memory: the agent's notes, memory add TEXT|edit ID TEXT|forget ID|"
+                          "playbooks|playbook NAME|delete-playbook NAME")
     sub.add_argument("target", nargs="?", default="",
                      help="rename, delete: the chat's id (ask: the question's first word); "
-                          "plans: show, approve, reject, cancel or close")
+                          "plans: show, approve, reject, cancel or close; memory: notes, add, "
+                          "edit, forget, playbooks, playbook or delete-playbook")
     sub.add_argument("text", nargs="*", help="ask: the message; rename: the title; plans: the "
-                                             "plan's id")
+                                             "plan's id; memory: the note, its id, a playbook's "
+                                             "name")
     sub.add_argument("--chat", default="",
                      help="chat: go on with this chat; log, plans: only its")
     sub.add_argument("--q", default="", help="chats: only those whose title holds these words")

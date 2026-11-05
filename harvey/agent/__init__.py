@@ -13,6 +13,9 @@ the user approved.
                   their budgets
     actions.py    what it may do under an approved plan: save a set, and
                   queue the runs the pages' buttons queue, the same way
+    wakes.py      Harvey waking it under an approved plan (a job on the
+                  agent's lane) when a run finishes or at a time it chose
+    memory.py     its notes and playbooks, kept between conversations
 
 No tool sends or approves email, touches a campaign, the do-not-contact
 list, a merge or a setting, or approves a plan. The model runs on the

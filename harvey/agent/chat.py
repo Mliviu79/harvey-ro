@@ -31,6 +31,13 @@ control request) and end the process when no result follows within
 STOP_GRACE_SECONDS. A failed or stopped answer can be retried: the same
 message again in the same chat, the earlier attempt kept on file as
 ``retried`` (harvey agent log shows it; the Chat tab shows the retry).
+
+Between the user's visits Harvey may wake the agent under an approved plan
+(wakes.py: a job, never this process). A wake answers in the plan's chat,
+holding the same lease, so it waits while a process here holds it; its
+answer counts as unread until the chat is opened, and a process primed
+before a wake answer was written is given it before its next message.
+Every new process starts with the memory snapshot (memory.py).
 """
 
 from __future__ import annotations
@@ -104,7 +111,7 @@ ERRORS = ("login", "max_turns", "failed", "timeout", "stopped")
 # Why a message (or a change to a chat) is refused before anything is
 # written.
 REFUSALS = ("empty", "too_long", "codex", "budget", "busy", "elsewhere", "cli", "full",
-            "missing", "retry")
+            "missing", "retry", "waking")
 
 CODEX_REFUSED = ("The chat runs on Claude only for now: Codex needs a mode of its own to load "
                  "Harvey's tools. Set brain.provider: claude in harvey.local.yaml to use it.")
@@ -154,14 +161,21 @@ def title_of(text: str, limit: int = TITLE_CHARS) -> str:
 
 def _row(r) -> dict:
     keys = ("id", "turn", "role", "text", "status", "chat", "created_at", "updated_at",
-            "tokens", "context")
-    return dict(zip(keys, r))
+            "tokens", "context", "wake")
+    out = dict(zip(keys, r))
+    # (An answer written on a wake: why it woke, wakes.label; None for the
+    # rest.)
+    try:
+        out["wake"] = json.loads(out["wake"]) if out.get("wake") else None
+    except ValueError:
+        out["wake"] = {"label": "woken"}
+    return out
 
 
 def _chat_row(r) -> dict | None:
     if r is None:
         return None
-    return dict(zip(("id", "title", "created_at", "last_at", "turn"), r))
+    return dict(zip(("id", "title", "created_at", "last_at", "turn", "unread"), r))
 
 
 async def _one(state, name: str, args=()):
@@ -188,11 +202,26 @@ def _lease(chat_id: str) -> str:
     return LEASE_PREFIX + chat_id
 
 
+def _held_refusal(holder: dict | None, verb: str = "") -> Refused:
+    """Why a chat whose lease someone else holds can't be used now: a wake
+    is answering in it (it ends within minutes), or another Harvey
+    process has it open."""
+    from harvey.agent.wakes import OWNER_PREFIX
+
+    holder = holder or {}
+    if str(holder.get("owner") or "").startswith(OWNER_PREFIX):
+        return Refused("Harvey is answering a wake in this chat: try again in a minute",
+                       "waking")
+    return Refused(
+        f"the chat is open in another Harvey process (pid {holder.get('pid', '?')} on "
+        f"{holder.get('host') or 'this machine'}): close it there" + verb, "elsewhere")
+
+
 # ── The chats ──
 
 async def chat_info(state, chat_id: str) -> dict | None:
-    """One chat ({id, title, created_at, last_at, turn, context, hint}), or
-    None."""
+    """One chat ({id, title, created_at, last_at, turn, unread, context,
+    hint}), or None. ``unread``: its wake answers the user hasn't opened."""
     info = _chat_row(await _one(state, "overlay.agent.chat", (chat_id,)))
     if info is None:
         return None
@@ -209,11 +238,21 @@ async def _held_elsewhere(state) -> set[str]:
     return {name[len(LEASE_PREFIX):] for name, who in rows if who != owner}
 
 
+async def _waking(state) -> set[str]:
+    """The chats a wake is answering in now (its lease)."""
+    from harvey.agent.wakes import OWNER_PREFIX
+
+    rows = await _all(state, "overlay.agent.chat_leases", (time.time() - LEASE_TTL_SECONDS,))
+    return {name[len(LEASE_PREFIX):] for name, who in rows
+            if str(who or "").startswith(OWNER_PREFIX)}
+
+
 async def chats(state, q: str = "", limit: int = 50) -> list[dict]:
     """The chats, newest activity first ({id, title, created_at, last_at,
-    answering}), those whose title holds ``q`` when it is given.
-    ``answering``: an answer is being made, here or in another Harvey
-    process."""
+    unread, answering}), those whose title holds ``q`` when it is given.
+    ``answering``: an answer is being made, here, in another Harvey
+    process or by a wake; ``unread``: wake answers the user hasn't
+    opened."""
     limit = max(1, min(int(limit or 50), 500))
     q = " ".join((q or "").split())
     if q:
@@ -231,6 +270,11 @@ async def chats(state, q: str = "", limit: int = 50) -> list[dict]:
         busy = c["id"] in answering or (bool(turn) and c["id"] in elsewhere)
         out.append({**c, "answering": busy})
     return out
+
+
+async def mark_read(state, chat_id: str) -> None:
+    """The user opened the chat: its wake answers are read."""
+    await _write(state, ("overlay.agent.chat_read", (chat_id,)))
 
 
 async def rename(state, chat_id: str, title: str) -> dict:
@@ -255,9 +299,10 @@ async def messages(state, chat: str | None, limit: int = 50, before: int | None 
     than that id), of one chat (its id) or of every chat (None); each
     turn's tool calls; the chat (chat_info); ``live``, the message being
     answered in this process, and ``busy`` (one is being answered here or
-    elsewhere; a running message nobody answers shows as stopped);
-    ``more``: older messages are on file. A retried turn is left out
-    unless ``retried`` (the log shows every attempt)."""
+    elsewhere; a running message nobody answers shows as stopped),
+    ``waking`` (a wake answers in it now); ``more``: older messages are on
+    file. A wake's answer carries ``wake`` (why it woke). A retried turn is
+    left out unless ``retried`` (the log shows every attempt)."""
     limit = max(1, min(int(limit or 50), 200))
     info = await chat_info(state, chat) if chat else None
     if chat is not None and info is None:
@@ -294,10 +339,11 @@ async def messages(state, chat: str | None, limit: int = 50, before: int | None 
                          "outcome": outcome, "at": at})
     hub = _HUBS.get(_key(state))
     live = hub.live_turn(info["id"]) if hub is not None and info is not None else ""
-    elsewhere = ""
+    elsewhere, waking = "", False
     if info is not None and info["turn"] and not live \
             and info["id"] in await _held_elsewhere(state):
         elsewhere = info["turn"]
+        waking = info["id"] in await _waking(state)
     for r in rows:
         # (Unfinished and answered by nobody: running when Harvey stopped,
         # or queued or held by the chat's earlier job-based version.)
@@ -305,7 +351,7 @@ async def messages(state, chat: str | None, limit: int = 50, before: int | None 
                 and r["turn"] not in (live, elsewhere):
             r["status"] = STOPPED
     return {"messages": rows, "calls": calls, "chat": info, "live": live,
-            "busy": bool(live or elsewhere), "more": more}
+            "busy": bool(live or elsewhere), "waking": waking, "more": more}
 
 
 # ── Priming a new process ──
@@ -341,6 +387,13 @@ def history(rows: list[dict], calls: dict, turn: str, budget: int = PRIME_TOKENS
             continue
         user = next((r for r in rows if r["turn"] == t and r["role"] == "user"), None)
         agent = next((r for r in rows if r["turn"] == t and r["role"] == "agent"), None)
+        if user is None and agent is not None and agent.get("wake") and agent["status"] == OK:
+            # (An answer Harvey wrote on a wake, with no message before it.)
+            lines = [wake_line(agent)]
+            lines += [_call_line(c) for c in calls.get(t, [])]
+            lines.append(f"Harvey: {agent['text']}")
+            exchanges.append("\n".join(lines))
+            continue
         if user is None or agent is None or user["status"] != ANSWERED or agent["status"] != OK:
             continue
         lines = [f"User: {user['text']}"]
@@ -368,9 +421,25 @@ def history(rows: list[dict], calls: dict, turn: str, budget: int = PRIME_TOKENS
     return "\n\n".join(kept)
 
 
+def wake_line(row: dict) -> str:
+    """The line before a wake's answer in the history: why Harvey woke."""
+    why = (row.get("wake") or {}).get("label") or "woken"
+    return f"(Harvey woke on its own, {why}; no message from the user)"
+
+
 async def prime(state, chat_id: str, turn: str, text: str) -> str:
-    """A new process's first message: prompts/agent.md, the chat so far
-    (history(), from Harvey's database), then the message."""
+    """A new process's first message: prompts/agent.md, the memory, the
+    chat so far (history(), from Harvey's database), then the message."""
+    parts = await opening(state, chat_id, turn)
+    parts.append("## The user's new message\n\n" + text)
+    return "\n\n".join(parts) + "\n"
+
+
+async def opening(state, chat_id: str, turn: str) -> list[str]:
+    """What every new process (a chat's, a wake's) is given first, as
+    parts: prompts/agent.md, the memory snapshot (memory.py: the notes,
+    the playbooks' names), the chat so far before ``turn``."""
+    from harvey.agent import memory
     from harvey.brain import PROMPTS_DIR
     from harvey.textio import read_user_text
 
@@ -398,10 +467,12 @@ async def prime(state, chat_id: str, turn: str, text: str) -> str:
                                                     "result": result, "outcome": outcome})
     past = history(rows, calls, turn, more=more)
     parts = [system.strip()]
+    remembered = await memory.snapshot(state)
+    if remembered:
+        parts.append(remembered)
     if past:
         parts.append("## The conversation so far\n\n" + past)
-    parts.append("## The user's new message\n\n" + text)
-    return "\n\n".join(parts) + "\n"
+    return parts
 
 
 # ── The process ──
@@ -704,8 +775,10 @@ class Hub:
         if await chat_info(self.state, chat_id) is None:
             raise Refused("no such chat", "missing")
         if chat_id in await _held_elsewhere(self.state):
-            raise Refused("the chat is open in another Harvey process: close it there first",
-                          "elsewhere")
+            from harvey.modules.worker import lease_holder
+
+            raise _held_refusal(await lease_holder(self.state, LEASE_TTL_SECONDS,
+                                                   _lease(chat_id)), " first")
         live = self._live(chat_id)
         await live.stop()
         async with live.lock:
@@ -718,6 +791,10 @@ class Hub:
                          ("overlay.agent.plans_chat_deleted", (now, now, chat_id)),
                          ("overlay.agent.delete_chat", (chat_id,)))
             self.chats.pop(chat_id, None)
+        # (Its plans' wakes still to come go with it.)
+        from harvey.agent import wakes
+
+        await wakes.cancel_chat(self.state, chat_id)
 
     async def close_all(self) -> None:
         lives = list(self.chats.values())
@@ -776,6 +853,10 @@ class Live:
         self.turns_used = 0
         self.answer: Answer | None = None
         self.last_usage: dict = {}
+        # The newest message of the chat its process has been given: a wake
+        # answer written after it (its lease lost and taken meanwhile) is
+        # put before the next message.
+        self.seen_id = 0
         self.used = time.monotonic()
         self.lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
@@ -802,11 +883,9 @@ class Live:
         async with self.hub._room:
             name = _lease(self.chat_id)
             if not await acquire_lease(self.state, self.hub.owner, LEASE_TTL_SECONDS, name):
-                holder = await lease_holder(self.state, LEASE_TTL_SECONDS, name) or {}
-                raise Refused(
-                    f"the chat is open in another Harvey process (pid {holder.get('pid', '?')} "
-                    f"on {holder.get('host') or 'this machine'}): close it there, or wait until "
-                    f"it has had no message for {IDLE_SECONDS // 60} minutes", "elsewhere")
+                raise _held_refusal(await lease_holder(self.state, LEASE_TTL_SECONDS, name),
+                                    f", or wait until it has had no message for "
+                                    f"{IDLE_SECONDS // 60} minutes")
             try:
                 await self.hub.make_room(self)
             except Refused:
@@ -922,7 +1001,10 @@ class Live:
                                               now, now, 0, 0, self.chat_id)),
                        ("overlay.agent.set_chat_turn", (turn, now, self.chat_id))]
             try:
+                missed = "" if fresh else await self._missed()
                 await _write(self.state, *writes)
+                last = await _one(self.state, "overlay.agent.chat_last_id", (self.chat_id,))
+                self.seen_id = int(last[0]) if last else 0
             except BaseException:
                 # (Nothing written: a process started for a chat that doesn't
                 # exist, or for a message that isn't on file, is closed now,
@@ -933,8 +1015,22 @@ class Live:
             answer = Answer(self.chat_id, turn)
             self.answer = answer
             await answer.emit({"type": "start", "chat": self.chat_id})
-            self._task = asyncio.ensure_future(self._answer(answer, text, brain, fresh))
+            self._task = asyncio.ensure_future(self._answer(answer, missed + text, brain, fresh))
             return answer
+
+    async def _missed(self) -> str:
+        """The wake answers written in the chat since its process was last
+        given a message, compactly, to put before the user's text ("" when
+        none)."""
+        rows = [_row(r) for r in await _all(self.state, "overlay.agent.chat_wakes_after",
+                                            (self.chat_id, self.seen_id, 20))]
+        rows = [r for r in rows if r["status"] == OK]
+        if not rows:
+            return ""
+        lines = ["## Written in this chat since your last message"]
+        for r in rows:
+            lines.append(wake_line(r) + "\nHarvey: " + " ".join(r["text"].split())[:2000])
+        return "\n\n".join(lines) + "\n\n## The user's new message\n\n"
 
     async def stop(self) -> bool:
         """Stop the answer being made (True when there was one)."""

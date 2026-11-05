@@ -744,8 +744,8 @@ statement("overlay.agent.usage",
           params=("2026-01-01 00:00:00",), bounded=True)
 # The chats' messages: the newest (of a chat, or of every chat), a turn's,
 # and the tool calls of some turns.
-_MESSAGE = ("SELECT id, turn, role, text, status, chat, created_at, updated_at, tokens, context "
-            "FROM agent_message ")
+_MESSAGE = ("SELECT id, turn, role, text, status, chat, created_at, updated_at, tokens, context, "
+            "wake FROM agent_message ")
 statement("overlay.agent.messages", _MESSAGE + "ORDER BY id DESC LIMIT ?", params=(50,))
 statement("overlay.agent.messages_before", _MESSAGE + "WHERE id < ? ORDER BY id DESC LIMIT ?",
           params=(100, 50))
@@ -784,7 +784,7 @@ statement("overlay.agent.calls_after",
 # holds some words), one, a new one, its title, the message it answers
 # now, and its removal with its messages and their tool calls (its
 # usage_events rows stay: they are the plan's accounting).
-_CHAT = "SELECT id, title, created_at, last_at, turn FROM agent_chat "
+_CHAT = "SELECT id, title, created_at, last_at, turn, unread FROM agent_chat "
 statement("overlay.agent.chats",
           _CHAT + "INDEXED BY agent_chat_recent ORDER BY last_at DESC LIMIT ?", params=(50,))
 statement("overlay.agent.chats_like",
@@ -888,3 +888,121 @@ statement("overlay.agent.set",
 statement("overlay.agent.sets_chat",
           "SELECT id, name, kind, of, n, created_at FROM agent_set INDEXED BY agent_set_chat "
           "WHERE chat = ? ORDER BY id DESC LIMIT ?", params=("c", 50))
+
+# ── What wakes the agent, and its memory (schema 34, harvey/agent/wakes.py,
+# memory.py) ──
+_EVENT = ("SELECT id, plan, kind, ref, data, due_at, created_at, seen_at, wake, cancelled_at "
+          "FROM agent_event ")
+# (Once per plan, kind and ref: a run that finishes is one event however
+# often it is seen finished.)
+statement("overlay.agent.event_add",
+          "INSERT OR IGNORE INTO agent_event (plan, kind, ref, data, due_at, created_at) "
+          "VALUES (?, ?, ?, ?, ?, ?)", params=(1, "run_done", "b@t", "{}", 1, 1))
+statement("overlay.agent.event", _EVENT + "WHERE id = ?", params=(1,))
+# A plan's events not seen yet that are due (what a wake reads), and those
+# still to come or to read (the plan card, plan_status).
+statement("overlay.agent.events_due",
+          _EVENT + "INDEXED BY agent_event_ref WHERE plan = ? AND seen_at IS NULL "
+          "AND cancelled_at IS NULL AND due_at <= ? ORDER BY id LIMIT ?", params=(1, 1, 50),
+          bounded=True)
+statement("overlay.agent.events_open",
+          _EVENT + "INDEXED BY agent_event_ref WHERE plan = ? AND seen_at IS NULL "
+          "AND cancelled_at IS NULL ORDER BY due_at, id LIMIT ?", params=(1, 50), bounded=True)
+statement("overlay.agent.due_plans",
+          "SELECT DISTINCT plan FROM agent_event INDEXED BY agent_event_open "
+          "WHERE seen_at IS NULL AND cancelled_at IS NULL AND due_at <= ?", params=(1,),
+          bounded=True)
+statement("overlay.agent.events_seen",
+          "UPDATE agent_event SET seen_at = ?, wake = ? "
+          "WHERE id IN (SELECT value FROM json_each(?)) AND seen_at IS NULL",
+          params=(1, "t", "[1, 2]"))
+statement("overlay.agent.event_cancel",
+          "UPDATE agent_event SET cancelled_at = ? WHERE id = ? AND seen_at IS NULL "
+          "AND cancelled_at IS NULL", params=(1, 1))
+statement("overlay.agent.events_cancel_plan",
+          "UPDATE agent_event INDEXED BY agent_event_ref SET cancelled_at = ? "
+          "WHERE plan = ? AND seen_at IS NULL AND cancelled_at IS NULL", params=(1, 1))
+statement("overlay.agent.scheduled_open",
+          "SELECT COUNT(*) FROM agent_event INDEXED BY agent_event_ref WHERE plan = ? "
+          "AND kind = 'scheduled' AND seen_at IS NULL AND cancelled_at IS NULL", params=(1,))
+# The plans a run belongs to, and whether all its jobs have finished.
+statement("overlay.agent.batch_plans",
+          "SELECT DISTINCT plan FROM agent_action INDEXED BY agent_action_batch "
+          "WHERE batch = ? AND outcome = 'ok' AND plan IS NOT NULL", params=("b",))
+statement("overlay.agent.batch_done",
+          "SELECT COUNT(*), COALESCE(SUM(status IN ('queued', 'running', 'paused')), 0), "
+          "MAX(finished_at) FROM jobs WHERE batch_id = ?", params=("b",))
+statement("overlay.agent.batch_statuses",
+          "SELECT status, COUNT(*) FROM jobs WHERE batch_id = ? GROUP BY status", params=("b",))
+statement("overlay.agent.plan_batches",
+          "SELECT a.batch, a.tool, b.label FROM agent_action a INDEXED BY agent_action_plan "
+          "LEFT JOIN job_batches b ON b.id = a.batch "
+          "WHERE a.plan = ? AND a.outcome = 'ok' AND a.batch IS NOT NULL ORDER BY a.id",
+          params=(1,), drives="a")
+# A plan's wake job still to finish, and how many of its wakes ran today.
+statement("overlay.agent.wake_job",
+          "SELECT id, status, not_before FROM jobs WHERE dedupe_key = ? "
+          "AND status IN ('queued', 'running', 'paused')", params=("agent_wake:1",))
+statement("overlay.agent.wakes_ran",
+          "SELECT COUNT(*) FROM jobs INDEXED BY idx_jobs_lane WHERE lane = ? "
+          "AND status IN ('done', 'failed') AND created_at >= datetime('now', '-1 day') "
+          "AND dedupe_key = ?", params=("agent", "agent_wake:1"))
+# The newest of a plan's wake jobs cancelled (by the user on the Queue page,
+# or with its plan), and the events it would have read, set aside with it.
+statement("overlay.agent.wake_cancelled_last",
+          "SELECT MAX(finished_at) FROM jobs INDEXED BY idx_jobs_lane WHERE lane = ? "
+          "AND status = 'cancelled' AND dedupe_key = ?", params=("agent", "agent_wake:1"))
+statement("overlay.agent.events_dismiss",
+          "UPDATE agent_event INDEXED BY agent_event_ref SET cancelled_at = ? "
+          "WHERE plan = ? AND seen_at IS NULL AND cancelled_at IS NULL AND created_at <= ? "
+          "AND due_at <= ?", params=(1, 1, 1, 1))
+statement("overlay.agent.wake_failed_since",
+          "SELECT COUNT(*) FROM jobs INDEXED BY idx_jobs_lane WHERE lane = ? AND status = 'failed' "
+          "AND dedupe_key = ? AND finished_at >= datetime('now', ?)",
+          params=("agent", "agent_wake:1", "-900 seconds"))
+# A wake's answer in its plan's chat (only into a chat on file), the chat's
+# wake answers the user hasn't opened, and the message the chat answers.
+statement("overlay.agent.add_wake",
+          "INSERT INTO agent_message (turn, role, text, status, chat, created_at, updated_at, "
+          "tokens, context, wake) SELECT ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ? "
+          "WHERE EXISTS (SELECT 1 FROM agent_chat WHERE id = ?)",
+          params=("t", "", "ok", "c", 1, 1, 0, 0, "{}", "c"))
+statement("overlay.agent.chat_unread_add",
+          "UPDATE agent_chat SET unread = unread + 1, last_at = ? WHERE id = ?", params=(1, "c"))
+statement("overlay.agent.chat_read",
+          "UPDATE agent_chat SET unread = 0 WHERE id = ? AND unread != 0", params=("c",))
+statement("overlay.agent.chat_take_turn",
+          "UPDATE agent_chat SET turn = ? WHERE id = ?", params=("t", "c"))
+statement("overlay.agent.chat_turn_if",
+          "UPDATE agent_chat SET turn = ? WHERE id = ? AND turn = ?", params=("", "c", "t"))
+statement("overlay.agent.chat_last_id",
+          "SELECT id FROM agent_message INDEXED BY agent_message_chat WHERE chat = ? "
+          "ORDER BY id DESC LIMIT 1", params=("c",))
+statement("overlay.agent.chat_wakes_after",
+          _MESSAGE + "INDEXED BY agent_message_chat WHERE chat = ? AND id > ? AND wake != '' "
+          "ORDER BY id LIMIT ?", params=("c", 1, 20))
+# The notes and the playbooks.
+_NOTE = "SELECT id, text, author, created_at, updated_at FROM agent_note "
+statement("overlay.agent.notes", _NOTE + "ORDER BY id")
+statement("overlay.agent.note", _NOTE + "WHERE id = ?", params=(1,))
+statement("overlay.agent.note_add",
+          "INSERT INTO agent_note (text, author, created_at, updated_at) VALUES (?, ?, ?, ?)",
+          params=("n", "agent", 1, 1))
+statement("overlay.agent.note_set",
+          "UPDATE agent_note SET text = ?, author = ?, updated_at = ? WHERE id = ?",
+          params=("n", "agent", 1, 1))
+statement("overlay.agent.note_delete", "DELETE FROM agent_note WHERE id = ?", params=(1,))
+_PLAYBOOK = "SELECT id, name, body, author, created_at, updated_at FROM agent_playbook "
+statement("overlay.agent.playbooks", _PLAYBOOK + "ORDER BY name")
+statement("overlay.agent.playbook", _PLAYBOOK + "WHERE name = ?", params=("n",))
+statement("overlay.agent.playbook_id", _PLAYBOOK + "WHERE id = ?", params=(1,))
+statement("overlay.agent.playbook_save",
+          "INSERT INTO agent_playbook (name, body, author, created_at, updated_at) "
+          "VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body, "
+          "author = excluded.author, updated_at = excluded.updated_at",
+          params=("n", "b", "agent", 1, 1))
+statement("overlay.agent.playbook_set",
+          "UPDATE agent_playbook SET name = ?, body = ?, author = ?, updated_at = ? WHERE id = ?",
+          params=("n", "b", "agent", 1, 1))
+statement("overlay.agent.playbook_delete", "DELETE FROM agent_playbook WHERE id = ?",
+          params=(1,))

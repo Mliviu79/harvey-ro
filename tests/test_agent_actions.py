@@ -741,7 +741,7 @@ const pick = name => { const i = src.indexOf('function ' + name + '('); let d = 
   for (let k = j; k < src.length; k++) { if (src[k] === '{') d++; else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1); } };
 for (const n of ['escHtml', 'icon', 'own', 'emptyState', 'chatWhen', 'renderChat', 'chatPending',
                  'chatCalls', 'chatLiveHtml', 'chatRetry', 'renderPlanCard', 'renderPlanList',
-                 'planBadge'])
+                 'planBadge', 'planWakes', 'wakeLabel'])
   vm.runInThisContext(pick(n));
 vm.runInThisContext(src.match(/const CHAT_ERRORS = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const PLAN_TONE = \{[^}]*\};/)[0]);
