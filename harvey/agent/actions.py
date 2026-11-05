@@ -619,6 +619,56 @@ class Actions:
         return {**out, "note": "the wake comes as a job at its time; the user sees it on the "
                                "plan's card and can cancel it"}
 
+    # ── Tasks (tasks.py) ──
+
+    async def assign_task(self, turn: str, plan, profile, prompt, campaign="") -> dict:
+        """A task under an approved plan of this chat (tasks.assign's
+        bounds), recorded as an action with no money held, refusals too."""
+        from harvey.agent import tasks
+
+        state = await self.state()
+        arguments = {"plan": plan, "profile": profile, "prompt": prompt, "campaign": campaign}
+        try:
+            task = await tasks.assign(state, plan, self.chat, turn, profile, prompt, campaign)
+        except tasks.Refused as e:
+            await plans.record(state, plan, self.chat, turn, "assign_task", arguments,
+                               plans.REFUSED, str(e))
+            raise readonly.Refused(str(e)) from None
+        await plans.record(state, plan, self.chat, turn, "assign_task", arguments, plans.OK,
+                           f"task {task['id']} ({task['profile']})")
+        return {"task": task["id"], "plan": task["plan"], "profile": task["profile"],
+                "status": task["status"],
+                "note": "queued as a job on the agent's lane: when it ends Harvey wakes you "
+                        "(a task_done event), and tasks() gives its result"}
+
+    async def tasks(self, plan) -> dict:
+        """A plan of this chat's tasks, with their checked results."""
+        from harvey.agent import tasks
+
+        state = await self.state()
+        try:
+            p = await plans.status(state, plan, chat=self.chat)
+        except plans.Refused as e:
+            raise readonly.Refused(str(e)) from None
+        return {"plan": p["id"], **await tasks.for_plan(state, p["id"])}
+
+    async def cancel_task(self, turn: str, plan, task) -> dict:
+        from harvey.agent import tasks
+
+        state = await self.state()
+        arguments = {"plan": plan, "task": task}
+        try:
+            plans.usable(await plans.get(state, plan), plan, self.chat)
+            done = await tasks.cancel(state, task, plan=plan, chat=self.chat,
+                                      why="cancelled by the agent")
+        except (plans.Refused, tasks.Refused) as e:
+            await plans.record(state, plan, self.chat, turn, "cancel_task", arguments,
+                               plans.REFUSED, str(e))
+            raise readonly.Refused(str(e)) from None
+        await plans.record(state, plan, self.chat, turn, "cancel_task", arguments, plans.OK,
+                           f"task {done['id']} cancelled")
+        return {"task": done["id"], "status": done["status"]}
+
     async def memory(self, verb: str, *args) -> dict:
         """The memory tools (memory.py): its refusals said as the tools'."""
         from harvey.agent import memory

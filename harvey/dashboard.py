@@ -4959,6 +4959,45 @@ async def cancel_agent_wake(event_id: int):
         return _bad(str(e), 404)
 
 
+# ── The agent's tasks (harvey/agent/tasks.py): the user sees and cancels them ──
+
+@app.get("/api/agent/tasks")
+async def get_agent_tasks(plan: int | None = None, limit: int = 20):
+    """The agent's tasks, newest first (of one plan): profile, status, the
+    checked result, the problem, tokens."""
+    from harvey.agent import tasks
+
+    state = _state()
+    await state.init_db()
+    return {"tasks": [tasks.public(t) for t in await tasks.listed(state, plan, limit)]}
+
+
+@app.get("/api/agent/tasks/{task_id}")
+async def get_agent_task(task_id: int):
+    from harvey.agent import tasks
+
+    state = _state()
+    await state.init_db()
+    found = await tasks.get(state, task_id)
+    if found is None:
+        return _bad(f"no task {task_id}", 404)
+    return {**tasks.public(found), "prompt": found["prompt"]}
+
+
+@app.post("/api/agent/tasks/{task_id}/cancel")
+async def cancel_agent_task(task_id: int):
+    """Cancel a task still queued or running (a running one is stopped)."""
+    from harvey.agent import tasks
+
+    state = _state()
+    await state.init_db()
+    try:
+        return {"success": True, "task": tasks.public(
+            await tasks.cancel(state, task_id, why="cancelled by the user"))}
+    except tasks.Refused as e:
+        return _bad(str(e), 404 if str(e).startswith("no task") else 409)
+
+
 # ── The agent's memory (harvey/agent/memory.py): the user sees and edits it ──
 
 @app.get("/api/agent/memory")

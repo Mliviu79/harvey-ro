@@ -750,11 +750,12 @@ const pick = name => { const i = src.indexOf('function ' + name + '('); let d = 
   for (let k = j; k < src.length; k++) { if (src[k] === '{') d++; else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1); } };
 for (const n of ['escHtml', 'icon', 'own', 'emptyState', 'chatWhen', 'renderChat', 'chatPending',
                  'chatCalls', 'chatLiveHtml', 'chatRetry', 'renderPlanCard', 'renderPlanList',
-                 'planBadge', 'planWakes', 'planCampaigns', 'startRequestCard', 'wakeLabel'])
+                 'planBadge', 'planWakes', 'planCampaigns', 'planTasks', 'taskLine', 'startRequestCard', 'wakeLabel'])
   vm.runInThisContext(pick(n));
 vm.runInThisContext(src.match(/const CHAT_ERRORS = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const PLAN_TONE = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const CAMPAIGN_TONE = \{[^}]*\};/)[0]);
+vm.runInThisContext(src.match(/const TASK_TONE = \{[^}]*\};/)[0]);
 global.relTime = () => 'now';
 const proposed = {id: 3, chat: 'c', turn: 't1', goal: '<b>Contacte</b>', steps: ['Estimez', '<i>Caut</i>'],
                   budget_usd: 1.5, expiry_hours: 72, status: 'proposed', runs: []};

@@ -2404,6 +2404,9 @@ def cmd_agent(args):
     if action == "plans":
         _agent_plans(args)
         return
+    if action == "tasks":
+        _agent_tasks(args)
+        return
     if action == "memory":
         _agent_memory(args)
         return
@@ -2494,6 +2497,72 @@ def _agent_memory(args) -> None:
         except memory.Refused as e:
             print(f"\n  {e}\n")
             raise SystemExit(1)
+
+    asyncio.run(main())
+
+
+def _agent_tasks(args) -> None:
+    """harvey agent tasks: the tasks the agent handed to a child (--plan:
+    one plan's); show ID (its prompt and checked result), cancel ID (a
+    queued or running one; a running one is stopped)."""
+    import json
+    import time
+
+    from harvey.agent import tasks
+    from harvey.state import StateManager
+
+    verb = args.target or "list"
+    task_id = args.text[0] if args.text else ""
+    if verb not in ("list", "show", "cancel"):
+        print("\n  harvey agent tasks [--plan ID] lists them; tasks show|cancel ID\n")
+        raise SystemExit(2)
+    if verb != "list" and not task_id:
+        print(f"\n  Say which task: harvey agent tasks {verb} ID (harvey agent tasks lists "
+              "them)\n")
+        raise SystemExit(2)
+
+    def line(x: dict) -> str:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(x["created_at"] or 0))
+        return (f"  {x['id']:>4}  plan {x['plan']:<4} {x['status']:<9}  {when}  {x['profile']}"
+                + (f" ({x['campaign']})" if x["campaign"] else "")
+                + (f"  {x['tokens']:,} tokens" if x["tokens"] else "")
+                + (f"  {tasks.summary(x)}" if tasks.summary(x) else ""))
+
+    async def main():
+        state = StateManager()
+        await state.init_db()
+        if verb == "list":
+            found = await tasks.listed(state, args.plan or None, limit=args.limit)
+            if not found:
+                print("\n  No tasks yet: the agent assigns one under an approved plan.\n")
+                return
+            print()
+            for x in found:
+                print(line(x))
+            print()
+            return
+        if verb == "cancel":
+            try:
+                x = await tasks.cancel(state, task_id, why="cancelled by the user")
+            except tasks.Refused as e:
+                print(f"\n  {e}\n")
+                raise SystemExit(1)
+            print(f"\n  Task {x['id']} is {x['status']}.\n")
+            return
+        found = await tasks.get(state, task_id)
+        if found is None:
+            print(f"\n  No task {task_id}: harvey agent tasks lists them.\n")
+            raise SystemExit(2)
+        x = (await tasks.listed(state, found["plan"], limit=200))
+        x = next((t for t in x if t["id"] == found["id"]), found)
+        print("\n" + line(x))
+        print("        prompt: " + x["prompt"])
+        if x["problem"]:
+            print("        problem: " + x["problem"])
+        if x["result"] is not None:
+            print("        result:\n          " + json.dumps(x["result"], ensure_ascii=False,
+                                                         indent=2).replace("\n", "\n          "))
+        print()
 
     asyncio.run(main())
 
@@ -4353,8 +4422,8 @@ def main():
     sub.set_defaults(func=cmd_jobs)
 
     sub = subparsers.add_parser(
-        "agent", help="The chats with Harvey's agent, its plans and its memory: chats, chat, "
-                      "ask, rename, delete, log, plans, memory",
+        "agent", help="The chats with Harvey's agent, its plans, tasks and memory: chats, "
+                      "chat, ask, rename, delete, log, plans, tasks, memory",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
                     "tools and runs on your Claude plan (within "
                     "usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
@@ -4364,23 +4433,27 @@ def main():
                     "until you delete them (the dashboard's Chat tab lists the same ones). The "
                     "answer is printed as it is written; Ctrl-C stops it.")
     sub.add_argument("agent_action", choices=("chats", "chat", "ask", "rename", "delete", "log",
-                                              "plans", "memory"),
+                                              "plans", "tasks", "memory"),
                      help="chats: the list (--q searches the titles); chat: a conversation in "
                           "the terminal (a new chat, or --chat ID goes on with one); ask TEXT: "
                           "one question, in a chat of its own; rename ID TITLE; delete ID; "
                           "log: the messages (--chat ID: one chat's); plans: the agent's plans "
                           "(--chat ID: one chat's), plans show|approve|reject|cancel|close ID; "
+                          "tasks: the tasks it handed on (--plan ID: one plan's), tasks "
+                          "show|cancel ID; "
                           "memory: the agent's notes, memory add TEXT|edit ID TEXT|forget ID|"
                           "playbooks|playbook NAME|delete-playbook NAME")
     sub.add_argument("target", nargs="?", default="",
                      help="rename, delete: the chat's id (ask: the question's first word); "
-                          "plans: show, approve, reject, cancel or close; memory: notes, add, "
+                          "plans: show, approve, reject, cancel or close; tasks: show or "
+                          "cancel; memory: notes, add, "
                           "edit, forget, playbooks, playbook or delete-playbook")
     sub.add_argument("text", nargs="*", help="ask: the message; rename: the title; plans: the "
-                                             "plan's id; memory: the note, its id, a playbook's "
-                                             "name")
+                                             "plan's id; tasks: the task's id; memory: the "
+                                             "note, its id, a playbook's name")
     sub.add_argument("--chat", default="",
                      help="chat: go on with this chat; log, plans: only its")
+    sub.add_argument("--plan", type=int, default=None, help="tasks: only this plan's")
     sub.add_argument("--q", default="", help="chats: only those whose title holds these words")
     sub.add_argument("--yes", action="store_true",
                      help="delete, plans cancel: without asking first")

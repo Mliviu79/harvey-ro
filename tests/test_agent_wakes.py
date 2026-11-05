@@ -836,11 +836,12 @@ const pick = name => { const i = src.indexOf('function ' + name + '('); let d = 
   for (let k = j; k < src.length; k++) { if (src[k] === '{') d++; else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1); } };
 for (const n of ['escHtml', 'icon', 'own', 'emptyState', 'chatWhen', 'renderChat', 'chatPending',
                  'chatCalls', 'chatLiveHtml', 'chatRetry', 'renderChatList', 'wakeLabel',
-                 'renderPlanCard', 'planBadge', 'planWakes', 'planCampaigns', 'startRequestCard', 'renderMemory'])
+                 'renderPlanCard', 'planBadge', 'planWakes', 'planCampaigns', 'planTasks', 'taskLine', 'startRequestCard', 'renderMemory'])
   vm.runInThisContext(pick(n));
 vm.runInThisContext(src.match(/const CHAT_ERRORS = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const PLAN_TONE = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const CAMPAIGN_TONE = \{[^}]*\};/)[0]);
+vm.runInThisContext(src.match(/const TASK_TONE = \{[^}]*\};/)[0]);
 global.relTime = () => 'now';
 global.fmtUsd = (n, d) => '$' + Number(n).toFixed(d);
 global.fmtN = n => String(n);

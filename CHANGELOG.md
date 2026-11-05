@@ -9,6 +9,25 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The agent hands work on to tasks.** Under an approved plan the agent
+  can `assign_task(plan, profile, prompt)`: a child run as an `agent_task`
+  job on the agent's lane, with one profile's tools only (`researcher`:
+  the schema, counts, estimates, areas, phrases and their yield, to propose
+  areas, phrases, sources and an estimate; `campaign_driver`: the writing
+  rules and one draft of the plan to check and fix with `edit_campaign`),
+  no chat history, the memory to read, 8 turns and 5 minutes. A child never
+  gets a tool that spends, queues a run, sends, schedules, plans, delegates
+  or writes the memory: its tool server registers only its profile's
+  tools and checks each call again. Its answer is one JSON object checked
+  against the profile's output: done, or invalid with the answer kept
+  (masked). Either way Harvey wakes the plan (`task_done`) and the agent
+  reads it with `tasks()`. At most 2 a plan queued or running, 6 a day;
+  closing the plan or deleting its chat cancels them, and a task that
+  ends after its plan closed keeps nothing and wakes nothing. Tokens go to the
+  usage log as `task.<profile>` and show on the plan card, which lists the
+  tasks with **Cancel**; `harvey agent tasks [--plan ID]`, `tasks show|cancel
+  ID`. Schema 36 (`agent_task`).
+
 - **Areas and search phrases.** A place is now searched by its own size: its
   circle holds the box Nominatim gives it (kept with the point, cached for
   good; a place cached before is asked once more), instead of a fixed 40 km

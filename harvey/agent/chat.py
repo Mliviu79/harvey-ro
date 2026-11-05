@@ -356,14 +356,15 @@ async def messages(state, chat: str | None, limit: int = 50, before: int | None 
 
 # ── Priming a new process ──
 
-def mcp_config(db_path: str, chat: str) -> dict:
+def mcp_config(db_path: str, chat: str, task: int | None = None) -> dict:
     """The MCP config naming Harvey's own server for one chat: this Python,
-    the server module, the database and the chat."""
+    the server module, the database and the chat (``task``: a task of the
+    chat's, whose profile's tools are all the server offers, tasks.py)."""
     package_root = str(Path(__file__).resolve().parents[2])
     return {"mcpServers": {"harvey": {
         "type": "stdio", "command": sys.executable,
         "args": ["-m", "harvey.agent.tools", "--db", str(Path(db_path).resolve()),
-                 "--chat", chat],
+                 "--chat", chat] + ([] if task is None else ["--task", str(int(task))]),
         "env": {"PYTHONPATH": package_root, "PYTHONIOENCODING": "utf-8"}}}}
 
 
@@ -767,8 +768,8 @@ class Hub:
 
     async def delete(self, chat_id: str) -> None:
         """Delete a chat: its answer stopped and its process closed, then
-        its messages and their tool calls (usage_events stay: the plan's
-        accounting). Its open plans close (a proposed one rejected, an
+        its messages and their tool calls, and its tasks' tool calls
+        (usage_events stay: the plan's accounting). Its open plans close (a proposed one rejected, an
         approved one done: its runs finish under their caps; the plans and
         their actions stay on file). Refused while another Harvey process
         serves it."""
@@ -787,6 +788,7 @@ class Hub:
             await live.close()
             now = int(time.time())
             await _write(self.state, ("overlay.agent.delete_chat_calls", (chat_id,)),
+                         ("overlay.agent.delete_chat_task_calls", (chat_id,)),
                          ("overlay.agent.delete_chat_messages", (chat_id,)),
                          ("overlay.agent.plans_chat_deleted", (now, now, chat_id)),
                          ("overlay.agent.delete_chat", (chat_id,)))

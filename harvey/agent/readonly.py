@@ -72,6 +72,7 @@ EXCLUDED_TABLES = {
     "agent_playbook": "the agent's own playbooks: playbooks() and read_playbook() read them",
     "agent_campaign": "the plans the agent's campaigns belong to: campaigns() and "
                       "campaign_status() say",
+    "agent_task": "the tasks the agent assigned: tasks() reads them",
     "register_set": "compressed bitmaps, not data",
     "local_fts": "the full-text index of local firms",
     "sqlite_master": "the schema: schema() describes it",

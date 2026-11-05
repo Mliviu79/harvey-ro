@@ -356,12 +356,15 @@ async def cancel_event(state, event_id) -> dict:
 
 async def cancel_plan(state, plan_id, *, running: bool = True) -> int:
     """A plan closed (done, cancelled, its chat deleted): its events not
-    read are dropped and its wake job cancelled, a waiting one at once, a
-    running one asked to stop (its CLI is ended within STOP_POLL_SECONDS
-    and nothing it wrote goes into the chat). ``running`` False leaves a
+    read are dropped, its tasks cancelled (tasks.cancel_plan) and its wake
+    job cancelled, a waiting one at once, a running one asked to stop (its
+    CLI is ended within STOP_POLL_SECONDS and nothing it wrote goes into
+    the chat). ``running`` False leaves a
     running wake to finish: the agent closing its own plan from that wake
     still gets its last answer into the chat. How many events."""
     from harvey.modules import jobs
+
+    from harvey.agent import tasks
 
     n = await _write(state, "overlay.agent.events_cancel_plan", (_now(), int(plan_id)))
     row = await _one(state, "overlay.agent.wake_job", (dedupe(plan_id),))
@@ -370,6 +373,9 @@ async def cancel_plan(state, plan_id, *, running: bool = True) -> int:
             await jobs.cancel(state, row[0])
         except jobs.Refused:
             pass
+    # (Its tasks too, a running one stopped: no more work is done under
+    # the plan.)
+    await tasks.cancel_plan(state, plan_id)
     return n
 
 
@@ -564,19 +570,7 @@ async def run(ctx) -> dict:
     answered = payload is not None and not payload.get("is_error") and bool(response) \
         and not ended
     if not answered:
-        lowered = (response + " " + err).lower()
-        if any(p in lowered for p in chat._LOGIN_PATTERNS):
-            raise jobs.LaneExhausted("Claude isn't logged in: run claude login, then resume "
-                                     "the agent's lane on the Queue page")
-        if any(p in lowered for p in _QUOTA_PATTERNS):
-            why = "your Claude plan's limit is reached for now: the wakes wait"
-            await hold(state, why, QUOTA_RETRY_SECONDS)
-            raise jobs.LaneExhausted(why, retry_after=QUOTA_RETRY_SECONDS)
-        if not (ended == "max_turns" or (payload or {}).get("subtype") == "error_max_turns"):
-            detail = (f"no answer after {TIMEOUT_SECONDS} s" if ended == "timeout"
-                      else response[:300] if payload is not None
-                      else f"the Claude CLI ended (exit {exit_code}): {err[:300]}")
-            raise jobs.JobError(f"the wake got no answer: {detail}".strip())
+        await no_answer(state, payload, response, err, ended, exit_code)
     await state.delete_setting(HOLD_KEY)
     why_woke = label(events)
     quiet = answered and silent(response)
@@ -603,6 +597,35 @@ async def run(ctx) -> dict:
             "silent": quiet, "turns": turns, "tokens": tokens, "label": why_woke["label"]}
 
 
+def turn_limit(payload, ended: str) -> bool:
+    """Whether a run with no answer ended at its turn limit."""
+    return ended == "max_turns" or (payload or {}).get("subtype") == "error_max_turns"
+
+
+async def no_answer(state, payload, response: str, err: str, ended: str, exit_code, *,
+                    what: str = "wake", timeout: int = TIMEOUT_SECONDS) -> None:
+    """A run of the agent's lane (a wake, a task) that got no answer: a
+    logged-out CLI pauses the lane, a spent quota rests it, anything else
+    but the turn limit fails the job (its detail is Harvey's own words, a
+    tail of the CLI's for the Queue page). Returns at the turn limit."""
+    from harvey.agent import chat
+    from harvey.modules import jobs
+
+    lowered = (response + " " + err).lower()
+    if any(p in lowered for p in chat._LOGIN_PATTERNS):
+        raise jobs.LaneExhausted("Claude isn't logged in: run claude login, then resume "
+                                 "the agent's lane on the Queue page")
+    if any(p in lowered for p in _QUOTA_PATTERNS):
+        why = f"your Claude plan's limit is reached for now: the {what}s wait"
+        await hold(state, why, QUOTA_RETRY_SECONDS)
+        raise jobs.LaneExhausted(why, retry_after=QUOTA_RETRY_SECONDS)
+    if not turn_limit(payload, ended):
+        detail = (f"no answer after {timeout} s" if ended == "timeout"
+                  else response[:300] if payload is not None
+                  else f"the Claude CLI ended (exit {exit_code}): {err[:300]}")
+        raise jobs.JobError(f"the {what} got no answer: {detail}".strip())
+
+
 async def _keep(state, owner: str, lease: str) -> None:
     """Renew the wake's chat lease while it runs."""
     from harvey.agent import chat
@@ -617,22 +640,27 @@ async def _keep(state, owner: str, lease: str) -> None:
 
 
 async def _ask(state, exe: str, chat_id: str, content: str, model: str,
-               calling: dict | None = None, stop=None):
+               calling: dict | None = None, stop=None, *, task: int | None = None,
+               max_turns: int | None = None, timeout: float = TIMEOUT_SECONDS):
     """One message to a new CLI process and its answer: (the result or
     None, turns, the last model call's usage, how it ended early or "",
-    stderr's tail, the exit code). At most chat.MAX_TURNS turns, counted
-    here; past them, or TIMEOUT_SECONDS, the CLI is interrupted.
-    ``calling`` is told when the process started and its turns so far.
-    ``stop()`` (the job's stop_reason) is asked every STOP_POLL_SECONDS:
-    when it says to stop, the CLI is ended at once and it ends "stopped"."""
+    stderr's tail, the exit code). At most ``max_turns`` turns
+    (chat.MAX_TURNS by default), counted here; past them, or ``timeout``
+    seconds, the CLI is interrupted. ``task``: the MCP server serves that
+    task's tools only (tasks.py). ``calling`` is told when the process
+    started and its turns so far. ``stop()`` (the job's stop_reason) is
+    asked every STOP_POLL_SECONDS: when it says to stop, the CLI is ended
+    at once and it ends "stopped"."""
     calling = {} if calling is None else calling
     from harvey import claude_runtime
     from harvey.agent import chat
 
+    max_turns = chat.MAX_TURNS if max_turns is None else int(max_turns)
     folder = tempfile.mkdtemp(prefix="harvey-agent-mcp-")
     cwd = str(Path(tempfile.mkdtemp(prefix="harvey-claude-")).resolve())
     config_path = Path(folder) / "mcp.json"
-    config_path.write_text(json.dumps(chat.mcp_config(state.db_path, chat_id)), encoding="utf-8")
+    config_path.write_text(json.dumps(chat.mcp_config(state.db_path, chat_id, task=task)),
+                           encoding="utf-8")
     cmd = claude_runtime.build_agent_command(exe, str(config_path), max_turns=chat.PROCESS_TURNS,
                                              model=model)
     try:
@@ -645,7 +673,7 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
         raise jobs.LaneExhausted(f"the Claude CLI couldn't be started: {e}") from None
     calling["started"] = True
     turns, ids, usage, ended, result = 0, set(), None, "", None
-    deadline = time.monotonic() + TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout
     # (Asked on a clock, not only when the stream goes quiet: a wake that
     # streams without a pause is stopped all the same.)
     poll_at = time.monotonic() + STOP_POLL_SECONDS
@@ -693,7 +721,7 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                     calling["turns"] = turns
                     if mid:
                         ids.add(mid)
-            elif kind == "user" and turns >= chat.MAX_TURNS:
+            elif kind == "user" and turns >= max_turns:
                 ended = "max_turns"
                 result = await _interrupted(proc)
                 break
@@ -728,9 +756,11 @@ async def _interrupted(proc) -> dict | None:
     return None
 
 
-async def _record(state, brain, payload, turns: int, started: float, turn: str) -> int:
-    """The wake's usage in usage_events (agent ``agent``, task ``wake``):
-    its tokens, 0 when it ended with no result (still counted as a call)."""
+async def _record(state, brain, payload, turns: int, started: float, turn: str,
+                  task: str = "wake") -> int:
+    """The run's usage in usage_events (agent ``agent``, task ``task``: a
+    wake's, or ``task.<profile>`` for a task's): its tokens, 0 when it
+    ended with no result (still counted as a call)."""
     from harvey.agent import chat
 
     ms = int((time.monotonic() - started) * 1000)
@@ -738,7 +768,7 @@ async def _record(state, brain, payload, turns: int, started: float, turn: str) 
         await state.increment_usage()
         if payload is None:
             await brain._record_usage({"usage": {}, "num_turns": turns, "is_error": True,
-                                       "duration_ms": ms}, agent="agent", task="wake", label=turn)
+                                       "duration_ms": ms}, agent="agent", task=task, label=turn)
             return 0
         model_usage = payload.get("modelUsage") if isinstance(payload.get("modelUsage"),
                                                               dict) else {}
@@ -746,8 +776,8 @@ async def _record(state, brain, payload, turns: int, started: float, turn: str) 
                                    "num_turns": turns, "duration_ms": ms,
                                    "session_id": payload.get("session_id") or "",
                                    "is_error": bool(payload.get("is_error"))},
-                                  agent="agent", task="wake", label=turn)
+                                  agent="agent", task=task, label=turn)
         return chat._tokens(model_usage)
     except Exception as e:
-        logger.warning("a wake's usage not recorded: %s", e)
+        logger.warning("the agent's usage (%s) not recorded: %s", task, e)
         return 0

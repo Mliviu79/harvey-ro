@@ -7337,6 +7337,7 @@ function renderPlanCard(p) {
       escHtml(t('chat.plan.reject')) + '</button></div>';
   }
   html += planCampaigns(p.campaigns);
+  html += planTasks(p);
   if (p.status === 'approved') {
     html += planWakes(p.wakes);
     html += '<div class="btn-row"><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'cancel\')">' +
@@ -7392,6 +7393,43 @@ async function openCampaignStart(id) {
   await editCampaign(id);
   const el = document.getElementById('campaign-wizard');
   if (el) el.scrollIntoView({block: 'start'});
+}
+
+// The tasks the agent handed to a child under a plan: a line each (its
+// profile, status and a short result line), Cancel while one is queued or
+// running, and the tokens they used together.
+const TASK_TONE = {queued: 'waiting', running: 'active', done: 'good', invalid: 'note', failed: 'bad',
+                   cancelled: 'idle'};
+
+function planTasks(p) {
+  const list = p.tasks || [];
+  if (!list.length) return '';
+  return '<div class="plan-tasks"><div class="muted small">' + escHtml(t('chat.task.title')) +
+    (p.task_tokens ? ' · ' + escHtml(t('chat.task.tokens', {n: p.task_tokens})) : '') + '</div><ul>' + list.map(x =>
+    '<li><b>' + escHtml(t('chat.task.profile.' + x.profile)) + '</b> #' + escHtml(String(x.task)) +
+      (x.campaign ? ' <span class="muted small">' + escHtml(x.campaign) + '</span>' : '') +
+      ' <span class="badge t-' + escHtml(TASK_TONE[x.status] || 'idle') + '">' + escHtml(t('chat.task.st.' + x.status)) + '</span>' +
+      (taskLine(x) ? ' <span class="muted small task-line">' + escHtml(taskLine(x)) + '</span>' : '') +
+      (x.status === 'queued' || x.status === 'running'
+        ? ' <button type="button" class="btn btn-ghost btn-sm" data-task="' + escHtml(String(x.task)) + '" onclick="cancelTask(this.dataset.task)">' +
+          escHtml(t('chat.task.cancel')) + '</button>' : '') + '</li>').join('') + '</ul></div>';
+}
+
+// A task's result in counts, in the page's words (a problem as Harvey wrote it).
+function taskLine(x) {
+  const c = x.counts || {};
+  if (x.profile === 'researcher' && 'areas' in c) return t('chat.task.found', {areas: c.areas, phrases: c.phrases, sources: c.sources});
+  if ('edits' in c) return (c.ok ? t('chat.task.check_ok') : t('chat.task.check_problems', {n: c.problems})) + ' · ' +
+    t('chat.task.edits', {edits: c.edits, todo: c.to_do});
+  // (A cancelled one's badge says it all; an invalid or failed one's problem
+  // is Harvey's own diagnostic.)
+  return x.status === 'cancelled' ? '' : (x.problem || '');
+}
+
+async function cancelTask(id) {
+  const r = await api('/api/agent/tasks/' + encodeURIComponent(id) + '/cancel', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: '{}'});
+  planDone(r, 'chat.task.cancelled');
 }
 
 // An approved plan's wakes to come: each scheduled one with its time, its
@@ -7570,7 +7608,7 @@ function wakeLabel(w) {
   if (runs.length) parts.push(t('chat.wake.run', {run: runs.slice(0, 3).join(', ')}));
   if (kinds.indexOf('scheduled') >= 0) parts.push(t('chat.wake.scheduled'));
   kinds.filter(k => k !== 'run_done' && k !== 'scheduled')
-    .forEach(k => parts.push(['members', 'reply', 'campaign'].includes(k) ? t('chat.wake.kind.' + k)
+    .forEach(k => parts.push(['members', 'reply', 'campaign', 'task_done'].includes(k) ? t('chat.wake.kind.' + k)
       : t('chat.wake.event', {kind: String(k).replace(/_/g, ' ')})));
   return parts.join('; ') || t('chat.wake.woken');
 }

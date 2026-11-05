@@ -215,8 +215,9 @@ async def status(state, plan_id, chat: str | None = None) -> dict:
 async def for_chat(state, chat: str) -> list[dict]:
     """A chat's plans, oldest first, each with its money and runs (the Chat
     tab's cards), its campaigns (outreach.for_plan: their counts, a start
-    asked for) and an approved one's wakes to come (wakes.pending)."""
-    from harvey.agent import outreach, wakes
+    asked for), its tasks (tasks.for_plan: each with its result line, and
+    their tokens) and an approved one's wakes to come (wakes.pending)."""
+    from harvey.agent import outreach, tasks, wakes
 
     out = []
     for plan in reversed(await listed(state, chat, limit=100)):
@@ -227,6 +228,8 @@ async def for_chat(state, chat: str) -> list[dict]:
             p["wakes"] = await wakes.pending(state, plan["id"])
         if plan["status"] not in (PROPOSED, REJECTED):
             p["campaigns"] = await outreach.for_plan(state, plan["id"])
+            found = await tasks.for_plan(state, plan["id"])
+            p["tasks"], p["task_tokens"] = found["tasks"], found["tokens"]
         out.append(p)
     return out
 

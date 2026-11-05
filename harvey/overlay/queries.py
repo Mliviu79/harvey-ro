@@ -1111,3 +1111,61 @@ statement("overlay.agent.campaign_intents",
                                   "agent asks: one row a conversation"})
 statement("overlay.agent.campaign_plans", "SELECT campaign, plan FROM agent_campaign",
           scans={"agent_campaign": "the campaigns the agent made: a handful"})
+
+# ── The tasks the agent hands to a child under a plan (schema 36,
+# harvey/agent/tasks.py) ──
+_TASK = ("SELECT id, plan, chat, parent_turn, turn, profile, campaign, prompt, output, status, "
+         "attempts, result_json, problem, created_at, started_at, finished_at, tokens, job "
+         "FROM agent_task ")
+statement("overlay.agent.task_add",
+          "INSERT INTO agent_task (plan, chat, parent_turn, turn, profile, campaign, prompt, "
+          "output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          params=(1, "c", "t", "u", "researcher", "", "p", "researcher", 1))
+statement("overlay.agent.task", _TASK + "WHERE id = ?", params=(1,))
+statement("overlay.agent.tasks_plan",
+          _TASK + "INDEXED BY agent_task_plan WHERE plan = ? ORDER BY id DESC LIMIT ?",
+          params=(1, 20))
+statement("overlay.agent.tasks", _TASK + "ORDER BY id DESC LIMIT ?", params=(20,))
+# A plan's tasks still to finish, and those assigned since a time (the
+# caps assign_task holds).
+statement("overlay.agent.tasks_open",
+          "SELECT COUNT(*) FROM agent_task INDEXED BY agent_task_plan WHERE plan = ? "
+          "AND status IN ('queued', 'running')", params=(1,))
+statement("overlay.agent.tasks_since",
+          "SELECT COUNT(*) FROM agent_task INDEXED BY agent_task_plan WHERE plan = ? "
+          "AND created_at >= ?", params=(1, 1))
+statement("overlay.agent.task_job", "UPDATE agent_task SET job = ? WHERE id = ?",
+          params=("j", 1))
+statement("overlay.agent.task_start",
+          "UPDATE agent_task SET status = 'running', attempts = attempts + 1, started_at = ? "
+          "WHERE id = ? AND status IN ('queued', 'running')", params=(1, 1))
+# How a task ended (only one still to finish: a cancelled one stays so).
+statement("overlay.agent.task_finish",
+          "UPDATE agent_task SET status = ?, result_json = ?, problem = ?, finished_at = ?, "
+          "tokens = tokens + ? WHERE id = ? AND status IN ('queued', 'running')",
+          params=("done", "{}", "", 1, 0, 1))
+# How a task ended with a result (done, invalid, failed): only while its
+# plan is approved and not past its time; a task whose plan closed keeps
+# nothing of its answer.
+statement("overlay.agent.task_finish_open",
+          "UPDATE agent_task SET status = ?, result_json = ?, problem = ?, finished_at = ?, "
+          "tokens = tokens + ? WHERE id = ? AND status IN ('queued', 'running') AND EXISTS "
+          "(SELECT 1 FROM agent_plan WHERE agent_plan.id = agent_task.plan "
+          "AND agent_plan.status = 'approved' AND agent_plan.expires_at > ?)",
+          params=("done", "{}", "", 1, 0, 1, 1))
+statement("overlay.agent.task_tokens",
+          "UPDATE agent_task SET tokens = tokens + ? WHERE id = ?", params=(0, 1))
+statement("overlay.agent.task_cancel",
+          "UPDATE agent_task SET status = 'cancelled', problem = ?, finished_at = ? "
+          "WHERE id = ? AND status IN ('queued', 'running')", params=("", 1, 1))
+statement("overlay.agent.tasks_open_plan",
+          "SELECT id, job FROM agent_task INDEXED BY agent_task_plan WHERE plan = ? "
+          "AND status IN ('queued', 'running')", params=(1,))
+# A deleted chat's tasks' tool calls (the chat's own go by its messages).
+statement("overlay.agent.delete_chat_task_calls",
+          "DELETE FROM agent_tool_call INDEXED BY agent_tool_call_turn WHERE turn IN "
+          "(SELECT turn FROM agent_task INDEXED BY agent_task_chat WHERE chat = ?)",
+          params=("c",))
+statement("overlay.agent.task_requeue",
+          "UPDATE agent_task SET status = 'queued' WHERE id = ? AND status = 'running'",
+          params=(1,))

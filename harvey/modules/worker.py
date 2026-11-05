@@ -590,17 +590,21 @@ async def _first(*events: asyncio.Event) -> None:
 async def _after_job(state, job: jobs.Job) -> None:
     """A job ended: when it finished its run, the plans that run is of get
     their event (harvey/agent/wakes.py); a wake that finished lets the
-    plan's next one be queued for what came meanwhile."""
+    plan's next one be queued for what came meanwhile; a task whose job
+    ended without ending it (harvey/agent/tasks.py) ends with it."""
     try:
         now = await jobs.get(state, job.id)
         if now is None or now.status not in jobs.FINISHED:
             return
-        from harvey.agent import wakes
+        from harvey.agent import tasks, wakes
 
         if job.batch_id:
             await wakes.run_finished(state, job.batch_id)
         if job.kind == wakes.WAKE_KIND and job.params.get("plan"):
             await wakes.enqueue(state, job.params["plan"])
+        if job.kind == tasks.TASK_KIND:
+            # (A task whose run failed ends failed, and tells its plan.)
+            await tasks.job_ended(state, now)
     except Exception as e:
         logger.warning("worker: the agent's wakes after job %s: %s", job.id, e)
 

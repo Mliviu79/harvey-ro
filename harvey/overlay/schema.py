@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 35).
+"""The overlay's tables (harvey.db schema 36).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 35
+LATEST = 36
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1060,10 +1060,43 @@ def _to_35(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_35)
 
 
+# ── Schema 36: the tasks Harvey's agent hands to a child under a plan ──
+
+SCHEMA_36 = """
+-- A task the agent assigned under a plan (harvey/agent/tasks.py): a child
+-- run with one profile's tools only (researcher, campaign_driver), no chat
+-- history, its prompt masked, its answer one JSON object checked against
+-- the profile's output (output: its name). parent_turn: the message the
+-- agent was answering when it assigned it; turn: the child's own, its tool
+-- calls' (agent_tool_call.turn). campaign: the one a campaign_driver works
+-- on. status queued, running, done (result_json valid), invalid (the
+-- answer kept, masked, with the problem), failed, cancelled; job: its
+-- agent_task job.
+CREATE TABLE agent_task (
+  id INTEGER PRIMARY KEY, plan INTEGER NOT NULL, chat TEXT NOT NULL,
+  parent_turn TEXT NOT NULL DEFAULT '', turn TEXT NOT NULL, profile TEXT NOT NULL,
+  campaign TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, output TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
+    ('queued', 'running', 'done', 'failed', 'invalid', 'cancelled')),
+  attempts INTEGER NOT NULL DEFAULT 0, result_json TEXT NOT NULL DEFAULT '',
+  problem TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, started_at INTEGER,
+  finished_at INTEGER, tokens INTEGER NOT NULL DEFAULT 0, job TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX agent_task_plan ON agent_task(plan, id);
+CREATE INDEX agent_task_chat ON agent_task(chat, id);
+"""
+
+
+def _to_36(con: sqlite3.Connection) -> None:
+    """Schema 36: agent_task. Nothing on file changes: the agent assigns
+    its first task when a plan's work is worth handing on."""
+    _script(con, SCHEMA_36)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
-         (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35))
+         (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

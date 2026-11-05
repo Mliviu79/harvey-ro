@@ -1200,6 +1200,19 @@ async def run_agent_wake(ctx) -> dict:
     return await wakes.run(ctx)
 
 
+@jobs.kind("agent_task", stoppable=True)
+async def run_agent_task(ctx) -> dict:
+    """One task of a plan's agent on the agent's lane: a one-shot Claude run
+    whose tool server serves only the task's profile's tools, its answer
+    one JSON object checked against the profile's output (tasks.run: its
+    limits, its end, the task_done event that wakes the plan). Asked to
+    stop (its plan closed, the task or the job cancelled), it ends its CLI
+    and the task is cancelled."""
+    from harvey.agent import tasks
+
+    return await tasks.run(ctx)
+
+
 # How many background finder jobs wait at most: the backlog is fed a little
 # at a time, so a person's run never queues behind a million of them.
 BACKLOG_QUEUED = 50
