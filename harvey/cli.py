@@ -2500,6 +2500,14 @@ def _agent_plans(args) -> None:
                 print(f"        run {r['batch_id'] or '(being queued)'} {r['tool']}: "
                       f"{'live' if r['live'] else 'finished'}, ${r['spent_usd']:.4f} spent, "
                       f"${r['committed_usd']:.4f} committed")
+            from harvey.agent import outreach
+
+            for c in await outreach.for_plan(state, plan["id"]):
+                print(f"        campaign {c['id']} {c['name']!r}: {c['status']}, "
+                      f"{c['members']:,} members, {c['sent']:,} sent, {c['replies']:,} replies"
+                      + (f" ({c['needs_human']:,} need you)" if c["needs_human"] else "")
+                      + ("; its start asked for: harvey campaigns show "
+                         f"{c['id']}, then start" if c.get("request") else ""))
             for a in await plans.actions(state, plan["id"], limit=20):
                 print(f"        {a['tool']}: {a['outcome']}" + (f" ({a['why']})" if a["why"] else ""))
             print()

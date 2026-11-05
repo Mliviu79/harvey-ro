@@ -449,16 +449,18 @@ def test_a_call_is_filed_under_the_message_it_started_for_and_none_without_one(d
 
 READ_TOOLS = ["schema", "counts", "query", "pipeline", "firms", "coverage", "contacts_summary",
               "campaigns", "spend", "estimate", "jobs", "plan_status", "sets", "notes",
-              "read_playbook", "playbooks"]
+              "read_playbook", "playbooks", "writing_rules", "campaign_preview",
+              "campaign_status", "replies"]
 ACTION_TOOLS = ["propose_plan", "close_plan", "save_set", "discover", "registry_pull",
                 "find_contacts", "verify_contacts", "cancel_run", "schedule_wake", "remember",
-                "forget", "save_playbook"]
+                "forget", "save_playbook", "save_audience", "create_campaign", "edit_campaign",
+                "request_start", "pause_campaign", "draft_reply", "suppress"]
 
 
 def test_the_server_offers_its_reading_tools_and_its_actions_only(db):
     """Every tool is a read, or one of the actions under a plan: none
-    approves, sends, touches a campaign, the do-not-contact list, a merge
-    or a setting, or fetches a page."""
+    approves, sends, starts or resumes a campaign, undoes a do-not-contact
+    entry, merges or changes a setting, or fetches a page."""
     from mcp import Client
 
     async def run():
@@ -470,9 +472,10 @@ def test_the_server_offers_its_reading_tools_and_its_actions_only(db):
     assert all(by[n].annotations.read_only_hint and not by[n].annotations.destructive_hint
                for n in READ_TOOLS)
     assert not any(by[n].annotations.read_only_hint for n in ACTION_TOOLS)
-    for word in ("approve", "send", "outbox", "campaign", "autopilot", "suppress", "merge",
-                 "setting", "fetch", "acknowledg"):
+    for word in ("approve", "send", "outbox", "autopilot", "unsuppress", "undo", "resume",
+                 "merge", "setting", "fetch", "acknowledg"):
         assert not any(word in n for n in ACTION_TOOLS), word
+    assert not any(n.startswith("start") for n in ACTION_TOOLS)
 
 
 def test_every_tool_answers_and_none_returns_the_planted_text(db):

@@ -209,6 +209,11 @@ AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went
 # Outbox error on the first answer since an opt-out was undone: it waits for
 # you even on autopilot (the undo panel promises it).
 REVIEW_AFTER_UNDO = "waiting for you: the first answer since you undid their opt-out"
+# Outbox error on an answer Harvey's agent asked the Handler to draft: it
+# waits for you even on autopilot (promote_for_autopilot takes no row with a
+# note), and Approve all leaves it for you to read one at a time. Your
+# autopilot is consent to Harvey's own answers, not to one the agent asked for.
+AGENT_DRAFT_HELD = "waiting for you: an answer Harvey's agent asked for"
 # Outbox error on what an undone hand send brought back: a human decides
 # again, so autopilot never approves it (promote_for_autopilot).
 RESTORED_FOR_REVIEW = "waiting for you: back after you undid a hand send"
@@ -1015,7 +1020,8 @@ class StateManager:
         undo of their address's do-not-contact entries are one write. Only
         an opt-out Harvey read in their words (opt_out, migrated: a keyword
         or the model can be wrong) is lifted here, never one you added by
-        hand. False, and nothing written, when they weren't opted out.
+        hand, and none while an entry Harvey's agent made stands (it is
+        undone on the list). False, and nothing written, when they weren't opted out.
         Raises suppression.Refused, and writes nothing, while an
         unsubscribe, objection or complaint of theirs stands: that is
         undone on the do-not-contact list, with a note saying why."""
@@ -1032,6 +1038,10 @@ class StateManager:
             raise suppression.Refused(
                 f"they asked for it themselves ({asked}): undo it on the do-not-contact list, "
                 "with a note saying why")
+        if suppression.agent_entry(con, email):
+            raise suppression.Refused(
+                "Harvey's agent put them on the do-not-contact list under a plan: undo it on "
+                "the do-not-contact list, with a note saying why")
         if con.execute("UPDATE prospects SET status = 'replied', updated_at = ? "
                        "WHERE id = ? AND status = 'opted_out'",
                        (_utcnow().isoformat(), prospect_id)).rowcount != 1:
@@ -1645,13 +1655,15 @@ class StateManager:
             else:
                 # Not the ones autopilot held for a look (possible planted
                 # links or a leak), the first answer since an opt-out was
-                # undone, nor a first email the privacy page leaves no room
-                # for its other link: those are looked at one at a time.
+                # undone, an answer Harvey's agent asked for, nor a first
+                # email the privacy page leaves no room for its other link:
+                # those are looked at one at a time.
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
                     "updated_at = ? WHERE status = 'pending_review' "
-                    "AND COALESCE(error, '') NOT LIKE ? AND COALESCE(error, '') NOT IN (?, ?)",
-                    (now, HELD_FOR_REVIEW + "%", REVIEW_AFTER_UNDO, PRIVACY_LINK_HELD),
+                    "AND COALESCE(error, '') NOT LIKE ? AND COALESCE(error, '') NOT IN (?, ?, ?)",
+                    (now, HELD_FOR_REVIEW + "%", REVIEW_AFTER_UNDO, PRIVACY_LINK_HELD,
+                     AGENT_DRAFT_HELD),
                 )
             approved = cursor.rowcount
             if approved:
@@ -2736,6 +2748,22 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def reply_thread(self, prospect_id: str, convo_id: str, campaign_id: str) -> dict:
+        """The thread an answer to this conversation goes into, as the
+        Handler's reply_meta keeps it: the newest email sent in it (an
+        answer, else the campaign's cold email to them), its subject,
+        thread and message id. {} when nothing was sent."""
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import queries
+
+        async with self._connect() as db:
+            async with db.execute(queries.sql("overlay.agent.reply_thread"),
+                                  (prospect_id, convo_id or "", campaign_id or "")) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return {}
+        return {"subject": row[0] or "", "thread_ref": row[1] or "", "message_id": row[2] or ""}
 
     async def get_campaigns_by_status(self, status: str) -> list[Campaign]:
         async with self._connect() as db:

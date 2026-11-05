@@ -16,9 +16,14 @@ the user approved.
     wakes.py      Harvey waking it under an approved plan (a job on the
                   agent's lane) when a run finishes or at a time it chose
     memory.py     its notes and playbooks, kept between conversations
+    outreach.py   campaigns under a plan: an audience and a draft made the
+                  Campaigns page's way, a start asked of the user, replies
+                  counted and answered through the Handler for review, the
+                  do-not-contact list added to, and what a campaign tells
+                  its plan
 
-No tool sends or approves email, touches a campaign, the do-not-contact
-list, a merge or a setting, or approves a plan. The model runs on the
+No tool sends or approves email, starts or resumes a campaign, undoes a
+do-not-contact entry, merges, changes a setting, or approves a plan. The model runs on the
 operator's Claude plan (claude -p), with only Harvey's tools
 (claude_runtime.build_agent_command).
 """

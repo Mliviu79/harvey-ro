@@ -78,6 +78,9 @@ QUOTA_RETRY_SECONDS = 3600
 DAY_RETRY_SECONDS = 3600
 # After a wake failed, the plan's next one waits this long.
 FAILED_RETRY_SECONDS = 900
+# How often a running wake looks whether it was asked to stop (its plan
+# cancelled or closed, the job cancelled or paused on the Queue page).
+STOP_POLL_SECONDS = 2.0
 # A finished run older than this when the sweep first sees it is left
 # alone (one that finished before wakes existed).
 SWEEP_LOOKBACK_SECONDS = 3600
@@ -86,6 +89,9 @@ OWNER_PREFIX = "wake-"
 # Why the agent's lane rests (the Queue page and Today read it).
 HOLD_KEY = "agent.wake_hold"
 _QUOTA_PATTERNS = ("usage limit", "rate limit", "limit reached", "quota")
+# The plans whose day's wakes were said to be used, and the day (the sweep
+# asks every minute: it is logged once a day).
+_CAPPED_LOGGED: dict[int, str] = {}
 
 
 class Refused(ValueError):
@@ -270,8 +276,11 @@ async def enqueue(state, plan_id) -> str | None:
     if not await due_events(state, plan["id"], limit=1):
         return None
     if await wakes_today(state, plan["id"]) >= WAKES_PER_DAY:
-        logger.info("plan %s: %s wakes today already; its events wait", plan["id"],
-                    WAKES_PER_DAY)
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _CAPPED_LOGGED.get(plan["id"]) != day:
+            _CAPPED_LOGGED[plan["id"]] = day
+            logger.info("plan %s: %s wakes today already; its events wait", plan["id"],
+                        WAKES_PER_DAY)
         return None
     failed = await _one(state, "overlay.agent.wake_failed_since",
                         (AGENT_LANE, dedupe(plan["id"]), f"-{FAILED_RETRY_SECONDS} seconds"))
@@ -345,16 +354,18 @@ async def cancel_event(state, event_id) -> dict:
     return _event(row)
 
 
-async def cancel_plan(state, plan_id) -> int:
+async def cancel_plan(state, plan_id, *, running: bool = True) -> int:
     """A plan closed (done, cancelled, its chat deleted): its events not
-    read are dropped and its waiting wake job cancelled (one running ends
-    on its own, finding the plan closed or reporting on it). How many
-    events."""
+    read are dropped and its wake job cancelled, a waiting one at once, a
+    running one asked to stop (its CLI is ended within STOP_POLL_SECONDS
+    and nothing it wrote goes into the chat). ``running`` False leaves a
+    running wake to finish: the agent closing its own plan from that wake
+    still gets its last answer into the chat. How many events."""
     from harvey.modules import jobs
 
     n = await _write(state, "overlay.agent.events_cancel_plan", (_now(), int(plan_id)))
     row = await _one(state, "overlay.agent.wake_job", (dedupe(plan_id),))
-    if row and row[1] in (jobs.QUEUED, jobs.PAUSED):
+    if row and (running or row[1] in (jobs.QUEUED, jobs.PAUSED)):
         try:
             await jobs.cancel(state, row[0])
         except jobs.Refused:
@@ -518,7 +529,8 @@ async def run(ctx) -> dict:
         content = await prime(state, plan, events, turn)
         payload, turns, usage, ended, err, exit_code = await _ask(
             state, exe, plan["chat"], content, getattr(getattr(config, "brain", None),
-                                                       "model", "") or "", calling)
+                                                       "model", "") or "", calling,
+            stop=getattr(ctx, "stop_reason", None))
     except asyncio.CancelledError:
         # (Cut off, by the worker's shutdown: its process is ended, and a
         # call it made counts all the same.)
@@ -536,6 +548,18 @@ async def run(ctx) -> dict:
         finally:
             await release_lease(state, owner, lease)
     tokens = await _record(state, brain, payload, turns, started, turn)
+    stop = getattr(ctx, "stop_reason", None)
+    if ended != "stopped" and stop is not None and await stop():
+        # (Asked to stop after its last poll, while its answer came in: it
+        # is not written either.)
+        ended = "stopped"
+    if ended == "stopped":
+        # (Its plan was cancelled or closed, or the job cancelled or paused:
+        # its CLI is ended and nothing it answered goes into the chat. The
+        # job ends as stop_reason set it; its events are the plan's to drop.)
+        await ctx.say(f"  plan {plan_id}: the wake was stopped; nothing written")
+        return {"plan": plan_id, "chat": plan["chat"], "turn": turn, "stopped": True,
+                "turns": turns, "tokens": tokens}
     response = str((payload or {}).get("result") or "").strip()
     answered = payload is not None and not payload.get("is_error") and bool(response) \
         and not ended
@@ -593,12 +617,14 @@ async def _keep(state, owner: str, lease: str) -> None:
 
 
 async def _ask(state, exe: str, chat_id: str, content: str, model: str,
-               calling: dict | None = None):
+               calling: dict | None = None, stop=None):
     """One message to a new CLI process and its answer: (the result or
     None, turns, the last model call's usage, how it ended early or "",
     stderr's tail, the exit code). At most chat.MAX_TURNS turns, counted
     here; past them, or TIMEOUT_SECONDS, the CLI is interrupted.
-    ``calling`` is told when the process started and its turns so far."""
+    ``calling`` is told when the process started and its turns so far.
+    ``stop()`` (the job's stop_reason) is asked every STOP_POLL_SECONDS:
+    when it says to stop, the CLI is ended at once and it ends "stopped"."""
     calling = {} if calling is None else calling
     from harvey import claude_runtime
     from harvey.agent import chat
@@ -620,16 +646,33 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
     calling["started"] = True
     turns, ids, usage, ended, result = 0, set(), None, "", None
     deadline = time.monotonic() + TIMEOUT_SECONDS
+    # (Asked on a clock, not only when the stream goes quiet: a wake that
+    # streams without a pause is stopped all the same.)
+    poll_at = time.monotonic() + STOP_POLL_SECONDS
+    reading = None
     try:
         await proc.send({"type": "user", "message": {"role": "user", "content": content}})
         while True:
-            try:
-                event = await asyncio.wait_for(proc.read(),
-                                               timeout=max(0.0, deadline - time.monotonic()))
-            except asyncio.TimeoutError:
+            if stop is not None and time.monotonic() >= poll_at:
+                poll_at = time.monotonic() + STOP_POLL_SECONDS
+                if await stop():
+                    ended = "stopped"
+                    break
+            left = deadline - time.monotonic()
+            if reading is None:
+                reading = asyncio.ensure_future(proc.read())
+            done, _ = await asyncio.wait({reading}, timeout=max(
+                0.0, min(left, poll_at - time.monotonic()) if stop is not None else left))
+            if not done:
+                if time.monotonic() < deadline:
+                    continue
+                reading.cancel()
+                reading = None
                 ended = "timeout"
                 result = await _interrupted(proc)
                 break
+            event = reading.result()
+            reading = None
             if event is None:
                 break
             kind = event.get("type")
@@ -658,6 +701,8 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                 result = event
                 break
     finally:
+        if reading is not None:
+            reading.cancel()
         if result is None:
             proc.kill()
         await proc.close()

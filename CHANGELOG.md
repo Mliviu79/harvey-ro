@@ -9,6 +9,49 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The agent prepares and follows campaigns; you start them.** Under an
+  approved plan (free work: no budget needed) the agent can save an
+  audience from a Contacts filter (`save_audience`: its id and what a
+  campaign would take, counted, never an address), make a draft campaign
+  through the wizard's own code (`create_campaign`: the offer, a sequence
+  written to the email frameworks in the install's language, checked as
+  the send check will check it: only the merge variables the sender fills,
+  no banned phrase, the subject, length and link limits; the
+  legitimate-interest note, at least 80 characters), edit its own drafts,
+  count what one would take (`campaign_preview`), and ask you to start it
+  (`request_start`): the plan card shows a start request with the
+  audience counted, the sequence, the note, the sending account and what
+  is still needed, and a button to the draft's Start on the Campaigns page.
+  Starting stays yours. A campaign the agent made belongs to its plan
+  (schema 35, `agent_campaign`), and tells it, as wakes with structured
+  fields only: new members (the start's snapshot, a roll), a reply (the
+  conversation's id, its intent, stage and status as Harvey's reply
+  reader set them, whether they asked to stop or it needs you, whether an
+  answer waits: never the text, the subject or the address), the campaign
+  finishing, sending paused by the bounce rate, address checks held. The
+  agent reads `campaign_status`, `campaigns` and `replies` (counts, and
+  conversation ids with their fields), has the reply reader draft an
+  answer with its short guidance (`draft_reply`: Harvey's own prompt and
+  rules; it always waits for your own approval in the Outbox, even on
+  autopilot and outside Approve all: autopilot is your consent to
+  Harvey's answers, not to one the agent asked for; refused for an opt-out, an escalation, a no, a closed
+  conversation, a reply answered already, one with an answer waiting, or
+  someone on the do-not-contact list), adds to the
+  do-not-contact list (`suppress`: a conversation's person, a contact or a
+  firm; never an undo; its entries are by hand, by the agent, so the
+  one-click Undo opt-out refuses while one stands and you lift it on the
+  do-not-contact list) and pauses a campaign of its plan
+  (`pause_campaign`; there is no resume). `writing_rules` gives it the
+  frameworks, merge variables and limits. `harvey agent plans show` lists
+  a plan's campaigns.
+- **A run's report says why companies gave nothing.** The contact
+  finder's result keeps a class for a company it found nothing for (its
+  site unreachable or behind a bot challenge, read with nothing on it,
+  waiting for a check or the classifier, not taken as the firm's, no
+  website found, no search set up or no money for it, ...), and the run's
+  report counts them (`nothing_why`, in `plan_status`, `jobs report`, and
+  `harvey jobs report`): classes only, never a page's words.
+
 - **Harvey wakes its agent to follow a plan while you are away.** When a
   run of an approved plan finishes (every job of it done, failed or
   cancelled), or at a time the agent scheduled with `schedule_wake` (at
@@ -741,6 +784,25 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Merge variables have one list.** The send check's template check and
+  the Sender read the same five (`first_name`, `last_name`, `company`,
+  `title`, `personalization`), and the Sender now fills them with any
+  spacing inside the braces (`{{ company }}`, `{{company  }}`), as the
+  check accepts them, instead of leaving one for the gate to refuse.
+- **Every agent tool says its own bounds.** Each tool's description now
+  states the limits that enforce it (a plan's 1 to 12 steps of at most 200
+  characters, its budget to the cent and 1 to 168 hours, a note's 300
+  characters, a wake's 10 minutes ahead and 12 a day, a playbook's name
+  and size, a query's sample), taken from the constants themselves, so the
+  model keeps to them instead of learning them from a refusal.
+- **Closing or cancelling a plan stops its running wake.** A wake job is
+  now stoppable: its plan closed or cancelled, or the job cancelled or
+  paused on the Queue page, ends its Claude run within two seconds and
+  nothing it answered goes into the chat (the call still counts), even
+  while it streams; the agent closing its own plan from a wake lets that
+  wake finish its report. The
+  minute's sweep logs a plan at its day's wakes once a day, not every
+  minute.
 - **Campaign address checks count against the spend limits.** The Email
   module's checks of waiting addresses follow the contact finder's rule: a
   priced request is reserved from `spend.per_day_usd` / `per_month_usd` and

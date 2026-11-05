@@ -8,9 +8,14 @@ queue): the same selection of companies or contacts, the same estimate,
 the same run caps, the same module switches, and the install's day and
 month spend limits, which jobs.reserve keeps as for any run. The plan's
 budget is a limit on top (plans.reserve: the run's caps are held from it
-before anything is queued). No action sends, approves or writes an email,
-touches a campaign, the do-not-contact list, a merge, a setting or
-anything outside its run: those are never offered as tools.
+before anything is queued).
+
+The campaign actions (outreach.py) are free: an audience saved, a draft
+campaign made or edited, a start asked of the user, a campaign paused,
+an answer drafted by the Handler and queued for review, an entry added
+to the do-not-contact list. No action sends or approves an email,
+starts or resumes a campaign, undoes a do-not-contact entry, merges, or
+changes a setting: those are never offered as tools.
 
 Actions take a filter (the Contacts and Companies pages' own) or a set the
 agent saved (agent_set: a filter, or one read-only SELECT of ids run
@@ -106,7 +111,7 @@ class Actions:
             report = await jobs.batch_report(state, run["batch_id"], keep=False)
             run["report"] = {k: report.get(k) for k in (
                 "jobs", "statuses", "seconds", "searches_usd", "checks_made", "checks_usd",
-                "lookups_usd", "classify", "total_usd")}
+                "lookups_usd", "classify", "total_usd", "nothing_why")}
             run["errors"] = await views.error_classes(state, run["batch_id"])
         out["actions"] = [{k: a[k] for k in ("id", "tool", "batch_id", "cap_usd",
                                              "classify_cap_usd", "outcome", "why", "at")}
@@ -440,6 +445,147 @@ class Actions:
                 "links", "companies", "calls", "usd_typical", "usd_high", "price_known",
                 "note")}, queue
         return await self._act(turn, "verify_contacts", arguments, plan, prepare)
+
+    # ── Campaigns (outreach.py): free, through the Campaigns page's code ──
+
+    async def _campaign_act(self, turn: str, tool: str, arguments: dict, plan, work) -> dict:
+        """One campaign action under ``plan`` (an approved plan of this
+        chat): ``work(state, config)``'s answer, recorded as an action with
+        no money held, refusals too."""
+        from harvey.agent import outreach
+        from harvey.modules.job_kinds import _config
+
+        state = await self.state()
+        try:
+            plans.usable(await plans.get(state, plan), plan, self.chat)
+            config = _config()
+            if config is None:
+                raise readonly.Refused("Harvey's settings can't be read")
+            out = await work(state, config)
+        except (outreach.Refused, plans.Refused, readonly.Refused) as e:
+            why = str(e).strip("'\"")
+            await plans.record(state, plan, self.chat, turn, tool, arguments, plans.REFUSED, why)
+            raise readonly.Refused(why) from None
+        done = ", ".join(f"{k} {out[k]}" for k in ("audience", "campaign", "conversation",
+                                                   "contact", "firm", "outbox", "status")
+                         if out.get(k) not in (None, ""))
+        await plans.record(state, plan, self.chat, turn, tool, arguments, plans.OK, done)
+        return {"plan": int(plan), **out}
+
+    async def save_audience(self, turn: str, plan, name, filter=None, set=None) -> dict:
+        """An audience by a Contacts filter, or a filter set, saved as
+        "Salvează ca public" saves it, with its preview's counts."""
+        from harvey.agent import outreach
+
+        arguments = {"plan": plan, "name": name, "filter": filter or {}, "set": set}
+
+        async def work(state, config):
+            if set not in (None, ""):
+                if filter:
+                    raise readonly.Refused("give a filter or a set, not both")
+                s = await self._set(set)
+                if s["kind"] != "filter":
+                    raise readonly.Refused("an audience is a Contacts filter: save_set with a "
+                                           "filter, not a SELECT")
+                query = s["definition"]
+            else:
+                raw = _filter_args(filter or {})
+                if not raw:
+                    raise readonly.Refused("give a filter (the Contacts page's) or a filter set")
+                _, args = await views._filter(state, raw)
+                query = urlencode(args)
+            return await outreach.save_audience(state, config, name, query)
+        return await self._campaign_act(turn, "save_audience", arguments, plan, work)
+
+    async def create_campaign(self, turn: str, plan, name, audience, offer, sequence, note,
+                              rolling: bool = False, always_review: bool = False) -> dict:
+        from harvey.agent import outreach
+
+        arguments = {"plan": plan, "name": name, "audience": audience, "offer": offer,
+                     "steps": len(sequence) if isinstance(sequence, list) else 0,
+                     "rolling": bool(rolling), "always_review": bool(always_review)}
+        return await self._campaign_act(turn, "create_campaign", arguments, plan,
+                                        lambda state, config: outreach.create(
+                                            state, config, int(plan), self.chat, name=name,
+                                            audience=audience, offer=offer, sequence=sequence,
+                                            note=note, rolling=rolling,
+                                            always_review=always_review))
+
+    async def edit_campaign(self, turn: str, plan, campaign, **fields) -> dict:
+        from harvey.agent import outreach
+
+        arguments = {"plan": plan, "campaign": campaign,
+                     "fields": sorted(k for k, v in fields.items() if v is not None)}
+        return await self._campaign_act(turn, "edit_campaign", arguments, plan,
+                                        lambda state, config: outreach.edit(
+                                            state, int(plan), self.chat, campaign, **fields))
+
+    async def request_start(self, turn: str, plan, campaign) -> dict:
+        from harvey.agent import outreach
+
+        return await self._campaign_act(turn, "request_start",
+                                        {"plan": plan, "campaign": campaign}, plan,
+                                        lambda state, config: outreach.request_start(
+                                            state, config, int(plan), self.chat, campaign))
+
+    async def pause_campaign(self, turn: str, plan, campaign) -> dict:
+        from harvey.agent import outreach
+
+        return await self._campaign_act(turn, "pause_campaign",
+                                        {"plan": plan, "campaign": campaign}, plan,
+                                        lambda state, config: outreach.pause(
+                                            state, int(plan), self.chat, campaign))
+
+    async def draft_reply(self, turn: str, plan, conversation, guidance) -> dict:
+        from harvey.agent import outreach
+
+        arguments = {"plan": plan, "conversation": conversation,
+                     "guidance": outreach.guidance_text(guidance)}
+        return await self._campaign_act(turn, "draft_reply", arguments, plan,
+                                        lambda state, config: outreach.draft_reply(
+                                            state, config, int(plan), self.chat, conversation,
+                                            guidance))
+
+    async def suppress(self, turn: str, plan, conversation=None, contact=None, firm=None,
+                       reason: str = "") -> dict:
+        from harvey.agent import outreach
+
+        arguments = {"plan": plan, "conversation": conversation, "contact": contact,
+                     "firm": firm, "reason": reason}
+        return await self._campaign_act(turn, "suppress", arguments, plan,
+                                        lambda state, config: outreach.suppress(
+                                            state, config, int(plan), self.chat,
+                                            conversation=conversation, contact=contact,
+                                            firm=firm, reason=reason))
+
+    async def campaign_read(self, verb: str, campaign=None, plan=None) -> dict:
+        """The campaign reads: preview, status, replies (of a campaign, or
+        of a plan of this chat's campaigns)."""
+        from harvey.agent import outreach
+        from harvey.modules.job_kinds import _config
+
+        state = await self.state()
+        try:
+            if verb == "preview":
+                config = _config()
+                if config is None:
+                    raise readonly.Refused("Harvey's settings can't be read")
+                return await outreach.preview(state, config, campaign)
+            if verb == "status":
+                return await outreach.status(state, campaign)
+            if verb == "replies":
+                if (campaign in (None, "")) == (plan in (None, "")):
+                    raise readonly.Refused("give a campaign or a plan, one of the two")
+                if campaign not in (None, ""):
+                    await outreach.status(state, campaign)
+                    return {"campaign": str(campaign),
+                            **await outreach.replies(state, [str(campaign)])}
+                p = await plans.status(state, plan, chat=self.chat)
+                ids = [link["campaign"] for link in await outreach.of_plan(state, p["id"])]
+                return {"plan": p["id"], "campaigns": ids, **await outreach.replies(state, ids)}
+        except (outreach.Refused, plans.Refused) as e:
+            raise readonly.Refused(str(e)) from None
+        raise ValueError(verb)
 
     # ── Wakes and memory ──
 

@@ -758,3 +758,27 @@ def test_a_twin_searched_earlier_with_nothing_found_does_not_block_her_published
     cid = run(go())
     assert ("Ioana Vrânceanu", "ioana.vranceanu@clinica-exemplu.example", "unchecked",
             "confirmed") in _addresses(db, cid)
+
+
+def test_why_a_site_gave_nothing_is_kept_as_a_class(tmp_path, no_network):
+    """An unreachable site and one answering with a bot challenge: the
+    read says which (draft.values["unread"]), and the finder's result
+    keeps the class a run's report counts, never the page's words."""
+    no_network.extra["https://shield.example"] = httpx.Response(
+        403, text=SG_CHALLENGE, headers={"content-type": "text/html"})
+    assert _read(no_network, "nowhere.example").values.get("unread") == "unreachable"
+    assert _read(no_network, "shield.example").values.get("unread") == "blocked"
+    assert not _read(no_network, EN).values.get("unread")
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        out = []
+        for name, domain in (("NOWHERE SRL", "nowhere.example"), ("SHIELD SRL", "shield.example")):
+            cid = await s.add_company(Company(name=name, domain=domain, location="Brașov",
+                                              source="registry:onrc"))
+            out.append((await finder.find(s, cid, spend=finder.Spend(), env={})).as_dict())
+        return out
+    unreachable, blocked = run(go())
+    assert (unreachable["why"], blocked["why"]) == ("unreachable", "blocked")
+    assert unreachable["contacts"] == blocked["contacts"] == 0

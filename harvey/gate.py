@@ -266,6 +266,49 @@ def pre_send_check(
     return GateResult(ok=not reasons, reasons=reasons)
 
 
+# The merge variables a template may use: the one list. Sender._render
+# fills exactly these (each from the prospect card's field of the same
+# name, MERGE_FIELDS where it differs), written {{name}} with or without
+# spaces inside the braces (MERGE_VAR_RE); template_problems refuses any
+# other.
+MERGE_VARS = ("first_name", "last_name", "company", "title", "personalization")
+MERGE_FIELDS = {"personalization": "personalization_notes"}
+MERGE_VAR_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+_TEMPLATE_TAG_RE = MERGE_VAR_RE
+
+
+def template_problems(subject: str, body: str) -> list[str]:
+    """What the gate would refuse in a sequence template before it is ever
+    rendered: a merge variable the Sender doesn't fill, a single-brace tag,
+    a banned phrase, a subject or body over the limits, more than one link,
+    HTML. Its merge variables are taken as filled. [] when none."""
+    subject, body = (subject or "").strip(), (body or "").strip()
+    text = subject + " " + body
+    reasons = []
+    unknown = sorted({m.group(1) for m in _TEMPLATE_TAG_RE.finditer(text)
+                      if m.group(1) not in MERGE_VARS})
+    if unknown:
+        reasons.append(f"unknown merge variables: {unknown[:3]} (use {', '.join(MERGE_VARS)})")
+    rest = _TEMPLATE_TAG_RE.sub("x", text)
+    if MERGE_TAG_RE.findall(rest):
+        reasons.append("a tag in single braces: merge variables are {{like_this}}")
+    lowered = text.lower()
+    hits = [p for p in BANNED_PHRASES if p in lowered]
+    if hits:
+        reasons.append(f"banned phrases: {hits[:3]}")
+    if len(subject) > MAX_SUBJECT_LEN:
+        reasons.append(f"subject too long ({len(subject)} > {MAX_SUBJECT_LEN})")
+    words = len(body.split())
+    if words > MAX_BODY_WORDS:
+        reasons.append(f"body too long ({words} words > {MAX_BODY_WORDS})")
+    links = URL_RE.findall(body)
+    if len(links) > MAX_LINKS:
+        reasons.append(f"too many links ({len(links)} > {MAX_LINKS})")
+    if re.search(r"<\s*(html|body|div|table|img|a)\b", body, re.IGNORECASE):
+        reasons.append("HTML markup in body (plain text only)")
+    return reasons
+
+
 # ── Autopilot review ──────────────────────────────────────────────────────
 #
 # Websites and the replies people send reach the model, and either can carry

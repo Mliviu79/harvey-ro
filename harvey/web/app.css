@@ -1470,6 +1470,11 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .plan-card .btn-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-1); }
 .plan-wakes ul { margin: 2px 0 0; padding-left: var(--sp-4); font-size: var(--fs-caption); }
 .plan-wakes li { margin: 2px 0; }
+.plan-campaigns ul { margin: 2px 0 0; padding-left: var(--sp-4); font-size: var(--fs-caption); }
+.plan-campaigns li { margin: 2px 0; }
+.start-card { margin: var(--sp-1) 0; padding: var(--sp-2); border-radius: var(--r-md); box-shadow: inset 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
+.start-card ul, .start-card ol { margin: 2px 0 0; padding-left: var(--sp-4); }
+.start-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-msg.wake { box-shadow: inset 3px 0 0 var(--line), inset 0 0 0 1px var(--line); }
 .chat-memory { display: flex; flex-direction: column; gap: var(--sp-2); margin-bottom: var(--sp-3); }
 .chat-memory[hidden] { display: none; }

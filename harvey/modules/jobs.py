@@ -543,7 +543,8 @@ async def batch_report(state, batch_id: str, *, keep: bool = True) -> dict:
     past its free tier with no price among the reasons), Hunter's pattern
     lookups (``lookups_made``, ``lookups_usd``) and the classifier (calls,
     tokens, USD) its jobs record (a finder job's result ``spend``, every
-    job's progress ``classify``). A finished run's report is stored on its
+    job's progress ``classify``), and why its contact-finder jobs found
+    nothing, counted by class (``nothing_why``: finder.WHY). A finished run's report is stored on its
     batch row (``report_json``, with what it was made from: the jobs'
     statuses and last finish) and read from there while none of its jobs
     changed; retrying or resuming one clears it. A running run's is
@@ -590,7 +591,7 @@ async def _batch_report(state, batch_id: str, statuses: dict) -> dict:
     out = {"batch_id": batch_id, "jobs": 0, "statuses": statuses, "seconds": None,
            "job_seconds": 0.0, "searches_usd": 0.0, "checks_usd": 0.0, "checks_made": 0,
            "checks_refused": 0, "services": {}, "lookups_usd": 0.0, "lookups_made": 0,
-           "other_usd": 0.0,
+           "other_usd": 0.0, "nothing_why": {},
            "classify": {"calls": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0, "usd": 0.0,
                         "unpriced": 0, "refused": 0},
            "total_usd": 0.0}
@@ -621,6 +622,17 @@ async def _batch_report(state, batch_id: str, statuses: dict) -> dict:
                 "WHERE j.batch_id = ? AND json_valid(j.result_json) GROUP BY s.key "
                 "ORDER BY s.key", (batch_id,)) as cur:
             services = {k: int(n or 0) for k, n in await cur.fetchall()}
+        # (Why its contact-finder jobs found nothing, by class: finder.WHY.)
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import queries
+
+        from harvey.finder import WHY
+
+        async with db.execute(queries.sql("overlay.agent.batch_why"), (batch_id,)) as cur:
+            for k, n in await cur.fetchall():
+                # (A class only: anything else a result holds is "other".)
+                k = k if k in WHY else "other"
+                out["nothing_why"][k] = out["nothing_why"].get(k, 0) + int(n)
     out["jobs"] = sum(out["statuses"].values())
     (wall, work, total, searches, checks, made, refused_checks, lookups, looked, calls, errors,
      tin, tout, cusd, unpriced, refused) = [x or 0 for x in row]
@@ -665,6 +677,9 @@ def report_line(r: dict) -> str:
     line = "; ".join(parts)
     if c.get("refused"):
         line += f"; the classifier's money ran out for {c['refused']:,} job(s)"
+    if r.get("nothing_why"):
+        line += "; found nothing: " + ", ".join(
+            f"{k.replace('_', ' ')} {n:,}" for k, n in sorted(r["nothing_why"].items()))
     return line
 
 

@@ -451,8 +451,17 @@ def test_a_filter_set_and_a_select_set_are_resolved_server_side_and_never_return
 # ── The same path as the dashboard ──
 
 def _jobs_of(db, batch):
-    return sorted(_q(db, "SELECT kind, lane, module, capability, label, params_json, "
-                         "dedupe_key, est_cost FROM jobs WHERE batch_id = ?", batch))
+    """A run's jobs as rows to compare; a forced run's ``since`` (the clock
+    when it was queued, to the second) is kept only as present or not, so
+    two runs queued across a second boundary still compare."""
+    out = []
+    for row in _q(db, "SELECT kind, lane, module, capability, label, params_json, "
+                      "dedupe_key, est_cost FROM jobs WHERE batch_id = ?", batch):
+        params = json.loads(row[5] or "{}")
+        if params.get("since"):
+            params["since"] = "<set>"
+        out.append((*row[:5], json.dumps(params, sort_keys=True), *row[6:]))
+    return sorted(out)
 
 
 def _batch(db, batch):
@@ -741,10 +750,11 @@ const pick = name => { const i = src.indexOf('function ' + name + '('); let d = 
   for (let k = j; k < src.length; k++) { if (src[k] === '{') d++; else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1); } };
 for (const n of ['escHtml', 'icon', 'own', 'emptyState', 'chatWhen', 'renderChat', 'chatPending',
                  'chatCalls', 'chatLiveHtml', 'chatRetry', 'renderPlanCard', 'renderPlanList',
-                 'planBadge', 'planWakes', 'wakeLabel'])
+                 'planBadge', 'planWakes', 'planCampaigns', 'startRequestCard', 'wakeLabel'])
   vm.runInThisContext(pick(n));
 vm.runInThisContext(src.match(/const CHAT_ERRORS = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const PLAN_TONE = \{[^}]*\};/)[0]);
+vm.runInThisContext(src.match(/const CAMPAIGN_TONE = \{[^}]*\};/)[0]);
 global.relTime = () => 'now';
 const proposed = {id: 3, chat: 'c', turn: 't1', goal: '<b>Contacte</b>', steps: ['Estimez', '<i>Caut</i>'],
                   budget_usd: 1.5, expiry_hours: 72, status: 'proposed', runs: []};

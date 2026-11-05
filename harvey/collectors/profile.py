@@ -928,6 +928,9 @@ class ProfileCollector:
         # Hosts that answered with a bot challenge (SiteGround's 202,
         # Cloudflare's "Just a moment...") rather than a page.
         self.challenged: set[str] = set()
+        # Companies whose homepage couldn't be read, and why as a class
+        # ("unreachable" or "blocked"): the contact finder's report counts them.
+        self.site_unread: dict[str, str] = {}
         # Read for the ways a company can be reached whatever is confirmed
         # (the contact finder's site read): the contact page and the team
         # page are fetched for them, and kept here per company.
@@ -1392,6 +1395,9 @@ class ProfileCollector:
                 logger.info(f"profile: {domain} answered with a bot challenge (challenged, not unreachable)")
             else:
                 logger.info(f"profile: {domain} unreachable")
+            # (Why, as a class: the contact finder's report counts them.)
+            self.site_unread[company_id] = (
+                "blocked" if domain in self.challenged else "unreachable")
             return obs
         self.site_names[company_id] = site_name_from_html(home, domain)
         pages.append((site, home))
@@ -1702,6 +1708,11 @@ async def site_draft(inp, ctx, only: set[str] | None = None) -> Draft:
     better = c.better_name(inp.company_id, inp.name, inp.domain)
     if better:
         draft.values["name"] = better
+    unread = getattr(c, "site_unread", {}).get(inp.company_id)
+    if unread:
+        # The homepage couldn't be read: "unreachable" (no answer on any of
+        # https/http, bare/www) or "blocked" (a bot challenge).
+        draft.values["unread"] = unread
     return draft
 
 

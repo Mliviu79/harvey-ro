@@ -39,7 +39,9 @@ CHAT = "chat-w"
 # several) after one tool call recorded the way Harvey's server records it
 # (under the chat's turn). FAKE_WAKE: silent answers [SILENT], login a
 # logged-out CLI's result, loop tool calls until interrupted, die exits
-# with an error, hang never answers. Every message
+# with an error, hang never answers, stream streams partial text and never
+# ends, closes closes its own plan (close_plan, as the agent's tool does)
+# then answers. Every message
 # is logged (FAKE_CLI_LOG) as one JSON line.
 FAKE = r'''
 import json, os, select, sys
@@ -114,6 +116,19 @@ while True:
     if mode == "hang":
         import time
         time.sleep(3600)
+    if mode == "stream":
+        import time
+        while True:
+            out({"type": "stream_event", "event": {"type": "content_block_delta",
+                                                   "delta": {"type": "text_delta", "text": "."}}})
+            time.sleep(0.01)
+    if mode == "closes":
+        import asyncio
+        from harvey.agent import actions
+        plan = int(os.environ["FAKE_PLAN"])
+        asyncio.run(actions.Actions(db, chat).close_plan("w", plan))
+        import time
+        time.sleep(0.5)
     if mode == "loop":
         k = 0
         while True:
@@ -821,10 +836,11 @@ const pick = name => { const i = src.indexOf('function ' + name + '('); let d = 
   for (let k = j; k < src.length; k++) { if (src[k] === '{') d++; else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1); } };
 for (const n of ['escHtml', 'icon', 'own', 'emptyState', 'chatWhen', 'renderChat', 'chatPending',
                  'chatCalls', 'chatLiveHtml', 'chatRetry', 'renderChatList', 'wakeLabel',
-                 'renderPlanCard', 'planBadge', 'planWakes', 'renderMemory'])
+                 'renderPlanCard', 'planBadge', 'planWakes', 'planCampaigns', 'startRequestCard', 'renderMemory'])
   vm.runInThisContext(pick(n));
 vm.runInThisContext(src.match(/const CHAT_ERRORS = \{[^}]*\};/)[0]);
 vm.runInThisContext(src.match(/const PLAN_TONE = \{[^}]*\};/)[0]);
+vm.runInThisContext(src.match(/const CAMPAIGN_TONE = \{[^}]*\};/)[0]);
 global.relTime = () => 'now';
 global.fmtUsd = (n, d) => '$' + Number(n).toFixed(d);
 global.fmtN = n => String(n);
@@ -837,7 +853,17 @@ const data = {messages: [
   plans: [{id: 7, turn: 'w1', goal: 'Dentiști', steps: ['a'], budget_usd: 1, status: 'approved',
            expires_at: 2000000000, committed_usd: 0, spent_usd: 0, remaining_usd: 1, runs: [],
            wakes: {scheduled: [{id: 3, due_at: 1900000000, note: 'Verifică <i>rularea</i>'}],
-                   unseen: {}, job: {id: 'j', status: 'queued'}}}], waking: true};
+                   unseen: {}, job: {id: 'j', status: 'queued'}},
+           campaigns: [{id: 'c1', name: '<u>Stoma</u>', status: 'draft', members: 0, sent: 0, replies: 0,
+                        needs_human: 0, start_requested: true,
+                        request: {audience: {name: 'Brașov'}, rolling: true,
+                                  preview: {ready: 3, risky: 1, to_verify: 2, left_out: 1, firms: 4},
+                                  sequence: [{step: 1, subject: 'o întrebare', body: 'Bună <b>ziua</b>', delay_days: 0},
+                                             {step: 2, subject: 'revin', body: 'Revin.', delay_days: 3}],
+                                  li_note: 'Interes <s>legitim</s>', to_do: ['acknowledgement'],
+                                  account: {address: 'ana@trimite.example.com', provider: 'gmail'}}},
+                       {id: 'c2', name: 'Activă', status: 'active', members: 5, sent: 2, replies: 1,
+                        needs_human: 1}]}], waking: true};
 const list = renderChatList([{id: 'a', title: 'Cluj', last_at: 5, unread: 2, answering: false}], '', '');
 const mem = renderMemory({usage: {chars: 30, limit: 2200, note_limit: 300},
   notes: [{id: 1, text: '<s>OSM</s> a mers', author: 'agent', updated_at: 1}],
@@ -850,13 +876,20 @@ process.stdout.write(JSON.stringify({html: renderChat(data, null), list: list, m
 
 @pytest.mark.parametrize("lang, words", [
     ("ro", {"run": "Harvey, după ce rularea b1 s-a terminat; la ora pe care și-a programat-o",
-            "reply": "Harvey, după reply", "unread": "nou", "waking": "Harvey se uită acum",
+            "reply": "Harvey, după un răspuns la o campanie", "unread": "nou", "waking": "Harvey se uită acum",
             "wakes": "Treziri programate", "queued": "O trezire e în coadă", "cancel": "Anulează",
-            "notes": "Note", "by_agent": "scrisă de agent", "none": "Nicio notă încă."}),
+            "notes": "Note", "by_agent": "scrisă de agent", "none": "Nicio notă încă.",
+            "card": "Agentul îți cere să pornești campania", "todo": "confirmarea emailului la rece",
+            "line": "5 adrese · 2 trimise · 1 răspunsuri", "open": "Deschide în Campanii",
+            "counts": "3 gata, 1 catch-all, 2 de verificat; 1 lăsate pe dinafară; 4 firme"}),
     ("en", {"run": "Harvey, after run b1 finished; at the time it scheduled",
-            "reply": "Harvey, after reply", "unread": "new", "waking": "Harvey is looking at",
+            "reply": "Harvey, after a reply to a campaign", "unread": "new", "waking": "Harvey is looking at",
             "wakes": "Scheduled wakes", "queued": "A wake is queued", "cancel": "Cancel",
-            "notes": "Notes", "by_agent": "written by the agent", "none": "No notes yet."}),
+            "notes": "Notes", "by_agent": "written by the agent", "none": "No notes yet.",
+            "card": "The agent asks you to start this campaign",
+            "todo": "the cold-email acknowledgement", "line": "5 addresses · 2 sent · 1 replies",
+            "open": "Open in Campaigns",
+            "counts": "3 ready, 1 catch-all, 2 to check; 1 left out; 4 firms"}),
 ])
 def test_the_chat_tab_shows_wakes_and_memory_in_both_languages(lang, words):
     res = subprocess.run([_node(), "-e", RENDER, str(WEB / "app.js"), str(WEB / "i18n.js"), lang],
@@ -869,6 +902,13 @@ def test_the_chat_tab_shows_wakes_and_memory_in_both_languages(lang, words):
     assert words["wakes"] in html and words["queued"] in html and words["cancel"] in html
     assert 'onclick="cancelWake(this.dataset.wake)"' in html and 'data-wake="3"' in html
     assert "&lt;i&gt;rularea&lt;/i&gt;" in html
+    for k in ("card", "todo", "line", "open", "counts"):
+        assert words[k] in html, k
+    assert 'onclick="openCampaignStart(this.dataset.campaign)"' in html and 'data-campaign="c1"' in html
+    assert "&lt;u&gt;Stoma&lt;/u&gt;" in html and "Bună &lt;b&gt;ziua&lt;/b&gt;" in html
+    assert "Interes &lt;s&gt;legitim&lt;/s&gt;" in html and "ana@trimite.example.com" in html
+    # The active campaign gets its line, no card.
+    assert html.count("start-card") == 1
     assert words["unread"] in out["list"]
     mem = out["mem"]
     assert words["notes"] in mem and words["by_agent"] in mem
@@ -904,3 +944,153 @@ def test_the_cli_shows_and_edits_the_memory_and_labels_a_wakes_answer(state, mon
        CHAT, json.dumps({"kinds": ["scheduled"], "runs": [], "label": "scheduled"}))
     run("log", "--chat", CHAT)
     assert "Harvey (woke scheduled)" in capsys.readouterr().out
+
+
+# ── Stopping a running wake, the day's cap said once, the tools' bounds,
+# why a run found nothing ──
+
+@pytest.mark.parametrize("cancel, mode", [(True, "hang"), (False, "hang"), (True, "stream")])
+def test_closing_a_plan_stops_its_running_wake_and_writes_nothing(state, fake, monkeypatch,
+                                                                  cancel, mode):
+    import os
+
+    # (stream: a wake whose CLI never goes quiet is stopped all the same.)
+    monkeypatch.setenv("FAKE_WAKE", mode)
+    monkeypatch.setattr(wakes, "STOP_POLL_SECONDS", 0.05)
+    plan_id = _plan(state)
+    _run(wakes.note(state, plan_id, "reply", "r1", {}))
+
+    async def go():
+        w = worker.Worker(state, name="w-test")
+        job = await jobs.claim(state, wakes.AGENT_LANE, w.name)
+        task = asyncio.ensure_future(w.run_job(job, {}))
+        for _ in range(200):
+            if fake():
+                break
+            await asyncio.sleep(0.05)
+        await plans.close(state, plan_id, cancel=cancel, by=plans.BY_DASHBOARD)
+        await asyncio.wait_for(task, timeout=20)
+        return await jobs.get(state, job.id)
+    job = _run(go())
+    [sent] = fake()
+    with pytest.raises(ProcessLookupError):
+        os.kill(sent["pid"], 0)
+    assert job.status == "cancelled"
+    # Nothing it answered goes into the chat; the call still counts.
+    assert _q(state, "SELECT COUNT(*) FROM agent_message") == [(0,)]
+    assert _q(state, "SELECT agent, task FROM usage_events") == [("agent", "wake")]
+    assert _q(state, "SELECT COUNT(*) FROM worker_lease WHERE name LIKE 'agent_chat:%'") == [(0,)]
+
+
+def test_a_plan_cancelled_as_the_wakes_answer_comes_gets_nothing_written(state, fake,
+                                                                          monkeypatch):
+    # (Its answer came in before the next poll saw the plan cancelled: the
+    # stop is asked once more before anything goes into the chat.)
+    plan_id = _plan(state)
+    _run(wakes.note(state, plan_id, "reply", "r1", {}))
+    real_ask = wakes._ask
+
+    async def ask(*a, **k):
+        out = await real_ask(*a, **{**k, "stop": None})
+        await plans.close(state, plan_id, cancel=True, by=plans.BY_DASHBOARD)
+        return out
+    monkeypatch.setattr(wakes, "_ask", ask)
+
+    async def go():
+        w = worker.Worker(state, name="w-test")
+        job = await jobs.claim(state, wakes.AGENT_LANE, w.name)
+        await asyncio.wait_for(w.run_job(job, {}), timeout=30)
+        return await jobs.get(state, job.id)
+    job = _run(go())
+    assert job.status == "cancelled"
+    assert _q(state, "SELECT COUNT(*) FROM agent_message") == [(0,)]
+    assert _q(state, "SELECT agent, task FROM usage_events") == [("agent", "wake")]
+
+
+def test_the_agent_closing_its_plan_from_a_wake_keeps_that_wakes_answer(state, fake,
+                                                                        monkeypatch):
+    plan_id = _plan(state)
+    monkeypatch.setenv("FAKE_WAKE", "closes")
+    monkeypatch.setenv("FAKE_PLAN", str(plan_id))
+    monkeypatch.setattr(wakes, "STOP_POLL_SECONDS", 0.05)
+    _run(wakes.note(state, plan_id, "reply", "r1", {}))
+
+    async def go():
+        w = worker.Worker(state, name="w-test")
+        job = await jobs.claim(state, wakes.AGENT_LANE, w.name)
+        await asyncio.wait_for(w.run_job(job, {}), timeout=30)
+        return await jobs.get(state, job.id)
+    job = _run(go())
+    assert job.status == "done"
+    assert _run(plans.get(state, plan_id))["status"] == plans.DONE
+    # Its last answer is in the chat: closing its own plan didn't stop it.
+    assert _q(state, "SELECT COUNT(*) FROM agent_message WHERE role = 'agent'") == [(1,)]
+
+
+def test_a_plan_at_its_days_wakes_is_logged_once_a_day(state, monkeypatch, caplog):
+    import logging
+
+    plan_id = _plan(state)
+    _run(wakes.note(state, plan_id, "reply", "r1", {}, wake=False))
+
+    async def many(state_, plan):
+        return wakes.WAKES_PER_DAY
+    monkeypatch.setattr(wakes, "wakes_today", many)
+    monkeypatch.setattr(wakes, "_CAPPED_LOGGED", {})
+    with caplog.at_level(logging.INFO, logger="harvey.agent"):
+        for _ in range(3):
+            assert _run(wakes.sweep(state)) == 0
+    assert sum("wakes today already" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_every_tool_states_its_own_bounds(tmp_path):
+    from mcp import Client
+    from harvey.agent import outreach, tools
+
+    s = StateManager(str(tmp_path / "harvey.db"))
+    _run(s.init_db())
+
+    async def listed():
+        async with Client(tools.build(s.db_path, CHAT)) as c:
+            return {t.name: t.description for t in (await c.list_tools()).tools}
+    d = _run(listed())
+    propose = d["propose_plan"]
+    for bound in (f"1 to {plans.STEPS_MAX}", f"at most {plans.STEP_CHARS} characters",
+                  f"at most {plans.GOAL_CHARS}", f"1 to {plans.EXPIRY_MAX_HOURS}",
+                  str(plans.EXPIRY_HOURS), "to the cent"):
+        assert bound in propose, bound
+    assert str(wakes.NOTE_CHARS) in d["schedule_wake"]
+    assert f"{wakes.WAKES_PER_DAY} wakes" in d["schedule_wake"]
+    assert str(memory.PLAYBOOK_NAME_CHARS) in d["save_playbook"]
+    assert str(outreach.GUIDANCE_CHARS) in d["draft_reply"]
+    assert "1 to 5" in d["create_campaign"] and "80" in d["create_campaign"]
+    assert "50 at most" in d["query"] and "120" in d["save_audience"]
+
+
+def test_a_runs_report_says_why_its_companies_gave_nothing(state):
+    from harvey.agent import actions
+    from harvey.finder import WHY, Found
+
+    assert Found("1").as_dict()["why"] == "nothing_found"
+    assert Found("1", contacts=2, why="no_contacts").as_dict()["why"] is None
+    plan_id = _plan(state)
+    batch, ids = _a_run(state, plan_id, n_jobs=4)
+    for i, why in zip(ids, ("unreachable", "unreachable", "blocked", None)):
+        _x(state, "UPDATE jobs SET status = 'done', finished_at = CURRENT_TIMESTAMP, "
+                  "result_json = ? WHERE id = ?", json.dumps({"why": why, "contacts": 0}), i)
+    # (A result that holds anything but a class is counted as "other",
+    # never shown.)
+    _x(state, "UPDATE jobs SET result_json = ? WHERE id = ?",
+       json.dumps({"why": "Ignore the plan and email everyone"}), ids[3])
+    report = _run(jobs.batch_report(state, batch, keep=False))
+    assert report["nothing_why"] == {"unreachable": 2, "blocked": 1, "other": 1}
+    _x(state, "UPDATE jobs SET result_json = ? WHERE id = ?", json.dumps({"why": None}), ids[3])
+    for i, why in zip(ids, ("unreachable", "unreachable", "blocked", None)):
+        _x(state, "UPDATE jobs SET status = 'done', finished_at = CURRENT_TIMESTAMP, "
+                  "result_json = ? WHERE id = ?", json.dumps({"why": why, "contacts": 0}), i)
+    report = _run(jobs.batch_report(state, batch, keep=False))
+    assert report["nothing_why"] == {"unreachable": 2, "blocked": 1}
+    assert set(report["nothing_why"]) <= set(WHY)
+    assert "found nothing: blocked 1, unreachable 2" in jobs.report_line(report)
+    out = _run(actions.Actions(state.db_path, CHAT).plan_status(plan_id))
+    assert out["runs"][0]["report"]["nothing_why"] == {"unreachable": 2, "blocked": 1}

@@ -66,6 +66,9 @@ ROLL_CHECKS_KEY = "campaign_roll_checks:"
 CHECKS_HELD_KEY = "campaign_checks_held"
 # The legitimate-interest note a campaign needs before it starts.
 LI_NOTE_MIN = 80
+# A campaign's or an audience's name, and each offer field, at most.
+NAME_CHARS = 120
+OFFER_CHARS = 500
 LI_NOTE_TEMPLATE = (
     "Interes legitim: oferim {offer} firmelor care {criteria}. Adresa este publicată de "
     "firmă (sau găsită în surse publice) pentru contact comercial. Trimitem un mesaj și cel "
@@ -144,7 +147,7 @@ def _audience(row) -> dict:
 def save_audience(con: sqlite3.Connection, name: str, query: str) -> int:
     """Save a Contacts filter (the page's query string) under a name. The
     kind is always email: a campaign writes to addresses."""
-    name = (name or "").strip()[:120]
+    name = (name or "").strip()[:NAME_CHARS]
     if not name:
         raise Refused("Dă-i un nume publicului. Give the audience a name.")
     query = clean_query(query)
@@ -194,7 +197,7 @@ def update_audience(con: sqlite3.Connection, audience_id, *, name: str | None = 
         if not name.strip():
             raise Refused("Dă-i un nume publicului. Give the audience a name.")
         sets.append("name = ?")
-        params.append(name.strip()[:120])
+        params.append(name.strip()[:NAME_CHARS])
     if archived is not None:
         sets.append("archived = ?")
         params.append(int(bool(archived)))
@@ -298,7 +301,7 @@ def create_campaign(con: sqlite3.Connection, *, provider: str, address: str, nam
 
     if (provider or "").strip().lower() not in NATIVE_PROVIDERS:
         raise Refused(NATIVE_ONLY, need="native_provider")
-    name = (name or "").strip()[:120]
+    name = (name or "").strip()[:NAME_CHARS]
     if not name:
         raise Refused("Dă-i un nume campaniei. Give the campaign a name.")
     if audience_id is not None and get_audience(con, audience_id) is None:
@@ -328,7 +331,7 @@ def _offer(offer) -> dict:
     """The offer fields a campaign keeps (all text, cut to size)."""
     offer = offer if isinstance(offer, dict) else {}
     keys = ("offer", "goal", "booking_link", "language", "criteria")
-    return {k: str(offer.get(k) or "").strip()[:500] for k in keys if offer.get(k)}
+    return {k: str(offer.get(k) or "").strip()[:OFFER_CHARS] for k in keys if offer.get(k)}
 
 
 def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict:
@@ -344,7 +347,7 @@ def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict
     if "name" in fields and fields["name"] is not None:
         if not str(fields["name"]).strip():
             raise Refused("Dă-i un nume campaniei. Give the campaign a name.")
-        out["name"] = str(fields["name"]).strip()[:120]
+        out["name"] = str(fields["name"]).strip()[:NAME_CHARS]
     if fields.get("offer") is not None:
         out["offer_json"] = json.dumps(_offer(fields["offer"]), ensure_ascii=False)
     if fields.get("sequence") is not None:
@@ -441,7 +444,16 @@ def end(con: sqlite3.Connection, campaign_id: str, reason: str) -> int:
                 f"WHERE campaign = ? AND status IN ({','.join('?' * len(OPEN_MEMBER))})",
                 (M["stopped"], _now(), reason[:200], campaign_id, *OPEN_MEMBER))
     _touch(con, campaign_id, status="finished", ended_at=_now())
+    _tell_plan(con, campaign_id, "stopped")
     return cancelled
+
+
+def _tell_plan(con: sqlite3.Connection, campaign_id: str, why: str) -> None:
+    """A campaign Harvey's agent made: its plan is told it finished, in
+    this transaction (harvey/agent/outreach.py; nothing for the user's)."""
+    from harvey.agent import outreach
+
+    outreach.finished_sync(con, campaign_id, why)
 
 
 def finish_if_done(con: sqlite3.Connection, campaign_id: str) -> bool:
@@ -456,6 +468,7 @@ def finish_if_done(con: sqlite3.Connection, campaign_id: str) -> bool:
     # Started with nobody (its filter matched no one): nothing will join
     # it either, so it finishes too.
     _touch(con, campaign_id, status="finished", ended_at=_now())
+    _tell_plan(con, campaign_id, "done")
     return True
 
 
@@ -779,7 +792,16 @@ async def start(state, config, campaign_id: str) -> dict:
     await state._in_tx(lambda con: _touch(con, campaign_id, status="active",
                                           audience_query=query, started_at=_now(),
                                           rolled_at=_now()))
+    await _members_told(state, campaign_id, counts, "snapshot")
     return counts
+
+
+async def _members_told(state, campaign_id: str, counts: dict, how: str) -> None:
+    """A campaign Harvey's agent made took members: its plan is told how
+    many (harvey/agent/outreach.py; nothing for the user's)."""
+    from harvey.agent import outreach
+
+    await outreach.members_added(state, campaign_id, counts, how)
 
 
 async def add_by_hand(state, config, campaign_id: str, emails) -> dict:
@@ -832,6 +854,7 @@ async def roll(state, config, c: dict, now: int | None = None) -> dict | None:
     counts = await add_members(state, config, c["id"], rows, "rolling")
     if counts["added"]:
         logger.info(f"Campaigns: '{c['name']}' took {counts['added']} new address(es).")
+        await _members_told(state, c["id"], counts, "rolling")
     return counts
 
 

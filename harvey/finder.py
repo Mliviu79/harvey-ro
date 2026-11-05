@@ -302,6 +302,18 @@ def site_of(company: dict) -> tuple[str, str]:
     return "", ""
 
 
+# Why the finder found nothing for a company, as a class (Found.why; never
+# a page's or a source's words): its site couldn't be reached, answered
+# with a bot challenge or failed to read; it was read and gave nothing;
+# the site it holds or a search found waits for a check or the classifier,
+# or wasn't taken as the firm's; it has no website and none was found, or
+# no search could look (none set up, no money for it, every search failed);
+# it was skipped (read already, a contact on file).
+WHY = ("unreachable", "blocked", "site_error", "no_contacts", "waiting_check",
+       "waiting_classifier", "not_linked", "no_website_found", "no_search", "no_budget",
+       "search_error", "already_read", "has_contact", "gone", "nothing_found")
+
+
 @dataclass
 class Found:
     """What the finder did for one company."""
@@ -326,6 +338,8 @@ class Found:
     services: dict = field(default_factory=dict)
     spend: dict = field(default_factory=dict)
     ms: int = 0
+    # Why it found nothing, as a class (WHY): the run's report counts them.
+    why: str = ""
 
     def as_dict(self) -> dict:
         return {"company_id": self.company_id, "steps": self.steps, "contacts": self.contacts,
@@ -339,7 +353,7 @@ class Found:
                           "lookups_made": self.lookups,
                           "services": {k: n for k, n in self.services.items()
                                        if k != "hunter_search"}},
-                "ms": self.ms}
+                "ms": self.ms, "why": None if self.contacts else (self.why or "nothing_found")}
 
 
 async def find(state, company_id: str, *, spend: Spend, since: str | None = None,
@@ -373,6 +387,7 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
     company = await company_row(state, company_id)
     if company is None:
         out.skipped.append("merged into another company, or gone")
+        out.why = "gone"
         return out
     env = env if env is not None else _env()
     enabled = await switches.enabled_ids(state)
@@ -388,6 +403,7 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
     if waiting:
         out.skipped.append("the website a search found waits for a check "
                            "(harvey contacts rejudge)")
+        out.why = "waiting_check"
     elif domain and not site_done and company.get("website_found"):
         # A website a search found and the evidence took, read again
         # (Search again, a refresh): the same evidence and the same
@@ -406,6 +422,8 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
             out.contacts += done.contacts
             out.people += done.people
             out.trust = verdict(done.draft) if verdict else "confirmed"
+        out.why = ("site_error" if done is None
+                   else done.draft.values.get("unread") or "no_contacts")
         out.website = domain
     elif not domain and (since or want_website or not had_contact):
         # (Forced, a company with a phone already is looked up too.)
@@ -415,6 +433,9 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
                                background=background)
         if found:
             domain = found
+        out.why = out.why or _lookup_why(out)
+    else:
+        out.why = "already_read" if domain else "has_contact"
     trust = out.trust or floor or "confirmed"
     if domain and trust != "unconfirmed":
         # (An address built at a domain that may not be the company's would
@@ -458,6 +479,8 @@ async def _reread_found(state, company: dict, domain: str, read, out: Found, *,
         # the re-check settles it.
         checked = bool((await state.read("website_basis", company["id"])).get("by"))
         out.trust = have if d.waiting and checked else "unconfirmed"
+        out.why = ("site_error" if draft is None else draft.values.get("unread")
+                   or ("waiting_classifier" if d.waiting else "not_linked"))
         _skip(out, f"nothing linked from the website read again: {d.note}")
         await state.record_search("company", company["id"], *SITE, looked_for=_contact_read(),
                                   outcome="nothing" if draft is not None else "error",
@@ -471,6 +494,7 @@ async def _reread_found(state, company: dict, domain: str, read, out: Found, *,
     out.contacts += done.contacts
     out.people += done.people
     out.trust = trust
+    out.why = "no_contacts"
 
 
 def _reader(state, confirmed, config):
@@ -902,6 +926,22 @@ def _contact_read() -> str:
     from harvey.modules.runs import CONTACT_READ
 
     return CONTACT_READ
+
+
+def _lookup_why(out: Found) -> str:
+    """Why a lookup found the company no site, as a class (WHY)."""
+    if out.website:
+        return "no_contacts"
+    said = " ".join(out.skipped)
+    if "waits for the classifier" in said:
+        return "waiting_classifier"
+    if "no search module" in said or "no name to search by" in said:
+        return "no_search"
+    if "website search skipped" in said or "no free searches left" in said:
+        return "no_budget"
+    if out.failed and not any(s.startswith("search:") for s in out.steps):
+        return "search_error"
+    return "no_website_found"
 
 
 def _skip(out: Found, why: str) -> None:

@@ -1,14 +1,15 @@
 """What a button that queues work reads from its request: the Discover
 run's sources and searches, the companies a Find-contacts run takes, the
 links a verification takes, the money amounts, and the estimates shown
-before each.
+before each; and the two writes the Campaigns page makes before a
+campaign exists to start (an audience saved, a draft made).
 
 The dashboard's endpoints (harvey/dashboard.py) and the agent's action
 tools (harvey/agent/actions.py) both go through these, then through the
 same enqueue functions (harvey/modules/job_kinds.py), so a run the agent
 queues is the run the same request on the page would queue: the same
-selection, the same caps, the same module switches. Nothing here spends
-or queues.
+selection, the same caps, the same module switches. Nothing here spends,
+queues or starts anything.
 """
 
 from __future__ import annotations
@@ -306,3 +307,34 @@ async def verify_selection(state, body: dict) -> tuple[list[dict], str]:
             return [], str(e)
         _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
     return await contact_check.links(state, ids[:limit], limit=limit), ""
+
+
+# ── Campaigns: an audience saved, a draft made ──
+
+async def save_audience(state, name: str, query: str) -> int:
+    """A Contacts filter (the page's query string) saved as an audience, as
+    "Salvează ca public" saves it: a filter the page can't read isn't
+    saved (ValueError), nor one with no name (campaigns.Refused)."""
+    from harvey import campaigns
+    from harvey.contact_query import filter_from_query
+
+    await filter_from_query(state, query or "")
+    return await state.campaigns_call(campaigns.save_audience, str(name or ""), query or "")
+
+
+async def new_campaign(state, config, body: dict) -> str:
+    """A draft campaign from the wizard's request ({"name", "audience_id"
+    or "query", "rolling", "offer", "sequence", "li_note", "review"}),
+    sending from the settings' account: its id. campaigns.Refused when it
+    can't be made (no native provider, no name, no such audience, a bad
+    sequence)."""
+    from harvey import campaigns
+
+    address = getattr(getattr(config, "persona", None), "email", "") or ""
+    return await state.campaigns_call(
+        campaigns.create_campaign, provider=config.channels.email.provider,
+        address=address, name=str(body.get("name") or ""),
+        audience_id=body.get("audience_id"), query=str(body.get("query") or ""),
+        rolling=bool(body.get("rolling")), offer=body.get("offer"),
+        sequence=body.get("sequence") or None, li_note=str(body.get("li_note") or ""),
+        review=str(body.get("review") or "inherit"))

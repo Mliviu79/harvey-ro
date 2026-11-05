@@ -1183,11 +1183,13 @@ async def run_verify_contacts(ctx) -> dict:
 
 # ── Harvey's agent woken under an approved plan (harvey/agent/wakes.py) ──
 
-@jobs.kind("agent_wake")
+@jobs.kind("agent_wake", stoppable=True)
 async def run_agent_wake(ctx) -> dict:
     """One wake of a plan's agent on the agent's lane: a one-shot Claude
     run in the plan's chat over the plan's events not yet seen (wakes.run:
-    its limits, its lease on the chat, its answer or its silence)."""
+    its limits, its lease on the chat, its answer or its silence). Asked
+    to stop (its plan cancelled or closed, the job cancelled or paused), it
+    ends its CLI and writes nothing into the chat."""
     from harvey.agent import wakes
 
     return await wakes.run(ctx)

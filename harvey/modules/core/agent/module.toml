@@ -5,9 +5,12 @@
 # queues runs (Discover, a registry pull, Find contacts, Verify contacts)
 # only under a plan the user approved, within its budget, through the
 # pages' own code; Harvey wakes it under that plan (a job on this module's
-# lane) when a run finishes or at a time it scheduled. It keeps short notes
-# and playbooks. No tool sends or approves email, touches campaigns, the
-# do-not-contact list, merges or settings.
+# lane) when a run finishes, at a time it scheduled, or when one of the
+# campaigns it drafted under the plan has news. It saves audiences, drafts
+# campaigns for the user to start, has the reply reader draft answers for
+# review and adds to the do-not-contact list. It keeps short notes and
+# playbooks. No tool sends or approves email, starts or resumes a
+# campaign, undoes a do-not-contact entry, merges or changes settings.
 id = "agent"
 name = "Agent"
 description = "A chat that answers questions about Harvey's data, and queues searches and checks under a plan you approve."

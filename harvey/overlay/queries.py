@@ -1006,3 +1006,102 @@ statement("overlay.agent.playbook_set",
           params=("n", "b", "agent", 1, 1))
 statement("overlay.agent.playbook_delete", "DELETE FROM agent_playbook WHERE id = ?",
           params=(1,))
+
+# ── The campaigns the agent made under a plan (schema 35,
+# harvey/agent/outreach.py) ──
+_LINK = ("SELECT campaign, plan, chat, created_at, start_requested_at, start_request "
+         "FROM agent_campaign ")
+statement("overlay.agent.campaign_link_add",
+          "INSERT INTO agent_campaign (campaign, plan, chat, created_at) VALUES (?, ?, ?, ?)",
+          params=("c", 1, "c", 1))
+statement("overlay.agent.campaign_link", _LINK + "WHERE campaign = ?", params=("c",))
+statement("overlay.agent.plan_campaigns",
+          _LINK + "INDEXED BY agent_campaign_plan WHERE plan = ? ORDER BY created_at",
+          params=(1,), bounded=True)
+statement("overlay.agent.campaign_start_request",
+          "UPDATE agent_campaign SET start_requested_at = ?, start_request = ? WHERE campaign = ?",
+          params=(1, "{}", "c"))
+# The open approved plan a campaign belongs to (what its events wake),
+# read inside a campaign's own transaction too.
+statement("overlay.agent.campaign_open_plan",
+          "SELECT l.plan FROM agent_campaign l JOIN agent_plan p ON p.id = l.plan "
+          "WHERE l.campaign = ? AND p.status = 'approved' AND p.expires_at > ?",
+          params=("c", 1))
+# The active campaigns of open plans (a sending rail reached: each one's
+# plan is told).
+statement("overlay.agent.campaigns_open_active",
+          "SELECT l.campaign, l.plan FROM agent_campaign l "
+          "CROSS JOIN agent_plan p CROSS JOIN campaigns c "
+          "WHERE p.id = l.plan AND c.id = l.campaign "
+          "AND p.status = 'approved' AND p.expires_at > ? AND c.status = 'active'",
+          params=(1,), drives="l",
+          scans={"agent_campaign": "the campaigns the agent made: a handful, read when a "
+                                   "sending rail is reached"})
+# A campaign in counts: its members by status, its cold email by status,
+# its conversations by intent, stage and status, their answers by status,
+# and its newest conversations' structured fields (never their text).
+statement("overlay.agent.campaign_members",
+          "SELECT status, COUNT(*) FROM campaign_member INDEXED BY campaign_member_status "
+          "WHERE campaign = ? GROUP BY status", params=("c",))
+statement("overlay.agent.campaign_sequence",
+          "SELECT status, COUNT(*) FROM outbox INDEXED BY uq_outbox_campaign_step "
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' GROUP BY status",
+          params=("c",))
+statement("overlay.agent.campaign_replies",
+          "SELECT intent, stage, status, COUNT(*) FROM conversations "
+          "INDEXED BY idx_conversations_campaign_id WHERE campaign_id = ? "
+          "GROUP BY intent, stage, status", params=("c",))
+statement("overlay.agent.campaign_answers",
+          "SELECT o.status, COUNT(*) FROM conversations c INDEXED BY idx_conversations_campaign_id "
+          "CROSS JOIN outbox o INDEXED BY idx_outbox_prospect "
+          "WHERE c.campaign_id = ? AND o.prospect_id = c.prospect_id AND o.conversation_id = c.id "
+          "AND o.kind = 'reply' GROUP BY o.status", params=("c",), drives="c")
+statement("overlay.agent.campaign_conversations",
+          "SELECT c.id, c.intent, c.stage, c.status, c.updated_at, "
+          "(SELECT COUNT(*) FROM outbox o INDEXED BY idx_outbox_prospect "
+          "WHERE o.prospect_id = c.prospect_id AND o.conversation_id = c.id AND o.kind = 'reply' "
+          "AND o.status IN ('pending_review', 'approved')), "
+          "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].sender') "
+          "END "
+          "FROM conversations c INDEXED BY idx_conversations_campaign_id WHERE c.campaign_id = ? "
+          "ORDER BY c.updated_at DESC LIMIT ?", params=("c", 50), bounded=True)
+# One conversation's structured fields: its campaign, intent, stage,
+# status, how many messages its thread holds (never the thread), whether
+# an answer to it waits, who wrote its newest message (prospect or harvey,
+# never what).
+statement("overlay.agent.conversation",
+          "SELECT c.id, c.prospect_id, c.campaign_id, c.intent, c.stage, c.status, "
+          "json_array_length(CASE WHEN json_valid(c.thread_json) THEN c.thread_json "
+          "ELSE '[]' END), "
+          "(SELECT COUNT(*) FROM outbox o INDEXED BY idx_outbox_prospect "
+          "WHERE o.prospect_id = c.prospect_id AND o.conversation_id = c.id AND o.kind = 'reply' "
+          "AND o.status IN ('pending_review', 'approved')), "
+          "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].sender') "
+          "END "
+          "FROM conversations c WHERE c.id = ?", params=("c",))
+# The thread an answer goes into: the newest email sent in it (an answer,
+# else the campaign's cold email to them).
+statement("overlay.agent.reply_thread",
+          "SELECT subject, thread_ref, message_id FROM outbox INDEXED BY idx_outbox_prospect "
+          "WHERE prospect_id = ? AND status = 'sent' AND ((kind = 'reply' AND conversation_id = ?) "
+          "OR (kind = 'sequence' AND campaign_id = ?)) ORDER BY sent_at DESC LIMIT 1",
+          params=("p", "c", "c"), bounded=True)
+# Why a run's contact-finder jobs found nothing, by class (finder.Found.why).
+statement("overlay.agent.batch_why",
+          "SELECT json_extract(result_json, '$.why'), COUNT(*) FROM jobs INDEXED BY idx_jobs_batch "
+          "WHERE batch_id = ? AND kind = 'find_contacts' AND json_valid(result_json) "
+          "AND json_extract(result_json, '$.why') IS NOT NULL GROUP BY 1", params=("b",))
+# An email contact's address, for a do-not-contact entry the agent asks for
+# (never returned to it).
+statement("overlay.agent.contact_value",
+          "SELECT k.kind, c.value FROM contact c JOIN contact_kinds k ON k.id = c.kind "
+          "WHERE c.id = ?", params=(1,))
+# Every campaign's conversations by intent, and the plan each campaign the
+# agent made belongs to (the campaigns() view).
+statement("overlay.agent.campaign_intents",
+          "SELECT campaign_id, intent, COUNT(*) FROM conversations WHERE campaign_id != '' "
+          "GROUP BY campaign_id, intent", bounded=True,
+          scans={"conversations": "every campaign's replies counted by intent, when the "
+                                  "agent asks: one row a conversation"})
+statement("overlay.agent.campaign_plans", "SELECT campaign, plan FROM agent_campaign",
+          scans={"agent_campaign": "the campaigns the agent made: a handful"})

@@ -50,6 +50,10 @@ PERSON_ASKED = frozenset(SUPPRESSION_REASON[k] for k in
 # an objection or a complaint is undone on the list itself, with a note.
 READ_IN_THEIR_WORDS = frozenset(SUPPRESSION_REASON[k] for k in ("opt_out", "migrated"))
 NOTE_MAX = 300
+# Who made an entry Harvey's agent asked for (harvey/agent/outreach.py):
+# always reason by_hand, and the one-click undo of an opt-out refuses while
+# one stands for the address (agent_entry).
+BY_AGENT = "agent"
 
 
 class Refused(ValueError):
@@ -267,6 +271,15 @@ def standing_request(con: sqlite3.Connection, email: str) -> str:
         f"AND reason IN ({','.join('?' * len(reasons))}) ORDER BY id LIMIT 1",
         (ADDRESS, key, *reasons)).fetchone()
     return REASON_NAMES.get(row[0], "") if row else ""
+
+
+def agent_entry(con: sqlite3.Connection, email: str) -> bool:
+    """Whether an entry Harvey's agent made (BY_AGENT) is in force for this
+    address: the one-click undo of an opt-out doesn't lift it."""
+    key = normalize_address(email)
+    return bool(key and con.execute(
+        "SELECT 1 FROM suppression WHERE scope = ? AND value = ? AND undone_at IS NULL "
+        "AND by = ? LIMIT 1", (ADDRESS, key, BY_AGENT)).fetchone())
 
 
 # ── Reading ──

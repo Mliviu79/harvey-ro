@@ -338,7 +338,9 @@ def contacts_summary(db_path) -> dict:
 
 
 def campaigns(db_path) -> dict:
-    """Every campaign with its members by status and its outbox by status."""
+    """Every campaign with its members by status, its outbox by status
+    (``sent``: its cold email sent), its replies by intent, and the plan
+    of Harvey's agent it was made under (None: the user's)."""
     con, _ = readonly.connect(db_path)
     try:
         con.execute("BEGIN")
@@ -349,6 +351,14 @@ def campaigns(db_path) -> dict:
         outbox: dict = {}
         for campaign, kind, status, n in _x(con, "overlay.agent.outbox"):
             outbox.setdefault(campaign or "", {})[f"{kind}:{status}"] = n
+        replies: dict = {}
+        from harvey.agent.outreach import INTENTS, _enum
+
+        for campaign, intent, n in _x(con, "overlay.agent.campaign_intents"):
+            # (The Handler's labels only: anything else is "other".)
+            k = _enum(intent, INTENTS) or "none"
+            replies.setdefault(campaign, {})[k] = replies.get(campaign, {}).get(k, 0) + n
+        linked = dict(_x(con, "overlay.agent.campaign_plans"))
         con.execute("ROLLBACK")
     finally:
         con.close()
@@ -356,9 +366,11 @@ def campaigns(db_path) -> dict:
     for cid, name, status, origin, rolling, audience, started, ended, updated in rows:
         out.append({"id": cid, "name": name, "status": status, "origin": origin,
                     "rolling": bool(rolling), "audience_id": audience, "started_at": started,
-                    "ended_at": ended, "updated_at": updated,
+                    "ended_at": ended, "updated_at": updated, "plan": linked.get(cid),
                     "members": _member_names(members.get(cid, {})),
-                    "outbox": outbox.get(cid, {})})
+                    "outbox": outbox.get(cid, {}),
+                    "sent": outbox.get(cid, {}).get("sequence:sent", 0),
+                    "replies": replies.get(cid, {})})
     return {"campaigns": out}
 
 

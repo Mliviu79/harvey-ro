@@ -23,7 +23,9 @@ from harvey.config import (
     compliance_of, operator_timezone, provider_notice, send_window_of,
 )
 from harvey import email_rules, unsubscribe
-from harvey.gate import autopilot_review, pre_send_check
+from harvey.gate import (
+    MERGE_FIELDS, MERGE_VAR_RE, MERGE_VARS, autopilot_review, pre_send_check,
+)
 from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
@@ -326,25 +328,21 @@ class Sender:
         await self._drain_due()
 
     def _render(self, text: str, prospect) -> str:
-        """Fill merge variables. The pre-send gate rejects any leftovers."""
-        replacements = {
-            # A company inbox has no name; "there" keeps "Hi {{first_name}}," readable.
-            "first_name": prospect.first_name or ("there" if prospect.is_company_inbox else ""),
-            "last_name": prospect.last_name,
-            "company": prospect.company,
-            "title": prospect.title,
-            "personalization": prospect.personalization_notes,
-        }
+        """Fill merge variables (gate.MERGE_VARS, the one list the template
+        check reads too). The pre-send gate rejects any leftovers."""
+        values = {k: getattr(prospect, MERGE_FIELDS.get(k, k), "") or "" for k in MERGE_VARS}
+        # A company inbox has no name; "there" keeps "Hi {{first_name}}," readable.
+        if not values["first_name"] and prospect.is_company_inbox:
+            values["first_name"] = "there"
         # "{{company}}'s" for "Parkes Builders" should read "Builders'".
-        company = prospect.company or ""
+        company = values["company"]
         if company.endswith(("s", "S")):
-            for tag in ("{{company}}", "{{ company }}"):
-                text = text.replace(tag + "'s", company + "'")
-                text = text.replace(tag + "’s", company + "’")
-        for key, value in replacements.items():
-            text = text.replace("{{" + key + "}}", value or "")
-            text = text.replace("{{ " + key + " }}", value or "")
-        return text.strip()
+            text = re.sub(r"\{\{\s*company\s*\}\}(['\u2019])s", lambda m: company + m.group(1),
+                          text)
+
+        def fill(m):
+            return values[m.group(1)] if m.group(1) in values else m.group(0)
+        return MERGE_VAR_RE.sub(fill, text).strip()
 
     async def stageable(self, campaign_id: str, member: dict, prospect,
                         sendable_email) -> tuple[str, str] | None:

@@ -7265,12 +7265,63 @@ function renderPlanCard(p) {
     html += '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="approvePlan(this.dataset.plan)">' +
       escHtml(t('chat.plan.approve')) + '</button><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'reject\')">' +
       escHtml(t('chat.plan.reject')) + '</button></div>';
-  } else if (p.status === 'approved') {
+  }
+  html += planCampaigns(p.campaigns);
+  if (p.status === 'approved') {
     html += planWakes(p.wakes);
     html += '<div class="btn-row"><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'cancel\')">' +
       escHtml(t('chat.plan.cancel')) + '</button></div>';
   }
   return html + '</div>';
+}
+
+// The campaigns the agent made under a plan: a line each (status, members,
+// sent, replies), and for a draft it asked the user to start, a card with
+// what the Start would take (its audience counted, its sequence, its note,
+// the sending account, what is still to do) and a button to the campaign's
+// Start on the Campaigns page: the start itself stays there.
+function planCampaigns(list) {
+  if (!list || !list.length) return '';
+  return '<div class="plan-campaigns"><div class="muted small">' + escHtml(t('chat.camp.title')) + '</div><ul>' + list.map(c =>
+    '<li><b>' + escHtml(c.name || c.id) + '</b> <span class="badge t-' + escHtml(CAMPAIGN_TONE[c.status] || 'idle') + '">' + escHtml(t('chat.camp.st.' + c.status)) + '</span> ' +
+      '<span class="muted small">' + escHtml(t('chat.camp.line', {members: fmtN(c.members || 0), sent: fmtN(c.sent || 0), replies: fmtN(c.replies || 0)})) +
+      (c.needs_human ? ' · ' + escHtml(t('chat.camp.needs_you', {n: fmtN(c.needs_human)})) : '') + '</span>' +
+      (c.request ? startRequestCard(c) : '') + '</li>').join('') + '</ul></div>';
+}
+
+const CAMPAIGN_TONE = {draft: 'waiting', active: 'active', paused: 'note', finished: 'good', archived: 'idle'};
+
+function startRequestCard(c) {
+  const r = c.request || {};
+  const counts = r.preview || {};
+  const todo = (r.to_do || []).map(k => '<li>' + escHtml(t('chat.camp.todo.' + k)) + '</li>').join('');
+  const steps = (r.sequence || []).map(st => '<li><b>' + escHtml(st.subject || '') + '</b>' +
+    (st.step > 1 ? ' <span class="muted small">' + escHtml(t('chat.camp.after_days', {n: st.delay_days || 0})) + '</span>' : '') +
+    '<div class="start-body">' + escHtml(st.body || '') + '</div></li>').join('');
+  const acct = r.account ? (r.account.address || '') + (r.account.provider ? ' (' + r.account.provider + ')' : '') : '';
+  return '<div class="start-card"><div class="plan-head"><b>' + escHtml(t('chat.camp.request')) + '</b></div>' +
+    (r.audience ? '<div class="small">' + escHtml(t('chat.camp.audience', {name: r.audience.name})) + '</div>' : '') +
+    '<div class="small">' + escHtml(t('chat.camp.counts', {ready: fmtN(counts.ready || 0), risky: fmtN(counts.risky || 0),
+      check: fmtN(counts.to_verify || 0), out: fmtN((counts.left_out || 0) + (counts.untrusted || 0) + (counts.suppressed || 0) +
+      (counts.overlap || 0) + (counts.answered || 0) + (counts.risky_held || 0)), firms: fmtN(counts.firms || 0)})) + '</div>' +
+    (acct ? '<div class="small">' + escHtml(t('chat.camp.account', {account: acct})) + '</div>' : '') +
+    (r.rolling ? '<div class="small muted">' + escHtml(t('chat.camp.rolling')) + '</div>' : '') +
+    (steps ? '<div class="muted small">' + escHtml(t('chat.camp.sequence')) + '</div><ol class="plan-steps">' + steps + '</ol>' : '') +
+    '<div class="muted small">' + escHtml(t('chat.camp.note')) + '</div><div class="start-body small">' + escHtml(r.li_note || '') + '</div>' +
+    (todo ? '<div class="muted small">' + escHtml(t('chat.camp.todo')) + '</div><ul>' + todo + '</ul>' : '') +
+    '<div class="small">' + escHtml(t('chat.camp.check')) + '</div>' +
+    '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm" data-campaign="' + escHtml(c.id) + '" onclick="openCampaignStart(this.dataset.campaign)">' +
+      escHtml(t('chat.camp.open')) + '</button></div></div>';
+}
+
+// The campaign's draft opened on the Campaigns page, its Start there (the
+// acknowledgement first when it isn't given, then the start).
+async function openCampaignStart(id) {
+  _cp.tab = 'campaigns';
+  goTab('campaigns');
+  await editCampaign(id);
+  const el = document.getElementById('campaign-wizard');
+  if (el) el.scrollIntoView({block: 'start'});
 }
 
 // An approved plan's wakes to come: each scheduled one with its time, its
@@ -7449,7 +7500,8 @@ function wakeLabel(w) {
   if (runs.length) parts.push(t('chat.wake.run', {run: runs.slice(0, 3).join(', ')}));
   if (kinds.indexOf('scheduled') >= 0) parts.push(t('chat.wake.scheduled'));
   kinds.filter(k => k !== 'run_done' && k !== 'scheduled')
-    .forEach(k => parts.push(t('chat.wake.event', {kind: String(k).replace(/_/g, ' ')})));
+    .forEach(k => parts.push(['members', 'reply', 'campaign'].includes(k) ? t('chat.wake.kind.' + k)
+      : t('chat.wake.event', {kind: String(k).replace(/_/g, ' ')})));
   return parts.join('; ') || t('chat.wake.woken');
 }
 

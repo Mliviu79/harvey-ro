@@ -3782,16 +3782,13 @@ async def list_audiences(archived: bool = False):
 async def save_audience(request: Request):
     """Save the Contacts page's current filter: {"name", "query"} (its query
     string; kind is always email)."""
-    from harvey import campaigns
-    from harvey.contact_query import filter_from_query
+    from harvey import campaigns, launch
 
     body = await _json_body(request)
     state = await _campaign_state()
-    query = str(body.get("query") or "")
     try:
-        await filter_from_query(state, query)       # a filter the page can't read isn't saved
-        audience_id = await state.campaigns_call(campaigns.save_audience,
-                                                 str(body.get("name") or ""), query)
+        audience_id = await launch.save_audience(state, str(body.get("name") or ""),
+                                                 str(body.get("query") or ""))
     except (campaigns.Refused, ValueError) as e:
         return _campaign_refusal(e)
     except Exception as e:
@@ -3896,20 +3893,13 @@ async def create_campaign(request: Request):
     delay_days}], "li_note", "review": "inherit" | "always"}. Refused
     (409, need native_provider) unless the provider is Gmail, SMTP or
     Microsoft 365."""
-    from harvey import campaigns
+    from harvey import campaigns, launch
 
     body = await _json_body(request)
     try:
         config = _campaign_config()
         state = await _campaign_state()
-        address = getattr(getattr(config, "persona", None), "email", "") or ""
-        campaign_id = await state.campaigns_call(
-            campaigns.create_campaign, provider=config.channels.email.provider,
-            address=address, name=str(body.get("name") or ""),
-            audience_id=body.get("audience_id"), query=str(body.get("query") or ""),
-            rolling=bool(body.get("rolling")), offer=body.get("offer"),
-            sequence=body.get("sequence") or None, li_note=str(body.get("li_note") or ""),
-            review=str(body.get("review") or "inherit"))
+        campaign_id = await launch.new_campaign(state, config, body)
     except (campaigns.Refused, ValueError) as e:
         return _campaign_refusal(e)
     return {"success": True, "id": campaign_id,

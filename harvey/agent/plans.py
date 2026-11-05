@@ -214,8 +214,9 @@ async def status(state, plan_id, chat: str | None = None) -> dict:
 
 async def for_chat(state, chat: str) -> list[dict]:
     """A chat's plans, oldest first, each with its money and runs (the Chat
-    tab's cards), and an approved one's wakes to come (wakes.pending)."""
-    from harvey.agent import wakes
+    tab's cards), its campaigns (outreach.for_plan: their counts, a start
+    asked for) and an approved one's wakes to come (wakes.pending)."""
+    from harvey.agent import outreach, wakes
 
     out = []
     for plan in reversed(await listed(state, chat, limit=100)):
@@ -224,6 +225,8 @@ async def for_chat(state, chat: str) -> list[dict]:
             max(0.0, plan["budget_usd"] - m["committed_usd"]), 6)}
         if plan["status"] == APPROVED:
             p["wakes"] = await wakes.pending(state, plan["id"])
+        if plan["status"] not in (PROPOSED, REJECTED):
+            p["campaigns"] = await outreach.for_plan(state, plan["id"])
         out.append(p)
     return out
 
@@ -279,8 +282,10 @@ async def close(state, plan_id, *, cancel: bool, by: str, chat: str | None = Non
         raise Refused(f"plan {plan['id']} changed meanwhile")
     from harvey.agent import wakes
 
-    # (Its wakes still to come go with it.)
-    await wakes.cancel_plan(state, plan["id"])
+    # (Its wakes still to come go with it, and one running is stopped,
+    # unless the agent closed the plan itself: from a wake, that wake's
+    # last answer still reaches the chat.)
+    await wakes.cancel_plan(state, plan["id"], running=by != BY_AGENT)
     out = await get(state, plan["id"])
     out["runs_cancelled"] = 0
     if cancel:

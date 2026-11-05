@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 34).
+"""The overlay's tables (harvey.db schema 35).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 34
+LATEST = 35
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1035,10 +1035,35 @@ def _to_34(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_34)
 
 
+# ── Schema 35: the campaigns Harvey's agent made under a plan ──
+
+SCHEMA_35 = """
+-- A campaign Harvey's agent made under a plan (harvey/agent/outreach.py):
+-- the plan and chat it belongs to, so what happens to it (members a roll
+-- took, a reply, the campaign finishing) wakes that plan; and when the
+-- agent asked the user to start it, with what it counted then (JSON: the
+-- preview's counts, what is still to do before it can start). The chat
+-- shows it as a card; the start itself stays the user's own, on the
+-- Campaigns page.
+CREATE TABLE agent_campaign (
+  campaign TEXT PRIMARY KEY, plan INTEGER NOT NULL, chat TEXT NOT NULL,
+  created_at INTEGER NOT NULL, start_requested_at INTEGER,
+  start_request TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX agent_campaign_plan ON agent_campaign(plan);
+"""
+
+
+def _to_35(con: sqlite3.Connection) -> None:
+    """Schema 35: agent_campaign. Nothing on file changes: a campaign the
+    user made belongs to no plan."""
+    _script(con, SCHEMA_35)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
-         (32, _to_32), (33, _to_33), (34, _to_34))
+         (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

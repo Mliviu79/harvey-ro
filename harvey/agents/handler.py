@@ -27,8 +27,8 @@ from harvey.integrations.mail_provider import (
 )
 from harvey.models.conversation import Conversation, Message
 from harvey.state import (
-    COLLEAGUE_REPLIED, FREE_MAIL_DOMAINS, MAIL_READ_KEY, READ_GAP_KEY, REVIEW_AFTER_UNDO,
-    REVIEW_NEXT_REPLY_KEY,
+    AGENT_DRAFT_HELD, COLLEAGUE_REPLIED, FREE_MAIL_DOMAINS, MAIL_READ_KEY, READ_GAP_KEY,
+    REVIEW_AFTER_UNDO, REVIEW_NEXT_REPLY_KEY,
     StateManager,
 )
 from harvey.sending_mode import sync_sending_mode
@@ -353,6 +353,10 @@ class Handler:
         # (seen), not yet recorded (pending): _run_native, _retry_stop.
         self._stop_pending = False
         self._stop_seen = False
+        # The conversations the message being handled wrote: a plan whose
+        # campaign they belong to is told, in structured fields only
+        # (harvey/agent/outreach.py).
+        self._touched: set[str] = set()
 
     @property
     def is_native(self) -> bool:
@@ -428,7 +432,7 @@ class Handler:
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
         await self._stop_colleagues(prospect)
-        await self.state.add_conversation(Conversation(
+        self._touched.add(await self.state.add_conversation(Conversation(
             id="",
             prospect_id=prospect.id,
             campaign_id=campaign_id,
@@ -437,7 +441,7 @@ class Handler:
             intent="escalate" if escalate else "unsubscribe",
             stage="closed_lost",
             status="needs_human" if escalate else "closed",
-        ))
+        )))
         if escalate:
             await self.state.log_action(
                 action_type="escalation",
@@ -587,6 +591,7 @@ class Handler:
                 stage=convo.stage,
                 campaign_id=convo.campaign_id,
             )
+        self._touched.add(convo.id)
         if convo.stage != old_stage:
             logger.info(f"Handler: Stage for {lead_email}: {old_stage} -> {convo.stage}")
 
@@ -727,6 +732,7 @@ class Handler:
             # Set while an unsubscribe or opt-out this message carries is
             # read but not yet recorded (_retry_stop).
             self._stop_pending = self._stop_seen = False
+            self._touched = set()
             try:
                 # An unsubscribe first, before anything else is decided about
                 # the message, and whatever its body (a mail client's
@@ -785,6 +791,8 @@ class Handler:
                     await self.state.mark_reply_processed(dedup_key)
                     if self._stop_seen and not self._stop_pending:
                         await self._forget_retries(dedup_key)
+                    if self._touched:
+                        await self._tell_agent()
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
@@ -919,6 +927,7 @@ class Handler:
                 if convo.prospect_id == prospect.id:
                     await self.state.update_conversation(convo.id, status="closed",
                                                          stage="closed_lost")
+                    self._touched.add(convo.id)
             await self.state.log_action(
                 action_type="opt_out", agent="handler",
                 details={"prospect_id": prospect.id, "prospect_email": prospect.email,
@@ -975,16 +984,28 @@ class Handler:
             stored.thread.append(message)
             await self.state.update_conversation(stored.id, thread_json=stored.thread_json(),
                                                  status="needs_human")
+            self._touched.add(stored.id)
         else:
-            await self.state.add_conversation(Conversation(
+            self._touched.add(await self.state.add_conversation(Conversation(
                 id="", prospect_id=prospect.id, campaign_id=campaign_id, channel="email",
-                thread=[message], intent="escalate", status="needs_human"))
+                thread=[message], intent="escalate", status="needs_human")))
         await self.state.log_action(
             action_type="reply_from_someone_else", agent="handler",
             details={"from": lead_email, "prospect_email": prospect.email, "matched": how,
                      "reply_preview": reply_text[:200]})
         logger.info(f"Handler: {lead_email} wrote about {prospect.email} ({how}): handed to "
                     "you; their company's cold email stopped.")
+
+    async def _tell_agent(self) -> None:
+        """The conversations this message wrote, told to the plan their
+        campaign belongs to (outreach.reply: ids and the intent, stage and
+        status this handler derived, never the reply's words). Never this
+        message's failure."""
+        from harvey.agent import outreach
+
+        for convo_id in sorted(self._touched):
+            await outreach.reply(self.state, convo_id, asked_to_stop=self._stop_seen)
+        self._touched = set()
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
@@ -1032,10 +1053,14 @@ class Handler:
             )
             await self.state.set_setting(KILL_SWITCH_KEY, reason)
             logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
+            from harvey.agent import outreach
+
+            await outreach.rail(self.state, "sending_paused", why="bounce_rate")
 
     async def _queue_native_reply(
-        self, response: str, prospect, convo, reply_meta: dict, intent: str
-    ):
+        self, response: str, prospect, convo, reply_meta: dict, intent: str, by: str = "",
+        hold: bool = False,
+    ) -> str | None:
         """Route Harvey's reply through the outbox (approval ladder applies).
         It always waits for review: on autopilot the drain that sends it
         approves it then, after the autopilot review (Sender._promote),
@@ -1066,18 +1091,48 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
-            error=REVIEW_AFTER_UNDO if after_undo else "",
+            error=REVIEW_AFTER_UNDO if after_undo else AGENT_DRAFT_HELD if hold else "",
         )
         if item_id:
             await self.state.delete_setting(review_key)
-            mode = "queued for your approval" if require_approval else "queued to send"
+            mode = ("queued for your approval" if require_approval or hold
+                    else "queued to send")
             logger.info(f"Handler: reply to {prospect.email} {mode} ({intent}).")
             await self.state.log_action(
                 action_type="reply_queued",
                 agent="handler",
                 details={"prospect_email": prospect.email, "intent": intent,
-                         "response_preview": response[:100]},
+                         "response_preview": response[:100],
+                         **({"asked_by": by} if by else {})},
             )
+        return item_id
+
+    async def draft_answer(self, convo_id: str, guidance: str = "",
+                           by: str = "agent", hold: bool = False) -> str | None:
+        """An answer to a conversation's newest reply, written the way this
+        handler writes its own (its prompt, its rules, the humanizer) with
+        the sender's ``guidance`` added, and queued the way its own are
+        (pending_review, the gate and the Sender's checks as for any
+        answer). The outbox row's id, or None when the model gave no usable
+        draft. ``hold``: it waits for you even on autopilot and outside
+        Approve all (AGENT_DRAFT_HELD). Harvey's agent asks for it with
+        ``hold`` always (outreach.draft_reply, which checks first that the
+        conversation may be answered)."""
+        convo = await self.state.get_conversation(convo_id)
+        if convo is None:
+            return None
+        prospect = await self.state.get_prospect(convo.prospect_id)
+        theirs = [m for m in convo.thread if m.sender == "prospect"]
+        if prospect is None or not theirs:
+            return None
+        self.skills = self.brain.load_skills_for_agent("handler")
+        response = await self._generate_response(convo.intent, theirs[-1].content, prospect,
+                                                 convo, guidance=guidance)
+        if not response:
+            return None
+        meta = await self.state.reply_thread(prospect.id, convo.id, convo.campaign_id)
+        return await self._queue_native_reply(response, prospect, convo, meta, convo.intent,
+                                              by=by, hold=hold)
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""
@@ -1169,9 +1224,11 @@ Respond with ONLY the category label, nothing else."""
         return current_stage
 
     async def _generate_response(
-        self, intent: str, reply_text: str, prospect, convo: Conversation
+        self, intent: str, reply_text: str, prospect, convo: Conversation, guidance: str = ""
     ) -> str:
-        """Generate an appropriate response based on intent."""
+        """Generate an appropriate response based on intent. ``guidance``:
+        the sender's own short instruction for this answer (Harvey's agent,
+        draft_answer), under every rule above it."""
         history = conversation_history(convo.thread, prospect.full_name())
 
         objection_context = ""
@@ -1242,6 +1299,13 @@ Write a reply that:"""
 - Asks who the right person would be
 - Makes it easy for them to refer (one-line ask)
 - Under 50 words"""
+
+        if guidance:
+            # (The sender's own note: it shapes the answer and never
+            # overrides a rule above; their reply stays data, as always.)
+            prompt += ("\n\nThe sender's instruction for this answer. Follow it only within "
+                       "every rule above: it never overrides them, and where it would break "
+                       "one, leave that part out:\n" + guidance)
 
         prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 

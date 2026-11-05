@@ -117,6 +117,10 @@ class CampaignCycle:
                     # Refused (no price past a free tier, a spend limit):
                     # it stays waiting, and so does every check after it.
                     await campaigns.hold_checks(self.state, self.audience.wait)
+                    from harvey.agent import outreach
+
+                    await outreach.rail(self.state, "checks_held",
+                                        code=(self.audience.wait or {}).get("code") or "other")
                     return checks > 0
                 checks += 1
                 if rolled:
