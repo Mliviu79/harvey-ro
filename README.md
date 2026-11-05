@@ -84,7 +84,7 @@ Your selected subscription covers model calls, subject to its usage limits. That
 
 For comparison, the tools Harvey replaces start at $250–500/month — and they are weakest precisely where Harvey is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
 
-**Harvey also budgets itself.** It reads the active provider's subscription quota and throttles to leave headroom for your own Claude or Codex work. Set `max_daily_claude_percent: 80` for either provider—the setting's name predates Codex support. If quota cannot be read, Harvey reports it as unavailable and falls back to its daily call budget.
+**Harvey also budgets itself.** It reads the active provider's subscription quota and throttles to leave headroom for your own Claude or Codex work. For Claude the numbers are what the Claude CLI itself reports: the rate-limit event in each of Harvey's answers, and, when there is no recent one, the CLI's `/usage` command (no model call, no tokens). Harvey never reads your Claude login. The Usage tab and `harvey usage` say when the numbers were last seen and from which of the two. Set `max_daily_claude_percent: 80` for either provider—the setting's name predates Codex support. If quota cannot be read, Harvey reports it as unavailable and falls back to its daily call budget; while a Claude window is unknown or its reading is over 30 minutes old, that budget holds as well.
 
 Harvey runs locally with your own login. Check the terms and usage limits of the provider you choose.
 

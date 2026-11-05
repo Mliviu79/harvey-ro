@@ -24,6 +24,13 @@ and MCP servers, and saves a transcript of the prompt under
   an enclosing Claude Code session removed. Login, proxy and provider
   variables are left exactly as they are.
 
+The output is stream-json (``--verbose``): one JSON event a line, the last
+the result the brain reads, and among them the CLI's ``rate_limit_event``,
+which is how Harvey knows the plan's usage without ever reading the login
+(harvey/integrations/quota.py). The one call that keeps slash commands is
+the ``/usage`` check (build_usage_probe_command): the same isolation
+otherwise, and no model call.
+
 The agent (harvey/agent/chat.py) is the one call that has tools: only
 Harvey's own MCP server, read-only (build_agent_command). It runs with
 ``--restricted`` instead of ``--safe-mode``, which would not start the
@@ -62,7 +69,12 @@ REQUIRED_FLAGS = (
     "--strict-mcp-config",
     "--tools",
     "--output-format",
+    "--verbose",
 )
+
+# The /usage check (harvey/integrations/quota.py): the brain's isolation but
+# for --disable-slash-commands, which would refuse the one command it runs.
+PROBE_FLAGS = tuple(f for f in REQUIRED_FLAGS if f != "--disable-slash-commands")
 
 # The agent's call (build_agent_command): Harvey's MCP server and nothing
 # else, a conversation over stdin and stdout. --max-turns isn't listed by
@@ -199,8 +211,12 @@ def build_command(executable: str, model: str = "", session_id: str | None = Non
     on stdin."""
     cmd = [
         executable, "-p",
-        # JSON output carries exact token/cost accounting per call.
-        "--output-format", "json",
+        # One JSON event a line: the result line carries exact token/cost
+        # accounting per call (the fields --output-format json gave), and a
+        # rate_limit_event line the plan's usage (harvey/integrations/quota.py).
+        # (stream-json output needs --verbose; it adds no instruction source.)
+        "--output-format", "stream-json",
+        "--verbose",
         # No tools at all: prompts carry untrusted text (prospect replies,
         # scraped pages); with no tools an injected instruction has nothing
         # to act with, and --strict-mcp-config keeps the operator's MCP
@@ -225,6 +241,24 @@ def build_command(executable: str, model: str = "", session_id: str | None = Non
         except ValueError:
             pass
     return cmd
+
+
+def build_usage_probe_command(executable: str) -> list[str]:
+    """argv for the /usage check: the command goes in on stdin, and the CLI
+    answers it itself (no model call, no tokens). The brain's isolation,
+    without --disable-slash-commands, which would refuse /usage."""
+    return [
+        executable, "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--tools", "",
+        "--strict-mcp-config",
+        # (Safe mode turns off custom commands, not the built-in /usage.)
+        "--safe-mode",
+        "--setting-sources", "",
+        "--no-session-persistence",
+        "--max-turns", "1",
+    ]
 
 
 def build_agent_command(executable: str, mcp_config: str, *, max_turns: int,

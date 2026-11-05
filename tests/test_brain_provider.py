@@ -523,12 +523,31 @@ def test_dashboard_codex_quota_is_labelled_codex(client, monkeypatch):
 
 
 def test_dashboard_claude_default_unchanged(client, monkeypatch):
+    import time
+
+    from harvey.integrations import quota
+
     monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig())
-    monkeypatch.setitem(dash._quota_clients, ("claude", ""),
-                        _Quota({"seven_day": {"utilization": 50.0, "resets_at": ""}}))
+    reset = int(time.time()) + 3600
+    # (Claude's reading is what its CLI last reported, kept in the database.)
+    asyncio.run(quota.note_infos(StateManager(str(client.db_path)), [
+        {"status": "allowed", "rateLimitType": "seven_day",
+         "unifiedWindows": {"seven_day": {"utilization": 0.5, "resetsAt": reset}}}]))
     data = client.get("/api/usage").json()
     assert data["quota_provider"] == "claude"
-    assert data["quota"]["seven_day"]["utilization"] == 50.0
+    w = data["quota"]["seven_day"]
+    assert w["utilization"] == 50.0 and w["source"] == "answer" and w["seen_at"]
+
+
+def test_claude_quota_card_says_when_and_where_it_was_seen():
+    html = _render_js("quotaCardHtml", {
+        "quota_provider": "claude", "quota_status": "available",
+        "quota": {"seven_day_fable": {"utilization": 3.0, "resets_at": "",
+                                      "seen_at": "2026-11-05T10:00:00Z", "age_seconds": 60,
+                                      "source": "usage_check"}}},
+        helpers=("escHtml", "formatDate", "parseTs", "relTime"))
+    assert "Weekly, fable" in html and "seen " in html
+    assert "from the CLI&#39;s /usage command" in html or "from the CLI's /usage command" in html
 
 
 def test_dashboard_reports_unavailable_codex_quota(client, monkeypatch):

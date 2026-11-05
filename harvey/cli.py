@@ -278,6 +278,21 @@ def cmd_status(args):
         raise SystemExit(1)
 
 
+def _quota_seen(windows: dict) -> str:
+    """When the newest of Claude's readings was seen and where it came from
+    ("" for a gauge that doesn't say: Codex's)."""
+    seen = [w for w in windows.values() if isinstance(w.get("age_seconds"), int)]
+    if not seen:
+        return ""
+    w = min(seen, key=lambda w: w["age_seconds"])
+    age = w["age_seconds"]
+    ago = ("just now" if age < 60 else f"{age // 60} min ago" if age < 3600
+           else f"{age // 3600} h ago")
+    source = {"answer": "from an answer's rate-limit event",
+              "usage_check": "from the CLI's /usage command"}.get(w.get("source"), "")
+    return f"Last seen {ago} ({w['seen_at']})" + (f", {source}" if source else "") + "."
+
+
 def cmd_usage(args):
     """Show brain usage: active provider's quota, totals, breakdowns."""
     from harvey.state import StateManager
@@ -305,7 +320,7 @@ def cmd_usage(args):
                     CodexClient(model=brain_config.model)).get_utilization()
             elif provider == "claude":
                 from harvey.integrations.quota import QuotaClient
-                windows = await QuotaClient().get_utilization()
+                windows = await QuotaClient(state).get_utilization()
         except Exception:
             pass
 
@@ -317,12 +332,19 @@ def cmd_usage(args):
                       "limit_reached": "Usage limit"}
             for key, w in windows.items():
                 resets = f"  (resets {w['resets_at']})" if w.get("resets_at") else ""
-                print(f"  {labels.get(key, key):<16} {w['utilization']:5.1f}% used{resets}")
+                label = labels.get(key) or (f"Weekly, {key[len('seven_day_'):]}"
+                                            if key.startswith("seven_day_") else key)
+                print(f"  {label:<16} {w['utilization']:5.1f}% used{resets}")
+            seen = _quota_seen(windows)
+            if seen:
+                print(f"  {seen}")
         elif provider == "codex":
             print("  Quota gauge unavailable (check 'codex login', the Codex CLI "
                   "version, and network).")
         elif provider == "claude":
-            print("  Quota gauge unavailable (run 'claude login' or check network).")
+            print("  Quota gauge unavailable: no reading from the Claude CLI yet (it comes "
+                  "with Harvey's next answer, or its /usage check; run 'claude login' "
+                  "if it isn't logged in).")
 
         totals = await state.usage_totals()
         print()

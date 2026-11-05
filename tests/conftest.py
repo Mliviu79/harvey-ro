@@ -129,6 +129,21 @@ def _stand_in_claude_cli(request, monkeypatch):
     claude_runtime.clear_cache()
 
 
+import harvey.integrations.quota as _quota  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_usage_check(monkeypatch):
+    """The /usage check never runs in tests: it starts the real CLI.
+    Tests of the check keep the real one from before this runs
+    (tests/test_quota.py), with a stand-in for the CLI's output."""
+    async def no_probe(state, *, force=False):
+        return False
+
+    monkeypatch.setattr(_quota, "probe", no_probe)
+    monkeypatch.setattr(_quota, "_run_probe", lambda exe: None)
+
+
 import harvey.humanize  # noqa: E402
 
 

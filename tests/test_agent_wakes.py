@@ -110,6 +110,15 @@ while True:
     if mode == "login":
         result("Not logged in · Please run /login", True)
         continue
+    if mode == "limited":
+        # (The plan's limit reached, as the CLI's rate-limit event says it,
+        # with an error result that doesn't: fictional values.)
+        import time
+        out({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "resetsAt": int(time.time()) + 3600,
+            "rateLimitType": "five_hour"}})
+        result("Something went wrong", True)
+        continue
     if mode == "die":
         sys.stderr.write("something broke\n")
         sys.exit(3)
@@ -444,6 +453,20 @@ def test_over_the_plans_share_the_wake_waits_and_the_lane_rests(state, fake, mon
     assert fake() == []
     held = _run(wakes.held(state))
     assert held and "usage.max_daily_claude_percent" in held["why"] and not held["paused"]
+
+
+def test_a_rejected_rate_limit_event_rests_the_lane_until_later(state, fake, monkeypatch):
+    from harvey.integrations import quota
+
+    monkeypatch.setenv("FAKE_WAKE", "limited")
+    plan_id = _plan(state)
+    _run(wakes.note(state, plan_id, "reply", "r1", {}))
+    job = _work_wake(state)
+    assert job.status == "queued" and job.not_before
+    held = _run(wakes.held(state))
+    assert "Claude plan's limit is reached" in held["why"] and not held["paused"]
+    assert quota.limited(_run(quota.load(state)))
+    assert _q(state, "SELECT COUNT(*) FROM agent_message") == [(0,)]
 
 
 def test_a_logged_out_cli_pauses_the_agents_lane(state, fake, monkeypatch):

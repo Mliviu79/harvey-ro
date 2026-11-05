@@ -2189,9 +2189,10 @@ function emailTag(p) {
     escHtml(m.label) + '</span>';
 }
 
-// Quota gauges for the ACTIVE provider only: Claude's are the numbers
-// `/usage` shows in Claude Code; Codex's are the ChatGPT plan's limits.
-// When they can't be read, say so rather than hiding the card.
+// Quota gauges for the ACTIVE provider only: Claude's are what its CLI
+// last reported (an answer's rate-limit event, or its /usage command), with
+// when; Codex's are the ChatGPT plan's limits. When they can't be read, say
+// so rather than hiding the card.
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
@@ -2206,7 +2207,8 @@ function quotaCardHtml(data) {
     const color = pct >= 80 ? 'yellow' : 'green';
     const resets = w.resets_at ? t('use.resets', {when: formatDate(w.resets_at)}) : '';
     const lkey = 'use.window.' + key;
-    const label = t(lkey) === lkey ? key : t(lkey);
+    const label = t(lkey) !== lkey ? t(lkey)
+      : key.startsWith('seven_day_') ? t('use.window.seven_day_model', {model: key.slice(10)}) : key;
     html += '<div class="progress-wrap">' +
       '<div class="progress-label">' +
         '<span class="text">' + escHtml(label) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
@@ -2214,6 +2216,14 @@ function quotaCardHtml(data) {
       '</div>' +
       '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>' +
     '</div>';
+  }
+  // When the newest reading was seen, and from which source (Claude's only).
+  const seen = Object.values(data.quota).filter(w => w.seen_at)
+    .sort((a, b) => (a.age_seconds || 0) - (b.age_seconds || 0))[0];
+  if (seen) {
+    const skey = 'use.source.' + seen.source;
+    html += '<p class="muted">' + t('use.seen', {when: relTime(seen.seen_at)}) +
+      (t(skey) !== skey ? ' &middot; ' + escHtml(t(skey)) : '') + '</p>';
   }
   return html;
 }

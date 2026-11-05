@@ -200,7 +200,11 @@ while True:
                                                    "delta": {"type": "text_delta", "text": piece}}})
         out({"type": "assistant", "message": {"id": mid, "content": [
             {"type": "text", "text": f"Mesajul {n}: trei firme."}]}})
-        out({"type": "rate_limit_event"})
+        # (The plan's usage, as the CLI reports it: fictional values.)
+        reset = int(time.time()) + 3600
+        out({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "resetsAt": reset, "rateLimitType": "five_hour",
+            "unifiedWindows": {"five_hour": {"utilization": 0.05 * n, "resetsAt": reset}}}})
         result(f"Mesajul {n}: trei firme.")
 '''
 
@@ -372,6 +376,19 @@ def test_two_messages_are_one_conversation_in_one_process(state, fake):
     [(title, turn)] = _q(state, "SELECT title, turn FROM agent_chat")
     assert (title, turn) == ("Câte firme din Cluj?", "")
     assert _q(state, "SELECT SUM(claude_calls) FROM usage_log") == [(2,)]
+
+
+def test_an_answers_rate_limit_event_is_the_plans_usage_reading(state, fake):
+    from harvey.integrations import quota
+
+    async def work(h):
+        first = await _say(h, None, "Câte firme din Cluj?")
+        await _say(h, first[0]["chat"], "Și cu email?")
+        return await quota.QuotaClient(state).get_utilization(probe_if_stale=False)
+    gauge = _run(state, work)
+    # (The newest answer's reading replaced the first's.)
+    assert gauge["five_hour"]["utilization"] == 10.0
+    assert gauge["five_hour"]["source"] == "answer"
 
 
 def test_a_chats_title_is_its_first_message_cut_at_a_word():

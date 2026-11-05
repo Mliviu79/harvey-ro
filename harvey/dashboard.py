@@ -1497,16 +1497,17 @@ def _quota_client_for(provider: str, model: str = ""):
     """One cached quota reader per provider (and Codex model). Each reads
     only its own subscription, so a Claude gauge is never shown as Codex or
     vice versa, and Codex shows the bucket metering the configured model."""
-    key = (provider, model if provider == "codex" else "")
+    if provider == "claude":
+        # (Claude's readings are kept in the database, so the reader holds
+        # nothing of its own.)
+        from harvey.integrations.quota import QuotaClient
+        return QuotaClient(_state())
+    if provider != "codex":
+        return None
+    key = (provider, model)
     if key not in _quota_clients:
-        if provider == "codex":
-            from harvey.codex import CodexClient, CodexQuotaClient
-            _quota_clients[key] = CodexQuotaClient(CodexClient(model=model))
-        elif provider == "claude":
-            from harvey.integrations.quota import QuotaClient
-            _quota_clients[key] = QuotaClient()
-        else:
-            return None
+        from harvey.codex import CodexClient, CodexQuotaClient
+        _quota_clients[key] = CodexQuotaClient(CodexClient(model=model))
     return _quota_clients[key]
 
 

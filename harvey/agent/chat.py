@@ -1175,6 +1175,12 @@ class Live:
                     last_call = await self._emit_calls(answer, last_call)
                     if turns >= MAX_TURNS:
                         answer.stop("max_turns")
+                elif kind == "rate_limit_event":
+                    # (The plan's usage, as the CLI reports it: the gauge
+                    # the budget check reads.)
+                    from harvey.integrations import quota
+
+                    await quota.note(state, event)
                 elif kind == "result":
                     result = event
                     break

@@ -847,6 +847,25 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Claude's usage gauge no longer touches your login.** Harvey used to
+  read the Claude OAuth token (the credentials file or the macOS keychain)
+  and call Anthropic's usage endpoint with it; Anthropic's terms don't let a
+  developer collect, store or pass on Claude.ai credentials, so that is
+  gone. The numbers now come from the Claude CLI itself: the rate-limit
+  event every one of Harvey's runs writes (the brain's calls, now read as
+  stream-json, the agent's chats, wakes and tasks), each window kept with
+  when it was seen until it resets, and, when there's no reading from the
+  last 10 minutes, the CLI's own `/usage` command, asked at most every 10
+  minutes with no tools and no model call. A window the CLI says is
+  rejected counts as full until it resets: the brain doesn't retry and the
+  agent's lane rests. The Usage tab and `harvey usage` say when the numbers
+  were seen and whether from an answer or the `/usage` check. A window
+  the CLI hasn't reported, or reported over 30 minutes ago, isn't taken as
+  room to spend: the daily call budget holds as well, as with no gauge
+  (unless a `/usage` check in that time didn't list it: no session running). A
+  `/usage` check the model answered instead of the CLI gives no reading and
+  isn't asked again for a day. Codex's gauge is unchanged.
+
 - **Merge variables have one list.** The send check's template check and
   the Sender read the same five (`first_name`, `last_name`, `company`,
   `title`, `personalization`), and the Sender now fills them with any

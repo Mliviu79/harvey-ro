@@ -1,4 +1,5 @@
-"""Tests for usage tracking: schema, pricing, result parsing, reconciliation, quota."""
+"""Tests for usage tracking: schema, pricing, result parsing, reconciliation
+(the quota gauge: tests/test_quota.py)."""
 
 import json
 import os
@@ -10,7 +11,6 @@ import pytest_asyncio
 
 from harvey.brain import Brain
 from harvey.state import StateManager
-from harvey.integrations.quota import _parse_window, _token_from_json_blob
 
 
 @pytest_asyncio.fixture
@@ -144,21 +144,3 @@ async def test_usage_is_harvey_only(state):
     import harvey.usage as usage_mod
     assert not hasattr(usage_mod, "reconcile_transcripts")
     assert not hasattr(usage_mod, "parse_transcript_events")
-
-
-# ── quota client helpers ──
-
-
-def test_token_from_json_blob():
-    blob = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-abc"}})
-    assert _token_from_json_blob(blob) == "sk-ant-oat01-abc"
-    assert _token_from_json_blob("not json") is None
-    assert _token_from_json_blob(json.dumps({"other": 1})) is None
-
-
-def test_parse_window():
-    parsed = _parse_window({"utilization": 42.5, "resets_at": "2026-08-29T01:00:00Z"})
-    assert parsed == {"utilization": 42.5, "resets_at": "2026-08-29T01:00:00Z"}
-    assert _parse_window({"utilization": "bad"}) is None
-    assert _parse_window(None) is None
-    assert _parse_window({"utilization": 0})["utilization"] == 0.0

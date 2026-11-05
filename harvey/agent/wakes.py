@@ -614,6 +614,13 @@ async def no_answer(state, payload, response: str, err: str, ended: str, exit_co
     if kind == "auth" or any(p in lowered for p in chat._LOGIN_PATTERNS):
         raise jobs.LaneExhausted(driver.login_detail(driver.CODEX if codex else driver.CLAUDE)
                                  + ", then resume the agent's lane on the Queue page")
+    if not codex and kind != "usage_limit":
+        # (The CLI's own rate-limit event said the plan's limit is reached:
+        # harvey/integrations/quota.py.)
+        from harvey.integrations import quota
+
+        if quota.limited(await quota.load(state)):
+            kind = "usage_limit"
     if kind == "usage_limit" or any(p in lowered for p in _QUOTA_PATTERNS):
         why = (f"your {'ChatGPT' if codex else 'Claude'} plan's limit is reached for now: "
                f"the {what}s wait")
@@ -718,6 +725,10 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                 ended = "max_turns"
                 result = await _interrupted(proc)
                 break
+            elif kind == "rate_limit_event":
+                from harvey.integrations import quota
+
+                await quota.note(state, event)
             elif kind == "result":
                 result = event
                 break

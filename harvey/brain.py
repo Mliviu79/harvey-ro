@@ -74,6 +74,10 @@ def active_brain_status(raw: str, provider: str) -> dict:
     return status if status.get("provider") == provider else {}
 
 
+# The stream-json lines a run writes before its result.
+_STREAM_EVENTS = ("system", "assistant", "user", "stream_event", "rate_limit_event")
+
+
 class BrainUnavailable(Exception):
     """The provider can't be used until the operator acts. Raised only where
     a caller must leave its input untouched for a later retry."""
@@ -106,9 +110,8 @@ class Brain:
             )
             self.quota = CodexQuotaClient(self.codex)
         else:
-            # Lazy import avoids a cycle (quota -> usage -> state).
             from harvey.integrations.quota import QuotaClient
-            self.quota = QuotaClient()
+            self.quota = QuotaClient(state)
 
     def for_profile(self, profile_id: str = "") -> "Brain":
         """The brain that writes for a campaign's AI profile. One profile
@@ -354,6 +357,16 @@ class Brain:
 
                 if process.returncode != 0:
                     error = stderr.decode(errors="replace").strip()
+                    _, _, limits = self._parse_stream(
+                        (stdout or b"").decode(errors="replace"))
+                    if limits:
+                        from harvey.integrations import quota
+
+                        await quota.note_infos(self.state, limits)
+                    if any(i.get("status") == "rejected" for i in limits):
+                        logger.error("Claude usage limit reached for this plan; "
+                                     "calls wait until it resets.")
+                        return ""
                     logger.error(
                         f"Claude exited with code {process.returncode}: {error[:300]}"
                     )
@@ -367,7 +380,14 @@ class Brain:
                     continue  # retry transient failures
 
                 raw = stdout.decode(errors="replace").strip()
-                response, payload = self._parse_result_payload(raw)
+                response, payload, limits = self._parse_stream(raw)
+                # The plan's usage as the CLI reported it (never fails the
+                # call).
+                limited = any(i.get("status") == "rejected" for i in limits)
+                if limits:
+                    from harvey.integrations import quota
+
+                    await quota.note_infos(self.state, limits)
 
                 # Usage accounting must never break the response path.
                 try:
@@ -380,6 +400,11 @@ class Brain:
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
 
+                if payload is None and raw and not response:
+                    logger.error("Claude's output ended without a result.")
+                    last_error = "no result"
+                    continue
+
                 if payload and payload.get("is_error"):
                     # The CLI reported an API error (overloaded, rate limited)
                     # inside a successful exit. That text is not the model's
@@ -387,6 +412,13 @@ class Brain:
                     # other transient failure.
                     logger.error(f"Claude reported an error: {response[:300]}")
                     last_error = response
+                    if limited:
+                        # The plan's limit is reached: retrying can't help
+                        # before it resets, and the reading now holds the
+                        # budget check back until then.
+                        logger.error("Claude usage limit reached for this plan; "
+                                     "calls wait until it resets.")
+                        return ""
                     continue
 
                 logger.debug(f"Brain response: {response[:200]}...")
@@ -507,20 +539,47 @@ class Brain:
 
     @staticmethod
     def _parse_result_payload(raw: str) -> tuple[str, dict | None]:
-        """Split CLI JSON output into (response_text, result_payload).
+        """Split CLI output into (response_text, result_payload).
 
-        With ``--output-format json`` stdout is one JSON object whose
-        ``result`` field is the model's text. If parsing fails (older CLI,
-        truncated output), fall back to treating stdout as plain text so a
-        formatting change can never break Harvey's pipeline.
+        With ``--output-format stream-json`` stdout is one JSON event a
+        line, the last the result, whose ``result`` field is the model's
+        text (the object ``--output-format json`` printed alone, which is
+        read the same way). If no line is a result (older CLI, truncated
+        output), fall back to treating stdout as plain text so a formatting
+        change can never break Harvey's pipeline.
         """
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw, None
-        if not isinstance(payload, dict) or payload.get("type") != "result":
-            return raw, None
-        return str(payload.get("result") or ""), payload
+        text, payload, _ = Brain._parse_stream(raw)
+        return text, payload
+
+    @staticmethod
+    def _parse_stream(raw: str) -> tuple[str, dict | None, list[dict]]:
+        """(response_text, result_payload, rate_limit_infos) of a call's
+        stdout: the last result line, and every rate_limit_event's info
+        (harvey/integrations/quota.py), oldest first."""
+        from harvey.integrations.quota import rate_limit_info
+
+        payload, infos, events = None, [], 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            events += event.get("type") in _STREAM_EVENTS
+            info = rate_limit_info(event)
+            if info:
+                infos.append(info)
+            elif event.get("type") == "result":
+                payload = event
+        if payload is None:
+            # (Events with no result: a stream cut short, never the model's
+            # text. Only output that isn't a stream is read as plain text.)
+            return ("" if events else raw), None, infos
+        return str(payload.get("result") or ""), payload, infos
 
     async def _record_usage(
         self, payload: dict | None, agent: str, task: str, label: str
@@ -642,8 +701,9 @@ class Brain:
     ) -> bool:
         """Check whether Harvey may spend more of the active subscription.
 
-        Preferred signal: the account's REAL utilization windows (Claude's
-        `/usage` numbers, or Codex's ChatGPT-plan rate limits), compared
+        Preferred signal: the account's REAL utilization windows (Claude's,
+        as its CLI reports them in each answer and its /usage command, or
+        Codex's ChatGPT-plan rate limits), compared
         against max_percent so Harvey always leaves the remainder for the
         user's own interactive work. Fallback when those are unavailable:
         Harvey's own call counter for this provider against max_daily_calls.
@@ -675,10 +735,22 @@ class Brain:
                         f"{self.provider_label} quota gate: utilization {worst:.0f}% >= "
                         f"{max_percent:.0f}% limit. {resets}"
                     )
-                return within
+                    return False
+                if not self._gauge_unknown(windows):
+                    return True
+                # (A window the gauge doesn't know now, or knows only from
+                # a while ago, isn't room to spend: the call counter holds
+                # as well, as with no gauge at all.)
 
         calls = await self.check_usage()
         return calls < max_daily_calls
+
+    def _gauge_unknown(self, windows: dict) -> bool:
+        """Whether a window the gauge must know is missing, or was last
+        seen too long ago (Claude's: the CLI reports only some windows in
+        an answer; Codex's reader asks for every one, so never)."""
+        unknown = getattr(self.quota, "unknown_windows", None)
+        return bool(unknown()) if callable(unknown) else False
 
     def load_prompt(self, prompt_name: str, **kwargs) -> str:
         """Load a prompt template from the prompts/ directory and fill in variables."""
