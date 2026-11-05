@@ -593,7 +593,8 @@ async function loadPublicData() {
 function renderPublicData(data) {
   const el = document.getElementById('public-data');
   if (!el) return;
-  _pdRunning = {fin: !!(data.financials || {}).running, tax: !!(data.taxpayers || {}).running};
+  _pdRunning = {fin: !!(data.financials || {}).running, tax: !!(data.taxpayers || {}).running,
+                bounds: !!(data.boundaries || {}).running};
   const fin = data.financials || {};
   const reg = data.registry;
   const num = v => fmtN(Number(v || 0));
@@ -643,7 +644,8 @@ function renderPublicData(data) {
       '<div class="module-terms">' + escHtml(t('pd.source', {attribution: fin.attribution || ''})) + '</div>';
   }
   clearTimeout(_pdTimer);
-  if (fin.running || (data.taxpayers || {}).running || (data.anaf || {}).running) {
+  if (fin.running || (data.taxpayers || {}).running || (data.anaf || {}).running ||
+      (data.boundaries || {}).running) {
     _pdTimer = setTimeout(pollFinancials, 3000);
   }
   el.innerHTML = '<div class="subhead">' + escHtml(t('pd.title')) + '</div>' +
@@ -657,7 +659,54 @@ function renderPublicData(data) {
         taxpayersBody(data.taxpayers || {}) + '</div></div>' +
       '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.anaf')) + '</h3>' +
         anafBody(data.anaf || {}) + '</div></div>' +
+      (data.boundaries && data.boundaries.on !== undefined
+        ? '<div class="module-row"><div class="module-text"><h3>' + escHtml(t('pd.bounds')) + '</h3>' +
+          boundariesBody(data.boundaries) + '</div></div>' : '') +
     '</div>';
+}
+
+// OpenStreetMap's administrative boundaries: one extract a region, read locally.
+function boundariesBody(b) {
+  if (!b.on) return '<p class="desc">' + escHtml(t('pd.bounds_off')) + '</p>';
+  const num = v => fmtN(Number(v || 0));
+  const regions = (b.regions || []).join(', ');
+  const lines = [];
+  const loaded = b.loaded;
+  if (loaded) {
+    const levels = Object.entries(loaded.levels || {}).map(([level, n]) =>
+      t('pd.bounds_level', {level: level, n: num(n)})).join(', ');
+    lines.push(escHtml(t('pd.bounds_loaded', {units: num(loaded.units), levels: levels,
+                                              regions: loaded.regions || regions})) +
+      ' ' + relTime(loaded.loaded_at));
+  } else if (regions) {
+    lines.push(escHtml(t('pd.bounds_none', {regions: regions, size: tServer('module.boundaries.cost', b.size_note || '')})));
+  } else {
+    lines.push(escHtml(t('pd.bounds_no_region')));
+  }
+  (b.downloads || []).filter(d => d.file).forEach(d => lines.push(escHtml(t('pd.bounds_downloaded', {
+    file: d.file, mb: fmtN(Math.round((d.bytes || 0) / 1e6)), day: d.day}))));
+  lines.push(escHtml(t('pd.bounds_why')));
+  if (b.library) lines.push('<span class="error">' + escHtml(tServer('pd.bounds_library', b.library)) + '</span>');
+  const rep = b.report;
+  if (rep && (rep.errors || []).length) lines.push('<span class="error">' + escHtml(t('pd.failed', {error: rep.errors[0]})) + '</span>');
+  const busy = !!b.running;
+  const blocked = busy || !!b.library || !regions;
+  return lines.map(l => '<p class="desc">' + l + '</p>').join('') +
+    '<div class="pd-actions">' +
+      '<button class="btn primary" ' + (blocked ? 'disabled ' : '') + 'onclick="loadBoundaries(false)">' +
+        escHtml(busy ? t('pd.bounds_loading') : t(loaded ? 'pd.update' : 'pd.load')) + '</button> ' +
+      (loaded ? '<button class="btn" ' + (blocked ? 'disabled ' : '') + 'onclick="loadBoundaries(true)">' +
+        escHtml(t('pd.bounds_fresh')) + '</button>' : '') +
+    '</div>' +
+    '<div class="module-terms">' + escHtml(t('pd.source', {attribution: b.attribution || ''})) + '</div>';
+}
+
+async function loadBoundaries(force) {
+  const res = await api('/api/public-data/boundaries/load', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({force: !!force}),
+  });
+  if (!res || !res.success) { showToast(failMsg(res, t('pd.failed', {error: ''})), 'error'); return; }
+  loadPublicData();
 }
 
 // The Ministry of Finance's taxpayer file: loaded once a year, read locally.
@@ -797,7 +846,13 @@ async function pollFinancials() {
     if ((rep.errors || []).length && !rep.companies) showToast(t('pd.failed', {error: rep.errors[0]}), 'error');
     else showToast(rep.unchanged ? t('pd.tax_unchanged_toast') : t('pd.tax_loaded_toast', {companies: fmtN(rep.companies || 0)}), 'success');
   }
-  _pdRunning = {fin: !!fin.running, tax: !!tax.running};
+  const bounds = data.boundaries || {};
+  if (_pdRunning.bounds && !bounds.running && bounds.report) {
+    const rep = bounds.report;
+    if ((rep.errors || []).length) showToast(t('pd.failed', {error: rep.errors[0]}), 'error');
+    else showToast(t('pd.bounds_loaded_toast'), 'success');
+  }
+  _pdRunning = {fin: !!fin.running, tax: !!tax.running, bounds: !!bounds.running};
   renderPublicData(data);
 }
 
@@ -1807,6 +1862,7 @@ async function estimateDiscovery() {
       (data.notes || []).map(n => escHtml(t('disc.left_out', {why: n}))).join('<br>') + '</div>' : '') +
     (over ? '<div class="test-result error" style="margin-top:12px">' + escHtml(t('disc.over_cap')) + '</div>' : '') +
     websitesEstimate(data.find_websites) +
+    areaShapes(sources, data.cells_note) +
     perSource +
     '<div class="query-list">' +
       data.queries.slice(0, 40).map(escHtml).join('<br>') +
@@ -1818,6 +1874,20 @@ async function estimateDiscovery() {
   btn.disabled = false;
   btn.textContent = data.free ? t('disc.run_free')
     : t('disc.run_paid', {cost: fmtUsd(Math.min(data.estimated_cost, cap), 2)});
+}
+
+// How each source covers its areas, in the estimate: one listings circle,
+// a map grid's starting cells (a full cell splits as it runs), a point.
+function areaShapes(sources, note) {
+  const lines = (sources || []).filter(s => s.areas && s.shape).map(s => {
+    if (s.shape === 'circle') return t('disc.shape_circle', {label: s.label, radius: (s.radius_km || []).join(', ')});
+    if (s.shape === 'grid') return t('disc.shape_grid', {label: s.label, n: s.cells || 0});
+    if (s.shape === 'point') return t('disc.shape_point', {label: s.label});
+    return '';
+  }).filter(Boolean);
+  if (!lines.length) return '';
+  return '<div class="muted small" style="margin-top:6px">' + lines.map(escHtml).join('<br>') +
+    (note ? '<br>' + escHtml(t('disc.cells_note')) : '') + '</div>';
 }
 
 // What "find websites" would use, in the estimate: its amount, what a paid

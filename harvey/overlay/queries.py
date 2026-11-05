@@ -737,6 +737,12 @@ statement("overlay.agent.searches",
           "GROUP BY m.name, c.name, s.outcome", params=(1_700_000_000,), drives="s",
           bounded=True,
           scans={"search": "the searches of the last days, by their time index"})
+# A discovery lane's searches since a time (phrase_yield: per phrase, what
+# each found and cost), by the lane's index; job errors are never read.
+statement("overlay.agent.discover_jobs",
+          "SELECT status, params_json, result_json, progress_json, actual_cost FROM jobs "
+          "WHERE lane = ? AND status IN ('done', 'failed', 'cancelled', 'paused') "
+          "AND created_at >= ? AND kind = 'discover'", params=("serper", "2026-01-01 00:00:00"))
 # Harvey's own model calls since a time, by agent and task.
 statement("overlay.agent.usage",
           "SELECT agent, task, COUNT(*), SUM(input_tokens), SUM(output_tokens), "

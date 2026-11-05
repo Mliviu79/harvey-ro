@@ -1,0 +1,53 @@
+# Administrative boundaries from OpenStreetMap: the outline of every
+# country, county, town and commune (and a city's sectors) in the regions
+# the market packs name, loaded once from a Geofabrik extract into
+# data/boundaries.db and read there. An area then has its real shape: a
+# listings search covers it with one circle and keeps what falls inside, a
+# capped map search is tiled over it.
+id = "boundaries"
+name = "Administrative boundaries (OpenStreetMap)"
+description = "The outline of every county, town and commune, from an OpenStreetMap extract kept locally: areas by their real shape, their sub-units, and searches tiled over them."
+set = "original"
+kind = "gazetteer"
+version = "0.1.0"
+api = 1
+markets = []
+requires = []
+default_enabled = false
+entry = "harvey.modules.original.boundaries.capabilities"
+wraps = ["harvey.modules.original.boundaries.store", "harvey.modules.original.boundaries.source"]
+secrets = []
+attribution = "© OpenStreetMap contributors (ODbL 1.0), extract by Geofabrik"
+terms_note = "OpenStreetMap data, Open Database License 1.0: credit \"© OpenStreetMap contributors\" wherever it is shown. Downloaded from download.geofabrik.de (one extract per region, updated daily there; Harvey downloads one only when asked). Needs pyosmium (osmium) in the image."
+
+[cost]
+as_of = 2026-11-05
+usd = 0.0
+note = "free (one download, about 320 MB for Romania)"
+
+# The Geofabrik regions to load ("europe/romania"); empty: the ones the
+# market packs that are on name.
+[settings.regions]
+type = "list"
+default = []
+
+[[capabilities]]
+id = "boundaries_sync"
+op = "sync"
+inputs = []
+outputs = { values = ["boundaries", "downloaded", "regions"] }
+cost = { usd = 0.0, per = "region" }
+
+[[capabilities]]
+id = "find_area"
+op = "lookup"
+inputs = [["locality"], ["region"]]
+outputs = { values = ["units", "loaded"] }
+cost = { usd = 0.0, per = "place" }
+
+[[capabilities]]
+id = "area_unit"
+op = "lookup"
+inputs = [["id:unit"]]
+outputs = { values = ["unit", "loaded"] }
+cost = { usd = 0.0, per = "unit" }

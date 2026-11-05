@@ -25,6 +25,11 @@
    "value": "39.7392,-104.9903"
   },
   {
+   "key": "geobox:denver, co",
+   "updated_at": true,
+   "value": "-"
+  },
+  {
    "key": "geo:nowhere, zz",
    "updated_at": true,
    "value": "-"

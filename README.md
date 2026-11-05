@@ -502,6 +502,46 @@ doesn't count yet: that needs a gazetteer.
 
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
+**Areas, not a fixed 40 km.** A place is searched by its own size: its circle
+is the one that holds the box Nominatim gives the place (a town a few km, a
+county tens), and `icp.geo_coordinates` still overrides it. Each kind of
+source covers an area its own way, as its module's manifest says (`area` on
+the capability):
+
+- **One circle** for a listings source with no result cap (DataForSEO Business
+  Listings): one search a phrase over the whole area, and what comes back
+  outside the area is dropped (by its outline when the boundaries are loaded,
+  else by its box). For Google data on firms the registry already lists, this
+  is the cheap way: one $0.012 request per 1,000 businesses plus $0.00036 each.
+  Every business in the circle is billed, those outside the area too, so
+  neighbouring areas' circles pay twice for where they overlap (the count
+  before a run says how many); an area inside another the same run names
+  isn't searched again by a circle or a grid, only by a rank search.
+- **A grid** for a map search that serves at most a fixed number of places
+  (Scavio Maps 120, DataForSEO Maps 700, `max_results` in the manifest): the
+  area starts as a few coarse cells (a town one, a county 2 × 2), each
+  searched from its centre at the zoom its size gives; a cell that comes back
+  full is split into four, queued as more pages of the same search under the
+  same cap, and a cell whose page is mostly places earlier cells found stops
+  there. The estimate counts the starting cells and says splits may add more,
+  within the cap.
+- **A point** for a ranked web search (DataForSEO SERP): rank from the area's
+  point.
+
+**Boundaries (optional, off by default).** The `boundaries` module loads
+OpenStreetMap's administrative boundaries for the regions the market packs
+name (Romania: `europe/romania`, a Geofabrik extract of about 320 MB, ODbL:
+© OpenStreetMap contributors) into `data/boundaries.db`: every country,
+county, town, commune and city sector with its admin level, ref tags (such as
+`ref:siruta`), parent, outline, centre and area in km². Turn it on in
+**Surse**, then load it on the public-data page (with its size and licence)
+or `harvey boundaries load`; the download is kept in
+`data/boundaries/<date>/` and carries on from where it stopped. It needs
+pyosmium, in the image since this release (`docker compose build harvey`
+when the page says "library missing"). With it an area has its real shape,
+a homonymous county and town are told apart, and the agent sees an area's
+sub-units.
+
 > **Every page is billed.** Google removed 100-results-per-page in September 2025, so a deep search is billed as one request per page of 10 nearly everywhere, and below rank 30 it is mostly directories. Harvey still goes as deep as the source serves; `--depth 30` keeps a rank search to the first three pages.
 
 ### 2. PROFILE — what they are
@@ -1035,6 +1075,7 @@ harvey registry search dentist BV  # every firm in Romania: words, CAEN code, co
 harvey financials load       # the Ministry of Finance's yearly statements into data/financials.db
 harvey financials status     # what is loaded; check: is a new or revised year out
 harvey taxpayers load        # the Ministry of Finance's taxpayer file into data/taxpayers.db
+harvey boundaries load       # OpenStreetMap's administrative boundaries into data/boundaries.db (module boundaries on)
 harvey taxpayers status      # what is loaded; check: is a newer file out
 harvey anaf check --missing  # ANAF's company data for companies never checked
                              # (--all-on-file, --cui N; one request a second, kept 30 days)

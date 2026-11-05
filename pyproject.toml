@@ -38,6 +38,8 @@ dependencies = [
     "anthropic>=0.40,<1",
     # The agent's tools (harvey/agent/tools.py): an MCP server over stdio.
     "mcp>=2.3,<3",
+    # The boundaries module's load (OpenStreetMap extracts), imported only there.
+    "osmium>=4.0,<5",
 ]
 
 [project.optional-dependencies]

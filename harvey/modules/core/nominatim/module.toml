@@ -28,5 +28,5 @@ max_per_second = 1
 id = "geocode"
 op = "lookup"
 inputs = [["locality"], ["region"]]
-outputs = { values = ["point"] }
+outputs = { values = ["point", "bbox"] }
 cost = { usd = 0.0, per = "place" }

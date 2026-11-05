@@ -401,3 +401,63 @@ def reference_rows() -> list[tuple[str, int, str, str, str]]:
     return [(code, version, name, ENGLISH_NAMES.get((code, version), ""),
              _keywords().get((code, version), ""))
             for (code, version), name in sorted(_classes().items())]
+
+
+@lru_cache(maxsize=1)
+def _everyday_spelled() -> dict[tuple[str, int], list[str]]:
+    """(code, version) -> the everyday words of reference/caen_cuvinte.csv
+    as written there (diacritics kept): search phrases as people type them."""
+    text = resources.files("harvey").joinpath("reference/caen_cuvinte.csv") \
+        .read_text(encoding="utf-8")
+    rows = csv.DictReader(line for line in io.StringIO(text) if not line.startswith("#"))
+    out: dict[tuple[str, int], list[str]] = {}
+    for r in rows:
+        words = out.setdefault((r["code"], int(r["version"])), [])
+        for word in r["cuvinte"].split(";"):
+            word = " ".join(word.split())
+            if word and word not in words:
+                words.append(word)
+    return out
+
+
+def phrases(query: str, limit: int = 40) -> dict:
+    """Candidate search phrases for an activity, from the words Harvey
+    already maps to CAEN classes, read backwards: ``query`` is class codes
+    ("8623", "8621,8622") or words ("dentist"). Returns the classes
+    (code, revision, names) and the phrases, each with where it came from:
+    "everyday" (reference/caen_cuvinte.csv, Romanian), "synonym" (SYNONYMS,
+    Romanian or English, written without diacritics) or "class name" (the
+    nomenclature's Romanian name, the English one where Harvey has it).
+    Candidates only: whoever searches trims them and measures what each
+    finds."""
+    codes = [c.strip() for c in re.split(r"[,\s;]+", query or "") if c.strip()]
+    if codes and all(c.isdigit() for c in codes):
+        pairs = [(m.code, m.version) for c in codes for m in lookup(c) if m.version in CURRENT_VERSIONS]
+    else:
+        pairs = classes_for(query or "")
+    pairs = list(dict.fromkeys(pairs))[:12]
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(phrase: str, source: str, lang: str, pair):
+        key = _fold(phrase)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append({"phrase": phrase, "from": source, "lang": lang, "code": pair[0]})
+
+    for pair in pairs:
+        for word in _everyday_spelled().get(pair, []):
+            add(word, "everyday", "ro", pair)
+        for phrase, classes in SYNONYMS.items():
+            if pair in classes:
+                add(phrase, "synonym", "", pair)
+    for pair in pairs:
+        if ENGLISH_NAMES.get(pair):
+            add(ENGLISH_NAMES[pair], "class name", "en", pair)
+        if _classes().get(pair):
+            add(_classes()[pair], "class name", "ro", pair)
+    classes = [{"code": c, "version": v, "revision": revision_label(v),
+                "name_ro": _classes().get((c, v), ""), "name_en": ENGLISH_NAMES.get((c, v), "")}
+               for c, v in pairs]
+    return {"classes": classes, "phrases": out[:limit], "more": max(0, len(out) - limit)}

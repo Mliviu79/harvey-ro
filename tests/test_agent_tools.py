@@ -450,7 +450,7 @@ def test_a_call_is_filed_under_the_message_it_started_for_and_none_without_one(d
 READ_TOOLS = ["schema", "counts", "query", "pipeline", "firms", "coverage", "contacts_summary",
               "campaigns", "spend", "estimate", "jobs", "plan_status", "sets", "notes",
               "read_playbook", "playbooks", "writing_rules", "campaign_preview",
-              "campaign_status", "replies"]
+              "campaign_status", "replies", "areas", "plan_cells", "terms", "phrase_yield"]
 ACTION_TOOLS = ["propose_plan", "close_plan", "save_set", "discover", "registry_pull",
                 "find_contacts", "verify_contacts", "cancel_run", "schedule_wake", "remember",
                 "forget", "save_playbook", "save_audience", "create_campaign", "edit_campaign",

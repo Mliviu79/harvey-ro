@@ -27,6 +27,9 @@ FIND_MAX = 50_000
 WEBSITES_DEFAULT_USD = 0.0
 # Search phrases one request may name, and places each runs in.
 TERMS_MAX = 50
+# What a tiled search's estimate says beside its cells.
+CELLS_NOTE = ("a capped map search starts with these cells; a cell that comes back full is "
+              "split into four as it runs, which can cost more, always within the cap")
 
 
 def money(value, default: float | None = None) -> float:
@@ -73,19 +76,94 @@ async def discovery_refusal(state, body: dict):
     return None
 
 
+def _unit_id(item) -> int | None:
+    """A boundary unit's id from an area a request names (5, "5",
+    "unit:5"), or None for a place name."""
+    if isinstance(item, int) and not isinstance(item, bool):
+        return item
+    text = str(item or "").strip().lower()
+    text = text[len("unit:"):] if text.startswith("unit:") else text
+    return int(text) if text.isdigit() else None
+
+
+async def discovery_areas(state, body: dict, *, network: bool = True) -> list:
+    """The areas a Discover request names (``areas``: boundary unit ids or
+    place names, at most TERMS_MAX), each as a geo.Area: a unit from the
+    boundaries file (the boundaries module on and loaded), a place from
+    the boundaries or Nominatim (``network`` False: only what is cached).
+    ValueError for one that can't be found. They are kept on the request
+    as ``_areas`` for discovery_queries, one inside another marked
+    ``inside`` (the listings circle or map grid of the outer one covers
+    it)."""
+    from harvey.modules import runs
+
+    raw = body.get("areas") or []
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    out = []
+    for item in [i for i in raw if str(i).strip()][:TERMS_MAX]:
+        unit = _unit_id(item)
+        if unit is not None:
+            found = await runs.boundary_unit(state, unit)
+            if found is None:
+                raise ValueError(f"no boundary unit {unit}: the boundaries module must be on "
+                                 "and loaded (areas() names the units)")
+            area = runs.unit_area(found)
+        else:
+            area = await runs.place_area(state, str(item).strip(), network=network)
+            if area is None:
+                raise ValueError(f"{str(item).strip()!r}: no such place found"
+                                 + ("" if network else " (not looked up yet: give a "
+                                    "boundary unit, or a place a run looked up before)"))
+        out.append(area)
+    kept = [a.as_dict() for a in out]
+    for i, inner in enumerate(out):
+        for j, outer in enumerate(out):
+            if j != i and "inside" not in kept[j] and await _within(state, inner, outer):
+                # A listings circle or a map grid over the outer one already
+                # covers it (and pays for what it finds once): only a
+                # source that ranks from each place searches it.
+                kept[i]["inside"] = outer.name
+                break
+    body["_areas"] = kept
+    return out
+
+
+async def _within(state, inner, outer) -> bool:
+    """Whether all of ``inner``'s box is in ``outer`` (by its outline when
+    it has one, else its box): what a search over ``outer`` keeps covers
+    it."""
+    from harvey.modules import runs
+
+    if inner.bbox is None or not outer.shaped or outer.name == inner.name:
+        return False
+    if outer.unit is not None and not outer.rings:
+        unit = await runs.boundary_unit(state, outer.unit)
+        outer.rings = (unit or {}).get("rings") or []
+    s, w, n, e = inner.bbox
+    return all(outer.contains(la, lo) is True
+               for la, lo in ((s, w), (s, e), (n, w), (n, e), ((s + n) / 2, (w + e) / 2)))
+
+
 def discovery_queries(body: dict, config, provider: str = ""):
     """The searches a Discover request makes at ``provider``: from Harvey's
     settings (the target industries and places, or a preset's phrases),
     or the request's own ``terms`` in each of its ``cities`` (the settings'
-    places when it names none). ValueError for a preset the source can't
-    search with."""
-    from harvey.collectors.discover import DiscoveryQuery, build_queries, preset_problem
+    places when it names none), or in each of its areas (``_areas``, from
+    discovery_areas: each search then carries its circle and area).
+    ValueError for a preset the source can't search with."""
+    from harvey import geo
+    from harvey.collectors.discover import (DiscoveryQuery, area_shape, build_queries,
+                                            preset_problem)
 
     preset = str(body.get("preset") or "")
     problem = preset_problem(preset, provider or str(body.get("provider") or ""), config=config)
     if problem:
         raise ValueError(problem)
     cities = [str(c).strip() for c in (body.get("cities") or []) if str(c).strip()] or None
+    areas = {a["name"]: a for a in body.get("_areas") or [] if a.get("name")}
+    if areas:
+        cities = list(areas)
     # No depth or limit: every result the source has (the cap stops the run).
     depth = int(body.get("depth") or 0) or None
     limit = int(body.get("limit") or 0) or None
@@ -94,10 +172,46 @@ def discovery_queries(body: dict, config, provider: str = ""):
         places = cities or list(config.icp.geography) or [""]
         coords = getattr(config.icp, "geo_coordinates", {}) or {}
         language = getattr(config.icp, "search_language", "") or "en"
-        return [DiscoveryQuery(term=t, location=c, depth=depth, limit=limit,
-                               coordinate=coords.get(c, ""), language=language)
-                for t in terms[:TERMS_MAX] for c in places[:TERMS_MAX]]
-    return build_queries(config, cities=cities, depth=depth, limit=limit, preset=preset)
+        out = [DiscoveryQuery(term=t, location=c, depth=depth, limit=limit,
+                              coordinate=coords.get(c, ""), language=language)
+               for t in terms[:TERMS_MAX] for c in places[:TERMS_MAX]]
+    else:
+        out = build_queries(config, cities=cities, depth=depth, limit=limit, preset=preset)
+    covers = bool(provider) and area_shape(provider)[0] in ("circle", "grid")
+    for q in out:
+        if q.location in areas:
+            q.area = dict(areas[q.location])
+            q.coordinate = geo.Area.from_dict(q.area).coordinate
+    # An area inside another the request names is searched only by a source
+    # that ranks from its point: a circle or grid over the outer one covers it.
+    return [q for q in out if not (covers and q.area.get("inside"))]
+
+
+async def place_queries(state, plan: list[dict], *, network: bool = True) -> None:
+    """Give each search of a source that searches an area (a listings
+    circle, a map grid) the area of its place, as the run will: what the
+    estimate counts cells over. ``network`` False: only places already
+    looked up (or in the boundaries)."""
+    from harvey import geo
+    from harvey.collectors.discover import area_shape
+    from harvey.modules import runs
+
+    found: dict[str, object] = {}
+    for part in plan:
+        if not part.get("provider") or area_shape(part["provider"])[0] not in ("circle", "grid"):
+            continue
+        for q in part["queries"]:
+            if q.area or not q.location:
+                if q.coordinate and not q.area:
+                    area = geo.Area.from_coordinate(q.coordinate, name=q.location)
+                    q.area = area.as_dict() if area else {}
+                continue
+            if q.location not in found:
+                found[q.location] = await runs.place_area(state, q.location, network=network)
+            area = found[q.location]
+            if area is not None:
+                q.area = area.as_dict()
+                q.coordinate = q.coordinate or area.coordinate
 
 
 def discovery_plan(body: dict, config, queries=None) -> tuple[list[dict], list[str]]:
@@ -188,14 +302,21 @@ async def discovery_estimate(state, config, plan: list[dict], notes: list[str],
     the answer says what counting cost. Without it nothing is asked of a
     source (the agent's estimate). The registry's part is its free count
     of the firms that match."""
-    from harvey.collectors.discover import PROVIDERS, estimate_cost
+    from harvey.collectors.discover import PROVIDERS, area_cells, area_shape, estimate_cost
     from harvey.modules.job_kinds import registry_count
     from harvey.modules.runs import run_discovery
 
+    await place_queries(state, plan, network=count)
     parts = []
     for part in plan:
         if part.get("provider"):
             key, queries = part["provider"], part["queries"]
+            shape, most = area_shape(key)
+            areas = {"shape": shape, "max_results": most,
+                     "areas": len({q.location for q in queries if q.area}),
+                     "cells": sum(area_cells(key, q) for q in queries),
+                     "radius_km": sorted({q.area["radius_km"] for q in queries
+                                          if q.area.get("radius_km")})[:10]}
             counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
             if count and PROVIDERS[key].can_count:
                 report = await run_discovery(state, config, key, queries,
@@ -207,7 +328,7 @@ async def discovery_estimate(state, config, plan: list[dict], notes: list[str],
                           "queries": [q.keyword() for q in queries],
                           "query_count": len(queries),
                           "estimated_cost": round(estimate_cost(key, queries), 4),
-                          "free": PROVIDERS[key].estimate(queries) == 0, **counted})
+                          "free": PROVIDERS[key].estimate(queries) == 0, **areas, **counted})
         else:
             try:
                 n = await asyncio.to_thread(registry_count, part["params"])
@@ -235,6 +356,8 @@ async def discovery_estimate(state, config, plan: list[dict], notes: list[str],
                       if any(p_["available"] is not None for p_ in parts) else None),
         "count_cost": round(sum(p_["count_cost"] for p_ in parts), 4),
         "errors": [e for p_ in parts for e in p_["errors"]],
+        "cells_note": CELLS_NOTE if any(p_.get("shape") == "grid" and p_.get("areas")
+                                        for p_ in parts) else "",
     }
 
 

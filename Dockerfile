@@ -4,9 +4,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps (curl needed for the Claude CLI installer)
+# System deps (curl needed for the Claude CLI installer; libexpat1 for
+# pyosmium, which reads the boundaries' OpenStreetMap extracts)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    curl ca-certificates libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

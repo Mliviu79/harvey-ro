@@ -9,6 +9,29 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Areas and search phrases.** A place is now searched by its own size: its
+  circle holds the box Nominatim gives it (kept with the point, cached for
+  good; a place cached before is asked once more), instead of a fixed 40 km
+  (`icp.geo_coordinates` still wins). Each source covers an area as its
+  manifest says (`area`, `max_results` on the capability): DataForSEO
+  Business Listings takes one circle and drops what falls outside the area;
+  the capped map searches (Scavio Maps 120, DataForSEO Maps 700) are tiled:
+  coarse cells first, a full cell split into four as more pages of the same
+  search under the same cap, a cell of mostly known places stopped early,
+  each cell's zoom from its size; an area inside another the same run
+  names is left to the outer one's circle or grid. Every Nominatim request
+  now takes its turn on the module's lane (one a second across Harvey). The Discover estimate shows each source's
+  shape and starting cells. A new `boundaries` module (off by default) loads
+  OpenStreetMap's administrative boundaries from a Geofabrik extract
+  (Romania: about 320 MB, ODbL) into `data/boundaries.db` as a resumable
+  load job (`harvey boundaries load`, or the public-data page): outlines,
+  admin levels, ref tags, parents, km². It needs pyosmium (`osmium`), now in
+  the image with `libexpat1`. The agent gets `areas()` (an area's unit and
+  sub-units), `plan_cells()` (each source's shape and price over an area),
+  `terms()` (candidate phrases from the CAEN words read backwards) and
+  `phrase_yield()` (per phrase and source: new firms and new firms per
+  dollar, from the discovery runs' reports), and `discover()` takes areas.
+
 - **The agent prepares and follows campaigns; you start them.** Under an
   approved plan (free work: no budget needed) the agent can save an
   audience from a Contacts filter (`save_audience`: its id and what a

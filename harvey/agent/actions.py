@@ -277,14 +277,18 @@ class Actions:
 
     async def discover(self, turn: str, plan, sources, phrases=None, cities=None,
                        preset: str = "", depth=None, max_spend=0.0, websites_max_spend=0.0,
-                       find_websites: bool = True, classify_max_spend=0.0) -> dict:
+                       find_websites: bool = True, classify_max_spend=0.0,
+                       areas=None) -> dict:
         """A Discover run over search sources, as the Discover tab queues
-        it: its searches (the settings' or ``phrases`` in ``cities``), its
-        spend cap, its website lookups' amount and its classifier cap."""
+        it: its searches (the settings' or ``phrases`` in ``cities``, or in
+        ``areas``: boundary unit ids or place names, each searched by its
+        shape), its spend cap, its website lookups' amount and its
+        classifier cap."""
         from harvey.collectors.discover import PROVIDERS
 
         keys = [str(k) for k in (sources if isinstance(sources, list) else [sources]) if k]
         body = {"providers": keys, "cities": list(cities or []), "terms": list(phrases or []),
+                "areas": list(areas or []),
                 "preset": preset or "", "depth": depth, "max_spend": max_spend,
                 "find_websites": bool(find_websites), "websites_max_spend": websites_max_spend,
                 "classify_max_spend": classify_max_spend}
@@ -351,6 +355,11 @@ class Actions:
         config = _config()
         if config is None:
             raise readonly.Refused("Harvey's settings can't be read")
+        if body.get("areas"):
+            try:
+                await launch.discovery_areas(state, body)
+            except ValueError as e:
+                raise readonly.Refused(str(e)) from None
         source_plan, notes = launch.discovery_plan(body, config)
         max_spend = _cap("max_spend", body.get("max_spend"))
         try:
@@ -361,8 +370,12 @@ class Actions:
         classify_cap = _cap("classify_max_spend", body.get("classify_max_spend"))
         estimate = await launch.discovery_estimate(state, config, source_plan, notes, websites,
                                                    count=False)
+        estimate_parts = estimate["sources"]
         estimate = {k: estimate[k] for k in ("query_count", "estimated_cost", "free",
-                                             "available", "notes", "errors", "find_websites")}
+                                             "available", "notes", "errors", "find_websites",
+                                             "cells_note")}
+        estimate["shapes"] = {p["key"]: {k: p.get(k) for k in ("shape", "cells", "areas")}
+                              for p in estimate_parts}
         estimate["queries"] = [q for p in source_plan for q in (
             [x.keyword() for x in p["queries"]] if p.get("provider") else [p["label"]])][:20]
 

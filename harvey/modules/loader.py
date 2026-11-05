@@ -41,7 +41,7 @@ REQUIRED = ("id", "set", "kind", "version", "api")
 # reads a key, or claims what another module does.
 PACK_KEYS = {*REQUIRED, "name", "description", "markets", "requires",
              "default_enabled", "terms_note", "attribution", "cost", "signals",
-             "registry_name_order"}
+             "registry_name_order", "boundaries"}
 # How a lane may say its pace: one request every N seconds, or N a second.
 LANE_PACES = ("min_interval_seconds", "max_per_second", "max_per_minute", "max_per_hour")
 # The periods a recurring free allowance renews over ([[free_allowances]]).
@@ -50,6 +50,10 @@ ALLOWANCE_PERIODS = ("minute", "hour", "day", "month")
 # How a market's official registers usually write a person's name: a hint
 # only (both orders are tried where it matters), "" when there is none.
 NAME_ORDERS = ("", "given_first", "family_first")
+# A market's boundaries extract: a Geofabrik region path ("europe/romania").
+_REGION = re.compile(r"^[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)*$")
+# The shape a search module's capability searches an area in (harvey/geo.py).
+AREA_SHAPES = ("", "circle", "grid", "point")
 CAPABILITY_OPS = ("query", "lookup", "read", "sync", "expand", "judge", "action")
 SETTING_TYPES = ("bool", "int", "float", "str", "list", "choice")
 ABSENCE_VALUES = ("unknown", "false")
@@ -127,6 +131,9 @@ class Manifest:
     free_allowances: tuple[dict, ...] = ()
     # A market's: how its official registers usually write a name.
     registry_name_order: str = ""
+    # A market's: the boundaries extracts that cover it (Geofabrik region
+    # paths, "europe/romania"), what the boundaries module loads.
+    boundaries: tuple[str, ...] = ()
     # The identifier schemes it declares ([[identifiers]]: name, numeric,
     # legal, and ``legacy``: where schema 24 kept the key, as the
     # company_ids kind and the value's prefix, "cui" or "external:osm:"):
@@ -332,6 +339,18 @@ def _check_capabilities(raw, where: str, problems: list[str]) -> tuple[dict, ...
         if not isinstance(refresh, int) or isinstance(refresh, bool) or refresh < 0:
             problems.append(f"{where}: capability {cid} refresh_days must be a whole "
                             f"number of days (0 for never), got {refresh!r}")
+        # How a search covers an area, and the most results one search
+        # serves (a capped map search is tiled: harvey/geo.py).
+        if cap.get("area", "") not in AREA_SHAPES:
+            problems.append(f"{where}: capability {cid} area must be one of "
+                            f"{', '.join(repr(a) for a in AREA_SHAPES)}, got {cap.get('area')!r}")
+        most = cap.get("max_results")
+        if most is not None and (not isinstance(most, int) or isinstance(most, bool) or most < 1):
+            problems.append(f"{where}: capability {cid} max_results must be a whole number "
+                            f"above 0, got {most!r}")
+        if cap.get("area") == "grid" and most is None:
+            problems.append(f"{where}: capability {cid} is searched in a grid, so it needs "
+                            "max_results (a cell is split when it comes back full)")
         out.append(dict(cap))
     return tuple(out)
 
@@ -533,6 +552,11 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
     if order not in NAME_ORDERS:
         problems.append(f"{where}: registry_name_order must be one of "
                         f"{', '.join(repr(o) for o in NAME_ORDERS)}, got {order!r}")
+    regions = _str_list(raw.get("boundaries"), "boundaries", where, problems)
+    for region in regions:
+        if not _REGION.match(region):
+            problems.append(f"{where}: boundaries {region!r} must be a region path like "
+                            "'europe/romania' (lower case letters, digits, - and /)")
     texts = {k: raw.get(k, "") for k in ("name", "description")}
     for k, v in texts.items():
         if not isinstance(v, str):
@@ -560,6 +584,7 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         contact_kinds=_check_contact_kinds(raw.get("contact_kinds"), where, problems),
         free_allowances=_check_allowances(raw.get("free_allowances"), where, problems),
         registry_name_order=order if order in NAME_ORDERS else "",
+        boundaries=regions,
         identifiers=_check_identifiers(raw.get("identifiers"), where, problems),
         register=_check_register(raw.get("register"), where, problems),
     )

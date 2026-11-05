@@ -30,12 +30,13 @@ import re
 import unicodedata
 from collections.abc import MutableMapping
 from html import unescape
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from urllib.parse import urlparse
 
 import httpx
 
+from harvey import geo
 from harvey.modules.api import Draft, Fact, Record
 from harvey.transient import Transient
 
@@ -286,8 +287,17 @@ GEOCODE_UA = "Harvey/0.1 (open-source sales agent; github.com/ethanplusai/harvey
 
 async def nominatim_point(city: str, client: httpx.AsyncClient) -> str | None:
     """"Denver, CO" -> "39.7392,-104.9903"; "" when Nominatim knows no such
-    place, None when it couldn't be asked. Caching the answer is the
-    caller's (it is kept for good: harvey/modules/runs.py)."""
+    place, None when it couldn't be asked."""
+    place = await nominatim_place(city, client)
+    return None if place is None else place["point"]
+
+
+async def nominatim_place(city: str, client: httpx.AsyncClient) -> dict | None:
+    """"Denver, CO" -> {"point": "39.7392,-104.9903", "bbox": [south, west,
+    north, east]} (the box Nominatim gives the place, when it gives one);
+    {"point": ""} when Nominatim knows no such place, None when it couldn't
+    be asked. Caching the answer is the caller's (it is kept for good:
+    harvey/modules/runs.py)."""
     try:
         r = await client.get(
             NOMINATIM,
@@ -301,8 +311,17 @@ async def nominatim_point(city: str, client: httpx.AsyncClient) -> str | None:
         return None
     if not hits:
         logger.warning("geocode: no match for %r", city)
-        return ""
-    return f"{float(hits[0]['lat']):.4f},{float(hits[0]['lon']):.4f}"
+        return {"point": ""}
+    hit = hits[0]
+    out = {"point": f"{float(hit['lat']):.4f},{float(hit['lon']):.4f}"}
+    try:
+        # Nominatim's box is [south, north, west, east], as strings.
+        s, n, w, e = (float(v) for v in hit.get("boundingbox") or ())
+        if -90 <= s <= n <= 90 and -180 <= w <= e <= 180:
+            out["bbox"] = [round(s, 5), round(w, 5), round(n, 5), round(e, 5)]
+    except (TypeError, ValueError):
+        pass
+    return out
 
 
 # ── The record every provider returns ─────────────────────────────────
@@ -333,6 +352,10 @@ class Business:
     provider: str = ""
     raw_title: str = ""             # SERP evidence for junk filtering before normalization
     snippet: str = ""               # the text under a web result's title (never stored)
+    # Where the listing is on the map, when the source says: what keeps a
+    # result inside the area searched (never stored).
+    lat: float | None = None
+    lng: float | None = None
 
     def identity(self) -> str:
         return self.domain or self.external_id
@@ -359,6 +382,10 @@ class DiscoveryQuery:
     # The country to search in (two letters, "RO"), when known: a search
     # that can be told one (Brave) gets results from there first.
     country: str = ""
+    # The area searched (harvey/geo.py Area.as_dict(): its point, circle,
+    # box and boundary unit), when known: results outside it are dropped,
+    # and a capped map search is tiled over it.
+    area: dict = field(default_factory=dict)
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -432,6 +459,38 @@ def search_pages(depth: int | None, page_size: int) -> int:
     if not depth:
         return SEARCH_PAGES_ESTIMATE
     return max(1, -(-depth // page_size))
+
+
+def area_shape(provider_key: str) -> tuple[str, int | None]:
+    """(how a search through ``provider_key`` covers an area, the most
+    results one search serves), from its module's manifest (``area`` and
+    ``max_results`` on the capability that claims it): "circle", "grid",
+    "point" or "" (no area: a web search)."""
+    from harvey.modules import switches
+
+    for m in switches.manifests():
+        for cap in m.capabilities:
+            if cap.get("provider") == provider_key and cap.get("op") == "query":
+                return str(cap.get("area") or ""), cap.get("max_results")
+    return "", None
+
+
+def query_area(query: "DiscoveryQuery") -> "geo.Area | None":
+    return geo.Area.from_dict(query.area) if query.area else None
+
+
+def area_cells(provider_key: str, query: "DiscoveryQuery") -> int:
+    """How many searches a query starts as at ``provider_key``: the grid's
+    first cells for a tiled source over an area with a shape (a full cell
+    adds four more as it runs, within the cap), else one."""
+    if not query.area or area_shape(provider_key)[0] != "grid":
+        return 1
+    area = query_area(query)
+    return len(geo.start_cells(area)) if area and area.shaped else 1
+
+
+# What a grid cell's search carries as its area: it is searched as is.
+CELL_AREA = {"source": "cell"}
 
 
 # Match whole placeholder values, never substrings of opaque credentials.
@@ -603,6 +662,12 @@ class DiscoveryProvider:
     # part-way: how many (None: unknown) and what fetching them would cost.
     unfetched: int | None = None
     unfetched_cost: float = 0.0
+    # Set by a tiled search (search_cells) for each cell: the places earlier
+    # cells found, and whether this cell stopped on a page mostly of them.
+    seen: set | None = None
+    seen_stopped: bool = False
+    # What the last tiled search did: cells searched, split, stopped early.
+    cells: dict | None = None
 
 
 class DataForSEOListings(DiscoveryProvider):
@@ -820,6 +885,7 @@ class DataForSEOListings(DiscoveryProvider):
             review_count=rating.get("votes_count"),
             is_claimed=item.get("is_claimed"),
             has_website=bool(url),
+            lat=_coordinate(item, "", "latitude"), lng=_coordinate(item, "", "longitude"),
             external_id=_gbp_ids(item)[0],
             alt_ids=_gbp_ids(item)[1],
             source_url=item.get("check_url") or "",
@@ -863,7 +929,9 @@ class DataForSEOSerp(DiscoveryProvider):
     UNIT_RESULTS = 10
     MAX_DEPTH = 200
     # The radius of the search point. DataForSEO documents it in mm
-    # (199-199999), so 2000 is 2 m: a pinpoint at the city centre, which is
+    # (199-199999; checked against docs.dataforseo.com on 2026-11-05: the
+    # organic endpoint takes "latitude,longitude,radius", Maps takes a zoom
+    # instead), so 2000 is 2 m: a pinpoint at the area's point, which is
     # what "when we searched from downtown Denver" means. Chosen so that if
     # the unit were metres it would still be 2 km, still downtown.
     POINT_RADIUS = "2000"
@@ -879,7 +947,8 @@ class DataForSEOSerp(DiscoveryProvider):
     def estimate(self, queries):
         # Billing is the unit price x the units served; priced at the full
         # depth, since a search can't say beforehand how many Google serves.
-        return sum(self.UNIT_COST * self._units(self._depth(q)) for q in queries)
+        return sum(self.UNIT_COST * self._units(self._depth(q)) * area_cells(self.key, q)
+                   for q in queries)
 
     def first_cost(self, query):
         return self.UNIT_COST
@@ -994,16 +1063,27 @@ class DataForSEOMaps(DataForSEOSerp):
     UNIT_RESULTS = 100
     MAX_DEPTH = 700
     rank_codes = ("MAPS_RANK",)
-    # City-wide zoom; DataForSEO accepts 3z-21z and defaults to 17z (a few
-    # streets), which would rank only whoever is closest to the pin.
+    # The zoom of a point with no radius; DataForSEO accepts 3z-21z and
+    # defaults to 17z (a few streets), which would rank only whoever is
+    # closest to the pin. With a radius (a city's circle, a grid's cell) the
+    # zoom is the one whose view spans it (geo.zoom_for_radius).
     ZOOM = "12z"
+
+    def zoom(self, query: DiscoveryQuery) -> str:
+        """The zoom whose view spans the search's circle, when it has a real
+        one (a grid cell, an area with a shape); else ZOOM."""
+        point = geo.parse_coordinate(query.coordinate)
+        if (point is None or point[2] is None
+                or (query.area or {}).get("source") in (None, "", "point")):
+            return self.ZOOM
+        return f"{geo.zoom_for_radius(point[2], 3, 21)}z"
 
     async def fetch(self, client, env, query):
         keyword = query.keyword()
         items = await self._post(client, env, "serp/google/maps/live/advanced", {
             "keyword": keyword, "language_code": query.language,
             "depth": self._affordable_depth(query),
-            **_dfs_location(query, self.ZOOM)})
+            **_dfs_location(query, self.zoom(query))})
         out = []
         for item in items:
             # maps_paid_item is an ad; only organic map results have a rank.
@@ -1027,6 +1107,7 @@ class DataForSEOMaps(DataForSEOSerp):
                 is_claimed=item.get("is_claimed"),
                 has_website=bool(url or domain),
                 maps_rank=item.get("rank_group"),
+                lat=_coordinate(item, "", "latitude"), lng=_coordinate(item, "", "longitude"),
                 external_id=external, alt_ids=alt_ids, source_url=url,
                 provider=self.key, keyword=keyword,
             ))
@@ -1045,6 +1126,20 @@ def _gbp_ids(item: dict) -> tuple[str, tuple[str, ...]]:
     if cid:
         return f"dataforseo:cid:{cid}", ((f"dataforseo:{place}",) if place else ())
     return (f"dataforseo:{place}" if place else ""), ()
+
+
+def _coordinate(item: dict, under: str, key: str) -> float | None:
+    """A result's latitude or longitude (``item[key]``, or
+    ``item[under][key]``), or None."""
+    holder = item.get(under) if under else item
+    value = holder.get(key) if isinstance(holder, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        value = float(value)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _best(current: int | None, new) -> int | None:
@@ -1697,10 +1792,16 @@ class ScavioProvider(DiscoveryProvider):
             await self.page_done(len(rows))
             if last_page:
                 break
+            if self._enough(items):
+                self.seen_stopped = True
+                break
         return rows
 
     def _last_page(self, data: dict, items: list, page_size: int) -> bool:
         return len(items) < page_size
+
+    def _enough(self, items: list) -> bool:
+        return False
 
     def first_cost(self, query):
         return self.CREDIT_PRICE
@@ -1736,33 +1837,28 @@ class ScavioMaps(ScavioProvider):
         return max(1, min(self.MAX_PAGES, -(-query.limit // self.PAGE_SIZE)))
 
     def estimate(self, queries):
-        return sum(self.CREDIT_PRICE * self._page_count(q) for q in queries)
+        return sum(self.CREDIT_PRICE * self._page_count(q) * area_cells(self.key, q)
+                   for q in queries)
 
     @staticmethod
     def map_center(coordinate: str) -> str:
         """"39.7392,-104.9903,40" -> "@39.7392,-104.9903,10z".
 
-        Google Maps takes a center and a zoom, not a radius. A zoom-z view
-        spans roughly 40,000 km / 2^z, so a 40 km radius is zoom 10 (one
-        metro area) and 5 km is zoom 13.
+        Google Maps takes a center and a zoom, not a radius: the zoom whose
+        view spans the circle (geo.zoom_for_radius), so a 40 km radius is
+        zoom 10 (one metro area) and a 5 km cell zoom 13.
         """
+        point = geo.parse_coordinate(coordinate)
+        if point is None:
+            return ""
         parts = [p.strip() for p in coordinate.split(",")]
-        if len(parts) < 2 or not all(parts[:2]):
-            return ""
-        try:
-            lat, lng = float(parts[0]), float(parts[1])
-            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-                return ""
-        except ValueError:
-            return ""
-        try:
-            radius_km = float(parts[2]) if len(parts) > 2 and parts[2] else 40.0
-        except ValueError:
-            radius_km = 40.0
-        if not math.isfinite(radius_km) or radius_km <= 0:
-            radius_km = 40.0
-        zoom = round(math.log2(40000 / max(radius_km, 0.5)))
-        return f"@{parts[0]},{parts[1]},{max(3, min(zoom, 16))}z"
+        return f"@{parts[0]},{parts[1]},{geo.zoom_for_radius(point[2] or geo.DEFAULT_RADIUS_KM)}z"
+
+    def _enough(self, items: list) -> bool:
+        # A cell of a tiled search whose page is mostly places earlier
+        # cells found stops there.
+        return self.seen is not None and geo.mostly_seen(
+            [f"gmaps:{i.get('place_id')}" if i.get("place_id") else "" for i in items], self.seen)
 
     async def fetch(self, client, env, query):
         # The map center picks the area, as it does in the Maps app. Without
@@ -1791,6 +1887,8 @@ class ScavioMaps(ScavioProvider):
                 rating=item.get("rating"),
                 review_count=item.get("reviews"),
                 has_website=bool(site),
+                lat=_coordinate(item, "gps_coordinates", "latitude"),
+                lng=_coordinate(item, "gps_coordinates", "longitude"),
                 # A Maps list position is not an organic rank, so rank stays
                 # None and no SERP_RANK is recorded for it.
                 external_id=f"gmaps:{place_id}" if place_id else "",
@@ -2318,9 +2416,146 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
             for f in facts if f.code in confirmed]
 
 
+def _place_key(biz: Business) -> str:
+    """What tells one place from another across a tiled search's cells:
+    its listing id (a chain's branches share a website, never a place),
+    else its identity."""
+    return biz.external_id or biz.identity()
+
+
+async def search_cells(provider: DiscoveryProvider, client: httpx.AsyncClient, env: dict,
+                       query: DiscoveryQuery, area: geo.Area, cap: int) -> list[Business]:
+    """One search tiled over ``area`` at a source that serves at most
+    ``cap`` places a search (a capped map search): the area's first cells
+    (geo.start_cells), each searched from its centre at the zoom its size
+    gives, as more pages of the same search under the same spend cap and
+    kill switch. A cell that comes back full (``cap`` places, or the depth
+    asked) is split into its four quarters, queued behind the others, while
+    it is large enough (geo.can_split) and the search takes every result
+    (no depth or limit below the cap). A cell whose page is mostly places
+    earlier cells found stops there and isn't split. The places are kept
+    once each, with the best rank any cell gave. A stop between or inside
+    cells leaves the cells still to search (and the page inside one) as
+    the cursor; a cell that fails after others found something is skipped,
+    or (a failure worth trying again) stops the search there. What it did
+    is ``provider.cells`` ({"cells", "split", "seen_stops", "left"})."""
+    resumed = dict(provider.cursor or {})
+    if "cells" in resumed:
+        pending = [tuple(c) for c in resumed["cells"]]
+        inner = resumed.get("cell") or None
+    else:
+        pending, inner = geo.start_cells(area), None
+    budget = provider.remaining_budget
+    outer = provider.on_page
+    takes_all = (query.depth is None or query.depth >= cap) and query.limit is None
+    full_at = min(cap, query.depth or cap)
+    found: dict[str, Business] = {}
+    spent = 0.0
+    stats = {"cells": 0, "split": 0, "seen_stops": 0, "left": 0}
+    stop: tuple[str, dict] | None = None
+    provider.last_error = ""
+    for_cell = None
+    while pending:
+        cell = pending[0]
+        for_cell = replace(query, coordinate=geo.cell_coordinate(cell), area=dict(CELL_AREA),
+                           total=None)
+        if stats["cells"] and inner is None:
+            # The cap against everything the search has spent so far.
+            provider.last_cost, provider.remaining_budget = spent, budget
+            why = await provider.halt(provider.first_cost(for_cell))
+            if why:
+                stop = (why, {"cells": pending})
+                break
+        provider.cursor, inner = inner, None
+        provider.next_cursor = None
+        provider.stop_reason = ""
+        provider.complete = True
+        provider.remaining_budget = budget - spent
+        provider.last_cost = 0.0
+        provider.seen, provider.seen_stopped = set(found), False
+        before_cost, before_found = spent, len(found)
+        if outer is not None:
+            async def on_page(pages, results, cost=0.0, _c=before_cost, _f=before_found):
+                await outer(pages, _f + results, _c + float(cost or 0.0))
+            provider.on_page = on_page
+        try:
+            items = await provider.fetch(client, env, for_cell)
+        except ProviderExhausted as e:
+            spent += provider.last_cost
+            if not found:
+                provider.last_cost = spent
+                raise
+            stop = (str(e), {"cells": pending})
+            break
+        except Exception as e:
+            spent += provider.last_cost
+            from harvey.transient import is_transient
+            if not found:
+                provider.last_cost = spent
+                raise
+            if is_transient(e):
+                stop = (PART_WAY, {"cells": pending})
+                provider.last_error = f"cell {stats['cells'] + 1} failed: {e}"
+                break
+            provider.last_error = f"cell {stats['cells'] + 1} failed: {e}"
+            pending.pop(0)
+            continue
+        spent += provider.last_cost
+        stats["cells"] += 1
+        ids = [_place_key(b) for b in items]
+        mostly = provider.seen_stopped or geo.mostly_seen(ids, provider.seen)
+        for biz in items:
+            ident = _place_key(biz)
+            if not ident:
+                continue
+            have = found.get(ident)
+            if have is None:
+                found[ident] = biz
+            else:
+                for name in RANK_FIELDS:
+                    setattr(have, name, _best(getattr(have, name), getattr(biz, name)))
+        if provider.stop_reason:
+            # Stopped inside the cell (the cap, the kill switch, a later
+            # page failing): it carries on there.
+            rest = pending if provider.next_cursor else pending[1:]
+            stop = (provider.stop_reason, {"cells": rest, "cell": provider.next_cursor}
+                    if provider.next_cursor else {"cells": rest})
+            break
+        pending.pop(0)
+        if query.limit is not None and len(found) >= query.limit:
+            break
+        if mostly:
+            stats["seen_stops"] += 1
+        elif len(items) >= full_at and takes_all and geo.can_split(cell):
+            pending += geo.split(area, cell)
+            stats["split"] += 1
+    error = provider.last_error
+    provider.last_cost = spent
+    provider.remaining_budget = budget
+    provider.on_page = outer
+    provider.seen, provider.seen_stopped = None, False
+    provider.stop_reason, provider.complete, provider.next_cursor = "", True, None
+    provider.last_error = error
+    if stop is not None:
+        why, cursor = stop
+        left = len(cursor["cells"])
+        stats["left"] = left
+        unfetched_cost = left * provider.estimate([for_cell]) if for_cell else 0.0
+        provider._stopped(why, None, unfetched_cost, cursor=cursor if left else None)
+        if why == PART_WAY and not provider.last_error:
+            provider.last_error = "a cell failed part-way"
+    provider.cells = stats
+    if found:
+        logger.info("%s: %r tiled in %d cell(s) (%d split, %d stopped on known places)",
+                    provider.key, query.keyword(), stats["cells"], stats["split"],
+                    stats["seen_stops"])
+    return list(found.values())
+
+
 async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.AsyncClient,
                        env: dict, remaining: float = math.inf, host=None,
-                       paused=None, cursor: dict | None = None, on_page=None) -> Draft:
+                       paused=None, cursor: dict | None = None, on_page=None,
+                       area: geo.Area | None = None) -> Draft:
     """One search through one provider, as a Draft: a record per result
     (junk dropped and counted in ``counts``, each keyed by its position),
     the facts each result gives, and what the search really cost.
@@ -2338,8 +2573,18 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     ``values["transient"]``: on the first page the draft fails, on a later
     one it keeps the earlier pages and stops PART_WAY with its cursor. A
     provider that can take more later says when (``values["retry_after"]``,
-    seconds)."""
+    seconds).
+
+    ``area`` (else the query's own, without an outline) is the area
+    searched: a source that serves at most N places a search is tiled over
+    it (search_cells; ``counts["cells"]``, ``counts["split"]``), and a
+    result the source places outside it is dropped
+    (``counts["outside_area"]``)."""
     provider = PROVIDERS[provider_key]
+    area = area or query_area(query)
+    if area is not None and not area.shaped:
+        area = None
+    shape, cap = area_shape(provider_key) if area else ("", None)
     draft = Draft()
     provider.last_cost = 0.0
     provider.last_error = provider.stop_reason = ""
@@ -2352,8 +2597,12 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     provider.next_cursor = None
     provider.on_page = on_page
     provider.pages = 0
+    provider.cells = None
     try:
-        found = await provider.fetch(client, env, query)
+        if shape == "grid" and cap:
+            found = await search_cells(provider, client, env, query, area, int(cap))
+        else:
+            found = await provider.fetch(client, env, query)
     except ProviderExhausted as e:
         logger.warning("discover: %s stopped: %s", provider_key, e)
         draft.failed = draft.stop = str(e)
@@ -2394,6 +2643,14 @@ async def search_draft(provider_key: str, query: DiscoveryQuery, client: httpx.A
     # can't say a business is no longer ranked.
     draft.complete_codes = (tuple(provider.rank_codes)
                             if provider.complete and not cursor else ())
+    if provider.cells:
+        draft.counts.update(cells=provider.cells["cells"], split=provider.cells["split"],
+                            seen_stops=provider.cells["seen_stops"])
+    if area is not None and shape in ("circle", "grid"):
+        inside = [b for b in found if area.contains(b.lat, b.lng) is not False]
+        if len(inside) < len(found):
+            draft.counts["outside_area"] = len(found) - len(inside)
+        found = inside
     draft.counts["found"] = len(found)
     for i, biz in enumerate(found):
         if host is not None and biz.domain and not is_junk(biz.domain):
@@ -2463,7 +2720,8 @@ def provider_capabilities(module_id: str, caps: dict[str, str]) -> dict:
                                        remaining=ctx.budget.remaining,
                                        paused=ctx.settings.get("paused"),
                                        cursor=ctx.settings.get("cursor"),
-                                       on_page=ctx.settings.get("on_page"))
+                                       on_page=ctx.settings.get("on_page"),
+                                       area=ctx.settings.get("area"))
             return draft.stamp(module_id, cap_id)
 
         return Capability(module_id, cap_id, run,
@@ -2487,7 +2745,8 @@ def preset_capabilities(module_id: str, caps: dict[str, str]) -> dict:
                                        host=company_host if preset == "hiring" else None,
                                        paused=ctx.settings.get("paused"),
                                        cursor=ctx.settings.get("cursor"),
-                                       on_page=ctx.settings.get("on_page"))
+                                       on_page=ctx.settings.get("on_page"),
+                                       area=ctx.settings.get("area"))
             draft.stamp(*ctx.settings["searcher"])
             extra = [(r.key, f) for r in draft.records
                      for f in preset_facts(inp.query, r.source_url, r.key)]

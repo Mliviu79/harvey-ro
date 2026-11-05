@@ -47,7 +47,8 @@ import time
 
 import harvey.overlay.queries  # noqa: F401  (registers the named statements)
 from harvey import campaigns as campaign_rules, contact_check, launch, queries
-from harvey.agent import actions, memory, outreach, plans, readonly, views, wakes
+from harvey.agent import actions, areas as area_views, memory, outreach, plans, readonly, \
+    views, wakes
 
 logger = logging.getLogger("harvey.agent")
 
@@ -62,7 +63,8 @@ INSTRUCTIONS = (
     "Harvey's data in counts: counts() for how many firms and contacts a filter selects, "
     "the other views for the pipeline, campaigns, spend and the queue, schema() for the "
     "tables and their join rules, query() for one SELECT (rows come back as a sample with "
-    "their total), estimate() for what a run would cost. To act: propose_plan() with a "
+    "their total), estimate() for what a run would cost; areas(), plan_cells(), terms() and "
+    "phrase_yield() for where and what to search. To act: propose_plan() with a "
     "budget, wait for the user to approve it, then discover(), registry_pull(), "
     "find_contacts() or verify_contacts() under it, on a filter or a saved set "
     "(save_set()), and follow the runs with plan_status(); schedule_wake() to look again "
@@ -222,6 +224,9 @@ def build(db_path: str, chat: str = ""):
                              open_world_hint=True)
     stops = ToolAnnotations(read_only_hint=False, destructive_hint=True,
                             open_world_hint=False)
+    # (Reads; a place never looked up is asked of Nominatim once, and cached.)
+    looks_up = ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                               open_world_hint=True)
 
     def tool(description: str, annotations=read_only):
         return server.tool(description=description, annotations=annotations,
@@ -319,6 +324,58 @@ def build(db_path: str, chat: str = ""):
         return await t.call("jobs", args, lambda: views.job_info(t.state, action, id, lane,
                                                                  status, limit))
 
+    # ── Where and what to search (areas.py) ──
+
+    @tool("What an area is, before searching it: place (a town or county name, or a boundary "
+          "unit's id from an earlier answer). Returns its unit (name, admin level, km², box, ref "
+          "tags such as ref:siruta, parent), its sub-units (how many by level, the first "
+          f"{area_views.SUB_UNITS_NAMED} names with their ids), the circle a listings search "
+          "would take, whether the boundaries are loaded (without them: Nominatim's point and "
+          "box, no outline or sub-units), and other units the name may mean. A place never "
+          "looked up is looked up once at Nominatim (free, cached). Nothing is spent.",
+          looks_up)
+    async def areas(place: str) -> str:
+        async def run():
+            return await area_views.areas(t.state, place, writer=await a.state())
+        return await t.call("areas", {"place": place}, run)
+
+    @tool("How each search source would cover an area and what it would cost, before "
+          "anything runs: area (a place or a boundary unit id), sources (search source keys), "
+          "terms (the phrases, at most 50). Per source: a listings circle (one search a "
+          "phrase, results outside the area dropped), a map grid for a source that serves at "
+          f"most N places a search (its first cells, at most {area_views.CELLS_SHOWN} shown, "
+          "their size and zoom; a full cell splits in four as the run goes, within its cap), "
+          "or a point (ranked web search), with the estimate. Nothing is queued or spent.",
+          looks_up)
+    async def plan_cells(area: str, sources: list[str], terms: list[str]) -> str:
+        args = {"area": area, "sources": sources, "terms": terms}
+
+        async def run():
+            return await area_views.plan_cells(t.state, area, sources, terms,
+                                               writer=await a.state())
+        return await t.call("plan_cells", args, run)
+
+    @tool("Candidate search phrases for an activity: query is class codes ('8623', "
+          "'8621,8622') or words ('dentist'). Returns the activity classes they mean (the "
+          "market's classification: CAEN in Romania) and up to 40 phrases from the words "
+          "Harvey maps to them (everyday words, synonyms, class names, each marked where it "
+          "came from), plus the settings' own phrases. Candidates: trim them to the few people "
+          "type, and measure them with phrase_yield().")
+    async def terms(query: str) -> str:
+        return await t.call("terms", {"query": query},
+                            lambda: area_views.terms(t.state, query))
+
+    @tool(f"What each search phrase gave, per source, over the last days ({area_views.YIELD_DAYS} "
+          "by default): searches, places found, new firms (not on file before), what it cost "
+          f"and new firms per dollar, best first ({area_views.YIELD_ROWS} rows at most); area "
+          "keeps the searches of a place (by name), source one source. Counts only, from the "
+          "discovery runs' own reports.")
+    async def phrase_yield(days: int = area_views.YIELD_DAYS, area: str = "",
+                           source: str = "") -> str:
+        args = {"days": days, "area": area, "source": source}
+        return await t.call("phrase_yield", args, threaded(area_views.phrase_yield, t.db_path,
+                                                           days, area, source))
+
     # ── Acting: plans, sets and runs (actions.py) ──
 
     a = t.actions
@@ -373,7 +430,9 @@ def build(db_path: str, chat: str = ""):
 
     @tool("Queue a Discover run under an approved plan, as the Discover tab does: sources "
           "(search source keys, e.g. ['osm'] or ['serper']), phrases (search words; none: the "
-          "settings' industries) in cities (none: the settings' places), or a preset; depth "
+          "settings' industries) in cities (none: the settings' places) or in areas (places or "
+          "boundary unit ids from areas(): each searched by its shape, as plan_cells() "
+          "shows), or a preset; depth "
           "(results a search goes to; none: every one the source has, the cap stops it); "
           "max_spend (the searches' cap, USD; 0: free sources only), websites_max_spend (also "
           "look up a website for each company found with none, paid lookups up to this), "
@@ -384,14 +443,14 @@ def build(db_path: str, chat: str = ""):
                        cities: list[str] | None = None, preset: str = "",
                        depth: int | None = None, max_spend: float = 0.0,
                        websites_max_spend: float = 0.0, find_websites: bool = True,
-                       classify_max_spend: float = 0.0) -> str:
+                       classify_max_spend: float = 0.0, areas: list[str] | None = None) -> str:
         args = {"plan": plan, "sources": sources, "phrases": phrases or [],
-                "cities": cities or [], "preset": preset, "depth": depth,
+                "cities": cities or [], "areas": areas or [], "preset": preset, "depth": depth,
                 "max_spend": max_spend, "websites_max_spend": websites_max_spend,
                 "find_websites": find_websites, "classify_max_spend": classify_max_spend}
         return await acting("discover", args, lambda turn: a.discover(
             turn, plan, sources, phrases, cities, preset, depth, max_spend,
-            websites_max_spend, find_websites, classify_max_spend))
+            websites_max_spend, find_websites, classify_max_spend, areas))
 
     @tool("Queue a registry pull under an approved plan, as the Registry page does: filters "
           "(the registry's: words, county, locality, status, min/max_turnover, "

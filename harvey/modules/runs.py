@@ -48,19 +48,85 @@ async def _enabled(state) -> frozenset[str]:
     return frozenset(await switches.enabled_ids(state))
 
 
-# ── Geocoding (the nominatim module) ──
+# ── Geocoding (the nominatim module, and the boundaries when loaded) ──
 
-async def geocode_city(state, city: str, radius_km: int = 40,
-                       client: httpx.AsyncClient | None = None) -> str:
-    """"Denver, CO" -> "39.7392,-104.9903,40". Cached permanently, a miss
-    too (as "-"), so a place is asked once."""
-    if not city:
-        return ""
-    cache_key = f"geo:{city.strip().lower()}"
-    cached = await state.get_setting(cache_key)
-    if cached:
-        return "" if cached == "-" else f"{cached},{radius_km}"
+GEO_KEY = "geo:{}"          # "lat,lng", or "-" for a place Nominatim doesn't know
+GEOBOX_KEY = "geobox:{}"    # its box "south,west,north,east", or "-" when it gave none
 
+
+def _place_key(city: str) -> str:
+    return city.strip().lower()
+
+
+async def _boundary_area(state, city: str):
+    """The area a place name means in the boundaries file, when the
+    boundaries module is on and loaded and knows the name: its first
+    match (boundaries.store.find: an exact name first, then by parent, the
+    larger level first; a homonymous county and town are told apart by
+    naming the unit's id), or None."""
+    enabled = await _enabled(state)
+    if "boundaries" not in enabled:
+        return None
+    try:
+        draft = await api.capability("boundaries", "find_area")(
+            api.Input(locality=city), api.Context(enabled=enabled))
+    except (api.CapabilityMissing, LookupError) as e:
+        logger.debug("boundaries not asked for %r: %s", city, e)
+        return None
+    units = draft.values.get("units") or []
+    return unit_area(units[0], name=city) if units else None
+
+
+def unit_area(unit: dict, name: str = ""):
+    """A boundary unit (boundaries.store) as an Area: its centre, the
+    circle round it that holds its box, its box, id, level and km²."""
+    from harvey import geo
+
+    area = geo.Area.from_bbox(float(unit["lat"]), float(unit["lng"]), unit["bbox"],
+                              name=name or unit.get("name") or "", source="boundaries")
+    area.unit, area.level = int(unit["id"]), int(unit["level"])
+    area.area_km2 = float(unit.get("area_km2") or 0.0)
+    if unit.get("rings"):
+        area.rings = unit["rings"]
+        area.radius_km = geo.covering_radius(area.lat, area.lng, area.rings)
+    return area
+
+
+async def boundary_unit(state, unit_id) -> dict | None:
+    """One boundary unit with its outline and children (boundaries'
+    area_unit), or None when the module is off, nothing is loaded or there
+    is no such unit."""
+    enabled = await _enabled(state)
+    if "boundaries" not in enabled:
+        return None
+    draft = await api.capability("boundaries", "area_unit")(
+        api.Input(ids={"unit": str(unit_id)}), api.Context(enabled=enabled))
+    return draft.values.get("unit")
+
+
+async def place_area(state, city: str, client: httpx.AsyncClient | None = None, *,
+                     network: bool = True):
+    """The area a place name covers: from the boundaries when they know it,
+    else Nominatim's point and box (asked once, cached for good: a place
+    answered before boxes were kept is asked once more). ``network``
+    False reads only what is cached. None when the place isn't known (or,
+    offline, not cached)."""
+    from harvey import geo
+
+    if not city or not city.strip():
+        return None
+    area = await _boundary_area(state, city)
+    if area is not None:
+        return area
+    key = _place_key(city)
+    cached = await state.get_setting(GEO_KEY.format(key))
+    box = await state.get_setting(GEOBOX_KEY.format(key))
+    if cached == "-":
+        return None
+    if cached and (box or not network):
+        return _cached_area(city, cached, box)
+    if not network:
+        return None
     from harvey.collectors.discover import TIMEOUT
 
     owned = client is None
@@ -73,19 +139,58 @@ async def geocode_city(state, city: str, radius_km: int = 40,
             await client.aclose()
     point = draft.values.get("point")
     if point is None:
+        # Not asked (the network): an old answer still serves.
+        return _cached_area(city, cached, box) if cached else None
+    bbox = draft.values.get("bbox")
+    await ingest.place(state, GEO_KEY.format(key), point or "-")
+    if point:
+        await ingest.place(state, GEOBOX_KEY.format(key),
+                           ",".join(str(v) for v in bbox) if bbox else "-")
+    return _cached_area(city, point, ",".join(str(v) for v in bbox) if bbox else "-") \
+        if point else None
+
+
+def _cached_area(city: str, point: str, box: str | None):
+    from harvey import geo
+
+    parsed = geo.parse_coordinate(point)
+    if parsed is None:
+        return None
+    lat, lng, _ = parsed
+    try:
+        bbox = [float(v) for v in (box or "").split(",")] if box and box != "-" else []
+    except ValueError:
+        bbox = []
+    if len(bbox) == 4:
+        return geo.Area.from_bbox(lat, lng, bbox, name=city)
+    # (No box: a point only, its radius the caller's.)
+    return geo.Area(name=city, lat=lat, lng=lng, source="point")
+
+
+async def geocode_city(state, city: str, radius_km: int = 40,
+                       client: httpx.AsyncClient | None = None) -> str:
+    """"Denver, CO" -> "39.7392,-104.9903,<radius>": the point, and the
+    radius of the circle that holds the place's box or outline
+    (``radius_km`` when its gazetteer gave no box). "" when the place
+    isn't known."""
+    area = await place_area(state, city, client)
+    if area is None:
         return ""
-    await ingest.place(state, cache_key, point or "-")
-    return f"{point},{radius_km}" if point else ""
+    if area.bbox is None:
+        return f"{area.lat:.4f},{area.lng:.4f},{radius_km}"
+    return area.coordinate
 
 
 async def resolve_coordinates(state, queries, radius_km: int = 40,
                               client: httpx.AsyncClient | None = None):
-    """Fill in coordinates for any query that lacks them.
+    """Fill in coordinates, and the area, for any query that lacks them.
 
-    Configured ``icp.geo_coordinates`` always wins; this only covers what the
-    user did not spell out. Distinct cities are geocoded once each, however
-    many queries share them.
+    Configured ``icp.geo_coordinates`` always wins (its circle is the
+    area); this only covers what the user did not spell out. Distinct
+    cities are geocoded once each, however many queries share them.
     """
+    from harvey import geo
+
     needed = {q.location for q in queries if q.location and not q.coordinate}
     points: dict[str, str] = {}
     for i, city in enumerate(sorted(needed)):
@@ -93,10 +198,38 @@ async def resolve_coordinates(state, queries, radius_km: int = 40,
             await asyncio.sleep(1.1)     # Nominatim: max 1 request/second
         points[city] = await geocode_city(state, city, radius_km, client)
 
+    areas: dict[str, object] = {}
     for query in queries:
         if not query.coordinate:
             query.coordinate = points.get(query.location, "")
+        if query.coordinate and not query.area:
+            if query.location not in areas:
+                areas[query.location] = (await place_area(state, query.location, network=False)
+                                         if query.location in points else None)
+            area = areas[query.location]
+            if area is None or area.coordinate != query.coordinate:
+                # A circle the user wrote is an area; a point a gazetteer
+                # gave with no box is only a point.
+                area = geo.Area.from_coordinate(
+                    query.coordinate, name=query.location,
+                    source="config" if query.location not in points else "point")
+            if area is not None:
+                query.area = area.as_dict()
     return queries
+
+
+async def area_outline(state, query):
+    """The query's area with its outline read from the boundaries (a unit
+    the boundaries module knows), else as the query keeps it."""
+    from harvey import geo
+
+    area = geo.Area.from_dict(query.area) if query.area else None
+    if area is None or area.unit is None:
+        return area
+    unit = await boundary_unit(state, area.unit)
+    if unit and unit.get("rings"):
+        area.rings = unit["rings"]
+    return area
 
 
 # ── Discovery (the search modules and the presets) ──
@@ -229,7 +362,8 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                                   settings={"provider": provider_key,
                                             "searcher": (searcher.module, searcher.id),
                                             "paused": paused, "on_page": on_page,
-                                            "cursor": cursor if i == 0 else None})
+                                            "cursor": cursor if i == 0 else None,
+                                            "area": await area_outline(state, query)})
                 report.queries_ran += 1
                 draft = await cap(api.Input(query=query, area=query.location,
                                             extra={"provider": provider_key}), ctx)

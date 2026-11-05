@@ -1589,6 +1589,62 @@ async def _run_source(state, args, kind_: str, module: str, capability: str, lab
 
 TAX_MODULE = "mf_taxpayers"
 ANAF_MODULE = "anaf"
+BOUNDARIES_MODULE = "boundaries"
+
+
+def _print_boundaries_status(meta: dict | None):
+    from harvey.modules.original.boundaries import store
+
+    if not meta:
+        print("\n  No boundaries loaded. harvey boundaries load")
+    else:
+        levels = ", ".join(f"level {lv}: {n:,}" for lv, n in (meta.get("levels") or {}).items())
+        print(f"\n  Boundaries of {meta.get('regions') or '?'}: {meta.get('units', 0):,} units "
+              f"({levels})")
+        print(f"  loaded {meta.get('loaded_at')} UTC in {meta.get('load_seconds')} s, "
+              f"{int(meta.get('bytes', 0)) / 1e6:.1f} MB")
+    if store.library_problem():
+        print(f"  {store.library_problem()}")
+    print(f"  Source: {_attribution(BOUNDARIES_MODULE)}\n")
+
+
+def cmd_boundaries(args):
+    """OpenStreetMap's administrative boundaries in data/boundaries.db:
+    load them from a Geofabrik extract, or show what is loaded. No Claude."""
+    import json as _json
+
+    from harvey.modules.original.boundaries import store
+    from harvey.state import StateManager
+
+    if args.boundaries_action == "status":
+        meta = store.status()
+        if args.json:
+            print(_json.dumps({"loaded": meta, "library": store.library_problem()},
+                              ensure_ascii=False, indent=2))
+        else:
+            _print_boundaries_status(meta)
+        return
+    _require_module(BOUNDARIES_MODULE, "harvey boundaries load")
+    if store.library_problem():
+        print(f"\n  {store.library_problem()}\n")
+        raise SystemExit(1)
+
+    async def _load():
+        state = StateManager()
+        await state.init_db()
+        print("\n  OpenStreetMap boundaries: downloads each region's extract when none is "
+              "kept (Romania: about 320 MB), then loads them...", flush=True)
+        found = await _run_source(state, args, "source_sync", BOUNDARIES_MODULE,
+                                  "boundaries_sync", "Boundaries: load", force=args.force)
+        if found is None:
+            return
+        values = found[0].result.get("values") or {}
+        if values.get("unchanged"):
+            print("  Already loaded from the extracts kept (--force downloads fresh ones).")
+        _print_boundaries_status(values.get("boundaries") or store.status())
+
+    asyncio.run(_load())
+
 
 
 def _print_taxpayers_status(meta: dict | None, change: dict | None, checked_at: str,
@@ -4125,6 +4181,24 @@ def main():
     r = tax_sub.add_parser("check", help="Ask data.gov.ro now whether a newer file is out")
     _background_arg(r)
     sub.set_defaults(func=cmd_taxpayers)
+
+    sub = subparsers.add_parser(
+        "boundaries",
+        help="Administrative boundaries (OpenStreetMap, via Geofabrik) in data/boundaries.db: "
+             "load, status",
+        description="Downloads the OpenStreetMap extract of each region the market packs "
+                    "name (Romania: about 320 MB from download.geofabrik.de; kept in "
+                    "data/boundaries/) and loads every administrative boundary into a local "
+                    "database: an area's outline, its sub-units, and the cells a capped map "
+                    "search is tiled into. The boundaries module must be on (harvey modules "
+                    "enable boundaries). © OpenStreetMap contributors, ODbL. Free; no Claude.")
+    b_sub = sub.add_subparsers(dest="boundaries_action", required=True)
+    r = b_sub.add_parser("load", help="Download the extracts if missing and load them")
+    r.add_argument("--force", action="store_true", help="Download fresh extracts and load")
+    _background_arg(r)
+    r = b_sub.add_parser("status", help="What is loaded")
+    r.add_argument("--json", action="store_true", help="Print JSON")
+    sub.set_defaults(func=cmd_boundaries)
 
     sub = subparsers.add_parser(
         "anaf",

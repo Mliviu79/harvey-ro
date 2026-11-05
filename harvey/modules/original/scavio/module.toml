@@ -32,6 +32,9 @@ op = "query"
 provider = "scavio_maps"
 # Finds a company by its name and town (the contact finder's website lookup).
 lookup = "website"
+# At most 120 places a search: an area is tiled, a full cell split in four.
+area = "grid"
+max_results = 120
 inputs = [["query", "area"]]
 outputs = { records = "companies", ids = ["domain", "phone", "external"], facts = ["FOUND_IN_SERP", "NO_WEBSITE", "REVIEW_RATING", "REVIEW_COUNT"] }
 cost = { usd = 0.01, per = "page", note = "up to 20 listings a page, 6 pages (120 places), all Google Maps serves" }

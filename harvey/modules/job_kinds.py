@@ -515,9 +515,14 @@ async def run_source_sync(ctx) -> dict:
     out = {"module": module, "unchanged": bool(values.get("unchanged")),
            "offline": values.get("offline") or "", "downloaded": values.get("downloaded") or [],
            "values": {k: v for k, v in values.items() if k != "progress"}}
-    if not values.get("unchanged"):
+    from harvey.modules import switches
+
+    # A gazetteer's load (the boundaries) describes places, not companies:
+    # there is nothing to count or look up after it.
+    describes_firms = getattr(switches.by_id().get(module), "kind", "source") == "source"
+    if describes_firms and not values.get("unchanged"):
         await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
-    if p.get("lookup", True) and not (p.get("auto") and values.get("unchanged")):
+    if describes_firms and p.get("lookup", True) and not (p.get("auto") and values.get("unchanged")):
         found = await lookup_by_id(ctx.state, progress=lambda done, total: ctx.say_soon(
             f"    companies on file: {done:,} of {total:,}..."))
         out.update(companies=found["companies"], observations=found["observations"],

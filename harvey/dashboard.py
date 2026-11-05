@@ -4295,6 +4295,17 @@ def _discovery_queries(body: dict, config, provider: str = ""):
     return launch.discovery_queries(body, config, provider)
 
 
+async def _discovery_areas(body: dict) -> None:
+    """The areas a request names, resolved onto it (launch.discovery_areas;
+    ValueError for one that can't be found)."""
+    from harvey import launch
+
+    if body.get("areas"):
+        state = _state()
+        await state.init_db()
+        await launch.discovery_areas(state, body)
+
+
 def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
     """One part per source the request ticked (launch.discovery_plan)."""
     from harvey import launch
@@ -4376,6 +4387,7 @@ async def estimate_discovery(request: Request):
             return JSONResponse(_error_body(refusal), status_code=409)
         config = load_config()
         try:
+            await _discovery_areas(body)
             plan, notes = _discovery_plan(body, config)
         except LookupError as e:
             return JSONResponse({"error": str(e).strip("'\"")}, status_code=400)
@@ -4445,6 +4457,7 @@ async def start_discovery(request: Request):
 
         config = load_config()
         try:
+            await _discovery_areas(body)
             plan, notes = _discovery_plan(body, config)
         except LookupError as e:
             return JSONResponse({"success": False, "message": str(e).strip("'\"")},
@@ -5768,6 +5781,7 @@ async def _public_data() -> dict:
             k: reg.get(k) for k in ("dataset", "date", "loaded_at", "firms", "operating")},
         "registry_on": "onrc" in on,
         "taxpayers": await _taxpayers_status(state, on),
+        "boundaries": await _boundaries_status(state, on),
         "anaf": await _anaf_status(state, on),
         "financials": {
             "on": FIN_MODULE in on,
@@ -5857,6 +5871,70 @@ async def set_financials_settings(request: Request):
 
 TAX_MODULE = "mf_taxpayers"
 ANAF_MODULE = "anaf"
+BOUNDARIES_MODULE = "boundaries"
+
+
+async def _boundaries_status(state, on: set[str]) -> dict:
+    """The boundaries' local copy: what is loaded (units by admin level,
+    the regions, when), the regions a load takes and what is downloaded
+    of them, whether pyosmium is there, whether a load is running."""
+    from harvey.modules import switches
+    from harvey.modules.api import Context
+    from harvey.modules.original.boundaries import capabilities as bcap
+    from harvey.modules.original.boundaries import source, store
+
+    m = switches.by_id().get(BOUNDARIES_MODULE)
+    if m is None:
+        return {"on": False}
+    settings = await switches.module_settings(state, BOUNDARIES_MODULE) \
+        if BOUNDARIES_MODULE in on else {}
+    loaded = await asyncio.to_thread(store.status)
+    try:
+        regions = bcap.regions(Context(settings=settings, enabled=frozenset(on)))
+    except ValueError:
+        regions = []
+    files = []
+    for region in regions:
+        path = source.downloaded(region)
+        files.append({"region": region, "file": path.name if path else "",
+                      "day": path.parent.name if path else "",
+                      "bytes": path.stat().st_size if path else None})
+    running, report = await _source_jobs(state, BOUNDARIES_MODULE)
+    return {
+        "on": BOUNDARIES_MODULE in on,
+        "loaded": None if loaded is None else {
+            k: loaded.get(k) for k in ("regions", "loaded_at", "load_seconds", "units",
+                                       "levels", "bytes")},
+        "regions": regions,
+        "downloads": files,
+        "size_note": (m.cost or {}).get("note", ""),
+        "library": store.library_problem(),
+        "running": running,
+        "report": report,
+        "attribution": _attribution(BOUNDARIES_MODULE),
+    }
+
+
+@app.post("/api/public-data/boundaries/load")
+async def load_boundaries(request: Request):
+    """Queue a download of each region's OpenStreetMap extract when none is
+    on disk, and the load of its boundaries. {"force": true}: a fresh
+    download and load."""
+    from harvey.modules.original.boundaries import store
+
+    refused = await _module_refused(BOUNDARIES_MODULE, "Loading the boundaries")
+    if refused:
+        return refused
+    if store.library_problem():
+        return JSONResponse({"success": False, "message": store.library_problem(),
+                             "code": "library_missing"}, status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    force = bool(isinstance(body, dict) and body.get("force"))
+    return await _queue_source(BOUNDARIES_MODULE, "source_sync", "boundaries_sync", force=force)
+
 
 
 async def _taxpayers_status(state, on: set[str]) -> dict:
