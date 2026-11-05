@@ -2402,18 +2402,18 @@ def preset_facts(query: DiscoveryQuery | None, source_url: str, record: str = ""
     return facts
 
 
-def _observations(biz: Business, company_id: str, confirmed: set[str],
+def _observations(biz: Business, company_id: str, wanted: set[str],
                   run_id: str, query: DiscoveryQuery | None = None,
                   ranks_only: bool = False) -> list[dict]:
     """Every fact this business gave us, as observation rows, and only the
-    confirmed ones (what a run writes for its first sighting)."""
+    ones in ``wanted`` (what a run writes for its first sighting)."""
     facts = business_facts(biz, query, ranks_only)
     if not ranks_only:
         facts += preset_facts(query, biz.source_url)
     return [{"company_id": company_id, "signal_code": f.code, "collector": f.collector,
              "value_num": f.value_num, "value_text": f.value_text, "confidence": f.confidence,
              "evidence_url": f.source_url, "run_id": run_id}
-            for f in facts if f.code in confirmed]
+            for f in facts if f.code in wanted]
 
 
 def _place_key(biz: Business) -> str:

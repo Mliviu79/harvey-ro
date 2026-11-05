@@ -1,13 +1,13 @@
-"""The signal vocabulary Harvey proposes, and the user confirms.
+"""The signal vocabulary: the facts Harvey knows how to collect.
 
-Harvey never decides on its own what makes a good prospect. It proposes a
-catalog of signals it knows how to collect — each with a plain-language
-description, what it costs, and why it might matter — and the user confirms,
-edits, or rejects them in the dashboard before any collection runs.
-
-Only ``confirmed`` signals get collected. That keeps spend intentional and
-keeps the resulting cohorts explainable: a prospect list is a query over
-signals a human chose, not a black box.
+Each signal has a plain-language description, what collecting it costs, and
+how a company with no reading of it reads. The vocabulary is governed: a
+fact naming a code no module declares is refused. Every signal a module
+that is on declares is collected; a module's switch is the only on/off.
+Spend is held where it happens, never here: a paid source runs only inside
+its run's cap (and, for the agent, the budget of a plan the user approved).
+A prospect list stays explainable: a query over named facts, not a black
+box.
 
 Design note: every signal is recorded as an OBSERVATION (a row), never a
 column. A new signal needs no migration, history comes free, and confidence
@@ -484,13 +484,11 @@ def available_codes(stored: dict[str, str], manifests=None) -> set[str]:
 async def sync_vocabulary(state) -> int:
     """Bring signal_codes in line with the module manifests.
 
-    Every signal a manifest declares is registered (new ones as PROPOSED,
-    awaiting user confirmation), with its declaring module and how it reads.
-    It is ``available`` while a module that is on declares it or lists it
-    among a capability's outputs (FOUND_IN_SERP stays while any search
-    module is on); otherwise it is hidden and never collected, and its
-    observations stay. Idempotent, and never overrides a decision the user
-    already made: an existing signal keeps its confirmed/rejected status.
+    Every signal a manifest declares is registered, with its declaring
+    module and how it reads. It is ``available`` (collected) while a
+    module that is on declares it or lists it among a capability's outputs
+    (FOUND_IN_SERP stays while any search module is on); otherwise it is
+    hidden and never collected, and its observations stay. Idempotent.
     The descriptions live here, in SIGNAL_CATALOG. The switches are read
     and every row written in one transaction, so a module turned on or off
     in another process at the same moment can't leave its signals hidden

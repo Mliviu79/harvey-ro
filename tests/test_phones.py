@@ -316,7 +316,6 @@ async def test_company_export_phone_columns(state):
     await state.add_company(Company(name="Beta", domain="beta.example",
                                     phone="Reception desk"))
     await state.add_company(Company(name="Gama", domain="gama.example"))
-    await state.set_signal_status("PHONE_NUMBER", "confirmed")
     await state.add_observations([
         {"signal_code": "PHONE_NUMBER", "company_id": cid, "value_text": v,
          "observed_at": f"2026-10-0{i + 1} 00:00:00"}
@@ -343,7 +342,6 @@ async def test_company_export_phone_columns(state):
 ])
 async def test_company_export_splits_a_listing_with_several_numbers(state, listed):
     cid = await state.add_company(Company(name="Alfa", domain="alfa.example.ro", phone=listed))
-    await state.set_signal_status("PHONE_NUMBER", "confirmed")
     await state.add_observations([
         {"signal_code": "PHONE_NUMBER", "company_id": cid, "value_text": v}
         for v in ["+40740000102", "+40268000103"]])

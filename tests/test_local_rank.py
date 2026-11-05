@@ -33,8 +33,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 

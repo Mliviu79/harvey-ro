@@ -241,7 +241,6 @@ def test_the_finder_links_published_addresses_and_builds_the_rest_the_same_way(
         s = await _state(db)
         cid = await s.add_company(Company(name="HARBORLINE DENTAL", domain=EN,
                                           location="Port Ellery", source="discover:serper"))
-        await s.set_signal_status("LIKELY_OWNER", "confirmed")
         found = await finder.find(s, cid, spend=finder.Spend(), env={})
         return cid, found
 

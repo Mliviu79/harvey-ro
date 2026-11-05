@@ -60,10 +60,6 @@ async def state(tmp_path):
     await sync_vocabulary(sm)
     # Web signals' module (off as shipped).
     await switches.set_enabled(sm, "web_marketing", True)
-    for code in ("ACTIVITY_CODE", "PHONE_NUMBER", "CONTACT_FOUND", "TECH_STACK",
-                 "RUNNING_GOOGLE_ADS", "TURNOVER", "EMPLOYEES", "EFACTURA_REGISTERED",
-                 "HAS_EMPLOYEES_TAX"):
-        await sm.set_signal_status(code, "confirmed")
     alfa, beta, gama = await _pull(
         sm, _firm(1, "EXEMPLU ALFA SRL", str(ALFA), "https://alfa.example.com",
                   "alfa.example.com"),
@@ -352,7 +348,8 @@ async def test_signal_states_and_cohorts_over_stored_and_register_signals(state)
     counts, rows = await state.cohort_verdicts(["TECH_STACK"], [], verdicts=("possible",))
     assert len(rows) == 3
     codes = {c["code"]: c for c in await state.get_signal_codes(available_only=True)}
-    assert codes["TECH_STACK"]["status"] == "confirmed" and codes["TECH_STACK"]["module"]
+    assert "status" not in codes["TECH_STACK"] and codes["TECH_STACK"]["module"]
+    assert "TECH_STACK" in await state.collected_signal_codes()
 
 
 # ── The dashboard on the overlay ──
@@ -407,8 +404,8 @@ async def test_dashboard_pages_on_the_overlay(state, client):
     assert est["companies"] == 1 and est["with_site"] == 0
     sig = client.get("/api/signals").json()
     assert sig["total"] and not sig.get("error")
-    co = client.post("/api/cohort", json={"require": ["TECH_STACK"]}).json()
-    assert co["size"] == 1 and co["companies"][0]["id"] == str(i["alfa"])
+    co = client.get("/api/companies?require=TECH_STACK&limit=50").json()
+    assert [x["id"] for x in co["companies"]] == [str(i["alfa"])]
     ov = client.get("/api/overview").json()
     assert ov["companies"] == 4 and ov["with_phone"] == 3
     live = client.get("/api/live-status").json()
@@ -434,10 +431,9 @@ V25_PAGES = {
     "live-status": ("GET", "/api/live-status", None),
     "overview": ("GET", "/api/overview", None),
     "signals": ("GET", "/api/signals", None),
-    "cohort.efactura": ("POST", "/api/cohort", {"require": ["EFACTURA_REGISTERED"]}),
-    "cohort.turnover": ("POST", "/api/cohort",
-                        {"ranges": [{"code": "TURNOVER", "min": 1000000}]}),
-    "cohort.tech": ("POST", "/api/cohort", {"require": ["TECH_STACK"]}),
+    "companies.efactura": ("GET", "/api/companies?require=EFACTURA_REGISTERED&limit=50", None),
+    "companies.min_turnover": ("GET", "/api/companies?min_turnover=1000000&limit=50", None),
+    "companies.tech": ("GET", "/api/companies?require=TECH_STACK&limit=50", None),
     "companies": ("GET", "/api/companies?limit=50", None),
     "companies.offset": ("GET", "/api/companies?limit=50&offset=2", None),
     "companies.county": ("GET", "/api/companies?county=Bra%C8%99ov&limit=50", None),
@@ -869,7 +865,6 @@ async def test_a_registry_reload_moves_the_statements_filed_answers(state, tmp_p
         finally:
             con.close()
 
-    await state.set_signal_status("FILED_ACCOUNTS", "confirmed")
     fin = sqlite3.connect(tmp_path / "financials.db")
     fin.execute("INSERT OR IGNORE INTO complete_year VALUES (2024)")
     fin.commit()

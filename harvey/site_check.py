@@ -139,7 +139,7 @@ async def recheck_one(state, company_id: str, *, batch: str = "", config=None) -
     urls = [(domain, website)] + [(d, f"https://{d}/") for d in others]
     urls = urls[:finder.MAX_CANDIDATES]
     cards = []
-    async with finder._reader(state, set(await state.confirmed_signal_codes()), config) as read:
+    async with finder._reader(state, await state.collected_signal_codes(), config) as read:
         for dom, url in urls:
             draft = await read.fetch(company, domain=dom)
             cards.append(site_match.card(facts, dom, draft or api.Draft(), url=url,

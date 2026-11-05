@@ -248,7 +248,7 @@ async def run_discover(ctx) -> dict:
         await enqueue_finder_follow_ups(ctx.state, report.company_ids,
                                         batch_id=ctx.job.batch_id, parent_id=ctx.id)
     stopped = report.stopped
-    if stopped in ("not configured", "no confirmed signals"):
+    if stopped == "not configured":
         raise JobError("; ".join(report.errors) or stopped)
     if stopped == "budget reached":
         raise SpendLimit("the run's spend limit is reached")
@@ -306,16 +306,14 @@ async def run_site_read(ctx) -> dict:
     if company is None:
         return {"skipped": "no website (or merged into another company)"}
     lane = ctx.lane
-    if "confirmed" not in lane:
+    if "config" not in lane:
         await sync_vocabulary(ctx.state)
         lane["config"] = _config()
         lane["keywords"] = role_keywords(getattr(lane["config"], "icp", None))
-    lane["confirmed"] = await ctx.state.confirmed_signal_codes()
-    if not lane["confirmed"]:
-        raise JobError("No signals confirmed yet: confirm signals first (Semnale, or "
-                       "harvey signals --confirm free); nothing is collected until you do.")
+    # Read each time: a module switched on or off since applies at once.
+    wanted = await ctx.state.collected_signal_codes()
     run_id = await ctx.lane_run("profile", "http")
-    found = await profile(ctx.state, [company], lane["confirmed"], run_id=run_id,
+    found = await profile(ctx.state, [company], wanted, run_id=run_id,
                           config=lane["config"], role_keywords=lane["keywords"])
     ctx.count(1)
     return {"domain": company["domain"], "observations": found}
@@ -343,7 +341,7 @@ async def run_duplicates_scan(ctx) -> dict:
 
 async def enqueue_register_counts(state, *, batch_id: str = "", parent_id: str = "") -> str:
     """Queue one count of every register signal over the firms in Harvey
-    for the registers' current loads (what the Signals page, the landing
+    for the registers' current loads (what the signal listing, the landing
     page and the People page read), after a register or the firms in
     Harvey changed. "" while one waits already."""
     try:
@@ -526,7 +524,7 @@ async def run_source_sync(ctx) -> dict:
         found = await lookup_by_id(ctx.state, progress=lambda done, total: ctx.say_soon(
             f"    companies on file: {done:,} of {total:,}..."))
         out.update(companies=found["companies"], observations=found["observations"],
-                   unconfirmed=found["unconfirmed"], errors=found["errors"][:3])
+                   errors=found["errors"][:3])
     return out
 
 
@@ -658,16 +656,16 @@ async def enqueue_id_checks(state, module_id: str, capability: str, company_ids=
 async def enqueue_follow_up_checks(state, company_ids, *, batch_id: str = "",
                                    parent_id: str = "", then_find: bool = False) -> int:
     """The checks a source's new companies get (every enricher capability
-    marked ``after_source`` whose module is on and has a confirmed signal
-    to record: ANAF's), queued on their own lanes. ``then_find``: each
+    marked ``after_source`` whose module is on and has a signal to record:
+    ANAF's; free lookups only, id_enrichers), queued on their own lanes. ``then_find``: each
     check queues the contact finder for its companies when it is done (the
     first module's checks only). Returns how many jobs."""
     from harvey.modules.runs import _enabled, _wanted, id_enrichers
 
-    confirmed = await state.confirmed_signal_codes()
+    wanted = await state.collected_signal_codes()
     queued = 0
     for m, cap, _ in id_enrichers(await _enabled(state), after_source=True):
-        if not _wanted(cap, confirmed):
+        if not _wanted(cap, wanted):
             continue
         ids, _dupes = await enqueue_id_checks(state, m.id, cap["id"], company_ids,
                                               batch_id=batch_id, parent_id=parent_id,
@@ -752,7 +750,7 @@ def _added(before: dict, report: dict) -> dict:
         for key, value in part.items():
             if isinstance(value, int) and not isinstance(value, bool) and key in out:
                 out[key] += value
-            elif key in ("unconfirmed", "stopped") and value:
+            elif key == "stopped" and value:
                 out[key] = value
             elif key == "errors" and value:
                 out["errors"] = (out["errors"] + list(value))[:20]

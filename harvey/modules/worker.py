@@ -626,7 +626,7 @@ async def _enqueue_backlog(state) -> None:
 
 
 async def _enqueue_stale_counts(state) -> None:
-    """The register counts the landing, Signals and People pages read,
+    """The register counts the landing and People pages and the signal listing read,
     queued when they aren't counted for the registers' current loads (the
     first start after the upgrade, a reload or a merge)."""
     try:

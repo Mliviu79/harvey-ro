@@ -44,8 +44,6 @@ def _seed(db_path) -> dict:
         s = StateManager(str(db_path))
         await s.init_db()
         await sync_vocabulary(s)
-        for code in ("PHONE_NUMBER", "CONTACT_FOUND"):
-            await s.set_signal_status(code, "confirmed")
         ids = {}
         # Registered firms, described by the registry beside the database:
         # the first authorised for dentistry (8623) and run by Ana Exemplu.
@@ -335,7 +333,7 @@ def test_overview_counts(client):
     asyncio.run(StateManager(str(client.db_path)).recount_register_tally())
     ov = client.get("/api/overview").json()
     assert ov["people"] == 4 and ov["with_activity"] == 5
-    assert ov["signals_confirmed"] == 2
+    assert "signals_confirmed" not in ov and "signals_proposed" not in ov
 
 
 def test_overview_on_an_empty_install(client):

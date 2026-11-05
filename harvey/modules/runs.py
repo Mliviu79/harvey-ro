@@ -3,7 +3,7 @@
 A run is what a person (the CLI, the dashboard) or the heartbeat starts: a
 discovery over a list of searches, a registry pull, a profile pass over the
 companies due for one. The run owns everything that isn't a module's to
-own: the confirmation gate read once at the start, the runs log, the spend
+own: the signals collected read once at the start, the runs log, the spend
 cap and the kill switch checked between calls, the do-not-contact list,
 and the order things are written in. Each call to a module goes through
 its capability (harvey/modules/api.py) and each thing it found through
@@ -295,13 +295,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
         return report
 
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    if not confirmed:
-        report.errors.append(
-            "no signals confirmed — confirm signals first (dashboard → Signals, "
-            "or `harvey signals --confirm free`) or discovery has nothing to record")
-        report.stopped = "no confirmed signals"
-        return report
+    wanted = await state.collected_signal_codes()
 
     report.run_id = await state.start_run(
         "discover", provider=provider_key,
@@ -358,7 +352,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                 budget = api.Budget()
                 budget.remaining = max(0.0, max_spend - report.actual_cost)
                 ctx = api.Context(http=client, env=env, budget=budget, config=config,
-                                  wanted=frozenset(confirmed), enabled=enabled,
+                                  wanted=frozenset(wanted), enabled=enabled,
                                   settings={"provider": provider_key,
                                             "searcher": (searcher.module, searcher.id),
                                             "paused": paused, "on_page": on_page,
@@ -443,7 +437,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                                  and (old[f.code] is None or f.value_num < old[f.code])]
                     batch += ingest.rows([replace(f, record="") for f in facts],
                                          company_id=where.company_id, origin=where.origin,
-                                         run_id=report.run_id, confirmed=confirmed)
+                                         run_id=report.run_id, wanted=wanted)
 
                 # A business this phrase ranked before, and that no search for
                 # it this run has found, is no longer ranked (within depth) or
@@ -452,7 +446,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                 # whether or not a preset ran it.)
                 phrase = query.keyword()
                 for code in draft.complete_codes:
-                    if code not in confirmed:
+                    if code not in wanted:
                         continue
                     found_now = ranked_in_run.setdefault((code, phrase), set())
                     gone = api.Fact(code, value_num=0.0, value_text=phrase,
@@ -460,7 +454,7 @@ async def run_discovery(state, config, provider_key: str | None = None, queries=
                                     capability=searcher.id)
                     for company_id in await state.ranked_company_ids(code, phrase) - found_now:
                         batch += ingest.rows([gone], company_id=company_id,
-                                             run_id=report.run_id, confirmed=confirmed)
+                                             run_id=report.run_id, wanted=wanted)
 
                 # Flush every batch. The observations are the asset; buffering
                 # them until some threshold means a run that dies loses them.
@@ -535,12 +529,10 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     """Save what an official source (``module``) read, overlay.store.PULL_CHUNK
     records per transaction, through ingest's rules for an official source.
     ``report`` is the source's own report (its ``values["report"]``); the
-    counts in _REPORT_COUNTS are added to it as records are saved, and
-    ``unconfirmed`` lists the signals the read collects
-    (``values["codes"]``) that aren't confirmed. ``dry_run`` matches
-    everything and writes nothing. A fact is written once per dataset:
-    re-reading the same dataset adds nothing, a newer one adds its readings
-    beside the old. ``progress(done, total)`` is called after each chunk
+    counts in _REPORT_COUNTS are added to it as records are saved.
+    ``dry_run`` matches everything and writes nothing. A fact is written
+    once per dataset: re-reading the same dataset adds nothing, a newer one
+    adds its readings beside the old. ``progress(done, total)`` is called after each chunk
     is written. ``saved_ids`` collects the id each saved
     record landed on; ``on_saved(ids)`` is told them as each batch commits."""
     from harvey.modules import switches
@@ -548,8 +540,7 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
 
     await switches.require(state, module, "Saving what the source found")
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    report.unconfirmed = [c for c in draft.values.get("codes", ()) if c not in confirmed]
+    wanted = await state.collected_signal_codes()
     report.dry_run = dry_run
     collector = draft.values.get("collector", "")
 
@@ -560,12 +551,12 @@ async def save_source_draft(state, draft: api.Draft, report, *, module: str,
     for fact in draft.facts:
         facts_of.setdefault(fact.record, []).append(fact)
     return await _save_source_overlay(
-        state, draft, report, facts_of, confirmed=confirmed, module=module,
+        state, draft, report, facts_of, wanted=wanted, module=module,
         dry_run=dry_run, do_not_contact=do_not_contact, progress=progress,
         saved_ids=saved_ids, on_saved=on_saved)
 
 
-async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, confirmed,
+async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, wanted,
                                module: str, dry_run: bool, do_not_contact, progress,
                                saved_ids, on_saved):
     """save_source_draft on the overlay: the records marked as Harvey's
@@ -590,7 +581,7 @@ async def _save_source_overlay(state, draft: api.Draft, report, facts_of, *, con
             matched_at, matches = (None, None) if dry_run else await state.match_records(chunk)
             results = await state.pull_records(
                 chunk, facts_of={r.key: facts_of.get(r.key, []) for r in chunk},
-                confirmed=frozenset(confirmed), run_id=report.run_id, dry_run=dry_run,
+                wanted=frozenset(wanted), run_id=report.run_id, dry_run=dry_run,
                 matches=matches, matched_at=matched_at)
             # Counted once the chunk is written: a chunk that fails takes
             # its counts with it.
@@ -631,9 +622,9 @@ async def _source_read(state, cap_id: str, inp: api.Input):
     from harvey.signals import sync_vocabulary
 
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
+    wanted = await state.collected_signal_codes()
     return await api.capability("onrc", cap_id)(
-        inp, api.Context(enabled=await _enabled(state), wanted=frozenset(confirmed)))
+        inp, api.Context(enabled=await _enabled(state), wanted=frozenset(wanted)))
 
 
 async def registry_pull(state, con, q, *, limit: int | None = None,
@@ -667,7 +658,7 @@ async def import_registry(state, files, dataset, *, county: str = "", classes=No
     kept company is authorised for is saved as its activities, so it can be
     searched by any of them later. ``with_administrators`` False leaves the
     representatives file unread; so does a run where neither people signal
-    is confirmed."""
+    is collected (their module is off)."""
     draft = await _source_read(state, "registry_import", api.Input(
         area=county, locality=locality, extra={
             "files": files, "dataset": dataset, "classes": list(classes or []),
@@ -806,7 +797,7 @@ def id_lookups(enabled) -> list[tuple]:
 async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
     """Read every free local source that knows companies by an identifier
     (the financial statements by CUI) for these companies (all of them when
-    None), and record what each knows through the confirmation gate. A
+    None), and record what each knows of the signals collected. A
     reading is written once per published file: running it again adds
     nothing, a revised file adds its readings beside the old.
 
@@ -819,21 +810,17 @@ async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
     its own file where they are, never copied: only what it gives as a
     contact (a phone) is kept, and a source that gives none is not read.
 
-    Returns {"observations", "companies", "unconfirmed": {module: [codes]},
-    "skipped" (a source with nothing loaded), "errors"}."""
+    Returns {"observations", "companies", "skipped" (a source with nothing
+    loaded), "errors"}."""
     from harvey.modules import switches
     from harvey.signals import sync_vocabulary
 
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
+    wanted = await state.collected_signal_codes()
     enabled = await _enabled(state)
-    out = {"observations": 0, "companies": 0, "unconfirmed": {}, "skipped": [], "errors": []}
+    out = {"observations": 0, "companies": 0, "skipped": [], "errors": []}
     for m, cap, kind in id_lookups(enabled):
-        codes = list((cap.get("outputs") or {}).get("facts") or ())
-        missing = [c for c in codes if c not in confirmed]
-        if missing:
-            out["unconfirmed"][m.id] = missing
-        if not _wanted(cap, confirmed):
+        if not _wanted(cap, wanted):
             continue
         # Register facts are read in place: only sources that bring
         # contacts (ids) are asked.
@@ -844,7 +831,7 @@ async def lookup_by_id(state, company_ids=None, *, progress=None) -> dict:
             continue
         run = api.capability(m.id, cap["id"])
         ctx = api.Context(settings=await switches.module_settings(state, m.id),
-                          wanted=frozenset(confirmed), enabled=enabled)
+                          wanted=frozenset(wanted), enabled=enabled)
         size = int(cap.get("batch") or 0)
 
         async def read(rows) -> tuple[str | None, dict[str, api.Draft]]:
@@ -942,21 +929,21 @@ def id_enrichers(enabled, *, after_source: bool = False) -> list[tuple]:
 # A check by identifier stops after this many failed batches in a row.
 CHECK_FAILURES_IN_A_ROW = 2
 
-# Why a check by identifier asked nothing: none of its signals is confirmed.
-NOTHING_CONFIRMED = "unconfirmed"
+# Why a check by identifier asked nothing: none of its signals is collected
+# (each is declared by a module that is off).
+NOTHING_WANTED = "nothing collected"
 
 
-def _wanted(cap: dict, confirmed) -> bool:
-    """Whether any signal a capability answers with is confirmed: a free
-    lookup by identifier is made only then (Harvey proposes, the user
-    confirms)."""
-    return bool(set((cap.get("outputs") or {}).get("facts") or ()) & set(confirmed))
+def _wanted(cap: dict, wanted) -> bool:
+    """Whether any signal a capability answers with is collected (declared
+    by a module that is on): a free lookup by identifier is made only then."""
+    return bool(set((cap.get("outputs") or {}).get("facts") or ()) & set(wanted))
 
 
 def _new_check_report(module: str) -> dict:
     return {"module": module, "companies": 0, "checked": 0, "cached": 0, "not_found": 0,
             "invalid": 0, "requests": 0, "observations": 0, "updated": 0, "phones_set": 0,
-            "unconfirmed": [], "errors": [], "stopped": ""}
+            "errors": [], "stopped": ""}
 
 
 async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
@@ -965,7 +952,7 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
     """Ask an enricher's lookup-by-identifier capability about these
     companies (every company with that identifier when None), a batch at
     a time (the capability's ``batch``), and record what it answers: each
-    reading through the confirmation gate, written only when it says
+    reading of a signal collected, written only when it says
     something new (ingest.changed), and a phone as the company's phone when
     it has none. ``missing_only`` asks only about companies the module has
     never answered for. ``progress(done, total)`` after each batch;
@@ -981,8 +968,8 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
     asked for ahead of the one being saved.
 
     Returns {"companies", "checked", "cached", "not_found", "invalid",
-    "requests", "observations", "updated", "phones_set", "unconfirmed",
-    "errors", "stopped"}."""
+    "requests", "observations", "updated", "phones_set", "errors",
+    "stopped"}."""
     from harvey.modules import switches
     from harvey.signals import sync_vocabulary
 
@@ -996,18 +983,16 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
     kind = kinds[0]
     size = max(1, int(cap.get("batch") or 1))
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
+    wanted = await state.collected_signal_codes()
     enabled = await _enabled(state)
     out = _new_check_report(module_id)
-    codes = list((cap.get("outputs") or {}).get("facts") or ())
-    out["unconfirmed"] = [c for c in codes if c not in confirmed]
     companies = await state.companies_with_id(kind, company_ids)
     out["companies"] = len(companies)
     if not companies:
         return out
-    if not _wanted(cap, confirmed):
-        # Nothing it answers is confirmed: no request, no phone, no run.
-        out["stopped"] = NOTHING_CONFIRMED
+    if not _wanted(cap, wanted):
+        # Nothing it answers is collected: no request, no phone, no run.
+        out["stopped"] = NOTHING_WANTED
         return out
     run = api.capability(module_id, cap_id)
     many = ingest.many_codes()
@@ -1026,7 +1011,7 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
     await _call(progress, 0, total)
     try:
         ctx = api.Context(http=http, settings=await switches.module_settings(state, module_id),
-                          wanted=frozenset(confirmed), enabled=enabled)
+                          wanted=frozenset(wanted), enabled=enabled)
 
         async def ask(chunk):
             return await run(api.Input(extra={
@@ -1077,7 +1062,7 @@ async def check_by_id(state, module_id: str, cap_id: str, company_ids=None, *,
                     found[contact.record][1].append(contact)
             async with state.batch() as batch:
                 result = await ingest.checked(batch, module_id, found, run_id=run_id,
-                                              confirmed=confirmed, many=many)
+                                              wanted=wanted, many=many)
             out["observations"] += result["observations"]
             out["phones_set"] += result["phones_set"]
             touched += result["updated"]
@@ -1172,17 +1157,17 @@ CHECKED_KEY = "modules.{}.checked_at"
 _profile_log = logging.getLogger("harvey.collectors.profile")
 
 
-def _hit_codes(enabled, confirmed) -> tuple[str, ...]:
+def _hit_codes(enabled, wanted) -> tuple[str, ...]:
     """The signals a site read is told a preset search found the company
     by: each ``fact:<CODE>`` input a read capability of a module that is on
-    declares, when the code is confirmed (a page saying nothing doesn't
+    declares, when the code is collected (a page saying nothing doesn't
     overwrite a hit)."""
     from harvey.modules import switches
 
     codes = {key[len("fact:"):] for m, cap in api.declared(switches.by_id())
              if m.id in enabled and cap.get("op") == "read"
              for need in cap.get("inputs") or () for key in need if key.startswith("fact:")}
-    return tuple(sorted(codes & set(confirmed)))
+    return tuple(sorted(codes & set(wanted)))
 
 
 async def _known(state, company: dict, codes) -> tuple[dict, str]:
@@ -1204,14 +1189,14 @@ async def _known(state, company: dict, codes) -> tuple[dict, str]:
     return hits, source_url
 
 
-async def profile(state, companies: list[dict], confirmed: set[str], run_id: str = "",
+async def profile(state, companies: list[dict], wanted: set[str], run_id: str = "",
                   config=None, role_keywords: list[str] | None = None) -> int:
     """Read many companies' sites (the website module's read_site), and
     write what each read found before the next: the observations are the
     asset, and a long run that dies must not take them with it. Returns
     the observations written."""
     total = 0
-    async with site_reader(state, confirmed, config=config,
+    async with site_reader(state, wanted, config=config,
                            role_keywords=role_keywords) as read:
         for company in companies:
             if not (company.get("domain") or "").strip():
@@ -1233,26 +1218,26 @@ class SiteRead:
 
 
 @asynccontextmanager
-async def site_reader(state, confirmed: set[str], *, config=None,
+async def site_reader(state, wanted: set[str], *, config=None,
                       role_keywords: list[str] | None = None, contacts: bool = False):
     """``read(company, run_id=, trust=, judge=)`` for one company's site at
-    a time, on one HTTP client and page reader. ``contacts`` reads the
-    contact and team pages for the ways to reach the company whatever is
-    confirmed (the contact finder's read)."""
+    a time, on one HTTP client and page reader, collecting the signals in
+    ``wanted``. ``contacts`` reads the contact and team pages for the ways
+    to reach the company whatever is wanted (the contact finder's read)."""
     from harvey.browser import PageReader
     from harvey.collectors import profile as P
 
     cap = api.capability("website", "read_site")
     enabled = await _enabled(state)
-    hit_codes = _hit_codes(enabled, confirmed)
+    hit_codes = _hit_codes(enabled, wanted)
     client, pages = P.open_http(), PageReader()
     ctx = api.Context(http=client, browser=pages, config=config,
-                      wanted=frozenset(confirmed), enabled=enabled,
+                      wanted=frozenset(wanted), enabled=enabled,
                       settings={"role_keywords": list(role_keywords or []),
                                 "contacts": contacts})
 
     async def read(company: dict, *, run_id: str = "", domain: str = "", judge=None):
-        return await _read_site(state, cap, ctx, company, confirmed, hit_codes,
+        return await _read_site(state, cap, ctx, company, wanted, hit_codes,
                                 run_id=run_id, domain=domain, judge=judge)
 
     async def fetch(company: dict, *, domain: str):
@@ -1265,7 +1250,7 @@ async def site_reader(state, confirmed: set[str], *, config=None,
         the contacts it still holds: the caller may have left some out)."""
         await _mark_profiled(state, company["id"], found=len(draft.contacts),
                              contacts=bool(ctx.settings.get("contacts")))
-        return await _keep_site(state, company, draft, confirmed, domain=domain, trust=trust,
+        return await _keep_site(state, company, draft, wanted, domain=domain, trust=trust,
                                 run_id=run_id)
 
     read.fetch, read.keep = fetch, keep
@@ -1276,7 +1261,7 @@ async def site_reader(state, confirmed: set[str], *, config=None,
         await pages.aclose()
 
 
-async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, run_id: str = "",
+async def _read_site(state, cap, ctx, company: dict, wanted, hit_codes, *, run_id: str = "",
                      domain: str = "", judge=None) -> SiteRead | None:
     """One company's site read and written. ``domain`` reads a site other
     than the company's own key (a website it declares, or one the contact
@@ -1300,7 +1285,7 @@ async def _read_site(state, cap, ctx, company: dict, confirmed, hit_codes, *, ru
     await _mark_profiled(state, company_id, found=len(draft.contacts),
                          contacts=bool(ctx.settings.get("contacts")))
     trust = judge(draft) if judge is not None else ""
-    return await _keep_site(state, company, draft, confirmed, domain=domain, trust=trust,
+    return await _keep_site(state, company, draft, wanted, domain=domain, trust=trust,
                             run_id=run_id)
 
 
@@ -1321,7 +1306,7 @@ async def _fetch_site(state, cap, ctx, company: dict, hit_codes, *, domain: str,
         return None
 
 
-async def _keep_site(state, company: dict, draft, confirmed, *, domain: str, trust: str = "",
+async def _keep_site(state, company: dict, draft, wanted, *, domain: str, trust: str = "",
                      run_id: str = "") -> SiteRead:
     """What a read found, written: every contact the draft holds (at most
     ``trust``) and its people; below confirmed nothing else about the site
@@ -1339,8 +1324,8 @@ async def _keep_site(state, company: dict, draft, confirmed, *, domain: str, tru
             _profile_log.debug(f"rename_company failed for {domain}: {e}")
     phones = [c for c in draft.contacts if c.kind == "phone"]
     if phones and own:
-        # Contact data like a published email: it doesn't wait for
-        # PHONE_NUMBER to be confirmed.
+        # Contact data like a published email: kept whatever signals the
+        # read collects.
         try:
             if await ingest.company_phone(state, company_id, phones[0].display):
                 _profile_log.info(f"profile: {domain} phone {phones[0].display} from its site")
@@ -1359,7 +1344,7 @@ async def _keep_site(state, company: dict, draft, confirmed, *, domain: str, tru
     if draft.facts and own:
         done.observations = await ingest.write(state, ingest.rows(
             draft.facts, company_id=company_id, run_id=run_id,
-            confirmed=confirmed), run_id)
+            wanted=wanted), run_id)
         _profile_log.info(f"profile: {domain} → {len(draft.facts)} observation(s)")
     if draft.values.get("email_pattern") and own:
         # How the addresses its pages publish are spelled: the address
@@ -1403,17 +1388,11 @@ async def profile_companies(state, companies: list[dict], config=None) -> tuple[
     from harvey.signals import sync_vocabulary
 
     await sync_vocabulary(state)
-    confirmed = await state.confirmed_signal_codes()
-    if not confirmed:
-        _profile_log.warning(
-            "profile: no signals confirmed yet — confirm signals first "
-            "(nothing is collected until you choose what matters)."
-        )
-        return 0, ""
+    wanted = await state.collected_signal_codes()
     run_id = await state.start_run("profile", provider="http")
     try:
         keywords = role_keywords(getattr(config, "icp", None))
-        n = await profile(state, companies, confirmed, run_id=run_id, config=config,
+        n = await profile(state, companies, wanted, run_id=run_id, config=config,
                           role_keywords=keywords)
         await state.finish_run(run_id, records=n, cost_usd=0.0)
         return n, run_id

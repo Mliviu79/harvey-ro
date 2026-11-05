@@ -4,9 +4,9 @@ harvey/collectors/onrc.py (the open-data files).
 
 A read returns the firms as records with their facts, and in ``values``
 what core needs to save and report them: the ``dataset``, the ``report``
-(an onrc.ImportReport, which core's save adds its counts to), the signal
-``codes`` the read collects, the ``collector`` label the firms'
-activities carry, and the ``run_params`` the runs log keeps."""
+(an onrc.ImportReport, which core's save adds its counts to), the
+``collector`` label the firms' activities carry, and the ``run_params``
+the runs log keeps."""
 
 import asyncio
 
@@ -15,10 +15,6 @@ from harvey.collectors import onrc
 from harvey.modules.api import Capability, Draft
 
 PEOPLE_CODES = ("CONTACT_FOUND", "DECISION_MAKER_TITLE")
-
-
-def _codes(with_administrators: bool) -> tuple[str, ...]:
-    return ("ACTIVITY_CODE", *PEOPLE_CODES) if with_administrators else ("ACTIVITY_CODE",)
 
 
 async def _sync(inp, ctx) -> Draft:
@@ -48,7 +44,7 @@ async def _search(inp, ctx) -> Draft:
     report.classes = onrc.class_labels(q.classes)
     report.authorised = report.active = report.in_area = draft.counts.get("matched", 0)
     draft.values.update(
-        report=report, codes=_codes(with_administrators), collector=onrc.COLLECTOR,
+        report=report, collector=onrc.COLLECTOR,
         run_params={"dataset": dataset.name, "source": "registry", "match": q.match[:500] or (
                         f"{len(q.firm_ids)} chosen firms" if q.firm_ids is not None else ""),
                     "area": inp.area, "classes": report.classes or ["any"], "limit": limit,
@@ -76,8 +72,7 @@ async def _import(inp, ctx) -> Draft:
     draft = onrc.firms_draft(firms, dataset, codes=codes, people=people, classes=classes,
                              with_administrators=with_administrators)
     draft.values.update(
-        dataset=dataset, report=report, codes=_codes(with_administrators),
-        collector=onrc.COLLECTOR,
+        dataset=dataset, report=report, collector=onrc.COLLECTOR,
         run_params={"dataset": dataset.name,
                     "county": ", ".join(onrc.counties(inp.area) or []) or "Romania",
                     "locality": inp.locality,

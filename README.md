@@ -30,10 +30,10 @@ Cycle complete. Sleeping for 15 minutes.
 
 And the dashboard it keeps, at `localhost:5555`. In this order: the Today screen, a
 conversation Harvey handed back because a prospect asked for a contract, approving
-a drafted reply from the outbox, confirming a signal, building a cohort from
-confirmed signals, searching contacts, and the same screen in dark mode:
+a drafted reply from the outbox, the Signals tab of an earlier release (it is
+gone: see below), searching contacts, and the same screen in dark mode:
 
-![Harvey's dashboard: the Today screen, a conversation handed back for a human, approving a reply in the outbox, confirming a signal and building a cohort, searching contacts, then dark mode](docs/dashboard.gif)
+![Harvey's dashboard: the Today screen, a conversation handed back for a human, approving a reply in the outbox, the Signals tab of an earlier release, searching contacts, then dark mode](docs/dashboard.gif)
 
 <sub>The demo data is invented: "Bookwell" selling online booking to roofers, dental practices and HVAC shops, on `.test` domains.</sub>
 
@@ -44,7 +44,7 @@ confirmed signals, searching contacts, and the same screen in dark mode:
 - [Why the subscription thing matters](#why-the-subscription-thing-matters)
 - [What Harvey actually does](#what-harvey-actually-does)
 - [Quick start](#quick-start)
-- [You confirm what it looks for](#you-confirm-what-it-looks-for)
+- [What it looks for](#what-it-looks-for)
 - [The prospecting pipeline](#the-prospecting-pipeline)
 - [The skills library](#the-skills-library)
 - [The sub-agents](#the-sub-agents)
@@ -160,13 +160,10 @@ cp .env.example .env && $EDITOR .env
 #    it updates the product, targeting and company and keeps your other settings)
 harvey train https://your-company.com
 
-# 4. Choose what makes a good prospect (see below — this one matters)
-harvey signals --confirm free
-
-# 5. Find businesses. Free source, no account needed.
+# 4. Find businesses. Free source, no account needed.
 harvey discover
 
-# 6. Watch it work
+# 5. Watch it work
 harvey dashboard          # prints a private link to http://127.0.0.1:5555
 harvey run
 ```
@@ -274,19 +271,15 @@ you need the Codex provider.
 
 ---
 
-## You confirm what it looks for
+## What it looks for
 
-This is the part that makes Harvey different from a black box, and it is deliberately not skippable.
-
-Harvey knows how to collect **31 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
+Harvey knows how to collect **31 signals** about a business. Each module collects the signals it declares while it is on (the dashboard's **Surse** page, or `harvey modules enable|disable <id>`): there is nothing else to switch on. Spend is held where it happens, never by a list of signals: a paid source runs only inside its run's cap, and Harvey's agent only inside the budget of a plan you approved.
 
 ```bash
-harvey signals                       # review the catalog
-harvey signals --confirm free        # everything that costs nothing (26 of them)
-harvey signals --confirm SERP_RANK   # a paid one, opted into explicitly
+harvey signals                       # the signals collected, each one's cost and counts
 ```
 
-Every signal shows what it is in plain language, **what it costs**, and how many companies already carry it.
+Every signal shows what it is in plain language, **what it costs**, and how many companies it was checked for.
 
 | | Signal | What it tells you |
 |---|---|---|
@@ -306,9 +299,9 @@ Every signal shows what it is in plain language, **what it costs**, and how many
 | **People** | `CONTACT_FOUND`, `DECISION_MAKER_TITLE`, `LIKELY_OWNER`, `REGISTRY_VERIFIED` | Who decides, and whether they own the place. |
 | **Contact** | `EMAIL_PATTERN`, `EMAIL_STATUS`, `CONTACT_FORM_URL` | Whether you can actually reach them. |
 
-### Then a cohort is a query, not a list
+### Then a list is a query, not a file
 
-Once signals are confirmed, the dashboard's cohort builder turns them into a target set — pick what a good prospect **must have**, what **disqualifies** them, and a **range** for numeric signals (organic rank 11 to 30), and it counts the matches live:
+The Companies and Contacts filters (and Harvey's agent) turn signals into a target set — pick what a good prospect **must have**, what **disqualifies** them, and bounds for the figures (turnover, employees):
 
 ```
 Has a marketing agency  AND  running Google Ads  AND NOT  already has online booking
@@ -317,7 +310,7 @@ Has a marketing agency  AND  running Google Ads  AND NOT  already has online boo
 
 That is a campaign with a reason behind it. You know exactly why each of those 23 is on the list, and so does the email Harvey writes them.
 
-Each condition is true, false or **not checked yet**, and every company lands in one of three tabs: **match** (every condition checked and met), **possible** (nothing rules it out, but something isn't checked yet) and **no match**. "NOT running ads" counts only companies checked and found without them, never ones nobody looked at. A disqualifier alone is a cohort too. The Signals tab shows, per signal, how many companies are yes, no and not checked, and the CSV export has a `verdict` column.
+Each condition is true, false or **not checked yet**, and every company lands in one of three tabs: **match** (every condition checked and met), **possible** (nothing rules it out, but something isn't checked yet) and **no match**. "NOT running ads" counts only companies checked and found without them, never ones nobody looked at. A disqualifier alone is a list too. `harvey signals` shows, per signal, how many companies are yes, no and not checked.
 
 ---
 
@@ -374,7 +367,7 @@ parts:
 
   `harvey discover --preset accelerator --provider serper`, or the *Look for*
   menu on the Discover tab.
-- **The signals:** turn them on in the Signals tab. They read the homepage and
+- **The signals:** collected while the `startups` module is on. They read the homepage and
   About page (and for a raise, the page the search found on their own site and
   their press or news page) for a line where the company says it about itself
   ("we went through Y Combinator", "Acme (Techstars '24)", "we raised a $4M
@@ -402,8 +395,8 @@ the companies' own sites and your search provider.
 your industries for companies whose own careers pages list one of your
 `icp.hiring_signals` roles (else `icp.titles`). Hosted boards and job sites
 are left out of the search, since a board page names a board, not a website
-to profile. Confirm `HIRING_ROLE` and profiling reads the board their site links
-to and records the role; the search hit alone records nothing.
+to profile. With the `hiring` module on, profiling reads the board their site links
+to and records the role (`HIRING_ROLE`); the search hit alone records nothing.
 
 **Romanian companies, by what they do.** `harvey import-onrc --county BV`
 reads ONRC's open data (free) and saves every operating company in the area
@@ -447,8 +440,8 @@ status` shows what is loaded and whether data.gov.ro has something newer, and
 its own when a new year is out (off by default: nothing downloads unless you
 ask). Companies on file with a CUI get `TURNOVER`, `EMPLOYEES`, `NET_RESULT`,
 `EQUITY`, `DEBTS`, `TOTAL_ASSETS` (derived: fixed + current assets + prepaid
-expenses), `TURNOVER_GROWTH`, `ACCOUNTS_FORM` and `FILED_ACCOUNTS` once you
-confirm them, one reading per year; cohort ranges compare the latest year on
+expenses), `TURNOVER_GROWTH`, `ACCOUNTS_FORM` and `FILED_ACCOUNTS`, one
+reading per year; cohort ranges compare the latest year on
 file, or a year you name. Registry search, pull and `import-onrc` take
 `--min-turnover 1M`, `--max-turnover`, `--min-employees`, `--max-employees`
 and `--unknown include|exclude (turnover and headcount alike)`, so the list is narrowed before
@@ -562,7 +555,7 @@ Agency detection is the compounding one. Almost every agency credits itself in t
 
 The people a company's own site names. The site read follows the homepage's own menu to the pages where a business names its people and says how to reach it (team, meet-the-doctors, about, our story, contact; in Romanian echipa, medici, despre noi, contact): six pages at most counting the homepage, and ten requests counting the ones that found it. Blog posts, careers pages, files and links to other sites are skipped, and so is a link that redirects to another business's site (a franchisor's team page) or lands back on the homepage. Only a homepage whose menu links to fewer than two such pages (a menu drawn by JavaScript the browser couldn't read, a one-page site) has the usual paths tried (`/about`, `/about-us`, `/team`, `/our-team`, `/contact`, `/contact-us`; on a `.ro` site `/echipa`, `/despre-noi`, `/medici` and `/contact` first). A page that answers with a bot check ends the read: it is never got around. Everything else a read fetches (the About and press pages the startup signals look for, the page a search found, `robots.txt`, `sitemap.xml`, the careers page and its job board's feed) has a budget of its own, fourteen requests, so it never eats into the menu read; a signal whose page that budget couldn't pay for stays unanswered rather than recorded as a "no". A page is fetched once per read, whichever signal asked for it first.
 
-On those pages it finds the people named in team cards and lists (a name in a heading with its title after it, or a name on one line and its title on the next), in schema.org markup (an organisation's `founder`, `employee`, `member`, `owner`), and in sentences: "owned and operated by…", "founded by…", "our founder, …", "Dale Whitlock, owner", and in Romanian "fondată de Dr. …", "fondatorul clinicii, …", "… a fondat clinica". CSS team cards are read only when none of those name anyone. The likeliest owner comes first (an explicit owner or founder title on the business's own card, then the others), twelve people at most; people the site remembers ("the late…", "retired in 2010") and a founder known only from a history sentence when the site lists a current owner are left out. Each owner is a `LIKELY_OWNER` reading when you confirm that signal, with the sentence or markup that says so. Headings made of ordinary words ("Team of Experts"), customers quoted in testimonials ("Founder at Quillnest") and titles that belong to another organisation are not people. A registry pull adds the registry's administrators. Everyone named, with no email or phone of their own, is a person to search (**People to search** on Contacts), and the [contact finder](#the-contact-finder) checks one address for each, up to three per company per search, owners first.
+On those pages it finds the people named in team cards and lists (a name in a heading with its title after it, or a name on one line and its title on the next), in schema.org markup (an organisation's `founder`, `employee`, `member`, `owner`), and in sentences: "owned and operated by…", "founded by…", "our founder, …", "Dale Whitlock, owner", and in Romanian "fondată de Dr. …", "fondatorul clinicii, …", "… a fondat clinica". CSS team cards are read only when none of those name anyone. The likeliest owner comes first (an explicit owner or founder title on the business's own card, then the others), twelve people at most; people the site remembers ("the late…", "retired in 2010") and a founder known only from a history sentence when the site lists a current owner are left out. Each owner is a `LIKELY_OWNER` reading, with the sentence or markup that says so. Headings made of ordinary words ("Team of Experts"), customers quoted in testimonials ("Founder at Quillnest") and titles that belong to another organisation are not people. A registry pull adds the registry's administrators. Everyone named, with no email or phone of their own, is a person to search (**People to search** on Contacts), and the [contact finder](#the-contact-finder) checks one address for each, up to three per company per search, owners first.
 
 The same read keeps the addresses the site publishes, hidden ones included (Cloudflare's email protection, `data-` attribute pairs, "name [at] domain [dot] ro"; one on the company's own domain is trusted, another only maybe), its contact form and the social profiles it links to. Those addresses also say how the company spells its people's: `nvale@` beside a Nora Vale on the team page means first initial and last name, and the address check builds everyone else's address the same way (see [Verify](#4-verify--can-you-reach-them)). While the Email module is on, a general address the company publishes (`office@`, `info@`) can become a prospect too, checked first like any other, and those emails greet the company's team instead of a first name.
 
@@ -744,7 +737,6 @@ The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeli
 - **Conversations** — every reply in the context of the emails that led to it. Threads Harvey handed to you (a contract request, a reply it had no safe answer for) come first, with **Hand back to Harvey**, **Close** and **Reopen**.
 
 **Pipeline**
-- **Signals** — the confirmation gate and the cohort builder
 - **Discover** — the provider menu with prices side by side, an estimate, then a run; plus reading the sites of companies found but not yet looked at
 - **Companies** — everything found, one row per company with its phone, email, activities, latest turnover and headcount, contact count, source, when it was found and last searched. Sort by newest found, name, town and county, turnover, employees, number of contacts or last searched, either way (a search adds best match). Filters: county, town, activity (CAEN codes or words), has a website, has a contact (any, phone, mobile, email, none), source, signals the company has or lacks, turnover and employees when the financial statements are loaded, and the search box (words, or a CUI). Exact total, page numbers, a page-number box and the page size; a jump to page 10,000 is as quick as page 1. A filtered or figure-sorted list is ordered once (a few seconds for a signal filter or a turnover sort over a million companies) and kept, so the pages after it are instant; a company that gains a contact or a search leaves or moves in the list at once. A number no company has as its CUI is searched as a word. The Actions menu (CSV, JSON, ANAF check, Find contacts) takes the selection or the whole filtered list in its order. A company's panel shows everything on file: its CUIs (a second one a source gave too), legal form, status and registered office, every financial year (turnover, employees, profit, equity, debts), the trade registry's classes and administrators, ANAF's kept answer, the taxpayer file, contacts with kind, trust, source and status, each person with their own contacts, places, sources, signals and the search log, with **Find contacts** and **Search again** for that company. A register that isn't loaded, or has nothing on the company, says so.
 - **Registry** — the whole trade registry (`data/registry.db`, every firm in Romania, operating or not), each firm beside its latest financial statements. Filters are the registry source's own, the ones Discover shows for it: activity (words or CAEN codes), county, town, status (operating, or every registration), turnover and employee bounds (firms with no figures left out or kept), employer, VAT, micro-enterprise tax. Sort by name, turnover, employees, net profit or registration date, either way. The total is exact, with page numbers and a page box; the first page takes about a second over 4 million firms, a sort or broad filter one to four the first time it is asked (less once the background rankings are ready, a few seconds after the page opens), and every page after it is instant. A search of only excluded words ("-auto") lists every firm but those. Each firm says whether it is already in Harvey (by CUI, or by registration number for a firm with none). Ticks are cleared when the filter changes. Its panel shows every financial year side by side, the registry's record with every CAEN class and the administrators, the taxpayer file's row and ANAF's kept answer. **Pull into Harvey** takes the ticked firms (up to 10,000) or the whole list: counted first, free, and queued as a registry pull, followed by the ANAF checks and the contact finder like any Discover run.
@@ -974,11 +966,10 @@ never checked, `--all-on-file` about every company with a CUI (kept answers are
 reused), `--cui N` about one; `harvey anaf status` counts the answers kept. On
 the dashboard the same is under **Sources → Public data**, in the Actions menu
 of the Companies tab (the selection, the filtered list, or everything) and on
-a company's panel. While the module is on and at least one of its signals is
-confirmed, `harvey registry pull` and `harvey import-onrc` check each saved
-firm at ANAF in the background while the rest is saved, then wait for the last
-batch, with progress. With none confirmed, ANAF is never asked and no phone is
-filled from it.
+a company's panel. While the module is on, `harvey registry pull` and
+`harvey import-onrc` check each saved firm at ANAF in the background while the
+rest is saved, then wait for the last batch, with progress. With the module
+off, ANAF is never asked and no phone is filled from it.
 
 **The taxpayer file.** `harvey taxpayers load` takes the newest year's file
 (2026: two parts of about 430 MB each, `^`-separated), keeps the download in
@@ -1000,8 +991,8 @@ A download is refused when the disk hasn't room for it and its load.
 `FISCALLY_INACTIVE`, `EFACTURA_REGISTERED`, `REGISTRATION_STATUS`,
 `LEGAL_FORM` and `ADDRESS` (the `anaf` module), `HAS_EMPLOYEES_TAX` and
 `MICRO_TAX_REGIME` (`mf_taxpayers`) and the yearly figures (`mf_financials`)
-are free, known from the source itself, and recorded once you confirm them on
-**Semnale**, where the cohort builder filters on them: turnover and employee
+are free, known from the source itself, and read while their modules are on;
+the Companies and Contacts filters use them: turnover and employee
 ranges, VAT registered, employer, micro-enterprise, and "fiscally inactive"
 to leave out (ANAF's explicit "not inactive" is a real no; a company never
 checked is unknown, not "active"). Before anything is pulled, registry search,
@@ -1062,7 +1053,7 @@ harvey agent plans           # the plans the agent proposed (--chat ID); plans s
 harvey agent memory          # the agent's notes; memory add TEXT|edit ID TEXT|forget ID|playbooks|playbook NAME|delete-playbook NAME
 harvey jobs                  # the queue per lane; cancel|retry|resume ID, pause|resume-lane LANE
                              # (resume ID --max-spend N raises a paused run's cap)
-harvey signals               # review/confirm what to prospect against
+harvey signals               # the signals collected, each one's cost and counts (read only)
 harvey discover              # find businesses; --providers / --estimate; --provider a,b runs several in one batch
 harvey profile               # read discovered companies' sites (free); one job per company
 harvey contacts [find|status|rejudge|judge-test|verify|classifier]  # the contact finder: find (filters, --max-spend, --classify-max-spend, --force, --background), the backlog, checking found websites (--run, --undo BATCH), the classifier's test (--file, --all, --profile), verifying contacts (--contact ID, --max-spend, --review, --undo BATCH), its profiles (classifier use TASK PROFILE)
@@ -1142,7 +1133,7 @@ website-marketing signals and email campaigns
 start off. Turning a module on never turns on another: one whose `requires`
 are off is refused, naming them, and one that an enabled module requires
 can't be turned off. Off means hidden, never deleted: its signals leave
-Semnale, the signal pickers and collection (their observations stay), its
+the signal pickers and collection (their observations stay), its
 discovery sources and presets are refused with an error that names the
 module, the contact finder stops using its searches, Hunter and the verifiers
 aren't called, and Settings stops offering
@@ -1162,8 +1153,8 @@ says what it takes, what it gives (records, identifiers, signals), what it
 costs and whether its module is on: `harvey caps list` (`--json`) prints
 them all. A capability returns what it found and writes nothing; one core
 step saves it, so every module goes through the same rules: the same
-company found twice is one company, only confirmed signals are recorded
-(and only ones the capability declares), a module that is off does
+company found twice is one company, only signals of modules that are on
+are recorded (and only ones the capability declares), a module that is off does
 nothing whoever asks it, phones and people accumulate instead of being
 overwritten. A sole trader's or family business's (PFA, II, IF) registered
 office and phone are public registry data and are kept like any firm's;
@@ -1282,7 +1273,7 @@ another service* on the dashboard) and Harvey stops suggesting it.
 
 **Codex calls fail** — Read the log line; every Codex error says what to do. "Not logged in" or "expired or is due for renewal" → use Codex once or run `codex login` with ChatGPT. "Hasn't been verified with Harvey" → install the supported Codex version named in the message. "Isolation could not be verified" → a Codex config layer outside your `~/.codex` (for example a managed or `/etc/codex` config) forces a tool, hook, MCP server, instructions or custom endpoint back on; Harvey refuses to send prompts until it's gone. Model catalog errors → choose an available model ID from the catalog shown in the message, or leave `brain.model` blank to select a listed model. Harvey never switches to Claude on its own.
 
-**Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
+**Discovery finds nothing** — If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
 
 **Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
 
@@ -1338,7 +1329,7 @@ tests/                   # 242 tests
 
 **Autonomous doesn't mean unsupervised.** Quiet hours, spend caps, send limits, an approval queue, a deterministic pre-send gate, and a kill switch. Harvey asks before it spends and before it sends, until you tell it not to.
 
-**You decide what a good prospect is.** Harvey proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
+**You decide what a good prospect is.** A prospect list is a query over named facts you can read back, never a black box. A prospect list you can't explain is a prospect list you shouldn't send to.
 
 **If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude or Codex is reserved for the parts that need judgment. That's why this runs on a subscription at all.
 
@@ -1352,7 +1343,7 @@ tests/                   # 242 tests
 
 ## Roadmap
 
-**Done:** heartbeat loop · observation data model with governed vocabulary · user-confirmed signal catalog · cohort builder · discovery provider menu with cost estimates · free HTTP profiler with agency detection · pattern-first email finding with honest status · native mail providers (Gmail API, Microsoft 365 via Graph, SMTP+IMAP) · outbox approval ladder · deterministic pre-send gate · bounce detection and kill switch · reply handling with intent classification · subscription quota tracking · website trainer · web dashboard · CSV export
+**Done:** heartbeat loop · observation data model with governed vocabulary · signal catalog · cohort engine behind the filters · discovery provider menu with cost estimates · free HTTP profiler with agency detection · pattern-first email finding with honest status · native mail providers (Gmail API, Microsoft 365 via Graph, SMTP+IMAP) · outbox approval ladder · deterministic pre-send gate · bounce detection and kill switch · reply handling with intent classification · subscription quota tracking · website trainer · web dashboard · CSV export
 
 **Next:** people enrichment from public registries · consent-gated voice callbacks · calendar integration for auto-booking · scheduled re-observation so signal *changes* trigger outreach · multi-product support
 

@@ -29,7 +29,7 @@ from harvey.collectors import discover as D
 from harvey.config import EnvConfig
 from harvey.config import load_config as _load_config
 from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 pytestmark = pytest.mark.modules_on("web_marketing", "startups", "hiring")
@@ -120,8 +120,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "parity.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 

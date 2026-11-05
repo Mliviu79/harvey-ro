@@ -32,9 +32,6 @@ async def state(tmp_path):
     sm = StateManager(str(path))
     await sm.init_db()
     await sync_vocabulary(sm)
-    for code in ("ACTIVITY_CODE", "PHONE_NUMBER", "CONTACT_FOUND", "TECH_STACK",
-                 "RUNNING_GOOGLE_ADS"):
-        await sm.set_signal_status(code, "confirmed")
     return sm
 
 
@@ -467,7 +464,7 @@ async def test_a_lookup_by_identifier_keeps_phones_and_reads_no_register_facts(s
         done = await ingest.checked(batch, "anaf", {one: (
             [api.Fact("VAT_REGISTERED", value_num=1, module="anaf", capability="company_check")],
             [api.Contact("phone", "+40700000031", module="anaf", capability="company_check")])},
-            run_id="run-1", confirmed={"VAT_REGISTERED"})
+            run_id="run-1", wanted={"VAT_REGISTERED"})
     assert done["observations"] == 0          # ANAF's answer is read from anaf.db
     assert _one(state, "SELECT n_phone FROM firm WHERE id = ?", int(one)) == 1
     assert _clean(state) == {}
@@ -493,8 +490,6 @@ async def test_a_pull_merges_a_listing_it_surely_is_inside_its_bulk_write(state)
 async def test_search_facts_of_every_provider_are_kept(state, module):
     # A search module that returns a fact (its capability's outputs) stores
     # it, whichever module declares the signal.
-    for code in ("FOUND_IN_SERP", "NO_WEBSITE"):
-        await state.set_signal_status(code, "confirmed")
     a, _ = await _listing(state, _hit(name="Unu Exemplu", n=91))
     kept = await state.add_observations([
         {"company_id": a, "signal_code": "NO_WEBSITE", "value_num": 1, "module": module,
@@ -689,8 +684,6 @@ async def test_opening_the_database_takes_no_write_lock_when_nothing_changed(sta
 
 @pytest.mark.asyncio
 async def test_company_and_its_history_read_on_the_overlay(state):
-    for code in ("YC_BACKED",):
-        await state.set_signal_status(code, "confirmed")
     a, _ = await _listing(state, _hit(name="Exemplu Startup", phone="+40700000041", n=101,
                                       domain="startup.example.com"))
     company = await state.get_company(a)

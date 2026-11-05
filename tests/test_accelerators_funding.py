@@ -256,9 +256,10 @@ def test_the_new_signals_are_free_profile_signals(code):
 
 
 @pytest.mark.asyncio
-async def test_they_start_proposed(state):
+async def test_they_are_collected_while_the_module_is_on(state):
+    """No confirmation: the startups module being on is what collects them."""
     await sync_vocabulary(state)
-    assert not {"ACCELERATOR", "FUNDING_ROUND"} & await state.confirmed_signal_codes()
+    assert {"ACCELERATOR", "FUNDING_ROUND"} <= await state.collected_signal_codes()
 
 
 # ── the presets ──
@@ -376,9 +377,8 @@ _PAD = "<p>We build billing for teams that ship fast.</p>" * 12
 @pytest.mark.asyncio
 async def test_profiling_records_the_program(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("ACCELERATOR", "confirmed")
     c, _ = _collector(state, "<h1>Acme</h1><p>Acme (Techstars '24) builds billing.</p>")
-    c.confirmed = await state.confirmed_signal_codes()
+    c.wanted = {"ACCELERATOR"}
     cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "ACCELERATOR"]
     assert (obs["value_num"], obs["value_text"]) == (1, "Techstars 2024")
@@ -386,7 +386,7 @@ async def test_profiling_records_the_program(state):
     assert await state.accelerator(cid) == "Techstars 2024"
 
     c2, _ = _collector(state, "<h1>Plain</h1><p>Family-run since 1987.</p>")
-    c2.confirmed = c.confirmed
+    c2.wanted = c.wanted
     plain = await state.add_company(Company(name="Plain", domain="plain.example"))
     [no] = [o for o in await c2.profile_company(plain, "plain.example") if o["signal_code"] == "ACCELERATOR"]
     assert no["value_num"] == 0
@@ -395,14 +395,13 @@ async def test_profiling_records_the_program(state):
 @pytest.mark.asyncio
 async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.example",
                                           source_url="https://acme.example/blog/series-a"))
     post = ('<meta property="article:published_time" content="2026-05-02T08:00:00Z">'
             "<h1>Acme raises $14M Series A</h1>" + _PAD)
     c, fetched = _collector(state, "<h1>Acme</h1><p>Billing.</p>",
                             pages={"https://acme.example/blog/series-a": post})
-    c.confirmed = await state.confirmed_signal_codes()
+    c.wanted = {"FUNDING_ROUND"}
     [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_num"] == 1 and obs["value_text"] == "Series A · $14M · 2026-05-02"
     assert obs["evidence_url"] == "https://acme.example/blog/series-a"
@@ -413,11 +412,10 @@ async def test_profiling_reads_the_search_hit_page_for_the_raise(state):
 @pytest.mark.asyncio
 async def test_a_hit_on_someone_elses_site_isnt_read(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.example",
                                           source_url="https://news.example.com/acme-raises"))
     c, fetched = _collector(state, "<h1>Acme</h1><p>Billing.</p>")
-    c.confirmed = await state.confirmed_signal_codes()
+    c.wanted = {"FUNDING_ROUND"}
     [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_num"] == 0
     assert not [u for u in fetched if "example.com" in u]
@@ -426,11 +424,10 @@ async def test_a_hit_on_someone_elses_site_isnt_read(state):
 @pytest.mark.asyncio
 async def test_the_press_page_is_checked(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("FUNDING_ROUND", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     press = "<h2>Acme raises $6M seed round (February 2026)</h2>" + _PAD
     c, _ = _collector(state, "<h1>Acme</h1><p>Billing.</p>", pages={"https://acme.example/press": press})
-    c.confirmed = await state.confirmed_signal_codes()
+    c.wanted = {"FUNDING_ROUND"}
     [obs] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "FUNDING_ROUND"]
     assert obs["value_text"] == "Seed · $6M · 2026-02"
 
@@ -662,12 +659,11 @@ async def test_only_a_recent_raise_brings_the_playbook(state, text, playbook):
 @pytest.mark.asyncio
 async def test_a_profile_that_finds_nothing_supersedes_an_accelerator_search_hit(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("ACCELERATOR", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     await state.add_observation(company_id=cid, signal_code="ACCELERATOR", collector="discover",
                                 value_num=1, confidence=0.6, observed_at="2026-01-01T00:00:00")
     c, _ = _collector(state, "<h1>Acme</h1><p>Billing.</p>")
-    c.confirmed = await state.confirmed_signal_codes()
+    c.wanted = {"ACCELERATOR"}
     [no] = [o for o in await c.profile_company(cid, "acme.example") if o["signal_code"] == "ACCELERATOR"]
     assert no["value_num"] == 0
     await state.add_observations([no])

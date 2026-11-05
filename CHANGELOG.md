@@ -1479,6 +1479,28 @@ minor versions can still change behaviour.
 
 ### Removed
 
+- **Confirming signals, and the Signals tab.** Every signal a module that
+  is on declares is collected; the module's switch (Surse, `harvey modules
+  enable|disable`) is the only on/off. Consent to spend lives where the
+  money is spent: a paid source runs only inside its run's cap, and the
+  agent only inside the budget of a plan you approved. Nothing that ran
+  with no cap collected a paid fact before, and nothing does now: site
+  reads, the ANAF checks after a pull and the local lookups by CUI are
+  free. Gone: the Signals tab with its cohort builder, `POST
+  /api/signals/status`, `/api/cohort` and `/api/cohort.csv`, `harvey
+  signals --confirm/--reject`, Today's "signals waiting for your
+  confirmation" and "no signals confirmed", the setup row "at least one
+  signal confirmed", and the "not recorded, not confirmed" lines in run
+  reports. `harvey signals` stays as a read-only list (each signal's cost
+  and how many companies it was checked for), `/api/signals` as the list
+  the Contacts and Companies filters pick from, and their must have / must
+  not have filters read the same cohort engine. What changes on an install
+  that had left signals proposed or rejected: discovery no longer stops at
+  "no confirmed signals", site reads collect every signal of the modules
+  that are on (more pages read per site when the startup or hiring module
+  is on), and a registry pull queues its free ANAF checks whenever the
+  ANAF module is on. The `signal.status` column stays in the database,
+  read by nothing (and left out of the agent's query()); no schema change.
 - **Instantly.** Harvey sends and reads mail through Gmail, SMTP or
   Microsoft 365 only, where every email passes the Outbox, the
   do-not-contact list, the source note and the unsubscribe header. Gone:

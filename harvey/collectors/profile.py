@@ -135,7 +135,7 @@ MAX_SITE_FETCHES = 10
 # look for, the page a search found, robots.txt, sitemap.xml, the careers
 # page and its job board's feed) have a budget of their own, so they never
 # eat into the menu read the contacts come from. With every signal they
-# answer confirmed, a site with no About and no press page takes 11 of them
+# answer collected, a site with no About and no press page takes 11 of them
 # (4 About paths, the search's page, 4 press paths, robots, sitemap), and a
 # careers link and its board's feed 2 more: 14 leaves one guess at a careers
 # path. Only a site with no careers link that misses most of these pages
@@ -905,18 +905,19 @@ class Known:
 class ProfileCollector:
     """Fetches a business's public pages and emits observations.
 
-    Only signals the user CONFIRMED are collected; everything else is skipped
-    even if the data is sitting right there in the HTML. ``known`` is what
-    core knows about the company already (Known); it is only read.
+    Only the signals in ``wanted`` are collected (those of modules that are
+    on); everything else is skipped even if the data is sitting right there
+    in the HTML. ``known`` is what core knows about the company already
+    (Known); it is only read.
     """
 
-    def __init__(self, known=None, confirmed: set[str] | None = None, timeout: float = 12.0,
+    def __init__(self, known=None, wanted: set[str] | None = None, timeout: float = 12.0,
                  role_keywords: list[str] | None = None, config=None):
         self.known = known
         # Where a business's national phone numbers are read when its
         # location doesn't name a country (prospect_country, icp.geography).
         self.config = config
-        self.confirmed = confirmed if confirmed is not None else set()
+        self.wanted = wanted if wanted is not None else set()
         self.timeout = timeout
         # icp.hiring_signals (or icp.titles): which open roles are worth a row.
         self.role_keywords = list(role_keywords or [])
@@ -931,7 +932,7 @@ class ProfileCollector:
         # Companies whose homepage couldn't be read, and why as a class
         # ("unreachable" or "blocked"): the contact finder's report counts them.
         self.site_unread: dict[str, str] = {}
-        # Read for the ways a company can be reached whatever is confirmed
+        # Read for the ways a company can be reached whatever is wanted
         # (the contact finder's site read): the contact page and the team
         # page are fetched for them, and kept here per company.
         self.contacts = False
@@ -939,7 +940,7 @@ class ProfileCollector:
         self.team: dict[str, list[dict]] = {}
 
     def wants(self, code: str) -> bool:
-        return code in self.confirmed
+        return code in self.wanted
 
     async def __aenter__(self):
         self._client = open_http()
@@ -1362,7 +1363,7 @@ class ProfileCollector:
 
     async def profile_company(self, company_id: str, domain: str,
                               location: str = "") -> list[dict]:
-        """Collect every confirmed profile signal for one business."""
+        """Collect every wanted profile signal for one business."""
         obs: list[dict] = []
         # Pages fetched for other signals, read again for phone numbers.
         pages: list[tuple[str, str]] = []
@@ -1657,7 +1658,7 @@ READ_BY = {
 
 async def site_draft(inp, ctx, only: set[str] | None = None) -> Draft:
     """Read one company's site (``inp.domain``, located at ``inp.locality``)
-    as a Draft: the facts every confirmed signal (``ctx.wanted``, narrowed
+    as a Draft: the facts every collected signal (``ctx.wanted``, narrowed
     to ``only``) asks for, each stamped with the capability it belongs to
     (READ_BY); the pages read; the phones they publish, the first of which
     is the company's when it has none; and in ``values["name"]`` the name

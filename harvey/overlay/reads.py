@@ -140,7 +140,7 @@ def connect(path, *, data_dir=None) -> tuple[sqlite3.Connection, list]:
 def recount_register_tally(path, codes=None) -> int:
     """Count every register signal over the firms in Harvey for the
     registers' current load marks and keep the counts (register_tally):
-    what the Signals page and the landing page read. A job (a walk of
+    what the signal listing and the landing page read. A job (a walk of
     every key per read: minutes on a whole registry), never a page.
     Returns how many rows were written."""
     con, attached = connect(path)
@@ -2464,10 +2464,12 @@ class Reader:
 
     # ── Signals ──
 
-    def signal_vocabulary(self, status: str | None = None) -> list[dict]:
+    def signal_vocabulary(self) -> list[dict]:
         """get_signal_codes on the overlay: the vocabulary with the module
         that declares each signal and whether a module that is on provides
-        it (the manifests say; the database keeps the status)."""
+        it (the manifests say). The stored ``status`` column, a confirmation
+        older releases asked for, isn't read: a signal of a module that is
+        on is collected."""
         from harvey.signals import available_codes
 
         declared = {sig["code"]: (m.id, sig) for m in self.manifests for sig in m.signals}
@@ -2479,10 +2481,9 @@ class Reader:
         out = []
         for row in cur.fetchall():
             r = dict(zip(cols, row))
-            if status and r["status"] != status:
-                continue
             module, sig = declared.get(r["code"], ("", {}))
             r.pop("id", None)
+            r.pop("status", None)
             r.update(module=module, available=int(r["code"] in available),
                      subject=sig.get("subject", "company"), absence=sig.get("absence", "unknown"),
                      collector=sig.get("collector", ""))
@@ -2508,7 +2509,7 @@ class Reader:
             if not st["true"]:
                 continue
             out.append({"signal_code": code, "label": vocab[code]["label"] or code,
-                        "status": vocab[code]["status"], "companies": st["true"],
+                        "companies": st["true"],
                         "observations": st["true"]})
         out.sort(key=lambda r: -r["companies"])
         return out

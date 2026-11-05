@@ -128,7 +128,7 @@ def test_social_links_keep_profiles_and_drop_share_buttons():
 def test_the_finders_site_read_keeps_emails_forms_profiles_and_people():
     from harvey.collectors.profile import ProfileCollector, _reach
 
-    c = ProfileCollector(confirmed=set())
+    c = ProfileCollector(wanted=set())
     c.contacts = True
     c.forms["c1"] = "https://alfa.example/contact"
     c.team["c1"] = [{"first_name": "Ana", "last_name": "Exemplu", "title": "Administrator",
@@ -244,7 +244,6 @@ def test_an_unproven_website_is_kept_unlinked_and_waits_for_a_check(tmp_path, mo
 
     async def go():
         s = await _state(db)
-        await s.set_signal_status("TECH_STACK", "confirmed")
         cid = await _company(s, name="DELTA EXAMPLE SRL", location="Cluj-Napoca, Cluj, Romania")
         await s.add_people(cid, [("POPESCU ION", "administrator")], source="onrc")
         return s, cid, await finder.find(s, cid, spend=_spend(), env=ENV)
@@ -401,8 +400,6 @@ def test_a_registry_pull_hands_the_finder_to_its_checks(tmp_path, monkeypatch):
 
     async def go():
         s = await _state(db)
-        for code in ("VAT_REGISTERED", "PHONE_NUMBER"):
-            await s.set_signal_status(code, "confirmed")
         cid = await _company(s, name="LAMBDA EXAMPLE SRL", cui="92000009")
         return await job_kinds.enqueue_follow_up_checks(s, [cid], then_find=True)
 

@@ -293,11 +293,8 @@ async def test_companies_on_file_get_their_phone_and_read_the_rest_in_place(stat
                                         source="registry:onrc"))
     pfa = await state.add_company(Company(name="POPESCU EXEMPLU PFA", cui="90000022",
                                           source="registry:onrc"))
-    for code in ("HAS_EMPLOYEES_TAX", "VAT_REGISTERED", "PHONE_NUMBER", "ADDRESS"):
-        await state.set_signal_status(code, "confirmed")
     first = await runs.lookup_by_id(state)
     assert first["companies"] == 2
-    assert "MICRO_TAX_REGIME" in first["unconfirmed"]["mf_taxpayers"]
     assert (await state.get_company(a)).phone == "+40 268 000 210"
     assert (await state.get_company(pfa)).phone == "+40 722 000 210"
     # The rest is read from the file, dated as it was published.
@@ -323,7 +320,6 @@ async def test_anaf_s_newer_reading_stays_current(state, monkeypatch):
 
     a = await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
                                         source="registry:onrc"))
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     # ANAF answered (now) that it isn't VAT registered; the file (July) says yes.
     monkeypatch.setattr(service, "CACHE_PATH", slim.folder(state) / "anaf.db")
     service.keep(service.CACHE_PATH, {"90000014": answer("90000014", vat=False)}, set())
@@ -336,7 +332,6 @@ async def test_anaf_s_newer_reading_stays_current(state, monkeypatch):
 async def test_nothing_loaded_is_skipped_quietly(state, monkeypatch, tmp_path):
     monkeypatch.setattr(store, "TAXPAYERS_PATH", tmp_path / "none.db")
     await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014"))
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     found = await runs.lookup_by_id(state)
     assert any("harvey taxpayers load" in s for s in found["skipped"])
 

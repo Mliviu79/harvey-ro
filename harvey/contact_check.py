@@ -152,7 +152,7 @@ async def verify_company(state, company_id: str, chosen: list[dict], *, batch: s
     website = company.get("website") or ""
     domain = normalize_domain(website) if website else ""
     if domain:
-        async with finder._reader(state, set(await state.confirmed_signal_codes()),
+        async with finder._reader(state, await state.collected_signal_codes(),
                                   config) as reader:
             draft = await reader.fetch(company, domain=domain)
         if draft is not None:

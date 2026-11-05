@@ -85,7 +85,8 @@ EXCLUDED_TABLES = {
 _SHADOW = re.compile(r"^local_fts_")
 
 # Columns the agent never reads, each with why: text a website or an
-# inbound email supplied, an email's content, or a secret.
+# inbound email supplied, an email's content, a secret, or a value nothing
+# reads any more (it would mislead).
 EXCLUDED_COLUMNS = {
     ("outbox", "subject"): "an email's subject (a reply's quotes the sender's)",
     ("outbox", "body"): "an email's body",
@@ -109,6 +110,8 @@ EXCLUDED_COLUMNS = {
     ("jobs", "error"): "a provider's or a page's error text: jobs() gives its class",
     ("jobs", "result_json"): "a job's result, with the errors its sources answered",
     ("runs", "error"): "a provider's or a page's error text",
+    ("signal", "status"): "a confirmation older releases asked for: every signal of a "
+                          "module that is on is collected",
 }
 
 # Short values a website or a listing wrote, readable but never trusted:

@@ -1740,8 +1740,7 @@ CONTACT_EXPORT_MAX = 500_000
 
 
 from harvey.contact_query import (  # noqa: E402  (the page's filters, shared)
-    codes as _codes, filter_from_query as _contact_filter, range_bound as _range_bound,
-    refuse_hidden_signals as _refuse_hidden_signals,
+    filter_from_query as _contact_filter,
 )
 
 
@@ -3449,15 +3448,12 @@ async def _overlay_overview() -> dict:
     state = _state()
     await state.init_db()
     found = await state.read("overview", _blocked_entries(config))
-    codes = await state.get_signal_codes(available_only=True)
     people = found["people"]
     return {"companies": found["companies"], "with_phone": found["with_phone"],
             "with_email": found["with_email"], "with_both": found["with_both"],
             "contacts": sum((await state.count_prospects_by_status()).values()),
             "people": people, "with_activity": found["with_activity"],
             "counting": found.get("counting", False),
-            "signals_proposed": sum(1 for c in codes if c.get("status") == "proposed"),
-            "signals_confirmed": sum(1 for c in codes if c.get("status") == "confirmed"),
             "sending": await _sending_summary(config)}
 
 
@@ -5492,8 +5488,6 @@ async def get_today():
         await sync_vocabulary(state)
 
         codes = await state.get_signal_codes(available_only=True)
-        proposed = [c for c in codes if c.get("status") == "proposed"]
-        confirmed = [c for c in codes if c.get("status") == "confirmed"]
         pending = await state.get_outbox(status="pending_review", limit=200)
         approved = await state.get_outbox(status="approved", limit=200)
         paused = await state.get_setting("sending_paused")
@@ -5513,13 +5507,12 @@ async def get_today():
         stats = {
             "companies": n_companies,
             "prospects": sum(counts.values()),
-            "signals_confirmed": len(confirmed),
+            "signals_on": len(codes),
             "outbox_pending": len(pending),
             "outbox_approved": len(approved),
             "open_conversations": open_convos,
             "needs_human": needs_human,
             "cold_waiting": len([i for i in pending + approved if i.get("kind") == "sequence"]),
-            "signals_proposed": len(proposed),
             "email_provider": _current_provider(),
             "unprofiled": unprofiled_count,
         }
@@ -5620,29 +5613,11 @@ async def get_today():
                 "action": "Open setup", "tab": "settings",
             })
 
-        if proposed:
-            items.append({
-                "key": "signals", "tone": "warn",
-                "title": (f"{len(proposed)} signal waiting for your confirmation"
-                          if len(proposed) == 1
-                          else f"{len(proposed)} signals waiting for your confirmation"),
-                "detail": ("Harvey won't collect anything you haven't approved. "
-                           "Confirm which signals define a good prospect for you."),
-                "action": "Review signals", "tab": "signals",
-            })
-        elif not confirmed:
-            items.append({
-                "key": "signals-none", "tone": "warn",
-                "title": "No signals confirmed",
-                "detail": "Every signal is rejected, so prospecting has nothing to collect.",
-                "action": "Review signals", "tab": "signals",
-            })
-
-        if not n_companies and confirmed:
+        if not n_companies:
             items.append({
                 "key": "discover", "tone": "good",
                 "title": "No companies yet",
-                "detail": ("Signals are confirmed but nothing has been collected. "
+                "detail": ("Nothing has been collected yet. "
                            "Discovery is free to try — no account needed."),
                 "action": "Find businesses", "tab": "discover",
             })
@@ -5750,7 +5725,7 @@ FIN_MODULE = "mf_financials"
 async def _source_jobs(state, module_id: str) -> tuple[bool, dict | None]:
     """(whether a load or check of ``module_id``'s local copy is queued or
     running, the last load's report: unchanged, offline, downloaded,
-    companies, observations, unconfirmed, errors)."""
+    companies, observations, errors)."""
     from harvey.modules import jobs
 
     active = await query_db(
@@ -5769,7 +5744,6 @@ async def _source_jobs(state, module_id: str) -> tuple[bool, dict | None]:
             report = {"unchanged": bool(r.get("unchanged")), "offline": r.get("offline") or "",
                       "downloaded": r.get("downloaded") or [],
                       "companies": r.get("companies", 0), "observations": r.get("observations", 0),
-                      "unconfirmed": (r.get("unconfirmed") or {}).get(module_id, []),
                       "errors": r.get("errors") or []}
     return bool(active and active[0]["n"]), report
 
@@ -6043,7 +6017,6 @@ async def _anaf_batch(state) -> tuple[bool, dict | None]:
             for key, value in j.result.items():
                 if isinstance(value, int) and not isinstance(value, bool) and key in report:
                     report[key] += value
-            report["unconfirmed"] = j.result.get("unconfirmed") or report["unconfirmed"]
             report["stopped"] = j.result.get("stopped") or report["stopped"]
         elif j.status == jobs.FAILED:
             done += n
@@ -6181,26 +6154,26 @@ async def search_caen(q: str = "", limit: int = 50):
     }
 
 
-# ── Signals: Harvey proposes, the user confirms ──
+# ── Signals: the facts Harvey collects ──
 #
-# Nothing is collected until a human has said yes to it. This is the gate the
-# whole prospecting pipeline hangs off: collectors ask `state.confirmed_signal_codes()`
-# and skip anything that isn't in the set.
+# Read only. A module's switch says what is collected; a paid source spends
+# only inside its run's cap. The Contacts and Companies filters list these
+# for their require/exclude choices.
 
 @app.get("/api/signals")
 async def get_signals():
     """The signal vocabulary, one group per module that declares signals,
-    with live cohort sizes. Signals of a module that is off are left out
-    (their observations stay); ``hidden`` counts them."""
+    with how many companies carry each and how many were checked either
+    way. Signals of a module that is off are left out (their observations
+    stay); ``hidden`` counts them."""
     try:
         from harvey.modules import switches
         from harvey.signals import absence, sync_vocabulary
 
         state = _state()
         await state.init_db()
-        # Syncing is idempotent and never overrides a decision the user made,
-        # so it is safe to run on every load — new signals shipped in an
-        # upgrade show up as `proposed` without any migration step.
+        # Idempotent, so safe on every load: signals shipped in an upgrade
+        # show up without any migration step.
         await sync_vocabulary(state)
 
         every = await state.get_signal_codes()
@@ -6209,7 +6182,7 @@ async def get_signals():
         # True / false / unknown per company: "unknown" is not checked yet.
         states = await state.signal_states([sig["code"] for sig in codes])
 
-        groups, summary = [], {"proposed": 0, "confirmed": 0, "rejected": 0}
+        groups = []
         for m in switches.manifests():
             rows = []
             for sig in codes:
@@ -6226,236 +6199,10 @@ async def get_signals():
             if rows:
                 groups.append({"key": m.id, "label": m.name or m.id,
                                "blurb": m.description, "signals": rows})
-        for sig in codes:
-            summary[sig.get("status", "proposed")] = (
-                summary.get(sig.get("status", "proposed"), 0) + 1
-            )
-
-        return {"summary": summary, "groups": groups, "total": len(codes),
-                "hidden": len(every) - len(codes)}
+        return {"groups": groups, "total": len(codes), "hidden": len(every) - len(codes)}
     except Exception as e:
         logger.exception("signals load failed")
-        return {"error": str(e), "groups": [], "summary": {}}
-
-
-@app.post("/api/signals/status")
-async def set_signals_status(request: Request):
-    """Confirm or reject one signal, or a whole category at once."""
-    try:
-        body = await request.json()
-        status = (body.get("status") or "").strip()
-        codes = body.get("codes") or ([body["code"]] if body.get("code") else [])
-        if status not in ("proposed", "confirmed", "rejected"):
-            return JSONResponse(
-                {"success": False, "message": f"invalid status: {status!r}"},
-                status_code=400,
-            )
-        if not codes:
-            return JSONResponse(
-                {"success": False, "message": "no signal codes given"}, status_code=400
-            )
-
-        from harvey.signals import sync_vocabulary
-
-        state = _state()
-        await state.init_db()
-        # Seed first: a confirm that arrives before anything has loaded the
-        # catalog would otherwise report success while changing nothing.
-        await sync_vocabulary(state)
-
-        # A hidden signal (its module is off) is not decided on here.
-        hidden = {r["code"] for r in await state.get_signal_codes() if not r.get("available", 1)}
-        changed, unknown, off = 0, [], []
-        for code in codes:
-            if code in hidden:
-                off.append(code)
-            elif await state.set_signal_status(code, status):
-                changed += 1
-            else:
-                unknown.append(code)
-        return {
-            "success": True, "changed": changed,
-            "status": status, "unknown": unknown, "module_off": off,
-        }
-    except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
-
-
-COHORT_PAGE_SIZE = 50
-COHORT_MAX_PAGE_SIZE = 200
-
-
-async def _cohort_companies(require: list[str], exclude: list[str],
-                            offset: int = 0, limit: int | None = None,
-                            ranges: list[dict] | None = None,
-                            verdicts=("match",)):
-    """(counts per verdict, the page of companies in ``verdicts``)."""
-    state = _state()
-    await state.init_db()
-    await _refuse_hidden_signals(state, [*require, *exclude, *(r["code"] for r in ranges or [])])
-    return await state.cohort_verdicts(require, exclude, ranges, verdicts=verdicts,
-                                       offset=offset, limit=limit)
-
-
-COHORT_VERDICTS = ("match", "possible", "no_match")
-
-
-def _verdicts(raw) -> list[str]:
-    """Which result tabs: one verdict, a list, CSV, or "all"."""
-    if raw is None or raw == "" or raw == []:
-        return ["match"]
-    if isinstance(raw, str):
-        raw = raw.split(",")
-    if not isinstance(raw, list) or any(not isinstance(v, str) for v in raw):
-        raise ValueError("verdict must be match, possible, no_match or all")
-    out = []
-    for v in (v.strip() for v in raw):
-        if v == "all":
-            return list(COHORT_VERDICTS)
-        if v not in COHORT_VERDICTS:
-            raise ValueError("verdict must be match, possible, no_match or all")
-        out.append(v)
-    return list(dict.fromkeys(out))
-
-
-COHORT_MAX_RANGES = 20
-
-
-def _ranges(raw) -> list[dict]:
-    """Numeric cohort filters: a list of {code, min, max} (and, for a yearly
-    signal, an optional ``key``: the year to compare instead of the latest),
-    or the CSV query form "SERP_RANK:11:30,MAPS_RANK::3,TURNOVER:1000000::2024".
-    At least one bound per range."""
-    if raw is None or raw == "" or raw == []:
-        return []
-    if isinstance(raw, str):
-        items = []
-        for part in raw.split(","):
-            if not part.strip():
-                continue
-            pieces = part.split(":")
-            if len(pieces) not in (3, 4):
-                raise ValueError("ranges look like CODE:min:max (or CODE:min:max:year)")
-            item = {"code": pieces[0], "min": pieces[1], "max": pieces[2]}
-            if len(pieces) == 4 and pieces[3].strip():
-                item["key"] = pieces[3]
-            items.append(item)
-        raw = items
-    if not isinstance(raw, list) or any(not isinstance(r, dict) for r in raw):
-        raise ValueError("ranges must be a list of {code, min, max}")
-    if len(raw) > COHORT_MAX_RANGES:
-        raise ValueError("too many ranges")
-    out = []
-    for r in raw:
-        code = r.get("code")
-        if not isinstance(code, str) or not code.strip() or len(code) > 128:
-            raise ValueError("each range needs a signal code")
-        low, high = _range_bound(r.get("min")), _range_bound(r.get("max"))
-        if low is None and high is None:
-            raise ValueError(f"range on {code} needs a min or a max")
-        if low is not None and high is not None and low > high:
-            raise ValueError(f"range on {code}: min is above max")
-        item = {"code": code.strip(), "min": low, "max": high}
-        key = r.get("key")
-        if key is not None and str(key).strip():
-            key = str(key).strip()
-            if not key.isdigit() or len(key) != 4:
-                raise ValueError(f"range on {code}: the year must be 4 digits")
-            item["key"] = key
-        out.append(item)
-    return out
-
-
-def _cohort_integer(raw, default):
-    if raw is None:
-        return default
-    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
-        raise ValueError("offset and limit must be integers")
-    value = int(raw)
-    if abs(value) > 9223372036854775807:
-        raise ValueError("offset or limit is too large")
-    return value
-
-
-@app.post("/api/cohort")
-async def preview_cohort(request: Request):
-    """How many companies carry ALL these signals and none of those.
-
-    The payoff for confirming signals: a cohort is a query, not a list. Set
-    intersection happens in SQL — intersecting in JS over a capped fetch
-    silently returns the wrong answer. ``ranges`` adds numeric filters —
-    ``[{"code": "SERP_RANK", "min": 11, "max": 30}]``. An exclusion alone is
-    a cohort too.
-
-    Every company gets a verdict: ``match`` (every condition checked and
-    met), ``possible`` (nothing rules it out, something isn't checked yet)
-    or ``no_match``. ``counts`` has all three and ``size`` is the matches.
-    ``verdict`` picks the tab ``companies`` pages through with
-    ``offset``/``limit`` (default ``match``); each row carries its verdict.
-    """
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise ValueError("request body must be an object")
-        require = _codes(body.get("require"))
-        exclude = _codes(body.get("exclude"))
-        ranges = _ranges(body.get("ranges"))
-        offset = max(0, _cohort_integer(body.get("offset"), 0))
-        limit = min(max(1, _cohort_integer(body.get("limit"), COHORT_PAGE_SIZE)),
-                    COHORT_MAX_PAGE_SIZE)
-        verdicts = _verdicts(body.get("verdict"))
-        if not require and not exclude and not ranges:
-            # No condition is an empty cohort, never every company.
-            offset = 0
-        counts, rows = await _cohort_companies(require, exclude, offset, limit,
-                                               ranges=ranges, verdicts=verdicts)
-        return {"size": counts["match"], "counts": counts,
-                "verdict": verdicts[0] if len(verdicts) == 1 else "all",
-                "total": sum(counts[v] for v in verdicts),
-                "offset": offset, "limit": limit, "companies": rows}
-    except (ValueError, TypeError) as e:
-        return JSONResponse(_error_body(e), status_code=400)
-    except Exception as e:
-        return JSONResponse({"size": 0, "companies": [], "error": str(e)}, status_code=500)
-
-
-def _csv_cell(value):
-    from harvey.export import csv_cell
-    return csv_cell(value or "")
-
-
-@app.get("/api/cohort.csv")
-async def export_cohort(require: str = "", exclude: str = "", ranges: str = "",
-                        verdict: str = ""):
-    """The whole cohort as a CSV download — every company in the chosen
-    verdicts (matches by default), not just one page, each with its verdict."""
-    import csv
-    import io
-
-    columns = ("name", "domain", "website", "industry", "location", "verdict")
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(columns)
-    try:
-        codes = _codes(require)
-        excluded = _codes(exclude)
-        bounds = _ranges(ranges)
-        verdicts = _verdicts(verdict)
-        if codes or excluded or bounds:
-            _, rows = await _cohort_companies(codes, excluded, ranges=bounds,
-                                              verdicts=verdicts)
-            for r in rows:
-                writer.writerow([_csv_cell(r.get(k)) for k in columns])
-    except ValueError as e:
-        return JSONResponse(_error_body(e), status_code=400)
-    except Exception as e:
-        logger.warning("Cohort export failed: %s", e)
-        return JSONResponse({"error": "Cohort export failed"}, status_code=500)
-    return PlainTextResponse(
-        buf.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="cohort.csv"'},
-    )
+        return {"error": str(e), "groups": []}
 
 
 @app.get("/api/runs")

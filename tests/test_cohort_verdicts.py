@@ -7,8 +7,6 @@ possible (nothing rules it out, something isn't checked) or no match.
 """
 
 import asyncio
-import csv
-import io
 import tempfile
 from pathlib import Path
 
@@ -212,38 +210,6 @@ def _seed_client(client):
     asyncio.run(go())
 
 
-def test_exclusion_only_cohort_with_three_counts(client):
-    _seed_client(client)
-    body = client.post("/api/cohort", json={"exclude": ["RUNNING_GOOGLE_ADS"]}).json()
-    assert body["size"] == 1 and body["verdict"] == "match"
-    assert body["counts"] == {"match": 1, "possible": 1, "no_match": 2}
-    assert [(c["name"], c["verdict"]) for c in body["companies"]] == [
-        ("Beta EXEMPLU SRL", "match")]
-    possible = client.post("/api/cohort", json={"exclude": ["RUNNING_GOOGLE_ADS"],
-                                                "verdict": "possible"}).json()
-    assert possible["size"] == 1 and possible["total"] == 1
-    assert [c["name"] for c in possible["companies"]] == ["Gama EXEMPLU SRL"]
-
-
-@pytest.mark.parametrize("verdict", ["maybe", ["match", 3], 7])
-def test_a_bad_verdict_is_a_client_error(client, verdict):
-    assert client.post("/api/cohort", json={"require": ["RUNNING_GOOGLE_ADS"],
-                                            "verdict": verdict}).status_code == 400
-
-
-def test_cohort_csv_carries_the_verdict(client):
-    _seed_client(client)
-    r = client.get("/api/cohort.csv", params={"require": "RUNNING_GOOGLE_ADS",
-                                              "verdict": "all"})
-    rows = list(csv.reader(io.StringIO(r.text)))
-    assert rows[0][-1] == "verdict"
-    assert sorted((row[0].split()[0], row[-1]) for row in rows[1:]) == [
-        ("Alfa", "match"), ("Beta", "no_match"), ("Delta", "match"), ("Gama", "possible")]
-    only = client.get("/api/cohort.csv", params={"exclude": "RUNNING_GOOGLE_ADS"})
-    assert [row[0] for row in list(csv.reader(io.StringIO(only.text)))[1:]] == [
-        "Beta EXEMPLU SRL"]
-
-
 def test_signals_api_reports_true_false_unknown(client):
     _seed_client(client)
     data = client.get("/api/signals").json()
@@ -259,83 +225,14 @@ def test_signals_api_reports_true_false_unknown(client):
 
 def test_a_listing_records_website_and_claim_both_ways():
     from harvey.collectors.discover import Business, _observations
-    confirmed = {"NO_WEBSITE", "UNCLAIMED_LISTING"}
+    wanted = {"NO_WEBSITE", "UNCLAIMED_LISTING"}
 
     def rows(**kw):
         biz = Business(name="EXEMPLU SRL", **kw)
         return {r["signal_code"]: r["value_num"]
-                for r in _observations(biz, "c1", confirmed, "run")}
+                for r in _observations(biz, "c1", wanted, "run")}
     assert rows(has_website=True, is_claimed=True) == {"NO_WEBSITE": 0.0,
                                                        "UNCLAIMED_LISTING": 0.0}
     assert rows(has_website=False, is_claimed=False) == {"NO_WEBSITE": 1.0,
                                                          "UNCLAIMED_LISTING": 1.0}
     assert rows() == {}
-
-
-# ── The Signals page ──
-
-
-def _node_page(script):
-    import json
-    import shutil
-    import subprocess
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node unavailable")
-    app = Path(__file__).resolve().parent.parent / "harvey" / "web" / "app.js"
-    out = subprocess.run([node, "-e", script, str(app), str(app.parent / "i18n.js")],
-                         text=True, encoding="utf-8", capture_output=True, check=True)
-    return json.loads(out.stdout)
-
-
-@pytest.mark.parametrize("lang", ["ro", "en"])
-def test_cohort_result_shows_three_tabs_and_what_possible_means(lang):
-    data = _node_page(r'''
-const fs = require('fs'), vm = require('vm');
-const app = fs.readFileSync(process.argv[1], 'utf8');
-vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
-vm.runInThisContext("LANG = '%s';");
-const el = {innerHTML: ''}, bodies = [];
-global.document = {getElementById: () => el};
-global.escHtml = s => String(s);
-global.api = async (path, opts) => { bodies.push(JSON.parse(opts.body));
-  return {size: 1, total: 5, verdict: 'possible', offset: 0,
-          counts: {match: 1, possible: 5, no_match: 2},
-          companies: [{name: 'EXEMPLU SRL', domain: 'example.com', verdict: 'possible'}]}; };
-vm.runInThisContext("const _cohort = {require: new Set(), exclude: new Set(['RUNNING_GOOGLE_ADS']), ranges: {}, verdict: 'possible'};" +
- "let _cohortOffset = 0, _cohortGeneration = 0; const COHORT_PAGE = 50;" +
- app.slice(app.indexOf('async function runCohort('), app.indexOf('async function exportCohort(')));
-(async () => { await runCohort();
-  console.log(JSON.stringify({html: el.innerHTML, body: bodies[0],
-    possible: t('cohort.explain.possible'), tab: t('cohort.tab.possible'),
-    hasEn: hasKey('en', 'cohort.explain.possible'), hasRo: hasKey('ro', 'cohort.explain.possible')})); })()
-  .catch(e => {console.error(e); process.exit(1);});
-''' % lang)
-    assert data["body"]["verdict"] == "possible" and data["body"]["exclude"] == ["RUNNING_GOOGLE_ADS"]
-    assert data["hasEn"] and data["hasRo"]
-    html = data["html"]
-    assert html.count("setCohortVerdict(") == 3
-    assert 'class="on" aria-pressed="true" onclick="setCohortVerdict(\'possible\')' in html
-    assert data["possible"] in html and data["tab"] in html
-    assert "EXEMPLU SRL" in html
-
-
-def test_signal_row_shows_yes_no_and_not_checked():
-    data = _node_page(r'''
-const fs = require('fs'), vm = require('vm');
-const app = fs.readFileSync(process.argv[1], 'utf8');
-vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
-vm.runInThisContext("LANG = 'en';");
-global.escHtml = s => String(s);
-global.jsq = s => JSON.stringify(s);
-global.badge = s => '';
-vm.runInThisContext(app.slice(app.indexOf('function tServer('), app.indexOf('async function loadSignals(')));
-vm.runInThisContext(app.slice(app.indexOf('function sigLabel('), app.indexOf('async function setSignals(')));
-const sig = {code: 'RUNNING_GOOGLE_ADS', label: 'Running Google Ads', description: 'd',
-             cost_note: 'free', status: 'confirmed', companies: 2,
-             states: {true: 2, false: 1, unknown: 7}};
-console.log(JSON.stringify({checked: sigRow(sig),
-  unchecked: sigRow({...sig, companies: 0, states: {true: 0, false: 0, unknown: 10}})}));
-''')
-    assert "2 yes · 1 no · 7 not checked" in data["checked"]
-    assert "not checked" not in data["unchecked"]

@@ -145,7 +145,6 @@ def test_registry_administrators_anaf_phones_site_reads_and_prospects(tmp_path):
 
     async def go():
         s = await _state(db)
-        await s.set_signal_status("CONTACT_FOUND", "confirmed")
         # The registry's administrators are read from it (never copied).
         slim.describe(s, slim.firm("EXEMPLU SASE SRL", 90000006, domain="sase.example"),
                       people=[("J08/90000006/2010", "EXEMPLU MARIA", "administrator")])
@@ -394,7 +393,6 @@ def test_signal_filters_reuse_the_cohort_rules(client):
 
     async def tag():
         s = StateManager(str(client.db_path))
-        await s.set_signal_status("CONTACT_FORM_URL", "confirmed")
         await s.add_observations([{"company_id": ids[2], "signal_code": "CONTACT_FORM_URL",
                                    "value_text": "https://ex2.example/contact"}])
     run(tag())
@@ -405,7 +403,7 @@ def test_signal_filters_reuse_the_cohort_rules(client):
     # checked for the signal is "possible", so it isn't listed).
     res = client.get("/api/contacts", params={"exclude": "CONTACT_FORM_URL"}).json()
     assert "https://ex2.example/contact" not in {r["value"] for r in res["rows"]}
-    # A signal of a module that is off is refused, as on the cohort builder.
+    # A signal of a module that is off is refused, as in the cohort engine.
     assert client.get("/api/contacts", params={"require": "RUNNING_GOOGLE_ADS"}).status_code == 400
 
 

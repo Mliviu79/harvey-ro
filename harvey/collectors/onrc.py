@@ -34,12 +34,12 @@ The downloaded files themselves are kept as published (data/onrc/<date>/):
 prune_downloads() deletes the representatives file and older datasets, but
 only when called.
 
-Every fact lands as an observation with the dataset it came from, under
-the same confirmation gate as discovery: companies (and what they are
-authorised to do, which describes them like their industry) are saved
-because you asked for them by activity and place, but ACTIVITY_CODE,
-CONTACT_FOUND and DECISION_MAKER_TITLE rows are written only when you
-confirmed those signals.
+Every fact lands as an observation with the dataset it came from, as
+discovery's do: companies (and what they are authorised to do, which
+describes them like their industry) are saved because you asked for them
+by activity and place, and the ACTIVITY_CODE, CONTACT_FOUND and
+DECISION_MAKER_TITLE rows with them while the modules that declare those
+signals are on.
 """
 
 import csv
@@ -66,7 +66,7 @@ SOURCE = "registry:onrc"
 COLLECTOR = "registry"
 
 # The files an import reads, by role. "people" is only fetched when its
-# signals are confirmed: it's the second-largest file and useless otherwise.
+# signals are collected: it's the second-largest file and useless otherwise.
 FILES = {
     "caen": "OD_CAEN_AUTORIZAT.CSV",
     "status": "OD_STARE_FIRMA.CSV",
@@ -701,7 +701,6 @@ class ImportReport:
     administrators: int = 0
     activities: int = 0          # company activities (CAEN classes) added
     observations: int = 0
-    unconfirmed: list[str] = field(default_factory=list)
     run_id: str = ""
     dry_run: bool = False
     errors: list[str] = field(default_factory=list)

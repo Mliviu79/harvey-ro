@@ -1975,7 +1975,7 @@ class StateManager:
                                                         ("since", "covered_from", "mailbox")})
         return True
 
-    # ── Signal vocabulary (governed; user-confirmed before collection) ──
+    # ── Signal vocabulary (governed: a code no module declares is refused) ──
 
     async def write_vocabulary(self, rows_for, settings_prefix: str) -> int:
         """Upsert the whole vocabulary in one write transaction.
@@ -1995,31 +1995,21 @@ class StateManager:
         return await self._on_overlay("write_contact_kinds", rows_for,
                                       settings_prefix)
 
-    async def get_signal_codes(self, status: str | None = None,
-                               available_only: bool = False) -> list[dict]:
+    async def get_signal_codes(self, available_only: bool = False) -> list[dict]:
         """The vocabulary. ``available_only`` leaves out the signals of
         modules that are off (hidden, never collected)."""
-        rows = await self._read("signal_vocabulary", status)
+        rows = await self._read("signal_vocabulary")
         rows = [r for r in rows if r["available"]] if available_only else rows
         return sorted(rows, key=lambda r: (r.get("category") or "", r["code"]))
 
-    async def set_signal_status(self, code: str, status: str) -> bool:
-        """Confirm / reject a proposed signal. Only confirmed signals are
-        collected — Harvey proposes, the user decides."""
-        if status not in ("proposed", "confirmed", "rejected"):
-            raise ValueError(f"invalid signal status: {status}")
-        return await self._on_overlay("set_signal_status", code, status)
-
-    async def confirmed_signal_codes(self) -> set[str]:
-        """What collectors may collect: confirmed by a person, and declared
-        by a module that is on."""
+    async def collected_signal_codes(self) -> set[str]:
+        """What collectors collect: every signal a module that is on
+        declares (or one of its capabilities returns). A module's switch is
+        the only on/off; what a paid source may spend is its run's cap."""
         from harvey.modules import switches
         from harvey.signals import available_codes
 
-        stored = await self.settings_with_prefix(switches.PREFIX)
-        available = available_codes(stored)
-        return {c for c in await self._on_overlay("signal_codes", "confirmed")
-                if c in available}
+        return available_codes(await self.settings_with_prefix(switches.PREFIX))
 
     # ── Observations (every fact is a row, never a column) ──
 

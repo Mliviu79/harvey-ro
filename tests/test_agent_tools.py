@@ -92,7 +92,7 @@ READABLE = {
               "batch",
     "sending_account": "id label provider address:personal profile_id enabled created_at",
     "signal": "id code label description category value_type unit cardinality keyed_by "
-              "when_known cost_note status confidence_floor",
+              "when_known cost_note confidence_floor",
     "signal_source": "signal module how precedence absent",
     "signal_tally": "signal n_true n_checked",
     "source": "id name",

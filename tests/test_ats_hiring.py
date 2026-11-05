@@ -252,8 +252,8 @@ async def test_network_errors_read_as_none():
 
 # ── profiling: HIRING_ROLE + OPEN_ROLES from the board ──
 
-def _collector(confirmed, pages: dict[str, str], feeds: dict[str, object], keywords=("head of growth",)):
-    c = ProfileCollector(None, set(confirmed), role_keywords=list(keywords))
+def _collector(wanted, pages: dict[str, str], feeds: dict[str, object], keywords=("head of growth",)):
+    c = ProfileCollector(None, set(wanted), role_keywords=list(keywords))
     requested = []
 
     async def fake_get(url):
@@ -303,7 +303,7 @@ async def test_profile_finds_the_board_on_the_careers_page():
                    keywords=["growth marketing manager"])
     obs = await c.profile_company("c1", "acme.example")
     assert [o["value_text"] for o in obs] == ["Growth Marketing Manager · Marketing · London · posted 2026-10-05"]
-    assert not any(o["signal_code"] == "OPEN_ROLES" for o in obs)      # not confirmed
+    assert not any(o["signal_code"] == "OPEN_ROLES" for o in obs)      # not wanted
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,6 @@ async def test_no_feed_request_unless_a_hiring_signal_is_confirmed():
 @pytest.mark.asyncio
 async def test_profile_companies_takes_keywords_from_the_config(state, monkeypatch):
     await sync_vocabulary(state)
-    await state.set_signal_status("HIRING_ROLE", "confirmed")
     seen = {}
 
     async def fake_profile(state, companies, confirmed, run_id="", config=None,
@@ -449,7 +448,6 @@ async def test_a_careers_subdomain_hit_is_recorded_as_the_company(state, monkeyp
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
     await sync_vocabulary(state)
-    await state.set_signal_status("FOUND_IN_SERP", "confirmed")
     q = build_queries(_config(), preset="hiring")[0]
     report = await run_discovery(state, _config(), "fake", [q])
     assert report.new_companies == 1, report.errors
@@ -606,7 +604,6 @@ async def test_hiring_preset_hits_on_ats_hosts_are_never_prospects(state, monkey
     monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
                         raising=False)
     await sync_vocabulary(state)
-    await state.set_signal_status("FOUND_IN_SERP", "confirmed")
     report = await run_discovery(state, _config(), "fake", build_queries(_config(), preset="hiring")[:1])
     assert report.new_companies == 0 and report.junk == 1
 

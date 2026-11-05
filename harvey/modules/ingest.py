@@ -6,8 +6,9 @@ Here is where a draft becomes rows, under the rules no module can skip:
 - a record is matched by the resolver (harvey/resolver.py) before it is
   saved, so a company found twice is one company, a likely one goes to the
   review list, and a known one only has its gaps filled;
-- a fact is written only when its signal is confirmed and its module is on
-  (the confirmation gate), and a phone number only when it parses;
+- a fact is written only when its signal is declared by a module that is on
+  (the vocabulary refuses a code nobody declares), and a phone number only
+  when it parses;
 - people and contacts accumulate: a second source adds beside the first,
   never over it;
 - every observation says which module and capability found it and which
@@ -155,7 +156,7 @@ async def source_record(batch, record: Record, *, collector: str,
         result = await batch.save_company(company, match)
         out.company_id, out.origin = result.company_id, result.origin
     # What the company does, all of it: describes the record (like its
-    # industry), so it isn't held behind the signal gate.
+    # industry), written whatever signals the run collects.
     out.activities = await batch.set_company_activities(
         out.company_id, record.activities, source=collector)
     await batch.add_company_source(out.company_id, record.source, record.external_id, out.origin)
@@ -191,18 +192,19 @@ def _declared_facts() -> dict[tuple[str, str], frozenset[str]]:
 
 def rows(facts: list[Fact], *, company_id: str = "", origin: str = "",
          records: dict[str, Saved] | None = None, run_id: str = "",
-         confirmed: set[str] | None = None, collector: str = "") -> list[dict]:
+         wanted: set[str] | None = None, collector: str = "") -> list[dict]:
     """Observation rows for ``facts``: a fact about the record called for
     goes to ``company_id`` (found for ``origin``), one about a record of
     the draft to where that record was saved (``records``, by key). Facts
-    not confirmed (``confirmed``; None checks nothing here), about a record
+    outside ``wanted`` (the signals collected, of modules that are on;
+    None checks nothing here), about a record
     that wasn't saved, or a phone that doesn't parse are left out, and so
     is one the capability stamped on it doesn't declare in its manifest
     (a module's bug, or a module naming another as the finder: logged)."""
     out = []
     declared = _declared_facts() if any(f.module for f in facts) else {}
     for fact in facts:
-        if confirmed is not None and fact.code not in confirmed:
+        if wanted is not None and fact.code not in wanted:
             continue
         if fact.module and fact.code not in declared.get((fact.module, fact.capability), ()):
             seen = (fact.module, fact.capability, fact.code)
@@ -243,14 +245,14 @@ async def write(store, batch: list[dict], run_id: str = "") -> int:
 
 
 async def facts(store, found: list[Fact], *, company_id: str, origin: str = "",
-                run_id: str = "", confirmed: set[str] | None = None,
+                run_id: str = "", wanted: set[str] | None = None,
                 collector: str = "") -> int:
-    """Facts about one company, through the gate: ``confirmed`` None reads
-    what is confirmed now."""
-    if confirmed is None:
-        confirmed = await store.confirmed_signal_codes()
+    """Facts about one company, of the signals collected: ``wanted`` None
+    reads what the module switches collect now."""
+    if wanted is None:
+        wanted = await store.collected_signal_codes()
     return await write(store, rows(found, company_id=company_id, origin=origin,
-                                   run_id=run_id, confirmed=confirmed or set(),
+                                   run_id=run_id, wanted=wanted or set(),
                                    collector=collector), run_id)
 
 
@@ -306,18 +308,18 @@ def _new_readings(found: list[dict], latest: dict, ever: set, many: frozenset[st
 
 
 async def checked(batch, module: str, found: dict[str, tuple[list[Fact], list]], *,
-                  run_id: str, confirmed, many: frozenset[str] | None = None) -> dict:
+                  run_id: str, wanted, many: frozenset[str] | None = None) -> dict:
     """What a lookup by identifier answered for many companies at once
     (``found``: {company_id: (facts, contacts)}), saved on one batch the
     way ``changed``, ``write`` and ``company_phones`` save one company's,
-    with a statement for the lot instead of several each: each fact through
-    the confirmation gate, written only when it says something new; every
+    with a statement for the lot instead of several each: each fact of a
+    signal collected (``wanted``), written only when it says something new; every
     number a contact of its company (with its source and trust), and the
     first one the company's phone when it has none. Returns
     {"observations", "updated", "phones_set"}: rows written, companies with
     a new reading, phones set."""
     many = many_codes() if many is None else many
-    rows_of = {cid: _one_each(rows(facts, run_id=run_id, confirmed=confirmed,
+    rows_of = {cid: _one_each(rows(facts, run_id=run_id, wanted=wanted,
                                    records={cid: Saved(cid, cid)}), many)
                for cid, (facts, _) in found.items()}
     readings = await batch.module_readings_of([cid for cid, r in rows_of.items() if r], module)
@@ -373,7 +375,7 @@ async def add_contacts(store, company_id: str, found, origin: str = "",
                        trust: str = "", region: str | None = None) -> int:
     """Every contact a capability found for a company (api.Contact), linked
     to it with its source and evidence. Contact data, like a published
-    email: it doesn't wait for a signal to be confirmed. ``trust`` is the
+    email: kept whatever signals a run collects. ``trust`` is the
     most a contact can be trusted (found on a website whose match to the
     company is only likely, or unconfirmed): never thrown away, only marked.
     How many were kept (a number that doesn't parse isn't)."""
@@ -418,7 +420,7 @@ async def named_people(batch, company_id: str, found: list[Fact], *, origin: str
                        source: str = "") -> None:
     """The people a source's CONTACT_FOUND facts name ("Ana Pop —
     administrator"), as people of the company (on a batch): records to
-    search for a contact, kept whether or not the signal is confirmed."""
+    search for a contact, kept whatever signals a run collects."""
     from harvey import contacts
 
     named = [contacts.split_person(f.value_text or "") for f in found

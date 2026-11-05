@@ -314,7 +314,7 @@ def test_cross_site_simple_requests_change_nothing(env, content_type):
     body = json.dumps({"SMTP_HOST": "relay.example.test"})
     with TestClient(dash.app, base_url=ORIGIN) as c:
         for path in ("/api/settings/env", "/api/harvey/start", "/api/outbox/approve-all",
-                     "/api/sending/resume", "/api/signals/status"):
+                     "/api/sending/resume", "/api/modules/web_marketing"):
             r = c.post(path, content=body, headers={**CROSS_SITE, "Content-Type": content_type})
             assert r.status_code == 403
             # Older browsers send no fetch metadata: the missing token still stops it.

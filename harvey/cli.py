@@ -547,7 +547,7 @@ def cmd_profile(args):
         observations = sum(int(j.result.get("observations") or 0) for j in read)
         print(f"  Read {len(read)} sites → {observations} observations (free)")
         _job_failures(found)
-        print("\n  See what turned up: harvey dashboard → Signals\n")
+        print("\n  See what turned up: harvey dashboard → Companies\n")
 
     asyncio.run(_profile())
 
@@ -1058,9 +1058,6 @@ def _print_pull_report(report, where: str = ""):
         print(f"  {report.activities} activities (CAEN classes) recorded, "
               "searchable with harvey search")
         print(f"  {report.observations} observations recorded")
-    for code in report.unconfirmed:
-        print(f"    {code} not confirmed, so not recorded "
-              f"(harvey signals --confirm {code})")
     for err in report.errors[:5]:
         print(f"    ! {err}")
 
@@ -1236,7 +1233,6 @@ def _print_follow_ups(found) -> None:
             for key, value in j.result.items():
                 if isinstance(value, int) and not isinstance(value, bool) and key in total:
                     total[key] += value
-            total["unconfirmed"] = j.result.get("unconfirmed") or total["unconfirmed"]
             total["stopped"] = j.result.get("stopped") or total["stopped"]
         waiting = sum(1 for j in checks if j.module == module and j.status not in jobs.FINISHED)
         _print_check_report(total)
@@ -1551,10 +1547,6 @@ def cmd_financials(args):
                                  settings)
         print(f"  {result.get('companies', 0):,} companies on file got figures, "
               f"{result.get('observations', 0):,} observations recorded")
-        for module, codes in (result.get("unconfirmed") or {}).items():
-            if module == FIN_MODULE and codes:
-                print(f"    not recorded, not confirmed: {', '.join(codes)} "
-                      f"(harvey signals --confirm {','.join(codes)})")
         for err in (result.get("errors") or [])[:3]:
             print(f"    ! {err}")
         print()
@@ -1736,10 +1728,6 @@ def cmd_taxpayers(args):
                                 settings)
         print(f"  {result.get('companies', 0):,} companies on file got readings, "
               f"{result.get('observations', 0):,} observations recorded")
-        for module, codes in (result.get("unconfirmed") or {}).items():
-            if codes:
-                print(f"    {module}: not recorded, not confirmed: {', '.join(codes)} "
-                      f"(harvey signals --confirm {','.join(codes)})")
         for err in (result.get("errors") or [])[:3]:
             print(f"    ! {err}")
         print()
@@ -1763,6 +1751,8 @@ def _module_name(module_id: str) -> str:
 
 
 def _print_check_report(r: dict) -> None:
+    from harvey.modules.runs import NOTHING_WANTED
+
     name = _module_name(r["module"])
     print(f"  {name}: {r['companies']:,} compan{'y' if r['companies'] == 1 else 'ies'} "
           f"with a CUI; {r['checked']:,} asked in {r['requests']:,} request"
@@ -1771,11 +1761,8 @@ def _print_check_report(r: dict) -> None:
                                                   if r["invalid"] else ""))
     print(f"  {r['observations']:,} observations recorded on {r['updated']:,} companies"
           + (f"; {r['phones_set']:,} got a phone" if r["phones_set"] else ""))
-    if r["unconfirmed"]:
-        print(f"    not recorded, not confirmed: {', '.join(r['unconfirmed'])} "
-              f"(harvey signals --confirm {','.join(r['unconfirmed'])})")
-    if r["stopped"] == "unconfirmed":
-        print("    nothing asked: none of its signals is confirmed")
+    if r["stopped"] == NOTHING_WANTED:
+        print("    nothing asked: none of its signals is collected (their modules are off)")
     elif r["stopped"] == "busy":
         print("    stopped: the service stayed busy or couldn't be reached; "
               "harvey anaf check --missing finishes later")
@@ -1846,7 +1833,6 @@ def cmd_anaf(args):
                 if isinstance(value, int) and not isinstance(value, bool) and key in report \
                         and key != "companies":
                     report[key] += value
-            report["unconfirmed"] = job.result.get("unconfirmed") or report["unconfirmed"]
             report["stopped"] = job.result.get("stopped") or report["stopped"]
             if job.status == jobs.QUEUED and job.error:
                 report["stopped"] = report["stopped"] or "busy"
@@ -2123,7 +2109,8 @@ def cmd_discover(args):
             print("  " + "=" * 68 + "\n")
             raise SystemExit(1)
 
-        print("\n  Next: harvey dashboard → Signals → cohort builder\n")
+        print("\n  Next: harvey dashboard → Companies (filter by what was found), "
+              "or harvey contacts find\n")
 
     asyncio.run(_discover())
 
@@ -2832,10 +2819,10 @@ def cmd_worker(args):
 
 
 def cmd_signals(args):
-    """Review the signal vocabulary — Harvey proposes, you confirm.
-
-    Nothing is collected until a signal is confirmed, so a fresh install
-    prospects against nothing until someone makes these decisions.
+    """The facts Harvey collects about companies: one line per signal of a
+    module that is on, with what it costs and how many companies it has
+    been checked for. Read only: a module's switch (harvey modules) says
+    what is collected, and a paid source spends only inside its run's cap.
     """
     from harvey.state import StateManager
     from harvey.signals import sync_vocabulary
@@ -2845,42 +2832,14 @@ def cmd_signals(args):
         await state.init_db()
         await sync_vocabulary(state)
 
-        codes = [a.strip().upper() for a in (args.confirm or args.reject or "").split(",")
-                 if a.strip()]
-        # Signals of a module that is off are hidden: not listed, not decided on.
-        visible = await state.get_signal_codes(available_only=True)
-        if codes:
-            status = "confirmed" if args.confirm else "rejected"
-            if codes == ["ALL"]:
-                codes = [c["code"] for c in visible]
-            elif codes == ["FREE"]:
-                # Only signals whose cost note STARTS with free/included. A
-                # substring match would sweep in "1 credit (free tiers
-                # available)", which is not free.
-                codes = [c["code"] for c in visible
-                         if (c["cost_note"] or "").lower().startswith(("free", "included"))]
-            hidden = {c["code"]: c["module"] for c in await state.get_signal_codes()
-                      if not c["available"]}
-            for c in codes:
-                if c in hidden:
-                    print(f"\n  {c}: its module {hidden[c]} is off "
-                          f"(harvey modules enable {hidden[c]}).")
-            changed = sum(
-                [1 for c in codes if c not in hidden and await state.set_signal_status(c, status)]
-            )
-            print(f"\n  {changed} signal(s) {status}.\n")
-            return
-
-        rows = visible
+        # Signals of a module that is off are hidden: not listed, not collected.
+        rows = await state.get_signal_codes(available_only=True)
+        hidden = len(await state.get_signal_codes()) - len(rows)
         states = await state.signal_states([r["code"] for r in rows])
-        by_status = {"confirmed": 0, "proposed": 0, "rejected": 0}
-        for r in rows:
-            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
 
-        print(f"\n  Signals — {by_status['confirmed']} confirmed, "
-              f"{by_status['proposed']} awaiting you, {by_status['rejected']} off")
+        print(f"\n  Signals: {len(rows)} collected"
+              + (f", {hidden} of modules that are off" if hidden else ""))
         print("  " + "=" * 66)
-        mark = {"confirmed": "[on] ", "proposed": "[ ? ]", "rejected": "[off]"}
         current = None
         for r in rows:
             if r["category"] != current:
@@ -2890,16 +2849,11 @@ def cmd_signals(args):
             st = states.get(r["code"], {})
             seen_txt = (f"  ({st['true']} yes, {st['false']} no, {st['unknown']} not checked)"
                         if st.get("true") or st.get("false") else "")
-            print(f"    {mark.get(r['status'], '     ')} {r['code']:<22} "
-                  f"{r['label']}{seen_txt}")
+            print(f"    {r['code']:<22} {r['label']}{seen_txt}")
             print(f"          {r['cost_note']}")
-
-        if by_status["proposed"]:
-            print("\n  Confirm with: harvey signals --confirm CODE[,CODE...]")
-            print("  Everything free: harvey signals --confirm free")
-            print("  Details and descriptions: harvey dashboard → Signals\n")
-        else:
-            print("")
+        if hidden:
+            print("\n  A module's signals show once it is on: harvey modules list")
+        print("")
 
     asyncio.run(_signals())
 
@@ -3134,7 +3088,7 @@ def _switch_module(module_id: str, on: bool):
         if on:
             print(f"\n  {m.name or m.id} is on.")
             if m.signals:
-                print(f"  Its signals are back in the vocabulary, as you left them: "
+                print(f"  Its signals are collected again: "
                       f"{', '.join(s['code'] for s in m.signals)}")
         else:
             print(f"\n  {m.name or m.id} is off. Nothing was deleted: its data stays, "
@@ -4337,11 +4291,7 @@ def main():
     sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(
-        "signals", help="Review/confirm which signals Harvey prospects against")
-    sub.add_argument("--confirm", metavar="CODES", default="",
-                     help="Comma-separated codes to confirm ('all' or 'free' accepted)")
-    sub.add_argument("--reject", metavar="CODES", default="",
-                     help="Comma-separated codes to turn off")
+        "signals", help="The facts Harvey collects about companies, with costs and counts")
     sub.set_defaults(func=cmd_signals)
 
     sub = subparsers.add_parser(
@@ -4399,7 +4349,7 @@ def main():
                      help="With --recount: write the recounted values where they differ")
     sub.add_argument("--registers", action="store_true",
                      help="Count the register signals over the firms in Harvey (what the "
-                          "Signals and landing pages show) for the registers' current loads")
+                          "signal listing and landing page show) for the registers' current loads")
     sub.add_argument("--db", default="", help="The database to check (default: data/harvey.db)")
     sub.set_defaults(func=cmd_doctor)
 

@@ -133,16 +133,16 @@ async def test_a_signal_another_enabled_module_produces_stays(state):
 
 
 @pytest.mark.asyncio
-async def test_off_hides_keeps_data_and_the_users_decision(state):
+async def test_off_hides_and_stops_collecting_and_keeps_the_data(state):
+    """The module's switch is the only on/off: on, its signals are collected
+    with nothing to confirm; off, they are hidden and never collected."""
     await switches.set_enabled(state, "web_marketing", True)
-    await state.set_signal_status("TECH_STACK", "confirmed")
-    await state.set_signal_status("RUNNING_GOOGLE_ADS", "rejected")
     cid = await state.add_company(Company(name="Exemplu SRL", domain="exemplu.example"))
     await state.add_observation("TECH_STACK", company_id=cid, value_text="WordPress")
-    assert "TECH_STACK" in await state.confirmed_signal_codes()
+    assert {"TECH_STACK", "RUNNING_GOOGLE_ADS"} <= await state.collected_signal_codes()
 
     await switches.set_enabled(state, "web_marketing", False)
-    assert "TECH_STACK" not in await state.confirmed_signal_codes()   # never collected
+    assert "TECH_STACK" not in await state.collected_signal_codes()   # never collected
     assert len(await state.get_observations(company_id=cid, signal_code="TECH_STACK")) == 1
     # The vocabulary still knows the code; an invented one is still refused.
     await state.add_observation("TECH_STACK", company_id=cid, value_text="Joomla")
@@ -150,8 +150,7 @@ async def test_off_hides_keeps_data_and_the_users_decision(state):
         await state.add_observation("NOT_A_SIGNAL", company_id=cid)
 
     await switches.set_enabled(state, "web_marketing", True)
-    status = {r["code"]: r["status"] for r in await state.get_signal_codes()}
-    assert (status["TECH_STACK"], status["RUNNING_GOOGLE_ADS"]) == ("confirmed", "rejected")
+    assert "TECH_STACK" in await state.collected_signal_codes()
 
 
 # ── Turning modules on and off ──
@@ -402,11 +401,9 @@ def test_signals_page_hides_modules_that_are_off(client):
                                                  "mf_taxpayers", "onrc"]
     assert all(s["when_known"] for g in data["groups"] for s in g["signals"])
 
-    r = client.post("/api/signals/status", json={"codes": ["TECH_STACK"], "status": "confirmed"})
-    assert r.json()["changed"] == 0 and r.json()["module_off"] == ["TECH_STACK"]
-    r = client.post("/api/cohort", json={"require": ["TECH_STACK"]})
+    # The filters refuse it too: its data stops at the day the module went off.
+    r = client.get("/api/contacts", params={"require": "TECH_STACK"})
     assert r.status_code == 400 and "web_marketing" in r.json()["error"]
-    assert client.get("/api/cohort.csv", params={"require": "TECH_STACK"}).status_code == 400
 
 
 def test_discover_api_refuses_and_hides_disabled_sources(client):
@@ -538,31 +535,25 @@ console.log(JSON.stringify(out));
     assert "Niciun modul găsit" in out["empty"]
 
 
-def test_signal_rows_say_when_known_and_settings_hide_keys_of_modules_off():
+def test_settings_hide_keys_of_modules_off():
     node = shutil.which("node")
     if not node:
         pytest.skip("node is not installed")
     app = (WEB / "app.js").read_text(encoding="utf-8")
-    funcs = (app[app.index("function tServer("):app.index("async function loadSignals(")]
-             + app[app.index("function sigLabel("):app.index("async function setSignals(")]
-             + app[app.index("function applyEnvKeys("):app.index("function saveGmail(")])
+    funcs = app[app.index("function applyEnvKeys("):app.index("function saveGmail(")]
     script = r"""
 const fs = require('fs'), vm = require('vm');
 vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
-global.escHtml = s => String(s); global.jsq = s => JSON.stringify(s); global.badge = s => '';
 const fields = ['REOON_API_KEY', 'SMTP_HOST', 'REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY']
   .map(keys => ({dataset: {env: keys}, hidden: false}));
 global.document = {querySelectorAll: () => fields};
 vm.runInThisContext(process.argv[2]);
-const row = sigRow({code: 'ACTIVITY_CODE', label: 'Registered activity (CAEN)', description: 'd',
-  cost_note: 'free (ONRC open data, data.gov.ro)', status: 'proposed', when_known: 'source'});
 applyEnvKeys(['HUNTER_API_KEY']);
-console.log(JSON.stringify({row, hidden: fields.map(f => f.hidden)}));
+console.log(JSON.stringify({hidden: fields.map(f => f.hidden)}));
 """
     res = subprocess.run([node, "-e", script, str(WEB / "i18n.js"), funcs],
                          text=True, encoding="utf-8", capture_output=True, check=True, timeout=30)
     out = json.loads(res.stdout)
-    assert "se știe din sursă" in out["row"]
     assert out["hidden"] == [True, True, False]
 
 
@@ -662,8 +653,7 @@ async def test_a_sync_reads_the_switches_inside_its_own_write(state, monkeypatch
 
     monkeypatch.setattr(state, "write_vocabulary", flip_first)
     await sync_vocabulary(state)
-    await state.set_signal_status("TECH_STACK", "confirmed")
-    assert "TECH_STACK" in await state.confirmed_signal_codes()
+    assert "TECH_STACK" in await state.collected_signal_codes()
 
 
 # ── Hunter and the verifiers follow their switches ──
@@ -734,10 +724,6 @@ def test_module_off_refusals_name_the_module_for_the_page(client):
     assert r.status_code == 409 and r.json()["off_module"] == "serper"
     r = client.post("/api/discover/run", json={"provider": "serper"})
     assert r.json()["off_module"] == "serper" and r.json()["success"] is False
-    r = client.post("/api/cohort", json={"require": ["TECH_STACK"]})
-    assert r.status_code == 400 and r.json()["off_module"] == "web_marketing"
-    r = client.get("/api/cohort.csv", params={"require": "TECH_STACK"})
-    assert r.json()["off_module"] == "web_marketing"
 
 
 def test_the_modules_page_names_what_a_module_needs(client):

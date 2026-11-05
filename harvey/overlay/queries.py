@@ -42,7 +42,7 @@ statement("overlay.firms.local_search",
 statement("overlay.firms.sources",
           "SELECT firm FROM firm_source WHERE source = ? AND batch = ?", params=(1, 1))
 
-# ── Today, the backlog, the Signals page ──
+# ── Today, the backlog, the signal listing ──
 statement("overlay.tally", "SELECT name, n FROM tally")
 statement("overlay.signals",
           "SELECT s.code, s.status, t.n_true, t.n_checked FROM signal s "

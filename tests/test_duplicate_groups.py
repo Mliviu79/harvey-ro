@@ -33,8 +33,6 @@ async def state(tmp_path):
     sm = StateManager(str(tmp_path / "g.db"))
     await sm.init_db()
     await sync_vocabulary(sm)
-    for code in ("PHONE_NUMBER", "FOUND_IN_SERP", "CONTACT_FOUND"):
-        await sm.set_signal_status(code, "confirmed")
     return sm
 
 
@@ -436,7 +434,6 @@ async def _seeded(path, size=4):
     sm = StateManager(str(path))
     await sm.init_db()
     await sync_vocabulary(sm)
-    await sm.set_signal_status("PHONE_NUMBER", "confirmed")
     ids = await _chain(sm, size)
     await sm.scan_duplicates()
     return sm, ids

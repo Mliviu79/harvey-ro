@@ -14,7 +14,7 @@ import pytest_asyncio
 from harvey.collectors import onrc
 from harvey.models import Company
 from harvey.modules import runs
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 from tests import slim
 
@@ -128,8 +128,6 @@ async def state(tmp_path):
     sm = StateManager(str(tmp_path / "test.db"))
     await sm.init_db()
     await sync_vocabulary(sm)
-    for sig in SIGNAL_CATALOG:
-        await sm.set_signal_status(sig["code"], "confirmed")
     yield sm
 
 
@@ -348,13 +346,19 @@ async def test_old_nomenclature_never_matches(state, files):
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_signals_are_not_recorded(state, files):
-    for code in ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"):
-        await state.set_signal_status(code, "proposed")
+async def test_an_old_installs_proposed_signals_dont_hold_the_read(state, files):
+    """An older release's "proposed" rows are read by nothing: the read
+    and its administrators go on as with any other install."""
+    import sqlite3
+
+    con = sqlite3.connect(state.db_path)
+    with con:
+        con.execute("UPDATE signal SET status = 'proposed' WHERE code IN "
+                    "('ACTIVITY_CODE', 'CONTACT_FOUND', 'DECISION_MAKER_TITLE')")
+    con.close()
     report = await run(state, files)
-    assert report.new_companies == 3
-    assert report.observations == 0
-    assert report.unconfirmed == ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"]
+    assert report.new_companies == 3 and report.administrators > 0
+    assert not hasattr(report, "unconfirmed")
 
 
 @pytest.mark.asyncio
@@ -590,8 +594,7 @@ async def test_every_authorised_class_of_a_kept_company_is_read(state, files):
 
 
 @pytest.mark.asyncio
-async def test_activities_are_read_without_the_signal_confirmed(state, files):
-    await state.set_signal_status("ACTIVITY_CODE", "proposed")
+async def test_activities_are_read_and_searchable(state, files):
     await run(state, files)
     b = await state.get_company_by_cui("90000025")
     assert await activities(state, b.id) == [("8623", 3)]
@@ -663,7 +666,6 @@ async def test_administrators_none_reads_no_representatives(state, files):
     files["people"].unlink()        # proves the file isn't opened
     report = await run(state, files, with_administrators=False)
     assert report.administrators == 0 and not report.errors
-    assert report.unconfirmed == []
     assert report.new_companies == 3
 
 

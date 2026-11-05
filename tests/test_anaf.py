@@ -406,13 +406,10 @@ async def test_a_check_keeps_each_answer_once_and_reads_it_in_place(state, monke
                                         location="Brașov, Romania", source="registry:onrc"))
     asked = []
     stub_anaf(monkeypatch, {A: answer(A), B: answer(B, phone="0722 000 210")}, asked)
-    for code in ("FISCALLY_INACTIVE", "VAT_REGISTERED", "PHONE_NUMBER", "ADDRESS"):
-        await state.set_signal_status(code, "confirmed")
 
     first = await runs.check_by_id(state, "anaf", "company_check")
     assert [sorted(b) for b in asked] == [[A, B]]             # one batch, one request
     assert first["companies"] == 2 and first["updated"] == 2
-    assert "LEGAL_FORM" in first["unconfirmed"]
     # ANAF's answers are read from its own file, never copied into harvey.db.
     assert sorted(await readings(state, "FISCALLY_INACTIVE")) == sorted(
         [(a, 0, None, "anaf"), (b, 0, None, "anaf")])
@@ -447,22 +444,40 @@ async def test_missing_only_asks_about_companies_never_answered(state, monkeypat
     service.keep(service.CACHE_PATH, {A: answer(A)}, set(), "2020-01-01T00:00:00+00:00")
     asked = []
     stub_anaf(monkeypatch, {B: answer(B)}, asked)
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     report = await runs.check_by_id(state, "anaf", "company_check", missing_only=True)
     assert asked == [[B]] and report["cached"] == 1
     assert report["companies"] == 2 and a
 
 
 @pytest.mark.asyncio
-async def test_nothing_is_asked_or_written_until_one_of_its_signals_is_confirmed(state,
-                                                                                monkeypatch):
+async def test_a_check_asks_with_nothing_confirmed(state, monkeypatch):
+    """No signal to confirm first: an install whose older release left the
+    ANAF signals "proposed" is asked about at once, and after a pull."""
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
+    with sqlite3.connect(state.db_path) as db:
+        db.execute("UPDATE signal SET status = 'proposed'")
     asked = []
     stub_anaf(monkeypatch, {A: answer(A)}, asked)
     report = await runs.check_by_id(state, "anaf", "company_check")
-    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0   # nor after a pull
+    assert asked == [[A]] and report["requests"] == 1 and not report["stopped"]
+    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 1   # after a pull too
+
+
+@pytest.mark.asyncio
+async def test_nothing_is_asked_when_none_of_its_signals_is_collected(state, monkeypatch):
+    """The lookup is made only for a signal it can record: none collected
+    (their modules off), no request, no phone, no run."""
+    a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
+    asked = []
+    stub_anaf(monkeypatch, {A: answer(A)}, asked)
+
+    async def nothing():
+        return set()
+    monkeypatch.setattr(state, "collected_signal_codes", nothing)
+    report = await runs.check_by_id(state, "anaf", "company_check")
+    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
     assert asked == [] and report["requests"] == 0 and report["phones_set"] == 0
-    assert report["stopped"] == runs.NOTHING_CONFIRMED and "VAT_REGISTERED" in report["unconfirmed"]
+    assert report["stopped"] == runs.NOTHING_WANTED
     assert not (await state.get_company(a)).phone
     with sqlite3.connect(state.db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
@@ -477,7 +492,6 @@ async def _companies(state, n):
 @pytest.mark.live_anaf_client
 async def test_a_busy_anaf_stops_the_run_instead_of_moving_on(state, real_ask):
     await _companies(state, 250)                          # three batches
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     anaf = Anaf(fail=[503] * 1000)
     async with anaf.client() as http:
         report = await runs.check_by_id(state, "anaf", "company_check", http=http)
@@ -489,7 +503,6 @@ async def test_a_busy_anaf_stops_the_run_instead_of_moving_on(state, real_ask):
 @pytest.mark.live_anaf_client
 async def test_two_refused_batches_in_a_row_stop_the_run(state, real_ask):
     await _companies(state, 350)                          # four batches
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     anaf = Anaf(fail=[400] * 1000)
     async with anaf.client() as http:
         report = await runs.check_by_id(state, "anaf", "company_check", http=http)
@@ -507,7 +520,6 @@ async def test_a_check_is_refused_while_the_module_is_off(state):
 async def test_firms_a_source_brings_in_are_queued_for_a_check(state):
     ids = [await state.add_company(Company(name=f"EXEMPLU {c} SRL", cui=c,
                                            source="registry:onrc")) for c in (A, B, C)]
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     assert await job_kinds.enqueue_follow_up_checks(state, ids) == 1
     with sqlite3.connect(state.db_path) as db:
         queued = db.execute("SELECT kind, module, capability FROM jobs").fetchall()
@@ -517,7 +529,6 @@ async def test_firms_a_source_brings_in_are_queued_for_a_check(state):
 @pytest.mark.asyncio
 async def test_no_follow_up_while_the_module_is_off(state):
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     await switches.set_enabled(state, "anaf", False)
     assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
 
@@ -576,7 +587,6 @@ async def test_the_next_request_goes_out_while_a_batch_is_saved_never_faster_tha
         state, monkeypatch):
     ids = await _companies(state, 550)                    # six batches
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     monkeypatch.setattr(lanes, "interval", lambda lane: 0.1)
     log = []
     _paced_anaf(monkeypatch, known, log)
@@ -607,7 +617,6 @@ async def test_a_stop_ends_it_after_the_batch_already_asked_for_and_loses_nothin
         state, monkeypatch):
     ids = await _companies(state, 550)
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     log = []
     _paced_anaf(monkeypatch, known, log)
     saved_batches = []
@@ -656,7 +665,6 @@ async def test_a_paused_check_job_goes_on_from_where_it_got(state, monkeypatch):
 
     ids = await _companies(state, 350)
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     asked = []
     stub_anaf(monkeypatch, known, asked)
     params = {"module": "anaf", "capability": "company_check", "company_ids": ids}
@@ -682,7 +690,6 @@ async def test_a_busy_anaf_hands_the_job_back_and_rests_the_lane(state, monkeypa
     queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", ids)
     first = await jobs.get(state, queued[0])
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     calls = []
 
     async def ask(client, cuis, **kw):
@@ -718,7 +725,6 @@ async def test_a_save_that_fails_part_way_never_ends_the_job_done(state, monkeyp
 
     ids = await _companies(state, 350)
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     stub_anaf(monkeypatch, known, [])
     real = ingest.checked
     fail_on = {2}
@@ -756,7 +762,6 @@ async def test_a_failed_batch_then_a_good_one_is_asked_again_not_skipped(state, 
 
     ids = await _companies(state, 350)
     known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    await state.set_signal_status("VAT_REGISTERED", "confirmed")
     calls = []
 
     async def ask(client, cuis, **kw):
@@ -835,8 +840,6 @@ def test_a_company_panel_shows_findings_official_first(client, monkeypatch, tmp_
         await sync_vocabulary(sm)
         slim.describe(sm, slim.firm("EXEMPLU A SRL", A, address="Str. Veche 2"))
         cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
-        for code in ("PHONE_NUMBER", "ADDRESS", "VAT_REGISTERED"):
-            await sm.set_signal_status(code, "confirmed")
         await sm.add_contacts(cid, [contacts.Found("phone", "+40722000210", source="phones",
                                                    capability="site_phones",
                                                    seen="2026-10-01 10:00:00")])
@@ -869,7 +872,6 @@ def test_a_finding_lists_its_official_sources_newest_first(client, monkeypatch, 
         await sm.init_db()
         await sync_vocabulary(sm)
         cid = await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
-        await sm.set_signal_status("PHONE_NUMBER", "confirmed")
         await sm.add_contacts(cid, [contacts.Found("phone", "+40268000210", source="phones",
                                                    capability="x", seen="2026-10-20 10:00:00")])
         # ANAF's latest answer and the taxpayer file give the same number.
@@ -890,7 +892,6 @@ def test_the_dashboard_checks_a_selection_at_anaf(client, monkeypatch, tmp_path)
         sm = StateManager(str(tmp_path / "harvey.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        await sm.set_signal_status("VAT_REGISTERED", "confirmed")
         return await sm.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
 
     cid = asyncio.run(setup())

@@ -32,8 +32,6 @@ async def state(tmp_path):
     sm = StateManager(str(tmp_path / "r.db"))
     await sm.init_db()
     await sync_vocabulary(sm)
-    for code in ("ACTIVITY_CODE", "PHONE_NUMBER", "FOUND_IN_SERP", "CONTACT_FOUND"):
-        await sm.set_signal_status(code, "confirmed")
     return sm
 
 

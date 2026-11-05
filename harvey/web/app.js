@@ -1,6 +1,5 @@
 let currentTab = 'overview';
 let _companies = [], _prospects = [], _campaigns = [];
-let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
 let _modules = { email: false };   // dashboard modules (visibility only)
 
@@ -101,7 +100,7 @@ function mailHref(e) {
 // ── One status vocabulary ──
 //
 // Harvey's tables each carry their own words for state: a prospect is `new`,
-// a campaign is `draft`, an email is `pending_review`, a signal is `proposed`.
+// a campaign is `draft`, an email is `pending_review`, a plan is `proposed`.
 // Everything resolves through this map (label key in i18n.js, then tone), so
 // a status reads the same way no matter which table it came out of.
 //
@@ -504,7 +503,6 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'overview': loadOverview(); break;
     case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
-    case 'signals': loadSignals(); break;
     case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': loadCompanies(); break;
@@ -624,9 +622,6 @@ function renderPublicData(data) {
       lines.push(escHtml(t('pd.fin_uptodate')));
     }
     const rep = fin.report;
-    if (rep && (rep.unconfirmed || []).length) {
-      lines.push(escHtml(t('pd.unconfirmed', {codes: rep.unconfirmed.join(', ')})));
-    }
     if (rep && (rep.errors || []).length) {
       lines.push('<span class="error">' + escHtml(t('pd.failed', {error: rep.errors[0]})) + '</span>');
     }
@@ -730,7 +725,6 @@ function taxpayersBody(tax) {
     lines.push(escHtml(t('pd.fin_uptodate')));
   }
   const rep = tax.report;
-  if (rep && (rep.unconfirmed || []).length) lines.push(escHtml(t('pd.unconfirmed', {codes: rep.unconfirmed.join(', ')})));
   if (rep && (rep.errors || []).length) lines.push('<span class="error">' + escHtml(t('pd.failed', {error: rep.errors[0]})) + '</span>');
   const busy = !!tax.running;
   return lines.map(l => '<p class="desc">' + l + '</p>').join('') +
@@ -755,7 +749,6 @@ function anafBody(anaf) {
     lines.push(escHtml(t('pd.anaf_running', {done: fmtN(job.done || 0), total: fmtN(job.total || 0)})));
   } else if (job && job.report) {
     lines.push(escHtml(anafSummary(job.report)));
-    if ((job.report.unconfirmed || []).length) lines.push(escHtml(t('pd.unconfirmed', {codes: job.report.unconfirmed.join(', ')})));
     if ((job.report.errors || []).length) lines.push('<span class="error">' + escHtml(t('pd.anaf_failed', {error: job.report.errors[0]})) + '</span>');
   }
   const busy = !!anaf.running;
@@ -770,7 +763,6 @@ function anafBody(anaf) {
 }
 
 function anafSummary(rep) {
-  if (rep.stopped === 'unconfirmed') return t('pd.anaf_unconfirmed');
   const done = t('pd.anaf_done', {companies: fmtN(rep.companies || 0), asked: fmtN(rep.checked || 0),
                                   cached: fmtN(rep.cached || 0), updated: fmtN(rep.updated || 0),
                                   missing: fmtN(rep.not_found || 0)});
@@ -984,7 +976,6 @@ async function loadOverview() {
     if (setupEl) setupEl.innerHTML = offlineLine();
     return;
   }
-  navCount('nav-signals', ov.signals_proposed || 0);
   const nav = document.getElementById('nav-companies');
   if (nav) { nav.textContent = ov.companies ? fmtN(ov.companies) : ''; nav.className = 'nav-count soft' + (ov.companies ? ' on' : ''); }
 
@@ -1067,14 +1058,12 @@ function runName(r) {
 }
 
 // Setup checks that matter for finding contacts (scope "finding"), plus
-// whether any signal is confirmed and any company is on file.
+// whether any company is on file.
 function renderOverviewSetup(setup, ov) {
   const el = document.getElementById('overview-setup');
   if (!el) return;
   const checks = ((setup && setup.checks) || []).filter(c => c.scope === 'finding');
   const rows = checks.map(c => ({done: c.done, label: checkLabel(c), help: checkHelp(c), optional: !c.required}));
-  rows.push({done: (ov.signals_confirmed || 0) > 0, label: t('ov.check.signals'),
-             help: t('ov.check.signals_help'), tab: 'signals'});
   rows.push({done: (ov.companies || 0) > 0, label: t('ov.check.companies'),
              help: t('ov.check.companies_help'), tab: 'discover'});
   const needed = rows.filter(r => !r.optional);
@@ -1130,7 +1119,6 @@ async function loadToday() {
 
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
-  navCount('nav-signals', (data.stats || {}).signals_proposed || 0);
   navCount('nav-conversations', (data.stats || {}).needs_human || 0);
   _todayStats = data.stats || {};
   renderFigures(_todayStats);
@@ -1182,8 +1170,6 @@ function todayItemText(it, stats) {
       const missing = ((_setup && _setup.checks) || []).filter(c => c.required && !c.done).slice(0, 3).map(checkLabel);
       return tr(t('today.item.setup'), missing.length ? missing.join(', ') : t('today.item.setup_detail'), t('today.item.setup_action'));
     }
-    case 'signals': return tr(t('today.item.signals', {n: s.signals_proposed || 0}), t('today.item.signals_detail'), t('today.item.signals_action'));
-    case 'signals-none': return tr(t('today.item.signals_none'), t('today.item.signals_none_detail'), t('today.item.signals_action'));
     case 'discover': return tr(t('today.item.discover'), t('today.item.discover_detail'), t('today.item.discover_action'));
     case 'profile': return tr(t('today.item.profile', {n: s.unprofiled || 0}), t('today.item.profile_detail'), t('today.item.profile_action'));
     case 'needs-human': return tr(t('today.item.needs_human', {n: s.needs_human || 0}), t('today.item.needs_human_detail'), t('today.item.needs_human_action'));
@@ -1305,7 +1291,7 @@ function renderFigures(stats) {
   if (facts) facts.innerHTML =
     '<span>' + tBold('kpi.fact_companies', stats.companies || 0) + '</span>' +
     '<span>' + tBold('kpi.fact_unread', stats.unprofiled || 0) + '</span>' +
-    '<span>' + tBold('kpi.fact_signals', stats.signals_confirmed || 0) + '</span>';
+    '<span>' + tBold('kpi.fact_signals', stats.signals_on || 0) + '</span>';
 
   el.innerHTML = '<div class="kpis">' +
     card(t('kpi.found'), fmtN(stats.prospects || 0), sparkBars(tr.found, t('kpi.found_spark')),
@@ -1518,124 +1504,12 @@ async function useOtherWarmup() {
   if (data && data.success) loadSetupStatus();
 }
 
-// ── Signals: Harvey proposes, you confirm ──
-
 // A server-written text in this dashboard's language: the translation is
 // used only while the server's English still matches the English it was
 // made from, so a changed description never shows a stale translation.
 function tServer(key, english) {
   if (getLang() === 'en' || !english) return english || '';
   return hasKey('en', key) && t(key, null, 'en') === english ? t(key) : english;
-}
-
-async function loadSignals() {
-  const data = await api('/api/signals');
-  const sumEl = document.getElementById('signals-summary');
-  const grpEl = document.getElementById('signals-groups');
-  markLoadFailed('signals', !data || data.error);
-  if (!data || data.error) { grpEl.innerHTML = offlineState(); sumEl.innerHTML = ''; return; }
-  _signals = data;
-
-  const s = data.summary || {};
-  navCount('nav-signals', s.proposed || 0);
-  const parts = [[t('sig.confirmed'), s.confirmed || 0, 'c-good'], [t('sig.waiting'), s.proposed || 0, 'c-wait'],
-                 [t('sig.off'), s.rejected || 0, 'c-idle']];
-  const all = parts.reduce((x, p) => x + p[1], 0) || 1;
-  sumEl.innerHTML = '<div class="card sig-summary"><div class="funnel-bar">' +
-    parts.filter(p => p[1]).map(p => '<span class="seg ' + p[2] + '" style="flex:' + p[1] + '"></span>').join('') +
-    '</div><div class="funnel-legend">' + parts.map(p =>
-      '<div class="legend-item"><span class="legend-key"><i class="' + p[2] + '"></i>' + escHtml(p[0]) + '</span>' +
-      '<span class="legend-val">' + fmtN(p[1]) + '<small>' + Math.round(100 * p[1] / all) + '%</small></span></div>'
-    ).join('') + '</div></div>';
-
-  grpEl.innerHTML = (data.groups || []).map(g => {
-    // Only the undecided ones: "Confirm all" must never re-enable a signal
-    // you turned off (or "Skip all" turn off one you confirmed).
-    const pending = escHtml(JSON.stringify(g.signals.filter(x => x.status === 'proposed').map(x => x.code)));
-    const undecided = g.signals.filter(x => x.status === 'proposed').length;
-    return '<div class="sig-group">' +
-      '<div class="sig-group-head"><div>' +
-        '<h3>' + escHtml(tServer('module.' + g.key + '.name', g.label)) + '</h3><p>' +
-        escHtml(tServer('module.' + g.key + '.about', g.blurb)) + '</p>' +
-      '</div>' +
-      (undecided
-        ? '<div class="btn-row">' +
-            '<button class="btn btn-primary btn-sm" onclick="setSignals(' + pending +
-              ', \'confirmed\')">' + escHtml(t('sig.confirm_all', {n: undecided})) + '</button>' +
-            '<button class="btn btn-secondary btn-sm" onclick="setSignals(' + pending +
-              ', \'rejected\')">' + escHtml(t('sig.skip_all', {n: undecided})) + '</button>' +
-          '</div>'
-        : '') +
-      '</div>' +
-      '<div class="card flush">' + g.signals.map(sigRow).join('') + '</div>' +
-    '</div>';
-  }).join('');
-
-  renderCohortBuilder();
-}
-
-function sigLabel(sig) {
-  return tServer('sigc.' + sig.code + '.label', sig.label || sig.code);
-}
-
-const WHEN_KNOWN = ['source', 'search', 'enrich', 'judged'];
-
-function sigRow(sig) {
-  const free = /free|included/i.test(sig.cost_note || '');
-  const costCls = free ? 'free' : (/\$/.test(sig.cost_note || '') ? 'paid' : '');
-  // Checked either way, and the rest: "not checked" is unknown, never "no".
-  const st = sig.states || {};
-  const seen = st.true || st.false
-    ? '<span class="cost-chip" title="' + escHtml(t('sig.states_hint')) + '">' +
-        escHtml(t('sig.states', {yes: st.true || 0, no: st.false || 0, unk: st.unknown || 0})) + '</span>'
-    : sig.companies
-      ? '<span class="cost-chip">' + escHtml(t('sig.seen', {n: sig.companies})) + '</span>' : '';
-  // When in a search the fact can be known: from the source itself, from a
-  // search, by reading the company, or by a model's judgement.
-  const when = WHEN_KNOWN.includes(sig.when_known)
-    ? '<span class="cost-chip" title="' + escHtml(t('sig.when_hint')) + '">' +
-        escHtml(t('sig.when.' + sig.when_known)) + '</span>' : '';
-  const floor = sig.confidence_floor > 0
-    ? '<span class="cost-chip">' + escHtml(t('sig.floor', {p: Math.round(sig.confidence_floor * 100)})) + '</span>' : '';
-
-  const decide = sig.status === 'confirmed'
-    ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-        '],\'rejected\')">' + escHtml(t('sig.turn_off')) + '</button>'
-    : sig.status === 'rejected'
-      ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'confirmed\')">' + escHtml(t('sig.turn_on')) + '</button>'
-      : '<button class="btn btn-primary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'confirmed\')">' + escHtml(t('sig.confirm')) + '</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
-          '],\'rejected\')">' + escHtml(t('sig.skip')) + '</button>';
-
-  return '<div class="sig-row ' + (sig.status === 'rejected' ? 'rejected' : '') + '">' +
-    '<div class="sig-main">' +
-      '<div class="sig-label">' + escHtml(sigLabel(sig)) +
-        '<span class="sig-code">' + escHtml(sig.code) + '</span></div>' +
-      '<div class="sig-desc">' + escHtml(tServer('sigc.' + sig.code + '.desc', sig.description)) + '</div>' +
-      '<div class="sig-meta">' +
-        '<span class="cost-chip ' + costCls + '">' + escHtml(tServer('sigc.' + sig.code + '.cost', sig.cost_note) || t('sig.cost_unknown')) + '</span>' +
-        when + floor + seen + badge(sig.status) +
-      '</div>' +
-    '</div>' +
-    '<div class="sig-decide">' + decide + '</div>' +
-  '</div>';
-}
-
-async function setSignals(codes, status) {
-  const data = await api('/api/signals/status', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({codes: codes, status: status}),
-  });
-  if (data && data.success) {
-    showToast(status === 'confirmed' ? t('sig.toast_confirmed', {n: data.changed})
-                                     : t('sig.toast_off', {n: data.changed}), 'success');
-  } else {
-    showToast(failMsg(data, t('sig.toast_failed')), 'error');
-  }
-  loadSignals();
 }
 
 // ── Discover: tick sources, price them, then run them as one batch ──
@@ -2052,204 +1926,6 @@ function renderDiscoverResult(report, running) {
         (report.errors || []).slice(0, 8).map(e =>
           '<div class="check-help">' + escHtml(e) + '</div>').join('') + '</div>'
       : '');
-}
-
-// ── Cohort builder: a prospect list is a query ──
-
-// verdict: the result tab shown, match / possible / no_match.
-let _cohort = { require: new Set(), exclude: new Set(), ranges: {}, verdict: 'match' };
-let _cohortOffset = 0;
-let _cohortGeneration = 0;
-const COHORT_PAGE = 50;
-
-function renderCohortBuilder() {
-  const el = document.getElementById('cohort-builder');
-  if (!el || !_signals) return;
-
-  const confirmed = (_signals.groups || [])
-    .flatMap(g => g.signals)
-    .filter(s => s.status === 'confirmed');
-
-  if (!confirmed.length) {
-    el.innerHTML = '<p class="muted small">' + escHtml(t('cohort.empty')) + '</p>';
-    document.getElementById('cohort-result').innerHTML = '';
-    return;
-  }
-
-  const col = (title, key, hint) =>
-    '<div><div class="subhead" style="margin-top:0">' + escHtml(title) +
-      ' <span class="hint">' + escHtml(hint) + '</span></div><div class="cohort-grid">' +
-    confirmed.map(s =>
-      '<label class="cohort-pick"><input type="checkbox" ' +
-        (_cohort[key].has(s.code) ? 'checked ' : '') +
-        'onchange="toggleCohort(\'' + key + '\',' + jsq(s.code) + ',this.checked)">' +
-        '<span>' + escHtml(sigLabel(s)) + '</span>' +
-        '<span class="n">' + fmtN(s.companies || 0) + '</span></label>'
-    ).join('') + '</div></div>';
-
-  // Numeric signals (ranks, ratings) take a range: "organic rank 11-30".
-  const numeric = confirmed.filter(s => s.value_type === 'num');
-  const bound = (code, side) => {
-    const v = (_cohort.ranges[code] || {})[side];
-    return '<input type="number" class="cohort-bound" placeholder="' + escHtml(t('cohort.' + side)) + '" ' +
-      'value="' + (v === undefined || v === null ? '' : escHtml(String(v))) + '" ' +
-      'aria-label="' + escHtml(code) + ' ' + side + '" ' +
-      'onchange="setCohortRange(' + jsq(code) + ',' + jsq(side) + ',this.value)">';
-  };
-  const rangeCol = numeric.length ?
-    '<div class="spacer"></div><div><div class="subhead" style="margin-top:0">' + escHtml(t('cohort.range')) +
-      ' <span class="hint">' + escHtml(t('cohort.range_hint')) + '</span></div>' +
-      '<div class="cohort-grid">' +
-      numeric.map(s =>
-        '<div class="cohort-pick cohort-range"><span>' + escHtml(sigLabel(s)) + '</span>' +
-          bound(s.code, 'min') + '<span class="muted">' + escHtml(t('cohort.to')) + '</span>' + bound(s.code, 'max') + '</div>'
-      ).join('') + '</div></div>' : '';
-
-  el.innerHTML = col(t('cohort.must'), 'require', t('cohort.must_hint')) +
-    '<div class="spacer"></div>' +
-    col(t('cohort.must_not'), 'exclude', t('cohort.must_not_hint')) + rangeCol;
-}
-
-function setCohortRange(code, side, value) {
-  const r = _cohort.ranges[code] || {min: null, max: null};
-  r[side] = value === '' || isNaN(Number(value)) ? null : Number(value);
-  if (r.min === null && r.max === null) delete _cohort.ranges[code];
-  else _cohort.ranges[code] = r;
-  _cohortOffset = 0;
-  runCohort();
-}
-
-function toggleCohort(key, code, on) {
-  if (on) _cohort[key].add(code); else _cohort[key].delete(code);
-  // A company can't be both required and excluded on the same signal.
-  const other = key === 'require' ? 'exclude' : 'require';
-  if (on) _cohort[other].delete(code);
-  _cohortOffset = 0;  // a new cohort starts on its first page
-  runCohort();
-  renderCohortBuilder();
-}
-
-async function runCohort() {
-  const generation = ++_cohortGeneration;
-  const offset = _cohortOffset;
-  const el = document.getElementById('cohort-result');
-  if (!el) return;
-  const require = [..._cohort.require], exclude = [..._cohort.exclude];
-  const ranges = _cohortRanges();
-  const verdict = _cohort.verdict || 'match';
-  if (!require.length && !exclude.length && !ranges.length) { el.innerHTML = ''; return; }
-  // Remove the prior export button as soon as its criteria become stale.
-  el.innerHTML = '<p class="muted">' + escHtml(t('cohort.loading')) + '</p>';
-
-  const data = await api('/api/cohort', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({require: require, exclude: exclude, ranges: ranges,
-                          verdict: verdict, offset: offset, limit: COHORT_PAGE}),
-  });
-  if (generation !== _cohortGeneration) return;
-  if (!data || data.error) {
-    el.innerHTML = data ? '<div class="test-result error">' +
-      escHtml(failMsg({off_module: data.off_module, error: data.error}, '')) + '</div>' : '';
-    return;
-  }
-
-  // Every company lands in one of three tabs; "possible" is not checked yet.
-  const counts = data.counts || {match: data.size};
-  const shown = data.total !== undefined ? data.total : data.size;
-  let html = '<div class="cohort-out">' +
-    '<div class="segmented" role="group" aria-label="' + escHtml(t('cohort.tabs_label')) + '">' +
-    ['match', 'possible', 'no_match'].map(v =>
-      '<button class="' + (v === verdict ? 'on' : '') + '" aria-pressed="' + (v === verdict) +
-        '" onclick="setCohortVerdict(\'' + v + '\')">' + escHtml(t('cohort.tab.' + v)) +
-        ' <span class="n">' + fmtN(counts[v] || 0) + '</span></button>').join('') + '</div>' +
-    '<div class="cohort-size" style="margin-top:14px">' + fmtN(shown) + '</div>' +
-    '<div class="muted small" style="margin-top:2px">' +
-      escHtml(verdict === 'match' ? t('cohort.match', {n: shown}) : t('cohort.count.' + verdict, {n: shown})) + '</div>' +
-    '<div class="muted small" style="margin-top:2px">' + escHtml(t('cohort.explain.' + verdict)) + '</div>';
-
-  if (data.companies && data.companies.length) {
-    html += '<div class="table-card" style="margin-top:16px"><table><thead><tr>' +
-      '<th>' + escHtml(t('cohort.company')) + '</th><th>' + escHtml(t('cohort.domain')) + '</th><th>' +
-      escHtml(t('cohort.industry')) + '</th><th>' + escHtml(t('cohort.location')) + '</th>' +
-      '</tr></thead><tbody>' +
-      data.companies.map(c =>
-        '<tr><td>' + escHtml(c.name) + '</td><td class="muted">' + escHtml(c.domain) + '</td>' +
-        '<td class="muted">' + escHtml(c.industry) + '</td>' +
-        '<td class="muted">' + escHtml(c.location) + '</td></tr>'
-      ).join('') + '</tbody></table></div>';
-
-    const first = data.offset + 1, last = data.offset + data.companies.length;
-    const hasPrev = data.offset > 0, hasNext = last < shown;
-    html += '<div class="pager-row">' +
-      '<span class="muted small">' + escHtml(t('page.range', {from: first, to: last, total: shown})) + '</span>' +
-      '<span style="flex:1"></span>' +
-      '<button class="btn btn-secondary btn-sm" onclick="pageCohort(-1)"' +
-        (hasPrev ? '' : ' disabled') + '>' + escHtml(t('page.prev')) + '</button>' +
-      '<button class="btn btn-secondary btn-sm" onclick="pageCohort(1)"' +
-        (hasNext ? '' : ' disabled') + '>' + escHtml(t('page.next')) + '</button>' +
-      '<button class="btn btn-secondary btn-sm" onclick="exportCohort(this)">' + escHtml(t('cohort.export')) + '</button>' +
-      '</div>';
-  } else if (shown === 0) {
-    html += '<p class="muted small" style="margin-top:12px">' +
-      escHtml(t(verdict === 'match' ? 'cohort.none' : 'cohort.none_tab')) + '</p>';
-  } else if (_cohortOffset > 0) {
-    // The cohort shrank under us (a re-profile, a delete): back to page one.
-    _cohortOffset = 0;
-    return runCohort();
-  }
-  el.innerHTML = html + '</div>';
-}
-
-function _cohortRanges() {
-  return Object.entries(_cohort.ranges || {})
-    .filter(([, r]) => r.min !== null || r.max !== null)
-    .map(([code, r]) => ({code: code, min: r.min, max: r.max}));
-}
-
-async function exportCohort(button) {
-  const qs = new URLSearchParams({require: [..._cohort.require].join(','),
-                                  exclude: [..._cohort.exclude].join(',')});
-  // The tab on screen; the CSV says each company's verdict either way.
-  if (_cohort.verdict && _cohort.verdict !== 'match') qs.set('verdict', _cohort.verdict);
-  // Ranges travel as "CODE:min:max", a blank side meaning no limit.
-  const ranges = Object.entries(_cohort.ranges || {})
-    .map(([code, r]) => code + ':' + (r.min ?? '') + ':' + (r.max ?? ''));
-  if (ranges.length) qs.set('ranges', ranges.join(','));
-  button.disabled = true;
-  button.textContent = t('export.exporting');
-  let url;
-  let link;
-  try {
-    const response = await authFetch('/api/cohort.csv?' + qs);
-    if (await lockIfRefused(response)) throw new Error('Dashboard authorization required');
-    if (!response.ok) throw new Error('Export failed (HTTP ' + response.status + ')');
-    url = URL.createObjectURL(await response.blob());
-    link = document.createElement('a');
-    link.href = url;
-    link.download = 'grup-' + new Date().toISOString().slice(0, 10) + '.csv';
-    document.body.appendChild(link);
-    link.click();
-    button.textContent = t('cohort.export');
-  } catch (error) {
-    button.textContent = t('export.retry');
-  } finally {
-    if (link) link.remove();
-    // Give the browser time to start consuming the download before revoking.
-    if (url) setTimeout(() => URL.revokeObjectURL(url), 1000);
-    button.disabled = false;
-  }
-}
-
-function pageCohort(dir) {
-  _cohortOffset = Math.max(0, _cohortOffset + dir * COHORT_PAGE);
-  runCohort();
-}
-
-function setCohortVerdict(verdict) {
-  _cohort.verdict = verdict;
-  _cohortOffset = 0;
-  runCohort();
 }
 
 // ── Settings ──
@@ -3480,14 +3156,14 @@ function sortCompanies(key) {
   loadCompanies();
 }
 
-// The confirmed signals, for the require/exclude filters (shared with the
-// Contacts page).
+// The signals collected (of modules that are on), for the require/exclude
+// filters (shared with the Contacts page).
 function loadSignalChoices(then) {
   _cv.signals = [];
   api('/api/signals').then(res => {
     _cv.signals = [];
     ((res && res.groups) || []).forEach(g => (g.signals || []).forEach(sig => {
-      if (sig.status === 'confirmed') _cv.signals.push({code: sig.code, label: sig.label || sig.code});
+      _cv.signals.push({code: sig.code, label: sig.label || sig.code});
     }));
     renderContactFilters();
     if (then) then();
@@ -4827,7 +4503,7 @@ async function loadContactList() {
     api('/api/signals').then(res => {
       _cv.signals = [];
       ((res && res.groups) || []).forEach(g => (g.signals || []).forEach(sig => {
-        if (sig.status === 'confirmed') _cv.signals.push({code: sig.code, label: sig.label || sig.code});
+        _cv.signals.push({code: sig.code, label: sig.label || sig.code});
       }));
       renderContactFilters();
     });

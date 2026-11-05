@@ -425,10 +425,7 @@ async def test_the_statements_are_read_in_place_never_copied(state):
     await _company(state, "CLUJ EXEMPLU SRL", "90000041")
     nothing = await runs.lookup_by_id(state)
     assert nothing["observations"] == 0
-    assert set(nothing["unconfirmed"]["mf_financials"]) == set(FIN_CODES)
 
-    for code in ("TURNOVER", "EMPLOYEES"):
-        await state.set_signal_status(code, "confirmed")
     # A lookup asks the statements nothing (they bring no contact) and
     # writes nothing: every figure is read from their file.
     first = await runs.lookup_by_id(state)
@@ -445,7 +442,6 @@ async def test_a_range_compares_the_latest_year_or_the_year_named(state):
     dormant = await _company(state, "DINTE TEST SRL", "90000025")
     old = await _company(state, "CLUJ EXEMPLU SRL", "90000041")
     unseen = await _company(state, "FARA CIFRE SRL", "90000163")
-    await state.set_signal_status("TURNOVER", "confirmed")
     await runs.lookup_by_id(state)
 
     def verdicts(ranges):
@@ -525,8 +521,6 @@ def test_bounds_without_loaded_statements_are_refused(reg, tmp_path):
 async def test_a_pull_with_bounds_saves_only_the_matches_with_their_figures(reg, reg_path, state,
                                                                            monkeypatch):
     monkeypatch.setattr(registry, "REGISTRY_PATH", reg_path)
-    await state.set_signal_status("TURNOVER", "confirmed")
-    await state.set_signal_status("FILED_ACCOUNTS", "confirmed")
     q = registry.resolve(reg, "dentist BV", fin=store.Filter(min_turnover=1_000_000),
                          fin_path=store.FINANCIALS_PATH)
     report = await runs.registry_pull(state, reg, q, with_administrators=False)
@@ -540,7 +534,6 @@ async def test_a_pull_with_bounds_saves_only_the_matches_with_their_figures(reg,
 @pytest.mark.asyncio
 async def test_a_sole_traders_missing_statement_is_never_a_no(reg, reg_path, state, monkeypatch):
     monkeypatch.setattr(registry, "REGISTRY_PATH", reg_path)
-    await state.set_signal_status("FILED_ACCOUNTS", "confirmed")
     await runs.registry_pull(state, reg, registry.resolve(reg, "dentist BV"),
                              with_administrators=False)
     sole = await state.get_company_by_cui("90000155")
@@ -603,7 +596,6 @@ async def test_nothing_is_downloaded_unless_auto_update_is_on(state, monkeypatch
 async def test_a_lookup_with_nothing_loaded_is_skipped_quietly(state, monkeypatch, tmp_path):
     monkeypatch.setattr(store, "FINANCIALS_PATH", tmp_path / "missing.db")
     await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
-    await state.set_signal_status("TURNOVER", "confirmed")
     got = await runs.lookup_by_id(state)
     # The statements are read in place: a lookup asks them nothing, loaded or not.
     assert got["errors"] == [] and got["observations"] == 0
@@ -647,17 +639,6 @@ def test_public_data_says_what_is_loaded_and_takes_settings(client):
     assert refused.status_code == 409 and refused.json()["off_module"] == "mf_financials"
 
 
-def test_a_cohort_range_can_name_a_year():
-    import harvey.dashboard as dash
-
-    assert dash._ranges("TURNOVER:1000000::2024") == [
-        {"code": "TURNOVER", "min": 1_000_000.0, "max": None, "key": "2024"}]
-    assert dash._ranges([{"code": "TURNOVER", "min": 1}]) == [
-        {"code": "TURNOVER", "min": 1.0, "max": None}]
-    with pytest.raises(ValueError, match="4 digits"):
-        dash._ranges([{"code": "TURNOVER", "min": 1, "key": "last"}])
-
-
 @pytest.mark.asyncio
 async def test_an_export_credits_the_sources_its_data_came_from(state, tmp_path):
     from harvey.export import latest_year_figures, source_notes
@@ -666,7 +647,6 @@ async def test_an_export_credits_the_sources_its_data_came_from(state, tmp_path)
     other = await _company(state, "CU CIFRE SRL", "90000990")
     # With no statement of its own, only the registry is credited.
     assert await source_notes(state, [other]) == ["ONRC open data, data.gov.ro (CC-BY 4.0)"]
-    await state.set_signal_status("TURNOVER", "confirmed")
     notes = await source_notes(state, [a])
     assert any("Ministerul Finanțelor" in n for n in notes)
     assert (await latest_year_figures(state, [a], ("TURNOVER",)))[a] == (

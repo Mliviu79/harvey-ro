@@ -468,7 +468,7 @@ def test_a_phone_fact_that_does_not_parse_is_left_out():
     facts = [api.Fact("PHONE_NUMBER", value_text="+13035550142"),
              api.Fact("PHONE_NUMBER", value_text="555-0100"),
              api.Fact("TECH_STACK", value_text="HubSpot")]
-    rows = ingest.rows(facts, company_id="c1", confirmed={"PHONE_NUMBER"})
+    rows = ingest.rows(facts, company_id="c1", wanted={"PHONE_NUMBER"})
     assert [r["value_text"] for r in rows] == ["+13035550142"]
 
 
@@ -480,8 +480,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "contract.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 
@@ -608,7 +606,7 @@ def test_a_fact_its_capability_does_not_declare_is_left_out(caplog):
              # A site read stamps what it reads for another module that declares it.
              api.Fact("TECH_STACK", value_text="HubSpot", module="web_marketing",
                       capability="marketing_profile")]
-    rows = ingest.rows(facts, company_id="c1", confirmed=None)
+    rows = ingest.rows(facts, company_id="c1", wanted=None)
     assert [(r["signal_code"], r["module"]) for r in rows] == [
         ("EMAIL_PATTERN", "hunter"), ("TECH_STACK", "web_marketing")]
     assert "hunter.domain_search returned REVIEW_RATING" in caplog.text

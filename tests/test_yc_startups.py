@@ -75,9 +75,8 @@ def test_the_signal_is_in_the_catalog_and_starts_proposed():
 @pytest.mark.asyncio
 async def test_the_profile_collector_records_it(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("YC_BACKED", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
+    c.wanted, c.site_names, c.known = {"YC_BACKED"}, {}, state
 
     pages = {"acme.example": "<h1>Acme</h1><p>Acme (YC W24) builds billing.</p>",
              "plain.example": "<h1>Plain</h1><p>Family-run since 1987.</p>"}
@@ -281,9 +280,8 @@ def test_real_ways_sites_mention_yc_without_being_backed(html):
 @pytest.mark.asyncio
 async def test_the_about_page_is_checked_when_the_homepage_is_silent(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("YC_BACKED", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
+    c.wanted, c.site_names, c.known = {"YC_BACKED"}, {}, state
     fetched = []
 
     async def resolve(self, domain):
@@ -329,12 +327,11 @@ def test_a_preset_hit_records_that_the_search_matched():
 @pytest.mark.asyncio
 async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("YC_BACKED", "confirmed")
     cid = await state.add_company(Company(name="Acme", domain="acme.example"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="discover",
                                 value_num=1, confidence=0.7, evidence_url="https://acme.example/blog/raise")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
+    c.wanted, c.site_names, c.known = {"YC_BACKED"}, {}, state
 
     async def resolve(self, domain):
         return f"https://{domain}", "<h1>Acme</h1><p>Billing.</p>"
@@ -412,12 +409,11 @@ def test_the_preset_excludes_ycs_own_sites():
 @pytest.mark.asyncio
 async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
     await sync_vocabulary(state)
-    await state.set_signal_status("YC_BACKED", "confirmed")
     cid = await state.add_company(Company(name="Vendor", domain="vendor.example"))
     await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="profile",
                                 value_num=1, observed_at="2026-01-01T00:00:00")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = await state.confirmed_signal_codes(), {}, state
+    c.wanted, c.site_names, c.known = {"YC_BACKED"}, {}, state
 
     async def resolve(self, domain):
         return f"https://{domain}", "<p>Trusted by 300 YC-backed startups.</p>"
@@ -435,7 +431,7 @@ async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
 @pytest.mark.asyncio
 async def test_ycs_own_domains_are_never_profiled(state):
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = {"YC_BACKED", "TECH_STACK"}, {}, state
+    c.wanted, c.site_names, c.known = {"YC_BACKED", "TECH_STACK"}, {}, state
     fetched = []
 
     async def resolve(self, domain):

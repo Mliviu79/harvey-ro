@@ -13,7 +13,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 # Web signals are the web-marketing module's (off as shipped).
@@ -26,8 +26,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 

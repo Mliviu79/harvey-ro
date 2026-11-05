@@ -155,9 +155,8 @@ def test_no_booking_wording(html):
 async def team_requests(state, domain):  # noqa: F811
     """The paths a read tries on a homepage whose menu links nowhere."""
     await sync_vocabulary(state)
-    await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
+    c.wanted, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
     requested = []
 
     async def fake_fetch(url):
@@ -187,9 +186,8 @@ async def test_romanian_fallback_paths_go_first(state):  # noqa: F811
 @pytest.mark.asyncio
 async def test_romanian_team_page_is_read_with_the_contact_page(state):  # noqa: F811
     await sync_vocabulary(state)
-    await state.set_signal_status("CONTACT_FOUND", "confirmed")
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
+    c.wanted, c.site_names, c.known = {"CONTACT_FOUND"}, {}, state
     pad = "<p>" + "Bine ați venit. " * 40 + "</p>"
     pages = {"": "<html>home</html>",
              "/contact": f"<html>{pad}<p>Telefon 0712 000 000</p></html>",

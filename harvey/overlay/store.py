@@ -145,7 +145,7 @@ def connect(path, *, data_dir=None) -> tuple[sqlite3.Connection, list]:
 
 
 # Store methods that only read: run without taking the write lock.
-READS = frozenset({"match_company", "companies_with_id", "held", "signal_codes",
+READS = frozenset({"match_company", "companies_with_id", "held",
                    "keeper_order", "observed", "module_readings", "module_readings_of",
                    "dictionaries_stale", "match_records", "scan_candidates", "unknown_pairs"})
 
@@ -339,8 +339,9 @@ class Store:
 
     def write_vocabulary(self, rows_for, settings_prefix: str) -> int:
         """StateManager.write_vocabulary on the overlay: every declared
-        signal upserted, its confirmation (``status``) kept unless a row
-        names one, then who provides each (signal_source)."""
+        signal upserted, then who provides each (signal_source). The
+        ``status`` column (a confirmation older releases asked for, read by
+        nothing now) is kept as it is unless a row names one."""
         settings = dict(self.x("SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
                                (len(settings_prefix), settings_prefix)).fetchall())
         rows = rows_for(settings)
@@ -368,14 +369,6 @@ class Store:
             "available = excluded.available",
             [(k["kind"], k.get("label", k["kind"]), k.get("channel", ""), k.get("module", ""),
               1 if k.get("available", True) else 0) for k in rows_for(settings)])
-
-    def signal_codes(self, status: str | None = None) -> list[str]:
-        if status:
-            return [r[0] for r in self.x("SELECT code FROM signal WHERE status = ?", (status,))]
-        return [r[0] for r in self.x("SELECT code FROM signal")]
-
-    def set_signal_status(self, code: str, status: str) -> bool:
-        return self.x("UPDATE signal SET status = ? WHERE code = ?", (status, code)).rowcount > 0
 
     # ── Matching and saving a firm ──
 
@@ -1390,7 +1383,7 @@ class Store:
                                                     declared_domain=r.declared_domain)
                                  for r in records]
 
-    def pull(self, records, *, facts_of=None, confirmed=frozenset(), run_id: str = "",
+    def pull(self, records, *, facts_of=None, wanted=frozenset(), run_id: str = "",
              dry_run: bool = False, matches=None, matched_at: int | None = None
              ) -> list[tuple[str, bool, bool, bool]]:
         """Mark the firms a register pull read as Harvey's, in bulk (the
@@ -1442,7 +1435,7 @@ class Store:
                 if found:
                     self.add_observations(ingest.rows(
                         [replace(f, record="") for f in found], company_id=saved[0],
-                        origin=saved[0], run_id=run_id, confirmed=set(confirmed)), run_id)
+                        origin=saved[0], run_id=run_id, wanted=set(wanted)), run_id)
             self._register_phones(regions)
             self._reorder(*regions)
         return out

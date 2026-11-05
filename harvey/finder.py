@@ -391,7 +391,7 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
         return out
     env = env if env is not None else _env()
     enabled = await switches.enabled_ids(state)
-    confirmed = set(await state.confirmed_signal_codes())
+    wanted = await state.collected_signal_codes()
     domain, floor = site_of(company)
     site_done = bool(domain) and await company_searched(state, company_id, *SITE, since,
                                                         looked_for=SITE_WANTS)
@@ -408,14 +408,14 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
         # A website a search found and the evidence took, read again
         # (Search again, a refresh): the same evidence and the same
         # contact choice as when it was found, never everything on it.
-        async with _reader(state, confirmed, config) as read:
+        async with _reader(state, wanted, config) as read:
             await _reread_found(state, company, domain, read, out, run_id=run_id,
                                 config=config)
         out.website = domain
     elif domain and not site_done:
         on_file = await _on_file(state, company_id)
         verdict = judge(company, on_file, 1, floor=floor) if floor else None
-        async with _reader(state, confirmed, config) as read:
+        async with _reader(state, wanted, config) as read:
             done = await read(company, domain=domain, judge=verdict, run_id=run_id)
         out.steps.append("site")
         if done is not None:
@@ -429,7 +429,7 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
         # (Forced, a company with a phone already is looked up too.)
         found = await _look_up(state, company, out, spend=spend, since=since,
                                batch_id=batch_id, enabled=enabled, env=env,
-                               confirmed=confirmed, config=config, run_id=run_id,
+                               wanted=wanted, config=config, run_id=run_id,
                                background=background)
         if found:
             domain = found
@@ -497,11 +497,11 @@ async def _reread_found(state, company: dict, domain: str, read, out: Found, *,
     out.why = "no_contacts"
 
 
-def _reader(state, confirmed, config):
+def _reader(state, wanted, config):
     from harvey.collectors.ats import role_keywords
     from harvey.modules.runs import site_reader
 
-    return site_reader(state, confirmed, config=config, contacts=True,
+    return site_reader(state, wanted, config=config, contacts=True,
                        role_keywords=role_keywords(getattr(config, "icp", None)))
 
 
@@ -547,7 +547,7 @@ async def free_for_background_now(module: str, on: bool, share: float) -> int | 
 
 
 async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, batch_id,
-                   enabled, env, confirmed, config, run_id, background: bool = False) -> str:
+                   enabled, env, wanted, config, run_id, background: bool = False) -> str:
     """Step 2: the company's name and town through each search that can
     find it, cheapest first, until one gives a website. In the background,
     a search with some of its free allowance left for the background comes
@@ -629,7 +629,7 @@ async def _look_up(state, company: dict, out: Found, *, spend: Spend, since, bat
                     await asyncio.to_thread(lanes.hold, s.module, draft.values.get("retry_after"))
                     out.skipped.append(f"{s.module}: {draft.stop}")
                 continue
-            chosen = await choose(state, company, draft.records, confirmed=confirmed,
+            chosen = await choose(state, company, draft.records, wanted=wanted,
                                   config=config, run_id=run_id, source=s.module)
             await state.record_search(
                 "company", company_id, s.module, s.capability, looked_for="website",
@@ -838,7 +838,7 @@ def _results(n: int, reasons: dict) -> str:
     return f"{n} result{'' if n == 1 else 's'}" + (f": {counts}" if counts else "")
 
 
-async def choose(state, company: dict, records, *, confirmed=frozenset(), config=None,
+async def choose(state, company: dict, records, *, wanted=frozenset(), config=None,
                  run_id: str = "", source: str = "") -> Chosen:
     """The company's own site among a search's ``records`` (in memory
     only), chosen and written (site_match.screen, classify's ``results``,
@@ -879,7 +879,7 @@ async def choose(state, company: dict, records, *, confirmed=frozenset(), config
             if not picked:
                 out.detail = f"{head}; none could be the firm's site"
                 return out
-    async with _reader(state, confirmed, config) as read:
+    async with _reader(state, wanted, config) as read:
         drafts, cards = [], []
         for r in picked:
             domain = r.domain.lower()
@@ -1380,7 +1380,7 @@ async def select(state, f: contacts.ContactFilter | None = None, *, ids=None,
                  attach_figures: bool = False) -> list[dict]:
     """The companies a Find-contacts run takes: those matching the filter's
     company conditions (a value not known yet is searched, like a
-    "possible" in the cohort builder) and with no contact (every match with
+    "possible" in state.cohort_verdicts) and with no contact (every match with
     ``force``), with whether each has a website, up to ``limit``. Given
     ``ids``, only those, in pieces of IDS_PER_QUERY."""
     f = f or contacts.ContactFilter()

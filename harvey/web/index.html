@@ -112,7 +112,6 @@
       <button data-tab="registry" onclick="showTab('registry', this)"><svg class="icon" aria-hidden="true"><use href="#i-registry"/></svg><span class="label" data-i18n="nav.registry">Registru</span></button>
       <button data-tab="prospects" onclick="showTab('prospects', this)"><svg class="icon" aria-hidden="true"><use href="#i-contacts"/></svg><span class="label" data-i18n="nav.contacts">Contacte</span></button>
       <button data-tab="discover" onclick="showTab('discover', this)"><svg class="icon" aria-hidden="true"><use href="#i-discover"/></svg><span class="label" data-i18n="nav.discover">Descoperă</span></button>
-      <button data-tab="signals" onclick="showTab('signals', this)"><svg class="icon" aria-hidden="true"><use href="#i-signals"/></svg><span class="label" data-i18n="nav.signals">Semnale</span><span class="nav-count" id="nav-signals"></span></button>
       <button data-tab="modules" onclick="showTab('modules', this)"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span class="label" data-i18n="nav.modules">Surse</span></button>
       <button data-tab="chat" onclick="showTab('chat', this)"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span class="label" data-i18n="nav.chat">Chat</span><span class="nav-count" id="nav-chat"></span></button>
     </div>
@@ -231,7 +230,7 @@
   </div>
 </div>
 
-<!-- Signals: the confirmation gate -->
+<!-- Sources: the modules Harvey is made of -->
 <div id="modules" class="section">
   <div class="section-head">
     <div>
@@ -241,24 +240,6 @@
   </div>
   <div id="public-data"></div>
   <div id="modules-list"></div>
-</div>
-
-<div id="signals" class="section">
-  <div class="section-head">
-    <div>
-      <h2 data-i18n="sig.title">Semnale</h2>
-      <p data-i18n="sig.lede">Harvey propune ce știe să caute. Tu hotărăști ce contează: nu se colectează nimic până nu confirmi.</p>
-    </div>
-  </div>
-  <div id="signals-summary"></div>
-  <div id="signals-groups"></div>
-
-  <div class="subhead needs-data" data-i18n="cohort.title">Constructor de grupuri</div>
-  <div class="card needs-data">
-    <p class="lede" data-i18n="cohort.lede">O listă de firme e o interogare, nu un fișier. Alege semnalele pe care trebuie să le aibă o firmă, și pe cele care o exclud, și vezi câte se potrivesc acum.</p>
-    <div id="cohort-builder"></div>
-    <div id="cohort-result"></div>
-  </div>
 </div>
 
 <!-- Discover: the only stage that spends money -->

@@ -18,7 +18,7 @@ import pytest_asyncio
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
 from harvey.modules import runs as R
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 from tests import slim
 
@@ -29,8 +29,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 
@@ -217,15 +215,20 @@ async def test_kill_switch_stops_between_batches(state, config, register):
 
 
 @pytest.mark.asyncio
-async def test_nothing_runs_until_signals_are_confirmed(state, config, register):
-    for sig in SIGNAL_CATALOG:
-        await state.set_signal_status(sig["code"], "proposed")
+async def test_a_run_records_with_nothing_confirmed(state, config, register):
+    """No signal to confirm first: an install whose older release left every
+    signal "proposed" searches and records like any other."""
+    import sqlite3
+
+    con = sqlite3.connect(state.db_path)
+    with con:
+        con.execute("UPDATE signal SET status = 'proposed'")
+    con.close()
     fake = register(FakeProvider([[biz(domain="a.com")]]))
     report = await R.run_discovery(state, config, "fake",
                                    [D.DiscoveryQuery(term="roofer")])
-    assert report.stopped == "no confirmed signals"
-    assert fake.calls == 0
-    assert "confirm signals" in report.errors[0].lower()
+    assert fake.calls == 1 and not report.errors
+    assert report.new_companies == 1 and report.observations > 0
 
 
 # ── Entity resolution ──
@@ -309,16 +312,20 @@ async def test_every_fact_becomes_an_observation(state, config, register):
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_signals_are_not_recorded(state, config, register):
-    """The confirmation gate has to hold inside the collector, not just in
-    the UI that sets it."""
-    await state.set_signal_status("REVIEW_RATING", "rejected")
+async def test_an_old_rejected_signal_is_recorded(state, config, register):
+    """A "rejected" row an older release left is read by nothing: what the
+    search returned for it is recorded with the rest."""
+    import sqlite3
+
+    con = sqlite3.connect(state.db_path)
+    with con:
+        con.execute("UPDATE signal SET status = 'rejected' WHERE code = 'REVIEW_RATING'")
+    con.close()
     register(FakeProvider([[biz(domain="vellmora.example", rating=4.6, review_count=88)]]))
     await R.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
 
     codes = {o["signal_code"] for o in await _observations(state)}
-    assert "REVIEW_RATING" not in codes
-    assert "REVIEW_COUNT" in codes
+    assert {"REVIEW_RATING", "REVIEW_COUNT"} <= codes
 
 
 @pytest.mark.asyncio
@@ -1193,8 +1200,6 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     state = StateManager(str(tmp_path / 'test.db'))
     await state.init_db()
     await sync_vocabulary(state)
-    for signal in SIGNAL_CATALOG:
-        await state.set_signal_status(signal['code'], 'confirmed')
     report = await R.run_discovery(state, load_config(), provider_key=provider,
         queries=[D.DiscoveryQuery(term='roofer', location='Denver')])
     assert report.errors == []

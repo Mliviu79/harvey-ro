@@ -120,18 +120,18 @@ def test_settings_form_is_hidden_while_its_data_failed():
     assert re.search(r"\.section\.load-failed \.needs-data\s*\{\s*display:\s*none", css)
 
 
-def test_discover_and_signals_hide_their_forms_when_the_page_failed():
+def test_discover_hides_its_form_when_the_page_failed():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     disc = html[html.index('<div id="discover" class="section">'):html.index("<!-- Companies -->")]
-    sig = html[html.index('<div id="signals" class="section">'):html.index("<!-- Discover")]
     assert 'estimateDiscovery()' in disc
-    # The estimate/run form and the cohort builder are marked needs-data.
+    # The estimate/run form is marked needs-data.
     form = disc[disc.index('data-i18n="disc.run"') - 60:]
     assert form.count("needs-data") >= 2 and form.index("needs-data") < form.index("estimateDiscovery()")
-    assert sig.count("needs-data") == 2 and sig.index("needs-data") < sig.index('id="cohort-builder"')
     app = (WEB / "app.js").read_text(encoding="utf-8")
-    assert "markLoadFailed('signals'" in _fn(app, "loadSignals")
     assert "markLoadFailed('discover'" in _fn(app, "loadDiscoverProviders")
+    # The Signals tab is gone (nothing to confirm): no page, no nav button.
+    assert 'id="signals"' not in html and 'data-tab="signals"' not in html
+    assert "function loadSignals(" not in app
 
 
 @pytest.mark.parametrize("fail, header, meta", [
@@ -224,7 +224,7 @@ def test_counts_use_the_text_face_not_mono():
     """In Geist Mono the ro-RO thousands dot takes a full cell: "2. 421"."""
     css = (WEB / "app.css").read_text(encoding="utf-8")
     assert re.search(r"--num:\s*var\(--sans\)", css)
-    for sel in (".stat-value", ".kpi-value", ".legend-val", ".cohort-size", ".pager-range"):
+    for sel in (".stat-value", ".kpi-value", ".legend-val", ".pager-range"):
         rule = re.search(re.escape(sel) + r"\s*\{([^}]*)\}", css).group(1)
         assert "var(--mono)" not in rule, sel
     assert re.search(r"body\s*\{[^}]*font-variant-numeric:\s*tabular-nums", css)

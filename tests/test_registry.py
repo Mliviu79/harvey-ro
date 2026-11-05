@@ -15,7 +15,7 @@ from harvey import registry
 from harvey.collectors import onrc
 from harvey.models import Company
 from harvey.modules import runs
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 from tests import slim
 from tests.test_onrc import BIRTH, CAEN, CNP, DATASET, FIRMS, PEOPLE, STATUS, firm, write
@@ -68,8 +68,6 @@ async def state(tmp_path):
     sm = StateManager(str(tmp_path / "test.db"))
     await sm.init_db()
     await sync_vocabulary(sm)
-    for sig in SIGNAL_CATALOG:
-        await sm.set_signal_status(sig["code"], "confirmed")
     yield sm
 
 
@@ -293,11 +291,8 @@ async def test_pull_limit_dry_run_and_gate(state, con):
     assert dry.new_companies == 4
     with sqlite3.connect(state.db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM firm").fetchone()[0] == 0
-    for code in ("ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"):
-        await state.set_signal_status(code, "proposed")
     report = await runs.registry_pull(state, con, q, limit=2, with_administrators=False)
     assert report.new_companies == 2 and report.observations == 0
-    assert report.unconfirmed == ["ACTIVITY_CODE"]
 
 
 @pytest.mark.asyncio

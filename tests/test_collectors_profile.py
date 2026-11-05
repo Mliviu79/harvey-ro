@@ -6,7 +6,7 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from harvey.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
+from harvey.collectors.profile import READ_BY, ProfileCollector, title_looks_like_role, _strip_code
 from harvey.modules import runs
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
@@ -25,9 +25,9 @@ async def state():
         yield sm
 
 
-def collector(confirmed=None):
+def collector(wanted=None):
     c = ProfileCollector.__new__(ProfileCollector)
-    c.confirmed = confirmed or set()
+    c.wanted = wanted or set()
     c.site_names = {}
     return c
 
@@ -155,51 +155,69 @@ def test_clean_page_has_no_false_tech():
     assert collector().detect_tech("<html><body><h1>Acme</h1></body></html>") == []
 
 
-# ── confirmation gate ──
+# ── what is collected: every signal of a module that is on ──
+
+_AGENCY_PAGE = ('<html><link href="/wp-content/x.css"><footer>Powered by '
+                '<a href="https://ag.example">Agency</a></footer></html>')
+
 
 @pytest.mark.asyncio
-async def test_only_confirmed_signals_are_collected(state, monkeypatch):
+async def test_a_declared_signal_is_collected_with_no_confirmation(state):
+    """Nothing to confirm: the signals of modules that are on are what a
+    read collects, straight after the vocabulary is synced."""
     await sync_vocabulary(state)
-    await state.set_signal_status("TECH_STACK", "confirmed")
-    confirmed = await state.confirmed_signal_codes()
-    c = collector(confirmed)
+    wanted = await state.collected_signal_codes()
+    c = collector(wanted)
+    assert c.wants("TECH_STACK") and c.wants("INCUMBENT_AGENCY")
+    # Every fact a site read can give, its modules all on here: each one read.
+    assert all(c.wants(code) for code in READ_BY)
 
-    assert c.wants("TECH_STACK")
-    assert not c.wants("INCUMBENT_AGENCY")   # proposed, never confirmed
+
+@pytest.mark.asyncio
+async def test_a_read_collects_only_what_it_is_given(state):
+    await sync_vocabulary(state)
+    c = collector({"TECH_STACK"})
+    assert not c.wants("INCUMBENT_AGENCY")
 
     async def fake_get(url):
-        return '<html><link href="/wp-content/x.css"><footer>Powered by <a href="https://ag.example">Agency</a></footer></html>'
+        return _AGENCY_PAGE
     c._get = fake_get
     c.known = state
 
     cid = await state.add_company(Company(name="Acme", domain="acme.example"))
-    obs = await c.profile_company(cid, "acme.example")
-    codes = {o["signal_code"] for o in obs}
-    assert codes == {"TECH_STACK"}, "unconfirmed signals must not be collected"
+    codes = {o["signal_code"] for o in await c.profile_company(cid, "acme.example")}
+    assert codes == {"TECH_STACK"}
 
 
 @pytest.mark.asyncio
-async def test_seeded_catalog_starts_unconfirmed(state):
+async def test_the_seeded_catalog_is_collected_and_explains_itself(state):
     from harvey.modules import switches
 
     n = await sync_vocabulary(state)
     assert n == len({sig["code"] for m in switches.shipped() for sig in m.signals})
     assert n >= len(SIGNAL_CATALOG)
-    assert await state.confirmed_signal_codes() == set()
-    proposed = await state.get_signal_codes(status="proposed")
-    assert len(proposed) == n
-    # every proposed signal explains itself to the user
-    for sig in proposed:
+    every = await state.get_signal_codes()
+    assert await state.collected_signal_codes() == {s["code"] for s in every if s["available"]}
+    for sig in every:
         assert sig["description"] and sig["cost_note"]
+        assert "status" not in sig
 
 
 @pytest.mark.asyncio
-async def test_user_decision_survives_reseeding(state):
+async def test_an_old_installs_signal_decisions_are_ignored(state):
+    """A database an older release wrote keeps its status column (proposed,
+    rejected): it still opens and reads, and nothing reads the column."""
+    import sqlite3
+
     await sync_vocabulary(state)
-    await state.set_signal_status("SERP_RANK", "rejected")
+    con = sqlite3.connect(state.db_path)
+    with con:
+        con.execute("UPDATE signal SET status = 'rejected' WHERE code = 'SERP_RANK'")
+        con.execute("UPDATE signal SET status = 'proposed' WHERE code = 'TECH_STACK'")
+    con.close()
     await sync_vocabulary(state)          # e.g. after an upgrade
-    codes = {c["code"]: c["status"] for c in await state.get_signal_codes()}
-    assert codes["SERP_RANK"] == "rejected", "re-seeding must not undo a user's choice"
+    assert {"SERP_RANK", "TECH_STACK"} <= await state.collected_signal_codes()
+    assert "SERP_RANK" in {c["code"] for c in await state.get_signal_codes(available_only=True)}
 
 
 @pytest.mark.asyncio

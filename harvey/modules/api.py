@@ -100,7 +100,7 @@ class Context:
     settings: dict[str, Any] = field(default_factory=dict)
     env: dict[str, Any] = field(default_factory=dict)
     config: Any = None                  # HarveyConfig, for what an ICP says
-    # Signal codes worth collecting (confirmed, from a module that is on);
+    # Signal codes worth collecting (declared by a module that is on);
     # None means every code. A capability skips work only these need.
     wanted: frozenset[str] | None = None
     # Modules that are on; None means all (a one-off call).

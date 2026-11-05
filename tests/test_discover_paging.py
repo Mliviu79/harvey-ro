@@ -22,7 +22,7 @@ import pytest_asyncio
 from harvey.collectors import discover as D
 from harvey.config import EnvConfig, load_config
 from harvey.modules import runs as R
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 DENVER = {"location": "Denver, CO", "coordinate": "39.7392,-104.9903,40"}
@@ -35,8 +35,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 

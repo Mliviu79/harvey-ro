@@ -29,7 +29,7 @@ from harvey.modules import job_kinds, jobs
 from harvey.modules import runs as R
 from harvey.modules.worker import (Worker, acquire_lease, lease_holder,
                                    release_lease, wait_for_batch)
-from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
+from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
 
@@ -43,8 +43,6 @@ async def state():
         sm = StateManager(os.path.join(tmp, "test.db"))
         await sm.init_db()
         await sync_vocabulary(sm)
-        for sig in SIGNAL_CATALOG:
-            await sm.set_signal_status(sig["code"], "confirmed")
         yield sm
 
 
