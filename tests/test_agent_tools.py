@@ -59,8 +59,8 @@ READABLE = {
     "firm_source": "firm source batch ref first_seen last_seen",
     "ident_scheme": "id name module numeric legal",
     "job_batches": "id kind label params_json max_spend created_at report_json",
-    "jobs": "id kind lane module capability label params_json dedupe_key status result_json "
-            "est_cost reserved actual_cost attempts not_before error paused_reason "
+    "jobs": "id kind lane module capability label params_json dedupe_key status "
+            "est_cost reserved actual_cost attempts not_before paused_reason "
             "stop_requested batch_id parent_id worker created_at started_at finished_at "
             "updated_at",
     "legacy_id": "uuid firm",
@@ -87,7 +87,7 @@ READABLE = {
     "register_tally": "signal module mark loaded n_true n_false at n_values",
     "revision": "name n",
     "role": "name id",
-    "runs": "id stage status provider records cost_usd params_json error started_at ended_at",
+    "runs": "id stage status provider records cost_usd params_json started_at ended_at",
     "search": "id target is_person origin module capability looked_for at outcome found cost "
               "batch",
     "sending_account": "id label provider address:personal profile_id enabled created_at",
@@ -447,18 +447,30 @@ def test_a_call_is_filed_under_the_message_it_started_for_and_none_without_one(d
     assert _records(db, "second") == [] and _records(db, "") == []
 
 
-def test_the_server_offers_only_its_read_only_tools(db):
+READ_TOOLS = ["schema", "counts", "query", "pipeline", "firms", "coverage", "contacts_summary",
+              "campaigns", "spend", "estimate", "jobs", "plan_status", "sets"]
+ACTION_TOOLS = ["propose_plan", "close_plan", "save_set", "discover", "registry_pull",
+                "find_contacts", "verify_contacts", "cancel_run"]
+
+
+def test_the_server_offers_its_reading_tools_and_its_actions_only(db):
+    """Every tool is a read, or one of the actions under a plan: none
+    approves, sends, touches a campaign, the do-not-contact list, a merge
+    or a setting, or fetches a page."""
     from mcp import Client
 
     async def run():
         async with Client(tools.build(str(db), "t")) as c:
             return (await c.list_tools()).tools
     listed = asyncio.run(run())
-    assert sorted(t.name for t in listed) == sorted(
-        ["schema", "counts", "query", "pipeline", "firms", "coverage", "contacts_summary",
-         "campaigns", "spend", "estimate", "jobs"])
-    assert all(t.annotations.read_only_hint and not t.annotations.destructive_hint
-               for t in listed)
+    assert sorted(t.name for t in listed) == sorted(READ_TOOLS + ACTION_TOOLS)
+    by = {t.name: t for t in listed}
+    assert all(by[n].annotations.read_only_hint and not by[n].annotations.destructive_hint
+               for n in READ_TOOLS)
+    assert not any(by[n].annotations.read_only_hint for n in ACTION_TOOLS)
+    for word in ("approve", "send", "outbox", "campaign", "autopilot", "suppress", "merge",
+                 "setting", "fetch", "acknowledg"):
+        assert not any(word in n for n in ACTION_TOOLS), word
 
 
 def test_every_tool_answers_and_none_returns_the_planted_text(db):

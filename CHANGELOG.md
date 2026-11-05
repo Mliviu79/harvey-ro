@@ -9,6 +9,38 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The agent works for you, under a plan you approve.** Asked to do
+  something, Harvey's agent looks at the schema and the counts, estimates
+  each step and proposes a plan: its goal, its steps, a budget sized from
+  the estimates' high figures (0 for free work) and how long it stays open
+  (72 hours by default, a week at most). It shows as a card under the
+  answer with Approve (a dialog naming the budget) and Reject, and in
+  `harvey agent plans` (`show`, `approve` with the budget typed back,
+  `reject`, `cancel`, `close`); only you decide it, no tool of the agent's
+  can. Under an approved plan of its own chat the agent can queue a Discover
+  run, a registry pull, Find contacts or Verify contacts, each through the
+  same code as the page's button (`harvey/launch.py`, now shared by the
+  dashboard's endpoints and the agent): the same selection, estimate, run
+  caps, module switches and day and month limits, the run's caps reserved
+  from the plan's budget in one transaction so two actions can't both take
+  the last of it. A plan's committed money is its finished runs' actual cost
+  and its live runs' caps; the card shows it with what was spent, each run
+  (to the Queue) and Cancel, which cancels its live runs (a run being queued
+  as you cancel too); deleting the chat closes its open plans. The agent works on
+  filters and on sets it saves (a filter, or one SELECT of firm ids, contact
+  ids or registration numbers run under query()'s rules), resolved on
+  Harvey's side: it gets a set's id and count, never its rows. Every action,
+  refused ones too, is recorded (`agent_action`). Sending, approving email,
+  campaigns, autopilot, the acknowledgement, the do-not-contact list,
+  merges and settings are never tools. Schema 33 adds `agent_plan`,
+  `agent_set` and `agent_action`.
+- **No error text reaches the agent.** A job's or a run's error and a
+  job's result (which quote what providers and pages answered) are left out
+  of its queries; it sees each job's error class (spend limit, paused, lane
+  paused, retrying, error) instead. Short text from websites and listings
+  (names, addresses, roles, page addresses) stays readable and the schema
+  marks it as data, never instructions.
+
 - **Chats with Harvey's agent, read only.** A Chat tab (and `harvey agent
   chats`, `chat`, `ask`, `rename`, `delete`, `log`) keeps your conversations
   with a model about Harvey's data, the way claude.ai does: a list of chats

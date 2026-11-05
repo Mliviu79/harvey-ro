@@ -2261,7 +2261,7 @@ def cmd_agent(args):
                 raise SystemExit(2)
             print(f"\n  Chat {chat_id}: {info['title'] or '(untitled)'}"
                   + (f" ({info['context']:,} tokens of context)" if info["context"] else ""))
-        print("\n  Chat with Harvey's agent (read only). Enter sends; Ctrl-C stops an answer; "
+        print("\n  Chat with Harvey's agent. Enter sends; Ctrl-C stops an answer; "
               "Ctrl-D or 'exit' ends; 'new' starts a new chat.")
         while True:
             try:
@@ -2345,6 +2345,9 @@ def cmd_agent(args):
                         found["calls"].get(turn, []), every_call=args.calls)
 
     action = args.agent_action
+    if action == "plans":
+        _agent_plans(args)
+        return
     if action == "ask":
         if not question:
             print('\n  Say what to ask: harvey agent ask "how many firms have a phone?"\n')
@@ -2363,6 +2366,108 @@ def cmd_agent(args):
         _run_chat(_delete)
     else:
         asyncio.run(_log())
+
+
+def _plan_line(p: dict) -> str:
+    import time
+
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["created_at"] or 0))
+    money = (f"${p['committed_usd']:.2f} committed, ${p['spent_usd']:.2f} spent of "
+             f"${p['budget_usd']:.2f}" if "committed_usd" in p else f"${p['budget_usd']:.2f}")
+    return f"  {p['id']:>4}  {p['status']:<9}  {when}  {money}  {p['goal']}"
+
+
+def _agent_plans(args) -> None:
+    """harvey agent plans: the agent's plans (--chat: one chat's); show,
+    approve (the budget typed back), reject, cancel (its live runs too) or
+    close ID. Only a person decides a plan: the agent's tools can't."""
+    import time
+
+    from harvey.agent import plans
+    from harvey.state import StateManager
+
+    verb = args.target or "list"
+    plan_id = args.text[0] if args.text else ""
+    if verb not in ("list", "show", "approve", "reject", "cancel", "close"):
+        print("\n  harvey agent plans [--chat ID] lists them; plans show|approve|reject|cancel|"
+              "close ID\n")
+        raise SystemExit(2)
+    if verb != "list" and not plan_id:
+        print(f"\n  Say which plan: harvey agent plans {verb} ID (harvey agent plans lists "
+              "them)\n")
+        raise SystemExit(2)
+
+    async def main():
+        state = StateManager()
+        await state.init_db()
+        if verb == "list":
+            found = await plans.listed(state, args.chat or None, limit=args.limit)
+            if not found:
+                print("\n  No plans yet: the agent proposes one in a chat when asked to act.\n")
+                return
+            print()
+            for p in found:
+                print(_plan_line({**p, **await plans.money(state, p["id"])}))
+            print()
+            return
+        try:
+            plan = await plans.status(state, plan_id)
+        except plans.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(2)
+        if verb == "show":
+            print("\n" + _plan_line(plan))
+            print(f"        chat {plan['chat']}; open {plan['expiry_hours']} h once approved"
+                  + (f", until {time.strftime('%Y-%m-%d %H:%M', time.localtime(plan['expires_at']))}"
+                     if plan["expires_at"] else ""))
+            for i, step in enumerate(plan["steps"], 1):
+                print(f"        {i}. {step}")
+            for r in plan["runs"]:
+                print(f"        run {r['batch_id'] or '(being queued)'} {r['tool']}: "
+                      f"{'live' if r['live'] else 'finished'}, ${r['spent_usd']:.4f} spent, "
+                      f"${r['committed_usd']:.4f} committed")
+            for a in await plans.actions(state, plan["id"], limit=20):
+                print(f"        {a['tool']}: {a['outcome']}" + (f" ({a['why']})" if a["why"] else ""))
+            print()
+            return
+        try:
+            if verb == "approve":
+                print("\n" + _plan_line(plan))
+                for i, step in enumerate(plan["steps"], 1):
+                    print(f"        {i}. {step}")
+                budget = f"{plan['budget_usd']:.2f}"
+                typed = input(f"\n  Its runs may spend ${budget} in all. Type {budget} to "
+                              "approve it: ").strip().lstrip("$")
+                try:
+                    same = round(float(typed), 2) == round(plan["budget_usd"], 2)
+                except ValueError:
+                    same = False
+                if not same:
+                    print("  Not approved.\n")
+                    raise SystemExit(1)
+                done = await plans.decide(state, plan["id"], True, plans.BY_CLI,
+                                          budget_usd=plan["budget_usd"])
+                print(f"  Approved: open until "
+                      f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(done['expires_at']))}.\n")
+            elif verb == "reject":
+                await plans.decide(state, plan["id"], False, plans.BY_CLI)
+                print("\n  Rejected.\n")
+            else:
+                if verb == "cancel" and not args.yes:
+                    typed = input(f"\n  Cancel plan {plan['id']} and its live runs? [y/N] ")
+                    if typed.strip().lower() not in ("y", "yes"):
+                        print("  Kept.\n")
+                        return
+                done = await plans.close(state, plan["id"], cancel=verb == "cancel",
+                                         by=plans.BY_CLI)
+                print(f"\n  Plan {done['id']} is {done['status']}"
+                      + (f"; {done['runs_cancelled']} job(s) cancelled" if verb == "cancel"
+                         else "") + ".\n")
+        except plans.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+
+    asyncio.run(main())
 
 
 def _run_chat(work) -> None:
@@ -4091,27 +4196,34 @@ def main():
     sub.set_defaults(func=cmd_jobs)
 
     sub = subparsers.add_parser(
-        "agent", help="The chats with Harvey's agent (read only): chats, chat, ask, rename, "
-                      "delete, log",
+        "agent", help="The chats with Harvey's agent and its plans: chats, chat, ask, "
+                      "rename, delete, log, plans",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
-                    "read-only tools, runs on your Claude plan (within "
-                    "usage.max_daily_claude_percent) and can't act yet. Chats are kept until "
-                    "you delete them (the dashboard's Chat tab lists the same ones). The answer "
-                    "is printed as it is written; Ctrl-C stops it.")
-    sub.add_argument("agent_action", choices=("chats", "chat", "ask", "rename", "delete", "log"),
+                    "tools and runs on your Claude plan (within "
+                    "usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
+                    "only you approve it (here or on the Chat tab), and it queues runs only "
+                    "under it. Chats are kept until you delete them (the dashboard's Chat tab "
+                    "lists the same ones). The answer is printed as it is written; Ctrl-C "
+                    "stops it.")
+    sub.add_argument("agent_action", choices=("chats", "chat", "ask", "rename", "delete", "log",
+                                              "plans"),
                      help="chats: the list (--q searches the titles); chat: a conversation in "
                           "the terminal (a new chat, or --chat ID goes on with one); ask TEXT: "
                           "one question, in a chat of its own; rename ID TITLE; delete ID; "
-                          "log: the messages (--chat ID: one chat's)")
+                          "log: the messages (--chat ID: one chat's); plans: the agent's plans "
+                          "(--chat ID: one chat's), plans show|approve|reject|cancel|close ID")
     sub.add_argument("target", nargs="?", default="",
-                     help="rename, delete: the chat's id (ask: the question's first word)")
-    sub.add_argument("text", nargs="*", help="ask: the message; rename: the title")
+                     help="rename, delete: the chat's id (ask: the question's first word); "
+                          "plans: show, approve, reject, cancel or close")
+    sub.add_argument("text", nargs="*", help="ask: the message; rename: the title; plans: the "
+                                             "plan's id")
     sub.add_argument("--chat", default="",
-                     help="chat: go on with this chat; log: only its messages")
+                     help="chat: go on with this chat; log, plans: only its")
     sub.add_argument("--q", default="", help="chats: only those whose title holds these words")
-    sub.add_argument("--yes", action="store_true", help="delete: without asking first")
+    sub.add_argument("--yes", action="store_true",
+                     help="delete, plans cancel: without asking first")
     sub.add_argument("--limit", type=int, default=20,
-                     help="log: messages shown; chats: chats shown (default: 20)")
+                     help="log: messages shown; chats, plans: shown (default: 20)")
     sub.add_argument("--calls", action="store_true", help="log: every tool call of each answer")
     sub.set_defaults(func=cmd_agent)
 

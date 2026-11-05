@@ -7179,7 +7179,7 @@ async function loadActivity() {
   el.innerHTML = html + '</div></div>';
 }
 
-// ── Chat: the chats with Harvey's agent (read only), each answer streamed as it is written ──
+// ── Chat: the chats with Harvey's agent, each answer streamed as it is written, and the plans it proposed ──
 
 // The open chat ('' a new one, made by its first message), its messages,
 // the answer being streamed here ({chat, turn, text, calls, end}) and the
@@ -7199,7 +7199,8 @@ async function loadChat() {
 async function loadChatList() {
   const box = document.getElementById('chat-q');
   const q = box ? box.value.trim() : '';
-  const data = await api('/api/agent/chats?q=' + encodeURIComponent(q));
+  const [data, plans] = await Promise.all([api('/api/agent/chats?q=' + encodeURIComponent(q)),
+                                           api('/api/agent/plans?limit=50')]);
   const el = document.getElementById('chat-chats');
   if (!data) { el.innerHTML = offlineLine(); return; }
   _chatList = data;
@@ -7207,6 +7208,96 @@ async function loadChatList() {
   note.innerHTML = data.refused
     ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>' : '';
   el.innerHTML = renderChatList(data.chats || [], _chatId, q);
+  const side = document.getElementById('chat-plans');
+  if (side) side.innerHTML = renderPlanList((plans && plans.plans) || [], data.chats || []);
+}
+
+// The plans still open (proposed, waiting for the user; approved, being
+// worked on), newest first: each opens its chat.
+function renderPlanList(list, chats) {
+  const open = list.filter(p => p.status === 'proposed' || p.status === 'approved');
+  if (!open.length) return '<p class="muted small">' + escHtml(t('chat.plans_none')) + '</p>';
+  const titles = {};
+  chats.forEach(c => { titles[c.id] = c.title; });
+  return open.map(p => '<button type="button" class="chat-open chat-plan-item" data-chat="' + escHtml(p.chat) + '" onclick="openChat(this.dataset.chat)">' +
+    '<span class="chat-item-title">' + escHtml(t('chat.plan.title', {id: p.id})) + ' · ' + escHtml(p.goal) + '</span>' +
+    '<span class="chat-item-when">' + planBadge(p.status) + ' ' + escHtml(fmtUsd(p.budget_usd, 2)) +
+      (titles[p.chat] ? ' · ' + escHtml(t('chat.plan.in_chat', {title: titles[p.chat]})) : '') + '</span></button>').join('');
+}
+
+const PLAN_TONE = {proposed: 'waiting', approved: 'active', rejected: 'idle', cancelled: 'idle',
+                   expired: 'note', done: 'good'};
+
+function planBadge(status) {
+  return '<span class="badge t-' + (PLAN_TONE[status] || 'idle') + '">' + escHtml(t('chat.plan.st.' + status)) + '</span>';
+}
+
+// A plan the agent proposed, under the answer that proposed it: its goal,
+// steps, budget and time; Approve and Reject while it waits; once
+// approved, what its runs committed and spent and each run (to the Queue),
+// with Cancel while it is open.
+function renderPlanCard(p) {
+  const steps = (p.steps || []).map(x => '<li>' + escHtml(x) + '</li>').join('');
+  const budget = p.budget_usd > 0 ? t('chat.plan.budget', {budget: fmtUsd(p.budget_usd, 2)}) : t('chat.plan.budget_free');
+  // (How long it stays open: while it waits, or once approved; a closed
+  // plan says only its status.)
+  const time = p.status === 'proposed' ? t('chat.plan.open_for', {n: p.expiry_hours})
+    : p.status === 'approved' && p.expires_at ? t('chat.plan.until', {when: new Date(p.expires_at * 1000).toLocaleString(intlLocale())}) : '';
+  let html = '<div class="plan-card" data-plan="' + escHtml(String(p.id)) + '">' +
+    '<div class="plan-head"><b>' + escHtml(t('chat.plan.title', {id: p.id})) + '</b> ' + planBadge(p.status) + '</div>' +
+    '<div class="plan-goal">' + escHtml(p.goal) + '</div>' +
+    (steps ? '<ol class="plan-steps">' + steps + '</ol>' : '') +
+    '<div class="muted small">' + escHtml(budget) + (time ? ' · ' + escHtml(time) : '') + '</div>';
+  if (p.status !== 'proposed' && p.status !== 'rejected') {
+    html += '<div class="small plan-money">' + escHtml(t('chat.plan.money', {committed: fmtUsd(p.committed_usd || 0, 2),
+      spent: fmtUsd(p.spent_usd || 0, 2), budget: fmtUsd(p.budget_usd, 2), remaining: fmtUsd(p.remaining_usd || 0, 2)})) + '</div>';
+    const runs = (p.runs || []).filter(r => r.batch_id);
+    if (runs.length) {
+      html += '<div class="plan-runs"><div class="muted small">' + escHtml(t('chat.plan.runs')) + '</div><ul>' + runs.map(r =>
+        '<li><code>' + escHtml(r.tool) + '</code> ' + escHtml(r.label || '') + ' <span class="muted small">' +
+        escHtml(t(r.live ? 'chat.plan.run_live' : 'chat.plan.run_done')) + ' · ' + escHtml(fmtUsd(r.spent_usd || 0, 4)) + '</span> ' +
+        '<button type="button" class="btn btn-ghost btn-sm" data-batch="' + escHtml(r.batch_id) + '" onclick="openQueue(this.dataset.batch)">' +
+        escHtml(t('chat.plan.run_open')) + '</button></li>').join('') + '</ul></div>';
+    }
+  }
+  if (p.status === 'proposed') {
+    html += '<div class="btn-row"><button type="button" class="btn btn-primary btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="approvePlan(this.dataset.plan)">' +
+      escHtml(t('chat.plan.approve')) + '</button><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'reject\')">' +
+      escHtml(t('chat.plan.reject')) + '</button></div>';
+  } else if (p.status === 'approved') {
+    html += '<div class="btn-row"><button type="button" class="btn btn-sm" data-plan="' + escHtml(String(p.id)) + '" onclick="decidePlan(this.dataset.plan, \'cancel\')">' +
+      escHtml(t('chat.plan.cancel')) + '</button></div>';
+  }
+  return html + '</div>';
+}
+
+function chatPlan(id) {
+  return ((_chatData && _chatData.plans) || []).find(p => String(p.id) === String(id));
+}
+
+// Approve: a confirmation naming the budget, which the request carries
+// (the server approves only the budget the user saw).
+async function approvePlan(id) {
+  const p = chatPlan(id);
+  if (!p || !confirm(t('chat.plan.approve_confirm', {id: p.id, budget: fmtUsd(p.budget_usd, 2)}))) return;
+  const r = await api('/api/agent/plans/' + encodeURIComponent(p.id) + '/approve', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({budget_usd: p.budget_usd})});
+  planDone(r, 'chat.plan.approved');
+}
+
+async function decidePlan(id, action) {
+  const p = chatPlan(id);
+  if (!p) return;
+  if (action === 'cancel' && !confirm(t('chat.plan.cancel_confirm', {id: p.id}))) return;
+  const r = await api('/api/agent/plans/' + encodeURIComponent(p.id) + '/' + action, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: '{}'});
+  planDone(r, action === 'cancel' ? 'chat.plan.cancelled' : 'chat.plan.rejected');
+}
+
+function planDone(r, key) {
+  if (r && r.success) showToast(t(key), 'success');
+  else showToast((r && r.message) || t('chat.plan.failed'), 'error');
+  loadChat();
 }
 
 function searchChats() {
@@ -7289,6 +7380,10 @@ function renderChat(data, live) {
   const calls = data.calls || {};
   const answered = new Set(msgs.filter(m => m.role === 'agent').map(m => m.turn));
   const last = msgs[msgs.length - 1].turn;
+  // (Each plan under the answer that proposed it; one whose answer isn't
+  // shown, older or still being written, after the messages.)
+  const plans = data.plans || [];
+  const shown = new Set();
   // (Older messages are on file: the chat is read 50 at a time.)
   let html = data.more ? '<button type="button" class="btn btn-sm chat-older" onclick="loadOlderChat()">' +
     escHtml(t('chat.older')) + '</button>' : '';
@@ -7308,7 +7403,11 @@ function renderChat(data, live) {
                (m.text ? '<div class="muted small">' + escHtml(m.text) + '</div>' : '') + '</div>'
            : '<div class="chat-text">' + escHtml(m.text) + '</div>') +
       chatCalls(calls[m.turn] || []) + (err && m.turn === last && !(live && !live.end) ? chatRetry(m.turn) : '') + '</div>';
+    for (const p of plans) {
+      if (p.turn === m.turn && !shown.has(p.id)) { shown.add(p.id); html += renderPlanCard(p); }
+    }
   }
+  for (const p of plans) if (!shown.has(p.id)) html += renderPlanCard(p);
   return html;
 }
 

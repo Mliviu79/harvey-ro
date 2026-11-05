@@ -137,7 +137,7 @@ async def test_a_draft_on_file_becomes_an_auto_draft_with_members_and_sends_noth
     state = StateManager(str(path))
     await state.init_db()
     con = sqlite3.connect(path)
-    assert schema.version(con) == schema.LATEST == 32 and schema.missing(con) == []
+    assert schema.version(con) == schema.LATEST == 33 and schema.missing(con) == []
     con.close()
     c = await state.campaign_record("c1")
     assert (c["status"], c["origin"], c["account_id"]) == ("draft", "auto", 1)

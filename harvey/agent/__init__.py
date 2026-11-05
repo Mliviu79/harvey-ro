@@ -1,5 +1,6 @@
 """Harvey's agent: a model that reads Harvey's data through tools Harvey
-serves it, and answers in the dashboard's chat.
+serves it, answers in the dashboard's chat, and queues work under a plan
+the user approved.
 
     readonly.py   what it may read: a read-only connection, the excluded
                   tables and columns, and the one SELECT a query() runs
@@ -8,8 +9,13 @@ serves it, and answers in the dashboard's chat.
                   harvey.agent.tools), with every call recorded
     chat.py       the chats the user keeps: a live Claude CLI process
                   for each one in use, each answer streamed as it is made
+    plans.py      the plans it proposes and only the user decides, and
+                  their budgets
+    actions.py    what it may do under an approved plan: save a set, and
+                  queue the runs the pages' buttons queue, the same way
 
-It can't act yet: no tool queues a job, spends, writes Harvey's data or
-touches email. The model runs on the operator's Claude plan (claude -p),
-with only Harvey's tools (claude_runtime.build_agent_command).
+No tool sends or approves email, touches a campaign, the do-not-contact
+list, a merge or a setting, or approves a plan. The model runs on the
+operator's Claude plan (claude -p), with only Harvey's tools
+(claude_runtime.build_agent_command).
 """

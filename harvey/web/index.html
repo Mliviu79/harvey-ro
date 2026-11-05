@@ -390,15 +390,17 @@
   <div id="queue-list"><p class="muted" data-i18n="common.loading">Se încarcă…</p></div>
 </div>
 
-<!-- Chat with Harvey's agent (read only): the chats kept, one open -->
+<!-- Chat with Harvey's agent: the chats kept, one open, and the plans it proposed -->
 <div id="chat" class="section">
-  <div class="section-head"><div><h2 data-i18n="chat.title">Chat</h2><p data-i18n="chat.lede">Întreabă-l pe Harvey despre datele tale: firme, contacte, căutări, campanii, costuri. Agentul citește prin uneltele lui Harvey, doar în citire, și nu poate face încă nimic în locul tău.</p></div>
+  <div class="section-head"><div><h2 data-i18n="chat.title">Chat</h2><p data-i18n="chat.lede">Întreabă-l pe Harvey despre datele tale: firme, contacte, căutări, campanii, costuri. Ca să lucreze pentru tine, agentul propune un plan cu un buget; pune în coadă căutări și verificări doar după ce îl aprobi, și niciodată nu trimite emailuri.</p></div>
     <div class="page-actions"><button type="button" class="btn chat-toggle" id="chat-toggle" onclick="toggleChats()" aria-expanded="false" aria-controls="chat-side" data-i18n="chat.chats">Chaturi</button><button type="button" class="btn btn-primary" id="chat-new" onclick="newChat()" data-i18n="chat.new">Chat nou</button></div></div>
   <div id="chat-note"></div>
   <div class="chat-layout">
     <aside id="chat-side" class="card chat-side">
       <input id="chat-q" type="search" class="form-input" oninput="searchChats()" data-i18n-placeholder="chat.search" data-i18n-aria="chat.search" placeholder="Caută în titluri" aria-label="Caută în titluri">
       <div id="chat-chats" class="chat-chats"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
+      <h4 class="chat-side-head" data-i18n="chat.plans">Planuri</h4>
+      <div id="chat-plans" class="chat-plans"></div>
     </aside>
     <div class="card chat-card">
       <div class="chat-head"><h3 id="chat-title"></h3><span id="chat-tokens"></span></div>

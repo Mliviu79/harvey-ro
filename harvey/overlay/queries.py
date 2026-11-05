@@ -815,3 +815,76 @@ statement("overlay.agent.chat_leases",
 statement("overlay.agent.add_call",
           "INSERT INTO agent_tool_call (turn, tool, arguments, result, ms, outcome, at) "
           "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("t", "schema", "{}", "", 0, "ok", 1))
+
+# ── The agent's plans, sets and actions (schema 33, harvey/agent/plans.py) ──
+_PLAN = ("SELECT id, chat, turn, goal, steps, budget_usd, expiry_hours, status, created_at, "
+         "decided_at, expires_at, closed_at, decided_by, closed_by FROM agent_plan ")
+statement("overlay.agent.plan_add",
+          "INSERT INTO agent_plan (chat, turn, goal, steps, budget_usd, expiry_hours, status, "
+          "created_at) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?)",
+          params=("c", "t", "goal", "[]", 1.0, 72, 1))
+statement("overlay.agent.plan", _PLAN + "WHERE id = ?", params=(1,))
+statement("overlay.agent.plans_chat",
+          _PLAN + "INDEXED BY agent_plan_chat WHERE chat = ? ORDER BY id DESC LIMIT ?",
+          params=("c", 50))
+statement("overlay.agent.plans_chat_status",
+          _PLAN + "INDEXED BY agent_plan_chat WHERE chat = ? AND status = ? "
+          "ORDER BY id DESC LIMIT ?", params=("c", "approved", 50))
+statement("overlay.agent.plans", _PLAN + "ORDER BY id DESC LIMIT ?", params=(50,))
+statement("overlay.agent.plans_status",
+          _PLAN + "INDEXED BY agent_plan_status WHERE status = ? ORDER BY id DESC LIMIT ?",
+          params=("approved", 50))
+# An approved plan past its time is expired, checked whenever a plan is read
+# or acted under (nothing runs on a clock).
+statement("overlay.agent.plan_expire",
+          "UPDATE agent_plan SET status = 'expired', closed_at = expires_at, "
+          "closed_by = 'expiry' WHERE status = 'approved' AND expires_at <= ?", params=(1,))
+statement("overlay.agent.plan_decide",
+          "UPDATE agent_plan SET status = ?, decided_at = ?, decided_by = ?, expires_at = ? "
+          "WHERE id = ? AND status = 'proposed'", params=("approved", 1, "dashboard", 2, 1))
+# A deleted chat's open plans: nothing can be done under them any more (no
+# chat answers there), so a proposed one is rejected and an approved one
+# done, its runs going on to their end under their caps.
+statement("overlay.agent.plans_chat_deleted",
+          "UPDATE agent_plan INDEXED BY agent_plan_chat "
+          "SET decided_at = CASE status WHEN 'proposed' THEN ? ELSE decided_at END, "
+          "decided_by = CASE status WHEN 'proposed' THEN 'chat deleted' ELSE decided_by END, "
+          "closed_at = ?, closed_by = 'chat deleted', "
+          "status = CASE status WHEN 'proposed' THEN 'rejected' ELSE 'done' END "
+          "WHERE chat = ? AND status IN ('proposed', 'approved')", params=(1, 1, "c"))
+statement("overlay.agent.plan_close",
+          "UPDATE agent_plan SET status = ?, closed_at = ?, closed_by = ? "
+          "WHERE id = ? AND status = 'approved'", params=("done", 1, "dashboard", 1))
+# A plan's runs: each action that holds or held money, with its run's cap
+# now, whether any of its jobs is still to finish, and what they spent.
+statement("overlay.agent.plan_runs",
+          "SELECT a.id, a.tool, a.batch, a.cap_usd, a.classify_cap_usd, a.outcome, a.at, "
+          "b.id IS NOT NULL, b.max_spend, json_extract(b.params_json, '$.classify_max_spend'), "
+          "b.label, "
+          "(SELECT COUNT(*) FROM jobs j WHERE j.batch_id = a.batch "
+          "AND j.status IN ('queued', 'running', 'paused')), "
+          "(SELECT COALESCE(SUM(j.actual_cost), 0) FROM jobs j WHERE j.batch_id = a.batch) "
+          "FROM agent_action a INDEXED BY agent_action_plan "
+          "LEFT JOIN job_batches b ON b.id = a.batch "
+          "WHERE a.plan = ? AND a.outcome IN ('reserved', 'ok') ORDER BY a.id", params=(1,),
+          drives="a")
+statement("overlay.agent.action_add",
+          "INSERT INTO agent_action (plan, chat, turn, tool, arguments, batch, cap_usd, "
+          "classify_cap_usd, outcome, why, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          params=(1, "c", "t", "find_contacts", "{}", None, 0.0, 0.0, "reserved", "", 1))
+statement("overlay.agent.action_settle",
+          "UPDATE agent_action SET batch = ?, outcome = ?, why = ? WHERE id = ?",
+          params=("b", "ok", "", 1))
+statement("overlay.agent.actions_plan",
+          "SELECT id, tool, arguments, batch, cap_usd, classify_cap_usd, outcome, why, at "
+          "FROM agent_action INDEXED BY agent_action_plan WHERE plan = ? "
+          "ORDER BY id DESC LIMIT ?", params=(1, 50))
+statement("overlay.agent.set_add",
+          "INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("c", "n", "filter", "firms", "{}", 0, 1))
+statement("overlay.agent.set",
+          "SELECT id, chat, name, kind, of, definition, n, created_at FROM agent_set "
+          "WHERE id = ?", params=(1,))
+statement("overlay.agent.sets_chat",
+          "SELECT id, name, kind, of, n, created_at FROM agent_set INDEXED BY agent_set_chat "
+          "WHERE chat = ? ORDER BY id DESC LIMIT ?", params=("c", 50))

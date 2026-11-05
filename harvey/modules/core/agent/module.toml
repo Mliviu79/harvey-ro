@@ -1,12 +1,14 @@
 # The agent: a model that reads Harvey's data through Harvey's own tools
-# (harvey/agent/: a read-only MCP server) and answers in the dashboard's
-# chat. It runs on your Claude plan, inside Harvey's share of it
+# (harvey/agent/: an MCP server) and answers in the dashboard's chat. It
+# runs on your Claude plan, inside Harvey's share of it
 # (usage.max_daily_claude_percent): one live Claude process per chat, no
-# job. It can't act yet: no tool queues, spends, writes data or touches
-# email.
+# job. It queues runs (Discover, a registry pull, Find contacts, Verify
+# contacts) only under a plan the user approved, within its budget, through
+# the pages' own code; no tool sends or approves email, touches campaigns,
+# the do-not-contact list, merges or settings.
 id = "agent"
 name = "Agent"
-description = "A chat that answers questions about Harvey's data, read only."
+description = "A chat that answers questions about Harvey's data, and queues searches and checks under a plan you approve."
 set = "core"
 kind = "action"
 version = "0.1.0"

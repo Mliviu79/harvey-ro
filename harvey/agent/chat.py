@@ -5,7 +5,7 @@ A chat (agent_chat, schema 32) is kept until the user deletes it: titled
 from its first message (TITLE_CHARS, no model call) or renamed, listed by
 its last activity, opened again any time and continued. While a chat is in
 use one long-lived process answers it (claude_runtime.build_agent_command:
-print mode with stream-json in and out, Harvey's read-only MCP server and
+print mode with stream-json in and out, Harvey's MCP server and
 its tools only, an empty working folder), owned by the Harvey process that
 serves it: the dashboard, or the terminal for ``harvey agent chat`` and
 ``ask``. Each message goes in on stdin as a JSON line; the answer comes out
@@ -697,7 +697,10 @@ class Hub:
     async def delete(self, chat_id: str) -> None:
         """Delete a chat: its answer stopped and its process closed, then
         its messages and their tool calls (usage_events stay: the plan's
-        accounting). Refused while another Harvey process serves it."""
+        accounting). Its open plans close (a proposed one rejected, an
+        approved one done: its runs finish under their caps; the plans and
+        their actions stay on file). Refused while another Harvey process
+        serves it."""
         if await chat_info(self.state, chat_id) is None:
             raise Refused("no such chat", "missing")
         if chat_id in await _held_elsewhere(self.state):
@@ -709,8 +712,10 @@ class Hub:
             # (No message can start meanwhile: it would wait for the lock,
             # then find the chat gone.)
             await live.close()
+            now = int(time.time())
             await _write(self.state, ("overlay.agent.delete_chat_calls", (chat_id,)),
                          ("overlay.agent.delete_chat_messages", (chat_id,)),
+                         ("overlay.agent.plans_chat_deleted", (now, now, chat_id)),
                          ("overlay.agent.delete_chat", (chat_id,)))
             self.chats.pop(chat_id, None)
 

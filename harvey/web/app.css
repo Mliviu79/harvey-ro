@@ -1457,6 +1457,17 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .chat-retry { margin-top: var(--sp-2); }
 .chat-older { align-self: center; }
 .chat-toggle { display: none; }
+.chat-side-head { font-size: var(--fs-caption); font-weight: 600; color: var(--text-2); margin: var(--sp-2) 0 0; }
+.chat-plans { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; min-height: 0; }
+.chat-plan-item { border-radius: var(--r-sm); }
+@media (hover: hover) { .chat-plan-item:hover { background: var(--surface-2); } }
+.plan-card { align-self: stretch; max-width: 100%; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-lg); background: var(--surface); box-shadow: inset 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: var(--sp-1); overflow-wrap: anywhere; }
+.plan-head { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+.plan-goal { font-size: var(--fs-ui); }
+.plan-steps { margin: 0; padding-left: var(--sp-4); font-size: var(--fs-ui); }
+.plan-runs ul { margin: 2px 0 0; padding-left: var(--sp-4); font-size: var(--fs-caption); }
+.plan-runs li { margin: 2px 0; }
+.plan-card .btn-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-1); }
 @media (max-width: 760px) {
   .chat-layout { grid-template-columns: minmax(0, 1fr); }
   .chat-toggle { display: inline-flex; }

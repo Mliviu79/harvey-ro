@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 32).
+"""The overlay's tables (harvey.db schema 33).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 32
+LATEST = 33
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -937,10 +937,62 @@ def _to_32(con: sqlite3.Connection) -> None:
     con.execute("UPDATE agent_message SET chat = 'earlier'")
 
 
+# ── Schema 33: the agent's plans, its saved sets and what it queued ──
+
+SCHEMA_33 = """
+-- A plan Harvey's agent proposed in a chat (harvey/agent/plans.py): its goal,
+-- its steps (a JSON list of short texts), the budget it asks for (USD, 0:
+-- free work only) and how long it stays open once approved. Only the user
+-- approves, rejects, cancels or closes it (the dashboard, the CLI); the
+-- agent may close it too, and acts only under an approved one of its own
+-- chat. status: proposed, approved, rejected, cancelled, expired, done.
+CREATE TABLE agent_plan (
+  id INTEGER PRIMARY KEY, chat TEXT NOT NULL, turn TEXT NOT NULL DEFAULT '',
+  goal TEXT NOT NULL, steps TEXT NOT NULL DEFAULT '[]',
+  budget_usd REAL NOT NULL CHECK (budget_usd >= 0),
+  expiry_hours INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'proposed'
+    CHECK (status IN ('proposed', 'approved', 'rejected', 'cancelled', 'expired', 'done')),
+  created_at INTEGER NOT NULL, decided_at INTEGER, expires_at INTEGER, closed_at INTEGER,
+  decided_by TEXT NOT NULL DEFAULT '', closed_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX agent_plan_chat ON agent_plan(chat, id);
+CREATE INDEX agent_plan_status ON agent_plan(status, id);
+-- A set of firms or contacts the agent saved by a filter (the Contacts and
+-- Companies pages' query string) or by one read-only SELECT of ids
+-- (of: firms, contacts, registry): resolved again each time an action
+-- takes it, never returned to the model. n: how many it held when saved.
+CREATE TABLE agent_set (
+  id INTEGER PRIMARY KEY, chat TEXT NOT NULL, name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('filter', 'select')), of TEXT NOT NULL,
+  definition TEXT NOT NULL, n INTEGER, created_at INTEGER NOT NULL
+);
+CREATE INDEX agent_set_chat ON agent_set(chat, id);
+-- Every action the agent asked for under a plan (harvey/agent/actions.py),
+-- refused ones too: its arguments, the run it queued (batch, a job_batches
+-- id) and the caps it took from the plan's budget. outcome: reserved (its
+-- caps held while it is queued), ok, nothing (nothing to do), refused or
+-- error, with why.
+CREATE TABLE agent_action (
+  id INTEGER PRIMARY KEY, plan INTEGER, chat TEXT NOT NULL, turn TEXT NOT NULL DEFAULT '',
+  tool TEXT NOT NULL, arguments TEXT NOT NULL DEFAULT '{}', batch TEXT,
+  cap_usd REAL NOT NULL DEFAULT 0, classify_cap_usd REAL NOT NULL DEFAULT 0,
+  outcome TEXT NOT NULL, why TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL
+);
+CREATE INDEX agent_action_plan ON agent_action(plan, id);
+CREATE INDEX agent_action_chat ON agent_action(chat, id);
+"""
+
+
+def _to_33(con: sqlite3.Connection) -> None:
+    """Schema 33: agent_plan, agent_set and agent_action. Nothing on file
+    changes: the agent proposes its first plan when asked to act."""
+    _script(con, SCHEMA_33)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
-         (32, _to_32))
+         (32, _to_32), (33, _to_33))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

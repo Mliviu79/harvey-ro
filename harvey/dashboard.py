@@ -1803,33 +1803,19 @@ def _block_listed(rows: list[dict], people: bool, suppressed: set | None = None)
                 r["do_not_contact"] = True
 
 
-# A Find-contacts run takes at most this many companies (the newest first);
-# a wider filter is taken in more runs.
-FIND_MAX = 50_000
+from harvey.launch import FIND_MAX  # noqa: E402  (the queueing paths, shared with the agent)
 
 
 async def _find_selection(body: dict):
     """(state, the companies a Find-contacts request selects, its filter's
     error or "") from {"filter": {the Contacts page's filters}, "company_ids",
-    "force", "limit"}."""
-    from harvey import finder
+    "force", "limit"} (launch.find_selection)."""
+    from harvey import launch
 
     state = _state()
     await state.init_db()
-    raw = body.get("filter") if isinstance(body.get("filter"), dict) else {}
-    try:
-        f, attach = await _contact_filter(state, {k: str(v) for k, v in raw.items()
-                                                  if v is not None})
-    except ValueError as e:
-        return state, [], str(e)
-    try:
-        limit = max(1, min(int(body.get("limit") or FIND_MAX), FIND_MAX))
-    except (TypeError, ValueError):
-        return state, [], "limit must be a number"
-    ids = body.get("company_ids") if isinstance(body.get("company_ids"), list) else None
-    selected = await finder.select(state, f, ids=ids, force=bool(body.get("force")),
-                                   limit=limit, attach_figures=attach)
-    return state, selected, ""
+    selected, error = await launch.find_selection(state, body)
+    return state, selected, error
 
 
 async def _json_body(request: Request) -> dict:
@@ -1850,22 +1836,13 @@ async def estimate_find_contacts(request: Request):
     the verifiers' free allowances (finder.checks_estimate); ``classifier``:
     its calls and their cost as a range (finder.classify_estimate). Both
     are estimates: the run's caps are what is enforced, step by step."""
-    from harvey import finder
-    from harvey.modules import switches
+    from harvey import launch
 
     body = await _json_body(request)
     state, selected, error = await _find_selection(body)
     if error:
         return JSONResponse({"error": error}, status_code=400)
-    from harvey.config import load_env
-
-    enabled, env = await switches.enabled_ids(state), load_env().model_dump()
-    # (What the run will do to each: searched already counts, unless forced.)
-    selected = await finder.plan(state, selected, enabled, env, force=bool(body.get("force")))
-    out = finder.estimate(selected, enabled, env)
-    return {**out, "more": len(selected) >= FIND_MAX,
-            "checks": await finder.checks_estimate(state, selected, enabled, env),
-            "classifier": await finder.classify_estimate(state, selected)}
+    return await launch.find_estimate(state, selected, bool(body.get("force")))
 
 
 @app.post("/api/contacts/find")
@@ -2410,27 +2387,10 @@ async def act_on_classify_profile(profile_id: str, action: str):
 # ── Verifying contacts with the classifier (harvey/contact_check.py) ──
 
 async def _verify_selection(state, body: dict) -> tuple[list[dict], str]:
-    """The links a verification takes: {"contact_ids": [...]} or {"filter":
-    {the Contacts page's filters}, "limit"}; at most contact_check.MAX_LINKS."""
-    from harvey import contact_check
+    """The links a verification takes (launch.verify_selection)."""
+    from harvey import launch
 
-    try:
-        limit = max(1, min(int(body.get("limit") or 200), contact_check.MAX_LINKS))
-    except (TypeError, ValueError):
-        return [], "limit must be a number"
-    ids = body.get("contact_ids")
-    if ids is not None:
-        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
-            return [], "contact_ids is a list of contact ids"
-    else:
-        raw = body.get("filter") if isinstance(body.get("filter"), dict) else {}
-        try:
-            f, _ = await _contact_filter(state, {k: str(v) for k, v in raw.items()
-                                                 if v is not None})
-        except ValueError as e:
-            return [], str(e)
-        _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
-    return await contact_check.links(state, ids[:limit], limit=limit), ""
+    return await launch.verify_selection(state, body)
 
 
 @app.post("/api/contacts/verify/estimate")
@@ -4324,96 +4284,34 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
 
 
 def _source_keys(body: dict) -> list[str]:
-    """The sources a Discover request names: ``providers`` (a list), or
-    the older single ``provider``."""
-    keys = body.get("providers")
-    if isinstance(keys, str):
-        keys = [k.strip() for k in keys.split(",")]
-    if not isinstance(keys, list) or not keys:
-        keys = [body.get("provider") or ""]
-    return list(dict.fromkeys(str(k) for k in keys if k))
+    from harvey import launch
+
+    return launch.source_keys(body)
 
 
 async def _discovery_refusal(body: dict):
     """Why a source or the preset asked for can't run (a ModuleOff: its
-    module is off), or None."""
-    from harvey.modules import switches
-    from harvey.modules.job_kinds import discover_sources
+    module is off), or None (launch.discovery_refusal)."""
+    from harvey import launch
 
     state = _state()
     await state.init_db()
-    enabled = await switches.enabled_ids(state)
-    jobbed = {s["key"]: s["module"] for s in discover_sources()}
-    for key in _source_keys(body) or [""]:
-        if key in jobbed:
-            if jobbed[key] not in enabled:
-                return switches.ModuleOff(jobbed[key], f"The {key} discovery source")
-            continue
-        problem = switches.discovery_problem(enabled, key, str(body.get("preset") or ""))
-        if problem:
-            return problem
-    return None
+    return await launch.discovery_refusal(state, body)
 
 
 def _discovery_queries(body: dict, config, provider: str = ""):
-    from harvey.collectors.discover import build_queries, preset_problem
+    from harvey import launch
 
-    preset = str(body.get("preset") or "")
-    problem = preset_problem(preset, provider or str(body.get("provider") or ""), config=config)
-    if problem:
-        raise ValueError(problem)
-    cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
-    # No depth or limit: every result the source has (the cap stops the run).
-    return build_queries(
-        config, cities=cities,
-        depth=int(body.get("depth") or 0) or None,
-        limit=int(body.get("limit") or 0) or None,
-        preset=preset,
-    )
+    return launch.discovery_queries(body, config, provider)
 
 
 def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
-    """One part per source the request ticked: a search source's queries,
-    or a registry pull's parameters from its filters. A source that can't
-    take this run (a preset it can't search with, filters that say
-    nothing) is skipped with a note, unless it is the only one: then the
-    run is refused (ValueError). Unknown sources are refused."""
-    from harvey.collectors.discover import PROVIDERS, is_discovery_source
-    from harvey.modules.job_kinds import discover_sources, lookup_only_message, registry_plan
+    """One part per source the request ticked (launch.discovery_plan)."""
+    from harvey import launch
 
-    keys = _source_keys(body)
-    if not keys:
-        raise ValueError("pick at least one source")
-    jobbed = {s["key"]: s for s in discover_sources()}
-    filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
-    plan, notes = [], []
-    for key in keys:
-        try:
-            if key in PROVIDERS and not is_discovery_source(key):
-                raise LookupError(lookup_only_message(key))
-            if key in PROVIDERS:
-                plan.append({"provider": key, "label": PROVIDERS[key].label,
-                             "queries": _discovery_queries(body, config, key)})
-            elif key in jobbed:
-                src = jobbed[key]
-                if src["job"] != "registry_pull":
-                    # Only the registry's filters are read here: another
-                    # source run as a job needs its own planner first.
-                    raise ValueError(f"{key} can't be run from Discover yet")
-                params = registry_plan(filters.get(key) or {})
-                plan.append({"source": key, "job": src["job"], "label": params.pop("label"),
-                             "params": params, "name": src["label"]})
-            else:
-                raise LookupError(f"unknown provider {key!r}")
-        except LookupError:
-            raise
-        except ValueError as e:
-            if len(keys) == 1:
-                raise
-            notes.append(f"{key}: {e}")
-    if not plan:
-        raise ValueError("; ".join(notes) or "no source can take this run")
-    return plan, notes
+    # (Through this module's _discovery_queries, read when called.)
+    return launch.discovery_plan(body, config,
+                                 queries=lambda b, c, k: _discovery_queries(b, c, k))
 
 
 @app.get("/api/discover/providers")
@@ -4479,12 +4377,8 @@ async def estimate_discovery(request: Request):
     answer says what counting cost. The registry's estimate is its free
     count of the firms that match."""
     try:
-        import asyncio
-
-        from harvey.collectors.discover import PROVIDERS, estimate_cost
+        from harvey import launch
         from harvey.config import load_config
-        from harvey.modules.job_kinds import registry_count
-        from harvey.modules.runs import run_discovery
 
         body = await request.json()
         refusal = await _discovery_refusal(body)
@@ -4497,57 +4391,14 @@ async def estimate_discovery(request: Request):
             return JSONResponse({"error": str(e).strip("'\"")}, status_code=400)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        state = _state()
-        await state.init_db()
-        parts = []
-        for part in plan:
-            if part.get("provider"):
-                key, queries = part["provider"], part["queries"]
-                counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
-                if PROVIDERS[key].can_count:
-                    report = await run_discovery(state, config, key, queries,
-                                                 dry_run=True, count=True)
-                    counted = {"counted": report.counted, "available": report.available,
-                               "count_cost": round(report.count_cost, 4),
-                               "errors": report.errors}
-                parts.append({"key": key, "label": part["label"],
-                              "queries": [q.keyword() for q in queries],
-                              "query_count": len(queries),
-                              "estimated_cost": round(estimate_cost(key, queries), 4),
-                              "free": PROVIDERS[key].estimate(queries) == 0, **counted})
-            else:
-                try:
-                    n = await asyncio.to_thread(registry_count, part["params"])
-                    errors = []
-                except FileNotFoundError as e:
-                    n, errors = None, [f"{e} (the filter needs it)"]
-                parts.append({"key": part["source"], "label": part["label"],
-                              "queries": [part["label"]], "query_count": 1,
-                              "estimated_cost": 0.0, "free": True, "counted": n is not None,
-                              "available": n, "count_cost": 0.0,
-                              "errors": errors or ([] if n is not None else [
-                                  "no registry loaded yet: the run loads it first (about "
-                                  "1.5 GB, once per dataset)"])})
-        queries = [q for p_ in parts for q in p_["queries"]]
-        counted_all = all(p_["counted"] for p_ in parts)
         try:
-            websites = await _websites_estimate(state, _find_websites(body))
+            websites = _find_websites(body)
         except (TypeError, ValueError):
             return JSONResponse({"error": "websites_max_spend must be a number of dollars, "
                                  "0 or more"}, status_code=400)
-        return {
-            "find_websites": websites,
-            "provider": parts[0]["key"],
-            "sources": parts, "notes": notes,
-            "queries": queries, "query_count": len(queries),
-            "estimated_cost": round(sum(p_["estimated_cost"] for p_ in parts), 4),
-            "free": all(p_["free"] for p_ in parts),
-            "counted": counted_all if len(parts) > 1 else parts[0]["counted"],
-            "available": (sum(p_["available"] or 0 for p_ in parts)
-                          if any(p_["available"] is not None for p_ in parts) else None),
-            "count_cost": round(sum(p_["count_cost"] for p_ in parts), 4),
-            "errors": [e for p_ in parts for e in p_["errors"]],
-        }
+        state = _state()
+        await state.init_db()
+        return await launch.discovery_estimate(state, config, plan, notes, websites)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -4559,58 +4410,28 @@ def _duplicate_body(e) -> dict:
             "job": e.job.as_dict()}
 
 
-# What a Discover run may spend looking up websites for the companies it
-# saves with none when the request names no amount: nothing, so a caller's
-# max_spend is all it spends; free lookups still run while the option is
-# on. (The Discover tab sends the amount its field shows.)
-WEBSITES_DEFAULT_USD = 0.0
+from harvey.launch import WEBSITES_DEFAULT_USD  # noqa: E402,F401
 
 
 def _find_websites(body: dict) -> float | None:
-    """A Discover request's "also find websites, up to $X": the amount
-    (``websites_max_spend``, $0 when absent: free lookups only), or None
-    when ``find_websites`` is false. On unless turned off. ValueError for
-    an amount that isn't one."""
-    if body.get("find_websites") is False:
-        return None
-    return _money(body.get("websites_max_spend"), default=WEBSITES_DEFAULT_USD)
+    """A Discover request's "also find websites, up to $X"
+    (launch.find_websites)."""
+    from harvey import launch
+
+    return launch.find_websites(body)
 
 
 async def _websites_estimate(state, amount: float | None) -> dict:
-    """What "find websites" would use: the searches that can find a
-    company by name (free ones first), the price of a paid lookup, and how
-    many paid lookups the amount pays for. How many companies will need
-    one isn't known before the run."""
-    from harvey import finder
-    from harvey.config import load_env
-    from harvey.modules import switches
+    from harvey import launch
 
-    if amount is None:
-        return {"enabled": False}
-    found = finder.searchers(await switches.enabled_ids(state), load_env().model_dump())
-    paid = [s for s in found if s.estimate > 0]
-    cheapest = min((s.estimate for s in paid), default=0.0)
-    return {"enabled": True, "max_spend": amount,
-            "free": sorted({s.module for s in found if s.estimate <= 0}),
-            "paid": sorted({s.module for s in paid}),
-            "per_lookup": round(cheapest, 4),
-            "paid_lookups": int(amount / cheapest + 1e-9) if cheapest else 0,
-            "searchers": [{"module": s.module, "provider": s.provider, "cost": s.estimate}
-                          for s in found]}
+    return await launch.websites_estimate(state, amount)
 
 
 def _money(value, default: float | None = None) -> float:
     """A dollar amount from a request: finite and >= 0, else ValueError."""
-    import math
+    from harvey import launch
 
-    if value is None or value == "":
-        if default is None:
-            raise ValueError("expected a number of dollars")
-        return default
-    amount = float(value)
-    if not math.isfinite(amount) or amount < 0:
-        raise ValueError("expected a number of dollars, 0 or more")
-    return amount
+    return launch.money(value, default)
 
 
 @app.post("/api/discover/run")
@@ -4947,7 +4768,8 @@ async def rename_agent_chat(chat_id: str, request: Request):
 @app.delete("/api/agent/chats/{chat_id}")
 async def delete_agent_chat(chat_id: str):
     """Delete a chat, its messages and their tool calls (an answer being
-    made is stopped first; the usage rows stay). {"success"}."""
+    made is stopped first; the usage rows stay; its open plans close:
+    chat.Hub.delete). {"success"}."""
     from harvey.agent import chat
 
     state = _state()
@@ -4967,15 +4789,20 @@ async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0
     {turn: [{tool, arguments, result, ms, outcome}]}), the chat ({id,
     title, context, hint: past chat.CONTEXT_HINT_TOKENS}), the message
     being answered (``live``: follow it with the stream), ``busy``, and
-    ``refused`` (Codex as the brain). 404 for no such chat."""
+    ``refused`` (Codex as the brain), and the chat's plans (``plans``,
+    oldest first, each with its committed, spent and runs). 404 for no
+    such chat."""
     from harvey.agent import chat
 
     state = _state()
     await state.init_db()
+    from harvey.agent import plans
+
     found = await chat.messages(state, chat_id, limit=limit, before=before or None)
     if found["chat"] is None:
         return _bad("no such chat", 404)
-    return {**found, "refused": chat.refusal(_load_config_quietly())}
+    return {**found, "plans": await plans.for_chat(state, chat_id),
+            "refused": chat.refusal(_load_config_quietly())}
 
 
 @app.post("/api/agent/chats/{chat_id}/messages")
@@ -5045,6 +4872,70 @@ async def stop_agent_answer(chat_id: str):
     from harvey.agent import chat
 
     return {"success": True, "stopped": await chat.hub(_state()).stop(chat_id)}
+
+
+# ── The agent's plans (harvey/agent/plans.py): only the user decides them ──
+
+def _plan_refused(e) -> JSONResponse:
+    return JSONResponse({"success": False, "message": str(e)},
+                        status_code=404 if str(e).startswith("no plan") else 409)
+
+
+@app.get("/api/agent/plans")
+async def get_agent_plans(chat: str = "", status: str = "", limit: int = 50):
+    """The agent's plans, newest first (of one chat, of one status), each
+    with what its runs committed and spent and what remains."""
+    from harvey.agent import plans
+
+    state = _state()
+    await state.init_db()
+    out = []
+    for p in await plans.listed(state, chat or None, status, limit):
+        m = await plans.money(state, p["id"])
+        out.append({**p, **m,
+                    "remaining_usd": round(max(0.0, p["budget_usd"] - m["committed_usd"]), 6)})
+    return {"plans": out}
+
+
+@app.get("/api/agent/plans/{plan_id}")
+async def get_agent_plan(plan_id: int):
+    """One plan with its money, its runs and its actions (refusals too)."""
+    from harvey.agent import plans
+
+    state = _state()
+    await state.init_db()
+    try:
+        out = await plans.status(state, plan_id)
+    except plans.Refused as e:
+        return _plan_refused(e)
+    return {**out, "actions": await plans.actions(state, plan_id)}
+
+
+@app.post("/api/agent/plans/{plan_id}/{action}")
+async def decide_agent_plan(plan_id: int, action: str, request: Request):
+    """approve ({"budget_usd": the budget the user confirmed, which must be
+    the plan's}), reject, cancel (its live runs are cancelled too) or close
+    (done: its runs go on to their end). The user's alone: the agent's
+    tools can't."""
+    from harvey.agent import plans
+
+    if action not in ("approve", "reject", "cancel", "close"):
+        return _bad("approve, reject, cancel or close", 404)
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        if action in ("approve", "reject"):
+            if action == "approve" and body.get("budget_usd") is None:
+                return _bad("budget_usd: the plan's budget, as the user confirmed it")
+            plan = await plans.decide(state, plan_id, action == "approve", plans.BY_DASHBOARD,
+                                      budget_usd=body.get("budget_usd"))
+        else:
+            plan = await plans.close(state, plan_id, cancel=action == "cancel",
+                                     by=plans.BY_DASHBOARD)
+    except plans.Refused as e:
+        return _plan_refused(e)
+    return {"success": True, "plan": plan}
 
 
 @app.get("/api/jobs/batches")
