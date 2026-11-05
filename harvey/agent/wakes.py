@@ -20,19 +20,21 @@ at most one wake job per plan is queued or running (its dedupe key), and
 it reads every due event not yet seen, marking them seen when it ends. At
 most WAKES_PER_DAY wakes a plan in 24 hours.
 
-A wake is one ``claude -p`` run (claude_runtime.build_agent_command, the
-same MCP server with ``--chat`` the plan's chat, so its tool calls are
-recorded under the wake's turn) whose first message is prompts/agent.md,
-the memory snapshot (memory.py), the chat so far, then the wake's events
-as structured data: never a page or a reply's text, which tool-less
-readers turn into fields first. Its answer goes into the plan's chat as an
-answer marked with why it woke (agent_message.wake), counted as unread
-until the user opens the chat; an answer of SILENT writes nothing (its
-tool calls are still recorded). Before each wake: the Claude plan's share
-(is_within_budget: over it, the lane rests and the wake waits), Claude as
-the brain (Codex refuses wakes), and the chat's lease: while a live chat
-process holds it (the user is in that chat), the wake waits and tries a
-little later, which is no failure. A logged-out CLI pauses the agent's
+A wake is one run of the agent's driver (driver.py: ``claude -p`` through
+claude_runtime.build_agent_command, or Codex's app-server when
+brain.provider is codex) with the same MCP server, ``--chat`` the plan's
+chat, so its tool calls are recorded under the wake's turn. Its first
+message is prompts/agent.md, the memory snapshot (memory.py), the chat so
+far, then the wake's events as structured data: never a page or a reply's
+text, which tool-less readers turn into fields first. Its answer goes into
+the plan's chat as an answer marked with why it woke
+(agent_message.wake), counted as unread until the user opens the chat; an
+answer of SILENT writes nothing (its tool calls are still recorded).
+Before each wake: the plan's share (is_within_budget, of the Claude plan
+or the ChatGPT plan: over it, the lane rests and the wake waits), the
+driver usable (its CLI, its login), and the chat's lease: while a live
+chat process holds it (the user is in that chat), the wake waits and tries
+a little later, which is no failure. A logged-out CLI pauses the agent's
 lane until the user resumes it; a spent quota rests it, with the reason on
 the Queue page and Today.
 
@@ -46,12 +48,9 @@ import asyncio
 import json
 import logging
 import re
-import shutil
-import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import harvey.overlay.queries  # noqa: F401  (registers the named statements)
 from harvey import queries
@@ -252,7 +251,7 @@ async def wakes_today(state, plan_id) -> int:
 
 async def enqueue(state, plan_id) -> str | None:
     """Queue the plan's wake: its job's id, or None (the plan isn't open,
-    nothing is due, the brain is Codex, the day's wakes are used, its last
+    nothing is due, the brain can't run here, the day's wakes are used, its last
     wake failed within FAILED_RETRY_SECONDS, or a wake is queued or
     running already: it reads the new events too). The events due when
     the plan's wake was last cancelled are set aside: a cancelled wake
@@ -487,7 +486,6 @@ async def held(state) -> dict | None:
 
 async def run(ctx) -> dict:
     """The agent_wake job: one wake of a plan (see the module's doc)."""
-    from harvey import claude_runtime
     from harvey.agent import chat, plans
     from harvey.brain import Brain
     from harvey.modules import jobs
@@ -503,7 +501,7 @@ async def run(ctx) -> dict:
     config = chat._config()
     why = chat.refusal(config)
     if why:
-        raise jobs.JobError("wakes run on Claude only: " + why)
+        raise jobs.JobError("wakes can't run: " + why)
     events = await due_events(state, plan_id)
     if not events:
         return {"plan": plan_id, "events": 0}
@@ -517,10 +515,7 @@ async def run(ctx) -> dict:
                "(usage.max_daily_claude_percent): the wakes wait")
         await hold(state, why, BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=BUDGET_RETRY_SECONDS)
-    try:
-        exe = await asyncio.to_thread(claude_runtime.check_cli, None, claude_runtime.AGENT_FLAGS)
-    except claude_runtime.ClaudeRuntimeError as e:
-        raise jobs.LaneExhausted(f"the Claude CLI can't be used for wakes: {e}") from None
+    exe = await runner(config, "wakes")
     owner = OWNER_PREFIX + ctx.job.id
     lease = chat._lease(plan["chat"])
     if not await acquire_lease(state, owner, chat.LEASE_TTL_SECONDS, lease):
@@ -570,7 +565,8 @@ async def run(ctx) -> dict:
     answered = payload is not None and not payload.get("is_error") and bool(response) \
         and not ended
     if not answered:
-        await no_answer(state, payload, response, err, ended, exit_code)
+        await no_answer(state, payload, response, err, ended, exit_code,
+                        provider=_provider_of(exe))
     await state.delete_setting(HOLD_KEY)
     why_woke = label(events)
     quiet = answered and silent(response)
@@ -603,26 +599,31 @@ def turn_limit(payload, ended: str) -> bool:
 
 
 async def no_answer(state, payload, response: str, err: str, ended: str, exit_code, *,
-                    what: str = "wake", timeout: int = TIMEOUT_SECONDS) -> None:
+                    what: str = "wake", timeout: int = TIMEOUT_SECONDS,
+                    provider: str = "") -> None:
     """A run of the agent's lane (a wake, a task) that got no answer: a
     logged-out CLI pauses the lane, a spent quota rests it, anything else
     but the turn limit fails the job (its detail is Harvey's own words, a
     tail of the CLI's for the Queue page). Returns at the turn limit."""
-    from harvey.agent import chat
+    from harvey.agent import chat, driver
     from harvey.modules import jobs
 
     lowered = (response + " " + err).lower()
-    if any(p in lowered for p in chat._LOGIN_PATTERNS):
-        raise jobs.LaneExhausted("Claude isn't logged in: run claude login, then resume "
-                                 "the agent's lane on the Queue page")
-    if any(p in lowered for p in _QUOTA_PATTERNS):
-        why = f"your Claude plan's limit is reached for now: the {what}s wait"
+    kind = (payload or {}).get("error_kind")
+    codex = (payload or {}).get("provider") == driver.CODEX or provider == driver.CODEX
+    if kind == "auth" or any(p in lowered for p in chat._LOGIN_PATTERNS):
+        raise jobs.LaneExhausted(driver.login_detail(driver.CODEX if codex else driver.CLAUDE)
+                                 + ", then resume the agent's lane on the Queue page")
+    if kind == "usage_limit" or any(p in lowered for p in _QUOTA_PATTERNS):
+        why = (f"your {'ChatGPT' if codex else 'Claude'} plan's limit is reached for now: "
+               f"the {what}s wait")
         await hold(state, why, QUOTA_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=QUOTA_RETRY_SECONDS)
     if not turn_limit(payload, ended):
         detail = (f"no answer after {timeout} s" if ended == "timeout"
                   else response[:300] if payload is not None
-                  else f"the Claude CLI ended (exit {exit_code}): {err[:300]}")
+                  else f"{driver.label(driver.CODEX if codex else driver.CLAUDE)} ended "
+                       f"(exit {exit_code}): {err[:300]}")
         raise jobs.JobError(f"the {what} got no answer: {detail}".strip())
 
 
@@ -652,25 +653,17 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
     asked every STOP_POLL_SECONDS: when it says to stop, the CLI is ended
     at once and it ends "stopped"."""
     calling = {} if calling is None else calling
-    from harvey import claude_runtime
-    from harvey.agent import chat
+    from harvey.agent import chat, driver
+    from harvey.modules import jobs
 
     max_turns = chat.MAX_TURNS if max_turns is None else int(max_turns)
-    folder = tempfile.mkdtemp(prefix="harvey-agent-mcp-")
-    cwd = str(Path(tempfile.mkdtemp(prefix="harvey-claude-")).resolve())
-    config_path = Path(folder) / "mcp.json"
-    config_path.write_text(json.dumps(chat.mcp_config(state.db_path, chat_id, task=task)),
-                           encoding="utf-8")
-    cmd = claude_runtime.build_agent_command(exe, str(config_path), max_turns=chat.PROCESS_TURNS,
-                                             model=model)
     try:
-        proc = await chat.Process.start(cmd, cwd, claude_runtime.runtime_env(cwd, safe=False),
-                                        [folder, cwd])
+        proc = await driver.start(exe, state.db_path, chat_id, task=task, model=model)
+    except driver.Unusable as e:
+        raise _unusable(e, "the agent") from None
     except OSError as e:
-        shutil.rmtree(folder, ignore_errors=True)
-        shutil.rmtree(cwd, ignore_errors=True)
-        from harvey.modules import jobs
-        raise jobs.LaneExhausted(f"the Claude CLI couldn't be started: {e}") from None
+        raise jobs.LaneExhausted(f"{driver.label(_provider_of(exe))} couldn't be started: "
+                                 f"{e}") from None
     calling["started"] = True
     turns, ids, usage, ended, result = 0, set(), None, "", None
     deadline = time.monotonic() + timeout
@@ -738,6 +731,36 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
     return result, turns, usage, ended, err, proc.proc.returncode
 
 
+def _provider_of(exe) -> str:
+    from harvey.agent import driver
+
+    return driver.CODEX if isinstance(exe, driver.CodexRunner) else driver.CLAUDE
+
+
+async def runner(config, what: str):
+    """What runs the agent for a wake or a task (driver.check), or
+    LaneExhausted saying why it can't (the lane pauses until the user
+    resumes it; a spent ChatGPT quota rests it)."""
+    from harvey.agent import driver
+
+    try:
+        return await driver.check(config)
+    except driver.Unusable as e:
+        raise _unusable(e, what) from None
+
+
+def _unusable(e, what: str):
+    """driver.Unusable as the job error it is: a spent quota rests the lane
+    (QUOTA_RETRY_SECONDS), anything else pauses it."""
+    from harvey.agent import driver
+    from harvey.modules import jobs
+
+    if e.kind == "usage_limit":
+        return jobs.LaneExhausted(f"your ChatGPT plan's limit is reached for now: {what} "
+                                  "waits", retry_after=QUOTA_RETRY_SECONDS)
+    return jobs.LaneExhausted(f"{driver.label(e.provider)} can't be used for {what}: {e}")
+
+
 async def _interrupted(proc) -> dict | None:
     """Interrupt the CLI: the result it ends with, or None."""
     from harvey.agent import chat
@@ -765,7 +788,7 @@ async def _record(state, brain, payload, turns: int, started: float, turn: str,
 
     ms = int((time.monotonic() - started) * 1000)
     try:
-        await state.increment_usage()
+        await state.increment_usage(provider=brain.provider)
         if payload is None:
             await brain._record_usage({"usage": {}, "num_turns": turns, "is_error": True,
                                        "duration_ms": ms}, agent="agent", task=task, label=turn)

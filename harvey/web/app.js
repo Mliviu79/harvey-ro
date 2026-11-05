@@ -6953,7 +6953,10 @@ async function loadChatList() {
   _chatList = data;
   const note = document.getElementById('chat-note');
   note.innerHTML = data.refused
-    ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>' : '';
+    ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>'
+    : data.provider === 'codex'
+      ? '<p class="muted small">' + escHtml(t('chat.on_codex', {model: data.model || t('chat.model_default')})) + '</p>'
+      : '';
   el.innerHTML = renderChatList(data.chats || [], _chatId, q);
   const side = document.getElementById('chat-plans');
   if (side) side.innerHTML = renderPlanList((plans && plans.plans) || [], data.chats || []);
@@ -7466,7 +7469,9 @@ async function deleteChat(id) {
 
 function chatRefused(r) {
   const code = r && own(CHAT_REFUSALS, r.code) ? r.code : '';
-  showToast(code ? t('chat.refused.' + code) : ((r && r.message) || t('chat.send_failed')), 'error');
+  // (The CLI's own words say what to do about it: a login, a version.)
+  const detail = code === 'cli' && r.message ? ' ' + r.message : '';
+  showToast(code ? t('chat.refused.' + code) + detail : ((r && r.message) || t('chat.send_failed')), 'error');
 }
 
 function chatKey(ev) {

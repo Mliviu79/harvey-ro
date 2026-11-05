@@ -4721,13 +4721,19 @@ def _chat_refused(e) -> JSONResponse:
 async def get_agent_chats(q: str = "", limit: int = 100):
     """The chats, newest activity first ({id, title, created_at, last_at,
     answering}), those whose title holds ``q``; why the chat can't run with
-    these settings (``refused``: Codex as the brain)."""
+    these settings (``refused``: Codex where it isn't supported); who
+    answers (``provider``, claude or codex, and ``model``, "" for its
+    default)."""
     from harvey.agent import chat
 
     state = _state()
     await state.init_db()
+    config = _load_config_quietly()
+    brain = getattr(config, "brain", None)
     return {"chats": await chat.chats(state, q, limit),
-            "refused": chat.refusal(_load_config_quietly())}
+            "refused": chat.refusal(config),
+            "provider": getattr(brain, "provider", "claude") or "claude",
+            "model": getattr(brain, "model", "") or ""}
 
 
 @app.post("/api/agent/chats")

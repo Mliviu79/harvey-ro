@@ -804,7 +804,12 @@ def test_over_the_budget_a_message_is_refused_and_nothing_written(state, fake, m
     assert live == {} and fake() == []
 
 
-def test_codex_and_an_empty_or_long_message_are_refused(state, fake):
+def test_codex_where_it_cant_run_and_an_empty_or_long_message_are_refused(state, fake,
+                                                                          monkeypatch):
+    # (Codex runs the chat on macOS and Linux: elsewhere it is refused.)
+    from harvey import codex
+    monkeypatch.setattr(codex, "_PLATFORM", "win32")
+
     async def work(h):
         out = []
         for text, cfg in (("Salut", _config("codex")), ("   ", None),
@@ -970,7 +975,8 @@ def _events(body: str) -> list[dict]:
 
 
 def test_the_dashboard_keeps_chats_and_streams_an_answer_in_order(client, fake, monkeypatch):
-    assert client.get("/api/agent/chats").json() == {"chats": [], "refused": ""}
+    assert client.get("/api/agent/chats").json() == {"chats": [], "refused": "",
+                                                     "provider": "claude", "model": ""}
     r = client.post("/api/agent/chats", json={"text": "Câte contacte am?"})
     assert r.status_code == 200 and r.json()["success"] is True
     chat_id, turn = r.json()["chat"], r.json()["turn"]
@@ -1013,9 +1019,13 @@ def test_the_dashboard_keeps_chats_and_streams_an_answer_in_order(client, fake, 
     assert client.get("/api/agent/chats").json()["chats"] == []
 
     monkeypatch.setattr(dash, "_load_config_quietly", lambda: _config("codex"))
+    listed = client.get("/api/agent/chats").json()
+    assert listed["refused"] == "" and listed["provider"] == "codex"
+    from harvey import codex
+    monkeypatch.setattr(codex, "_PLATFORM", "win32")
     refused = client.post("/api/agent/chats", json={"text": "Salut"})
     assert refused.status_code == 409 and refused.json()["code"] == "codex"
-    assert "Codex" in client.get("/api/agent/chats").json()["refused"]
+    assert "Windows" in client.get("/api/agent/chats").json()["refused"]
 
 
 def test_coming_back_to_a_chat_follows_its_answer_again(client, fake):

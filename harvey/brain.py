@@ -573,8 +573,10 @@ class Brain:
                 duration_ms=duration_ms,
                 num_turns=num_turns,
                 is_error=is_error,
-                source="result_json",
-                provider="claude",
+                # (The agent's Codex runs give their result in this shape
+                # too: harvey/agent/driver.py.)
+                source="codex_app_server" if self.provider == "codex" else "result_json",
+                provider=self.provider,
                 **row,
             )
 

@@ -25,8 +25,8 @@ there goes back in its answer's to_do.
 Bounds: at most OPEN_MAX tasks of a plan queued or running, PER_DAY
 assigned in 24 hours, TASK_TURNS turns and TIMEOUT_SECONDS a run.
 Closing or cancelling the plan, or deleting its chat, cancels its tasks
-(a running one is stopped, like a wake). Codex refuses tasks, as it does
-wakes. Its tokens go to usage_events (agent ``agent``, task
+(a running one is stopped, like a wake). A task runs on the agent's
+driver (driver.py: Claude, or Codex when brain.provider says so). Its tokens go to usage_events (agent ``agent``, task
 ``task.<profile>``) and to the task's row, which the plan card counts.
 """
 
@@ -363,7 +363,8 @@ def _masked(value):
 async def assign(state, plan_id, chat: str, parent_turn: str, profile: str, prompt: str,
                  campaign: str = "") -> dict:
     """A task under an approved plan of ``chat``, queued as an agent_task
-    job: the task, or Refused (no such plan, Codex, a profile that isn't,
+    job: the task, or Refused (no such plan, Codex where it can't run, a
+    profile that isn't,
     a campaign that isn't the plan's draft, an empty or long prompt, the
     plan's tasks at their caps)."""
     from harvey.agent import chat as chats, memory, outreach, plans
@@ -376,7 +377,7 @@ async def assign(state, plan_id, chat: str, parent_turn: str, profile: str, prom
         raise Refused(str(e)) from None
     why = chats.refusal(chats._config())
     if why:
-        raise Refused("tasks run on Claude only: " + why)
+        raise Refused("tasks can't run: " + why)
     p = PROFILES.get(str(profile or ""))
     if p is None:
         raise Refused(f"no profile {profile!r}: one of {', '.join(sorted(PROFILES))}")
@@ -577,7 +578,6 @@ async def prime(state, plan: dict, task: dict) -> str:
 
 async def run(ctx) -> dict:
     """The agent_task job: one child run (see the module's doc)."""
-    from harvey import claude_runtime
     from harvey.agent import chat, plans, wakes
     from harvey.brain import Brain
     from harvey.modules import jobs
@@ -596,8 +596,8 @@ async def run(ctx) -> dict:
     config = chat._config()
     why = chat.refusal(config)
     if why:
-        await _end(state, tid, FAILED, problem="tasks run on Claude only")
-        raise jobs.JobError("tasks run on Claude only: " + why)
+        await _end(state, tid, FAILED, problem="tasks can't run with these settings")
+        raise jobs.JobError("tasks can't run: " + why)
     brain = Brain(state, getattr(config, "brain", None))
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await brain.is_within_budget(max_percent=percent):
@@ -605,10 +605,7 @@ async def run(ctx) -> dict:
                "(usage.max_daily_claude_percent): the agent's wakes and tasks wait")
         await wakes.hold(state, why, wakes.BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=wakes.BUDGET_RETRY_SECONDS)
-    try:
-        exe = await asyncio.to_thread(claude_runtime.check_cli, None, claude_runtime.AGENT_FLAGS)
-    except claude_runtime.ClaudeRuntimeError as e:
-        raise jobs.LaneExhausted(f"the Claude CLI can't be used for tasks: {e}") from None
+    exe = await wakes.runner(config, "tasks")
     if not await _write(state, "overlay.agent.task_start", (_now(), tid)):
         # (Cancelled since it was read: no run.)
         return {"task": tid, "skipped": "the task is no longer open"}
@@ -647,7 +644,7 @@ async def run(ctx) -> dict:
         await _write(state, "overlay.agent.task_tokens", (tokens, tid))
         try:
             await wakes.no_answer(state, payload, response, err, ended, exit_code, what="task",
-                                  timeout=TIMEOUT_SECONDS)
+                                  timeout=TIMEOUT_SECONDS, provider=wakes._provider_of(exe))
         except jobs.LaneExhausted:
             # (It waits, queued again: no failure.)
             await _write(state, "overlay.agent.task_requeue", (tid,))

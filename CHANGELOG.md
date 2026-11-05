@@ -9,6 +9,26 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The agent runs on Codex too (opt-in).** With `brain.provider: codex`
+  the Chat tab, `harvey agent chat`, the agent's wakes and its tasks run on
+  Codex's app-server instead of being refused: the brain's private runtime
+  (Codex CLI 0.159.3 only, a temporary home, an access-only copy of your
+  ChatGPT login, the lockdown attested before the login is put in and
+  again after), with Harvey's own tool server as its only MCP server
+  (checked in the effective config and on the thread), no shell, file
+  editing or web search, read-only, approval never. The answer streams as
+  it is written, each Harvey tool call shows as it runs, Harvey counts its
+  turns, Stop interrupts the turn, and anything but Harvey's tools ends the
+  answer and the runtime. A chat's runtime is replaced (primed from the
+  chat on file) before its login copy, which has no refresh token, could
+  run out during an answer, and after Codex refuses it. Tokens are
+  recorded under provider Codex, and the
+  same plans, budgets and `usage.max_daily_claude_percent` share (of the
+  ChatGPT plan's windows) apply. Claude stays the default; Harvey never
+  switches on its own; Windows still refuses Codex. Checked against the real
+  0.159.3 CLI with a local stand-in model (no credentials, no network); a
+  live answer on a ChatGPT account isn't verified yet.
+
 - **The agent hands work on to tasks.** Under an approved plan the agent
   can `assign_task(plan, profile, prompt)`: a child run as an `agent_task`
   job on the agent's lane, with one profile's tools only (`researcher`:
@@ -111,7 +131,7 @@ minor versions can still change behaviour.
   are coalesced (one wake queued or running per plan, reading every event
   not yet seen), at most 12 wakes a plan a day, only while the plan is
   approved and open, within Harvey's share of your Claude plan (over it,
-  the wakes wait and the lane rests); Codex refuses wakes. A logged-out CLI
+  the wakes wait and the lane rests). A logged-out CLI
   pauses the agent's lane, a spent plan limit rests it, with the reason on
   the Queue page and Today. While you are in the chat the wake waits for
   you; a chat whose process was given the conversation before a wake
@@ -196,8 +216,8 @@ minor versions can still change behaviour.
   copied from websites and replies; 5 s). It can't act yet. Every tool call
   is recorded (`agent_tool_call`) and shown under its answer. Schemas 31 and
   32 add the chats' tables (messages already on file become one chat; the earlier chat jobs still waiting are cancelled). The `mcp` package is new: rebuild the Docker
-  image (`docker compose build harvey`). Claude only: with Codex as the
-  brain the chat says so.
+  image (`docker compose build harvey`). With Codex as the brain it runs
+  on Codex (see above).
 - **Settings → Classifier explains itself, and everything it does is on
   the page.** The card says what the classifier decides (whether a website
   a search found is the firm's, which contacts on it are the firm's), when

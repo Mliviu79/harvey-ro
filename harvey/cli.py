@@ -4375,8 +4375,8 @@ def main():
         "agent", help="The chats with Harvey's agent, its plans, tasks and memory: chats, "
                       "chat, ask, rename, delete, log, plans, tasks, memory",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
-                    "tools and runs on your Claude plan (within "
-                    "usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
+                    "tools and runs on your Claude plan, or your ChatGPT plan with "
+                    "brain.provider: codex (within usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
                     "only you approve it (here or on the Chat tab), and it queues runs only "
                     "under it, and Harvey wakes it when a run of the plan finishes or at a "
                     "time it scheduled (its answer lands in the plan's chat). Chats are kept "

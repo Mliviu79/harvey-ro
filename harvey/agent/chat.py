@@ -1,5 +1,7 @@
 """The chats with Harvey's agent: conversations the user keeps, each
-answered by a live Claude CLI process while it is in use.
+answered by a live process while it is in use: the Claude CLI's, or
+Codex's app-server when brain.provider is codex (driver.py, read as the
+same stream-json events; what follows says the CLI for either).
 
 A chat (agent_chat, schema 32) is kept until the user deletes it: titled
 from its first message (TITLE_CHARS, no model call) or renamed, listed by
@@ -47,7 +49,6 @@ import json
 import logging
 import shutil
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -113,10 +114,8 @@ ERRORS = ("login", "max_turns", "failed", "timeout", "stopped")
 REFUSALS = ("empty", "too_long", "codex", "budget", "busy", "elsewhere", "cli", "full",
             "missing", "retry", "waking")
 
-CODEX_REFUSED = ("The chat runs on Claude only for now: Codex needs a mode of its own to load "
-                 "Harvey's tools. Set brain.provider: claude in harvey.local.yaml to use it.")
 _LOGIN_PATTERNS = ("not logged in", "please run `claude login`", "invalid api key",
-                   "unauthorized")
+                   "unauthorized", "run 'codex login'")
 
 
 class Refused(ValueError):
@@ -136,11 +135,11 @@ def _config():
 
 
 def refusal(config) -> str:
-    """Why the chat can't run with these settings, or ""."""
-    brain = getattr(config, "brain", None)
-    if getattr(brain, "provider", "claude") == "codex":
-        return CODEX_REFUSED
-    return ""
+    """Why the chat can't run with these settings, or "" (driver.refusal:
+    Codex where it isn't supported)."""
+    from harvey.agent import driver
+
+    return driver.refusal(config)
 
 
 def _now() -> int:
@@ -480,7 +479,10 @@ async def opening(state, chat_id: str, turn: str) -> list[str]:
 
 class Process:
     """One CLI process: JSON lines in and out, its stderr's tail kept, its
-    MCP config folder and working folder removed when it ends."""
+    MCP config folder and working folder removed when it ends (the Claude
+    CLI's; driver.CodexProcess is Codex's, read the same way)."""
+
+    label = "the Claude CLI"
 
     def __init__(self, proc, folders: list[str]):
         self.proc = proc
@@ -711,6 +713,20 @@ class Hub:
         self.owner = f"chat-{uuid.uuid4().hex[:12]}"
         self.chats: dict[str, Live] = {}
         self._room = asyncio.Lock()
+        self._brain = None
+
+    def brain(self, config):
+        """The Brain for these settings. On Codex it is kept while they stay
+        the same, so its quota reading is cached (reading it starts a
+        runtime); on Claude a new one each message, as before."""
+        from harvey.brain import Brain
+
+        settings = getattr(config, "brain", None)
+        if getattr(settings, "provider", "claude") != "codex":
+            return Brain(self.state, settings)
+        if self._brain is None or self._brain.config != settings:
+            self._brain = Brain(self.state, settings)
+        return self._brain
 
     def _live(self, chat_id: str) -> "Live":
         live = self.chats.get(chat_id)
@@ -873,14 +889,13 @@ class Live:
     # The process
 
     async def _start(self, config) -> None:
-        from harvey import claude_runtime
+        from harvey.agent import driver
         from harvey.modules.worker import acquire_lease, lease_holder
 
         await self.close_process()
         try:
-            exe = await asyncio.to_thread(claude_runtime.check_cli, None,
-                                          claude_runtime.AGENT_FLAGS)
-        except claude_runtime.ClaudeRuntimeError as e:
+            runner = await driver.check(config)
+        except driver.Unusable as e:
             raise Refused(str(e), "cli") from None
         async with self.hub._room:
             name = _lease(self.chat_id)
@@ -893,23 +908,16 @@ class Live:
             except Refused:
                 await self._release()
                 raise
-            folder = tempfile.mkdtemp(prefix="harvey-agent-mcp-")
-            cwd = str(Path(tempfile.mkdtemp(prefix="harvey-claude-")).resolve())
             try:
-                config_path = Path(folder) / "mcp.json"
-                config_path.write_text(json.dumps(mcp_config(self.state.db_path, self.chat_id)),
-                                       encoding="utf-8")
-                brain = getattr(config, "brain", None)
-                cmd = claude_runtime.build_agent_command(
-                    exe, str(config_path), max_turns=PROCESS_TURNS,
-                    model=getattr(brain, "model", "") or "")
-                self.proc = await Process.start(
-                    cmd, cwd, claude_runtime.runtime_env(cwd, safe=False), [folder, cwd])
-            except OSError as e:
-                shutil.rmtree(folder, ignore_errors=True)
-                shutil.rmtree(cwd, ignore_errors=True)
+                self.proc = await driver.start(
+                    runner, self.state.db_path, self.chat_id,
+                    model=getattr(getattr(config, "brain", None), "model", "") or "")
+            except driver.Unusable as e:
                 await self._release()
-                raise Refused(f"the Claude CLI couldn't be started: {e}", "cli") from None
+                raise Refused(str(e), "cli") from None
+            except OSError as e:
+                await self._release()
+                raise Refused(f"{driver.label(config)} couldn't be started: {e}", "cli") from None
         self.turns_used = 0
         self.last_usage = {}
         self._pending = None
@@ -970,12 +978,10 @@ class Live:
     async def ask(self, text: str, config, new: bool = False, retry_of: str = "") -> Answer:
         """Send a checked message (Hub.ask, Hub.retry): ``new``, the chat's
         first; ``retry_of``, the turn it sends again."""
-        from harvey.brain import Brain
-
         async with self.lock:
             if self.answering:
                 raise Refused("an answer is still coming: wait for it, or stop it", "busy")
-            brain = Brain(self.state, getattr(config, "brain", None))
+            brain = self.hub.brain(config)
             percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
             if not await brain.is_within_budget(max_percent=percent):
                 raise Refused(f"Harvey's share of your {brain.provider_label} plan is used for "
@@ -983,7 +989,8 @@ class Live:
             if not new and await chat_info(self.state, self.chat_id) is None:
                 raise Refused("no such chat", "missing")
             fresh = (self.proc is None or not self.proc.alive
-                     or self.turns_used + MAX_TURNS > PROCESS_TURNS)
+                     or self.turns_used + MAX_TURNS > PROCESS_TURNS
+                     or getattr(self.proc, "stale", False))
             if self._idle is not None:
                 self._idle.cancel()
                 self._idle = None
@@ -1231,6 +1238,8 @@ class Live:
 
     async def _settle(self, answer, brain, result, ended, turns, started) -> None:
         """Write how the answer ended, from the result (or its absence)."""
+        from harvey.agent import driver
+
         if result is None:
             # (The call ran, and used the plan, until it ended: counted.)
             detail = {"stopped": "stopped before the answer was finished",
@@ -1249,9 +1258,10 @@ class Live:
                     "utf-8", errors="replace").strip()
                 exit_code = proc.proc.returncode if proc is not None else None
                 if any(p in err.lower() for p in _LOGIN_PATTERNS):
-                    code, detail = "login", "Claude isn't logged in: run claude login"
+                    code, detail = "login", driver.login_detail(brain.provider)
                 else:
-                    detail = f"the Claude CLI ended (exit {exit_code}): {err[:300]}".strip()
+                    who = proc.label if proc is not None else "the CLI"
+                    detail = f"{who} ended (exit {exit_code}): {err[:300]}".strip()
             await self._finish(answer, brain, None, code, detail or "no answer", turns, started)
             return
         payload = result
@@ -1268,9 +1278,10 @@ class Live:
                                turns, started)
         elif payload.get("is_error") or not response:
             # A logged-out CLI says so in its result, not on stderr.
-            if any(p in response.lower() for p in _LOGIN_PATTERNS):
+            if payload.get("error_kind") == "auth" \
+                    or any(p in response.lower() for p in _LOGIN_PATTERNS):
                 await self._finish(answer, brain, payload, "login",
-                                   "Claude isn't logged in: run claude login", turns, started)
+                                   driver.login_detail(brain.provider), turns, started)
             else:
                 await self._finish(answer, brain, payload, "failed",
                                    response[:300] or "no answer", turns, started)
@@ -1285,7 +1296,7 @@ class Live:
         tokens = 0
         context = context_of(payload, answer.usage)
         try:
-            await state.increment_usage()
+            await state.increment_usage(provider=brain.provider)
             if payload is None:
                 # (Ended with no result: the call ran and used the plan, its
                 # tokens unknown. A row all the same, so the call is counted

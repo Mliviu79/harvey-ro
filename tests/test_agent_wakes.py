@@ -487,9 +487,11 @@ def test_the_turn_limit_stops_a_wake_and_says_so(state, fake, monkeypatch):
     assert _q(state, "SELECT seen_at IS NOT NULL FROM agent_event") == [(1,)]
 
 
-def test_codex_and_the_days_wakes_queue_nothing(state, monkeypatch):
+def test_codex_where_it_cant_run_and_the_days_wakes_queue_nothing(state, monkeypatch):
+    from harvey import codex
     plan_id = _plan(state)
     monkeypatch.setattr(chat, "_config", lambda: _config("codex"))
+    monkeypatch.setattr(codex, "_PLATFORM", "win32")
     _run(wakes.note(state, plan_id, "reply", "r1", {}))
     assert _wake_jobs(state) == []
     monkeypatch.setattr(chat, "_config", lambda: _config())

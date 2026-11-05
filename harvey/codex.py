@@ -950,6 +950,15 @@ class _AppServer:
     """One private Codex runtime: a temporary home and workspace, and at
     most one ``codex`` process at a time."""
 
+    # Notifications this runtime never wants (the agent's runtime streams
+    # the answer's text, so it keeps item/agentMessage/delta), and TOML
+    # added to its private config.toml (the agent's MCP server).
+    opted_out = OPTED_OUT_NOTIFICATIONS
+    extra_toml = ""
+    # Set on every entry of the private catalog (the agent's runtime: its
+    # MCP tools offered directly, not behind a tool search).
+    catalog_overrides: dict = {}
+
     def __init__(self, codex_path: str):
         self.codex_path = codex_path
         self.root = ""
@@ -976,7 +985,7 @@ class _AppServer:
             os.mkdir(self.workspace, 0o700)
             os.chmod(self.root, 0o700)
             with open(os.path.join(self.codex_home, "config.toml"), "w", encoding="utf-8") as f:
-                f.write(build_private_config_toml())
+                f.write(build_private_config_toml() + self.extra_toml)
         except OSError as e:
             raise CodexError(
                 f"Could not create Codex's private runtime folder ({type(e).__name__}).",
@@ -1000,7 +1009,7 @@ class _AppServer:
         """Install Harvey's generated catalog in this disposable runtime only."""
         self.model_catalog_path = os.path.join(self.codex_home, "text-models.json")
         with open(self.model_catalog_path, "x", encoding="utf-8") as f:
-            json.dump({"models": list(catalog.values())}, f)
+            json.dump({"models": [{**m, **self.catalog_overrides} for m in catalog.values()]}, f)
         path = os.path.join(self.codex_home, "config.toml")
         with open(path, encoding="utf-8") as f:
             config = f.read()
@@ -1071,7 +1080,7 @@ class _AppServer:
             "capabilities": {
                 "experimentalApi": True,
                 "requestAttestation": False,
-                "optOutNotificationMethods": OPTED_OUT_NOTIFICATIONS,
+                "optOutNotificationMethods": list(self.opted_out),
             },
         }, deadline)
         # The process actually serving must be the version that was checked.

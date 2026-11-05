@@ -96,9 +96,21 @@ class _MockModel(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length", 0)))
         type(self).requests.append(json.loads(body))
+        request = type(self).requests[-1]
+        answered = any(i.get("type") == "function_call_output" for i in request.get("input", []))
         if type(self).mode == "toolcall":
             item = {"type": "function_call", "id": "fc", "call_id": "c", "name": "exec_command",
                     "arguments": "{\"cmd\": \"id\"}"}
+        elif type(self).mode == "agent" and not answered:
+            # (Harvey's schema tool, by whatever name the model is offered it.)
+            ns, name = next(e for e in _tool_entries(request) if e[1] and "schema" in e[1])
+            item = {"type": "function_call", "id": "fc", "call_id": "c", "name": name,
+                    "arguments": "{}"}
+            if ns:
+                item["namespace"] = ns
+        elif type(self).mode == "agent":
+            item = {"type": "message", "role": "assistant", "id": "m",
+                    "content": [{"type": "output_text", "text": "DONE"}]}
         else:
             item = {"type": "message", "role": "assistant", "id": "m",
                     "content": [{"type": "output_text", "text": "PONG"}]}
@@ -439,3 +451,73 @@ async def test_real_cli_preflight_checks_the_model_without_inference(mock_codex,
     await hc.CodexClient(model="gpt-6.1-sol",
                          native_home=mock_codex.native_home).preflight(timeout=60)
     assert mock_codex.requests == []
+
+
+# ── the agent: Harvey's MCP server, and nothing else ──
+
+
+def _tool_entries(request) -> list:
+    """Every tool the model is offered: (namespace, name), a namespace's
+    children included."""
+    out = []
+    pools = [request.get("tools") or []] + [
+        i.get("tools") or [] for i in request.get("input", []) if i.get("type") == "additional_tools"]
+    for pool in pools:
+        for t in pool:
+            if t.get("type") == "namespace":
+                out += [(t.get("name"), c.get("name")) for c in t.get("tools") or []]
+            else:
+                out.append(("", t.get("name") or t.get("type")))
+    return out
+
+
+@pytest.mark.asyncio
+async def test_real_cli_agent_gets_harveys_tools_only_and_runs_one(mock_codex, monkeypatch,
+                                                                   tmp_path):
+    """The agent's runtime (harvey/agent/driver.py) against the real CLI: the
+    model is offered Harvey's MCP tools and nothing else, a call to one runs
+    through Harvey's server with no approval asked, and the answer comes back
+    as the events the chat reads."""
+    import asyncio
+
+    from harvey.agent import driver
+    from harvey.state import StateManager
+
+    monkeypatch.setattr(hc, "DISABLED_FEATURES",
+                        hc.DISABLED_FEATURES + ("enable_request_compression",))
+    state = StateManager(str(tmp_path / "harvey.db"))
+    await state.init_db()
+    async with state._connect() as db:
+        await db.execute("INSERT INTO agent_chat (id, title, created_at, last_at, turn) "
+                         "VALUES ('c1', 'Test', 1, 1, 't1')")
+        await db.commit()
+    mock_codex.set_mode("agent")
+    runner = driver.CodexRunner(hc.find_codex(), "gpt-5.5")
+    proc = await driver.CodexProcess.start(runner, state.db_path, "c1")
+    events = []
+    try:
+        await proc.send({"type": "user", "message": {"role": "user", "content": "Câte firme?"}})
+        while True:
+            event = await asyncio.wait_for(proc.read(), 60)
+            if event is None:
+                break
+            events.append(event)
+            if event.get("type") == "result":
+                break
+    finally:
+        await proc.close()
+    offered = _tool_entries(mock_codex.requests[0])
+    # Harvey's tools in their namespace, offered directly (no tool search),
+    # and Codex's own readers of the (Harvey's) server's resources: no
+    # shell, file edits, web search or anything else.
+    names = {name for ns, name in offered if ns == "mcp__harvey"}
+    assert {"schema", "counts", "query", "propose_plan"} <= names
+    assert {name for ns, name in offered if ns != "mcp__harvey"} == driver.MCP_RESOURCE_TOOLS
+    result = events[-1]
+    assert result["type"] == "result" and not result["is_error"], result
+    assert result["result"] == "DONE"
+    assert any(e.get("type") == "assistant" and e["message"]["content"]
+               and e["message"]["content"][0].get("type") == "tool_use" for e in events)
+    async with state._connect() as db:
+        async with db.execute("SELECT tool, outcome FROM agent_tool_call") as cur:
+            assert await cur.fetchall() == [("schema", "ok")]

@@ -332,8 +332,11 @@ def test_assign_task_is_refused_outside_its_bounds(state, monkeypatch):
         assert refused(plan_id) == ""
         _x(state, "UPDATE agent_task SET status = 'done'")
     assert f"{tasks.PER_DAY} tasks in the last 24 hours" in refused(plan_id)
+    from harvey import codex
     monkeypatch.setattr(chat, "_config", lambda: _config("codex"))
-    assert "tasks run on Claude only" in refused(plan_id)
+    monkeypatch.setattr(codex, "_PLATFORM", "win32")
+    why = refused(plan_id)
+    assert "tasks can't run" in why and "Windows" in why
     outcomes = _q(state, "SELECT outcome, COUNT(*) FROM agent_action WHERE tool = 'assign_task' "
                          "GROUP BY outcome")
     assert dict(outcomes) == {"ok": tasks.PER_DAY, "refused": 11}
@@ -447,9 +450,11 @@ def test_a_child_is_held_to_its_turns(state, fake, monkeypatch):
               task["turn"])[0][0] >= tasks.TASK_TURNS
 
 
-def test_codex_refuses_a_task_already_queued(state, fake, monkeypatch):
+def test_codex_where_it_cant_run_refuses_a_task_already_queued(state, fake, monkeypatch):
+    from harvey import codex
     task = _assign(state, _plan(state))
     monkeypatch.setattr(chat, "_config", lambda: _config("codex"))
+    monkeypatch.setattr(codex, "_PLATFORM", "win32")
     assert _work(state).status == "failed"
     assert _task(state, task["id"])["status"] == "failed" and fake.lines() == []
 
