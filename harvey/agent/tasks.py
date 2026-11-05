@@ -18,7 +18,9 @@ A child can't spend, send, schedule, plan, delegate or remember: the
 profiles never hold those tools (FORBIDDEN), and the server refuses any
 tool outside its profile's even when it is asked for by name. A
 campaign_driver works on the one campaign it was given, a draft of the
-task's plan.
+task's plan, and changes only its sequence (DRIVER_EDITS): its audience,
+offer, note and the rest stay what the agent chose, and anything wrong
+there goes back in its answer's to_do.
 
 Bounds: at most OPEN_MAX tasks of a plan queued or running, PER_DAY
 assigned in 24 hours, TASK_TURNS turns and TIMEOUT_SECONDS a run.
@@ -176,6 +178,9 @@ def register(profile: Profile) -> Profile:
 _READ_MEMORY = frozenset({"notes", "playbooks", "read_playbook"})
 # The tools a campaign_driver calls on its own campaign only.
 CAMPAIGN_TOOLS = frozenset({"campaign_preview", "campaign_status", "replies", "edit_campaign"})
+# What a campaign_driver's edit_campaign may change: the emails it was
+# given to check, never the course the agent chose (audience, offer, note).
+DRIVER_EDITS = frozenset({"sequence"})
 
 register(Profile(
     "researcher",
@@ -203,10 +208,12 @@ register(Profile(
           "notes": _s(1500)}, ["check", "edits", "to_do"]),
     "You check one draft campaign of the plan against writing_rules(): its sequence (the "
     "merge variables, the limits, the banned phrases, the language), its legitimate-interest "
-    "note and what campaign_preview() says it would take. Fix what is wrong in the draft "
-    "with edit_campaign() (this campaign only, while it is a draft), then say what the check "
-    "found (check.ok, its problems), the edits you made, and what the start still needs "
-    "(to_do). You never start, pause or send anything.",
+    "note and what campaign_preview() says it would take. Fix what is wrong in its emails "
+    "with edit_campaign(sequence=...) (this campaign only, while it is a draft; the "
+    "sequence is the only thing you may change). Anything wrong in its audience, offer or "
+    "note goes in to_do for the agent to decide, never changed by you. Then say what the "
+    "check found (check.ok, its problems), the edits you made, and what the start still "
+    "needs (to_do). You never start, pause or send anything.",
     campaign=True))
 
 

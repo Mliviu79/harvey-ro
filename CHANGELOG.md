@@ -14,7 +14,8 @@ minor versions can still change behaviour.
   job on the agent's lane, with one profile's tools only (`researcher`:
   the schema, counts, estimates, areas, phrases and their yield, to propose
   areas, phrases, sources and an estimate; `campaign_driver`: the writing
-  rules and one draft of the plan to check and fix with `edit_campaign`),
+  rules and one draft of the plan to check, fixing only its emails with
+  `edit_campaign`: its audience, offer and note are the agent's to change),
   no chat history, the memory to read, 8 turns and 5 minutes. A child never
   gets a tool that spends, queues a run, sends, schedules, plans, delegates
   or writes the memory: its tool server registers only its profile's

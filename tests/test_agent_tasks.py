@@ -554,6 +554,13 @@ def test_a_campaign_driver_works_on_its_own_campaign_only(tmp_path, monkeypatch)
     assert "campaign " + mine in t.refusal("edit_campaign", {"plan": plan_id, "campaign": other})
     assert "campaign " + mine in t.refusal("replies", {"plan": plan_id})
     assert t.refusal("campaign_status", {"campaign": mine}) == ""
+    # Only the emails it was given: never the audience, offer, note or the rest.
+    assert t.refusal("edit_campaign", {"plan": plan_id, "campaign": mine, "sequence": SEQUENCE,
+                                       "audience": None, "note": None}) == ""
+    for field, value in (("audience", 7), ("name", "Alt nume"), ("offer", "altceva"),
+                         ("note", NOTE_LONG), ("rolling", True), ("always_review", True)):
+        why = t.refusal("edit_campaign", {"plan": plan_id, "campaign": mine, field: value})
+        assert "changes only the sequence, not " + field in why
     assert "isn't a tool" in t.refusal("request_start", {"plan": plan_id, "campaign": mine})
     assert "isn't a tool" in t.refusal("pause_campaign", {"plan": plan_id, "campaign": mine})
     assert "isn't a tool" in t.refusal("discover", {"plan": plan_id})

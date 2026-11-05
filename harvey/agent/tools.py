@@ -128,7 +128,8 @@ class Tools:
     def refusal(self, tool: str, arguments: dict) -> str:
         """Why a task's child may not make this call ("" when it may): the
         task isn't running, the tool isn't its profile's, or the call
-        names another plan or (a campaign_driver's) another campaign.
+        names another plan or (a campaign_driver's) another campaign, or a
+        campaign_driver's edit changes more than tasks.DRIVER_EDITS.
         Checked on every call, whatever tools were listed."""
         con = sqlite3.connect(self.db_path, timeout=readonly.BUSY_TIMEOUT_SECONDS)
         try:
@@ -147,6 +148,14 @@ class Tools:
         if profile.campaign and tool in tasks.CAMPAIGN_TOOLS \
                 and str(arguments.get("campaign") or "") != task["campaign"]:
             return f"this task works on campaign {task['campaign']} only"
+        if profile.campaign and tool == "edit_campaign":
+            changed = sorted(k for k, v in arguments.items()
+                             if k not in ("plan", "campaign") and v is not None
+                             and k not in tasks.DRIVER_EDITS)
+            if changed:
+                return (f"a {task['profile']} task changes only the "
+                        f"{', '.join(sorted(tasks.DRIVER_EDITS))}, not {', '.join(changed)}: "
+                        "say it in to_do")
         return ""
 
     def current(self) -> str:
