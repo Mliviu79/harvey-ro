@@ -1,8 +1,9 @@
 # The agent: a model that reads Harvey's data through Harvey's own tools
 # (harvey/agent/: a read-only MCP server) and answers in the dashboard's
 # chat. It runs on your Claude plan, inside Harvey's share of it
-# (usage.max_daily_claude_percent); one turn per job on its lane. It
-# can't act yet: no tool queues, spends, writes data or touches email.
+# (usage.max_daily_claude_percent): one live Claude process per chat, no
+# job. It can't act yet: no tool queues, spends, writes data or touches
+# email.
 id = "agent"
 name = "Agent"
 description = "A chat that answers questions about Harvey's data, read only."
@@ -14,10 +15,6 @@ markets = []
 requires = []
 default_enabled = true
 secrets = []
-
-# One turn at a time: each is a Claude call with tools, on the plan's quota.
-[[lanes]]
-id = "agent"
 
 [cost]
 as_of = 2026-11-04

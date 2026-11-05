@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 31).
+"""The overlay's tables (harvey.db schema 32).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 31
+LATEST = 32
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -893,9 +893,54 @@ def _to_31(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_31)
 
 
+# ── Schema 32: the chats the user keeps ──
+
+SCHEMA_32 = """
+-- A conversation with Harvey's agent (harvey/agent/chat.py), kept until the
+-- user deletes it: titled from its first message (or renamed), listed by
+-- its last activity. turn: the message being answered now ('' none), which
+-- Harvey's tools record their calls under.
+CREATE TABLE agent_chat (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL, turn TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX agent_chat_recent ON agent_chat(last_at);
+-- The chat a message belongs to; an answer's tokens (its part of the
+-- process's usage) and the context it was answered with (its last model
+-- call's input, cache read and cache creation tokens: how long the chat is).
+ALTER TABLE agent_message ADD COLUMN chat TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_message ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agent_message ADD COLUMN context INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX agent_message_chat ON agent_message(chat, id);
+"""
+
+
+def _to_32(con: sqlite3.Connection) -> None:
+    """Schema 32: agent_chat, and the chat of each message. The messages on
+    file become one chat, titled from its first message. The chat no longer
+    runs as jobs: the agent_turn jobs left waiting are cancelled."""
+    _script(con, SCHEMA_32)
+    con.execute("UPDATE jobs SET status = 'cancelled', error = 'the chat no longer runs as a job', "
+                "finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                "WHERE kind = 'agent_turn' AND status IN ('queued', 'running', 'paused')")
+    first = con.execute("SELECT MIN(created_at), MAX(COALESCE(updated_at, created_at)) "
+                        "FROM agent_message").fetchone()
+    if first[0] is None:
+        return
+    row = con.execute("SELECT text FROM agent_message WHERE role = 'user' "
+                      "ORDER BY id LIMIT 1").fetchone()
+    title = " ".join((row[0] if row else "").split())
+    if len(title) > 60:
+        title = title[:59].rstrip() + "\u2026"
+    con.execute("INSERT INTO agent_chat (id, title, created_at, last_at) VALUES (?, ?, ?, ?)",
+                ("earlier", title, first[0], first[1]))
+    con.execute("UPDATE agent_message SET chat = 'earlier'")
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
-STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31))
+STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
+         (32, _to_32))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

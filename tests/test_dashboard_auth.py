@@ -664,12 +664,20 @@ def test_unusable_token_locks_the_api_but_not_the_shell(env, anon):
 
 # ── Binding and startup ──
 
+def _never_serve(monkeypatch):
+    """The dashboard's server (dash._server_class, which start_dashboard
+    runs) fails the test if it is ever started."""
+    class Server:
+        def __init__(self, config):
+            pytest.fail("must not start")
+    monkeypatch.setattr(dash, "_server_class", lambda: Server)
+
+
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.com", "",
                                   "127.0.0.1.nip.io", "localhost.evil.example"])
 def test_non_loopback_binds_are_refused(env, monkeypatch, host):
-    import uvicorn
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start"))
+    _never_serve(monkeypatch)
     with pytest.raises(dash.DashboardSetupError, match="only listens on this machine"):
         dash.start_dashboard(host=host, port=5555)
 
@@ -677,20 +685,25 @@ def test_non_loopback_binds_are_refused(env, monkeypatch, host):
 @pytest.mark.parametrize("host, shown", [("127.0.0.1", "127.0.0.1"), ("localhost", "localhost"),
                                          ("::1", "[::1]"), ("[::1]", "[::1]")])
 def test_loopback_bind_prints_a_fragment_link(env, monkeypatch, capsys, host, shown):
-    import uvicorn
     calls = []
-    monkeypatch.setattr(uvicorn, "run", lambda app, **k: calls.append(k))
+
+    class Server:
+        def __init__(self, config):
+            calls.append(config)
+
+        def run(self):
+            pass
+    monkeypatch.setattr(dash, "_server_class", lambda: Server)
     dash.start_dashboard(host=host, port=5599)
     out = capsys.readouterr().out
     assert f"http://{shown}:5599/#token={env['token']}" in out
     assert "?token" not in out and "?t=" not in out
-    assert calls[0]["host"] == host.strip("[]") and calls[0]["proxy_headers"] is False
-    assert calls[0]["log_level"] == "warning"
+    assert calls[0].host == host.strip("[]") and calls[0].proxy_headers is False
+    assert calls[0].log_level == "warning"
 
 
 def test_startup_fails_closed_without_a_usable_token(env, monkeypatch):
-    import uvicorn
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start"))
+    _never_serve(monkeypatch)
     bad = env["dir"] / "data" / "bad-token"
     bad.write_text("nope")
     if os.name != "nt":
@@ -702,8 +715,7 @@ def test_startup_fails_closed_without_a_usable_token(env, monkeypatch):
 
 def test_cli_dashboard_refuses_and_prints_links(env, monkeypatch, capsys):
     import harvey.cli as cli
-    import uvicorn
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start"))
+    _never_serve(monkeypatch)
     args = type("A", (), {"host": "0.0.0.0", "port": 5555, "url": False})()
     with pytest.raises(SystemExit) as e:
         cli.cmd_dashboard(args)

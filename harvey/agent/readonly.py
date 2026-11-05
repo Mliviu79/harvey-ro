@@ -7,7 +7,10 @@ one SELECT (or WITH) statement, run under SQLite's authorizer: it may read
 only, and never a table or column below, whatever the statement says (the
 authorizer sees each column the compiled statement reads, through views
 and subqueries too: no string matching). It stops after QUERY_SECONDS
-(a progress handler) and returns at most MAX_ROWS rows.
+(a progress handler). Rows are a sample: SAMPLE_ROWS by default,
+SAMPLE_CAP at most, with how many the statement returns in all, counted
+under the same clock; a statement that aggregates (COUNT, SUM, ...) returns
+its groups in full, up to MAX_ROWS.
 
 Left out: Harvey's settings (keys, tokens), the email bodies and threads,
 and any text Harvey copied from a website or an inbound email (a page's
@@ -16,6 +19,19 @@ model that holds the tools. The agent gets counts and Harvey's own
 fields instead. A table or column added later is readable until it is
 named here: tests/test_agent_tools.py lists every readable one, so a new
 text column must be decided.
+
+Personal values never reach the model either (PERSONAL, REGISTER_PERSONAL:
+a person's name, an email address, a phone number, a profile link, and
+the columns that quote them). query() refuses a statement that reads one,
+wherever it reads it (its result, a WHERE, a GROUP BY, inside a function):
+SQL can rebuild a value from any expression of it (substr, ||, replace,
+CASE, group_concat, a number made of a phone), so no mask of the result
+could hold. The agent counts rows instead, by the columns that aren't
+personal (kind, line type, status, trust), or asks counts(). What the
+views return comes from Harvey's own page reads, and every value a tool
+returns has its email addresses and phone numbers masked all the same
+(mask_result: a***@example.com, +4072****). Firm names are businesses and
+stay.
 """
 
 from __future__ import annotations
@@ -40,6 +56,7 @@ EXCLUDED_TABLES = {
     "processed_replies": "inbound message ids",
     "site_undo": "what a site check took off, with the page text it was read from",
     "agent_message": "the chat itself (the agent is given its history)",
+    "agent_chat": "the chats themselves",
     "agent_tool_call": "the record of the agent's own calls",
     "register_set": "compressed bitmaps, not data",
     "local_fts": "the full-text index of local firms",
@@ -76,13 +93,53 @@ EXCLUDED_COLUMNS = {
     ("jobs", "progress_json"): "a job's log lines, which quote what sources said",
 }
 
+# Personal values in the tables the agent reads, each with why: query()
+# refuses any statement that reads one (see the module's docstring).
+# tests/test_agent_tools.py lists every readable column, these marked.
+PERSONAL = {
+    ("contact", "value"): "an email address, a phone number or a profile",
+    ("contact", "display"): "a contact as it was written",
+    ("person", "name"): "a person's name",
+    ("person", "name_norm"): "a person's name",
+    ("prospects", "first_name"): "a person's name",
+    ("prospects", "last_name"): "a person's name",
+    ("prospects", "linkedin_url"): "a person's profile",
+    ("prospects", "source_url"): "where the person was found (a profile)",
+    ("prospects", "email"): "an email address",
+    ("prospects", "phone"): "a phone number",
+    ("campaign_member", "email"): "an email address",
+    ("outbox", "to_email"): "an email address",
+    ("suppression", "value"): "an email address or a domain",
+    ("sending_account", "address"): "an email address",
+    ("locations", "phone"): "a phone number",
+    ("local_firm", "phone"): "a phone number",
+    ("firm_key", "value"): "a firm's email addresses and name keys",
+    ("match_candidate", "reasons"): "the phones and emails two firms share",
+    ("merge", "reasons"): "the phones and emails two firms shared",
+}
+# The registers' columns (any alias) that name a natural person or hold a
+# phone number: refused the same way.
+REGISTER_PERSONAL = {
+    ("administrators", "first_name"): "a person's name",
+    ("administrators", "last_name"): "a person's name",
+    ("parsed", "phone"): "a phone number",
+    ("taxpayers", "phone"): "a phone number",
+    ("taxpayers", "fax"): "a phone number",
+}
+PERSONAL_HINT = ("count rows instead (COUNT(*), by kind, line_type, status or trust), or "
+                 "ask counts()")
+# What a statement calls that makes its rows aggregates: returned in full.
+AGGREGATES = {"count", "sum", "total", "avg", "min", "max", "group_concat", "string_agg"}
+
 FIRST_WORD = re.compile(r"^\s*(?:(?:--[^\n]*\n)|(?:/\*.*?\*/)|\s)*(\w+)", re.S)
 STATEMENTS = ("select", "with", "values")
 # What a query may call: any function but these.
 DENIED_FUNCTIONS = {"load_extension", "readfile", "writefile", "edit", "fts3_tokenizer"}
 
+# A sample of rows (to check a query's shape), and an aggregate's groups.
+SAMPLE_ROWS = 10
+SAMPLE_CAP = 50
 MAX_ROWS = 200
-ROWS_CAP = 1000
 QUERY_SECONDS = 5.0
 CELL_CHARS = 1000
 # How often (in SQLite's virtual machine steps) the clock is looked at.
@@ -178,13 +235,15 @@ def readable(con: sqlite3.Connection) -> dict[str, list[str]]:
 
 
 class _Gate:
-    """The authorizer of one query: reads of what isn't excluded, and
-    nothing else. ``why`` keeps the first refusal."""
+    """The authorizer of one query: reads of what isn't excluded or
+    personal, and nothing else. ``why`` keeps the first refusal;
+    ``aggregate`` notes an aggregate function called."""
 
     def __init__(self, main_tables: set[str], other_tables: set[str]):
         self.main = main_tables
         self.other = other_tables
         self.why = ""
+        self.aggregate = False
 
     def deny(self, why: str) -> int:
         if not self.why:
@@ -195,8 +254,11 @@ class _Gate:
         if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_FUNCTION:
-            if (arg2 or "").lower() in DENIED_FUNCTIONS:
+            name = (arg2 or "").lower()
+            if name in DENIED_FUNCTIONS:
                 return self.deny(f"the function {arg2}() isn't allowed")
+            if name in AGGREGATES:
+                self.aggregate = True
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_READ:
             return self._read((arg1 or "").lower(), (arg2 or "").lower(), db)
@@ -214,7 +276,12 @@ class _Gate:
                 return self.deny(f"the table {table} isn't readable: {why}")
             return sqlite3.SQLITE_OK
         if db != "main":
-            return sqlite3.SQLITE_OK        # a register: read in full
+            # A register: read in full, but its personal columns.
+            why = REGISTER_PERSONAL.get((table, column))
+            if why:
+                return self.deny(f"{table}.{column} is personal ({why}) and isn't read: "
+                                 f"{PERSONAL_HINT}")
+            return sqlite3.SQLITE_OK
         why = excluded_table(table)
         if why:
             return self.deny(f"the table {table} isn't readable: {why}")
@@ -223,7 +290,57 @@ class _Gate:
         why = EXCLUDED_COLUMNS.get((table, column))
         if why:
             return self.deny(f"the column {table}.{column} isn't readable: {why}")
+        why = PERSONAL.get((table, column))
+        if why:
+            return self.deny(f"{table}.{column} is personal ({why}) and isn't read: "
+                             f"{PERSONAL_HINT}")
         return sqlite3.SQLITE_OK
+
+
+def personal(table: str, column: str, register: bool = False) -> str:
+    """Why a column is personal (query() refuses it), or ""."""
+    return (REGISTER_PERSONAL if register else PERSONAL).get((table.lower(), column.lower()), "")
+
+
+# ── Masking ──
+
+_EMAIL = re.compile(r"([A-Za-z0-9][A-Za-z0-9._%+\-]*)@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+)")
+# A whole value written as a phone number: + or 0 first, 9 to 15 digits.
+_PHONE = re.compile(r"\s*(?:\+|0)[\d\s().\-/]{8,24}")
+# A number in E.164 inside a longer text (tel:+40721..., a note).
+_E164 = re.compile(r"\+\d{9,15}\b")
+_LINKEDIN = re.compile(r"(linkedin\.com/in/)[^\s/?#]+", re.IGNORECASE)
+PHONE_SHOWN = 4
+
+
+def _mask_phone(text: str) -> str:
+    """Its first PHONE_SHOWN digits (a + kept) and ****."""
+    digits = re.sub(r"\D", "", text)
+    return ("+" if text.strip().startswith("+") else "") + digits[:PHONE_SHOWN] + "****"
+
+
+def mask(value):
+    """A value as the model may see it: email addresses as a***@domain,
+    phone numbers as their first digits and ****, a person's LinkedIn
+    profile without its name. Anything else is returned as it is."""
+    if not isinstance(value, str) or not value:
+        return value
+    if _PHONE.fullmatch(value) and 9 <= len(re.sub(r"\D", "", value)) <= 15:
+        return _mask_phone(value)
+    out = _EMAIL.sub(lambda m: f"{m.group(1)[0]}***@{m.group(2)}", value)
+    out = _E164.sub(lambda m: _mask_phone(m.group(0)), out)
+    return _LINKEDIN.sub(lambda m: m.group(1) + "***", out)
+
+
+def mask_result(obj):
+    """``mask`` over every value of a tool's result (dicts, lists, rows)."""
+    if isinstance(obj, str):
+        return mask(obj)
+    if isinstance(obj, dict):
+        return {k: mask_result(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [mask_result(v) for v in obj]
+    return obj
 
 
 def _cell(value):
@@ -235,8 +352,9 @@ def _cell(value):
 
 
 def check_statement(sql: str) -> str:
-    """The statement, stripped, or Refused when it doesn't start as a read."""
-    text = (sql or "").strip()
+    """The statement, stripped (a trailing ; too), or Refused when it
+    doesn't start as a read."""
+    text = (sql or "").strip().rstrip(";").strip()
     if not text:
         raise Refused("give one SELECT statement")
     m = FIRST_WORD.match(text)
@@ -245,15 +363,22 @@ def check_statement(sql: str) -> str:
     return text
 
 
-def run_query(con: sqlite3.Connection, sql: str, *, limit: int = MAX_ROWS,
+SAMPLE_NOTE = ("a sample to check the query's shape, not the data: answer with counts "
+               "(COUNT, GROUP BY) or the count views")
+
+
+def run_query(con: sqlite3.Connection, sql: str, *, limit: int | None = None,
               seconds: float = QUERY_SECONDS, params=()) -> dict:
     """One read on ``con`` (a connect() connection): {"columns", "rows",
-    "truncated"}, at most ``limit`` rows (ROWS_CAP at most). Refused for
-    anything else: a write, an ATTACH or a PRAGMA, an excluded table or
-    column, two statements, or a statement still running after
+    "truncated", "total", ...}. A statement that aggregates returns its
+    rows in full (MAX_ROWS at most); any other returns a sample, ``limit``
+    rows (SAMPLE_ROWS by default, SAMPLE_CAP at most), with ``total``, the
+    rows it returns in all, counted within the same ``seconds`` (None, and
+    ``total_note`` saying so, when the count can't finish in time).
+    Refused for anything else: a write, an ATTACH or a PRAGMA, an excluded
+    table or column, two statements, or a statement still running after
     ``seconds``."""
     text = check_statement(sql)
-    limit = max(1, min(int(limit or MAX_ROWS), ROWS_CAP))
     names = {a: set(tables(con, a)) for a in schemas(con)}
     gate = _Gate({t.lower() for t in names.pop("main", set())},
                  {t.lower() for ts in names.values() for t in ts})
@@ -272,21 +397,33 @@ def run_query(con: sqlite3.Connection, sql: str, *, limit: int = MAX_ROWS,
     con.set_authorizer(gate)
     con.set_progress_handler(progress, PROGRESS_STEPS)
     rows, size, truncated = [], 0, False
+    out: dict = {}
     try:
         try:
             cur = con.execute(text, tuple(params))
-            # Row by row, each cell cut as it comes: at most ``limit`` rows
+            # (The authorizer saw the compiled statement: an aggregate's
+            # rows are its answer, any other's a sample.)
+            aggregate = gate.aggregate
+            if aggregate:
+                cap = MAX_ROWS
+            else:
+                cap = max(1, min(int(limit or SAMPLE_ROWS), SAMPLE_CAP))
+            # Row by row, each cell cut as it comes: at most ``cap`` rows
             # and RESULT_BUDGET characters held.
             while True:
                 row = cur.fetchone()
                 if row is None:
                     break
-                if len(rows) >= limit or size > RESULT_BUDGET:
+                if len(rows) >= cap or size > RESULT_BUDGET:
                     truncated = True
                     break
                 cells = [_cell(v) for v in row]
                 size += sum(len(c) if isinstance(c, str) else 8 for c in cells)
                 rows.append(cells)
+            cols = [d[0] for d in cur.description or ()]
+            cur.close()
+            if truncated and not aggregate:
+                out.update(_total(con, text, params, late))
         except (sqlite3.Error, sqlite3.Warning) as e:
             if gate.why:
                 raise Refused(gate.why) from None
@@ -299,13 +436,34 @@ def run_query(con: sqlite3.Connection, sql: str, *, limit: int = MAX_ROWS,
                 raise Refused(f"a value or a row is too large ({e}): at most "
                               f"{VALUE_BYTES:,} bytes a value and {COLUMNS_CAP} columns") from None
             raise Refused(f"SQLite: {e}") from None
-        cols = [d[0] for d in cur.description or ()]
     finally:
         con.set_authorizer(None)
         con.set_progress_handler(None, 0)
         con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, was[0])
         con.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, was[1])
-    return {"columns": cols, "rows": rows, "truncated": truncated}
+    result = {"columns": cols, "rows": rows, "truncated": truncated}
+    if not aggregate:
+        result["total"] = out.get("total", len(rows))
+        if "total_note" in out:
+            result["total_note"] = out["total_note"]
+        if rows:
+            result["note"] = SAMPLE_NOTE
+    return result
+
+
+def _total(con, text: str, params, late: list) -> dict:
+    """{"total": the rows ``text`` returns in all} counted on the query's
+    own clock, or {"total": None, "total_note"} when it runs out."""
+    try:
+        # (A newline before the parenthesis: a trailing -- comment stays one.)
+        n = con.execute(f"SELECT COUNT(*) FROM ({text}\n)", tuple(params)).fetchone()[0]
+        return {"total": n}
+    except sqlite3.Error:
+        if late:
+            late.clear()
+            return {"total": None, "total_note": "counting every row took longer than the "
+                    "query's time: the total isn't known (count it with a narrower WHERE)"}
+        raise
 
 
 def call_reader(db_path, method: str, *args, **kwargs):

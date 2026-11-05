@@ -6,7 +6,10 @@ connections opened read-only, so a write would fail) or a readonly
 connection. The views run Harvey's own named statements
 (harvey/overlay/queries.py, ``overlay.agent.*``) and page reads, and
 return Harvey's own fields and counts: never a column readonly.py leaves
-out. The estimates are the ones the dashboard shows before a run, with
+out. A view that lists rows lists a sample (FIRMS_LIMIT at most) beside
+its totals: the agent answers from counts. The filters are the Contacts
+and Companies pages' own, read by their parser (contact_query), so a
+count here is the count those pages show. The estimates are the ones the dashboard shows before a run, with
 nothing that spends or queues: a Discover estimate never asks a source
 to count its results (that is a paid request), and the classifier's price
 list is never fetched (classify_prices.OFFLINE).
@@ -21,10 +24,17 @@ import harvey.overlay.queries  # noqa: F401  (registers the named statements)
 from harvey import queries
 from harvey.agent import readonly
 
-# The most firms a view lists, and the most it counts coverage over.
-FIRMS_LIMIT = 50
-COVERAGE_MAX = 200_000
+# The most firms a view lists: a sample beside the totals; the jobs a list
+# shows by default, and at most.
+FIRMS_LIMIT = 10
+JOBS_LIMIT = 10
+JOBS_CAP = 50
 SEARCH_DAYS = 30
+# What a filter may say: the Contacts page's arguments (contact_query), the
+# Companies page's ``search`` among them.
+FILTER_KEYS = ("county", "locality", "caen", "website", "contact", "kind", "status", "trust",
+               "person", "source", "found_in", "q", "search", "require", "exclude",
+               "min_turnover", "max_turnover", "min_employees", "max_employees", "unknown")
 ESTIMATES = ("discover", "registry", "find_contacts", "verify")
 
 
@@ -47,20 +57,33 @@ def schema(db_path) -> dict:
     try:
         main = readonly.readable(con)
         reader = reads.Reader(con, attached)
-        catalog = [{k: r.get(k) for k in ("code", "label", "description", "category",
-                                         "value_type", "unit", "cost_note", "module",
-                                         "available", "subject")}
+        # (Short: the whole answer fits in a tool result. A fact's code and
+        # label say what it is.)
+        catalog = [{k: r.get(k) for k in ("code", "label", "value_type", "cost_note",
+                                         "available")}
                    for r in reader.signal_vocabulary()]
         regs = {}
         for a in attached:
-            regs[a.alias] = {"module": a.module,
-                             "tables": {t: readonly.columns(con, t, a.alias)
-                                        for t in readonly.tables(con, a.alias)}}
+            tables = {t: readonly.columns(con, t, a.alias) for t in readonly.tables(con, a.alias)}
+            regs[a.alias] = {"module": a.module, "tables": tables}
+            personal = {f"{t}.{c}": readonly.personal(t, c, register=True)
+                        for t, cols in tables.items() for c in cols
+                        if readonly.personal(t, c, register=True)}
+            if personal:
+                regs[a.alias]["personal"] = personal
     finally:
         con.close()
+    def table(t, cols):
+        out = {"columns": cols}
+        if TABLE_NOTES.get(t):
+            out["about"] = TABLE_NOTES[t]
+        personal = {c: readonly.personal(t, c) for c in cols if readonly.personal(t, c)}
+        if personal:
+            out["personal"] = personal
+        return out
+
     return {
-        "harvey_db": {t: {"columns": cols, "about": TABLE_NOTES.get(t, "")}
-                      for t, cols in main.items()},
+        "harvey_db": {t: table(t, cols) for t, cols in main.items()},
         "left_out": {"tables": sorted(readonly.EXCLUDED_TABLES),
                      "columns": sorted(f"{t}.{c}" for t, c in readonly.EXCLUDED_COLUMNS)},
         "registers": regs,
@@ -69,18 +92,53 @@ def schema(db_path) -> dict:
     }
 
 
+# What the agent got wrong without them: the identifier scheme's name, the
+# types a join must agree on, the kept counts a firm has. Every `name` in
+# backticks is a column (tests/test_agent_tools.py checks each exists).
 SCHEMA_NOTES = [
+    "Prefer the views: counts() answers how many firms and contacts a filter (county, "
+    "locality, caen, website, contact, kind, ...) selects in one call, exactly as the "
+    "Contacts and Companies pages count them. query() is for what no view answers.",
     "Times in firm, contact, link, search, obs and reading are unix seconds; the Email "
     "module's tables (prospects, campaigns, outbox, jobs, usage_events) use SQLite "
     "datetime text.",
-    "firm.live = 0 is a firm itself; another value is the firm it was merged into. "
+    "A firm itself has `firm.live` = 0; another value is the firm it was merged into. "
     "Count firms with WHERE live = 0.",
-    "A firm's register identifiers are in firm_ident (scheme -> ident_scheme.name, key); "
-    "the registers are attached under their aliases and read in place.",
-    "trust and best_trust: 0 confirmed, 1 likely, 2 unconfirmed. contact.kind -> "
-    "contact_kinds.id. search.outcome: 0 error, 1 found, 2 nothing, 3 skipped.",
-    "A fact (signal) a website showed is a reading row (num, positive); a register's is "
-    "read from the register's own tables.",
+    "A firm's kept counts are columns of firm: `firm.n_contacts`, `firm.n_email`, "
+    "`firm.n_phone`, `firm.n_mobile`, `firm.n_people` and `firm.best_trust` (there is no "
+    "other count column). A website is `firm.website` or `firm.domain` (NULL: none).",
+    "Register identifiers are in firm_ident: `firm_ident.scheme` is `ident_scheme.id`, "
+    "named by `ident_scheme.name`: 'ro.cui' (the CUI, `firm_ident.key` stored as an "
+    "INTEGER) or 'ro.onrc_reg' (the trade register number, TEXT). The name is 'ro.cui', "
+    "never 'cui'. (scheme, key) is the primary key: fi.scheme = (SELECT id FROM "
+    "ident_scheme WHERE name = 'ro.cui') AND fi.key = 12345678 is one index lookup. "
+    "`firm_ident.firm` is the record holding it (after a merge, a member: its live firm "
+    "is `firm.live`).",
+    "The registry (alias reg): `reg.firms.cui` is TEXT ('' when there is none, sometimes "
+    "with RO), so never join on it: a firm's registry row is reached by its CUI through "
+    "`reg.firm_by_cui.cui` (INTEGER, the primary key) and `reg.firm_by_cui.firm_id` = "
+    "`reg.firms.id`: firm_ident fi JOIN reg.firm_by_cui b ON b.cui = fi.key JOIN reg.firms "
+    "r ON r.id = b.firm_id, with fi.scheme the 'ro.cui' id. A firm with no CUI: "
+    "`reg.firms.reg` = `firm_ident.key` under 'ro.onrc_reg'.",
+    "Activities: `reg.firm_caen.firm_id` = `reg.firms.id`, `reg.firm_caen.code` an "
+    "INTEGER (8621), `reg.firm_caen.version` the CAEN revision (3 is Rev.3). firm_caen has "
+    "no index by code: count by activity and place with counts() (it reads the registry's "
+    "search index), never a scan of firm_caen.",
+    "Figures (alias fin): `fin.current.cui` INTEGER (= `firm_ident.key` of 'ro.cui'), "
+    "`fin.current.year`, `fin.current.turnover`, `fin.current.employees`. Taxpayers (alias "
+    "tax): `tax.current.cui`, `tax.current.vat`, `tax.current.employer`, `tax.current.micro`.",
+    "trust and best_trust: 0 confirmed, 1 likely, 2 unconfirmed. `contact.kind` = "
+    "`contact_kinds.id`. `search.outcome`: 0 error, 1 found, 2 nothing, 3 skipped.",
+    "A fact (signal) a website showed is a reading row (`reading.num`, `reading.positive`); "
+    "a register's is read from the register's own tables.",
+    "Personal columns (listed under personal for each table and register: a person's name, an "
+    "email, a phone, a profile) are refused by query(), wherever a statement reads them "
+    "(its result, a WHERE, a GROUP BY, inside a function). Count rows by the columns that "
+    "aren't personal instead: `contact.kind`, `contact.line_type`, `contact.status`, "
+    "`link.trust`; or counts(). What the views return has emails and phones masked.",
+    "query() returns a sample of rows (10 by default, 50 at most) with their total: enough "
+    "to check a query's shape, not to answer from. An aggregate (COUNT, SUM, GROUP BY) comes "
+    "back in full.",
 ]
 
 TABLE_NOTES = {
@@ -144,35 +202,54 @@ def _member_names(by_status: dict) -> dict:
     return {names.get(k, str(k)): n for k, n in by_status.items()}
 
 
-def _place_filter(county: str = "", locality: str = "", activity: str = ""):
-    from harvey import contacts
-    from harvey.contact_query import caen_arg
+async def _filter(state, raw):
+    """The ContactFilter a filter's arguments ask for (the Contacts page's,
+    with the Companies page's ``search``), read by the pages' own parser."""
+    from harvey.contact_query import filter_from_query
 
+    raw = raw if isinstance(raw, dict) else {}
+    unknown = sorted(set(raw) - set(FILTER_KEYS))
+    if unknown:
+        raise readonly.Refused(f"no filter {', '.join(unknown)}: the filters are "
+                               f"{', '.join(FILTER_KEYS)}")
+    args = {k: str(v) if not isinstance(v, (list, tuple)) else ",".join(map(str, v))
+            for k, v in raw.items() if v is not None and v != ""}
     try:
-        caen = caen_arg((activity or "").strip()[:200])
+        f, _ = await filter_from_query(state, args)
     except ValueError as e:
         raise readonly.Refused(str(e))
-    return contacts.ContactFilter(county=(county or "").strip()[:200],
-                                  locality=(locality or "").strip()[:200], caen=caen)
+    return f, args
 
 
 FIRM_FIELDS = ("id", "name", "cui", "location", "website", "industry", "contacts",
                "searched_at", "created_at", "source")
 
 
-def firms(db_path, county: str = "", locality: str = "", activity: str = "",
-          limit: int = 20) -> dict:
-    """Firms in Harvey by place (county, town) and activity (CAEN codes or
-    words): how many match, and the newest ``limit`` of them."""
-    f = _place_filter(county, locality, activity)
-    limit = max(1, min(int(limit or 20), FIRMS_LIMIT))
+async def counts(state, raw: dict | None = None) -> dict:
+    """How many firms and contacts a filter selects, as the Companies and
+    Contacts pages count them: firms with and without a website, without a
+    contact, with an email, a phone, a mobile; contacts by kind, status and
+    trust, the mobiles and the emails that can be sent to."""
+    f, args = await _filter(state, raw)
+
+    def read(reader):
+        return {"firms": reader.firm_counts(f), "contacts": reader.contact_counts(f)}
+
+    out = await asyncio.to_thread(_with_reader, _db(state), read)
+    return {"filter": args, **out}
+
+
+async def firms(state, raw: dict | None = None, limit: int = FIRMS_LIMIT) -> dict:
+    """Firms a filter selects (the Companies page's): how many, and a sample
+    of the newest (FIRMS_LIMIT at most) to show what a row holds."""
+    f, args = await _filter(state, raw)
+    limit = max(1, min(int(limit or FIRMS_LIMIT), FIRMS_LIMIT))
 
     def read(reader):
         total, ids, _ = reader.companies_page(f, "created", "desc", limit, 0)
-        rows = reader.company_rows(ids)
-        return total, rows
+        return total, reader.company_rows(ids)
 
-    total, rows = _with_reader(db_path, read)
+    total, rows = await asyncio.to_thread(_with_reader, _db(state), read)
     out = []
     for r in rows:
         row = {k: r.get(k) for k in FIRM_FIELDS}
@@ -181,8 +258,9 @@ def firms(db_path, county: str = "", locality: str = "", activity: str = "",
         row["figures"] = {k: figures.get(k) for k in ("year", "turnover", "employees")
                           if k in figures}
         out.append(row)
-    return {"filter": {"county": f.county, "locality": f.locality, "caen": list(f.caen)},
-            "total": total, "shown": len(out), "firms": out}
+    return {"filter": args, "total": total, "shown": len(out), "sample": out,
+            "note": "a sample of the newest, to show what a firm's row holds: answer with "
+                    "the total and counts()"}
 
 
 def _with_reader(db_path, fn):
@@ -201,33 +279,18 @@ def _with_reader(db_path, fn):
         con.close()
 
 
-def coverage(db_path, county: str = "", locality: str = "", activity: str = "") -> dict:
-    """What was done where: of the firms a place and activity select, how
-    many have a website known and read, were searched by the contact
-    finder, and have contacts; the backlog; the searches of the last
-    SEARCH_DAYS days by module and outcome."""
+async def coverage(state, raw: dict | None = None) -> dict:
+    """What was done where: the firms a filter selects counted as counts()
+    counts them (websites, sites read, searched by the contact finder or by
+    anything, contacts found), and the searches of the last SEARCH_DAYS
+    days by module and outcome."""
     from harvey.overlay.schema import OUTCOME
 
-    f = _place_filter(county, locality, activity)
-    narrowed = bool(f.county or f.locality or f.caen)
+    f, args = await _filter(state, raw)
     outcomes = {v: k for k, v in OUTCOME.items()}
 
     def read(reader):
-        out = {"filter": {"county": f.county, "locality": f.locality, "caen": list(f.caen)}}
-        if narrowed:
-            ids = reader.matching(f)
-            out["firms"] = len(ids)
-            if len(ids) > COVERAGE_MAX:
-                out["note"] = (f"{len(ids):,} firms: counted for at most {COVERAGE_MAX:,}; "
-                               "narrow the place or the activity")
-            else:
-                out["of_them"] = _coverage_of(reader.con, ids)
-        else:
-            t = reader.tally()
-            out["firms"] = t.get("firms", 0)
-            out["of_them"] = {"with_contact": t.get("firms_with_contact", 0),
-                              "with_site": t.get("firms_with_site", 0)}
-        out["backlog"] = reader.backlog()
+        out = {"filter": args, "firms": reader.firm_counts(f)}
         since = int(time.time()) - SEARCH_DAYS * 86400
         out["searches_since_days"] = SEARCH_DAYS
         out["searches"] = [{"module": m, "capability": c, "outcome": outcomes.get(o, o),
@@ -237,23 +300,7 @@ def coverage(db_path, county: str = "", locality: str = "", activity: str = "") 
                            _x(reader.con, "overlay.agent.searches", (since,))]
         return out
 
-    return _with_reader(db_path, read)
-
-
-def _coverage_of(con, ids) -> dict:
-    import json
-
-    keys = ("firms", "with_site", "site_read", "finder_searched", "searched", "with_contact",
-            "with_email", "with_phone", "with_people")
-    sums = [0] * len(keys)
-    ids = list(ids)
-    for start in range(0, len(ids), 5000):
-        row = con.execute(queries.sql("overlay.agent.coverage"),
-                          (json.dumps(ids[start:start + 5000]),)).fetchone()
-        sums = [a + (b or 0) for a, b in zip(sums, row)]
-    out = dict(zip(keys, sums))
-    out.pop("firms")
-    return out
+    return await asyncio.to_thread(_with_reader, _db(state), read)
 
 
 def contacts_summary(db_path) -> dict:
@@ -334,7 +381,7 @@ async def spend(state) -> dict:
 # ── jobs() ──
 
 async def job_info(state, action: str = "list", ref: str = "", lane: str = "",
-                   status: str = "", limit: int = 20) -> dict:
+                   status: str = "", limit: int = JOBS_LIMIT) -> dict:
     """list (newest first; by lane and status), get (one job by id), or
     report (a run's time and cost)."""
     from harvey.modules import jobs
@@ -343,7 +390,7 @@ async def job_info(state, action: str = "list", ref: str = "", lane: str = "",
     if action == "list":
         statuses = [s for s in (status or "").split(",") if s.strip() in jobs.STATUSES] or None
         found = await jobs.list_jobs(state, lane=lane or None, statuses=statuses,
-                                     limit=max(1, min(int(limit or 20), 200)))
+                                     limit=max(1, min(int(limit or JOBS_LIMIT), JOBS_CAP)))
         return {"jobs": [_job(j) for j in found]}
     if action == "get":
         job = await jobs.find(state, ref) if ref else None

@@ -685,7 +685,7 @@ statement("overlay.contact_check.in_campaign",
 statement("overlay.contact_check.done",
           "SELECT contact FROM contact_check WHERE batch = ? AND firm = ?", params=("b", 1))
 
-# ── The agent's views (harvey/agent/views.py) and its chat (schema 31) ──
+# ── The agent's views (harvey/agent/views.py) and its chat (schemas 31, 32) ──
 # Counts only: the Email module's prospects, campaign members, the outbox
 # (no subject or body) and conversations (no thread) by status.
 statement("overlay.agent.prospects", "SELECT status, COUNT(*) FROM prospects GROUP BY status",
@@ -713,14 +713,22 @@ statement("overlay.agent.contacts",
           drives="c", bounded=True,
           scans={"contact": "every contact counted by kind, trust and status, when the "
                             "agent asks: the table read once"})
-# What a set of firms has had done to it (coverage): sites known and read,
-# searched, found contacts.
-statement("overlay.agent.coverage",
+# A set of firms counted (the counts view, coverage): websites, contacts by
+# kind, sites read, searched, people named. Reader.FIRM_COUNTS names them.
+statement("overlay.agent.firm_counts",
           "SELECT COUNT(*), SUM(f.website IS NOT NULL OR f.domain IS NOT NULL), "
-          "SUM(f.site_read_at IS NOT NULL), SUM(f.finder_at IS NOT NULL), "
-          "SUM(f.last_search_at IS NOT NULL), SUM(f.n_contacts > 0), SUM(f.n_email > 0), "
-          "SUM(f.n_phone > 0), SUM(f.n_people > 0) "
+          "SUM(f.n_contacts = 0), SUM(f.n_email > 0), SUM(f.n_phone > 0), SUM(f.n_mobile > 0), "
+          "SUM(f.n_email > 0 OR f.n_mobile > 0), SUM(f.site_read_at IS NOT NULL), "
+          "SUM(f.finder_at IS NOT NULL), SUM(f.last_search_at IS NOT NULL), "
+          "SUM(f.n_people > 0) "
           f"FROM {_J} CROSS JOIN firm f WHERE f.id = j.value", params=_IDS, drives="j")
+# Every firm with an email or a mobile (no tally keeps the two together):
+# the firms with a contact, by their index.
+statement("overlay.agent.firms_reached",
+          "SELECT COUNT(*) FROM firm INDEXED BY firm_with_contact WHERE live = 0 "
+          "AND n_contacts > 0 AND (n_email > 0 OR n_mobile > 0)",
+          scans={"firm": "the firms with a contact (its partial index), counted when the "
+                         "agent asks"})
 # The searches made since a time, by module, capability and outcome.
 statement("overlay.agent.searches",
           "SELECT m.name, c.name, s.outcome, COUNT(*), COALESCE(SUM(s.cost), 0), MAX(s.at) "
@@ -734,26 +742,76 @@ statement("overlay.agent.usage",
           "SELECT agent, task, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
           "SUM(num_turns) FROM usage_events WHERE created_at >= ? GROUP BY agent, task",
           params=("2026-01-01 00:00:00",), bounded=True)
-# The chat: the newest messages, a turn's, and the tool calls of some turns.
-statement("overlay.agent.messages",
-          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
-          "ORDER BY id DESC LIMIT ?", params=(50,))
-statement("overlay.agent.messages_before",
-          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
-          "WHERE id < ? ORDER BY id DESC LIMIT ?", params=(100, 50))
-statement("overlay.agent.turn",
-          "SELECT id, turn, role, text, status, job, created_at, updated_at FROM agent_message "
-          "WHERE turn = ? ORDER BY id", params=("t",))
+# The chats' messages: the newest (of a chat, or of every chat), a turn's,
+# and the tool calls of some turns.
+_MESSAGE = ("SELECT id, turn, role, text, status, chat, created_at, updated_at, tokens, context "
+            "FROM agent_message ")
+statement("overlay.agent.messages", _MESSAGE + "ORDER BY id DESC LIMIT ?", params=(50,))
+statement("overlay.agent.messages_before", _MESSAGE + "WHERE id < ? ORDER BY id DESC LIMIT ?",
+          params=(100, 50))
+statement("overlay.agent.chat_messages",
+          _MESSAGE + "INDEXED BY agent_message_chat WHERE chat = ? ORDER BY id DESC LIMIT ?",
+          params=("c", 50))
+statement("overlay.agent.chat_messages_before",
+          _MESSAGE + "INDEXED BY agent_message_chat WHERE chat = ? AND id < ? "
+          "ORDER BY id DESC LIMIT ?", params=("c", 100, 50))
+statement("overlay.agent.turn", _MESSAGE + "WHERE turn = ? ORDER BY id", params=("t",))
+# How long the chat is now: the context its newest answer with a result
+# was given.
+statement("overlay.agent.chat_context",
+          "SELECT context FROM agent_message INDEXED BY agent_message_chat "
+          "WHERE chat = ? AND role = 'agent' AND context > 0 ORDER BY id DESC LIMIT 1",
+          params=("c",))
 statement("overlay.agent.set_status",
-          "UPDATE agent_message SET status = ?, job = COALESCE(NULLIF(?, ''), job), "
-          "updated_at = ? WHERE turn = ? AND role = 'user'", params=("queued", "", 1, "t"))
+          "UPDATE agent_message SET status = ?, updated_at = ? WHERE turn = ? AND role = 'user'",
+          params=("running", 1, "t"))
+# (Only into a chat on file: an answer that ends after its chat was
+# deleted leaves nothing behind.)
 statement("overlay.agent.add",
-          "INSERT INTO agent_message (turn, role, text, status, job, created_at, updated_at) "
-          "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("t", "user", "", "queued", "", 1, 1))
+          "INSERT INTO agent_message (turn, role, text, status, chat, created_at, updated_at, "
+          "tokens, context) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? "
+          "WHERE EXISTS (SELECT 1 FROM agent_chat WHERE id = ?)",
+          params=("t", "user", "", "running", "c", 1, 1, 0, 0, "c"))
 statement("overlay.agent.calls",
           "SELECT c.id, c.turn, c.tool, c.arguments, c.result, c.ms, c.outcome, c.at "
           f"FROM {_J} CROSS JOIN agent_tool_call c WHERE c.turn = j.value ORDER BY c.id",
           params=('["t"]',), drives="j", bounded=True)
+# A turn's tool calls after the last one seen (the stream of an answer).
+statement("overlay.agent.calls_after",
+          "SELECT id, tool, arguments, result, ms, outcome FROM agent_tool_call "
+          "WHERE turn = ? AND id > ? ORDER BY id", params=("t", 0))
+# The chats (schema 32): newest activity first (all, or those whose title
+# holds some words), one, a new one, its title, the message it answers
+# now, and its removal with its messages and their tool calls (its
+# usage_events rows stay: they are the plan's accounting).
+_CHAT = "SELECT id, title, created_at, last_at, turn FROM agent_chat "
+statement("overlay.agent.chats",
+          _CHAT + "INDEXED BY agent_chat_recent ORDER BY last_at DESC LIMIT ?", params=(50,))
+statement("overlay.agent.chats_like",
+          _CHAT + "INDEXED BY agent_chat_recent WHERE title LIKE ? ESCAPE '\\' "
+          "ORDER BY last_at DESC LIMIT ?", params=("%x%", 50),
+          scans={"agent_chat": "the chats walked newest first for a title search: one row a "
+                               "conversation the user keeps"})
+statement("overlay.agent.chat", _CHAT + "WHERE id = ?", params=("c",))
+statement("overlay.agent.new_chat",
+          "INSERT INTO agent_chat (id, title, created_at, last_at) VALUES (?, ?, ?, ?)",
+          params=("c", "t", 1, 1))
+statement("overlay.agent.rename_chat", "UPDATE agent_chat SET title = ? WHERE id = ?",
+          params=("t", "c"))
+statement("overlay.agent.chat_turn", "SELECT turn FROM agent_chat WHERE id = ?", params=("c",))
+statement("overlay.agent.set_chat_turn",
+          "UPDATE agent_chat SET turn = ?, last_at = ? WHERE id = ?", params=("t", 1, "c"))
+statement("overlay.agent.delete_chat_calls",
+          "DELETE FROM agent_tool_call INDEXED BY agent_tool_call_turn WHERE turn IN "
+          "(SELECT turn FROM agent_message INDEXED BY agent_message_chat WHERE chat = ?)",
+          params=("c",))
+statement("overlay.agent.delete_chat_messages",
+          "DELETE FROM agent_message WHERE chat = ?", params=("c",))
+statement("overlay.agent.delete_chat", "DELETE FROM agent_chat WHERE id = ?", params=("c",))
+# The chats some Harvey process has a live process for (their leases).
+statement("overlay.agent.chat_leases",
+          "SELECT name, owner FROM worker_lease WHERE name LIKE 'agent_chat:%' "
+          "AND heartbeat_at >= ?", params=(1.0,))
 statement("overlay.agent.add_call",
           "INSERT INTO agent_tool_call (turn, tool, arguments, result, ms, outcome, at) "
           "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("t", "schema", "{}", "", 0, "ok", 1))

@@ -30,6 +30,9 @@ Harvey's own MCP server, read-only (build_agent_command). It runs with
 server: no built-in tool that runs code or fetches, none of the user,
 project or local settings files, no MCP server but Harvey's
 (``--strict-mcp-config``), and permission for ``mcp__harvey__*`` only.
+It is one long-lived process per chat: messages go in on stdin and the
+answer comes out as it is made, one JSON event a line (stream-json both
+ways).
 
 Before any prompt is sent the CLI's ``--help`` must list every one of those
 flags; if any is missing Harvey refuses to call it (there is no fallback to
@@ -62,7 +65,8 @@ REQUIRED_FLAGS = (
 )
 
 # The agent's call (build_agent_command): Harvey's MCP server and nothing
-# else. --max-turns isn't listed by --help, so it isn't checked there.
+# else, a conversation over stdin and stdout. --max-turns isn't listed by
+# --help, so it isn't checked there.
 AGENT_FLAGS = (
     "--restricted",
     "--setting-sources",
@@ -72,7 +76,10 @@ AGENT_FLAGS = (
     "--allowedTools",
     "--disable-slash-commands",
     "--no-session-persistence",
+    "--input-format",
     "--output-format",
+    "--verbose",
+    "--include-partial-messages",
 )
 AGENT_TOOLS = "mcp__harvey__*"
 AGENT_ENV = {"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
@@ -222,11 +229,19 @@ def build_command(executable: str, model: str = "", session_id: str | None = Non
 
 def build_agent_command(executable: str, mcp_config: str, *, max_turns: int,
                         model: str = "") -> list[str]:
-    """argv for one turn of the agent: print mode, Harvey's MCP server
-    (``mcp_config``, a file) and its tools only. The prompt goes on stdin."""
+    """argv for the agent's chat process: print mode, Harvey's MCP server
+    (``mcp_config``, a file) and its tools only. Each message goes in on
+    stdin as a JSON line; the answer comes out one JSON event a line, text
+    as it is written (``--include-partial-messages``), until its result.
+    ``max_turns`` is the whole process's ceiling (chat.PROCESS_TURNS):
+    Harvey counts each answer's turns itself."""
     cmd = [
         executable, "-p",
-        "--output-format", "json",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        # (stream-json output needs it; it adds no instruction source.)
+        "--verbose",
+        "--include-partial-messages",
         # No built-in tool that runs code or fetches, none of the user,
         # project or local settings files (managed policy still applies).
         "--restricted",

@@ -7179,52 +7179,127 @@ async function loadActivity() {
   el.innerHTML = html + '</div></div>';
 }
 
-// ── Chat: questions to Harvey's agent (read only), answered when its turn ends ──
+// ── Chat: the chats with Harvey's agent (read only), each answer streamed as it is written ──
 
-let _chatPoll = null;
-
-function stopChatPoll() {
-  if (_chatPoll) { clearInterval(_chatPoll); _chatPoll = null; }
-}
+// The open chat ('' a new one, made by its first message), its messages,
+// the answer being streamed here ({chat, turn, text, calls, end}) and the
+// stream's AbortController: leaving a chat drops only this page's
+// stream, the answer goes on and is followed again on the way back.
+let _chatId = '';
+let _chatData = null;
+let _chatLive = null;
+let _chatAbort = null;
+let _chatList = null;
+let _chatSearch = null;
 
 async function loadChat() {
-  const el = document.getElementById('chat-list');
-  const data = await api('/api/agent/messages?limit=50');
-  if (!data) { el.innerHTML = offlineState(); stopChatPoll(); return; }
+  await Promise.all([loadChatList(), loadChatMessages()]);
+}
+
+async function loadChatList() {
+  const box = document.getElementById('chat-q');
+  const q = box ? box.value.trim() : '';
+  const data = await api('/api/agent/chats?q=' + encodeURIComponent(q));
+  const el = document.getElementById('chat-chats');
+  if (!data) { el.innerHTML = offlineLine(); return; }
+  _chatList = data;
   const note = document.getElementById('chat-note');
   note.innerHTML = data.refused
     ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>' : '';
-  document.getElementById('chat-send').disabled = !!data.refused;
-  el.innerHTML = renderChat(data);
-  el.scrollTop = el.scrollHeight;
-  if (data.busy && !_chatPoll) {
-    // Only while a turn waits or runs, and only on this tab.
-    _chatPoll = setInterval(() => {
-      if (currentTab !== 'chat') { stopChatPoll(); return; }
-      if (!document.hidden && !_locked) loadChat();
-    }, 3000);
-  } else if (!data.busy) {
-    stopChatPoll();
+  el.innerHTML = renderChatList(data.chats || [], _chatId, q);
+}
+
+function searchChats() {
+  clearTimeout(_chatSearch);
+  _chatSearch = setTimeout(loadChatList, 250);
+}
+
+// The chats, newest activity first: the open one marked, each with its
+// rename and delete.
+function renderChatList(list, current, q) {
+  if (!list.length) {
+    return '<p class="muted small">' + escHtml(t(q ? 'chat.none_found' : 'chat.none')) + '</p>';
   }
+  return list.map(c => '<div class="chat-item' + (c.id === current ? ' on' : '') + '" data-chat="' + escHtml(c.id) + '">' +
+    '<button type="button" class="chat-open" onclick="openChat(this.parentNode.dataset.chat)"' + (c.id === current ? ' aria-current="true"' : '') + '>' +
+    '<span class="chat-item-title">' + escHtml(c.title || t('chat.untitled')) + '</span>' +
+    '<span class="chat-item-when">' + (c.answering ? '<span class="badge t-active">' + escHtml(t('chat.answering')) + '</span> ' : '') + chatWhen(c.last_at) + '</span></button>' +
+    '<button type="button" class="icon-btn" onclick="renameChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.rename')) + '" aria-label="' + escHtml(t('chat.rename')) + '">' + icon('pen') + '</button>' +
+    '<button type="button" class="icon-btn" onclick="deleteChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.delete')) + '" aria-label="' + escHtml(t('chat.delete')) + '">' + icon('x') + '</button>' +
+    '</div>').join('');
+}
+
+async function loadChatMessages() {
+  const el = document.getElementById('chat-list');
+  if (!_chatId) { _chatData = {messages: [], calls: {}, chat: null}; paintChat(); return; }
+  const id = _chatId;
+  const data = await api('/api/agent/chats/' + encodeURIComponent(id) + '/messages?limit=50');
+  if (id !== _chatId) return;
+  if (!data) {
+    if (_lastFail === 404) { _chatId = ''; loadChat(); return; }
+    el.innerHTML = offlineState();
+    return;
+  }
+  _chatData = data;
+  paintChat();
+  if (data.live && (!_chatLive || _chatLive.turn !== data.live)) followChat(id, data.live);
+}
+
+// scroll: 'older' keeps the reader where they are (older messages added
+// above); 'follow' (an answer as it is written) stays at the end only when
+// the reader is there; otherwise the end is shown.
+function paintChat(scroll) {
+  const data = _chatData || {messages: []};
+  const el = document.getElementById('chat-list');
+  const live = _chatLive && _chatLive.chat === _chatId ? _chatLive : null;
+  const top = el.scrollTop;
+  const below = el.scrollHeight - top;
+  const atEnd = below <= el.clientHeight + 48;
+  el.innerHTML = renderChat(data, live);
+  el.scrollTop = scroll === 'older' ? el.scrollHeight - below
+    : (scroll === 'follow' && !atEnd ? top : el.scrollHeight);
+  const busy = !!(live && !live.end) || !!data.busy;
+  const refused = !!(_chatList && _chatList.refused);
+  document.getElementById('chat-send').disabled = refused || busy;
+  document.getElementById('chat-stop').hidden = !busy;
+  document.getElementById('chat-title').textContent = data.chat ? (data.chat.title || t('chat.untitled')) : t('chat.new');
+  document.getElementById('chat-tokens').innerHTML = chatContext(data.chat, live);
+}
+
+// How long the open chat is (its newest answer's context), and the hint to
+// start a new chat past the server's threshold.
+function chatContext(chat, live) {
+  const ended = live && live.end && live.end.context !== undefined ? live.end : null;
+  const n = ended && ended.context ? ended.context : (chat ? chat.context : 0);
+  const hint = ended && ended.context ? !!ended.hint : !!(chat && chat.hint);
+  if (!n) return '';
+  return '<span class="muted small">' + escHtml(t('chat.context', {n: fmtN(n)})) + '</span>' +
+    (hint ? ' <span class="badge t-note">' + escHtml(t('chat.hint_new')) + '</span>' : '');
 }
 
 function chatWhen(sec) {
   return sec ? relTime(new Date(Number(sec) * 1000).toISOString()) : '';
 }
 
-function renderChat(data) {
+function renderChat(data, live) {
   const msgs = data.messages || [];
   if (!msgs.length) {
     return emptyState(icon('chat'), escHtml(t('chat.empty')), escHtml(t('chat.empty_copy')));
   }
   const calls = data.calls || {};
   const answered = new Set(msgs.filter(m => m.role === 'agent').map(m => m.turn));
-  let html = '';
+  const last = msgs[msgs.length - 1].turn;
+  // (Older messages are on file: the chat is read 50 at a time.)
+  let html = data.more ? '<button type="button" class="btn btn-sm chat-older" onclick="loadOlderChat()">' +
+    escHtml(t('chat.older')) + '</button>' : '';
   for (const m of msgs) {
     if (m.role === 'user') {
       html += '<div class="chat-msg user"><div class="chat-meta">' + escHtml(t('chat.you')) + ' · ' + chatWhen(m.created_at) + '</div>' +
         '<div class="chat-text">' + escHtml(m.text) + '</div></div>';
-      if (!answered.has(m.turn)) html += chatPending(m, calls[m.turn] || []);
+      if (!answered.has(m.turn)) {
+        html += live && live.turn === m.turn ? chatLiveHtml(live)
+          : chatPending(m, calls[m.turn] || [], m.turn === last && m.status === 'stopped');
+      }
       continue;
     }
     const err = String(m.status || '').startsWith('error:') ? m.status.slice(6) : '';
@@ -7232,34 +7307,200 @@ function renderChat(data) {
       (err ? '<div class="chat-text"><b>' + escHtml(t(own(CHAT_ERRORS, err) ? 'chat.err.' + err : 'chat.err.failed')) + '</b>' +
                (m.text ? '<div class="muted small">' + escHtml(m.text) + '</div>' : '') + '</div>'
            : '<div class="chat-text">' + escHtml(m.text) + '</div>') +
-      chatCalls(calls[m.turn] || []) + '</div>';
+      chatCalls(calls[m.turn] || []) + (err && m.turn === last && !(live && !live.end) ? chatRetry(m.turn) : '') + '</div>';
   }
   return html;
 }
 
-const CHAT_ERRORS = {codex: 1, cli: 1, login: 1, max_turns: 1, failed: 1, timeout: 1};
+const CHAT_ERRORS = {login: 1, max_turns: 1, failed: 1, timeout: 1, stopped: 1};
+const CHAT_REFUSALS = {empty: 1, too_long: 1, codex: 1, budget: 1, busy: 1, elsewhere: 1, cli: 1,
+                       full: 1, missing: 1, retry: 1};
 
-function chatPending(m, list) {
-  const line = m.status === 'held' ? t('chat.held') : m.status === 'running' ? t('chat.thinking')
-    : m.status === 'stopped' ? t('chat.stopped') : t('chat.queued');
-  return '<div class="chat-msg agent pending"><div class="chat-text muted">' + escHtml(line) + '</div>' + chatCalls(list) + '</div>';
+// Send the chat's newest message again (its answer failed or was stopped).
+function chatRetry(turn) {
+  return '<div class="chat-retry"><button type="button" class="btn btn-sm" data-turn="' + escHtml(turn) + '" onclick="retryChat(this.dataset.turn)">' +
+    icon('refresh') + escHtml(t('chat.retry')) + '</button></div>';
 }
 
-// The tool calls a turn made, folded: what the agent read to answer.
-function chatCalls(list) {
+// A message with no answer that isn't being streamed here: still being
+// answered (in another Harvey process), or stopped (the newest can be
+// sent again).
+function chatPending(m, list, retry) {
+  const line = m.status === 'stopped' ? t('chat.stopped') : t('chat.thinking');
+  return '<div class="chat-msg agent pending"><div class="chat-text muted">' + escHtml(line) + '</div>' + chatCalls(list) +
+    (retry ? chatRetry(m.turn) : '') + '</div>';
+}
+
+// The answer as it is written: its text so far and each tool call, the
+// ones still running marked.
+function chatLiveHtml(live) {
+  const calls = live.calls.map(c => ({tool: c.tool, arguments: c.arguments, ms: c.ms || 0,
+                                      outcome: c.outcome || 'running', result: c.result || ''}));
+  const text = live.text ? '<div class="chat-text">' + escHtml(live.text) + '</div>'
+    : '<div class="chat-text muted">' + escHtml(t('chat.thinking')) + '</div>';
+  return '<div class="chat-msg agent pending" id="chat-live">' + text +
+    (calls.length ? chatCalls(calls, true) : '') + '</div>';
+}
+
+// The tool calls a turn made, folded (open while the answer is written):
+// what the agent read to answer.
+function chatCalls(list, open) {
   if (!list.length) return '';
+  const tone = {ok: 'good', refused: 'note', running: 'active'};
   const rows = list.map(c => '<li><code>' + escHtml(c.tool) + '</code> ' +
-    '<span class="badge t-' + (c.outcome === 'ok' ? 'good' : c.outcome === 'refused' ? 'note' : 'bad') + '">' +
-    escHtml(t('chat.call.' + (own({ok: 1, refused: 1, error: 1}, c.outcome) ? c.outcome : 'error'))) + '</span> ' +
-    '<span class="muted small">' + escHtml(fmtN(c.ms || 0)) + ' ms</span>' +
+    '<span class="badge t-' + (tone[c.outcome] || 'bad') + '">' +
+    escHtml(t('chat.call.' + (own({ok: 1, refused: 1, error: 1, running: 1}, c.outcome) ? c.outcome : 'error'))) + '</span> ' +
+    (c.outcome === 'running' ? '' : '<span class="muted small">' + escHtml(fmtN(c.ms || 0)) + ' ms</span>') +
     (c.arguments && Object.keys(c.arguments).length ? '<div class="chat-args"><code>' + escHtml(JSON.stringify(c.arguments)) + '</code></div>' : '') +
     (c.result ? '<div class="muted small">' + escHtml(c.result) + '</div>' : '') + '</li>').join('');
-  return '<details class="chat-calls"><summary>' + escHtml(t('chat.calls', {n: list.length})) + '</summary><ul>' + rows + '</ul></details>';
+  return '<details class="chat-calls"' + (open ? ' open' : '') + '><summary>' + escHtml(t('chat.calls', {n: list.length})) + '</summary><ul>' + rows + '</ul></details>';
+}
+
+// The open chat's messages before the oldest shown, added above them.
+async function loadOlderChat() {
+  const id = _chatId;
+  const msgs = (_chatData && _chatData.messages) || [];
+  if (!id || !msgs.length) return;
+  const data = await api('/api/agent/chats/' + encodeURIComponent(id) + '/messages?limit=50&before=' + msgs[0].id);
+  if (!data || id !== _chatId || !_chatData) return;
+  _chatData.messages = (data.messages || []).concat(_chatData.messages);
+  _chatData.calls = Object.assign({}, data.calls || {}, _chatData.calls || {});
+  _chatData.more = !!data.more;
+  paintChat('older');
+}
+
+// One event of the stream into the live answer.
+function chatEvent(live, ev) {
+  if (ev.type === 'text') live.text += ev.text || '';
+  else if (ev.type === 'tool_use') live.calls.push({tool: ev.tool, arguments: ev.arguments || {}});
+  else if (ev.type === 'tool_result') {
+    const c = live.calls.find(x => !x.outcome && x.tool === ev.tool) || live.calls.find(x => !x.outcome);
+    if (c) Object.assign(c, {outcome: ev.outcome, ms: ev.ms, result: ev.result});
+    else live.calls.push({tool: ev.tool, arguments: {}, outcome: ev.outcome, ms: ev.ms, result: ev.result});
+  } else if (ev.type === 'done' || ev.type === 'error' || ev.type === 'gone') live.end = ev;
+  return live;
+}
+
+// Read a chat's answer as server-sent events (fetch, so the token goes in
+// the header: EventSource can't send it), from its first event, and paint
+// each as it comes while that chat is open.
+async function followChat(chatId, turn) {
+  if (_chatAbort) _chatAbort.abort();
+  const abort = new AbortController();
+  _chatAbort = abort;
+  const live = {chat: chatId, turn: turn, text: '', calls: [], end: null};
+  _chatLive = live;
+  paintChat();
+  let r = null;
+  try {
+    r = await authFetch('/api/agent/chats/' + encodeURIComponent(chatId) + '/stream?turn=' + encodeURIComponent(turn),
+                        {signal: abort.signal});
+  } catch { r = null; }
+  if (r && r.ok && r.body) {
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    try {
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const line = buf.slice(0, i).split('\n').find(l => l.startsWith('data: '));
+          buf = buf.slice(i + 2);
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+          chatEvent(live, ev);
+          if (_chatLive === live && currentTab === 'chat') paintChat('follow');
+        }
+      }
+    } catch { /* left for another chat, or the connection dropped: the messages say how it ended */ }
+  }
+  if (abort.signal.aborted) return;
+  if (_chatLive === live) _chatLive = null;
+  if (_chatAbort === abort) _chatAbort = null;
+  if (live.end && live.end.type === 'error' && live.end.code === 'stopped') showToast(t('chat.stopped_toast'));
+  if (currentTab === 'chat') {
+    loadChatList();
+    if (_chatId === chatId) loadChatMessages();
+  }
+}
+
+// Leave the open chat's stream (its answer goes on on the server).
+function leaveChat() {
+  if (_chatAbort) _chatAbort.abort();
+  _chatAbort = null;
+  _chatLive = null;
+}
+
+function openChat(id) {
+  if (id === _chatId) { toggleChats(false); return; }
+  leaveChat();
+  _chatId = id || '';
+  _chatData = null;
+  toggleChats(false);
+  if (_chatList) document.getElementById('chat-chats').innerHTML =
+    renderChatList(_chatList.chats || [], _chatId, (document.getElementById('chat-q').value || '').trim());
+  document.getElementById('chat-list').innerHTML = '<p class="muted">' + escHtml(t('common.loading')) + '</p>';
+  loadChatMessages();
+}
+
+function newChat() {
+  openChat('');
+  const box = document.getElementById('chat-input');
+  if (box) box.focus();
+}
+
+// The list of chats on a narrow screen: shown or folded away.
+function toggleChats(open) {
+  const side = document.getElementById('chat-side');
+  const btn = document.getElementById('chat-toggle');
+  if (!side) return;
+  const on = open === undefined ? !side.classList.contains('open') : !!open;
+  side.classList.toggle('open', on);
+  if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+
+async function renameChat(id) {
+  const c = ((_chatList && _chatList.chats) || []).find(x => x.id === id);
+  const title = prompt(t('chat.rename_prompt'), c ? c.title : '');
+  if (title === null || !title.trim()) return;
+  const r = await api('/api/agent/chats/' + encodeURIComponent(id), {method: 'PATCH',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({title: title})});
+  if (!r || r.success === false) { chatRefused(r); return; }
+  loadChatList();
+  if (id === _chatId && _chatData) { _chatData.chat = Object.assign({}, _chatData.chat || {}, r.chat); paintChat(); }
+}
+
+async function deleteChat(id) {
+  const c = ((_chatList && _chatList.chats) || []).find(x => x.id === id);
+  if (!confirm(t('chat.delete_confirm', {title: (c && c.title) || t('chat.untitled')}))) return;
+  const r = await api('/api/agent/chats/' + encodeURIComponent(id), {method: 'DELETE'});
+  if (!r || r.success === false) { chatRefused(r); return; }
+  showToast(t('chat.deleted'));
+  if (id === _chatId) openChat('');
+  loadChatList();
+}
+
+function chatRefused(r) {
+  const code = r && own(CHAT_REFUSALS, r.code) ? r.code : '';
+  showToast(code ? t('chat.refused.' + code) : ((r && r.message) || t('chat.send_failed')), 'error');
 }
 
 function chatKey(ev) {
   // Enter sends, Shift+Enter is a new line.
   if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sendChat(ev); }
+}
+
+// What a message or a retry started: the chat it is in, open, its answer
+// followed.
+async function chatStarted(r) {
+  if (_chatId !== r.chat) leaveChat();
+  _chatId = r.chat;
+  await loadChat();
+  if (!_chatLive || _chatLive.turn !== r.turn) followChat(r.chat, r.turn);
 }
 
 async function sendChat(ev) {
@@ -7269,16 +7510,26 @@ async function sendChat(ev) {
   const text = (box.value || '').trim();
   if (!text || btn.disabled) return;
   btn.disabled = true;
-  const r = await api('/api/agent/messages', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                              body: JSON.stringify({text: text})});
-  btn.disabled = false;
-  if (!r || r.success === false) {
-    showToast((r && r.message) || t('chat.send_failed'), 'error');
-    return;
-  }
+  const path = _chatId ? '/api/agent/chats/' + encodeURIComponent(_chatId) + '/messages' : '/api/agent/chats';
+  const r = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                             body: JSON.stringify({text: text})});
+  if (!r || r.success === false) { btn.disabled = false; chatRefused(r); return; }
   box.value = '';
-  showToast(t('chat.sent'));
-  loadChat();
+  await chatStarted(r);
+}
+
+async function retryChat(turn) {
+  if (!_chatId) return;
+  const r = await api('/api/agent/chats/' + encodeURIComponent(_chatId) + '/retry', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({turn: turn})});
+  if (!r || r.success === false) { chatRefused(r); return; }
+  await chatStarted(r);
+}
+
+async function stopChat() {
+  if (!_chatId) return;
+  const r = await api('/api/agent/chats/' + encodeURIComponent(_chatId) + '/stop', {method: 'POST'});
+  if (!r) showToast(t('chat.send_failed'), 'error');
 }
 
 // ── Queue (Coadă): the background jobs, per lane ──

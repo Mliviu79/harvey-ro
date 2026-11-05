@@ -294,6 +294,10 @@ class Reader:
         self.keys: dict[int, tuple[str, object]] = {}
         self._keyless: set[int] = set()
         self._modules: dict[str, int] | None = None
+        # The firm sets worked out in this read (firm_set), by filter: a
+        # read that asks twice (the Contacts page, the agent's counts)
+        # works each out once.
+        self._firm_sets: dict[tuple, FirmSet | None] = {}
 
     # Plumbing
 
@@ -674,6 +678,14 @@ class Reader:
         allow (None: no such condition, every live firm); Harvey's own
         columns are ``predicates``. ``possible``: a cohort's unknowns pass
         too (the contact finder searches what isn't known yet)."""
+        from dataclasses import astuple
+
+        key = (repr(astuple(f)), possible)
+        if key not in self._firm_sets:
+            self._firm_sets[key] = self._firm_set(f, possible)
+        return self._firm_sets[key]
+
+    def _firm_set(self, f, possible: bool) -> FirmSet | None:
         if f.nothing:
             return FirmSet()
         parts: list[FirmSet] = []
@@ -1980,6 +1992,80 @@ class Reader:
             out = {c for c in out if c not in with_person} if firms is not None or f.source \
                 else {c for c in keep_set if c not in self._contacts_with_person(keep)}
         return [c for c in keep if c in out]
+
+    # ── Counts over a filter (the agent's counts view) ──
+
+    FIRM_COUNTS = ("firms", "with_website", "without_contact", "with_email", "with_phone",
+                   "with_mobile", "with_email_or_mobile", "site_read", "finder_searched",
+                   "searched", "with_people")
+
+    def firm_counts(self, f) -> dict:
+        """What the Companies page's filter selects, counted: the firms,
+        with and without a website, without a contact, with an email, a
+        phone, a mobile (email or mobile), their site read, searched by
+        the contact finder or by anything, people named. No firm condition:
+        the tallies (the reads a tally doesn't keep: None)."""
+        s = self.firm_set(f)
+        p = self.predicates(f)
+        if s is None and not self.narrowed(p):
+            t = self.tally()
+            out = dict.fromkeys(self.FIRM_COUNTS)
+            out.update(firms=t.get("firms", 0), with_website=t.get("firms_with_site", 0),
+                       without_contact=t.get("firms", 0) - t.get("firms_with_contact", 0),
+                       with_email=t.get("firms_with_email", 0),
+                       with_phone=t.get("firms_with_phone", 0),
+                       with_mobile=t.get("firms_with_mobile", 0),
+                       with_email_or_mobile=self.one("overlay.agent.firms_reached"))
+        else:
+            ids = self.matching(f)
+            sums = [0] * len(self.FIRM_COUNTS)
+            for chunk in chunks(ids, 5000):
+                row = self.x("overlay.agent.firm_counts", (json.dumps(chunk),)).fetchone()
+                sums = [a + (b or 0) for a, b in zip(sums, row)]
+            out = dict(zip(self.FIRM_COUNTS, sums))
+        if out["firms"] is not None and out["with_website"] is not None:
+            out["without_website"] = out["firms"] - out["with_website"]
+        return out
+
+    def contact_counts(self, f) -> dict:
+        """What the Contacts page's filter selects, counted: contacts by
+        kind, status and trust, the mobiles, the emails that can be sent
+        to (verified or risky, not on the do-not-contact list) and those on
+        it. No condition at all: the contact table counted whole."""
+        s = self.firm_set(f)
+        p = self.predicates(f)
+        plain_contact = not (f.status or f.trust in contacts.TRUST_LEVELS or f.has_person
+                             or f.source or (f.q or "").strip())
+        statuses = {v: k for k, v in schema.CONTACT_STATUS.items()}
+        out = {"contacts": 0, "by_kind": {}, "by_status": {}, "by_trust": {}, "mobile": 0,
+               "deliverable_email": 0, "do_not_contact": 0}
+
+        def add(kind, line, trust, status, n, dnc):
+            if f.kind == "mobile" and not (kind == "phone" and line == schema.MOBILE):
+                return
+            if f.kind and f.kind != "mobile" and kind != f.kind:
+                return
+            out["contacts"] += n
+            out["by_kind"][kind] = out["by_kind"].get(kind, 0) + n
+            name = statuses.get(status, "unknown") if status is not None else "unknown"
+            out["by_status"][name] = out["by_status"].get(name, 0) + n
+            level = TRUST_NAMES.get(trust, "unlinked") if trust is not None else "unlinked"
+            out["by_trust"][level] = out["by_trust"].get(level, 0) + n
+            if kind == "phone" and line == schema.MOBILE:
+                out["mobile"] += n
+            out["do_not_contact"] += dnc
+            if kind == "email" and status in (schema.CONTACT_STATUS["verified"],
+                                              schema.CONTACT_STATUS["risky"]):
+                out["deliverable_email"] += n - dnc
+
+        if s is None and not self.narrowed(p) and plain_contact:
+            for kind, line, trust, status, n, dnc in self.x("overlay.agent.contacts"):
+                add(kind, line, trust, status, n, dnc or 0)
+            return out
+        for cid in self._contact_ids(f, s, p):
+            r = self._contact_rows[cid]
+            add(r[1], r[4], r[10], r[5], 1, 1 if r[6] else 0)
+        return out
 
     def _contacts_with_person(self, ids) -> set[int]:
         return {l[0] for l in self._by_ids("overlay.read.links_of_contacts", list(ids)) if l[3]}

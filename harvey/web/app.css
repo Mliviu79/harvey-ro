@@ -1438,3 +1438,28 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .chat-args code { font-size: var(--fs-caption); white-space: pre-wrap; }
 .chat-form { display: flex; gap: var(--sp-2); align-items: flex-end; }
 .chat-form textarea { flex: 1; min-width: 0; resize: vertical; }
+#chat-tokens { display: inline-flex; flex-wrap: wrap; gap: var(--sp-1); align-items: center; }
+/* The chats beside the open one; on a narrow screen folded behind Chats. */
+.chat-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: var(--sp-3); align-items: start; }
+.chat-side { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 75vh; }
+.chat-chats { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; min-height: 0; }
+.chat-item { display: flex; align-items: center; gap: 2px; border-radius: var(--r-sm); }
+.chat-item.on { background: var(--select); }
+.chat-item .icon-btn { padding: 0 6px; background: none; box-shadow: none; opacity: 0; }
+.chat-item.on .icon-btn, .chat-item:focus-within .icon-btn { opacity: 1; }
+@media (hover: hover) { .chat-item:hover { background: var(--surface-2); } .chat-item.on:hover { background: var(--select); } .chat-item:hover .icon-btn { opacity: 1; } }
+@media (hover: none) { .chat-item .icon-btn { opacity: 1; } }
+.chat-open { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; text-align: left; padding: 6px 8px; border: none; background: none; cursor: pointer; color: var(--text); font: inherit; }
+.chat-item-title { font-size: var(--fs-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-item-when { font-size: var(--fs-caption); color: var(--text-3); }
+.chat-head { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: baseline; justify-content: space-between; }
+.chat-head h3 { font-size: var(--fs-body); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.chat-retry { margin-top: var(--sp-2); }
+.chat-older { align-self: center; }
+.chat-toggle { display: none; }
+@media (max-width: 760px) {
+  .chat-layout { grid-template-columns: minmax(0, 1fr); }
+  .chat-toggle { display: inline-flex; }
+  .chat-side { display: none; }
+  .chat-side.open { display: flex; }
+}

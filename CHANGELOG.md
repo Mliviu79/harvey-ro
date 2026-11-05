@@ -9,18 +9,37 @@ minor versions can still change behaviour.
 
 ### Added
 
-- **Chat with Harvey's agent, read only.** A Chat tab (and `harvey agent ask`,
-  `harvey agent log`) asks a model about Harvey's data. It runs on your Claude
-  plan as a job on its own lane (`agent_turn`), within Harvey's share of the
-  quota, and reads only through Harvey's own MCP server (`python -m
-  harvey.agent.tools`, the official `mcp` SDK): the schema and fact catalog,
-  named views (pipeline, firms by place and activity, coverage, contacts,
-  campaigns, jobs and spend), one SELECT under SQLite's authorizer on a
-  read-only connection (no settings, email text, or text copied from websites
-  and replies; 5 s, 200 rows), the estimates and the queue. It can't act yet.
-  Every tool call is recorded (`agent_tool_call`) and shown under its answer.
-  Schema 31 adds the chat's two tables. The `mcp` package is new: rebuild the
-  Docker image (`docker compose build harvey`). Claude only: with Codex as the
+- **Chats with Harvey's agent, read only.** A Chat tab (and `harvey agent
+  chats`, `chat`, `ask`, `rename`, `delete`, `log`) keeps your conversations
+  with a model about Harvey's data, the way claude.ai does: a list of chats
+  (newest activity first, search by title, rename, delete), New chat, and
+  any chat opened again and continued, its answer still streaming if you
+  left it mid-answer. Each chat in use is one Claude CLI process (stream-json
+  in and out) answering message after message, the answer written as it
+  comes with each tool call shown as it runs; Stop, Retry on a failed or
+  stopped answer, and the chat's context size with a hint to start afresh
+  past 150,000 tokens. No job and no queue: a message is answered at once or
+  refused at once (Harvey's share of the plan used, an answer still coming,
+  the chat open in another Harvey process, three chats already answering).
+  Up to three chats live at once per Harvey process; a chat's process
+  closes after 10 minutes without a message, and the next message primes a
+  new one with the conversation from Harvey's database (its oldest turns
+  condensed to a note when it is long). Ctrl-C on the dashboard waits 5 s
+  at most for an open answer.
+  It reads only through Harvey's own MCP server (`python -m
+  harvey.agent.tools`, the official `mcp` SDK), and in counts: `counts`
+  answers how many firms and contacts any Contacts or Companies filter
+  selects (with and without a website, with an email or a mobile, ...) in
+  one call, as those pages count them; rows come back only as a sample (10,
+  with their total); the schema gives the join rules (the `ro.cui` scheme,
+  integer keys, the registry's CUI table); a query that reads a personal
+  column (a name, an email, a phone, a profile) is refused, wherever it
+  reads it, and what the views return has emails and phones masked. One SELECT runs under SQLite's
+  authorizer on a read-only connection (no settings, email text, or text
+  copied from websites and replies; 5 s). It can't act yet. Every tool call
+  is recorded (`agent_tool_call`) and shown under its answer. Schemas 31 and
+  32 add the chats' tables (messages already on file become one chat; the earlier chat jobs still waiting are cancelled). The `mcp` package is new: rebuild the Docker
+  image (`docker compose build harvey`). Claude only: with Codex as the
   brain the chat says so.
 - **Settings → Classifier explains itself, and everything it does is on
   the page.** The card says what the classifier decides (whether a website

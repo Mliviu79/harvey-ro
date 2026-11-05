@@ -1365,13 +1365,3 @@ def registry_count(params: dict) -> int | None:
     finally:
         con.close()
 
-
-# ── The agent's chat (harvey/agent/chat.py) ──
-
-@jobs.kind("agent_turn")
-async def run_agent_turn(ctx) -> dict:
-    """One turn of the chat: the Claude CLI asked once with Harvey's
-    read-only tools, its answer written as the agent's message."""
-    from harvey.agent import chat
-
-    return await chat.run_turn(ctx)

@@ -526,6 +526,21 @@ def test_held_statements_probe_firm_ident_by_scheme_and_key(files, overlay_con):
         assert probe and all("(scheme=? AND key=?)" in p for p in probe), (st.name, plan)
 
 
+def test_the_agents_counts_read_firms_by_key_and_their_small_indexes(overlay_con):
+    """The agent's counts over a filter: each matching firm probed by its
+    id, never the firm table walked; the whole install's email-or-mobile
+    count from the firms with a contact (a small partial index)."""
+    plan = explain(overlay_con, queries.sql("overlay.agent.firm_counts"), ("[1, 2]",))
+    assert any(p.startswith("SEARCH f USING INTEGER PRIMARY KEY") for p in plan), plan
+    assert not any(p.startswith("SCAN f") for p in plan), plan
+    plan = explain(overlay_con, queries.sql("overlay.agent.firms_reached"))
+    assert plan == ["SCAN firm USING INDEX firm_with_contact"], plan
+    for name in ("overlay.agent.chat_messages", "overlay.agent.chats", "overlay.agent.chat_context",
+                 "overlay.agent.delete_chat_calls"):
+        plan = explain(overlay_con, queries.sql(name), queries.get(name).params)
+        assert not any(p.startswith("SCAN") and "USING" not in p for p in plan), (name, plan)
+
+
 def test_adapters_answer_on_fixture_files(files, overlay_con):
     from harvey.modules.ro.mf_financials.queries import Adapter as Fin
     from harvey.modules.ro.mf_taxpayers.queries import Adapter as Tax

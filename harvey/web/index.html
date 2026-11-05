@@ -390,17 +390,26 @@
   <div id="queue-list"><p class="muted" data-i18n="common.loading">Se încarcă…</p></div>
 </div>
 
-<!-- Chat with Harvey's agent (read only) -->
+<!-- Chat with Harvey's agent (read only): the chats kept, one open -->
 <div id="chat" class="section">
-  <div class="section-head"><div><h2 data-i18n="chat.title">Chat</h2><p data-i18n="chat.lede">Întreabă-l pe Harvey despre datele tale: firme, contacte, căutări, campanii, costuri. Agentul citește prin uneltele lui Harvey, doar în citire, și nu poate face încă nimic în locul tău.</p></div></div>
+  <div class="section-head"><div><h2 data-i18n="chat.title">Chat</h2><p data-i18n="chat.lede">Întreabă-l pe Harvey despre datele tale: firme, contacte, căutări, campanii, costuri. Agentul citește prin uneltele lui Harvey, doar în citire, și nu poate face încă nimic în locul tău.</p></div>
+    <div class="page-actions"><button type="button" class="btn chat-toggle" id="chat-toggle" onclick="toggleChats()" aria-expanded="false" aria-controls="chat-side" data-i18n="chat.chats">Chaturi</button><button type="button" class="btn btn-primary" id="chat-new" onclick="newChat()" data-i18n="chat.new">Chat nou</button></div></div>
   <div id="chat-note"></div>
-  <div class="card chat-card">
-    <div id="chat-list" class="chat-list" aria-live="polite"><p class="muted" data-i18n="common.loading">Se încarcă…</p></div>
-    <form id="chat-form" class="chat-form" onsubmit="sendChat(event)">
-      <textarea id="chat-input" rows="3" maxlength="4000" data-i18n-placeholder="chat.placeholder" data-i18n-aria="chat.placeholder" placeholder="Ex.: câte firme din Cluj au telefon, dar nu au email?" aria-label="Ex.: câte firme din Cluj au telefon, dar nu au email?" onkeydown="chatKey(event)"></textarea>
-      <button type="submit" class="btn btn-primary" id="chat-send" data-i18n="chat.send">Trimite</button>
-    </form>
-    <p class="muted small" data-i18n="chat.async">Răspunsul vine când se termină tura agentului, ca orice lucrare din Coadă: poți închide pagina între timp.</p>
+  <div class="chat-layout">
+    <aside id="chat-side" class="card chat-side">
+      <input id="chat-q" type="search" class="form-input" oninput="searchChats()" data-i18n-placeholder="chat.search" data-i18n-aria="chat.search" placeholder="Caută în titluri" aria-label="Caută în titluri">
+      <div id="chat-chats" class="chat-chats"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
+    </aside>
+    <div class="card chat-card">
+      <div class="chat-head"><h3 id="chat-title"></h3><span id="chat-tokens"></span></div>
+      <div id="chat-list" class="chat-list" aria-live="polite"><p class="muted" data-i18n="common.loading">Se încarcă…</p></div>
+      <form id="chat-form" class="chat-form" onsubmit="sendChat(event)">
+        <textarea id="chat-input" rows="3" maxlength="4000" data-i18n-placeholder="chat.placeholder" data-i18n-aria="chat.placeholder" placeholder="Ex.: câte firme din Cluj au telefon, dar nu au email?" aria-label="Ex.: câte firme din Cluj au telefon, dar nu au email?" onkeydown="chatKey(event)"></textarea>
+        <button type="button" class="btn" id="chat-stop" onclick="stopChat()" hidden data-i18n="chat.stop">Oprește</button>
+        <button type="submit" class="btn btn-primary" id="chat-send" data-i18n="chat.send">Trimite</button>
+      </form>
+      <p class="muted small" data-i18n="chat.live">Răspunsul apare pe măsură ce e scris, cu fiecare unealtă folosită. Chaturile rămân până le ștergi; un chat lung costă mai mult la fiecare mesaj, așa că un Chat nou e mai ieftin pentru o întrebare nouă.</p>
+    </div>
   </div>
 </div>
 

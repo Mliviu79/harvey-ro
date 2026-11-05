@@ -2222,55 +2222,248 @@ def _dollars(text: str) -> float:
 
 
 def cmd_agent(args):
-    """The chat with Harvey's agent: ask (queue a message and wait for the
-    answer, or --background) and log (the conversation, with each
-    answer's tool calls)."""
+    """The chats with Harvey's agent: chats (the list), chat (a conversation
+    in the terminal: a new chat, or --chat ID goes on with one), ask (one
+    question, in a chat of its own), each answer streamed as it is made;
+    rename, delete; log (the messages, with each answer's tool calls)."""
+    import time
+
     from harvey.agent import chat
     from harvey.state import StateManager
 
-    async def _ask():
-        state = StateManager()
-        await state.init_db()
+    # (ask's first word lands in ``target``.)
+    question = " ".join(([args.target] if args.target else []) + list(args.text or []))
+
+    async def _answer(h, chat_id, text):
+        """Send ``text`` and print the answer as it comes: (the answer, or
+        None when refused; whether it ended with an answer)."""
         try:
-            queued = await chat.ask(state, " ".join(args.text or []))
+            answer = await h.ask(chat_id, text)
         except chat.Refused as e:
             print(f"\n  {e}\n")
-            raise SystemExit(2)
-        if args.background:
-            await _queued_note(state, queued["batch_id"], 1)
-            return
-        print("\n  Asked. The answer comes when the turn ends (Ctrl-C stops waiting; the "
-              "turn goes on, and harvey agent log shows it).\n", flush=True)
-        await _wait_for(state, queued["batch_id"])
-        found = await chat.messages(state, limit=200)
-        _print_turn([m for m in found["messages"] if m["turn"] == queued["turn"]],
-                    found["calls"].get(queued["turn"], []), every_call=True)
-        answer = next((m for m in found["messages"] if m["turn"] == queued["turn"]
-                       and m["role"] == "agent"), None)
-        if answer is None:
-            print("  No answer yet: the turn waits (harvey jobs list says why).\n")
-        elif answer["status"] != chat.OK:
+            return None, False
+        return answer, await _print_answer(answer)
+
+    async def _ask(state, h):
+        answer, ok = await _answer(h, None, question)
+        if answer is not None:
+            print(f"  (Chat {answer.chat}: harvey agent chat --chat {answer.chat} "
+                  "goes on with it.)")
+        if not ok:
             raise SystemExit(1)
 
-    async def _log():
+    async def _chat(state, h):
+        chat_id = args.chat or None
+        if chat_id:
+            info = await chat.chat_info(state, chat_id)
+            if info is None:
+                print(f"\n  No chat {chat_id}: harvey agent chats lists them.\n")
+                raise SystemExit(2)
+            print(f"\n  Chat {chat_id}: {info['title'] or '(untitled)'}"
+                  + (f" ({info['context']:,} tokens of context)" if info["context"] else ""))
+        print("\n  Chat with Harvey's agent (read only). Enter sends; Ctrl-C stops an answer; "
+              "Ctrl-D or 'exit' ends; 'new' starts a new chat.")
+        while True:
+            try:
+                text = (await _read_line("\n  You: ")).strip()
+            except EOFError:
+                print()
+                break
+            if text in ("exit", "quit"):
+                break
+            if text == "new":
+                chat_id = None
+                print("  A new chat starts with the next message.")
+            elif text:
+                answer, _ = await _answer(h, chat_id, text)
+                if answer is not None:
+                    chat_id = answer.chat
+        if chat_id:
+            print(f"  (Chat {chat_id}: harvey agent chat --chat {chat_id} goes on with it.)\n")
+
+    async def _state():
         state = StateManager()
         await state.init_db()
-        found = await chat.messages(state, limit=args.limit)
+        return state
+
+    async def _chats():
+        state = await _state()
+        found = await chat.chats(state, args.q, limit=args.limit)
+        if not found:
+            print("\n  No chats" + (f" with {args.q!r} in their title" if args.q else "")
+                  + ': harvey agent chat starts one.\n')
+            return
+        print()
+        for c in found:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last_at"] or 0))
+            busy = "  [answering]" if c["answering"] else ""
+            print(f"  {c['id']}  {when}  {c['title'] or '(untitled)'}{busy}")
+        print()
+
+    async def _rename():
+        state = await _state()
+        if not args.target or not args.text:
+            print("\n  Say which chat and its title: harvey agent rename ID TITLE\n")
+            raise SystemExit(2)
+        try:
+            info = await chat.rename(state, args.target, " ".join(args.text))
+        except chat.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+        print(f"\n  Chat {info['id']} is now: {info['title']}\n")
+
+    async def _delete(state, h):
+        info = await chat.chat_info(state, args.target)
+        if info is None:
+            print(f"\n  No chat {args.target}: harvey agent chats lists them.\n")
+            raise SystemExit(2)
+        if not args.yes:
+            typed = (await _read_line(f"\n  Delete the chat {info['title'] or info['id']!r} and "
+                                      "its messages? [y/N] ")).strip().lower()
+            if typed not in ("y", "yes"):
+                print("  Kept.\n")
+                return
+        try:
+            await h.delete(args.target)
+        except chat.Refused as e:
+            print(f"\n  {e}\n")
+            raise SystemExit(1)
+        print("  Deleted.\n")
+
+    async def _log():
+        state = await _state()
+        if args.chat and await chat.chat_info(state, args.chat) is None:
+            print(f"\n  No chat {args.chat}: harvey agent chats lists them.\n")
+            raise SystemExit(2)
+        found = await chat.messages(state, args.chat or None, limit=args.limit, retried=True)
         if not found["messages"]:
-            print("\n  No messages yet: harvey agent ask \"...\"\n")
+            print('\n  No messages yet: harvey agent ask "..."\n')
             return
         turns = list(dict.fromkeys(m["turn"] for m in found["messages"]))
         for turn in turns:
             _print_turn([m for m in found["messages"] if m["turn"] == turn],
                         found["calls"].get(turn, []), every_call=args.calls)
 
-    if args.agent_action == "ask":
-        if not args.text:
+    action = args.agent_action
+    if action == "ask":
+        if not question:
             print('\n  Say what to ask: harvey agent ask "how many firms have a phone?"\n')
             raise SystemExit(2)
-        asyncio.run(_ask())
+        _run_chat(_ask)
+    elif action == "chat":
+        _run_chat(_chat)
+    elif action == "chats":
+        asyncio.run(_chats())
+    elif action == "rename":
+        asyncio.run(_rename())
+    elif action == "delete":
+        if not args.target:
+            print("\n  Say which chat: harvey agent delete ID (harvey agent chats lists them)\n")
+            raise SystemExit(2)
+        _run_chat(_delete)
     else:
         asyncio.run(_log())
+
+
+def _run_chat(work) -> None:
+    """``work(state, hub)`` on the database's chats, every process closed
+    at the end. Ctrl-C stops the answer being made; between answers it
+    ends the command."""
+    import signal
+
+    from harvey.agent import chat
+    from harvey.state import StateManager
+
+    async def main():
+        state = StateManager()
+        await state.init_db()
+        h = chat.hub(state)
+        task = asyncio.ensure_future(work(state, h))
+        loop = asyncio.get_running_loop()
+
+        def interrupt():
+            answering = h.answering()
+            if answering:
+                print("\n  Stopping the answer...", flush=True)
+                for chat_id in answering:
+                    asyncio.ensure_future(h.stop(chat_id))
+            else:
+                task.cancel()
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, interrupt)
+        except (NotImplementedError, RuntimeError):
+            pass    # (Windows: Ctrl-C ends the command, and the answer with it.)
+        try:
+            await task
+        except asyncio.CancelledError:
+            print()
+        finally:
+            await chat.close_all()
+
+    asyncio.run(main())
+
+
+async def _read_line(prompt: str) -> str:
+    """A line typed in the terminal, read without holding the event loop
+    (EOFError at Ctrl-D)."""
+    import sys
+
+    print(prompt, end="", flush=True)
+    loop = asyncio.get_running_loop()
+    try:
+        fd = sys.stdin.fileno()
+        done = loop.create_future()
+
+        def ready():
+            if not done.done():
+                done.set_result(sys.stdin.readline())
+
+        loop.add_reader(fd, ready)
+    except (NotImplementedError, ValueError, OSError, AttributeError):
+        line = await asyncio.to_thread(sys.stdin.readline)
+    else:
+        try:
+            line = await done
+        finally:
+            loop.remove_reader(fd)
+    if line == "":
+        raise EOFError
+    return line
+
+
+async def _print_answer(answer) -> bool:
+    """Print an answer's events as they come: its text as it is written,
+    each tool call and its outcome. True when it ended with an answer."""
+    import json
+
+    print("\n  Harvey: ", end="", flush=True)
+    wrote = after_tool = False
+    async for event in answer.follow():
+        kind = event["type"]
+        if kind == "text":
+            print(("\n    " if after_tool else "") + event["text"].replace("\n", "\n    "),
+                  end="", flush=True)
+            wrote, after_tool = True, False
+        elif kind == "tool_use":
+            after_tool = True
+            print(f"\n    · {event['tool']}({json.dumps(event['arguments'], ensure_ascii=False)[:160]})",
+                  end="", flush=True)
+        elif kind == "tool_result":
+            print(f" {event['outcome']}, {event['ms']} ms", end="", flush=True)
+        elif kind == "done":
+            if not wrote:
+                print(("\n    " if after_tool else "") + event["text"].replace("\n", "\n    "),
+                      end="")
+            print(f"\n\n  ({event['tokens']:,} tokens; the chat's context now "
+                  f"{event['context']:,})")
+            if event.get("hint"):
+                print("  This chat is long: 'new' starts a new one, which costs less a message.")
+            return True
+        elif kind == "error":
+            print(f"\n\n  No answer ({event['code']}): {event['detail']}")
+            return False
+    return False
 
 
 def _print_turn(rows: list[dict], calls: list[dict], *, every_call: bool = False) -> None:
@@ -3898,16 +4091,27 @@ def main():
     sub.set_defaults(func=cmd_jobs)
 
     sub = subparsers.add_parser(
-        "agent", help="The chat with Harvey's agent (read only): ask, log",
+        "agent", help="The chats with Harvey's agent (read only): chats, chat, ask, rename, "
+                      "delete, log",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
                     "read-only tools, runs on your Claude plan (within "
-                    "usage.max_daily_claude_percent) and can't act yet. A message is a job "
-                    "on the agent lane: the answer comes when the turn ends.")
-    sub.add_argument("agent_action", choices=("ask", "log"),
-                     help="ask TEXT: queue a message and wait for the answer; log: the chat")
-    sub.add_argument("text", nargs="*", help="ask: the message")
-    _background_arg(sub)
-    sub.add_argument("--limit", type=int, default=20, help="log: messages shown (default: 20)")
+                    "usage.max_daily_claude_percent) and can't act yet. Chats are kept until "
+                    "you delete them (the dashboard's Chat tab lists the same ones). The answer "
+                    "is printed as it is written; Ctrl-C stops it.")
+    sub.add_argument("agent_action", choices=("chats", "chat", "ask", "rename", "delete", "log"),
+                     help="chats: the list (--q searches the titles); chat: a conversation in "
+                          "the terminal (a new chat, or --chat ID goes on with one); ask TEXT: "
+                          "one question, in a chat of its own; rename ID TITLE; delete ID; "
+                          "log: the messages (--chat ID: one chat's)")
+    sub.add_argument("target", nargs="?", default="",
+                     help="rename, delete: the chat's id (ask: the question's first word)")
+    sub.add_argument("text", nargs="*", help="ask: the message; rename: the title")
+    sub.add_argument("--chat", default="",
+                     help="chat: go on with this chat; log: only its messages")
+    sub.add_argument("--q", default="", help="chats: only those whose title holds these words")
+    sub.add_argument("--yes", action="store_true", help="delete: without asking first")
+    sub.add_argument("--limit", type=int, default=20,
+                     help="log: messages shown; chats: chats shown (default: 20)")
     sub.add_argument("--calls", action="store_true", help="log: every tool call of each answer")
     sub.set_defaults(func=cmd_agent)
 

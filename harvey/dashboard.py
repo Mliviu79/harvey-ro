@@ -23,7 +23,7 @@ import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import (
-    HTMLResponse, JSONResponse, PlainTextResponse, Response,
+    HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse,
 )
 
 logger = logging.getLogger("harvey.dashboard")
@@ -81,6 +81,7 @@ async def _lifespan(_app):
         yield
     finally:
         stop.set()
+        await _close_chats()
         if task is not None:
             try:
                 await asyncio.wait_for(task, timeout=30)
@@ -4887,44 +4888,163 @@ async def act_on_lane(lane: str, action: str):
     return {"success": True, "lane": lane, "paused": action == "pause"}
 
 
-# ── The chat with Harvey's agent (harvey/agent/chat.py) ──
+# ── Chat: the chats with Harvey's agent (harvey/agent/chat.py) ──
 
-@app.get("/api/agent/messages")
-async def get_agent_messages(limit: int = 50, before: int = 0):
-    """The chat: the newest messages, oldest first ({id, turn, role, text,
-    status, created_at}), each turn's tool calls (``calls``: {turn: [{tool,
-    arguments, result, ms, outcome}]}), whether a turn waits or runs
-    (``busy``), and why the chat can't run with these settings
-    (``refused``: Codex as the brain)."""
+def _chat_refused(e) -> JSONResponse:
+    status = {"empty": 400, "too_long": 400, "retry": 400, "missing": 404,
+              "budget": 429}.get(e.code, 409)
+    return JSONResponse({"success": False, "code": e.code, "message": str(e)},
+                        status_code=status)
+
+
+@app.get("/api/agent/chats")
+async def get_agent_chats(q: str = "", limit: int = 100):
+    """The chats, newest activity first ({id, title, created_at, last_at,
+    answering}), those whose title holds ``q``; why the chat can't run with
+    these settings (``refused``: Codex as the brain)."""
     from harvey.agent import chat
 
     state = _state()
     await state.init_db()
-    found = await chat.messages(state, limit=limit, before=before or None)
-    return {**found, "refused": chat.refusal(_load_config_quietly())}
+    return {"chats": await chat.chats(state, q, limit),
+            "refused": chat.refusal(_load_config_quietly())}
 
 
-@app.post("/api/agent/messages")
-async def post_agent_message(request: Request):
-    """Send the agent a message: {"text"}. It is queued as a job on the
-    agent lane; the answer comes when the turn ends (GET the messages).
-    409 while Codex is the brain."""
+@app.post("/api/agent/chats")
+async def create_agent_chat(request: Request):
+    """A new chat with its first message, {"text"} (its title is made from
+    it): {"success", "chat", "turn"}, the answer started at once (follow it
+    with /api/agent/chats/{chat}/stream?turn=). Refused before anything is
+    written, with ``code`` (chat.REFUSALS)."""
     from harvey.agent import chat
-    from harvey.modules import jobs
 
     body = await _json_body(request)
     state = _state()
     await state.init_db()
-    config = _load_config_quietly()
-    why = chat.refusal(config)
-    if why:
-        return _refuse(why, 409)
     try:
-        queued = await chat.ask(state, str(body.get("text") or ""), config=config)
+        answer = await chat.hub(state).ask(None, str(body.get("text") or ""),
+                                           config=_load_config_quietly())
     except chat.Refused as e:
-        return _bad(str(e))
-    jobs.notify()
-    return {"success": True, **queued}
+        return _chat_refused(e)
+    return {"success": True, "chat": answer.chat, "turn": answer.turn}
+
+
+@app.patch("/api/agent/chats/{chat_id}")
+async def rename_agent_chat(chat_id: str, request: Request):
+    """Rename a chat: {"title"}. {"success", "chat"}."""
+    from harvey.agent import chat
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        return {"success": True, "chat": await chat.rename(state, chat_id,
+                                                           str(body.get("title") or ""))}
+    except chat.Refused as e:
+        return _chat_refused(e)
+
+
+@app.delete("/api/agent/chats/{chat_id}")
+async def delete_agent_chat(chat_id: str):
+    """Delete a chat, its messages and their tool calls (an answer being
+    made is stopped first; the usage rows stay). {"success"}."""
+    from harvey.agent import chat
+
+    state = _state()
+    await state.init_db()
+    try:
+        await chat.hub(state).delete(chat_id)
+    except chat.Refused as e:
+        return _chat_refused(e)
+    return {"success": True}
+
+
+@app.get("/api/agent/chats/{chat_id}/messages")
+async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0):
+    """A chat's newest messages, oldest first ({id, turn, role, text,
+    status, created_at, tokens, context}; ``before``: older than that id,
+    ``more``: older ones are on file), each turn's tool calls (``calls``:
+    {turn: [{tool, arguments, result, ms, outcome}]}), the chat ({id,
+    title, context, hint: past chat.CONTEXT_HINT_TOKENS}), the message
+    being answered (``live``: follow it with the stream), ``busy``, and
+    ``refused`` (Codex as the brain). 404 for no such chat."""
+    from harvey.agent import chat
+
+    state = _state()
+    await state.init_db()
+    found = await chat.messages(state, chat_id, limit=limit, before=before or None)
+    if found["chat"] is None:
+        return _bad("no such chat", 404)
+    return {**found, "refused": chat.refusal(_load_config_quietly())}
+
+
+@app.post("/api/agent/chats/{chat_id}/messages")
+async def post_agent_chat_message(chat_id: str, request: Request):
+    """Send a chat a message: {"text"}. {"success", "chat", "turn"}, or
+    refused with ``code`` as for a new chat (missing: 404; full: every live
+    chat is answering)."""
+    from harvey.agent import chat
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        answer = await chat.hub(state).ask(chat_id, str(body.get("text") or ""),
+                                           config=_load_config_quietly())
+    except chat.Refused as e:
+        return _chat_refused(e)
+    return {"success": True, "chat": answer.chat, "turn": answer.turn}
+
+
+@app.post("/api/agent/chats/{chat_id}/retry")
+async def retry_agent_chat_message(chat_id: str, request: Request):
+    """Send the chat's newest message again when its answer failed or was
+    stopped: {"turn"}. {"success", "chat", "turn": the new one}; the
+    earlier attempt stays on file, marked retried."""
+    from harvey.agent import chat
+
+    body = await _json_body(request)
+    state = _state()
+    await state.init_db()
+    try:
+        answer = await chat.hub(state).retry(chat_id, str(body.get("turn") or ""),
+                                             config=_load_config_quietly())
+    except chat.Refused as e:
+        return _chat_refused(e)
+    return {"success": True, "chat": answer.chat, "turn": answer.turn}
+
+
+@app.get("/api/agent/chats/{chat_id}/stream")
+async def stream_agent_answer(chat_id: str, turn: str = "", after: int = 0):
+    """The answer to ``turn`` as it is made, as server-sent events (one
+    ``data:`` JSON line each, from event ``after`` on: from the start when
+    the page comes back to the chat): start, text (as it is written),
+    tool_use (a tool call as it starts), tool_result (its outcome, from
+    agent_tool_call), then done (with the tokens and the chat's context)
+    or error (with its code). A turn this process isn't answering gets a
+    single gone event: its message's status says how it ended."""
+    from harvey.agent import chat
+
+    answer = chat.hub(_state()).answer(chat_id)
+
+    async def events():
+        if answer is None or answer.turn != turn:
+            yield "data: " + json.dumps({"type": "gone", "turn": turn}) + "\n\n"
+            return
+        async for event in answer.follow(max(0, int(after))):
+            yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/agent/chats/{chat_id}/stop")
+async def stop_agent_answer(chat_id: str):
+    """Stop the chat's answer being made: {"success", "stopped": whether
+    there was one}."""
+    from harvey.agent import chat
+
+    return {"success": True, "stopped": await chat.hub(_state()).stop(chat_id)}
 
 
 @app.get("/api/jobs/batches")
@@ -6313,6 +6433,35 @@ def dashboard_url(host: str = "127.0.0.1", port: int = 5555) -> str:
     return f"http://{name}:{port}/#token={token_store.get()}"
 
 
+# How long Ctrl-C waits for open requests (a chat's stream among them)
+# before cancelling them.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
+def _server_class():
+    import uvicorn
+
+    class Server(uvicorn.Server):
+        """uvicorn's server, the chats closed first on shutdown: each answer
+        being made ends (its stream with an error event), so an open stream
+        doesn't hold the graceful wait."""
+
+        async def shutdown(self, sockets=None):
+            await _close_chats()
+            await super().shutdown(sockets)
+
+    return Server
+
+
+async def _close_chats() -> None:
+    try:
+        from harvey.agent import chat
+
+        await chat.close_all()
+    except Exception:
+        logger.exception("the chats' processes didn't close cleanly")
+
+
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     """Start the dashboard server (loopback only, token required)."""
     import uvicorn
@@ -6329,5 +6478,7 @@ def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     if os.name == "nt":
         print("  Windows: the token file is protected by your folder's permissions,")
         print("  not POSIX file modes.\n")
-    uvicorn.run(app, host=bind, port=port, log_level="warning",
-                proxy_headers=False, server_header=False, date_header=False)
+    config = uvicorn.Config(app, host=bind, port=port, log_level="warning",
+                            proxy_headers=False, server_header=False, date_header=False,
+                            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS)
+    _server_class()(config).run()
