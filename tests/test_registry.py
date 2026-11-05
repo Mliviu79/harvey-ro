@@ -163,6 +163,24 @@ def test_the_same_with_county_names_codes_and_accents(con):
     assert registry.search(con, "dentist B")["total"] == 0
 
 
+def test_a_county_filter_takes_every_spelling_and_refuses_an_unknown_one(con):
+    """As a filter (the Contacts and Companies pages, the registry view, the
+    agent), a county in any spelling the pull takes; an unknown one is
+    refused, never dropped (which would search the whole country)."""
+    def found(counties):
+        q = registry.resolve(con, classes=onrc.parse_classes("dentist"), counties=counties)
+        return [r["name"] for r in registry.firm_rows(con, registry.matching_ids(con, q), q)]
+
+    cluj = found(["Cluj"])
+    assert cluj == ["CLUJ EXEMPLU SRL"]
+    for spelling in ("CJ", "cj", "judetul Cluj", "Județul Cluj"):
+        assert found([spelling]) == cluj, spelling
+    assert found(["BV"]) == found(["Brașov"]) and "CLUJ EXEMPLU SRL" not in found(["BV"])
+    for unknown in ("XX", "Atlantis"):
+        with pytest.raises(ValueError, match="unknown county"):
+            found([unknown])
+
+
 def test_codes_in_every_spelling(con):
     both = ["CLUJ EXEMPLU SRL", "DINTE TEST SRL", "TESTESCU ANA PERSOANĂ FIZICĂ AUTORIZATĂ",
             "ZÂMBET EXEMPLU SRL"]

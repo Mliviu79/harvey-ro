@@ -369,6 +369,8 @@ def test_one_row_per_contact_with_how_many_companies_it_reaches(client):
     ({"source": "serper"}, {"info@ex2.example"}),
     ({"locality": "Sibiu"}, {"+40268000111", "info@ex2.example"}),
     ({"county": "Brașov", "kind": "email"}, {"ana@ex0.example"}),
+    ({"county": "BV", "kind": "email"}, {"ana@ex0.example"}),
+    ({"county": "judetul brasov", "kind": "email"}, {"ana@ex0.example"}),
     ({"website": "no"}, {"+40268000111"}),
     ({"q": "0722 000"}, {"+40722000112"}),
     ({"q": "exemplu 0"}, {"+40268000111", "+40722000112", "ana@ex0.example"}),
@@ -377,6 +379,14 @@ def test_filters(client, params, want):
     _seed(client.db_path)
     rows = client.get("/api/contacts", params=params).json()["rows"]
     assert {r["value"] for r in rows} == want
+
+
+def test_an_unknown_county_is_refused_not_dropped(client):
+    """Dropped, it would list every county's contacts."""
+    _seed(client.db_path)
+    res = client.get("/api/contacts", params={"county": "Atlantis"})
+    assert res.status_code == 400 and "unknown county" in res.json()["error"]
+    assert client.get("/api/contacts", params={"county": "CJ"}).json()["rows"] == []
 
 
 def test_signal_filters_reuse_the_cohort_rules(client):
@@ -753,3 +763,16 @@ def test_an_address_that_checks_out_bad_is_never_written_to(tmp_path, monkeypatc
 
     assert _rows(db, "SELECT status FROM contact WHERE value = 'office@alfa.example'") == [
         (schema.CONTACT_STATUS["invalid"],)]
+
+
+def test_a_place_matches_its_county_by_name_or_code():
+    """A firm no register describes keeps the county as its source wrote
+    it; the filter may come either way."""
+    from harvey.contacts import place_matches
+
+    for place in ("Cluj-Napoca, CJ", "Cluj-Napoca, Cluj", "Cluj-Napoca, Cluj, Romania"):
+        for county in ("Cluj", "CJ", "cj", "judetul Cluj"):
+            assert place_matches(place, county), (place, county)
+    assert not place_matches("Brașov, BV", "Cluj")
+    assert not place_matches("Brașov, BV", "CJ")
+    assert place_matches("Brașov, BV", "Brașov", "Brașov")

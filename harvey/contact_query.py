@@ -118,6 +118,20 @@ def search_arg(raw: str) -> tuple[str, str, bool]:
     return "", match, False
 
 
+def county_arg(raw: str) -> str:
+    """The county as the registry spells it, from any spelling the pull
+    takes ("BV", "brasov", "județul Brașov"); "" for none. ValueError for
+    an unknown one: dropped, it would match the whole country."""
+    if not raw:
+        return ""
+    from harvey.collectors import onrc
+
+    name = onrc.county_name(raw)
+    if name is None:
+        raise ValueError(f"unknown county {raw!r}: use its name or code (BV, CJ, B)")
+    return name
+
+
 def query_args(query: str) -> dict[str, str]:
     """A query string ("kind=email&county=BV") as the page's arguments (the
     last value of a repeated key, as the page reads it)."""
@@ -135,7 +149,7 @@ async def filter_from_query(state, args) -> tuple[object, bool]:
     get = lambda k: (args.get(k) or "").strip()[:200]  # noqa: E731
     f = contacts.ContactFilter(
         kind=get("kind"), status=get("status"), trust=get("trust"),
-        has_person=get("person"), source=get("source"), county=get("county"),
+        has_person=get("person"), source=get("source"), county=county_arg(get("county")),
         locality=get("locality"), website=get("website"), q=get("q"),
         caen=caen_arg(get("caen")), contact=contact_arg(get("contact")),
         found_in=get("found_in"))

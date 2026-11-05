@@ -307,16 +307,28 @@ def _fold(text: str) -> str:
 
 def place_matches(location: str, county: str = "", locality: str = "") -> bool:
     """Whether a place ("Town, County, Country") is in the county and
-    locality, exactly as the SQL conditions below decide it (the place
-    folded as sql_name_norm, the typed words as _fold; LIKE ignores ASCII
-    case only, and both sides are already lower case there)."""
+    locality (the place folded as name_norm, the typed words as _fold). A
+    county is matched by its name or its code, whichever the place and the
+    filter use ("Cluj" and "CJ" alike)."""
     folded = name_norm(location or "")
     locality, county = (locality or "").strip(), (county or "").strip()
     if locality and not (folded + ",").startswith(_fold(locality) + ","):
         return False
-    if county and (", " + _fold(county) + ",") not in (", " + folded + ","):
+    if county and not _county_spellings(county) & {p.strip() for p in folded.split(",")}:
         return False
     return True
+
+
+def _county_spellings(county: str) -> set[str]:
+    """The county's folded name and code, or only what was typed when it
+    names no county."""
+    from harvey.collectors import onrc
+
+    out = {_fold(county)}
+    name = onrc.county_name(county)
+    if name:
+        out |= {_fold(name)} | {code.lower() for code, n in onrc.COUNTIES.items() if n == name}
+    return out
 
 
 like = _like

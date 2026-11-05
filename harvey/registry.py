@@ -696,7 +696,17 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
         for code, version in q.explicit_classes:
             expanded += [(code, v) for v in ((version,) if version is not None else CURRENT)]
         parts.append(_tags(expanded))
-    names = list(dict.fromkeys((counties or []) + want_counties))
+    # A county filter in any spelling the pull takes ("Brașov", "BV",
+    # "județul Brașov"); an unknown one is refused, never dropped (which
+    # would search the whole country).
+    given = []
+    for county in counties or []:
+        name = onrc.county_name(county)
+        if name is None:
+            raise ValueError(f"unknown county {str(county).strip()!r}: "
+                             "use its name or code (BV, CJ, B)")
+        given.append(name)
+    names = list(dict.fromkeys(given + want_counties))
     codes = [c for c in (_county_code(n) for n in names) if c]
     q.counties = names
     if codes:
