@@ -9,6 +9,28 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Link a ChatGPT account for Codex from the dashboard, and Harvey keeps
+  it renewed.** Settings → Model now offers **Account linked in Harvey**
+  for Codex: **Link account** starts a ChatGPT device-code login in a
+  Codex app-server of Harvey's own (the same locked-down config every call
+  runs under, no tools, no model call) and shows the page to open and the
+  one-time code to type there (device-code login must be allowed in
+  ChatGPT's security settings first). Once typed, Codex's own login file
+  lands in `data/auth/codex` and the brain is set to `brain.auth: account`;
+  a link that expires (15 minutes), fails or is cancelled leaves whatever
+  was there before. Harvey renews that login itself, about daily, through
+  Codex's own refresh in that folder, so there is no `codex login` to run
+  every 8 days; if a renewal can't keep it alive, the panel and Today say
+  "link the account again" and Codex calls stop as before. Calls still get
+  an access-only copy without the refresh token. **Unlink account** is
+  Codex's own logout. The terminal login (`~/.codex`) is never renewed or
+  touched.
+- **Codex in the Docker image.** The image installs the Codex CLI pinned to
+  the one version Harvey has verified (0.159.3; the build fails on any
+  other), so Codex works in Docker through the dashboard's link. A fresh
+  host still needs `~/.claude` to exist for the Claude terminal-login
+  mount (`mkdir -p ~/.claude`).
+
 - **The brain on an API key, with dollar caps.** Settings → Model now
   offers **API key** for Claude and for Codex beside the terminal login.
   The key goes in a password box and is checked with a free call (the

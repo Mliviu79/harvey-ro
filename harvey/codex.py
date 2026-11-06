@@ -43,6 +43,15 @@ neither change the real login nor renew it; once the login has expired or
 is due for renewal, calls fail with an auth error until the operator's own
 Codex use or ``codex login`` renews it. Harvey never writes the native login.
 
+The account linked in Harvey (``brain.auth: account``) is the one login
+Harvey keeps alive: a ChatGPT login made by a device-code link from
+Settings → Model into Harvey's own folder data/auth/codex
+(start_device_login), renewed there by Harvey (renew_login, from the
+worker: harvey/codex_link.py) and removed by Codex's own logout. Calls take
+their access-only copy from that folder exactly as from ~/.codex; the
+terminal login (~/.codex) is never renewed, read for anything else or
+written.
+
 API-key mode (``brain.auth: api_key``, CodexClient(api_key=True)) is the
 one exception to "ChatGPT only", and only when chosen: the key is given to
 Codex once through its app-server's own login (``login_api_key``:
@@ -401,7 +410,43 @@ def _parse_timestamp(value) -> float | None:
     return parsed.timestamp() if parsed.tzinfo else None
 
 
-def build_access_snapshot(native: dict, now: float | None = None) -> dict:
+def login_until(native: dict) -> float:
+    """Until when a ChatGPT login (an auth.json's data) can be given to a
+    runtime: before its access token runs out, and before Codex would want
+    to renew it (the limits build_access_snapshot checks); 0 when
+    unreadable."""
+    tokens = native.get("tokens") if isinstance(native, dict) else None
+    token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    expiry = _jwt_expiry(token) if isinstance(token, str) else None
+    refreshed = _parse_timestamp(native.get("last_refresh")) if isinstance(native, dict) else None
+    if expiry is None or refreshed is None:
+        return 0.0
+    return min(expiry - ACCESS_TOKEN_MIN_SECONDS,
+               refreshed + CODEX_RENEWAL_AGE_SECONDS - RENEWAL_MARGIN_SECONDS)
+
+
+def last_refreshed(native: dict) -> float | None:
+    """When the login was last renewed (its ``last_refresh``), or None."""
+    return _parse_timestamp(native.get("last_refresh")) if isinstance(native, dict) else None
+
+
+# What a stale login is told to do: the terminal login is the user's own to
+# renew; the account linked in Harvey (data/auth/codex) is renewed by
+# Harvey itself (harvey/codex_link.py), so a stale one there means the
+# renewal failed and only a new link helps.
+STALE_TERMINAL = (
+    "Your Codex login has expired or is due for renewal. Harvey never "
+    "renews Codex logins itself (it gives Codex a copy without the "
+    "refresh token): use Codex once, which renews a login older than "
+    "8 days, or run 'codex login'. Harvey picks the renewed login up "
+    "on its next call.")
+STALE_LINKED = (
+    "The Codex account linked in Harvey has expired and Harvey couldn't "
+    "renew it: link the account again in Settings → Model.")
+
+
+def build_access_snapshot(native: dict, now: float | None = None,
+                          linked: bool = False) -> dict:
     """An access-only copy of the operator's login for one runtime.
 
     The refresh token is never given to Codex, so the runtime can't rotate
@@ -409,23 +454,14 @@ def build_access_snapshot(native: dict, now: float | None = None) -> dict:
     0.159.3 sends no credentials at all without it, and renews (here: tries
     to, and can't) a login older than CODEX_RENEWAL_AGE_SECONDS. So a login
     that has expired or is due for renewal fails here, before anything runs,
-    with an actionable, non-retryable error: Harvey never renews a login.
+    with an actionable, non-retryable error: a runtime never renews a login.
+    (``linked``: the account linked in Harvey, which Harvey renews in its
+    own folder, renew_login; the message says to link it again.)
     """
     tokens = native["tokens"]
     now = time.time() if now is None else now
-    expiry = _jwt_expiry(tokens["access_token"])
-    refreshed = _parse_timestamp(native.get("last_refresh"))
-    if (expiry is None or expiry - now < ACCESS_TOKEN_MIN_SECONDS
-            or refreshed is None
-            or now - refreshed > CODEX_RENEWAL_AGE_SECONDS - RENEWAL_MARGIN_SECONDS):
-        raise CodexError(
-            "Your Codex login has expired or is due for renewal. Harvey never "
-            "renews Codex logins itself (it gives Codex a copy without the "
-            "refresh token): use Codex once, which renews a login older than "
-            "8 days, or run 'codex login'. Harvey picks the renewed login up "
-            "on its next call.",
-            kind="auth",
-        )
+    if login_until(native) - now < 0:
+        raise CodexError(STALE_LINKED if linked else STALE_TERMINAL, kind="auth")
     snapshot_tokens = {
         "id_token": tokens["id_token"],
         "access_token": tokens["access_token"],
@@ -1334,6 +1370,240 @@ async def login_api_key(home: Path, key: str, timeout: float = LOGIN_SECONDS) ->
         raise _setup_error("Codex didn't save the API key in its login file.")
 
 
+
+# ── The account linked in Harvey (brain.auth: account) ──
+#
+# A ChatGPT login Codex keeps in Harvey's folder data/auth/codex, made by a
+# device-code link from Settings → Model (start_device_login) and renewed
+# by Harvey there (renew_login), so nobody has to run 'codex login' or use
+# Codex to keep it alive. Each of these runs one app-server under the same
+# private config every call runs with (ChatGPT login only, file
+# credential storage, no other endpoint, every tool feature off), attested
+# before the login is started, renewed or removed; nothing is ever sent to
+# a model. Calls still get an access-only copy of that login (no refresh
+# token) in a runtime of their own, exactly as with the terminal login:
+# only these functions run Codex where the refresh token is.
+
+# How long a device code lasts. The app-server's answer gives no lifetime;
+# OpenAI's device codes run out after 15 minutes, and Harvey ends the link
+# then whatever the server says.
+DEVICE_LOGIN_SECONDS = 15 * 60
+# Where a device code may send the user (the panel shows it as a link).
+DEVICE_LOGIN_HOSTS = ("auth.openai.com", "chatgpt.com")
+_CODE_RE = re.compile(r"^[A-Za-z0-9-]{4,32}$")
+
+
+def is_linked_home(home) -> bool:
+    """Whether ``home`` is Harvey's own folder data/auth/codex (the account
+    linked in Harvey), never ~/.codex."""
+    if home is None:
+        return False
+    from harvey import brain_auth
+
+    try:
+        return Path(home).resolve() == brain_auth.account_dir("codex").resolve()
+    except OSError:
+        return False
+
+
+def _write_home_config(home: Path) -> None:
+    """The private config (ChatGPT login only) as ``home``'s config.toml."""
+    fd = os.open(Path(home) / "config.toml", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(build_private_config_toml())
+
+
+def _verification_url(value) -> str:
+    """The device code's page, when it is an https page of OpenAI's."""
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or len(value) > 300:
+        return ""
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or parts.username or parts.password or not any(
+            host == h or host.endswith("." + h) for h in DEVICE_LOGIN_HOSTS):
+        return ""
+    return value.strip()
+
+
+class DeviceLogin:
+    """A ChatGPT device-code login under way in its own app-server, its
+    CODEX_HOME the folder the login is written to. ``url`` and ``code``
+    are for the user (the code is typed at the url); neither is logged."""
+
+    def __init__(self, server: "_AppServer", login_id: str, url: str, code: str):
+        self.server = server
+        self.login_id = login_id
+        self.url = url
+        self.code = code
+
+    async def wait(self, deadline: float) -> dict:
+        """Until ``account/login/completed`` for this login: {plan} of the
+        ChatGPT account once it is linked. Raises CodexError: ``refused``
+        (the login didn't complete: denied, or device-code login not
+        allowed), ``timeout`` at ``deadline``, ``isolation`` on any server
+        request, ``auth`` when the account isn't a ChatGPT one."""
+        server = self.server
+        while True:
+            message = await server.read_message(deadline)
+            method = message.get("method")
+            if "id" in message and method:
+                await server.dispatch(message)          # (raises)
+            if method != "account/login/completed":
+                continue
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            if params.get("loginId") not in (None, self.login_id):
+                continue
+            if params.get("success") is not True:
+                # (Codex's error text isn't shown: only that it didn't.)
+                raise CodexError("The ChatGPT login didn't complete.", kind="refused")
+            break
+        account = await server.request("account/read", {"refreshToken": False}, deadline)
+        acct = account.get("account") if isinstance(account, dict) else None
+        if not isinstance(acct, dict) or acct.get("type") != "chatgpt":
+            raise CodexError("Codex didn't report a ChatGPT account after the login.",
+                             kind="auth")
+        return {"plan": _safe_name(acct.get("planType") or "")}
+
+    async def cancel(self, timeout: float = 5.0) -> None:
+        """Ask Codex to drop the login (``account/login/cancel``), then end
+        the process; errors are ignored (ending the process drops it too)."""
+        try:
+            await self.server.request("account/login/cancel", {"loginId": self.login_id},
+                                      time.monotonic() + timeout)
+        except (CodexError, OSError, ValueError):
+            pass
+        await self.close()
+
+    async def close(self) -> None:
+        await self.server.close()
+
+
+async def start_device_login(home: Path, timeout: float = LOGIN_SECONDS) -> DeviceLogin:
+    """Start a ChatGPT device-code login (``account/login/start`` with
+    ``type: chatgptDeviceCode``) in an app-server whose CODEX_HOME is
+    ``home``, an empty folder of Harvey's: its config attested (with no
+    login anywhere in it) before the login starts. Codex writes the login
+    to its own auth.json there once the user has typed the code; the
+    caller moves it where calls take it from. Raises CodexError."""
+    require_supported_platform()
+    path = find_codex()
+    if not path:
+        raise _setup_error(f"Codex CLI not found. Install it: {CODEX_INSTALL_HINT}")
+    if (Path(home) / "auth.json").exists():
+        raise _setup_error("The link folder already holds a login.")
+    server = _AppServer(path)
+    deadline = time.monotonic() + timeout
+    try:
+        async with asyncio.timeout(timeout):
+            server.prepare()
+            server.codex_home = str(home)
+            _write_home_config(Path(home))
+            await server.read_version(deadline)
+            await server.launch(deadline)
+            attest_effective_config(await server.read_config(deadline))
+            started = await server.request(
+                "account/login/start", {"type": "chatgptDeviceCode"}, deadline)
+            started = started if isinstance(started, dict) else {}
+            login_id, code = started.get("loginId"), started.get("userCode")
+            url = _verification_url(started.get("verificationUrl"))
+            if (started.get("type") != "chatgptDeviceCode" or not isinstance(login_id, str)
+                    or not login_id or not isinstance(code, str) or not _CODE_RE.match(code)
+                    or not url):
+                raise _setup_error("Codex didn't start a device-code login.")
+    except BaseException as e:
+        await server.close()
+        if isinstance(e, TimeoutError):
+            raise _timeout_error() from None
+        if isinstance(e, OSError):
+            raise CodexError(f"Could not prepare Codex's login folder ({type(e).__name__}).",
+                             kind="runtime") from None
+        raise
+    return DeviceLogin(server, login_id, url, code)
+
+
+async def _account_server(home: Path, deadline: float) -> "_AppServer":
+    """An app-server in the linked account's folder ``home``: the private
+    config attested first in a runtime with no login at all, then written
+    to ``home`` and attested again there."""
+    path = find_codex()
+    if not path:
+        raise _setup_error(f"Codex CLI not found. Install it: {CODEX_INSTALL_HINT}")
+    server = _AppServer(path)
+    try:
+        server.prepare()
+        await server.read_version(deadline)
+        await server.launch(deadline)
+        attest_effective_config(await server.read_config(deadline))
+        await server.stop()
+        server.codex_home = str(home)
+        _write_home_config(Path(home))
+        await server.launch(deadline)
+        attest_effective_config(await server.read_config(deadline))
+    except BaseException:
+        await server.close()
+        raise
+    return server
+
+
+async def renew_login(home: Path, timeout: float = LOGIN_SECONDS) -> dict:
+    """Renew the ChatGPT login Codex keeps in ``home`` (Harvey's
+    data/auth/codex): ``account/read`` with ``refreshToken: true``, which
+    has Codex refresh it and write the new tokens to its own auth.json
+    there. {plan}; raises CodexError (``auth``: Codex reports no ChatGPT
+    account any more). Whether the login is usable afterwards is the
+    file's to say (login_until), which the caller reads again."""
+    require_supported_platform()
+    _load_native_auth(Path(home))           # a ChatGPT login is there
+    deadline = time.monotonic() + timeout
+    server = None
+    try:
+        async with asyncio.timeout(timeout):
+            server = await _account_server(Path(home), deadline)
+            account = await server.request("account/read", {"refreshToken": True}, deadline)
+    except TimeoutError:
+        raise _timeout_error() from None
+    except OSError as e:
+        raise CodexError(f"Could not use Codex's login folder ({type(e).__name__}).",
+                         kind="runtime") from None
+    finally:
+        if server is not None:
+            await server.close()
+    acct = account.get("account") if isinstance(account, dict) else None
+    if not isinstance(acct, dict) or acct.get("type") != "chatgpt":
+        raise CodexError("Codex no longer reports the linked ChatGPT account.", kind="auth")
+    return {"plan": _safe_name(acct.get("planType") or "")}
+
+
+async def logout(home: Path, timeout: float = LOGIN_SECONDS) -> None:
+    """Unlink the ChatGPT login in ``home``: Codex's own ``account/logout``
+    there, which removes its auth.json. Should Codex leave the file (it
+    couldn't be reached, it refused), the file is removed anyway: an
+    unlinked account is never used again. Raises nothing."""
+    auth_file = Path(home) / "auth.json"
+    deadline = time.monotonic() + timeout
+    server = None
+    try:
+        require_supported_platform()
+        async with asyncio.timeout(timeout):
+            server = await _account_server(Path(home), deadline)
+            await server.request("account/logout", None, deadline)
+    except (CodexError, TimeoutError, OSError) as e:
+        logger.info("Codex's logout in Harvey's folder didn't answer (%s); removing the "
+                    "login file instead", getattr(e, "kind", type(e).__name__))
+    finally:
+        if server is not None:
+            await server.close()
+    try:
+        auth_file.unlink()
+    except FileNotFoundError:
+        pass
+
+
 async def _kill_tree(proc):
     """Kill the child and everything it started: the npm ``codex`` wrapper
     runs the native binary as a grandchild that holds the pipes."""
@@ -1506,7 +1776,7 @@ class CodexClient:
         # (Read fresh every call.)
         _, native = _load_native_auth(self.native_home, api_key=self.api_key)
         snapshot = (build_api_key_snapshot(native) if self.api_key
-                    else build_access_snapshot(native))
+                    else build_access_snapshot(native, linked=is_linked_home(self.native_home)))
         server.api_key = self.api_key
         server.prepare()
         await server.read_version(deadline)

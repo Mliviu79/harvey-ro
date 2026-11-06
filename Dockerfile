@@ -5,9 +5,10 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 # System deps (curl needed for the Claude CLI installer; libexpat1 for
-# pyosmium, which reads the boundaries' OpenStreetMap extracts)
+# pyosmium, which reads the boundaries' OpenStreetMap extracts; Node.js
+# runs the Codex CLI's npm package)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates libexpat1 \
+    curl ca-certificates libexpat1 nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -34,8 +35,21 @@ COPY --chown=harvey:harvey prompts/ prompts/
 COPY --chown=harvey:harvey skills/ skills/
 COPY --chown=harvey:harvey harvey.yaml .
 
+# Codex CLI, pinned to the one version Harvey has verified
+# (harvey/codex.py SUPPORTED_CODEX_VERSIONS; tests check this pin matches).
+# npm is only needed to install it, so it goes again afterwards.
+ARG CODEX_VERSION=0.159.3
+RUN apt-get update && apt-get install -y --no-install-recommends npm \
+    && npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && apt-get purge -y --auto-remove npm \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
 USER harvey
 ENV PATH="/home/harvey/.local/bin:${PATH}"
+
+# Fail the build unless the Codex CLI on PATH is the supported version.
+RUN python -c "from harvey.codex import check_cli_version; print(check_cli_version())"
 
 # Claude Code CLI, installed as the runtime user so ~/.local/bin is correct.
 # Download separately so fetch failures cannot be hidden by a shell pipeline.

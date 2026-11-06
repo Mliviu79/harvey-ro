@@ -10,9 +10,10 @@ Model says about it.
   with CLAUDE_CONFIG_DIR pointed there; Codex takes its login from there
   instead of ~/.codex (an access-only copy per call, as codex.py does with
   any login). Harvey never reads Claude's files there: only the CLI does,
-  and whether it is logged in is the CLI's own ``claude auth status``. The
-  dashboard's link flow that fills these folders comes later; until then a
-  status says the folder isn't linked yet.
+  and whether it is logged in is the CLI's own ``claude auth status``.
+  Codex's is linked from Settings → Model by a ChatGPT device-code login
+  and renewed by Harvey there (harvey/codex_link.py); Claude's link flow
+  isn't in this release (its folder stays "not linked yet").
 - ``api_key``: a key billed per token, saved once from Settings → Model
   after a free check (check_key: the provider's model list, no model
   call). Claude's is kept in .env under CLAUDE_KEY_ENV, a name only Harvey
@@ -55,9 +56,14 @@ AUTH_DIR = PROJECT_ROOT / "data" / "auth"
 # Harvey's .env, where the Claude key is kept (read afresh, so a key
 # removed from Settings stops being used without a restart).
 ENV_FILE = PROJECT_ROOT / ".env"
-# The ways to link the panel offers: the account link's flow isn't in this
-# release (its button stays hidden; the data model already knows it).
-OFFERED = (TERMINAL, API_KEY)
+# The ways to link the panel offers, per provider: Codex's account is
+# linked by a device code (harvey/codex_link.py); Claude's account link
+# isn't in this release (the data model already knows it).
+OFFERED_BY = {"claude": (TERMINAL, API_KEY), "codex": (TERMINAL, ACCOUNT, API_KEY)}
+
+
+def offered(provider: str) -> tuple[str, ...]:
+    return OFFERED_BY.get(provider, (TERMINAL,))
 # The .env name of the Claude API key Settings → Model saves: no CLI reads
 # it (claude_runtime.CREDENTIAL_ENV drops it from every child), so a key
 # saved here never moves a terminal or account login to per-token billing.
@@ -354,6 +360,12 @@ def codex_status(brain, full: bool) -> dict:
         out["linked"] = False
         out["problem"] = "No API key saved: paste one in Settings → Model."
         return out
+    if auth == ACCOUNT:
+        from harvey import codex_link
+        if not codex_link.is_linked():
+            out["linked"] = False
+            out["problem"] = "Not linked yet: press Link account in Settings → Model."
+            return out
     if home is not None and not (home / "auth.json").exists():
         out["linked"] = False
         out["problem"] = f"Not linked yet: no login in {_shown(home)}."
@@ -386,7 +398,9 @@ def codex_status(brain, full: bool) -> dict:
         out["problem"] = ("Codex is logged in with an API key or another provider: Harvey "
                           "uses a ChatGPT plan only. Run 'codex login' with ChatGPT.")
     elif not account.get("type"):
-        out["problem"] = "Codex isn't logged in: run 'codex login' with ChatGPT."
+        out["problem"] = ("Codex doesn't report the linked account: link it again in "
+                          "Settings → Model." if auth == ACCOUNT else
+                          "Codex isn't logged in: run 'codex login' with ChatGPT.")
     out["models"] = found.get("models") or []
     return out
 
@@ -411,14 +425,19 @@ def _shown(path: Path) -> str:
 
 # ── The status ──
 
+LINK_EXPIRED = ("The Codex login linked in Harvey has expired and couldn't be renewed: "
+                "link the account again.")
+
 async def status(brain, *, state=None, full: bool = False, force: bool = False) -> dict:
     """Settings → Model's status line (and setup-status's brain entry):
     {provider, model, reasoning_effort, auth, offered, folder, cli {ok,
     version, problem}, linked (True, False, None: unknown), linked_as
     {method, plan[, api]}, problem, last_error, models, codex_refused,
     checked_at, key_set {claude, codex} (whether a key is saved, never the
-    key), the brain's USD caps and Codex's prices, and in API-key mode
-    ``spend`` (brain_spend.totals)}. Kept KEEP_SECONDS (``full``: KEEP_FULL_SECONDS), a failed
+    key), the brain's USD caps and Codex's prices, in API-key mode
+    ``spend`` (brain_spend.totals), and for Codex ``codex_account`` (the
+    account linked in Harvey: codex_link.renewal_status, with ``link``,
+    a link under way)}. Kept KEEP_SECONDS (``full``: KEEP_FULL_SECONDS), a failed
     one KEEP_FAILED_SECONDS; ``force`` asks again."""
     from harvey.config import BrainConfig
 
@@ -446,6 +465,18 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
             raw = await state.get_setting(BRAIN_STATUS_KEY) or ""
         except Exception:
             raw = ""
+    codex_account = None
+    if provider == "codex":
+        # The account linked in Harvey: its renewal and a link under way.
+        from harvey import codex_link
+        try:
+            codex_account = await codex_link.renewal_status(state)
+        except Exception:
+            codex_account = {"linked": codex_link.is_linked(), "expired": False}
+        codex_account["link"] = codex_link.status()
+        if auth == ACCOUNT and codex_account.get("expired"):
+            found["linked"] = False
+            found["problem"] = LINK_EXPIRED
     spend = None
     if auth == API_KEY and state is not None:
         from harvey import brain_spend
@@ -455,7 +486,7 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
             spend = None
     return {"provider": provider, "model": brain.model,
             "reasoning_effort": brain.reasoning_effort, "auth": auth,
-            "offered": list(OFFERED), "spend": spend,
+            "offered": list(offered(provider)), "spend": spend, "codex_account": codex_account,
             "key_set": {p: key_set(p) for p in ("claude", "codex")},
             "usd_per_day": brain.usd_per_day, "usd_per_month": brain.usd_per_month,
             "codex_usd_per_mtok_in": brain.codex_usd_per_mtok_in,

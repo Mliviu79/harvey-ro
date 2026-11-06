@@ -1181,6 +1181,7 @@ function todayItemText(it, stats) {
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
+    case 'codex-login': return tr(t('today.item.codex_login'), t('today.item.codex_login_detail'), t('today.item.codex_login_action'));
     case 'agent-free-plans': return tr(t('today.item.agent_free_plans', {n: s.agent_free_plans || 0}), t('today.item.agent_free_plans_detail'), t('today.item.agent_free_plans_action'));
     case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
     case 'campaign-checks': return tr(t('today.item.campaign_checks', {n: s.campaign_checks_waiting || 0}),
@@ -5065,6 +5066,7 @@ async function loadModelCard(refresh) {
                          reasoning_effort: _model.reasoning_effort, auth: _model.auth, key: ''} : null;
   if (_modelPick) for (const k of MODEL_MONEY) _modelPick[k] = _model[k] == null ? '' : String(_model[k]);
   if (refresh) _modelFull = {};
+  adoptCodexLink(_model);
   renderModelCard();
   if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
 }
@@ -5078,6 +5080,7 @@ async function loadProviderStatus(provider, refresh) {
   const s = await api('/api/brain?provider=' + provider + (provider === 'codex' ? '&full=1' : '') +
                       (refresh ? '&refresh=1' : ''));
   _modelFull[provider] = s && !s.error ? s : {failed: true};
+  adoptCodexLink(_modelFull[provider]);
   renderModelCard();
 }
 
@@ -5135,7 +5138,10 @@ function renderModelCard() {
       (on ? ' checked' : '') + (disabled ? ' disabled' : '') +
       ' onchange="pickModel(' + jsq(name) + ', this.value)"> <span>' + escHtml(label) + '</span>' +
       (note ? ' <span class="muted small">' + escHtml(note) + '</span>' : '') + '</label>';
-  const ways = Array.from(new Set([...(_model.offered || ['terminal']), _model.auth]));
+  // (The ways the picked provider offers: Codex can link an account.)
+  const ways = Array.from(new Set([...((shown && shown.offered) || _model.offered || ['terminal']),
+                                   ...(p.provider === _model.provider ? [_model.auth] : [])]));
+  const account = codex ? (((shown || (_model.provider === 'codex' ? _model : null)) || {}).codex_account || {}) : {};
   const efforts = codex ? (((models.find(m => m.id === p.model) || {}).efforts || []).length
     ? models.find(m => m.id === p.model).efforts : (_model.efforts || [])) : [];
   let modelField = '<input class="form-input" id="model-name" list="model-options" autocomplete="off" value="' +
@@ -5172,18 +5178,139 @@ function renderModelCard() {
     '</div></div>' +
     '<div class="settings-row"><div><h3>' + escHtml(t('model.link')) + '</h3>' +
       '<p class="desc">' + escHtml(t(p.auth === 'api_key' ? (codex ? 'model.api_codex' : 'model.api_claude')
+                                     : codex && p.auth === 'account' ? 'model.account_codex'
                                      : codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
       '<div class="fields">' +
       ways.map(w => radio('auth', w, t('model.auth.' + w), p.auth === w, false,
                           w === 'account' && _model.folder ? _model.folder : '')).join('') +
       (p.auth === 'api_key' ? modelKeyFields(p, codex, keySet) : '') +
+      (codex && p.auth === 'account' ? codexAccountFields(account) : '') +
       modelStatusLine(shown || (p.provider === _model.provider ? _model : null)) +
       '<div class="btn-group"><button class="btn btn-primary btn-sm" id="model-save" onclick="saveModel()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.save')) + '</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="loadModelCard(true)">' + escHtml(t('model.recheck')) + '</button>' +
       (p.auth === 'api_key' && keySet ? '<button class="btn btn-ghost btn-sm" id="model-unlink" onclick="unlinkModelKey()"' +
-        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink')) + '</button>' : '') + '</div>' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink')) + '</button>' : '') +
+      (codex && p.auth === 'account' && account.linked && !_codexLinkPending() ?
+        '<button class="btn btn-ghost btn-sm" id="model-unlink-account" onclick="unlinkCodexAccount()"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink_account')) + '</button>' : '') + '</div>' +
     '</div></div>';
+}
+
+// Codex's account linked in Harvey (brain.auth: account): a ChatGPT
+// device-code login. Link account starts it (/api/brain/codex/link): the
+// page to open and the code to type there (the user's own to see), then a
+// wait the panel polls until the server says linked, expired or failed.
+// Linked: the plan, when Harvey last renewed the login, Unlink.
+let _codexLink = null, _codexLinkTimer = null;
+
+function _codexLinkPending() {
+  return !!(_codexLink && _codexLink.status === 'pending');
+}
+
+// A link started before this page was opened (or in another tab): follow it.
+function adoptCodexLink(s) {
+  const link = s && s.codex_account && s.codex_account.link;
+  if (link && link.status === 'pending' && !_codexLinkPending()) {
+    _codexLink = link;
+    followCodexLink();
+  }
+}
+
+function codexAccountFields(account) {
+  const link = _codexLink || (account.link && account.link.status === 'pending' ? account.link : null);
+  if (link && link.status === 'pending') {
+    const mins = Math.max(1, Math.ceil((link.expires_in || 0) / 60));
+    return '<div class="codex-link" role="group" aria-label="' + escHtml(t('model.link_start')) + '">' +
+      '<p class="small">' + escHtml(t('model.link_open')) + ' <a href="' + safeHref(link.url) +
+        '" target="_blank" rel="noopener noreferrer">' + escHtml(link.url) + '</a></p>' +
+      '<p class="small">' + escHtml(t('model.link_code')) + '</p>' +
+      '<div class="codex-code"><code id="codex-link-code">' + escHtml(link.code) + '</code>' +
+        '<button class="btn btn-secondary btn-sm" onclick="copyText(' + jsq(link.code) + ', this)">' +
+        escHtml(t('model.link_copy')) + '</button></div>' +
+      '<p class="small muted" aria-live="polite">' + escHtml(t('model.link_waiting', {n: mins})) + '</p>' +
+      '<p class="small muted">' + escHtml(t('model.link_note')) + '</p>' +
+      '<div class="btn-group"><button class="btn btn-ghost btn-sm" onclick="cancelCodexLink()">' +
+        escHtml(t('model.link_cancel')) + '</button></div></div>';
+  }
+  let out = '';
+  if (link && link.status === 'expired') out += '<p class="small muted">' + escHtml(t('model.link_expired')) + '</p>';
+  else if (link && link.status === 'failed') out += '<p class="small muted">' + escHtml(t('model.link_failed', {kind: link.kind || '-'})) + '</p>';
+  if (account.linked) {
+    const bits = [t('model.linked_here')];
+    if (account.renewed_at) bits.push(t('model.renewed', {when: new Date(account.renewed_at * 1000)
+      .toLocaleString(intlLocale(), {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})}));
+    const last = account.last_try || {};
+    if (last.ok === false && last.kind) bits.push(t('model.renew_failed', {kind: last.kind}));
+    out += '<p class="small">' + escHtml(bits.join(' · ')) + '</p>';
+    if (account.expired) out += '<p class="small"><span class="email-tag guess">' + escHtml(t('model.login_expired')) + '</span></p>';
+  }
+  if (!account.linked || account.expired) {
+    out += '<p class="small muted">' + escHtml(t('model.link_note')) + '</p>' +
+      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link" onclick="startCodexLink()"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t(account.linked ? 'model.link_again' : 'model.link_start')) +
+        '</button></div>';
+  }
+  return out;
+}
+
+async function startCodexLink() {
+  if (_modelBusy || _codexLinkPending()) return;
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain/codex/link', {method: 'POST'});
+    if (!res || res.status !== 'pending') {
+      showToast(failMsg(res, t('model.failed')), 'error');
+      return;
+    }
+    _codexLink = res;
+  } finally {
+    _modelBusy = false;
+  }
+  renderModelCard();
+  followCodexLink();
+}
+
+// Polls the link every few seconds until it ends (or the card is gone).
+function followCodexLink() {
+  clearTimeout(_codexLinkTimer);
+  _codexLinkTimer = setTimeout(async () => {
+    if (!document.getElementById('model-card') || !_codexLinkPending()) return;
+    const res = await api('/api/brain/codex/link');
+    if (!res || !res.status) { followCodexLink(); return; }
+    _codexLink = res;
+    if (res.status === 'pending') { renderModelCard(); followCodexLink(); return; }
+    if (res.status === 'linked') {
+      showToast(t('model.link_done'), 'success');
+      _codexLink = null;
+      if (_modelPick) _modelPick.auth = 'account';
+      loadModelCard(true);
+      return;
+    }
+    if (res.status === 'cancelled' || res.status === 'idle') _codexLink = null;
+    renderModelCard();
+  }, 3000);
+}
+
+async function cancelCodexLink() {
+  clearTimeout(_codexLinkTimer);
+  await api('/api/brain/codex/link', {method: 'DELETE'});
+  _codexLink = null;
+  showToast(t('model.link_cancelled'), 'success');
+  renderModelCard();
+}
+
+async function unlinkCodexAccount() {
+  if (_modelBusy) return;
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain/codex/account', {method: 'DELETE'});
+    if (res && res.success) showToast(t('model.account_unlinked'), 'success');
+    else showToast(failMsg(res, t('model.failed')), 'error');
+  } finally {
+    _modelBusy = false;
+  }
+  loadModelCard(true);
 }
 
 // The API key's box (a password field: what was saved is never shown), the
@@ -5227,6 +5354,10 @@ async function saveModel() {
   delete body.key;
   if (body.provider === 'codex' && !String(body.model || '').trim()) {
     showToast(t('model.codex_blank'), 'error');
+    return;
+  }
+  if (body.provider === 'codex' && body.auth === 'account' && _codexLinkPending()) {
+    showToast(t('model.link_first'), 'error');
     return;
   }
   if (body.auth === 'api_key' && !key && !((_model.key_set || {})[body.provider])) {

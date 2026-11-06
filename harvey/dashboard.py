@@ -1597,8 +1597,12 @@ async def set_brain(request: Request):
     else:
         values["reasoning_effort"] = ""
     auth = (values.get("auth") or current.auth).lower()
-    if auth not in brain_auth.OFFERED and auth != current.auth:
+    if auth not in brain_auth.offered(provider) and auth != current.auth:
         return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
+    if auth == brain_auth.ACCOUNT and provider == "codex" and auth != current.auth:
+        from harvey import codex_link
+        if not codex_link.is_linked():
+            return _refuse("Link the ChatGPT account first: press Link account.", 409)
     if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
         return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key first: "
                        "paste it in the key box.", 409)
@@ -1708,6 +1712,80 @@ async def delete_brain_key(provider: str = ""):
     await state.init_db()
     await state.log_action("brain_key", "dashboard", {"provider": provider, "saved": False})
     return {"success": True, "provider": provider, "key_set": False, "auth": auth}
+
+
+@app.post("/api/brain/codex/link")
+async def start_codex_link():
+    """Link a ChatGPT account for Codex (brain.auth: account): a device-code
+    login in an app-server of Harvey's own (codex_link.start). Answers
+    {status: pending, url, code, expires_in}: the user opens the url and
+    types the code there (it is theirs to see; it is never logged). Once
+    linked, the login is in data/auth/codex and a Codex brain is set to
+    it. One link at a time per install."""
+    from harvey import brain_auth, codex_link
+    why = brain_auth.codex_refusal()
+    if why:
+        return _refuse(why, 409)
+    state = _state()
+    await state.init_db()
+
+    async def linked():
+        current, _ = _brain_config_or_error()
+        if current is not None and current.provider == "codex" \
+                and current.auth != brain_auth.ACCOUNT:
+            from harvey.config import set_brain_settings
+            set_brain_settings({"auth": brain_auth.ACCOUNT}, _resolve_config_file())
+        brain_auth.forget()
+        _quota_clients.clear()
+        await state.log_action("brain_link", "dashboard", {"provider": "codex", "linked": True})
+
+    try:
+        return await codex_link.start(state, on_linked=linked)
+    except codex_link.LinkError as e:
+        return _refuse(str(e), 409)
+
+
+@app.get("/api/brain/codex/link")
+async def get_codex_link():
+    """The link under way (codex_link.status): {status: idle | pending |
+    linked | expired | failed | cancelled, url, code, expires_in (pending),
+    kind (failed), plan (linked)}."""
+    from harvey import codex_link
+    return codex_link.status()
+
+
+@app.delete("/api/brain/codex/link")
+async def cancel_codex_link():
+    """Cancel a link waiting for its code."""
+    from harvey import codex_link
+    return await codex_link.cancel()
+
+
+@app.delete("/api/brain/codex/account")
+async def unlink_codex_account():
+    """Unlink the account linked in Harvey: Codex's own logout in
+    data/auth/codex (an API key kept there is left alone). A brain on it
+    goes back to the terminal login."""
+    from harvey import brain_auth, codex_link
+    from harvey.config import ConfigError, set_brain_settings
+    state = _state()
+    await state.init_db()
+    try:
+        removed = await codex_link.unlink(state)
+    except codex_link.LinkError as e:
+        return _refuse(str(e), 409)
+    current, _ = _brain_config_or_error()
+    auth = current.auth if current else ""
+    if current is not None and current.provider == "codex" and auth == brain_auth.ACCOUNT:
+        try:
+            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
+            auth = brain_auth.TERMINAL
+        except ConfigError as e:
+            return _refuse(str(e), 409)
+    brain_auth.forget()
+    _quota_clients.clear()
+    await state.log_action("brain_link", "dashboard", {"provider": "codex", "linked": False})
+    return {"success": True, "removed": removed, "auth": auth}
 
 
 def _active_provider() -> str:
@@ -5902,6 +5980,23 @@ async def get_today():
                 "action": "Review the check", "tab": "settings",
             })
 
+        # The Codex account linked in Harvey couldn't be renewed: calls
+        # are refused until it is linked again.
+        codex_brain = _active_brain()
+        if codex_brain is not None and codex_brain.provider == "codex" \
+                and getattr(codex_brain, "auth", "") == "account":
+            from harvey import codex_link
+            linked = await codex_link.renewal_status(state)
+            if linked.get("expired"):
+                items.append({
+                    "key": "codex-login", "tone": "warn",
+                    "title": "The Codex login has expired: link the account again",
+                    "detail": ("Harvey renews the account linked in Settings → Model by "
+                               "itself, and this time it couldn't. Codex calls wait until "
+                               "it is linked again."),
+                    "action": "Open Settings", "tab": "settings",
+                })
+
         # Harvey's agent: its wakes wait (logged out, the plan's share or
         # limit used).
         from harvey.agent import wakes
@@ -6590,6 +6685,7 @@ def _server_class():
 
         async def shutdown(self, sockets=None):
             await _close_chats()
+            await _close_codex_link()
             await super().shutdown(sockets)
 
     return Server
@@ -6602,6 +6698,15 @@ async def _close_chats() -> None:
         await chat.close_all()
     except Exception:
         logger.exception("the chats' processes didn't close cleanly")
+
+
+async def _close_codex_link() -> None:
+    try:
+        from harvey import codex_link
+
+        await codex_link.close()
+    except Exception:
+        logger.exception("the Codex link's process didn't close cleanly")
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):

@@ -54,6 +54,10 @@ DUE_SOURCES_EVERY_SECONDS = 900
 BACKLOG_EVERY_SECONDS = 60
 # How often the agent's plans are looked at for a wake due (harvey/agent/wakes.py).
 WAKES_EVERY_SECONDS = 60
+# How often the Codex account linked in Harvey is looked at for a renewal
+# due (harvey/codex_link.py: a day after the last one, or sooner when it
+# would run out); the renewal runs beside the loop, one at a time.
+CODEX_LOGIN_EVERY_SECONDS = 600
 # How long a stopping worker lets running jobs reach the end of their page:
 # well inside the 10 s "docker stop" gives before it kills the process, so
 # a restart usually takes the clean path (the page kept, the cursor saved).
@@ -349,6 +353,8 @@ class Worker:
         # command's) never feeds the backlog.
         self._next_backlog = time.monotonic() + BACKLOG_EVERY_SECONDS
         self._next_wakes = 0.0
+        self._next_codex_login = 0.0
+        self._codex_login: asyncio.Task | None = None
         self._renewer: _Renewer | None = None
 
     def lost_leases(self) -> set[str]:
@@ -402,6 +408,10 @@ class Worker:
                 if self.full and time.monotonic() >= self._next_wakes:
                     self._next_wakes = time.monotonic() + WAKES_EVERY_SECONDS
                     await _sweep_wakes(self.state)
+                if self.full and time.monotonic() >= self._next_codex_login:
+                    self._next_codex_login = time.monotonic() + CODEX_LOGIN_EVERY_SECONDS
+                    if self._codex_login is None or self._codex_login.done():
+                        self._codex_login = asyncio.create_task(_renew_codex_login(self.state))
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(_first(stop, self._wake), timeout=self.poll)
@@ -433,6 +443,9 @@ class Worker:
 
     async def _shutdown(self) -> None:
         self.stopping = True
+        if self._codex_login is not None and not self._codex_login.done():
+            self._codex_login.cancel()
+            await asyncio.gather(self._codex_login, return_exceptions=True)
         running = [t for t in self._tasks.values() if not t.done()]
         if running:
             # Running jobs stop at their next page and go back to the queue.
@@ -607,6 +620,14 @@ async def _after_job(state, job: jobs.Job) -> None:
             await tasks.job_ended(state, now)
     except Exception as e:
         logger.warning("worker: the agent's wakes after job %s: %s", job.id, e)
+
+
+async def _renew_codex_login(state) -> None:
+    try:
+        from harvey import codex_link
+        await codex_link.renew_if_due(state)
+    except Exception as e:
+        logger.warning("worker: renewing the linked Codex login failed: %s", e)
 
 
 async def _sweep_wakes(state) -> None:

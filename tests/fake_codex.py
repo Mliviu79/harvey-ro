@@ -40,6 +40,32 @@ AUTH = os.path.join(os.environ["CODEX_HOME"], "auth.json")
 THREAD_ID = f"thr-{os.getpid()}" if SCENARIO == "smart" else "thr-1"
 
 
+def _jwt(claims):
+    import base64
+    enc = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    return f"{enc({'alg': 'none'})}.{enc(claims)}.sig"
+
+
+def write_chatgpt_login(refresh_token="linked-refresh-token"):
+    """What Codex 0.159.3 writes once a ChatGPT login completes or is
+    renewed: the tokens (a refresh token among them) and last_refresh now,
+    owner-only."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000123Z"
+    fd = os.open(AUTH + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+                   "tokens": {"id_token": _jwt({"email": "x@example.com"}),
+                              "access_token": _jwt({"exp": time.time() + 10 * 86400}),
+                              "refresh_token": refresh_token, "account_id": "acct-1"},
+                   "last_refresh": stamp}, f)
+    os.replace(AUTH + ".tmp", AUTH)
+
+
+# A device code's fictional answer (the code is the user's to type).
+DEVICE = {"loginId": "login-1", "type": "chatgptDeviceCode", "userCode": "WXYZ-12345",
+          "verificationUrl": "https://auth.openai.com/codex/device"}
+
+
 def read_auth():
     try:
         with open(AUTH) as f:
@@ -260,6 +286,20 @@ for line in sys.stdin:
         result = {"userAgent": f"harvey/{agent_version} (fake)",
                   "codexHome": os.environ.get("CODEX_HOME")}
         send({"method": "remoteControl/status/changed", "params": {"status": "disabled"}})
+    elif method == "account/read" and (params or {}).get("refreshToken") is True:
+        # A renewal: Codex refreshes the login with its refresh token and
+        # writes the new one to its own file.
+        if SCENARIO == "refresh_fails":
+            send({"id": mid, "error": {"code": -32603, "message": "refresh failed"}})
+            continue
+        login = read_auth() or {}
+        if SCENARIO == "refresh_gone" or not (login.get("tokens") or {}).get("refresh_token"):
+            result = {"account": None, "requiresOpenaiAuth": True}
+        else:
+            if SCENARIO != "refresh_stays":
+                write_chatgpt_login(login["tokens"]["refresh_token"] + "-rotated")
+            result = {"account": {"type": "chatgpt", "email": "x@example.com",
+                                  "planType": "plus"}, "requiresOpenaiAuth": True}
     elif method == "account/read":
         account = {"type": "chatgpt", "email": "x@example.com", "planType": "plus"}
         if SCENARIO == "apikey" or (SNAPSHOT or {}).get("auth_mode") == "apikey":
@@ -273,12 +313,47 @@ for line in sys.stdin:
         if SCENARIO == "login_refused":
             send({"id": mid, "error": {"code": -32600, "message": "refused"}})
             continue
+        if (params or {}).get("type") == "chatgptDeviceCode":
+            started = dict(DEVICE)
+            if SCENARIO == "device_bad_url":
+                started["verificationUrl"] = "javascript:alert(1)"
+            send({"id": mid, "result": started})
+            if SCENARIO == "device_ok":
+                write_chatgpt_login()
+                SNAPSHOT = read_auth()
+                send({"method": "account/login/completed", "params": {
+                    "loginId": "login-1", "success": True, "error": None}})
+                send({"method": "account/updated", "params": {"authMode": "chatgpt",
+                                                              "planType": "plus"}})
+            if SCENARIO == "device_denied":
+                send({"method": "account/login/completed", "params": {
+                    "loginId": "login-1", "success": False, "error": "denied"}})
+            if SCENARIO == "device_request":
+                send({"id": "srv-9", "method": "item/tool/requestUserInput", "params": {}})
+            continue
         if (params or {}).get("type") == "apiKey":
             fd = os.open(AUTH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": params.get("apiKey")}, f)
             SNAPSHOT = read_auth()
             result = {"type": "apiKey"}
+    elif method == "account/login/cancel":
+        send({"id": mid, "result": {"status": "canceled"}})
+        send({"method": "account/login/completed", "params": {
+            "loginId": (params or {}).get("loginId"), "success": False, "error": "canceled"}})
+        continue
+    elif method == "account/logout":
+        if SCENARIO == "logout_fails":
+            send({"id": mid, "error": {"code": -32603, "message": "offline"}})
+            continue
+        try:
+            os.unlink(AUTH)
+        except FileNotFoundError:
+            pass
+        SNAPSHOT = None
+        send({"id": mid, "result": {}})
+        send({"method": "account/updated", "params": {"authMode": None, "planType": None}})
+        continue
     elif method == "account/rateLimits/read":
         general = {"limitId": "codex",
                    "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1791910000},

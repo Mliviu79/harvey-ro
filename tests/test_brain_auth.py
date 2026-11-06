@@ -389,6 +389,7 @@ const els = {'model-card': {innerHTML: ''}};
 global.document = {getElementById: id => els[id] || null};
 global.escHtml = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 global.jsq = s => escHtml(JSON.stringify(String(s == null ? '' : s)));
+global.safeHref = u => /^https?:\/\//i.test(String(u || '').trim()) ? escHtml(String(u).trim()) : '';
 const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
 vm.runInThisContext(pick('let _model = null', '// Settings: the background'));
 const s = JSON.parse(process.argv[4]);
