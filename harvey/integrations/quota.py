@@ -346,16 +346,17 @@ def _answered(stdout: str) -> bool:
     return False
 
 
-def _run_probe(exe: str) -> str | None:
+def _run_probe(exe: str, auth: str = "terminal") -> str | None:
     """The /usage command's stream-json output (None when it didn't run or
-    failed). Its text is never logged."""
+    failed), under the login ``auth`` (brain.auth). Its text is never
+    logged."""
     from harvey import claude_runtime
 
     cmd = claude_runtime.build_usage_probe_command(exe)
     with claude_runtime.isolated_cwd() as cwd:
         try:
             out = subprocess.run(
-                cmd, cwd=cwd, env=claude_runtime.runtime_env(cwd), input="/usage",
+                cmd, cwd=cwd, env=claude_runtime.runtime_env(cwd, auth=auth), input="/usage",
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=PROBE_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError) as e:
@@ -367,10 +368,10 @@ def _run_probe(exe: str) -> str | None:
     return out.stdout or ""
 
 
-async def probe(state, *, force: bool = False) -> bool:
+async def probe(state, *, force: bool = False, auth: str = "terminal") -> bool:
     """Ask the CLI's /usage command for the windows and record them. At most
     every PROBE_EVERY_SECONDS (``force``: now), one at a time per database;
-    False when nothing was read."""
+    False when nothing was read. ``auth``: the login the calls use."""
     from harvey import claude_runtime
 
     if state is None:
@@ -396,7 +397,7 @@ async def probe(state, *, force: bool = False) -> bool:
         except claude_runtime.ClaudeRuntimeError as e:
             logger.debug(f"The /usage check wasn't run: {e}")
             return False
-        stdout = await asyncio.to_thread(_run_probe, exe)
+        stdout = await asyncio.to_thread(_run_probe, exe, auth)
         if not stdout:
             return False
         text, infos = output_text(stdout)
@@ -482,10 +483,12 @@ def unknown_windows(stored: dict, now: float | None = None,
 
 class QuotaClient:
     """The Claude plan's windows as the CLI last reported them (``state``:
-    where the readings are kept)."""
+    where the readings are kept; ``auth``: the login a /usage check runs
+    under, brain.auth)."""
 
-    def __init__(self, state=None):
+    def __init__(self, state=None, auth: str = "terminal"):
         self.state = state
+        self.auth = auth
         self._stored: dict = {}
 
     async def get_utilization(self, probe_if_stale: bool = True) -> dict | None:
@@ -501,7 +504,7 @@ class QuotaClient:
             now = time.time()
             if (now - newest >= PROBE_EVERY_SECONDS
                     or unknown_windows(stored, now, PROBE_EVERY_SECONDS)) \
-                    and await probe(self.state):
+                    and await probe(self.state, auth=self.auth):
                 stored = await load(self.state)
         self._stored = stored
         return gauge(stored)

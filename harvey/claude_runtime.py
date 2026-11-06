@@ -21,8 +21,12 @@ and MCP servers, and saves a transcript of the prompt under
 - the prompt on stdin, never in argv, where other local users can read it
   (``ps``) and where Windows ``.cmd`` shims would re-parse it;
 - a few inherited variables that load extra instructions or tie the call to
-  an enclosing Claude Code session removed. Login, proxy and provider
-  variables are left exactly as they are.
+  an enclosing Claude Code session removed, and so are the credentials
+  Harvey's own environment may hold (CREDENTIAL_ENV: an API key or token in
+  .env would otherwise move every call to per-token billing without a
+  word). The login is the one ``brain.auth`` names (harvey/brain_auth.py:
+  the CLI's own, or Harvey's account folder). Proxy and provider variables
+  are left exactly as they are.
 
 The output is stream-json (``--verbose``): one JSON event a line, the last
 the result the brain reads, and among them the CLI's ``rate_limit_event``,
@@ -110,6 +114,10 @@ STRIPPED_ENV = (
     "OLDPWD",
 )
 
+# Credentials a Claude child never inherits, whatever brain.auth says
+# (brain_auth.claude_env adds what a mode needs, after they are dropped).
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+
 HELP_TIMEOUT_SECONDS = 30
 
 _capable: dict[tuple, bool] = {}
@@ -188,13 +196,18 @@ def find_claude(env: dict | None = None) -> str | None:
         f"re-parses the flags that keep each call isolated. {INSTALL_HINT}")
 
 
-def runtime_env(cwd: str, base: dict | None = None, *, safe: bool = True) -> dict:
+def runtime_env(cwd: str, base: dict | None = None, *, safe: bool = True,
+                auth: str = "terminal") -> dict:
     """The child's environment: the operator's, minus instruction sources
+    and credentials, plus what the login ``auth`` (brain.auth) needs
     (``safe`` False: without safe mode, which keeps MCP servers out: the
     agent's call)."""
+    from harvey import brain_auth
+
     env = dict(os.environ if base is None else base)
-    for key in STRIPPED_ENV:
+    for key in STRIPPED_ENV + CREDENTIAL_ENV:
         env.pop(key, None)
+    env.update(brain_auth.claude_env(auth))
     env.pop("CLAUDE_CODE_SAFE_MODE", None)
     env["PWD"] = cwd
     if safe:

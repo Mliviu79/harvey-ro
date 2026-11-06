@@ -137,11 +137,35 @@ def _no_usage_check(monkeypatch):
     """The /usage check never runs in tests: it starts the real CLI.
     Tests of the check keep the real one from before this runs
     (tests/test_quota.py), with a stand-in for the CLI's output."""
-    async def no_probe(state, *, force=False):
+    async def no_probe(state, *, force=False, auth="terminal"):
         return False
 
     monkeypatch.setattr(_quota, "probe", no_probe)
-    monkeypatch.setattr(_quota, "_run_probe", lambda exe: None)
+    monkeypatch.setattr(_quota, "_run_probe", lambda exe, auth="terminal": None)
+
+
+import harvey.brain_auth as _brain_auth  # noqa: E402
+
+REAL_CLAUDE_STATUS = _brain_auth.claude_status
+REAL_CODEX_STATUS = _brain_auth.codex_status
+
+
+@pytest.fixture(autouse=True)
+def _no_login_status(monkeypatch, tmp_path_factory):
+    """Settings → Model's status never starts a real CLI in tests (it would
+    run 'claude auth status' or Codex's app-server), and the account
+    folders are a temporary one, never the checkout's data/auth. Tests of
+    the status take the real ones above, with a stand-in CLI."""
+    def unknown(*a, **k):
+        return {"cli": {"ok": True, "version": "", "problem": ""}, "linked": None,
+                "linked_as": {}, "problem": "", "models": []}
+
+    monkeypatch.setattr(_brain_auth, "claude_status", unknown)
+    monkeypatch.setattr(_brain_auth, "codex_status", unknown)
+    monkeypatch.setattr(_brain_auth, "AUTH_DIR", tmp_path_factory.mktemp("auth"))
+    _brain_auth.forget()
+    yield
+    _brain_auth.forget()
 
 
 import harvey.humanize  # noqa: E402

@@ -890,3 +890,49 @@ def test_text_only_catalog_rejects_unknown_tool_mode():
     catalog = {"future": {"slug": "future", "tool_mode": "future_mode", "visibility": "list"}}
     with pytest.raises(hc.CodexError):
         hc.require_toolless_model(hc.text_only_catalog(catalog), "future")
+
+
+# ── Settings → Model: the account and the models, no prompt sent ──
+
+
+@pytest.mark.asyncio
+async def test_describe_reads_the_account_and_the_models_it_can_run(fake, native_home):
+    found = await _client(native_home).describe(timeout=30)
+    assert found["version"] == "0.159.3"
+    # The account's type and plan only: never its email.
+    assert found["account"] == {"type": "chatgpt", "plan": "plus"}
+    assert "example.com" not in json.dumps(found)
+    # The picker's models that pass the text-only rule: a hidden one and one
+    # the catalog doesn't have are left out; a code-mode one is run in direct
+    # mode, as every call does; efforts are the ones Harvey knows.
+    assert found["models"] == [{"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol",
+                                "efforts": ["low", "high"]}]
+    assert "turn/start" not in fake.methods() and "thread/start" not in fake.methods()
+    assert not fake.sent_prompt()
+    assert _leftover_runtimes() == []
+
+
+@pytest.mark.asyncio
+async def test_describe_without_model_list_takes_the_catalog_listed_ones(fake, native_home):
+    fake.use("no_model_list")
+    found = await _client(native_home).describe(timeout=30)
+    assert [m["id"] for m in found["models"]] == ["gpt-6.1-sol", "gpt-5.5"]
+
+
+def test_usable_models_refuses_what_the_lockdown_cant_run():
+    catalog = hc.text_only_catalog({
+        "a-direct": {"slug": "a-direct", "visibility": "list", "priority": 5, "tool_mode": None},
+        "b-future": {"slug": "b-future", "visibility": "list", "priority": 1,
+                     "tool_mode": "future_mode"},
+        "c-code": {"slug": "c-code", "visibility": "list", "priority": 2,
+                   "tool_mode": "code_mode", "experimental_supported_tools": ["clock"]},
+        "d-hidden": {"slug": "d-hidden", "visibility": "hide", "priority": 0, "tool_mode": None},
+    })
+    assert [m["id"] for m in hc.usable_models(catalog)] == ["c-code", "a-direct"]
+    listed = [{"model": "d-hidden", "hidden": False}, {"model": "a-direct", "hidden": True}]
+    assert [m["id"] for m in hc.usable_models(catalog, listed)] == ["d-hidden"]
+
+
+def test_no_model_is_suggested_by_name():
+    # The live catalog decides: Harvey ships no model to recommend.
+    assert not hasattr(hc, "SUGGESTED_MODEL")

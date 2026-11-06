@@ -95,9 +95,6 @@ def require_supported_platform() -> None:
 # tool Harvey's lockdown doesn't know about.
 SUPPORTED_CODEX_VERSIONS = ("0.159.3",)
 CODEX_INSTALL_HINT = f"npm install -g @openai/codex@{SUPPORTED_CODEX_VERSIONS[-1]}"
-# Keep the setup suggestion stable. Explicit newer models and catalog-based
-# auto-selection use the same private text-only catalog.
-SUGGESTED_MODEL = "gpt-5.5"
 
 # An access token closer than this to expiry is treated as expired: the
 # runtime can't renew it, so the call would fail part-way.
@@ -781,6 +778,37 @@ def pick_default_model(catalog: dict) -> str:
     return candidates[0]["slug"]
 
 
+def usable_models(catalog: dict, listed: list | None = None) -> list[dict]:
+    """The models a user can pick for Harvey: what the account's picker
+    lists (model/list's ``listed``; without it, the catalog's entries with
+    visibility "list") that pass require_toolless_model's rule in the
+    private text-only catalog, in the catalog's priority order. Each is
+    {id, name, efforts} (the reasoning efforts the model takes, of
+    CODEX_REASONING_EFFORTS)."""
+    from harvey.config import CODEX_REASONING_EFFORTS
+
+    shown: dict[str, dict] = {}
+    if listed is None:
+        shown = {slug: {} for slug, m in catalog.items() if m.get("visibility") == "list"}
+    else:
+        for m in listed:
+            slug = m.get("model") or m.get("id")
+            if isinstance(slug, str) and not m.get("hidden"):
+                shown[slug] = m
+    out = []
+    for slug, entry in sorted(catalog.items(), key=lambda kv: (
+            kv[1].get("priority") if isinstance(kv[1].get("priority"), int) else 1 << 30, kv[0])):
+        if slug not in shown or not model_tools_removable(entry) or _safe_name(slug) != slug:
+            continue
+        info = shown[slug]
+        efforts = [e.get("reasoningEffort") if isinstance(e, dict) else e
+                   for e in info.get("supportedReasoningEfforts") or []]
+        out.append({"id": slug,
+                    "name": str(info.get("displayName") or slug)[:60],
+                    "efforts": [e for e in CODEX_REASONING_EFFORTS if e in efforts]})
+    return out
+
+
 def _iso_from_unix(value) -> str:
     if not isinstance(value, (int, float)) or value <= 0:
         return ""
@@ -1333,18 +1361,7 @@ class CodexClient:
         configured endpoints during start-up. Only then is the access-only
         login copy installed and the runtime restarted (and re-attested).
         """
-        _, native = _load_native_auth(self.native_home)  # fresh every call
-        snapshot = build_access_snapshot(native)
-        server.prepare()
-        await server.read_version(deadline)
-
-        # Phase 1 — no credentials anywhere in the runtime.
-        await server.launch(deadline)
-        attest_effective_config(await server.read_config(deadline))
-        await server.stop()
-
-        # Phase 2 — the same runtime and config, with the access-only login.
-        server.install_auth(snapshot)
+        await self._logged_in(server, deadline)
         model = self.model
         if toolless_model or not model:
             catalog = text_only_catalog(await server.read_catalog(deadline))
@@ -1357,6 +1374,73 @@ class CodexClient:
             await server.read_config(deadline), server.model_catalog_path)
         await self._require_chatgpt(server, deadline)
         return model, mcp_names
+
+    async def _logged_in(self, server: _AppServer, deadline: float) -> None:
+        """The runtime's version and route attested with no login in it, then
+        the access-only login copy installed (the runtime is stopped: the
+        caller launches it again, and attests it again)."""
+        _, native = _load_native_auth(self.native_home)  # fresh every call
+        snapshot = build_access_snapshot(native)
+        server.prepare()
+        await server.read_version(deadline)
+
+        # Phase 1 — no credentials anywhere in the runtime.
+        await server.launch(deadline)
+        attest_effective_config(await server.read_config(deadline))
+        await server.stop()
+
+        # Phase 2 — the same runtime and config, with the access-only login.
+        server.install_auth(snapshot)
+
+    async def describe(self, timeout: float = 90.0) -> dict:
+        """What the dashboard's Model panel shows, with no prompt sent: the
+        CLI version, the account (its ``type`` and ``plan`` only, never the
+        email) and the models Harvey can run (usable_models). Raises
+        CodexError."""
+        return await self._bounded(timeout, self._describe)
+
+    async def _describe(self, deadline: float) -> dict:
+        server = _AppServer(self._resolve_codex())
+        try:
+            await self._logged_in(server, deadline)
+            catalog = text_only_catalog(await server.read_catalog(deadline))
+            await server.launch(deadline)
+            attest_effective_config(await server.read_config(deadline))
+            account = await server.request("account/read", {"refreshToken": False}, deadline)
+            listed = await self._model_list(server, deadline)
+        finally:
+            await server.close()
+        acct = account.get("account") if isinstance(account, dict) else None
+        return {
+            "version": server.version,
+            "account": {"type": _safe_name(acct.get("type")) if isinstance(acct, dict) else "",
+                        "plan": _safe_name(acct.get("planType") or "")
+                        if isinstance(acct, dict) else ""},
+            "models": usable_models(catalog, listed),
+        }
+
+    async def _model_list(self, server: _AppServer, deadline: float) -> list | None:
+        """The app-server's model/list (the picker's models, hidden ones
+        left out), or None when it can't be read."""
+        found, cursor = [], None
+        for _ in range(MAX_STATUS_PAGES):
+            params = {"includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                page = await server.request("model/list", params, deadline)
+            except CodexError as e:
+                if e.kind in ("timeout", "runtime"):
+                    raise
+                return None
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list):
+                return None
+            found += [m for m in data if isinstance(m, dict)]
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return found
+        return found
 
     async def _attested_thread(self, server: _AppServer, deadline: float) -> tuple[str, str]:
         """An attested, logged-in runtime with a tool-less thread started on

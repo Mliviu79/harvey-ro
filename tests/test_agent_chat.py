@@ -1318,3 +1318,27 @@ def test_the_chat_renders_escaped_and_live_in_both_languages(lang, words):
     older = out["older"]
     assert older.index('onclick="loadOlderChat()"') < older.index("&lt;b&gt;hi")
     assert words["older"] in older
+
+
+def test_a_chat_runs_under_the_configured_login_without_inherited_credentials(
+        state, fake, monkeypatch):
+    # A key in Harvey's environment never reaches the chat's CLI, and the
+    # login it runs under is brain.auth's (account: Harvey's own folder).
+    from harvey import brain_auth
+
+    for key in claude_runtime.CREDENTIAL_ENV:
+        monkeypatch.setenv(key, "fake-credential-for-test")
+    cfg = _config()
+    cfg.brain.auth = "account"
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    seen = []
+    real_start = chat.Process.start
+
+    async def start(cmd, cwd, env, folders):
+        seen.append(dict(env))
+        return await real_start(cmd, cwd, env, folders)
+    monkeypatch.setattr(chat.Process, "start", start)
+    _run(state, lambda h: _say(h, None, "Câte firme din Cluj?"))
+    [env] = seen
+    assert not set(claude_runtime.CREDENTIAL_ENV) & set(env)
+    assert env["CLAUDE_CONFIG_DIR"] == str(brain_auth.AUTH_DIR / "claude")

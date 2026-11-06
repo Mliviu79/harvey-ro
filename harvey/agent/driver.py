@@ -131,10 +131,19 @@ def refusal(config) -> str:
 
 @dataclass(frozen=True)
 class CodexRunner:
-    """What a Codex process is started with (check())."""
+    """What a Codex process is started with (check()): ``native_home`` is
+    where its login is taken from (brain_auth.codex_home: None, ~/.codex)."""
     codex_path: str
     model: str = ""
     effort: str = ""
+    native_home: Path | None = None
+
+
+def auth(config) -> str:
+    """The login the agent's model runs under (brain.auth)."""
+    from harvey import brain_auth
+
+    return brain_auth.auth_of(getattr(config, "brain", None))
 
 
 async def check(config):
@@ -142,7 +151,7 @@ async def check(config):
     str), or a CodexRunner, once its CLI version and the user's login are
     seen to be usable; else Unusable."""
     if provider(config) == CODEX:
-        from harvey import codex
+        from harvey import brain_auth, codex
 
         brain = getattr(config, "brain", None)
         try:
@@ -152,11 +161,12 @@ async def check(config):
                 raise codex.CodexError(
                     f"Codex CLI not found. Install it: {codex.CODEX_INSTALL_HINT}", kind="setup")
             await asyncio.to_thread(codex.check_cli_version, path)
-            await asyncio.to_thread(codex.check_native_auth)
+            home = brain_auth.codex_home(auth(config))
+            await asyncio.to_thread(codex.check_native_auth, home)
         except codex.CodexError as e:
             raise Unusable(str(e), e.kind, CODEX) from None
         return CodexRunner(path, getattr(brain, "model", "") or "",
-                           getattr(brain, "reasoning_effort", "") or "")
+                           getattr(brain, "reasoning_effort", "") or "", home)
     from harvey import claude_runtime
 
     try:
@@ -166,11 +176,12 @@ async def check(config):
 
 
 async def start(runner, db_path: str, chat_id: str, *, task: int | None = None,
-                model: str = ""):
+                model: str = "", auth: str = "terminal"):
     """A process that answers in that chat (``task``: its MCP server offers
-    that task's tools only): chat.Process for the Claude CLI's path, a
-    CodexProcess for a CodexRunner. Raises OSError (not started) or
-    Unusable (Codex refused: its isolation, the login, the model)."""
+    that task's tools only): chat.Process for the Claude CLI's path (under
+    the login ``auth``, brain.auth), a CodexProcess for a CodexRunner (its
+    login is the runner's). Raises OSError (not started) or Unusable (Codex
+    refused: its isolation, the login, the model)."""
     if isinstance(runner, CodexRunner):
         return await CodexProcess.start(runner, db_path, chat_id, task=task)
     from harvey import claude_runtime
@@ -184,7 +195,8 @@ async def start(runner, db_path: str, chat_id: str, *, task: int | None = None,
                                encoding="utf-8")
         cmd = claude_runtime.build_agent_command(runner, str(config_path),
                                                  max_turns=chat.PROCESS_TURNS, model=model)
-        return await chat.Process.start(cmd, cwd, claude_runtime.runtime_env(cwd, safe=False),
+        return await chat.Process.start(cmd, cwd,
+                                        claude_runtime.runtime_env(cwd, safe=False, auth=auth),
                                         [folder, cwd])
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
@@ -355,7 +367,7 @@ class CodexProcess:
 
         server_entry = chat.mcp_config(db_path, chat_id, task=task)["mcpServers"][SERVER]
         client = codex.CodexClient(model=runner.model, reasoning_effort=runner.effort,
-                                   codex_path=runner.codex_path)
+                                   codex_path=runner.codex_path, native_home=runner.native_home)
         server = codex._AppServer(runner.codex_path)
         server.extra_toml = codex_mcp_toml(server_entry)
         server.opted_out = [m for m in codex.OPTED_OUT_NOTIFICATIONS

@@ -253,7 +253,7 @@ async def test_a_window_the_gauge_doesnt_know_isnt_room_to_spend(state):
 @pytest.mark.asyncio
 async def test_a_window_a_recent_usage_check_didnt_list_is_known(state, monkeypatch):
     # (The verified text has no session line: no session running.)
-    monkeypatch.setattr(quota, "_run_probe", lambda exe: _stream(
+    monkeypatch.setattr(quota, "_run_probe", lambda exe, auth="terminal": _stream(
         {"type": "assistant", "message": {"content": [
             {"type": "text", "text": VERIFIED_USAGE_TEXT}]}}))
     monkeypatch.setattr(quota, "probe", _REAL_PROBE)
@@ -272,7 +272,7 @@ async def test_a_window_a_recent_usage_check_didnt_list_is_known(state, monkeypa
 async def test_a_required_window_missing_asks_usage_even_with_fresh_answers(state,
                                                                            monkeypatch):
     runs = []
-    monkeypatch.setattr(quota, "_run_probe", lambda exe: runs.append(exe) or "")
+    monkeypatch.setattr(quota, "_run_probe", lambda exe, auth="terminal": runs.append(exe) or "")
     monkeypatch.setattr(quota, "probe", _REAL_PROBE)
     await quota.note_infos(state, [WEEK_ONLY])
     await quota.QuotaClient(state).get_utilization()
@@ -412,7 +412,7 @@ def test_the_probes_command_keeps_the_isolation_but_slash_commands():
 async def test_the_probe_records_its_reading_at_most_every_interval(state, monkeypatch):
     runs = []
 
-    def fake_run(exe):
+    def fake_run(exe, auth="terminal"):
         runs.append(exe)
         return _stream({"type": "assistant", "message": {"content": [
             {"type": "text", "text": VERIFIED_USAGE_TEXT}]}})
@@ -440,9 +440,9 @@ async def test_the_probe_records_its_reading_at_most_every_interval(state, monke
 @pytest.mark.asyncio
 async def test_a_probe_that_fails_or_says_nothing_known_is_no_reading(state, monkeypatch):
     monkeypatch.setattr(quota, "probe", _REAL_PROBE)
-    monkeypatch.setattr(quota, "_run_probe", lambda exe: None)
+    monkeypatch.setattr(quota, "_run_probe", lambda exe, auth="terminal": None)
     assert await quota.QuotaClient(state).get_utilization() is None
-    monkeypatch.setattr(quota, "_run_probe", lambda exe: _stream(
+    monkeypatch.setattr(quota, "_run_probe", lambda exe, auth="terminal": _stream(
         {"type": "result", "result": "You are using an API key."}))
     assert not await _REAL_PROBE(state, force=True)
     assert await quota.QuotaClient(state).get_utilization(probe_if_stale=False) is None
@@ -451,7 +451,7 @@ async def test_a_probe_that_fails_or_says_nothing_known_is_no_reading(state, mon
 @pytest.mark.asyncio
 async def test_the_probe_refuses_a_cli_without_its_flags(state, monkeypatch):
     runs = []
-    monkeypatch.setattr(quota, "_run_probe", lambda exe: runs.append(exe))
+    monkeypatch.setattr(quota, "_run_probe", lambda exe, auth="terminal": runs.append(exe))
     monkeypatch.setattr(claude_runtime, "_probe_help", lambda exe: "  --tools  --verbose")
     assert not await _REAL_PROBE(state, force=True)
     assert runs == []
@@ -462,7 +462,7 @@ async def test_the_probe_refuses_a_cli_without_its_flags(state, monkeypatch):
 async def test_a_probe_the_model_answered_gives_no_reading_and_waits_a_day(state, monkeypatch):
     runs = []
 
-    def answered(exe):
+    def answered(exe, auth="terminal"):
         runs.append(exe)
         # (A CLI that sent /usage to the model: its text could say anything.)
         return _stream({"type": "assistant", "message": {"content": [
@@ -487,15 +487,24 @@ _LOGIN_READS = re.compile(r"credentials\.json|find-generic-password|dump-keychai
                           r"oauth/usage|claudeAiOauth|accessToken|CLAUDE_CODE_OAUTH_TOKEN")
 
 
+# The one line that names the token: the credentials dropped from every
+# Claude child's environment (claude_runtime.CREDENTIAL_ENV), never read.
+_DROPPED = 'CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")'
+
+
 def test_no_code_reads_the_claude_login():
     root = Path(__file__).resolve().parents[1] / "harvey"
     found = []
     for path in root.rglob("*.py"):
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             code = line.split("#", 1)[0]
+            if path.name == "claude_runtime.py" and code.strip() == _DROPPED:
+                continue
             if _LOGIN_READS.search(code):
                 found.append(f"{path.relative_to(root.parent)}:{n}")
     assert found == []
+    runtime = (root / "claude_runtime.py").read_text(encoding="utf-8")
+    assert "STRIPPED_ENV + CREDENTIAL_ENV" in runtime
 
 
 def test_harvey_usage_says_when_and_where_seen():

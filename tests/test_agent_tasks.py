@@ -739,3 +739,27 @@ def test_each_profiles_tools_are_exactly_these():
         "campaigns", "writing_rules", "campaign_preview", "campaign_status", "replies",
         "edit_campaign"}
     assert set(tasks.PROFILES) == {"researcher", "campaign_driver"}
+
+
+def test_a_task_runs_under_the_configured_login_without_inherited_credentials(
+        state, fake, monkeypatch):
+    from harvey import brain_auth
+
+    for key in claude_runtime.CREDENTIAL_ENV:
+        monkeypatch.setenv(key, "fake-credential-for-test")
+    cfg = _config()
+    cfg.brain.auth = "account"
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    seen = []
+    real_start = chat.Process.start
+
+    async def start(cmd, cwd, env, folders):
+        seen.append(dict(env))
+        return await real_start(cmd, cwd, env, folders)
+    monkeypatch.setattr(chat.Process, "start", start)
+    plan_id = _plan(state)
+    _assign(state, plan_id)
+    assert _work(state).status == "done"
+    [env] = seen
+    assert not set(claude_runtime.CREDENTIAL_ENV) & set(env)
+    assert env["CLAUDE_CONFIG_DIR"] == str(brain_auth.AUTH_DIR / "claude")

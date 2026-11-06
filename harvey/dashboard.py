@@ -471,6 +471,36 @@ async def get_setup_status():
         "scope": "email",
     })
 
+    # 9. The model: provider, model, login (brain_auth.status, kept briefly;
+    # Codex's account and models only on Settings → Model).
+    from harvey import brain_auth
+    brain_cfg, brain_error = _brain_config_or_error()
+    if brain_cfg is None:
+        checks.append({"id": "brain", "label": "Model", "done": False, "required": True,
+                       "help": brain_error, "scope": "finding"})
+    else:
+        try:
+            state = _state()
+            await state.init_db()
+            brain = await brain_auth.status(brain_cfg, state=state)
+        except Exception as e:
+            brain = {"provider": brain_cfg.provider, "model": brain_cfg.model,
+                     "auth": brain_cfg.auth, "linked": None,
+                     "problem": f"Couldn't check the model ({type(e).__name__})."}
+        name = "Codex" if brain["provider"] == "codex" else "Claude"
+        checks.append({
+            "id": "brain",
+            "label": f"Model: {name}" + (f" ({brain['model']})" if brain.get("model") else ""),
+            "provider": brain["provider"], "model": brain.get("model", ""),
+            "auth": brain.get("auth", "terminal"), "linked": brain.get("linked"),
+            "linked_as": brain.get("linked_as") or {}, "cli": brain.get("cli") or {},
+            "last_error": brain.get("last_error", ""),
+            "done": brain.get("linked") is not False and bool((brain.get("cli") or {}).get("ok")),
+            "required": True,
+            "help": brain.get("problem") or "Settings → Model shows how Harvey thinks.",
+            "scope": "finding",
+        })
+
     required_checks = [c for c in checks if c["required"]]
     completed_required = sum(1 for c in required_checks if c["done"])
 
@@ -1488,26 +1518,123 @@ async def _brain_status() -> dict:
     return active_brain_status(rows[0]["value"], _active_provider()) if rows else {}
 
 
+def _brain_config_or_error():
+    """(the brain section of the config the dashboard reads, None) or
+    (None, why it can't be read)."""
+    from harvey.config import ConfigError, load_brain_config
+    try:
+        return load_brain_config(str(_resolve_config_file())), None
+    except ConfigError as e:
+        return None, str(e)
+
+
+@app.get("/api/brain")
+async def get_brain(full: bool = False, refresh: bool = False, provider: str = ""):
+    """Settings → Model: the provider, model, reasoning effort and login
+    (brain.auth) with its status (brain_auth.status: the CLI's version
+    check, linked as what, the last error's class; ``full`` with Codex's
+    account and its models, ``refresh`` asks the CLIs again). ``provider``
+    (claude, codex): that provider's status under the same login, for the
+    panel before a switch is saved."""
+    from harvey import brain_auth
+    from harvey.config import BRAIN_AUTH_READY, BRAIN_PROVIDERS, CODEX_REASONING_EFFORTS, BrainConfig
+    brain, error = _brain_config_or_error()
+    if brain is None:
+        return JSONResponse({"error": error}, status_code=500)
+    if provider and provider != brain.provider:
+        if provider not in BRAIN_PROVIDERS:
+            return JSONResponse({"error": f"'{provider}' is not a brain provider"}, status_code=400)
+        brain = BrainConfig(provider=provider, auth=brain.auth)
+    state = _state()
+    await state.init_db()
+    out = await brain_auth.status(brain, state=state, full=full, force=refresh)
+    out.update({"efforts": list(CODEX_REASONING_EFFORTS), "auth_ready": list(BRAIN_AUTH_READY),
+                "file": _resolve_config_file().name})
+    return out
+
+
+@app.post("/api/brain")
+async def set_brain(request: Request):
+    """Save Settings → Model: {provider, model, reasoning_effort, auth},
+    each optional, into harvey.local.yaml (config.set_brain_settings). Codex
+    is refused where it can't run (Windows), and with no model (a blank one
+    leaves the pick to a catalog that can hide it); a login the panel
+    doesn't offer is refused unless it is the one already set."""
+    from harvey import brain_auth
+    from harvey.config import BRAIN_KEYS, ConfigError, set_brain_settings
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or not body or set(body) - set(BRAIN_KEYS):
+        return _refuse("expected {provider, model, reasoning_effort, auth}", 400)
+    current, error = _brain_config_or_error()
+    if current is None:
+        return _refuse(error, 409)
+    values = {k: str(v if v is not None else "").strip() for k, v in body.items()}
+    if not values.get("provider"):
+        values.pop("provider", None)
+    provider = values.setdefault("provider", current.provider).lower()
+    if provider != current.provider:
+        # A model (and an effort) is one provider's: a switch that names
+        # none never carries the other one's along.
+        values.setdefault("model", "")
+        values.setdefault("reasoning_effort", "")
+    if provider == "codex":
+        why = brain_auth.codex_refusal()
+        if why:
+            return _refuse(why, 409)
+        model = values["model"] if "model" in values else (
+            current.model if current.provider == "codex" else "")
+        if not model:
+            return _refuse("Pick a Codex model: with none, Harvey would take the first one the "
+                           "catalog lists, and an account's catalog can hide it, so every call "
+                           "would fail.", 400)
+    else:
+        values["reasoning_effort"] = ""
+    auth = (values.get("auth") or current.auth).lower()
+    if auth not in brain_auth.OFFERED and auth != current.auth:
+        return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
+    try:
+        path = set_brain_settings(values, _resolve_config_file())
+    except ConfigError as e:
+        return _refuse(str(e), 400)
+    brain_auth.forget()
+    _quota_clients.clear()
+    state = _state()
+    await state.init_db()
+    saved, _ = _brain_config_or_error()
+    await state.log_action("brain_settings", "dashboard", {
+        "provider": saved.provider, "model": saved.model, "auth": saved.auth,
+        "reasoning_effort": saved.reasoning_effort, "file": path.name})
+    return {"success": True, "file": path.name, "loop_running": bool(_check_harvey_pid()),
+            "brain": {k: getattr(saved, k) for k in BRAIN_KEYS}}
+
+
 def _active_provider() -> str:
     brain = _active_brain()
     return brain.provider if brain else ""
 
 
-def _quota_client_for(provider: str, model: str = ""):
-    """One cached quota reader per provider (and Codex model). Each reads
-    only its own subscription, so a Claude gauge is never shown as Codex or
-    vice versa, and Codex shows the bucket metering the configured model."""
+def _quota_client_for(provider: str, model: str = "", auth: str = "terminal"):
+    """One cached quota reader per provider (and Codex model and login).
+    Each reads only its own subscription, so a Claude gauge is never shown
+    as Codex or vice versa, and Codex shows the bucket metering the
+    configured model."""
+    from harvey import brain_auth
+
     if provider == "claude":
         # (Claude's readings are kept in the database, so the reader holds
         # nothing of its own.)
         from harvey.integrations.quota import QuotaClient
-        return QuotaClient(_state())
+        return QuotaClient(_state(), auth=auth)
     if provider != "codex":
         return None
-    key = (provider, model)
+    key = (provider, model, auth)
     if key not in _quota_clients:
         from harvey.codex import CodexClient, CodexQuotaClient
-        _quota_clients[key] = CodexQuotaClient(CodexClient(model=model))
+        _quota_clients[key] = CodexQuotaClient(
+            CodexClient(model=model, native_home=brain_auth.codex_home(auth)))
     return _quota_clients[key]
 
 
@@ -1545,7 +1672,8 @@ async def get_usage():
     provider = brain.provider if brain else ""
     quota = None
     try:
-        client = _quota_client_for(provider, brain.model if brain else "")
+        client = _quota_client_for(provider, brain.model if brain else "",
+                                   brain.auth if brain else "terminal")
         if client is not None:
             quota = await client.get_utilization()
     except Exception as e:

@@ -9,6 +9,21 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Settings → Model.** The dashboard now says and sets how Harvey thinks:
+  Claude or Codex (Codex greyed out on Windows, with why), the model
+  (Claude's aliases opus, sonnet and haiku, or blank for the CLI's
+  default; for Codex the models your account lists that Harvey can run,
+  read live from the app-server), Codex's reasoning effort, how the CLI is
+  logged in, and a status line: the CLI's version, linked as what (the
+  login method and the plan, never an email), the class of the last
+  error. Saving writes only the `brain:` keys it changes in
+  `harvey.local.yaml`, comments kept. `/api/setup-status` has a `brain`
+  entry too. `brain.auth` (`terminal`, the default and what an install
+  without the key keeps; `account`, a login kept in Harvey's own
+  `data/auth/claude` or `data/auth/codex`) says which login the CLI uses;
+  the terminal login is the one way the panel offers until the dashboard's
+  link flows land.
+
 - **The agent runs on Codex too (opt-in).** With `brain.provider: codex`
   the Chat tab, `harvey agent chat`, the agent's wakes and its tasks run on
   Codex's app-server instead of being refused: the brain's private runtime
@@ -847,6 +862,17 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **No model is suggested by name for Codex.** `harvey setup` and `harvey
+  train --provider codex` list the models your account offers that Harvey
+  can run, read live, and ask (training takes `--model`, or prints the list
+  when it can't ask); a blank Codex model is refused on the dashboard. The
+  model setup used to suggest is no longer in every account's catalog.
+- **The agent answers in the language of your latest message.** An English
+  question got a Romanian answer; now the agent follows the message you
+  just wrote (Romanian only when it shows no language), a wake's report
+  keeps the chat's language, and a task writes in its request's language.
+  Campaign emails stay in the install's language.
+
 - **Claude's usage gauge no longer touches your login.** Harvey used to
   read the Claude OAuth token (the credentials file or the macOS keychain)
   and call Anthropic's usage endpoint with it; Anthropic's terms don't let a
@@ -1219,6 +1245,16 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **A key in `.env` no longer moves Claude to per-token billing.** The
+  Claude CLI Harvey starts (the brain, the agent's chats, wakes and tasks,
+  the `/usage` check) used to inherit `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` from Harvey's
+  environment, and the CLI prefers them to your subscription login. They
+  are now dropped from every child, whatever the login mode. (Codex's
+  child already got an allowlisted environment, never `OPENAI_API_KEY` or
+  `CODEX_API_KEY`.) If you logged the CLI in with
+  `CLAUDE_CODE_OAUTH_TOKEN` on purpose, run `claude login` instead.
 
 - **A campaign's checks of an address read by an index.** Whether another
   campaign holds an address, or it got cold email lately (every candidate

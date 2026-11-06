@@ -515,7 +515,7 @@ function loadCurrentTab() {
     case 'queue': loadQueue(); break;
     case 'chat': loadChat(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
+    case 'settings': loadSettings(); loadModelCard(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -1090,6 +1090,8 @@ function checkLabel(c) {
   if (c.id === 'email_provider') return t('check.email_provider', {provider: c.provider || ''});
   if (c.id === 'config') return t('check.config', {file: c.file || 'harvey.yaml'});
   if (c.id === 'warmup_service') return t('check.warmup.' + (c.choice || 'none'));
+  if (c.id === 'brain') return t('check.brain', {name: c.provider === 'codex' ? 'Codex' : 'Claude',
+                                                model: c.model ? ' (' + c.model + ')' : ''});
   const key = 'check.' + c.id;
   const label = t(key);
   return label === key ? (c.label || c.id) : label;
@@ -5012,6 +5014,159 @@ function backgroundSearchLine(bg, noSite) {
   return '<p class="muted small finder-status">' + escHtml(t('finder.bg', {n: fmtN(noSite),
     share: Math.round((bg.share || 0) * 100)})) + ' ' +
     (rows.length ? rows.map(escHtml).join(' &middot; ') : escHtml(t('finder.bg_none'))) + '</p>';
+}
+
+// Settings → Model: which subscription Harvey thinks with (Claude or
+// Codex), the model, Codex's reasoning effort, how the CLI is logged in
+// (brain.auth: only the ways whose flow exists are offered) and its status.
+// Codex's models are its account's live list (/api/brain?full=1), read
+// when Codex is chosen.
+let _model = null, _modelFull = {}, _modelPick = null, _modelBusy = false;
+
+async function loadModelCard(refresh) {
+  const el = document.getElementById('model-card');
+  if (!el) return;
+  const s = await api('/api/brain' + (refresh ? '?refresh=1' : ''));
+  _model = s && !s.error ? s : null;
+  _modelPick = _model ? {provider: _model.provider, model: _model.model,
+                         reasoning_effort: _model.reasoning_effort, auth: _model.auth} : null;
+  if (refresh) _modelFull = {};
+  renderModelCard();
+  if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
+}
+
+// The status (and models) of a provider: Codex's with its live list
+// (full=1); Claude's when it isn't the saved one (a switch not saved yet).
+async function loadProviderStatus(provider, refresh) {
+  if (_modelFull[provider] && !refresh) { renderModelCard(); return; }
+  _modelFull[provider] = {loading: true};
+  renderModelCard();
+  const s = await api('/api/brain?provider=' + provider + (provider === 'codex' ? '&full=1' : '') +
+                      (refresh ? '&refresh=1' : ''));
+  _modelFull[provider] = s && !s.error ? s : {failed: true};
+  renderModelCard();
+}
+
+function modelStatusLine(s) {
+  if (!s) return '';
+  const bits = [];
+  const cli = s.cli || {};
+  if (cli.version) bits.push(t('model.cli_version', {v: cli.version}));
+  if (s.linked === true) {
+    const as = s.linked_as || {};
+    bits.push(t('model.linked_as', {how: [as.method, as.plan].filter(Boolean).join(' · ') || '-'}));
+  } else if (s.linked === false) {
+    bits.push(t(s.auth === 'account' ? 'model.not_linked' : 'model.not_logged_in'));
+  } else if (cli.ok) {
+    bits.push(t('model.unknown'));
+  }
+  if (s.last_error) bits.push(t('model.last_error', {kind: s.last_error}));
+  const cls = s.linked === false || !cli.ok ? 'guess' : s.linked === true ? 'verified' : 'risky';
+  return '<p class="small model-status"><span class="email-tag ' + cls + '">' +
+    escHtml(t(s.linked === true && cli.ok ? 'model.ok' : cli.ok ? 'model.check' : 'model.cli_missing')) +
+    '</span> ' + escHtml(bits.join(' · ')) + '</p>' +
+    (s.problem ? '<p class="small muted">' + escHtml(s.problem) + '</p>' : '');
+}
+
+function renderModelCard() {
+  const el = document.getElementById('model-card');
+  if (!el) return;
+  if (!_model) { el.innerHTML = '<p class="muted">' + escHtml(t('model.unreadable')) + '</p>'; return; }
+  const p = _modelPick;
+  const codex = p.provider === 'codex';
+  // Codex's status is always its full one (its models); Claude's is the
+  // saved one's, or its own read when the switch isn't saved yet.
+  const full = codex || p.provider !== _model.provider ? _modelFull[p.provider] : null;
+  const shown = full ? (!full.loading && !full.failed ? full : null) : _model;
+  const models = (shown && shown.models) || [];
+  const radio = (name, value, label, on, disabled, note) =>
+    '<label class="check-line"><input type="radio" name="' + name + '" value="' + escHtml(value) + '"' +
+      (on ? ' checked' : '') + (disabled ? ' disabled' : '') +
+      ' onchange="pickModel(' + jsq(name) + ', this.value)"> <span>' + escHtml(label) + '</span>' +
+      (note ? ' <span class="muted small">' + escHtml(note) + '</span>' : '') + '</label>';
+  const ways = Array.from(new Set([...(_model.offered || ['terminal']), _model.auth]));
+  const efforts = codex ? (((models.find(m => m.id === p.model) || {}).efforts || []).length
+    ? models.find(m => m.id === p.model).efforts : (_model.efforts || [])) : [];
+  let modelField = '<input class="form-input" id="model-name" list="model-options" autocomplete="off" value="' +
+      escHtml(p.model || '') + '" placeholder="' + escHtml(t(codex ? 'model.codex_ph' : 'model.claude_ph')) +
+      '" oninput="pickModel(\'model\', this.value)">' +
+    '<datalist id="model-options">' + models.map(m => '<option value="' + escHtml(m.id) + '">' +
+      escHtml(m.name && m.name !== m.id ? m.name : '') + '</option>').join('') + '</datalist>';
+  let modelNote = '';
+  if (codex) {
+    if (full && full.loading) modelNote = t('model.codex_reading');
+    else if (full && full.failed) modelNote = t('model.codex_unread');
+    else if (shown && !models.length) modelNote = (shown.problem || t('model.codex_none'));
+    else if (shown) modelNote = t('model.codex_list', {n: models.length});
+  } else {
+    modelNote = t('model.claude_list');
+  }
+  el.innerHTML =
+    '<div class="settings-row"><div><h3>' + escHtml(t('model.provider')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('model.desc')) + '</p></div><div class="fields">' +
+      radio('provider', 'claude', t('model.claude'), !codex, false, '') +
+      radio('provider', 'codex', t('model.codex'), codex, !!_model.codex_refused,
+            _model.codex_refused ? t('model.codex_refused') : '') +
+      (_model.codex_refused ? '<p class="small muted">' + escHtml(_model.codex_refused) + '</p>' : '') +
+    '</div></div>' +
+    '<div class="settings-row"><div><h3>' + escHtml(t('model.model')) + '</h3>' +
+      '<p class="desc">' + escHtml(modelNote) + '</p></div><div class="fields">' +
+      '<div class="form-group"><label class="form-label" for="model-name">' + escHtml(t('model.model')) + '</label>' +
+        modelField + '</div>' +
+      (codex ? '<div class="form-group"><label class="form-label" for="model-effort">' + escHtml(t('model.effort')) +
+        '</label><select class="form-input" id="model-effort" onchange="pickModel(\'reasoning_effort\', this.value)">' +
+        '<option value="">' + escHtml(t('model.effort_default')) + '</option>' +
+        efforts.map(e => '<option value="' + escHtml(e) + '"' + (p.reasoning_effort === e ? ' selected' : '') + '>' +
+          escHtml(e) + '</option>').join('') + '</select></div>' : '') +
+    '</div></div>' +
+    '<div class="settings-row"><div><h3>' + escHtml(t('model.link')) + '</h3>' +
+      '<p class="desc">' + escHtml(t(codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
+      '<div class="fields">' +
+      ways.map(w => radio('auth', w, t('model.auth.' + w), p.auth === w, false,
+                          w === 'account' && _model.folder ? _model.folder : '')).join('') +
+      modelStatusLine(shown || (p.provider === _model.provider ? _model : null)) +
+      '<div class="btn-group"><button class="btn btn-primary btn-sm" id="model-save" onclick="saveModel()"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.save')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="loadModelCard(true)">' + escHtml(t('model.recheck')) + '</button></div>' +
+    '</div></div>';
+}
+
+function pickModel(key, value) {
+  if (!_modelPick) return;
+  if (key === 'provider' && value !== _modelPick.provider) {
+    _modelPick.provider = value;
+    // A model is one provider's: switching back gives the saved one again.
+    _modelPick.model = value === _model.provider ? _model.model : '';
+    _modelPick.reasoning_effort = value === _model.provider ? _model.reasoning_effort : '';
+    if (value === 'codex' || value !== _model.provider) loadProviderStatus(value, false);
+    renderModelCard();
+    return;
+  }
+  _modelPick[key] = value;
+  if (key === 'auth') renderModelCard();
+}
+
+async function saveModel() {
+  if (!_modelPick || _modelBusy) return;
+  const body = Object.assign({}, _modelPick);
+  if (body.provider === 'codex' && !String(body.model || '').trim()) {
+    showToast(t('model.codex_blank'), 'error');
+    return;
+  }
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    if (res && res.success) {
+      showToast(t('model.saved', {file: res.file}) + (res.loop_running ? ' ' + t('model.restart') : ''), 'success');
+    } else {
+      showToast(failMsg(res, t('model.failed')), 'error');
+    }
+  } finally {
+    _modelBusy = false;
+  }
+  loadModelCard(true);
 }
 
 // Settings: the background's searches inside free allowances (on or off,

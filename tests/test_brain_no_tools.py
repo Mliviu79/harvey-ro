@@ -109,7 +109,6 @@ async def test_claude_env_drops_instruction_sources_but_keeps_login(state, monke
     for key in claude_runtime.STRIPPED_ENV:
         monkeypatch.setenv(key, "/somewhere/else")
     keep = {"HOME": "/home/op", "CLAUDE_CONFIG_DIR": "/home/op/.claude",
-            "CLAUDE_CODE_OAUTH_TOKEN": "fake-token-for-test",
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:2",
             "CLAUDE_CODE_USE_BEDROCK": "1"}
     for key, value in keep.items():
@@ -122,6 +121,20 @@ async def test_claude_env_drops_instruction_sources_but_keeps_login(state, monke
     for key, value in keep.items():
         assert env[key] == value, key
     assert env["CLAUDE_CODE_SAFE_MODE"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_key_in_the_environment_never_reaches_claude(state, monkeypatch):
+    # A key or token in .env (loaded into Harvey's environment) would move
+    # every call to per-token billing: no child inherits one, in any mode.
+    for key in claude_runtime.CREDENTIAL_ENV:
+        monkeypatch.setenv(key, "fake-credential-for-test")
+    captured = _capture(monkeypatch)
+    await Brain(state).think("hi")
+    env = captured["kwargs"]["env"]
+    assert not set(claude_runtime.CREDENTIAL_ENV) & set(env)
+    assert set(claude_runtime.CREDENTIAL_ENV) == {
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
 
 
 @pytest.mark.asyncio

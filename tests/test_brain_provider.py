@@ -380,11 +380,23 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     monkeypatch.setattr(config_mod, "load_brain_config",
                         lambda: BrainConfig(provider="claude", model="claude-opus-4-8"))
 
+    async def models(brain, timeout=0):
+        return LISTED
+    monkeypatch.setattr("harvey.brain_auth.codex_models", models)
     args = type("A", (), {"url": "acme.example", "max_pages": 5, "provider": "codex",
                           "model": None, "reasoning_effort": "low"})()
+    # Switching provider never carries the other provider's model along, and
+    # Codex's is one the account lists: asked in a terminal, else --model.
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(SystemExit):
+        cli.cmd_train(args)
+    assert "config" not in seen
+    import harvey.setup as setup_mod
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(setup_mod, "_ask", lambda *a, **k: "2")
     cli.cmd_train(args)
-    # Switching provider never carries the other provider's model along.
-    assert seen["config"] == BrainConfig(provider="codex", reasoning_effort="low")
+    assert seen["config"] == BrainConfig(provider="codex", model="gpt-5.6-luna",
+                                         reasoning_effort="low")
 
     args.provider, args.reasoning_effort = None, None
     cli.cmd_train(args)
@@ -404,27 +416,42 @@ def _answering(answers, prompts):
     return ask
 
 
-@pytest.mark.parametrize("answers, expected", [
-    (["codex", ""], BrainConfig(provider="codex", model="gpt-5.5")),         # accept suggestion
-    (["codex", "gpt-6-sol"], BrainConfig(provider="codex", model="gpt-6-sol")),  # explicit kept
-    (["codex", "--model", "my-model"], BrainConfig(provider="codex", model="my-model")),
-    (["claude", ""], BrainConfig()),
-    (["claude", "opus"], BrainConfig(model="opus")),
+LISTED = [{"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol", "efforts": ["low"]},
+          {"id": "gpt-5.6-luna", "name": "gpt-5.6-luna", "efforts": []}]
+
+
+@pytest.mark.parametrize("answers, models, expected", [
+    (["codex", "2"], LISTED, BrainConfig(provider="codex", model="gpt-5.6-luna")),  # by number
+    (["codex", "gpt-6.1-sol"], LISTED, BrainConfig(provider="codex", model="gpt-6.1-sol")),
+    (["codex", "gpt-6-sol"], None, BrainConfig(provider="codex", model="gpt-6-sol")),  # typed
+    (["codex", "--model", "my-model"], None, BrainConfig(provider="codex", model="my-model")),
+    (["claude", ""], None, BrainConfig()),
+    (["claude", "opus"], None, BrainConfig(model="opus")),
 ])
-def test_setup_model_prompt(monkeypatch, answers, expected):
+def test_setup_model_prompt(monkeypatch, capsys, answers, models, expected):
     import harvey.setup as setup_mod
-    from harvey.codex import SUGGESTED_MODEL
 
     prompts = []
     monkeypatch.setattr(setup_mod, "_ask", _answering(answers, prompts))
-    assert setup_mod._ask_brain_config() == expected
+    assert setup_mod._ask_brain_config(models) == expected
     model_prompts = prompts[1:]
     if expected.provider == "codex":
-        # Suggested, never forced: an explicit name is kept as typed (and
-        # validated; a flag-like answer is asked again).
-        assert all(p == ("Model", SUGGESTED_MODEL) for p in model_prompts)
+        # Nothing is suggested: the account's live list, or a typed id.
+        assert all(default == "" for _, default in model_prompts)
+        out = capsys.readouterr().out
+        assert ("1. gpt-6.1-sol (GPT-6.1 Sol)" in out) == bool(models)
     else:
         assert model_prompts == [("Model (leave blank for the default)", "")]
+
+
+def test_setup_asks_again_for_a_blank_codex_model(monkeypatch):
+    import harvey.setup as setup_mod
+
+    prompts = []
+    monkeypatch.setattr(setup_mod, "_ask", _answering(["codex", "", "1"], prompts))
+    assert setup_mod._ask_brain_config(LISTED) == BrainConfig(provider="codex",
+                                                              model="gpt-6.1-sol")
+    assert len(prompts) == 3
 
 
 def test_setup_writes_the_selection(tmp_path, monkeypatch):
@@ -466,11 +493,20 @@ async def test_codex_setup_does_not_require_claude(monkeypatch, tmp_path):
         return True
 
     monkeypatch.setattr(setup_mod, "_test_claude", ready)
-    answers = iter(["codex", ""])
+    listed = []
+
+    async def models(brain, timeout=0):
+        listed.append(brain.auth)
+        return LISTED
+    monkeypatch.setattr("harvey.brain_auth.codex_models", models)
+    monkeypatch.setattr(setup_mod, "_current_auth", lambda: "terminal")
+    answers = iter(["codex", "1"])
     monkeypatch.setattr(setup_mod, "_ask", lambda *a, **k: next(answers))
     wizard = setup_mod.SetupWizard()
     await wizard._check_prerequisites()  # would SystemExit if Claude were required
-    assert wizard.brain_config.provider == "codex"
+    # The model is picked from the account's live list, after the login check.
+    assert wizard.brain_config == BrainConfig(provider="codex", model="gpt-6.1-sol")
+    assert listed == ["terminal"]
 
 
 # ── dashboard labels the active provider's quota only ──
@@ -506,9 +542,9 @@ class _NeverRead:
 
 def test_dashboard_codex_quota_is_labelled_codex(client, monkeypatch):
     monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig(provider="codex"))
-    monkeypatch.setitem(dash._quota_clients, ("codex", ""),
+    monkeypatch.setitem(dash._quota_clients, ("codex", "", "terminal"),
                         _Quota({"five_hour": {"utilization": 33.0, "resets_at": ""}}))
-    monkeypatch.setitem(dash._quota_clients, ("claude", ""), _NeverRead())
+    monkeypatch.setitem(dash._quota_clients, ("claude", "", "terminal"), _NeverRead())
     asyncio.run(StateManager(str(client.db_path)).record_usage_event(
         provider="codex", model="gpt-5.5", output_tokens=9))
     data = client.get("/api/usage").json()
@@ -552,8 +588,8 @@ def test_claude_quota_card_says_when_and_where_it_was_seen():
 
 def test_dashboard_reports_unavailable_codex_quota(client, monkeypatch):
     monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig(provider="codex"))
-    monkeypatch.setitem(dash._quota_clients, ("codex", ""), _Quota(None))
-    monkeypatch.setitem(dash._quota_clients, ("claude", ""), _NeverRead())
+    monkeypatch.setitem(dash._quota_clients, ("codex", "", "terminal"), _Quota(None))
+    monkeypatch.setitem(dash._quota_clients, ("claude", "", "terminal"), _NeverRead())
     data = client.get("/api/usage").json()
     assert data["quota"] is None
     assert data["quota_provider"] == "codex" and data["quota_status"] == "unavailable"

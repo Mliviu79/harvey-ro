@@ -583,6 +583,13 @@ class UsageConfig(BaseModel):
 
 BRAIN_PROVIDERS = ("claude", "codex")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# How the provider's CLI is logged in (harvey/brain_auth.py): ``terminal``,
+# the login the user made outside Harvey (the CLI's own folder: what every
+# install had before, and the default); ``account``, a login the CLI keeps
+# in a folder of Harvey's own (data/auth/<provider>); ``api_key``, a key
+# billed per token. BRAIN_AUTH_READY are those this release can run.
+BRAIN_AUTH_MODES = ("terminal", "account", "api_key")
+BRAIN_AUTH_READY = ("terminal", "account")
 
 # Model names are passed to a CLI, so they must look like a model name and
 # never like a flag ("-x") or anything a shell would treat specially.
@@ -596,11 +603,14 @@ class BrainConfig(BaseModel):
     ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
     fallback between them, and an explicit ``model`` only affects Harvey —
     your own Claude Code / Codex settings are never read or changed.
+    ``auth`` says which login the CLI uses (BRAIN_AUTH_MODES; absent:
+    ``terminal``, the CLI's own login, as before).
     """
 
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
     reasoning_effort: str = ""  # codex only; empty = model default
+    auth: str = "terminal"  # BRAIN_AUTH_MODES
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -619,6 +629,18 @@ class BrainConfig(BaseModel):
         v = str(v or "").strip()
         if v and not _MODEL_NAME_RE.match(v):
             raise ValueError(f"'{v}' is not a valid model name.")
+        return v
+
+    @field_validator("auth", mode="before")
+    @classmethod
+    def _valid_auth(cls, v) -> str:
+        v = str(v or "terminal").strip().lower().replace("-", "_")
+        if v not in BRAIN_AUTH_MODES:
+            raise ValueError(f"'{v}' is not a way to log in. "
+                             f"Use one of: {', '.join(BRAIN_AUTH_READY)}.")
+        if v not in BRAIN_AUTH_READY:
+            raise ValueError(f"brain.auth '{v}' isn't available in this version of Harvey. "
+                             f"Use one of: {', '.join(BRAIN_AUTH_READY)}.")
         return v
 
     @field_validator("reasoning_effort", mode="before")
@@ -924,6 +946,70 @@ def set_require_approval(value: bool, path=None) -> Path:
     written = save_config_change(edit, path)
     _mode_cache.pop(str(written.resolve()), None)
     return written
+
+
+BRAIN_KEYS = ("provider", "model", "reasoning_effort", "auth")
+
+
+def set_brain_settings(values: dict, path=None) -> Path:
+    """Write the ``brain:`` keys in ``values`` (BRAIN_KEYS) into
+    harvey.local.yaml (made from the config Harvey reads when there is none
+    yet, see save_config_change). Only those keys change, each line rewritten
+    in place, and the section must still be a valid BrainConfig, or nothing
+    is written and ConfigError says why. A key absent from the file and set
+    to its default stays absent (no ``auth: terminal`` written for an install
+    that never chose). Returns the file written."""
+    import copy
+    unknown = sorted(set(values) - set(BRAIN_KEYS))
+    if unknown:
+        raise ConfigError(f"Not a brain setting: {', '.join(unknown)}.")
+    try:
+        wanted = BrainConfig(**values).model_dump(include=set(values))
+    except ValidationError as e:
+        raise ConfigError(_format_validation_error(e))
+    defaults = BrainConfig().model_dump()
+
+    def edit(data_bytes: bytes, name: str) -> bytes:
+        bom = data_bytes.startswith(b"\xef\xbb\xbf")
+        try:
+            raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+        except UnicodeDecodeError:
+            raise ConfigError(f"{name} isn't UTF-8, so it isn't rewritten. Set brain: there by hand.")
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Invalid YAML in {name}: {e}")
+        if not isinstance(data, dict):
+            raise ConfigError(f"{name} isn't a YAML mapping. Set brain: there by hand.")
+        section = data.get("brain")
+        if section is not None and not isinstance(section, dict):
+            raise ConfigError(f"'brain' in {name} must be a mapping.")
+        section = section or {}
+        changes = [(("brain", k), v) for k, v in wanted.items()
+                   if section.get(k, defaults[k]) != v]
+        if not changes:
+            return data_bytes
+        expected = copy.deepcopy(data)
+        if not isinstance(expected.get("brain"), dict):
+            expected["brain"] = {}
+        for (_, k), v in changes:
+            expected["brain"][k] = v
+        try:
+            BrainConfig(**expected["brain"])
+        except ValidationError as e:
+            raise ConfigError(f"Invalid brain settings:\n{_format_validation_error(e)}")
+        try:
+            new = set_yaml_values(raw, changes)
+            ok = yaml.safe_load(new) == expected
+        except yaml.YAMLError:
+            ok = False
+        if not ok:
+            raise ConfigError(f"Couldn't change brain: in {name} safely. Set it there by hand.")
+        if b"\r\n" in data_bytes:
+            new = new.replace("\n", "\r\n")
+        return (b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8")
+
+    return save_config_change(edit, path)
 
 
 _mode_cache: dict[str, tuple[tuple, object]] = {}

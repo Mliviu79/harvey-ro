@@ -103,15 +103,18 @@ class Brain:
         self._usage_limited_until = 0.0
         self._usage_pause_recorded = False
         self._status_synced = False
+        from harvey import brain_auth
+        self.auth = brain_auth.auth_of(self.config)
         if self.provider == "codex":
             from harvey.codex import CodexClient, CodexQuotaClient
             self.codex = CodexClient(
-                model=self.model, reasoning_effort=self.config.reasoning_effort
+                model=self.model, reasoning_effort=self.config.reasoning_effort,
+                native_home=brain_auth.codex_home(self.auth),
             )
             self.quota = CodexQuotaClient(self.codex)
         else:
             from harvey.integrations.quota import QuotaClient
-            self.quota = QuotaClient(state)
+            self.quota = QuotaClient(state, auth=self.auth)
 
     def for_profile(self, profile_id: str = "") -> "Brain":
         """The brain that writes for a campaign's AI profile. One profile
@@ -316,7 +319,7 @@ class Brain:
                         # A fresh empty directory: never the checkout (whose
                         # CLAUDE.md is the setup wizard) or its ancestors.
                         cwd=cwd,
-                        env=claude_runtime.runtime_env(cwd),
+                        env=claude_runtime.runtime_env(cwd, auth=self.auth),
                         # A pipe, never the inherited terminal.
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,

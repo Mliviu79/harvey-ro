@@ -275,6 +275,23 @@ for line in sys.stdin:
             "codex_other": {"limitId": "codex_other", "normalModelSlug": "gpt-other",
                             "primary": {"usedPercent": 99, "windowDurationMins": 300}}},
             "ordinaryUsageAllowed": SCENARIO != "exhausted"}
+    elif method == "model/list":
+        if SCENARIO == "no_model_list":
+            send({"id": mid, "error": {"code": -32601, "message": "unknown method"}})
+            continue
+        result = {"data": [
+            {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1 Sol",
+             "hidden": False, "isDefault": True, "defaultReasoningEffort": "medium",
+             "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": "x"},
+                                           {"reasoningEffort": "high", "description": "x"},
+                                           {"reasoningEffort": "beyond", "description": "x"}]},
+            {"id": "gpt-5.5", "model": "gpt-5.5", "displayName": "GPT-5.5", "hidden": True,
+             "isDefault": False, "defaultReasoningEffort": "medium",
+             "supportedReasoningEfforts": []},
+            {"id": "gpt-elsewhere", "model": "gpt-elsewhere", "displayName": "Not in the catalog",
+             "hidden": False, "isDefault": False, "defaultReasoningEffort": "medium",
+             "supportedReasoningEfforts": []},
+        ], "nextCursor": None}
     elif method == "config/read":
         result = {"config": effective_config(), "origins": {}}
     elif method == "thread/start":

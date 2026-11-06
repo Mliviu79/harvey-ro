@@ -578,7 +578,7 @@ async def prime(state, plan: dict, task: dict) -> str:
 
 async def run(ctx) -> dict:
     """The agent_task job: one child run (see the module's doc)."""
-    from harvey.agent import chat, plans, wakes
+    from harvey.agent import chat, driver, plans, wakes
     from harvey.brain import Brain
     from harvey.modules import jobs
 
@@ -618,7 +618,7 @@ async def run(ctx) -> dict:
         payload, turns, usage, ended, err, exit_code = await wakes._ask(
             state, exe, task["chat"], content,
             getattr(getattr(config, "brain", None), "model", "") or "", calling, stop=stop,
-            task=tid, max_turns=TASK_TURNS, timeout=TIMEOUT_SECONDS)
+            task=tid, max_turns=TASK_TURNS, timeout=TIMEOUT_SECONDS, auth=driver.auth(config))
     except asyncio.CancelledError:
         # (Cut off by the worker's shutdown: back to the queue; a call it
         # made counts all the same.)

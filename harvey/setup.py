@@ -144,7 +144,7 @@ async def _test_claude(brain: Brain) -> bool:
     return "HARVEY_READY" in response
 
 
-def _ask_brain_config() -> BrainConfig:
+def _ask_provider() -> str:
     """Ask which subscription Harvey thinks with. Claude is the default."""
     _print_harvey("I think with an AI subscription you already pay for:")
     print("    claude — your Claude plan, via Claude Code (default)")
@@ -159,21 +159,54 @@ def _ask_brain_config() -> BrainConfig:
                 print(f"    ({e})")
                 continue
         if provider in ("claude", "codex"):
-            break
+            return provider
         print("    (type claude or codex)")
+
+
+def _ask_model(provider: str, codex_models: list | None = None,
+               auth: str = "terminal") -> BrainConfig:
+    """Ask for the model. Codex: one of ``codex_models`` (the account's live
+    list, brain_auth.codex_models: by number or id), else an id typed in;
+    never blank, and nothing is suggested. Claude: blank for the CLI's
+    default."""
     if provider == "codex":
-        from harvey.codex import SUGGESTED_MODEL
-        print(f"    {SUGGESTED_MODEL} is the Codex model Harvey has verified as text-only")
-        print("    (no code-execution tools). Press Enter to use it, or type another.")
+        ids = [m["id"] for m in codex_models or []]
+        if ids:
+            print("    The Codex models your account lists that Harvey can run (no tools):")
+            for n, m in enumerate(codex_models, 1):
+                name = f" ({m['name']})" if m.get("name") and m["name"] != m["id"] else ""
+                print(f"      {n}. {m['id']}{name}")
+        else:
+            print("    Type the exact id of a model your account's Codex catalog lists.")
     while True:
         if provider == "codex":
-            model = _ask("Model", default=SUGGESTED_MODEL, required=False)
+            model = _ask("Model (number or id)" if ids else "Model", required=True)
+            if model.isdigit() and 1 <= int(model) <= len(ids):
+                model = ids[int(model) - 1]
+            if not model:
+                print("    (Codex needs a model: pick one)")
+                continue
         else:
             model = _ask("Model (leave blank for the default)", required=False)
         try:
-            return BrainConfig(provider=provider, model=model)
+            return BrainConfig(provider=provider, model=model, auth=auth)
         except ValidationError:
             print("    (that doesn't look like a model name — try again or leave blank)")
+
+
+def _ask_brain_config(codex_models: list | None = None, auth: str = "terminal") -> BrainConfig:
+    """The provider, then its model (see _ask_model)."""
+    return _ask_model(_ask_provider(), codex_models, auth=auth)
+
+
+def _current_auth() -> str:
+    """brain.auth of the config setup edits (terminal when none is set or
+    it can't be read): re-running setup keeps the login it was linked with."""
+    from harvey.config import ConfigError, load_brain_config
+    try:
+        return load_brain_config(str(_config_file())).auth
+    except (ConfigError, OSError):
+        return "terminal"
 
 
 class SetupWizard:
@@ -236,11 +269,14 @@ class SetupWizard:
         await self._print_summary()
 
     async def _check_prerequisites(self):
-        """Pick the brain provider and verify its CLI is installed and working."""
-        self.brain_config = _ask_brain_config()
-        if self.brain_config.provider == "codex":
-            await self._check_codex()
+        """Pick the brain provider and verify its CLI is installed and working
+        (Codex: its model is asked once its login is seen, from the
+        account's live list)."""
+        auth = _current_auth()
+        if _ask_provider() == "codex":
+            await self._check_codex(auth)
         else:
+            self.brain_config = _ask_model("claude", auth=auth)
             await self._check_claude()
 
     async def _check_claude(self):
@@ -272,7 +308,8 @@ class SetupWizard:
                 raise SystemExit(1)
         self._check_python_packages()
 
-    async def _check_codex(self):
+    async def _check_codex(self, auth: str = "terminal"):
+        from harvey import brain_auth
         from harvey.codex import (
             CODEX_INSTALL_HINT, CodexError, check_cli_version, check_native_auth,
         )
@@ -298,12 +335,23 @@ class SetupWizard:
 
         print("  Checking Codex ChatGPT login...", end=" ")
         try:
-            check_native_auth()
+            check_native_auth(brain_auth.codex_home(auth))
             print("✓ Found")
         except CodexError as e:
             print("✗ Not ready")
             _print_harvey(str(e))
             raise SystemExit(1)
+
+        # The models this account lists, read live (no prompt is sent).
+        print("  Reading your account's Codex models...", end=" ", flush=True)
+        try:
+            models = await brain_auth.codex_models(BrainConfig(provider="codex", auth=auth))
+            print(f"✓ {len(models)} Harvey can run")
+        except CodexError as e:
+            print("✗ Couldn't read them")
+            _print_harvey(str(e))
+            models = []
+        self.brain_config = _ask_model("codex", models, auth=auth)
 
         # A real (subscription, not API-billed) call through the same
         # isolated runtime Harvey uses for every prompt.

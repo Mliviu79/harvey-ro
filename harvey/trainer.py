@@ -327,6 +327,8 @@ def brain_section(brain_config: BrainConfig) -> dict:
         section["model"] = brain_config.model
     if brain_config.reasoning_effort:
         section["reasoning_effort"] = brain_config.reasoning_effort
+    if brain_config.auth != "terminal":
+        section["auth"] = brain_config.auth
     return section
 
 

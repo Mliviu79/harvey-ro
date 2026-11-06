@@ -124,6 +124,9 @@ def world(tmp_path, monkeypatch):
         }
         for key, value in env.items():
             monkeypatch.setenv(key, value)
+        # The stand-in API's fake key has to reach the CLI: Harvey drops
+        # every credential from a child's environment otherwise.
+        monkeypatch.setattr(claude_runtime, "CREDENTIAL_ENV", ())
         monkeypatch.chdir(project)
         monkeypatch.setattr(tempfile, "tempdir", str(tmpbase))
         yield {"dir": w, "exe": exe, "log": log, "config": config, "project": project}

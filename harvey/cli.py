@@ -151,9 +151,36 @@ def cmd_train(args):
     except (ConfigError, ValidationError) as e:
         print(f"  {e}")
         sys.exit(2)
+    if brain_config.provider == "codex" and not brain_config.model:
+        brain_config = _codex_model_for_training(brain_config)
 
     trainer = Trainer(brain_config=brain_config)
     asyncio.run(trainer.train(url, max_pages=args.max_pages))
+
+
+def _codex_model_for_training(brain_config):
+    """Codex with no model: one of the models the account lists that Harvey
+    can run (read live, no prompt sent), asked in a terminal; elsewhere the
+    list is printed for --model."""
+    from harvey import brain_auth, codex
+    from harvey.config import BrainConfig
+
+    try:
+        models = asyncio.run(brain_auth.codex_models(brain_config))
+    except codex.CodexError as e:
+        print(f"  {e}")
+        sys.exit(2)
+    ids = [m["id"] for m in models]
+    if not ids:
+        print("  Codex lists no model Harvey can run on this account (none without tools).")
+        sys.exit(2)
+    if not sys.stdin.isatty():
+        print(f"  Codex needs a model: pass --model with one of {', '.join(ids)}.")
+        sys.exit(2)
+    from harvey.setup import _ask_model
+
+    chosen = _ask_model("codex", models, auth=brain_config.auth)
+    return BrainConfig(**{**brain_config.model_dump(), "model": chosen.model})
 
 
 def cmd_dashboard(args):
@@ -314,13 +341,15 @@ def cmd_usage(args):
         windows = None
         provider = brain_config.provider if brain_config else None
         try:
+            from harvey import brain_auth
             if provider == "codex":
                 from harvey.codex import CodexClient, CodexQuotaClient
-                windows = await CodexQuotaClient(
-                    CodexClient(model=brain_config.model)).get_utilization()
+                windows = await CodexQuotaClient(CodexClient(
+                    model=brain_config.model,
+                    native_home=brain_auth.codex_home(brain_config.auth))).get_utilization()
             elif provider == "claude":
                 from harvey.integrations.quota import QuotaClient
-                windows = await QuotaClient(state).get_utilization()
+                windows = await QuotaClient(state, auth=brain_config.auth).get_utilization()
         except Exception:
             pass
 
@@ -3923,7 +3952,9 @@ def main():
         "--provider", choices=["claude", "codex"], default=None,
         help="Subscription to think with (default: the one in your config, else claude)",
     )
-    sub.add_argument("--model", default=None, help="Model for this provider (default: provider default)")
+    sub.add_argument("--model", default=None,
+                     help="Model for this provider (Claude: its default; Codex: asked from "
+                          "the models your account lists)")
     sub.add_argument(
         "--reasoning-effort", default=None,
         help="Codex reasoning effort (minimal/low/medium/high/xhigh)",

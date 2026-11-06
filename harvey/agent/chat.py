@@ -911,7 +911,8 @@ class Live:
             try:
                 self.proc = await driver.start(
                     runner, self.state.db_path, self.chat_id,
-                    model=getattr(getattr(config, "brain", None), "model", "") or "")
+                    model=getattr(getattr(config, "brain", None), "model", "") or "",
+                    auth=driver.auth(config))
             except driver.Unusable as e:
                 await self._release()
                 raise Refused(str(e), "cli") from None
