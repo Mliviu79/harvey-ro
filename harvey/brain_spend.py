@@ -1,11 +1,12 @@
 """What the brain costs when it is billed per token (``brain.auth:
-api_key``), and the caps that hold it.
+api_key``, or a Claude account linked from the Anthropic Console:
+brain_auth.billed), and the caps that hold it.
 
-In the subscription modes (terminal, account) nothing here applies: the
-plan's own windows hold Harvey back (Brain.is_within_budget), and no call
-is counted as money.
+In the subscription modes (terminal, a subscription account) nothing here
+applies: the plan's own windows hold Harvey back (Brain.is_within_budget),
+and no call is counted as money.
 
-With an API key:
+With an API key (a Console account alike):
 
 - Every call of Harvey's own model (the brain's, the agent's chats, wakes
   and tasks) is a usage_events row with ``source`` SOURCE and its cost:
@@ -106,7 +107,13 @@ CHARS_PER_TOKEN = 3.0
 
 
 def api_key(brain) -> bool:
-    return (getattr(brain, "auth", "") or "") == API_KEY
+    """Whether ``brain``'s calls are billed per token, which is what every
+    rule here applies to: an API key, or a Claude account linked from the
+    Anthropic Console (brain_auth.billed)."""
+    from harvey import brain_auth
+
+    return brain_auth.billed(getattr(brain, "provider", "") or "claude",
+                             getattr(brain, "auth", "") or "")
 
 
 def _has_prices(brain) -> bool:

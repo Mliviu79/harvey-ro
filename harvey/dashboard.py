@@ -1603,15 +1603,21 @@ async def set_brain(request: Request):
         from harvey import codex_link
         if not codex_link.is_linked():
             return _refuse("Link the ChatGPT account first: press Link account.", 409)
+    if auth == brain_auth.ACCOUNT and provider != "codex" and (
+            auth != current.auth or provider != current.provider):
+        from harvey import claude_link
+        if not claude_link.has_account():
+            return _refuse("Link the Claude account first: press Link account.", 409)
     if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
         return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key first: "
                        "paste it in the key box.", 409)
-    if auth == brain_auth.API_KEY and not any(
+    if brain_auth.billed(provider, auth) and not any(
             (values[k] if k in values else getattr(current, k, None)) not in (None, "")
             for k in ("usd_per_day", "usd_per_month")):
         # (Billed per token, a cap is what the brain stops at: brain_spend.)
-        return _refuse("Set a USD cap for the day or the month: on an API key Harvey stops "
-                       "its calls at it, and makes none without one.", 400)
+        return _refuse("Set a USD cap for the day or the month: billed per token (an API key "
+                       "or a Console account), Harvey stops its calls at it, and makes none "
+                       "without one.", 400)
     try:
         path = set_brain_settings(values, _resolve_config_file())
     except ConfigError as e:
@@ -1785,6 +1791,105 @@ async def unlink_codex_account():
     brain_auth.forget()
     _quota_clients.clear()
     await state.log_action("brain_link", "dashboard", {"provider": "codex", "linked": False})
+    return {"success": True, "removed": removed, "auth": auth}
+
+
+@app.post("/api/brain/claude/link")
+async def start_claude_link(request: Request):
+    """Link a Claude account (brain.auth: account) by the CLI's own login:
+    {account: subscription | console}. Starts ``claude auth login`` in a
+    staging folder of Harvey's own (claude_link.start) and answers
+    {status: waiting_code, url, expires_in}: the user opens the url, signs
+    in, and pastes the code the page gives (POST .../link/code). Once
+    linked, the account is in data/auth/claude and a Claude brain is set to
+    it. One link at a time per install."""
+    from harvey import brain_auth, claude_link
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    kind = str((body or {}).get("account") or "subscription").strip().lower() \
+        if isinstance(body, dict) else ""
+    if kind not in claude_link.KINDS:
+        return _refuse("Say which account: subscription or console.", 400)
+    state = _state()
+    await state.init_db()
+
+    async def linked():
+        current, _ = _brain_config_or_error()
+        if current is not None and current.provider != "codex" \
+                and current.auth != brain_auth.ACCOUNT:
+            from harvey.config import set_brain_settings
+            set_brain_settings({"auth": brain_auth.ACCOUNT}, _resolve_config_file())
+        brain_auth.forget()
+        _quota_clients.clear()
+        await state.log_action("brain_link", "dashboard",
+                               {"provider": "claude", "linked": True, "account": kind})
+
+    try:
+        return await claude_link.start(state, kind, on_linked=linked)
+    except claude_link.LinkError as e:
+        return _refuse(str(e), 409)
+
+
+@app.post("/api/brain/claude/link/code")
+async def claude_link_code(request: Request):
+    """The code the sign-in page gave, written to the CLI's prompt
+    (claude_link.submit_code): {code}. Never logged or kept. Answers the
+    link's status (pending while the CLI checks it)."""
+    from harvey import claude_link
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    code = body.get("code") if isinstance(body, dict) else None
+    try:
+        return await claude_link.submit_code(code)
+    except claude_link.LinkError as e:
+        return _refuse(str(e), 400 if e.kind == "code" else 409)
+
+
+@app.get("/api/brain/claude/link")
+async def get_claude_link():
+    """The link under way (claude_link.status): {status: idle | pending |
+    waiting_code | linked | expired | failed | cancelled, account, url and
+    expires_in (pending, waiting_code), problem (invalid_code), kind
+    (failed), method and plan (linked)}."""
+    from harvey import claude_link
+    return claude_link.status()
+
+
+@app.delete("/api/brain/claude/link")
+async def cancel_claude_link():
+    """Cancel a link under way (its CLI ends; nothing moves in)."""
+    from harvey import claude_link
+    return await claude_link.cancel()
+
+
+@app.delete("/api/brain/claude/account")
+async def unlink_claude_account():
+    """Unlink the Claude account linked in Harvey: the CLI's own
+    ``claude auth logout`` in data/auth/claude, then the folder removed. A
+    brain on it goes back to the terminal login."""
+    from harvey import brain_auth, claude_link
+    from harvey.config import ConfigError, set_brain_settings
+    state = _state()
+    await state.init_db()
+    try:
+        removed = await claude_link.unlink(state)
+    except claude_link.LinkError as e:
+        return _refuse(str(e), 409)
+    current, _ = _brain_config_or_error()
+    auth = current.auth if current else ""
+    if current is not None and current.provider != "codex" and auth == brain_auth.ACCOUNT:
+        try:
+            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
+            auth = brain_auth.TERMINAL
+        except ConfigError as e:
+            return _refuse(str(e), 409)
+    brain_auth.forget()
+    _quota_clients.clear()
+    await state.log_action("brain_link", "dashboard", {"provider": "claude", "linked": False})
     return {"success": True, "removed": removed, "auth": auth}
 
 
@@ -5997,6 +6102,24 @@ async def get_today():
                     "action": "Open Settings", "tab": "settings",
                 })
 
+        # The Claude account linked in Harvey is logged out (signed out
+        # or revoked): calls fail until it is linked again.
+        claude_brain = codex_brain                       # (the brain read above)
+        if claude_brain is not None and claude_brain.provider != "codex" \
+                and getattr(claude_brain, "auth", "") == "account":
+            from harvey import brain_auth, claude_link
+            if claude_link.has_account():
+                found = await brain_auth.status(claude_brain, state=state)
+                if found.get("linked") is False:
+                    items.append({
+                        "key": "claude-login", "tone": "warn",
+                        "title": "The Claude login has ended: link the account again",
+                        "detail": ("The Claude account linked in Settings → Model is logged "
+                                   "out (signed out or revoked). Claude calls fail until it "
+                                   "is linked again."),
+                        "action": "Open Settings", "tab": "settings",
+                    })
+
         # Harvey's agent: its wakes wait (logged out, the plan's share or
         # limit used).
         from harvey.agent import wakes
@@ -6686,6 +6809,7 @@ def _server_class():
         async def shutdown(self, sockets=None):
             await _close_chats()
             await _close_codex_link()
+            await _close_claude_link()
             await super().shutdown(sockets)
 
     return Server
@@ -6707,6 +6831,15 @@ async def _close_codex_link() -> None:
         await codex_link.close()
     except Exception:
         logger.exception("the Codex link's process didn't close cleanly")
+
+
+async def _close_claude_link() -> None:
+    try:
+        from harvey import claude_link
+
+        await claude_link.close()
+    except Exception:
+        logger.exception("the Claude link's process didn't close cleanly")
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):

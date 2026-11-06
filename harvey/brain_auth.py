@@ -12,8 +12,13 @@ Model says about it.
   any login). Harvey never reads Claude's files there: only the CLI does,
   and whether it is logged in is the CLI's own ``claude auth status``.
   Codex's is linked from Settings → Model by a ChatGPT device-code login
-  and renewed by Harvey there (harvey/codex_link.py); Claude's link flow
-  isn't in this release (its folder stays "not linked yet").
+  and renewed by Harvey there (harvey/codex_link.py); Claude's by the
+  CLI's own ``claude auth login``, its page and pasted code relayed by the
+  panel (harvey/claude_link.py), and refreshed by the CLI itself. A Claude
+  account is a subscription or an Anthropic Console account; Harvey notes
+  which in a file of its own beside the folder (claude_account_kind), and a
+  Console account, billed per token, is held by the same USD caps as an
+  API key (billed).
 - ``api_key``: a key billed per token, saved once from Settings → Model
   after a free check (check_key: the provider's model list, no model
   call). Claude's is kept in .env under CLAUDE_KEY_ENV, a name only Harvey
@@ -57,9 +62,9 @@ AUTH_DIR = PROJECT_ROOT / "data" / "auth"
 # removed from Settings stops being used without a restart).
 ENV_FILE = PROJECT_ROOT / ".env"
 # The ways to link the panel offers, per provider: Codex's account is
-# linked by a device code (harvey/codex_link.py); Claude's account link
-# isn't in this release (the data model already knows it).
-OFFERED_BY = {"claude": (TERMINAL, API_KEY), "codex": (TERMINAL, ACCOUNT, API_KEY)}
+# linked by a device code (harvey/codex_link.py), Claude's by the CLI's own
+# login relayed (harvey/claude_link.py).
+OFFERED_BY = {"claude": (TERMINAL, ACCOUNT, API_KEY), "codex": (TERMINAL, ACCOUNT, API_KEY)}
 
 
 def offered(provider: str) -> tuple[str, ...]:
@@ -92,6 +97,43 @@ _kept: dict[tuple, tuple[float, dict]] = {}
 
 def account_dir(provider: str) -> Path:
     return AUTH_DIR / ("codex" if provider == "codex" else "claude")
+
+
+# The kinds of Claude account a link makes (claude auth login --claudeai
+# or --console), and Harvey's own note of which one data/auth/claude holds:
+# a file of Harvey's beside the folder, never one of Claude's.
+SUBSCRIPTION, CONSOLE = "subscription", "console"
+CLAUDE_LINK_NOTE = "claude-link.json"
+
+
+def claude_link_note() -> Path:
+    return AUTH_DIR / CLAUDE_LINK_NOTE
+
+
+def claude_account_kind() -> str:
+    """How the Claude account in data/auth/claude was linked: SUBSCRIPTION,
+    CONSOLE, or "" when Harvey linked none. A note that can't be read
+    counts as CONSOLE, so its calls are held by the caps rather than left
+    unbilled."""
+    path = claude_link_note()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError):
+        return CONSOLE
+    kind = data.get("kind") if isinstance(data, dict) else None
+    return kind if kind in (SUBSCRIPTION, CONSOLE) else CONSOLE
+
+
+def billed(provider: str, auth: str) -> bool:
+    """Whether the brain's calls are billed per token, so held by its USD
+    caps (harvey/brain_spend.py): an API key, or a Claude account linked
+    from the Anthropic Console."""
+    auth = auth or TERMINAL
+    if auth == API_KEY:
+        return True
+    return provider != "codex" and auth == ACCOUNT and claude_account_kind() == CONSOLE
 
 
 def key_dir() -> Path:
@@ -329,8 +371,10 @@ def claude_status(auth: str) -> dict:
     out["linked"] = found["logged_in"]
     if found["logged_in"]:
         out["linked_as"] = {k: found[k] for k in ("method", "plan", "api") if found[k]}
+    elif auth == ACCOUNT and claude_account_kind():
+        out["problem"] = LINK_ENDED
     elif auth == ACCOUNT:
-        out["problem"] = f"Not linked yet: no login in {_shown(account_dir('claude'))}."
+        out["problem"] = "Not linked yet: press Link account in Settings → Model."
     else:
         out["problem"] = "Claude isn't logged in: run 'claude login' in a terminal."
     return out
@@ -425,6 +469,8 @@ def _shown(path: Path) -> str:
 
 # ── The status ──
 
+LINK_ENDED = ("The Claude login linked in Harvey has ended (signed out or revoked): link "
+              "the account again in Settings → Model.")
 LINK_EXPIRED = ("The Codex login linked in Harvey has expired and couldn't be renewed: "
                 "link the account again.")
 
@@ -433,6 +479,9 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
     {provider, model, reasoning_effort, auth, offered, folder, cli {ok,
     version, problem}, linked (True, False, None: unknown), linked_as
     {method, plan[, api]}, problem, last_error, models, codex_refused,
+    billed (held by the USD caps: an API key or a Console account),
+    claude_account (Claude: {kind, link}, the account Harvey linked and a
+    link under way, claude_link.status),
     checked_at, key_set {claude, codex} (whether a key is saved, never the
     key), the brain's USD caps and Codex's prices, in API-key mode
     ``spend`` (brain_spend.totals), and for Codex ``codex_account`` (the
@@ -477,8 +526,13 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
         if auth == ACCOUNT and codex_account.get("expired"):
             found["linked"] = False
             found["problem"] = LINK_EXPIRED
+    claude_account = None
+    if provider != "codex":
+        from harvey import claude_link
+        claude_account = {"kind": claude_account_kind(), "link": claude_link.status()}
+    is_billed = billed(provider, auth)
     spend = None
-    if auth == API_KEY and state is not None:
+    if is_billed and state is not None:
         from harvey import brain_spend
         try:
             spend = await brain_spend.totals(state, brain)
@@ -487,6 +541,7 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
     return {"provider": provider, "model": brain.model,
             "reasoning_effort": brain.reasoning_effort, "auth": auth,
             "offered": list(offered(provider)), "spend": spend, "codex_account": codex_account,
+            "claude_account": claude_account, "billed": is_billed,
             "key_set": {p: key_set(p) for p in ("claude", "codex")},
             "usd_per_day": brain.usd_per_day, "usd_per_month": brain.usd_per_month,
             "codex_usd_per_mtok_in": brain.codex_usd_per_mtok_in,

@@ -141,15 +141,17 @@ def status() -> dict:
     return _public(_link)
 
 
-async def _keep_lease(state, owner: str) -> None:
+async def _keep_lease(state, owner: str, lease: str = LEASE) -> None:
+    """Renew ``owner``'s hold on ``lease`` until cancelled (Claude's link,
+    harvey/claude_link.py, keeps its own lease the same way)."""
     from harvey.modules import worker
 
     while True:
         await asyncio.sleep(LEASE_TTL_SECONDS / 3)
         try:
-            await worker.acquire_lease(state, owner, LEASE_TTL_SECONDS, LEASE)
+            await worker.acquire_lease(state, owner, LEASE_TTL_SECONDS, lease)
         except Exception as e:
-            logger.debug("codex link: renewing the lease failed: %s", e)
+            logger.debug("%s: renewing the lease failed: %s", lease, e)
 
 
 async def _stop_keeping(keeper: asyncio.Task | None) -> None:

@@ -467,12 +467,12 @@ def test_the_link_endpoints_need_the_token(client):
         assert getattr(bare, method)(url).status_code == 401
 
 
-def test_claude_offers_no_account_link_yet(client):
+def test_claude_offers_its_own_account_link_once_linked(client):
     from harvey.config import set_brain_settings
     set_brain_settings({"provider": "claude", "model": ""}, client.dir / "harvey.yaml")
-    assert client.get("/api/brain").json()["offered"] == ["terminal", "api_key"]
+    assert client.get("/api/brain").json()["offered"] == ["terminal", "account", "api_key"]
     r = client.post("/api/brain", json={"auth": "account"})
-    assert r.status_code == 409
+    assert r.status_code == 409 and "Link the Claude account first" in r.json()["message"]
 
 
 def test_today_says_link_again_when_the_renewal_failed(client, monkeypatch):

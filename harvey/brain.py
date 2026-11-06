@@ -131,7 +131,8 @@ class Brain:
         self.budget_why = ""
         from harvey import brain_auth
         self.auth = brain_auth.auth_of(self.config)
-        self.api_key = self.auth == brain_auth.API_KEY
+        # (Billed per token: an API key, or a Claude Console account.)
+        self.api_key = brain_auth.billed(self.provider, self.auth)
         if self.provider == "codex":
             from harvey.codex import CodexClient, CodexQuotaClient
             self.codex = CodexClient(

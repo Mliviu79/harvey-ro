@@ -5067,6 +5067,7 @@ async function loadModelCard(refresh) {
   if (_modelPick) for (const k of MODEL_MONEY) _modelPick[k] = _model[k] == null ? '' : String(_model[k]);
   if (refresh) _modelFull = {};
   adoptCodexLink(_model);
+  adoptClaudeLink(_model);
   renderModelCard();
   if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
 }
@@ -5081,6 +5082,7 @@ async function loadProviderStatus(provider, refresh) {
                       (refresh ? '&refresh=1' : ''));
   _modelFull[provider] = s && !s.error ? s : {failed: true};
   adoptCodexLink(_modelFull[provider]);
+  adoptClaudeLink(_modelFull[provider]);
   renderModelCard();
 }
 
@@ -5108,6 +5110,8 @@ function modelStatusLine(s) {
   } else if (s.linked === true) {
     const as = s.linked_as || {};
     bits.push(t('model.linked_as', {how: [as.method, as.plan].filter(Boolean).join(' · ') || '-'}));
+    // (A Console account is billed per token: its spend beside the caps.)
+    if (s.billed) bits.push(...modelSpendBits(s));
   } else if (s.linked === false) {
     bits.push(t(s.auth === 'account' ? 'model.not_linked' : 'model.not_logged_in'));
   } else if (cli.ok) {
@@ -5142,6 +5146,11 @@ function renderModelCard() {
   const ways = Array.from(new Set([...((shown && shown.offered) || _model.offered || ['terminal']),
                                    ...(p.provider === _model.provider ? [_model.auth] : [])]));
   const account = codex ? (((shown || (_model.provider === 'codex' ? _model : null)) || {}).codex_account || {}) : {};
+  // Claude's account linked in Harvey (its kind, a link under way), and
+  // whether the login picked is billed per token (held by the caps).
+  const claudeShown = !codex ? (shown || (_model.provider !== 'codex' ? _model : null)) : null;
+  const claudeAcc = (claudeShown && claudeShown.claude_account) || {};
+  const billed = p.auth === 'api_key' || (!codex && p.auth === 'account' && claudeAcc.kind === 'console');
   const efforts = codex ? (((models.find(m => m.id === p.model) || {}).efforts || []).length
     ? models.find(m => m.id === p.model).efforts : (_model.efforts || [])) : [];
   let modelField = '<input class="form-input" id="model-name" list="model-options" autocomplete="off" value="' +
@@ -5179,12 +5188,15 @@ function renderModelCard() {
     '<div class="settings-row"><div><h3>' + escHtml(t('model.link')) + '</h3>' +
       '<p class="desc">' + escHtml(t(p.auth === 'api_key' ? (codex ? 'model.api_codex' : 'model.api_claude')
                                      : codex && p.auth === 'account' ? 'model.account_codex'
+                                     : p.auth === 'account' ? 'model.account_claude'
                                      : codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
       '<div class="fields">' +
       ways.map(w => radio('auth', w, t('model.auth.' + w), p.auth === w, false,
                           w === 'account' && _model.folder ? _model.folder : '')).join('') +
       (p.auth === 'api_key' ? modelKeyFields(p, codex, keySet) : '') +
       (codex && p.auth === 'account' ? codexAccountFields(account) : '') +
+      (!codex && p.auth === 'account' ? claudeAccountFields(claudeAcc, claudeShown || {}) : '') +
+      (billed && p.auth !== 'api_key' ? modelCapFields(p) : '') +
       modelStatusLine(shown || (p.provider === _model.provider ? _model : null)) +
       '<div class="btn-group"><button class="btn btn-primary btn-sm" id="model-save" onclick="saveModel()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.save')) + '</button>' +
@@ -5193,6 +5205,9 @@ function renderModelCard() {
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink')) + '</button>' : '') +
       (codex && p.auth === 'account' && account.linked && !_codexLinkPending() ?
         '<button class="btn btn-ghost btn-sm" id="model-unlink-account" onclick="unlinkCodexAccount()"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink_account')) + '</button>' : '') +
+      (!codex && p.auth === 'account' && claudeAcc.kind && !_claudeLinkActive() ?
+        '<button class="btn btn-ghost btn-sm" id="model-unlink-account" onclick="unlinkClaudeAccount()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink_account')) + '</button>' : '') + '</div>' +
     '</div></div>';
 }
@@ -5313,6 +5328,169 @@ async function unlinkCodexAccount() {
   loadModelCard(true);
 }
 
+// Claude's account linked in Harvey (brain.auth: account): the CLI's own
+// login (claude auth login), relayed. Link account (a subscription) or Link
+// a Console account starts it (/api/brain/claude/link): the sign-in page
+// to open, then a box for the code that page gives, written to the CLI's
+// prompt (/api/brain/claude/link/code). The panel polls until the server
+// says linked, expired or failed; a code the CLI calls invalid is asked
+// for again. Linked: which kind, "link again" once the CLI says it is
+// logged out, Unlink.
+let _claudeLink = null, _claudeLinkTimer = null;
+
+function _claudeLinkActive() {
+  return !!(_claudeLink && (_claudeLink.status === 'pending' || _claudeLink.status === 'waiting_code'));
+}
+
+// A link started before this page was opened (or in another tab): follow it.
+function adoptClaudeLink(s) {
+  const link = s && s.claude_account && s.claude_account.link;
+  if (link && (link.status === 'pending' || link.status === 'waiting_code') && !_claudeLinkActive()) {
+    _claudeLink = link;
+    followClaudeLink();
+  }
+}
+
+function claudeAccountFields(acc, s) {
+  const saved = acc.link && (acc.link.status === 'pending' || acc.link.status === 'waiting_code') ? acc.link : null;
+  const link = _claudeLink || saved;
+  if (link && (link.status === 'pending' || link.status === 'waiting_code')) {
+    const mins = Math.max(1, Math.ceil((link.expires_in || 0) / 60));
+    const checking = link.status === 'pending';
+    return '<div class="codex-link" role="group" aria-label="' + escHtml(t('model.link_start')) + '">' +
+      (link.url ? '<p class="small">' + escHtml(t('model.claude_link_open')) + ' <a href="' + safeHref(link.url) +
+        '" target="_blank" rel="noopener noreferrer">' + escHtml(t('model.claude_link_page')) + '</a></p>' : '') +
+      '<div class="form-group"><label class="form-label" for="claude-link-code">' +
+        escHtml(t('model.claude_link_code')) + '</label>' +
+        '<div class="codex-code"><input class="form-input" id="claude-link-code" type="text" autocomplete="off"' +
+        ' autocapitalize="off" spellcheck="false" maxlength="512"' + (checking ? ' disabled' : '') +
+        ' onkeydown="if (event.key === \'Enter\') submitClaudeCode()">' +
+        '<button class="btn btn-secondary btn-sm" id="claude-link-submit" onclick="submitClaudeCode()"' +
+        (checking ? ' disabled' : '') + '>' + escHtml(t('model.claude_link_submit')) + '</button></div></div>' +
+      (link.problem === 'invalid_code' ? '<p class="small"><span class="email-tag guess">' +
+        escHtml(t('model.claude_code_invalid')) + '</span></p>' : '') +
+      '<p class="small muted" aria-live="polite">' + escHtml(checking ? t('model.claude_checking')
+        : t('model.claude_link_waiting', {n: mins})) + '</p>' +
+      '<p class="small muted">' + escHtml(t('model.claude_link_note')) + '</p>' +
+      '<div class="btn-group"><button class="btn btn-ghost btn-sm" onclick="cancelClaudeLink()">' +
+        escHtml(t('model.link_cancel')) + '</button></div></div>';
+  }
+  let out = '';
+  if (link && link.status === 'expired') out += '<p class="small muted">' + escHtml(t('model.claude_link_expired')) + '</p>';
+  else if (link && link.status === 'failed') out += '<p class="small muted">' + escHtml(t('model.claude_link_failed', {kind: link.kind || '-'})) + '</p>';
+  const ended = !!acc.kind && s.linked === false;
+  if (acc.kind) {
+    out += '<p class="small">' + escHtml(t(acc.kind === 'console' ? 'model.claude_linked_console' : 'model.claude_linked_here')) + '</p>';
+    if (ended) out += '<p class="small"><span class="email-tag guess">' + escHtml(t('model.claude_login_ended')) + '</span></p>';
+  }
+  if (!acc.kind || ended) {
+    out += '<p class="small muted">' + escHtml(t('model.claude_link_how')) + '</p>' +
+      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link" onclick="startClaudeLink(\'subscription\')"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t(acc.kind ? 'model.link_again' : 'model.link_start')) + '</button>' +
+      '<button class="btn btn-ghost btn-sm" id="model-link-console" onclick="startClaudeLink(\'console\')"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.claude_link_console')) + '</button></div>' +
+      '<p class="small muted">' + escHtml(t('model.claude_console_note')) + '</p>';
+  }
+  return out;
+}
+
+async function startClaudeLink(kind) {
+  if (_modelBusy || _claudeLinkActive()) return;
+  _modelBusy = true;
+  renderModelCard();
+  try {
+    const res = await api('/api/brain/claude/link', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({account: kind}),
+    });
+    if (!res || res.status !== 'waiting_code') {
+      showToast(failMsg(res, t('model.failed')), 'error');
+      return;
+    }
+    _claudeLink = res;
+  } finally {
+    _modelBusy = false;
+    renderModelCard();
+  }
+  followClaudeLink();
+}
+
+// The pasted code goes to the CLI's prompt; the box is emptied either way.
+async function submitClaudeCode() {
+  const box = document.getElementById('claude-link-code');
+  const code = box ? String(box.value || '').trim() : '';
+  if (!code || !_claudeLinkActive()) return;
+  if (box) box.value = '';
+  const res = await api('/api/brain/claude/link/code', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code: code}),
+  });
+  if (!res || !res.status) {
+    showToast(failMsg(res, t('model.failed')), 'error');
+    return;
+  }
+  _claudeLink = res;
+  renderModelCard();
+  followClaudeLink();
+}
+
+// Polls the link every few seconds until it ends (or the card is gone).
+function followClaudeLink() {
+  clearTimeout(_claudeLinkTimer);
+  _claudeLinkTimer = setTimeout(async () => {
+    if (!document.getElementById('model-card') || !_claudeLinkActive()) return;
+    const res = await api('/api/brain/claude/link');
+    if (!res || !res.status) { followClaudeLink(); return; }
+    const was = _claudeLink;
+    _claudeLink = res;
+    if (res.status === 'pending' || res.status === 'waiting_code') {
+      // (Redrawn only on a change, so a code being typed isn't wiped.)
+      if (!was || was.status !== res.status || was.problem !== res.problem) renderModelCard();
+      followClaudeLink();
+      return;
+    }
+    if (res.status === 'linked') {
+      showToast(t('model.claude_link_done'), 'success');
+      _claudeLink = null;
+      if (_modelPick) _modelPick.auth = 'account';
+      loadModelCard(true);
+      return;
+    }
+    if (res.status === 'cancelled' || res.status === 'idle') _claudeLink = null;
+    renderModelCard();
+  }, 3000);
+}
+
+async function cancelClaudeLink() {
+  clearTimeout(_claudeLinkTimer);
+  await api('/api/brain/claude/link', {method: 'DELETE'});
+  _claudeLink = null;
+  showToast(t('model.link_cancelled'), 'success');
+  renderModelCard();
+}
+
+async function unlinkClaudeAccount() {
+  if (_modelBusy) return;
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain/claude/account', {method: 'DELETE'});
+    if (res && res.success) showToast(t('model.account_unlinked'), 'success');
+    else showToast(failMsg(res, t('model.failed')), 'error');
+  } finally {
+    _modelBusy = false;
+  }
+  loadModelCard(true);
+}
+
+// The brain's USD caps alone (a Console account, billed per token).
+function modelCapFields(p) {
+  const field = (id, key, label, ph) =>
+    '<div class="form-group"><label class="form-label" for="' + id + '">' + escHtml(label) + '</label>' +
+    '<input class="form-input" id="' + id + '" type="number" min="0" step="any" inputmode="decimal" value="' +
+      escHtml(p[key] || '') + '" placeholder="' + escHtml(ph) + '" oninput="pickModel(' + jsq(key) + ', this.value)"></div>';
+  return '<p class="small muted">' + escHtml(t('model.caps_console')) + ' ' + escHtml(t('model.caps_note')) + '</p>' +
+    field('model-usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
+    field('model-usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph'));
+}
+
 // The API key's box (a password field: what was saved is never shown), the
 // brain's USD caps, and Codex's token prices (its CLI reports no cost).
 function modelKeyFields(p, codex, keySet) {
@@ -5358,6 +5536,16 @@ async function saveModel() {
   }
   if (body.provider === 'codex' && body.auth === 'account' && _codexLinkPending()) {
     showToast(t('model.link_first'), 'error');
+    return;
+  }
+  const claudeAcc = ((_model.provider !== 'codex' ? _model : (_modelFull.claude || {})).claude_account) || {};
+  if (body.provider !== 'codex' && body.auth === 'account' && (_claudeLinkActive() || !claudeAcc.kind)) {
+    showToast(t('model.claude_link_first'), 'error');
+    return;
+  }
+  const consoleBilled = body.provider !== 'codex' && body.auth === 'account' && claudeAcc.kind === 'console';
+  if (consoleBilled && !String(body.usd_per_day ?? '').trim() && !String(body.usd_per_month ?? '').trim()) {
+    showToast(t('model.cap_needed'), 'error');
     return;
   }
   if (body.auth === 'api_key' && !key && !((_model.key_set || {})[body.provider])) {

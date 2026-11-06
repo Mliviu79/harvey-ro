@@ -9,6 +9,25 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Link a Claude account from the dashboard, through the Claude CLI's own
+  login.** Settings → Model now offers **Account linked in Harvey** for
+  Claude: **Link account** (a subscription) or **Link a Console account**
+  starts the unmodified `claude auth login` under a pseudo-terminal in a
+  staging folder of Harvey's own, with the same stripped environment as
+  every Claude call. The panel shows the CLI's sign-in page (only an https
+  page on a Claude or Anthropic host; anything else fails the link) and a
+  box for the code that page gives after signing in, which Harvey writes
+  to the CLI's prompt and never logs or keeps. Whether it worked is the
+  CLI's own `claude auth status`; then the folder becomes
+  `data/auth/claude` by one rename and the brain is set to
+  `brain.auth: account`. A refused code, a cancel or 15 minutes with no
+  code leaves the account already there as it was. Harvey never reads or
+  stores the credential: the CLI keeps and refreshes it. When the CLI says
+  the account is logged out, the panel and Today say "link the account
+  again". **Unlink account** is the CLI's own `claude auth logout`. A
+  Console account is billed per token, so it is held by the brain's USD
+  caps, metering and plan holds exactly like an API key, and is refused
+  without a cap.
 - **Link a ChatGPT account for Codex from the dashboard, and Harvey keeps
   it renewed.** Settings → Model now offers **Account linked in Harvey**
   for Codex: **Link account** starts a ChatGPT device-code login in a

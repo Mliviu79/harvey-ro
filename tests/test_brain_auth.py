@@ -264,7 +264,7 @@ def test_status_is_kept_briefly_and_names_the_last_error(tmp_path, monkeypatch):
     two = run(brain_auth.status(BrainConfig(), state=state))
     assert calls == ["terminal"] and one == two
     assert one["last_error"] == "setup" and one["auth"] == "terminal"
-    assert one["offered"] == ["terminal", "api_key"]
+    assert one["offered"] == ["terminal", "account", "api_key"]
     assert [m["id"] for m in one["models"]] == ["opus", "sonnet", "haiku"]
     run(brain_auth.status(BrainConfig(), state=state, force=True))
     assert calls == ["terminal", "terminal"]
@@ -297,13 +297,13 @@ def test_the_panel_reads_and_saves_the_brain(client, monkeypatch):
     monkeypatch.setattr(codex, "_PLATFORM", "linux")
     got = client.get("/api/brain").json()
     assert (got["provider"], got["model"], got["auth"]) == ("claude", "", "terminal")
-    assert got["offered"] == ["terminal", "api_key"] and "account" in got["auth_ready"]
+    assert got["offered"] == ["terminal", "account", "api_key"] and "account" in got["auth_ready"]
     assert got["codex_refused"] == "" and got["key_set"] == {"claude": False, "codex": False}
 
     r = client.post("/api/brain", json={"provider": "codex", "model": ""})
     assert r.status_code == 400 and "Pick a Codex model" in r.json()["message"]
     r = client.post("/api/brain", json={"auth": "account"})
-    assert r.status_code == 409                  # no link flow yet: not offered
+    assert r.status_code == 409                  # no account linked yet
     r = client.post("/api/brain", json={"auth": "api_key"})
     assert r.status_code == 409 and "Save the Claude API key first" in r.json()["message"]
     assert not (client.dir / "harvey.local.yaml").exists()
@@ -430,7 +430,7 @@ def test_the_panel_offers_only_the_ways_that_work(lang, words):
     html = _panel(lang, CLAUDE)
     for w in words:
         assert w in html, w
-    # The account link's flow isn't here yet: no button for it.
+    # (Only the ways the status offers: this one lists no account.)
     assert 'value="account"' not in html and 'value="api_key"' in html
     assert 'id="model-key"' not in html                  # the key box: API key only
     assert '<option value="opus">' in html and 'id="model-effort"' not in html
