@@ -408,19 +408,29 @@ async def find_estimate(state, selected: list[dict], force: bool) -> dict:
 # ── Verify contacts ──
 
 async def verify_selection(state, body: dict) -> tuple[list[dict], str]:
-    """The links a verification takes: {"contact_ids": [...]} or {"filter":
-    {the Contacts page's filters}, "limit"}; at most contact_check.MAX_LINKS."""
+    """The links a verification takes: {"contact_ids": [...]} (every one,
+    or the first ``limit``) or {"filter": {the Contacts page's filters},
+    "limit"} (200 by default); at most contact_check.MAX_RUN contacts,
+    queued in pieces (enqueue_contact_checks)."""
     from harvey import contact_check
     from harvey.contact_query import filter_from_query
 
+    top = contact_check.MAX_RUN
+    ids = body.get("contact_ids")
     try:
-        limit = max(1, min(int(body.get("limit") or 200), contact_check.MAX_LINKS))
+        given = body.get("limit")
+        limit = (None if given in (None, "") and ids is not None
+                 else max(1, min(int(given or 200), top)))
     except (TypeError, ValueError):
         return [], "limit must be a number"
-    ids = body.get("contact_ids")
     if ids is not None:
         if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
             return [], "contact_ids is a list of contact ids"
+        if limit is None:
+            if len(ids) > top:
+                return [], (f"{len(ids):,} contacts: a verification takes at most {top:,} "
+                            "(give a limit, or fewer)")
+            limit = len(ids) or 1
     else:
         raw = body.get("filter") if isinstance(body.get("filter"), dict) else {}
         try:
@@ -429,7 +439,7 @@ async def verify_selection(state, body: dict) -> tuple[list[dict], str]:
         except ValueError as e:
             return [], str(e)
         _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
-    return await contact_check.links(state, ids[:limit], limit=limit), ""
+    return await contact_check.links(state, ids[:limit]), ""
 
 
 # ── Campaigns: an audience saved, a draft made ──

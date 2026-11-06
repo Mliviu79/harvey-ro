@@ -3886,6 +3886,37 @@ class Reader:
             return set()
         return {r[0] for r in self.x("overlay.contact_check.done", (batch, fid))}
 
+    def contact_links(self, ids) -> dict[int, dict]:
+        """{contact id: {"kind", "value", "links": [{"company_id", "company",
+        "source", "trust", "evidence_url"}]}} for many contacts in one read:
+        what ``reach`` gives one contact (each link's evidence rows, the
+        link's own trust when it has none, by company name), with the
+        firm's name only. Contacts not on file are left out."""
+        ids = [int(i) for i in ids]
+        kinds = self.contact_kind_value(ids)
+        links = list(self._by_ids("overlay.read.links_of_contacts", [i for i in ids
+                                                                      if i in kinds]))
+        lives = self.live_of([l[1] for l in links])
+        names = self.sort_keys(list(dict.fromkeys(lives.values())), "name")
+        evidence: dict[tuple, list] = {}
+        for firm, contact, src, trust, url, _first, person, _loc in self._by_ids(
+                "overlay.read.evidence", [[l[1], l[0]] for l in links], 500):
+            evidence.setdefault((firm, contact, person), []).append((src, trust, url))
+        per: dict[int, list] = {}
+        for contact, firm, trust, person, _loc, _first in links:
+            live = lives.get(firm, firm)
+            for src, etrust, url in evidence.get((firm, contact, person), [(None, trust, "")]):
+                per.setdefault(contact, []).append({
+                    "company_id": str(live), "company": names.get(live, ""),
+                    "source": src or "", "trust": TRUST_NAMES.get(etrust, ""),
+                    "evidence_url": url or ""})
+        out = {}
+        for i in ids:
+            if i in kinds:
+                rows = sorted(per.get(i, []), key=lambda r: r["company"])
+                out[i] = {"kind": kinds[i][0], "value": kinds[i][1], "links": rows}
+        return out
+
     def contact_kind_value(self, ids) -> dict[int, tuple[str, str]]:
         """{contact id: (its kind, its value)}."""
         return {r[0]: (r[1] or "", r[2] or "")

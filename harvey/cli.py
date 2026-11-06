@@ -774,22 +774,29 @@ async def _verify(state, args) -> None:
               "row(s) put back as they were\n")
         return
     if args.review:
-        rows = await state.read("contact_checks_open", "unsure", args.limit)
+        rows = await state.read("contact_checks_open", "unsure",
+                                200 if args.limit is None else args.limit)
         print(f"\n  {len(rows):,} link(s) the classifier was unsure of:")
         for r in rows:
             print(f"    {r['contact_id']}  {r['kind']} {r['value']}  at {r['company'] or r['company_id']}"
                   f"  ({r['model'] or r['profile']})")
         print()
         return
+    # (Every --contact given, or its first --limit; the filters' first
+    # --limit, 200 by default: at most contact_check.MAX_RUN, queued in
+    # pieces under one run.)
+    limit = max(1, min(200 if args.limit is None else args.limit, contact_check.MAX_RUN))
     if args.contact:
-        ids = list(args.contact)
+        ids = list(args.contact)[:limit] if args.limit is not None else list(args.contact)
+        if len(ids) > contact_check.MAX_RUN:
+            print(f"\n  {len(ids):,} contacts: a verification takes at most "
+                  f"{contact_check.MAX_RUN:,} (give --limit, or fewer).\n")
+            return
     else:
         f = ContactFilter(county=args.county, locality=args.locality, website=args.website,
                           q=args.q)
-        _, _, ids = await state.read("contacts_page", f, "", "desc", args.limit, 0,
-                                     cap=args.limit)
-    chosen = await contact_check.links(state, ids, limit=min(args.limit,
-                                                              contact_check.MAX_LINKS))
+        _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
+    chosen = await contact_check.links(state, ids)
     if not chosen:
         print("\n  No linked contact matches.\n")
         return
@@ -802,7 +809,10 @@ async def _verify(state, args) -> None:
           f"{est['calls']:,} calls through {est['profile_name'] or est['profile']}, estimated "
           f"${est['usd_typical']:.4f} typical to ${est['usd_high']:.4f} high"
           + ("" if est["price_known"] else " (no price: not counted)")
-          + f" (cap: ${args.max_spend:.2f})")
+          + f" (cap: ${args.max_spend:.2f}, over the whole run)")
+    if est["pieces"] > 1:
+        print(f"  Queued in {est['pieces']:,} pieces of at most {contact_check.MAX_LINKS:,} "
+              "links, one run: one cap, one report, one cancel.")
     print(f"  {est['note']}")
     if args.dry_run:
         print("  Nothing asked (--dry-run).\n")
@@ -901,7 +911,8 @@ def cmd_contacts(args):
         exclude = [c.strip().upper() for c in args.exclude.split(",") if c.strip()]
         if require or exclude:
             f.signals = (tuple(require), tuple(exclude))
-        selected = await finder.select(state, f, force=args.force, limit=args.limit)
+        selected = await finder.select(state, f, force=args.force,
+                                       limit=200 if args.limit is None else args.limit)
         if not selected:
             print("\n  Nothing to search: every company that matches has a contact "
                   "already (--force searches them again).\n")
@@ -4134,8 +4145,10 @@ def main():
     sub.add_argument("--require", default="",
                      help="Signal codes a company must hold (a code not checked yet counts)")
     sub.add_argument("--exclude", default="", help="Signal codes a company must not hold")
-    sub.add_argument("--limit", type=int, default=200,
-                     help="Most companies to search, newest first (default: 200)")
+    sub.add_argument("--limit", type=int, default=None,
+                     help="Most companies to search, newest first (default: 200); "
+                          "verify: most contacts taken (the filters' 200 by default, "
+                          "every --contact given)")
     sub.add_argument("--max-spend", type=_dollars, default=0.0,
                      help="Cap in dollars for website searches and address checks "
                           "(default: 0, nothing paid: websites are read only); verify: "

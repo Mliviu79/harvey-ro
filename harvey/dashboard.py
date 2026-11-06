@@ -2823,9 +2823,10 @@ async def _verify_selection(state, body: dict) -> tuple[list[dict], str]:
 @app.post("/api/contacts/verify/estimate")
 async def estimate_contact_verify(request: Request):
     """What verifying the chosen links may cost, before anything is sent:
-    {links, companies, calls, tokens_typical, tokens_high, basis,
-    usd_typical, usd_high, price_known, profile, model, off, note}. An
-    estimate: the run's cap is what is enforced, call by call."""
+    {links, companies, contacts, pieces, more, calls, tokens_typical,
+    tokens_high, basis, usd_typical, usd_high, price_known, profile, model,
+    off, note}. An estimate: the run's cap is what is enforced, call by
+    call, over the whole run however many pieces it is queued in."""
     from harvey import contact_check
 
     state = _state()
@@ -2841,8 +2842,10 @@ async def start_contact_verify(request: Request):
     """Verify the chosen links with the classifier's contacts task (yes /
     no / unsure), one job per company: the selection's fields and
     ``max_spend`` (USD the run's classifier calls may cost, required).
-    Its batch id undoes what its no's lowered (POST /api/contacts/verify/undo)."""
-    from harvey import classify
+    Its batch id undoes what its no's lowered (POST /api/contacts/verify/undo).
+    A large selection (contact_check.MAX_RUN at most) is queued in pieces
+    under that one batch: one cap, one report, one cancel."""
+    from harvey import classify, contact_check
     from harvey.modules import jobs
     from harvey.modules.job_kinds import enqueue_contact_checks
 
@@ -2866,7 +2869,8 @@ async def start_contact_verify(request: Request):
         return JSONResponse(_duplicate_body(e), status_code=409)
     jobs.notify()
     return {"success": True, "batch_id": batch_id, "queued": len(ids),
-            "already_waiting": len(dupes), "links": len(chosen), "max_spend": cap}
+            "already_waiting": len(dupes), "links": len(chosen), "max_spend": cap,
+            "pieces": len(contact_check.pieces(chosen))}
 
 
 @app.post("/api/contacts/verify/undo")

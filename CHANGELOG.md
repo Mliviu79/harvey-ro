@@ -9,6 +9,20 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A large verification is split and queued, not refused.** Verifying
+  contacts with the classifier (the agent's `verify_contacts`, Contacts →
+  Verify, `harvey contacts verify`) takes any selection up to 50,000
+  contacts: every ticked contact or every id of a set (or its first
+  `limit`), a filter's first `limit` (200 by default). It is queued in
+  pieces of at most 2,000 links, in order, under one run: the classifier
+  cap you type covers the whole run (it stops where the cap is reached,
+  whichever piece that is in), one report, one cancel. The estimate prices
+  the whole selection and says how many pieces it is queued in; the plan
+  holds the run's one cap once. No piece starts before the last is queued,
+  and a write that fails takes the whole run off, so a run is never left
+  half queued. The links are read in bulk, so a large selection is priced
+  in seconds.
+
 - **The agent's sets are frozen at save.** A set the agent saves, by a
   filter or by a SELECT, is resolved once and kept as its ids (schema 39,
   `agent_set_member`), at most 50,000 (past that it is refused with the

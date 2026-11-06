@@ -567,7 +567,8 @@ class Actions:
     async def verify_contacts(self, turn: str, plan, set=None, filter=None, max_spend=0.0,
                               limit=None) -> dict:
         """A verification by the classifier, as POST /api/contacts/verify
-        queues it: ``max_spend`` is what its calls may cost."""
+        queues it: ``max_spend`` is what its calls may cost, over the whole
+        run however many pieces it is queued in."""
         from harvey import classify, contact_check, launch
         from harvey.modules import jobs
         from harvey.modules.job_kinds import enqueue_contact_checks
@@ -580,7 +581,7 @@ class Actions:
             if await classify.available(state, "contacts") in ("off", "task off"):
                 raise readonly.Refused("no profile answers the classifier's contacts task: the "
                                        "user sets one in Settings → Classifier")
-            chosen = await self._resolve(set, filter, "contacts", contact_check.MAX_LINKS)
+            chosen = await self._resolve(set, filter, "contacts", contact_check.MAX_RUN)
             body = {"limit": limit}
             if "ids" in chosen:
                 taken.update(chosen["set"])
@@ -600,8 +601,8 @@ class Actions:
                 jobs.notify()
                 return out
             return (0.0, cap), {k: estimate.get(k) for k in (
-                "links", "companies", "calls", "usd_typical", "usd_high", "price_known",
-                "note")}, queue
+                "contacts", "links", "companies", "pieces", "more", "calls", "usd_typical",
+                "usd_high", "price_known", "note")}, queue
         return _with_set(await self._act(turn, "verify_contacts", arguments, plan, prepare),
                          taken)
 

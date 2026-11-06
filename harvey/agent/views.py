@@ -601,15 +601,17 @@ async def _find_estimate(state, p: dict) -> dict:
 
 
 async def _verify_estimate(state, p: dict) -> dict:
-    from harvey import contact_check
+    from harvey import contact_check, launch
 
-    limit = max(1, min(int(p.get("limit") or 200), contact_check.MAX_LINKS))
-    ids = p.get("contact_ids")
-    if ids is not None:
-        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
-            raise readonly.Refused("contact_ids is a list of contact ids")
+    if p.get("contact_ids") is not None:
+        # (The ids as the run reads them: every one, or the first limit.)
+        chosen, error = await launch.verify_selection(
+            state, {"contact_ids": p.get("contact_ids"), "limit": p.get("limit")})
+        if error:
+            raise readonly.Refused(error)
     else:
+        limit = max(1, min(int(p.get("limit") or 200), contact_check.MAX_RUN))
         f = await _contact_filter(state, p)
         _, _, ids = await state.read("contacts_page", f, "", "desc", limit, 0, cap=limit)
-    chosen = await contact_check.links(state, ids[:limit], limit=limit)
+        chosen = await contact_check.links(state, ids[:limit])
     return await contact_check.estimate(state, chosen)

@@ -1026,3 +1026,75 @@ def test_every_plan_string_is_in_both_languages():
     assert ro == en and len(ro) > 20
     for status in plans.STATUSES:
         assert f"chat.plan.st.{status}" in ro
+
+
+def test_verify_contacts_takes_a_large_set_as_one_run_in_pieces(db, monkeypatch):
+    from harvey import classify
+    from tests.test_contact_check_pieces import _many
+
+    async def seed():
+        s = StateManager(str(db))
+        await s.init_db()
+        return await _many(s, db)
+    _run(seed())
+
+    async def on(state, task, s=None):
+        return ""
+    monkeypatch.setattr(classify, "available", on)
+    plan_id = _propose(db, budget=1.0)
+    _approve(db, plan_id)
+    _, s = _one(db, "save_set", {"name": "Toate", "sql": "SELECT contact FROM link",
+                                 "of": "contacts"})
+    assert s["count"] == 4500
+    error, few = _one(db, "verify_contacts", {"plan": plan_id, "set": s["set"],
+                                              "max_spend": 0.1, "limit": 150})
+    assert not error, few
+    assert few["estimate"]["contacts"] == 150 and few["estimate"]["pieces"] == 1
+    with sqlite3.connect(db) as con:          # (the first run out of the way)
+        con.execute("UPDATE jobs SET status = 'cancelled'")
+    error, out = _one(db, "verify_contacts", {"plan": plan_id, "set": s["set"],
+                                              "max_spend": 0.2})
+    assert not error, out
+    assert out["estimate"]["contacts"] == 4500 and out["estimate"]["pieces"] == 3
+    assert out["queued"] == 45 and out["caps"] == {"max_spend": 0.0, "classify_max_spend": 0.2}
+    assert _q(db, "SELECT COUNT(*) FROM jobs WHERE batch_id = ?", out["run"]) == [(45,)]
+    # (The plan holds the one cap once, not a cap a piece.)
+    held = _q(db, "SELECT classify_cap_usd FROM agent_action WHERE batch = ?", out["run"])
+    assert held == [(0.2,)]
+
+
+def test_verify_contacts_whose_queueing_fails_leaves_no_run_outside_the_plan(db, monkeypatch):
+    # (A later piece's write failing used to leave the earlier pieces
+    # queued in a batch the plan never counted: spend past its budget.)
+    from harvey import classify
+    from harvey.modules import jobs
+    from tests.test_contact_check_pieces import _many
+
+    async def seed():
+        s = StateManager(str(db))
+        await s.init_db()
+        return await _many(s, db)
+    _run(seed())
+
+    async def on(state, task, s=None):
+        return ""
+    monkeypatch.setattr(classify, "available", on)
+    real = jobs.enqueue_many
+    calls = {"n": 0}
+
+    async def flaky(state, specs, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return await real(state, specs, **kw)
+    monkeypatch.setattr(jobs, "enqueue_many", flaky)
+    plan_id = _propose(db, budget=1.0)
+    _approve(db, plan_id)
+    _, s = _one(db, "save_set", {"name": "Toate", "sql": "SELECT contact FROM link",
+                                 "of": "contacts"})
+    error, _ = _one(db, "verify_contacts", {"plan": plan_id, "set": s["set"],
+                                            "max_spend": 0.2})
+    assert error
+    assert _q(db, "SELECT COUNT(*) FROM jobs WHERE lane = 'classify'") == [(0,)]
+    assert _q(db, "SELECT outcome FROM agent_action WHERE tool = 'verify_contacts'") == [
+        ("error",)]

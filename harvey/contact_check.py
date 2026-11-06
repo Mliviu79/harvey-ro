@@ -21,7 +21,9 @@ or below, unsure between.
 
 Nothing is deleted. A run is counted and priced first, then one job per
 company on the classifier's lane, under a USD cap the user types and the
-install's spend limits (classify.Meter).
+install's spend limits (classify.Meter). A large run (up to MAX_RUN
+contacts) is queued in pieces of MAX_LINKS links under its one batch: one
+cap over all of it, one report, one cancel.
 """
 
 from __future__ import annotations
@@ -34,37 +36,54 @@ from harvey import classify, finder, site_match
 logger = logging.getLogger("harvey.contact_check")
 
 VERDICTS = ("yes", "no", "unsure")
-# Links one run takes at most.
+# Links one piece of a run holds at most: a run is queued a piece at a time
+# (each piece one write, its jobs after the last piece's), every piece
+# under the run's one batch, so its cap, report and cancel are the run's.
 MAX_LINKS = 2000
+# Contacts, and links, one run takes at most (the agent's sets hold as many).
+MAX_RUN = 50_000
 
 
-async def links(state, contact_ids, *, limit: int = MAX_LINKS) -> list[dict]:
+async def links(state, contact_ids, *, limit: int = MAX_RUN) -> list[dict]:
     """Every live company each contact is linked to, once per (company,
     contact), with what the evidence says: [{"company_id", "contact_id",
-    "kind", "value", "evidence": [{"source", "trust", "url"}]}]."""
+    "kind", "value", "evidence": [{"source", "trust", "url"}]}], at most
+    ``limit`` of them, the contacts in the order given. Read MAX_LINKS
+    contacts at a time."""
     out: dict[tuple, dict] = {}
-    for cid in dict.fromkeys(int(c) for c in contact_ids):
-        reach = await state.read("reach", cid)
-        kind_value = await _kind_value(state, cid)
-        if kind_value is None:
-            continue
-        for r in reach.get("links") or []:
-            key = (r["company_id"], cid)
-            link = out.setdefault(key, {"company_id": r["company_id"], "contact_id": cid,
-                                        "company": r.get("company") or "",
-                                        "kind": kind_value[0], "value": kind_value[1],
-                                        "evidence": []})
-            link["evidence"].append({"source": r.get("source") or "",
-                                     "trust": r.get("trust") or "",
-                                     "url": r.get("evidence_url") or ""})
-            if len(out) >= limit:
-                return list(out.values())
+    ids = list(dict.fromkeys(int(c) for c in contact_ids))
+    for at in range(0, len(ids), MAX_LINKS):
+        found = await state.read("contact_links", ids[at:at + MAX_LINKS])
+        for cid in ids[at:at + MAX_LINKS]:
+            c = found.get(cid)
+            if c is None:
+                continue
+            for r in c["links"]:
+                key = (r["company_id"], cid)
+                link = out.setdefault(key, {"company_id": r["company_id"], "contact_id": cid,
+                                            "company": r["company"], "kind": c["kind"],
+                                            "value": c["value"], "evidence": []})
+                link["evidence"].append({"source": r["source"], "trust": r["trust"],
+                                         "url": r["evidence_url"]})
+                if len(out) >= limit:
+                    return list(out.values())
     return list(out.values())
 
 
-async def _kind_value(state, contact_id: int) -> tuple[str, str] | None:
-    rows = await state.read("contact_kind_value", [contact_id])
-    return rows.get(contact_id)
+def pieces(chosen: list[dict]) -> list[list[tuple[str, list[dict]]]]:
+    """``chosen`` as the pieces a run is queued in: its companies (each
+    company's links together, one job, in the order they first come)
+    gathered until a piece would pass MAX_LINKS links. A company is never
+    split: one with more links than that is a piece of its own."""
+    out: list[list] = []
+    size = 0
+    for cid, group in by_company(chosen).items():
+        if not out or size + len(group) > MAX_LINKS:
+            out.append([])
+            size = 0
+        out[-1].append((cid, group))
+        size += len(group)
+    return out
 
 
 def by_company(chosen: list[dict]) -> dict[str, list[dict]]:
@@ -76,12 +95,15 @@ def by_company(chosen: list[dict]) -> dict[str, list[dict]]:
 
 async def estimate(state, chosen: list[dict]) -> dict:
     """What verifying ``chosen`` may cost before anything is sent: a call
-    per link, as a range (classify.projection: typical and high, at the
+    per link (the whole selection, ``pieces`` the pieces it is queued in;
+    ``more``: it stopped at MAX_RUN links), as a range (classify.projection: typical and high, at the
     contacts profile's price), never a limit: the run's cap is what is
     enforced, call by call (``note``)."""
     s = (await classify.settings(state, "contacts")).for_task("contacts")
     p = await classify.projection(state, s, "contacts", len(chosen), await classify.sizes(state))
     return {"links": len(chosen), "companies": len(by_company(chosen)), "calls": len(chosen),
+            "contacts": len({link["contact_id"] for link in chosen}),
+            "pieces": len(pieces(chosen)), "more": len(chosen) >= MAX_RUN,
             "tokens_typical": p["tokens_typical"], "tokens_high": p["tokens_high"],
             "basis": p["basis"], "usd_typical": p["usd_typical"], "usd_high": p["usd_high"],
             "price_known": p["price_known"], "profile": s.profile,

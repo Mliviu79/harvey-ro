@@ -1119,24 +1119,47 @@ async def enqueue_classify_test(state, profile_id: str, *, tasks, max_spend: flo
 async def enqueue_contact_checks(state, chosen: list[dict], *, max_spend: float | None,
                                  label: str = "") -> tuple[str, list, list]:
     """One verification run over ``chosen`` links (contact_check.links): a
-    batch whose classifier cap is ``max_spend`` (None: none of its own),
-    one job per company on the classifier's lane. Returns (batch id, new
-    job ids, jobs already waiting); Duplicate when every one is."""
+    batch whose classifier cap is ``max_spend`` (None: none of its own)
+    over all of it, one job per company on the classifier's lane, queued a
+    piece at a time (contact_check.pieces: each piece one write, in order,
+    none starting before the last is written; a write failing takes the
+    run off whole and raises). Returns (batch id, new job ids, jobs already waiting); Duplicate when
+    every one is."""
     from harvey import contact_check
 
     groups = contact_check.by_company(chosen)
-    params = {"links": len(chosen), "companies": len(groups)}
+    split = contact_check.pieces(chosen)
+    params = {"links": len(chosen), "companies": len(groups), "pieces": len(split)}
     if max_spend is not None:
         params["classify_max_spend"] = float(max_spend)
     batch_id = await jobs.new_batch(state, "verify_contacts", label or "Verify contacts",
                                     params=params)
-    specs = [dict(kind="verify_contacts", lane=CLASSIFY_LANE, module="contact_finder",
-                  capability="verify_contacts", label=(links[0].get("company") or cid),
-                  params={"company_id": cid,
-                          "links": [{k: link[k] for k in ("contact_id", "kind", "value",
-                                                          "evidence")} for link in links]},
-                  dedupe_key=f"verify_contacts:{cid}") for cid, links in groups.items()]
-    new, dupes = await jobs.enqueue_many(state, specs, batch_id=batch_id)
+    new: list = []
+    dupes: list = []
+    # (More than one write: every piece held until the last is queued, so
+    # the run starts whole, or, a write failing, is taken off whole: never
+    # half a run its caller, or an agent's plan, doesn't know it holds.)
+    held = len(split) > 1
+    try:
+        for piece in split:
+            specs = [dict(kind="verify_contacts", lane=CLASSIFY_LANE, module="contact_finder",
+                          capability="verify_contacts", label=(links[0].get("company") or cid),
+                          params={"company_id": cid,
+                                  "links": [{k: link[k] for k in ("contact_id", "kind", "value",
+                                                                  "evidence")}
+                                            for link in links]},
+                          dedupe_key=f"verify_contacts:{cid}") for cid, links in piece]
+            added, there = await jobs.enqueue_many(state, specs, batch_id=batch_id, held=held)
+            new += added
+            dupes += there
+        if held and new:
+            await jobs.release_held(state, batch_id)
+    except BaseException:
+        if held:
+            await jobs.drop_held(state, batch_id)
+        else:
+            await jobs.drop_batch(state, batch_id)
+        raise
     if not new:
         await jobs.drop_batch(state, batch_id)
         if dupes:

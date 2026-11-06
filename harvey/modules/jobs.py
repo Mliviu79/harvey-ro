@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -709,15 +710,19 @@ async def enqueue(state, kind_: str, lane: str, params: dict | None = None, *,
 
 
 async def enqueue_many(state, specs: list[dict], *, batch_id: str = "",
-                       parent_id: str = "") -> tuple[list[str], list[Job]]:
+                       parent_id: str = "", held: bool = False) -> tuple[list[str], list[Job]]:
     """Queue several jobs in one transaction. Returns (the new ids, the
-    jobs already there for specs that were duplicates: those are skipped)."""
+    jobs already there for specs that were duplicates: those are skipped).
+    ``held``: none starts before ``release_held`` (or HOLD_SECONDS), for a
+    run queued in several writes that must start whole or not at all."""
     import sqlite3
 
     ids: list[str] = []
     dupes: list[Job] = []
     if not specs:
         return ids, dupes
+    until = (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + HOLD_SECONDS))
+             if held else None)
     async with state._connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
@@ -727,12 +732,12 @@ async def enqueue_many(state, specs: list[dict], *, batch_id: str = "",
                 try:
                     await db.execute(
                         "INSERT INTO jobs (id, kind, lane, module, capability, label, params_json, "
-                        "dedupe_key, est_cost, batch_id, parent_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "dedupe_key, est_cost, batch_id, parent_id, not_before) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (job_id, spec["kind"], spec["lane"], spec.get("module") or "",
                          spec.get("capability") or "", spec.get("label") or "",
                          _json(spec.get("params")), key, float(spec.get("est_cost") or 0.0),
-                         spec.get("batch_id", batch_id) or "", parent_id))
+                         spec.get("batch_id", batch_id) or "", parent_id, until))
                 except sqlite3.IntegrityError:
                     async with db.execute(
                             "SELECT id FROM jobs WHERE dedupe_key = ? AND status IN "
@@ -747,9 +752,38 @@ async def enqueue_many(state, specs: list[dict], *, batch_id: str = "",
         except BaseException:
             await db.rollback()
             raise
-    if ids:
+    if ids and not held:
         notify()
     return ids, dupes
+
+
+# A run queued in several writes (enqueue_many ``held``) waits this long at
+# most for its last one: a Harvey stopped mid-way leaves it to start then,
+# under its own caps.
+HOLD_SECONDS = 3600
+
+
+async def release_held(state, batch_id: str) -> None:
+    """Let the held jobs of ``batch_id`` start: its last write is done."""
+    import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+    from harvey import queries
+
+    async with state._connect() as db:
+        await db.execute(queries.sql("overlay.jobs.release_held"), (batch_id,))
+        await db.commit()
+    notify()
+
+
+async def drop_held(state, batch_id: str) -> None:
+    """Take a run that could not be queued whole off: its jobs that never
+    started (held, so none did), then the batch."""
+    import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+    from harvey import queries
+
+    async with state._connect() as db:
+        await db.execute(queries.sql("overlay.jobs.drop_held"), (batch_id,))
+        await db.commit()
+    await drop_batch(state, batch_id)
 
 
 # ── The worker's side ──

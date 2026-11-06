@@ -999,6 +999,13 @@ statement("overlay.agent.events_cancel_plan",
 statement("overlay.agent.scheduled_open",
           "SELECT COUNT(*) FROM agent_event INDEXED BY agent_event_ref WHERE plan = ? "
           "AND kind = 'scheduled' AND seen_at IS NULL AND cancelled_at IS NULL", params=(1,))
+# A run queued in several writes (jobs.enqueue_many held): let it start
+# once the last is done, or take off what never started when one failed.
+statement("overlay.jobs.release_held",
+          "UPDATE jobs SET not_before = NULL, updated_at = CURRENT_TIMESTAMP "
+          "WHERE batch_id = ? AND status = 'queued' AND started_at IS NULL", params=("b",))
+statement("overlay.jobs.drop_held",
+          "DELETE FROM jobs WHERE batch_id = ? AND started_at IS NULL", params=("b",))
 # The plans a run belongs to, and whether all its jobs have finished.
 statement("overlay.agent.batch_plans",
           "SELECT DISTINCT plan FROM agent_action INDEXED BY agent_action_batch "

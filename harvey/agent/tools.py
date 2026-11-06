@@ -577,9 +577,13 @@ def build(db_path: str, chat: str = "", task: int | None = None):
             turn, plan, set, filter, max_spend, classify_max_spend, force, limit))
 
     @tool("Queue a verification of contacts by the classifier under an approved plan, as "
-          "Contacts → Verify does: set (a set of contacts: its frozen ids) or filter, "
-          "max_spend (what its calls may cost, USD, 0 or more), limit (200 by default, "
-          f"{contact_check.MAX_LINKS:,} at most).",
+          "Contacts → Verify does: set (a set of contacts: its frozen ids; all of them, or "
+          "the first limit) or filter (limit 200 by default), max_spend (what its calls may "
+          "cost over the whole run, USD, 0 or more), limit. At most "
+          f"{contact_check.MAX_RUN:,} contacts a run, queued in pieces of "
+          f"{contact_check.MAX_LINKS:,} links under one run: one cap, one report, one "
+          "cancel_run. Returns the run's id, the cap, the estimate (pieces counted) and what "
+          "remains.",
           queues)
     async def verify_contacts(plan: int, set: int | None = None, filter: dict | None = None,
                               max_spend: float = 0.0, limit: int | None = None) -> str:
