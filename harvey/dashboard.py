@@ -4240,19 +4240,22 @@ async def edit_audience(audience_id: int, request: Request):
     return {"success": True}
 
 
-async def _preview_counts(state, query: str = "", emails=None, campaign_id: str = ""):
+async def _preview_counts(state, query: str = "", emails=None, campaign_id: str = "",
+                          send_to_risky: bool | None = None):
     from harvey import campaigns
 
     return await campaigns.preview(state, _campaign_config(), query=query, emails=emails,
-                                   campaign_id=campaign_id)
+                                   campaign_id=campaign_id, send_to_risky=send_to_risky)
 
 
 @app.get("/api/audiences/{audience_id}/preview")
-async def preview_audience(audience_id: int):
+async def preview_audience(audience_id: int, send_to_risky: bool | None = None):
     """What a campaign would take from this audience, counted: ready,
     catch-all, to check (a verifier credit each), left out (invalid or a
     guess, untrusted, do-not-contact, in another campaign, answered),
-    personal addresses by reason, firms, days at today's cap."""
+    personal addresses by reason, firms, days at today's cap.
+    ``send_to_risky``: as the campaign being made would have it (the
+    setting's when not given; never past it)."""
     from harvey import campaigns
 
     state = await _campaign_state()
@@ -4260,7 +4263,8 @@ async def preview_audience(audience_id: int):
     if audience is None:
         return _refuse("no such audience", 404)
     try:
-        return {"audience": audience, "counts": await _preview_counts(state, audience["query"])}
+        return {"audience": audience, "counts": await _preview_counts(
+            state, audience["query"], send_to_risky=send_to_risky)}
     except (campaigns.Refused, ValueError) as e:
         return _campaign_refusal(e)
 
@@ -4268,13 +4272,16 @@ async def preview_audience(audience_id: int):
 @app.post("/api/audiences/preview")
 async def preview_query(request: Request):
     """The same counts for a filter not saved yet: {"query"} (the Contacts
-    page's current filter)."""
+    page's current filter), and "send_to_risky" as above."""
     from harvey import campaigns
 
     body = await _json_body(request)
     state = await _campaign_state()
+    risky = body.get("send_to_risky")
     try:
-        return {"counts": await _preview_counts(state, str(body.get("query") or ""))}
+        return {"counts": await _preview_counts(state, str(body.get("query") or ""),
+                                                send_to_risky=None if risky is None
+                                                else bool(risky))}
     except (campaigns.Refused, ValueError) as e:
         return _campaign_refusal(e)
 
@@ -4307,6 +4314,10 @@ async def campaign_setup():
         "offer": {"offer": getattr(product, "description", "") or ""},
         "max_daily_sends": getattr(getattr(getattr(config, "channels", None), "email", None),
                                    "max_daily_sends", 0) or 0,
+        # A new campaign's send_to_risky starts as the setting's, and can't
+        # go past it (campaigns.risky_allowed).
+        "send_to_risky": bool(getattr(getattr(getattr(config, "channels", None), "email", None),
+                                      "send_to_risky", False)),
     }
 
 
@@ -4314,7 +4325,8 @@ async def campaign_setup():
 async def create_campaign(request: Request):
     """A new draft campaign: {"name", "audience_id" or "query", "rolling",
     "offer": {offer, goal, booking_link}, "sequence": [{subject, body,
-    delay_days}], "li_note", "review": "inherit" | "always"}. Refused
+    delay_days}], "li_note", "review": "inherit" | "always",
+    "send_to_risky"}. Refused
     (409, need native_provider) unless the provider is Gmail, SMTP or
     Microsoft 365."""
     from harvey import campaigns, launch
@@ -4349,6 +4361,9 @@ async def campaign_detail(campaign_id: str, status: str = "", limit: int = 200,
     except campaigns.Refused as e:
         return _campaign_refusal(e)
     c["query"] = await state.campaigns_call(campaigns.frozen_query, c, write=False)
+    # Its candidates as last decided: members, and those left out by rule.
+    c["candidates"] = await state.campaigns_call(campaigns.candidate_counts, campaign_id,
+                                                 write=False)
     # Why its waiting addresses aren't being checked, when that is so.
     held = await campaigns.checks_held(state) if (c.get("members") or {}).get("waiting") \
         else None
@@ -4361,7 +4376,8 @@ async def edit_campaign(campaign_id: str, request: Request):
     from harvey import campaigns
 
     body = await _json_body(request)
-    allowed = ("name", "offer", "sequence", "li_note", "review", "rolling", "audience_id", "query")
+    allowed = ("name", "offer", "sequence", "li_note", "review", "rolling", "audience_id", "query",
+               "send_to_risky")
     state = await _campaign_state()
     try:
         c = await state.campaigns_call(campaigns.update_campaign, campaign_id,

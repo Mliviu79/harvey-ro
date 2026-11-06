@@ -530,6 +530,17 @@ def test_always_review_goes_on_but_only_the_user_takes_it_off(db):
         ("always", "Stomatologi")]
 
 
+def test_send_to_risky_is_set_on_a_draft_only(db):
+    plan_id = _plan(db)
+    _, cid = _draft(db, plan_id)
+    # The setting's (off in these settings) when not given.
+    assert _q(db, "SELECT send_to_risky FROM campaigns WHERE id = ?", cid) == [(0,)]
+    _ok(db, "edit_campaign", {"plan": plan_id, "campaign": cid, "send_to_risky": True})
+    assert _q(db, "SELECT send_to_risky FROM campaigns WHERE id = ?", cid) == [(1,)]
+    # Never past the setting: the preview says catch-all addresses are held.
+    assert _ok(db, "campaign_preview", {"campaign": cid})["send_to_risky"] is False
+
+
 def test_names_are_kept_as_the_buttons_keep_them(db, client):
     plan_id = _plan(db)
     name = "  Alfa   și  Beta " + "x" * 200

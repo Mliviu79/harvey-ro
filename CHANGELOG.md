@@ -9,6 +9,34 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Each campaign keeps its candidates, and a rolling campaign reads only
+  what changed.** Every address a campaign's filter matched is kept as
+  decided (schema 38, `campaign_candidate`): a member, or left out with
+  the rule that left it out (invalid or a guess, untrusted, do-not-contact,
+  answered, held by another campaign or emailed lately, catch-all held).
+  Triggers log every email contact whose facts those rules read changed
+  (its status or do-not-contact flag, a link added, removed, re-trusted or
+  given a person, its firm merged or separated), and the hourly roll decides only those
+  contacts, through its frozen filter, plus the rows that came due: an
+  address another campaign held is decided again when that campaign's
+  membership ends, one emailed lately when the email turns 90 days old,
+  one left out by a do-not-contact entry when the entry is undone. The
+  whole filter is read again once a week (for what no change says, such
+  as a firm's register facts moving it into the filter), and when the log
+  was pruned past a paused campaign's place in it. First come still wins:
+  an address open in an active or paused campaign stays out of the others
+  until then. The campaign's page and `harvey campaigns show` say how many
+  were left out as last decided.
+- **`send_to_risky` per campaign.** A campaign now has its own: copied from
+  `channels.email.send_to_risky` when it is made (campaigns made before
+  take the setting's in the next cycle), chosen on the wizard, `harvey
+  campaigns new --send-to-risky` / `--no-send-to-risky`, `PATCH
+  /api/campaigns/{id}` or the agent's `create_campaign` / `edit_campaign`,
+  and changed only while it is a draft. It decides which catch-all
+  addresses the campaign takes, checks and stages, never past the setting,
+  which the send gate still reads. The preview says which way catch-all
+  addresses went.
+
 - **Link a Claude account from the dashboard, through the Claude CLI's own
   login.** Settings → Model now offers **Account linked in Harvey** for
   Claude: **Link account** (a subscription) or **Link a Console account**
@@ -934,6 +962,11 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **A rolling campaign's hourly roll no longer reads its whole audience.**
+  It reads the contacts that changed since its last roll and its
+  candidates that came due (see Added); a roll with one changed contact
+  among many reads that contact by its id. The first roll after this
+  update reads the whole audience once, to write the candidates.
 - **API-key mode stops at its limit.** A call billed per token is now
   counted as it streams and stopped, the way Stop does it, when it reaches
   its line: a chat answer or a brain call what was left of

@@ -7057,6 +7057,11 @@ function openCampaign(id) {
   loadCampaignDetail();
 }
 
+// How many addresses a campaign's rules left out as it last decided them.
+function candidatesLeftOut(cands) {
+  return Object.entries(cands || {}).reduce((n, [k, v]) => n + (k === 'members' ? 0 : (Number(v) || 0)), 0);
+}
+
 async function loadCampaignDetail() {
   const el = document.getElementById('campaign-detail');
   if (!el || !_cp.open) return;
@@ -7077,6 +7082,7 @@ async function loadCampaignDetail() {
     '<p class="small">' + (counts || escHtml(t('cp.no_members'))) + '</p>' +
     (data.checks_held ? '<p class="small"><b>' + escHtml(t('cp.checks_held', {n: fmtN((c.members || {}).waiting || 0)})) + '</b> ' +
       escHtml(checksHeldText(data.checks_held.code, data.checks_held.why)) + '</p>' : '') +
+    (candidatesLeftOut(c.candidates) ? '<p class="small muted">' + escHtml(t('cp.candidates', {n: fmtN(candidatesLeftOut(c.candidates))})) + '</p>' : '') +
     '<div class="subhead">' + escHtml(t('cp.filter')) + '</div>' +
     '<p class="small"><code>' + escHtml(c.query || t('cp.no_filter')) + '</code>' +
       (c.query ? ' <button class="btn btn-ghost btn-sm" onclick="openQueryInContacts(' + jsq(c.query) + ')">' + escHtml(t('cp.open_in_contacts')) + '</button>' : '') + '</p>' +
@@ -7197,6 +7203,7 @@ function previewHtml(c) {
     line('cw.c.personal', (p.named || 0) + (p.free_mail || 0) + (p.natural_person || 0)) +
     line('cw.c.firms', c.firms) + '</ul>' +
     (c.personal_sample ? '<p class="small muted">' + escHtml(t('cw.c.personal_sample', {m: fmtN(c.personal_sample)})) + '</p>' : '') +
+    (c.send_to_risky !== undefined ? '<p class="small muted">' + escHtml(t(c.send_to_risky ? 'cw.c.risky_taken' : 'cw.c.risky_not_taken')) + '</p>' : '') +
     (c.days_at_cap ? '<p class="small muted">' + escHtml(t('cw.c.days', {n: c.days_at_cap, cap: (_cp.setup || {}).max_daily_sends || 0})) + '</p>' : '');
 }
 
@@ -7205,7 +7212,7 @@ function previewHtml(c) {
 function openCampaignWizard() {
   const s = _cp.setup || {};
   _cp.wiz = {id: null, name: '', audience: (s.audiences || []).length ? String(s.audiences[0].id) : 'current', rolling: false,
-             offer: (s.offer || {}).offer || '', goal: 'reply', booking_link: '', review: false,
+             offer: (s.offer || {}).offer || '', goal: 'reply', booking_link: '', review: false, risky: !!s.send_to_risky,
              steps: [{subject: '', body: '', delay_days: 0}], li_note: s.li_note_template || '', counts: null};
   renderCampaignWizard();
   const el = document.getElementById('campaign-wizard');
@@ -7219,6 +7226,8 @@ async function editCampaign(id) {
   _cp.wiz = {id: c.id, name: c.name, audience: c.audience_id ? String(c.audience_id) : 'current', rolling: !!c.rolling,
              offer: (c.offer || {}).offer || '', goal: (c.offer || {}).goal || 'reply', booking_link: (c.offer || {}).booking_link || '',
              review: c.review === 'always', steps: (c.sequence || []).length ? c.sequence : [{subject: '', body: '', delay_days: 0}],
+             risky: c.send_to_risky === null || c.send_to_risky === undefined ? !!(_cp.setup || {}).send_to_risky : !!c.send_to_risky,
+             status: c.status || 'draft',
              li_note: c.li_note || '', counts: null, query: c.audience_query || ''};
   renderCampaignWizard();
 }
@@ -7304,6 +7313,9 @@ function renderCampaignWizard() {
       '<select class="form-input" id="cw-profile" disabled>' + opt('', t('cw.profile_soon'), '') + '</select></div></div>' +
     '<label class="check-line small"><input type="checkbox"' + (w.review ? ' checked' : '') + ' onchange="cwSet(\'review\', this.checked)"> ' +
       escHtml(t('cw.review')) + '</label>' +
+    '<label class="check-line small"><input type="checkbox"' + (w.risky && s && s.send_to_risky ? ' checked' : '') +
+      (s && s.send_to_risky && (w.status || 'draft') === 'draft' ? '' : ' disabled') + ' onchange="cwSet(\'risky\', this.checked)"> ' + escHtml(t('cw.risky')) + '</label>' +
+      (s && s.send_to_risky ? '' : '<p class="small muted">' + escHtml(t('cw.risky_setting_off')) + '</p>') +
     '<div class="subhead">4. ' + escHtml(t('cw.li_title')) + '</div>' +
     '<p class="small muted">' + escHtml(t('cw.li_help', {n: min})) + '</p>' +
     '<textarea class="form-input" rows="5" id="cw-li" oninput="cwSet(\'li_note\', this.value);document.getElementById(\'cw-li-n\').textContent=this.value.trim().length">' +
@@ -7318,6 +7330,8 @@ function cwBody() {
   const w = _cp.wiz;
   const body = {name: w.name, rolling: !!w.rolling, li_note: w.li_note, review: w.review ? 'always' : 'inherit',
                 offer: {offer: w.offer, goal: w.goal, booking_link: w.booking_link}};
+  // (A started campaign's is sent unchanged: it changes while a draft only.)
+  body.send_to_risky = !!w.risky;
   if (w.audience === 'current') body.query = contactQuery() || 'kind=email';
   else body.audience_id = Number(w.audience);
   const steps = w.steps.filter(st => st.subject.trim() || st.body.trim());
@@ -7330,8 +7344,8 @@ async function cwPreview() {
   if (!w) return;
   const res = w.audience === 'current'
     ? await api('/api/audiences/preview', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                           body: JSON.stringify({query: contactQuery() || 'kind=email'})})
-    : await api('/api/audiences/' + Number(w.audience) + '/preview');
+                                           body: JSON.stringify({query: contactQuery() || 'kind=email', send_to_risky: !!w.risky})})
+    : await api('/api/audiences/' + Number(w.audience) + '/preview?send_to_risky=' + (w.risky ? 'true' : 'false'));
   if (!res || !res.counts) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
   w.counts = res.counts;
   renderCampaignWizard();

@@ -445,6 +445,90 @@ def missing(con: sqlite3.Connection) -> list[str]:
     return [n for n in want if n not in have]
 
 
+# ── The contact change log and the campaigns' recheck hooks (schema 38) ──
+
+# Rules, not kept values: never dropped, bulk writes included (a merge's
+# firm.live, the recount's link rows), so a rolling campaign reads every
+# change (campaigns.roll). Only what add_members decides by and can let an
+# address in: an email contact's status and do-not-contact flag, a link
+# added, removed, re-trusted or given a person (another link may then be
+# the one it is read through), its firm merged or separated. What only
+# ever leaves one out (a reply, a send, a new do-not-contact entry) is
+# checked again when it is staged and sent, and ends memberships itself.
+_NOW = "CAST(strftime('%s', 'now') AS INTEGER)"
+_OPEN = "(0, 1, 2, 3)"        # schema.MEMBER_STATUS waiting, ready, staged, in_sequence
+
+
+def _email(contact: str) -> str:
+    return f"(SELECT kind FROM contact WHERE id = {contact}) = {EMAIL}"
+
+
+CHANGES = f"""
+CREATE TRIGGER change_contact_ins AFTER INSERT ON contact WHEN NEW.kind = {EMAIL} BEGIN
+  INSERT INTO contact_change (contact) VALUES (NEW.id);
+END;
+CREATE TRIGGER change_contact_upd AFTER UPDATE OF status, do_not_contact ON contact
+WHEN NEW.kind = {EMAIL} AND (NEW.status IS NOT OLD.status
+                             OR NEW.do_not_contact IS NOT OLD.do_not_contact) BEGIN
+  INSERT INTO contact_change (contact) VALUES (NEW.id);
+END;
+CREATE TRIGGER change_link_ins AFTER INSERT ON link WHEN {_email("NEW.contact")} BEGIN
+  INSERT INTO contact_change (contact) VALUES (NEW.contact);
+END;
+CREATE TRIGGER change_link_del AFTER DELETE ON link WHEN {_email("OLD.contact")} BEGIN
+  INSERT INTO contact_change (contact) VALUES (OLD.contact);
+END;
+-- (An address is read through one link: through a person first, then the
+-- surest, then the oldest. A person or a first_seen changing can pick
+-- another link, so another trust and firm.)
+CREATE TRIGGER change_link_trust AFTER UPDATE OF trust, person, first_seen ON link
+WHEN (NEW.trust IS NOT OLD.trust OR NEW.person IS NOT OLD.person
+      OR NEW.first_seen IS NOT OLD.first_seen) AND {_email("NEW.contact")} BEGIN
+  INSERT INTO contact_change (contact) VALUES (NEW.contact);
+END;
+-- A record merged or separated: its own addresses; and, leaving a group,
+-- the group's survivor's and those of the records still in it, which no
+-- longer carry its do-not-contact entry or its answer.
+CREATE TRIGGER change_firm_live AFTER UPDATE OF live ON firm WHEN NEW.live IS NOT OLD.live BEGIN
+  INSERT INTO contact_change (contact)
+  SELECT l.contact FROM link l CROSS JOIN contact c
+  WHERE l.firm = NEW.id AND c.id = l.contact AND c.kind = {EMAIL};
+  INSERT INTO contact_change (contact)
+  SELECT l.contact FROM link l CROSS JOIN contact c
+  WHERE OLD.live != 0 AND l.firm = OLD.live AND c.id = l.contact AND c.kind = {EMAIL};
+  INSERT INTO contact_change (contact)
+  SELECT l.contact FROM firm g CROSS JOIN link l CROSS JOIN contact c
+  WHERE OLD.live != 0 AND g.live = OLD.live AND g.live != 0 AND l.firm = g.id AND c.id = l.contact
+    AND c.kind = {EMAIL};
+END;
+-- An address's membership ended: where another campaign left it out
+-- because this one held it, it is decided again at that one's next roll.
+CREATE TRIGGER change_member_ended AFTER UPDATE OF status ON campaign_member
+WHEN OLD.status IN {_OPEN} AND NEW.status NOT IN {_OPEN} BEGIN
+  UPDATE campaign_candidate SET recheck_at = {_NOW}
+  WHERE email = NEW.email AND why = 5 AND campaign != NEW.campaign;
+END;
+-- A campaign stopped holding its addresses (finished, stopped, archived,
+-- failed): the same for every one of them still open in it.
+CREATE TRIGGER change_campaign_ended AFTER UPDATE OF status ON campaigns
+WHEN OLD.status IN ('active', 'paused') AND NEW.status NOT IN ('active', 'paused') BEGIN
+  UPDATE campaign_candidate SET recheck_at = {_NOW}
+  WHERE why = 5 AND campaign != NEW.id
+    AND email IN (SELECT email FROM campaign_member WHERE campaign = NEW.id);
+END;
+-- A do-not-contact entry undone: the addresses it left out are decided
+-- again (an address's own; a domain's or a firm's, every one so left out).
+CREATE TRIGGER change_suppression_undo AFTER UPDATE OF undone_at ON suppression
+WHEN OLD.undone_at IS NULL AND NEW.undone_at IS NOT NULL BEGIN
+  UPDATE campaign_candidate SET recheck_at = {_NOW}
+  WHERE why = 3 AND (NEW.scope != 1 OR email = NEW.value);
+END;
+"""
+CHANGE_NAMES = ("change_contact_ins", "change_contact_upd", "change_link_ins", "change_link_del",
+                "change_link_trust", "change_firm_live", "change_member_ended",
+                "change_campaign_ended", "change_suppression_undo")
+
+
 # ── Bulk mode ──
 
 # While the kept-value triggers are off, these note what a bulk write

@@ -1898,11 +1898,13 @@ class Reader:
             return None
         return self.one("SELECT id FROM contact_kinds WHERE kind = ?", (kind,))
 
-    def _contact_ids(self, f, s: FirmSet | None, p: dict) -> list[int]:
-        """Every contact the filter keeps."""
+    def _contact_ids(self, f, s: FirmSet | None, p: dict, only=None) -> list[int]:
+        """Every contact the filter keeps; ``only`` (contact ids): of those,
+        the ones it keeps, read by their ids and their firms' (a rolling
+        campaign's changed contacts), never the filter's whole set."""
         firms = None
         if s is not None or self.narrowed(p):
-            firms = set(self.matching(f))
+            firms = set(self.matching(f)) if only is None else self._matching_of(s, p, only)
         kind_id = self._kind_id(f.kind)
         status = schema.CONTACT_STATUS.get(f.status) if f.status else None
         trust = contacts.TRUST_LEVELS.index(f.trust) if f.trust in contacts.TRUST_LEVELS else None
@@ -1924,6 +1926,10 @@ class Reader:
                 candidates = {r[0] for chunk in chunks(list(live_of)) for r in self.x(
                     "overlay.read.contacts_of_firms",
                     (json.dumps(chunk), kind_id, kind_id, line, line))}
+        if only is not None:
+            # (The rows below check kind, status and trust; the links,
+            # source and person: no index read of every match needed.)
+            candidates = set(only) if candidates is None else candidates & set(only)
         # The narrowest condition a table answers by index (or a read of the
         # contact table returning the few that match) gives the candidates.
         narrow = []
@@ -1938,12 +1944,12 @@ class Reader:
             narrow.append(("overlay.read.contacts.by_trust", trust))
         if f.has_person == "yes":
             narrow.append(("overlay.read.contacts.with_person", None))
-        for name, arg in narrow:
+        for name, arg in narrow if only is None else ():
             hit = {r[0] for r in self.x(name, () if arg is None else (arg,))}
             candidates = hit if candidates is None else candidates & hit
         words = [w for w in (f.q or "")[:200].split()[:8]]
         for word in words:
-            hit = self._word_contacts(word)
+            hit = self._word_contacts(word, candidates if only is not None else None)
             candidates = hit if candidates is None else candidates & hit
         if candidates is None:
             candidates = {r[0] for r in self.x(
@@ -2081,25 +2087,19 @@ class Reader:
     def _contacts_with_person(self, ids) -> set[int]:
         return {l[0] for l in self._by_ids("overlay.read.links_of_contacts", list(ids)) if l[3]}
 
-    def _word_contacts(self, word: str) -> set[int]:
+    def _word_contacts(self, word: str, among=None) -> set[int]:
         """Contacts a word of the search box finds: in its value (a number
         however it is written), a firm it reaches (by name, through the
-        register's search), or a person it reaches."""
-        import re
-
+        register's search), or a person it reaches. ``among`` (contact
+        ids): only which of those it finds, their values read by id."""
         folded = contacts.fold(word)
         like = contacts.like(folded)
+        if among is not None:
+            return self._word_contacts_among(word, folded, like, set(among))
         found = {r[0] for r in self.x("overlay.read.contacts.value_like", (like,))}
-        digits = re.sub(r"[\s+\-.()/]", "", word)
-        if digits.isdigit() and len(digits) >= 3:
-            forms = {digits}
-            if digits.startswith("0") and not digits.startswith("00"):
-                forms.add("40" + digits[1:])
-            elif digits.startswith("00"):
-                forms.add(digits[2:])
-            for form in forms:
-                found |= {r[0] for r in self.x("overlay.read.contacts.value_like",
-                                               ("%" + form + "%",))}
+        for form in self._digit_forms(word):
+            found |= {r[0] for r in self.x("overlay.read.contacts.value_like",
+                                           ("%" + form + "%",))}
         persons = {r[0] for r in self.x("overlay.read.persons_like", (like,))}
         firms = self.words_set(word).ids if len(folded) >= 2 else set()
         if firms:
@@ -2113,6 +2113,59 @@ class Reader:
                 if l[3] in persons:
                     found.add(l[1])
         return found
+
+    @staticmethod
+    def _digit_forms(word: str) -> set[str]:
+        """A number of the search box as a phone may be written on file."""
+        import re
+
+        digits = re.sub(r"[\s+\-.()/]", "", word)
+        if not (digits.isdigit() and len(digits) >= 3):
+            return set()
+        forms = {digits}
+        if digits.startswith("0") and not digits.startswith("00"):
+            forms.add("40" + digits[1:])
+        elif digits.startswith("00"):
+            forms.add(digits[2:])
+        return forms
+
+    def _word_contacts_among(self, word: str, folded: str, like: str, among: set[int]
+                             ) -> set[int]:
+        """_word_contacts for a few contacts: their values by id, their
+        firms (live, through their links) against the word's firms, their
+        people against the word's."""
+        if not among:
+            return set()
+        ids = sorted(among)
+        found = {r[0] for r in self._by_ids_with("overlay.read.contacts.value_like_of", ids,
+                                                 (like,))}
+        for form in self._digit_forms(word):
+            found |= {r[0] for r in self._by_ids_with("overlay.read.contacts.value_like_of",
+                                                      ids, ("%" + form + "%",))}
+        links = list(self._by_ids("overlay.read.links_of_contacts", ids))
+        lives = self.live_of([l[1] for l in links])
+        firms = self.words_set(word).ids if len(folded) >= 2 else set()
+        persons = {r[0] for r in self.x("overlay.read.persons_like", (like,))}
+        for contact, firm, _, person, *_ in links:
+            if lives.get(firm) in firms or (person and person in persons):
+                found.add(contact)
+        return found
+
+    def _by_ids_with(self, name: str, ids, params=(), size: int = CHUNK):
+        """_by_ids for a statement taking more after its list."""
+        for chunk in chunks(ids, size):
+            yield from self.x(name, (json.dumps(chunk), *params))
+
+    def _matching_of(self, s: FirmSet | None, p: dict, contacts_: set[int]) -> set[int]:
+        """The live firms of these contacts' links that the filter's firm
+        conditions keep (``matching`` for a few contacts)."""
+        links = list(self._by_ids("overlay.read.links_of_contacts", sorted(contacts_)))
+        lives = list(dict.fromkeys(self.live_of([l[1] for l in links]).values()))
+        if s is not None:
+            lives = [f for f in lives if f in s]
+        if self.narrowed(p):
+            lives = self.passing(lives, p)
+        return set(lives)
 
     def _contact_order(self, ids, sort: str) -> list[int]:
         """Contacts in the sort's descending order (ties by id)."""
@@ -3501,14 +3554,15 @@ class Reader:
                 out["evidence_urls"].append(url)
         return out
 
-    def audience_rows(self, f=None, emails=None) -> list[dict]:
+    def audience_rows(self, f=None, emails=None, only=None) -> list[dict]:
         """The email contacts a campaign could take (campaigns.add_members
         decides): those the Contacts filter ``f`` keeps (its kind forced to
         email), or the addresses ``emails`` (ticked rows, typed ones). Each
         with its status, do-not-contact flag, and the one link it is read
         through: a live firm, through a person first, then the surest, then
         the oldest (trust None when it reaches no live firm). Its company,
-        person and evidence come with it."""
+        person and evidence come with it. ``only`` (contact ids, with
+        ``f``): of those, the ones ``f`` keeps (_contact_ids)."""
         ids: list[int] = []
         if emails is not None:
             for e in dict.fromkeys((e or "").strip().lower() for e in emails):
@@ -3520,7 +3574,7 @@ class Reader:
 
             f = replace(f, kind="email")
             if not f.nothing:
-                ids = self._contact_ids(f, self.firm_set(f), self.predicates(f))
+                ids = self._contact_ids(f, self.firm_set(f), self.predicates(f), only=only)
         rows = {r[0]: r for r in self._by_ids("overlay.read.contact_rows", ids)}
         ids = [c for c in ids if c in rows and rows[c][11] == EMAIL]
         links = list(self._by_ids("overlay.read.links_of_contacts", ids))

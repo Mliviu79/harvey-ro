@@ -372,9 +372,11 @@ async def save_audience(state, config, name, query: str) -> dict:
 
 
 async def create(state, config, plan: int, chat: str, *, name, audience, offer, sequence,
-                 note, rolling: bool = False, always_review: bool = False) -> dict:
+                 note, rolling: bool = False, always_review: bool = False,
+                 send_to_risky: bool | None = None) -> dict:
     """A draft campaign, made the way the wizard's Save makes one, that
-    belongs to ``plan``. Nothing is started or staged."""
+    belongs to ``plan``. Nothing is started or staged. ``send_to_risky``:
+    the setting's unless given (never past it: campaigns.risky_allowed)."""
     from harvey import campaigns, launch
 
     a = await _audience(state, audience)
@@ -382,6 +384,8 @@ async def create(state, config, plan: int, chat: str, *, name, audience, offer, 
             "rolling": bool(rolling), "offer": _offer(offer),
             "sequence": checked_sequence(sequence), "li_note": _note(note),
             "review": "always" if always_review else "inherit"}
+    if send_to_risky is not None:
+        body["send_to_risky"] = bool(send_to_risky)
     try:
         campaign_id = await launch.new_campaign(state, config, body)
     except (campaigns.Refused, ValueError) as e:
@@ -396,7 +400,7 @@ async def create(state, config, plan: int, chat: str, *, name, audience, offer, 
 
 async def edit(state, plan: int, chat: str, campaign_id, *, name=None, audience=None,
                offer=None, sequence=None, note=None, rolling=None,
-               always_review=None) -> dict:
+               always_review=None, send_to_risky=None) -> dict:
     """One of this plan's drafts edited the way the wizard's Save edits it."""
     from harvey import campaigns
 
@@ -416,6 +420,8 @@ async def edit(state, plan: int, chat: str, campaign_id, *, name=None, audience=
         fields["rolling"] = bool(rolling)
     if always_review is not None:
         fields["review"] = "always" if always_review else "inherit"
+    if send_to_risky is not None:
+        fields["send_to_risky"] = bool(send_to_risky)
     if not fields:
         raise Refused("say what to change")
     try:
@@ -455,7 +461,8 @@ async def preview(state, config, campaign_id) -> dict:
         return {"campaign": c["id"], "status": c["status"], "preview": None,
                 "note": "it names no audience"}
     counts = await campaigns.preview(state, config, query=query, campaign_id=c["id"])
-    return {"campaign": c["id"], "status": c["status"], "preview": _counts(counts)}
+    return {"campaign": c["id"], "status": c["status"], "preview": _counts(counts),
+            "send_to_risky": bool(counts.get("send_to_risky"))}
 
 
 async def to_do(state, config, c: dict) -> list[str]:

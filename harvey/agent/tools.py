@@ -612,16 +612,20 @@ def build(db_path: str, chat: str = "", task: int | None = None):
           "postal address and opt-out line are added when sent); note: the "
           f"legitimate-interest note, at least {campaign_rules.LI_NOTE_MIN} characters (why "
           "these firms, where the addresses come from, how many follow-ups, that an objection is honoured), which "
-          "the user reads at Start; rolling (take new matches of the audience, hourly) and "
-          "always_review (every email waits for the user even on autopilot). Free.", writes)
+          "the user reads at Start; rolling (take new matches of the audience, hourly), "
+          "always_review (every email waits for the user even on autopilot) and "
+          "send_to_risky (take catch-all addresses; the install's setting when not given, "
+          "never past it; changed only while a draft). Free.", writes)
     async def create_campaign(plan: int, name: str, audience: int, offer: str | dict,
                               sequence: list[dict], note: str, rolling: bool = False,
-                              always_review: bool = False) -> str:
+                              always_review: bool = False,
+                              send_to_risky: bool | None = None) -> str:
         args = {"plan": plan, "name": name, "audience": audience, "offer": offer,
                 "sequence": sequence, "note": note, "rolling": rolling,
-                "always_review": always_review}
+                "always_review": always_review, "send_to_risky": send_to_risky}
         return await acting("create_campaign", args, lambda turn: a.create_campaign(
-            turn, plan, name, audience, offer, sequence, note, rolling, always_review))
+            turn, plan, name, audience, offer, sequence, note, rolling, always_review,
+            send_to_risky))
 
     @tool("Edit one of this plan's DRAFT campaigns (create_campaign's fields and bounds; "
           "only those given change; always_review can be turned on, never off once on). A "
@@ -630,13 +634,15 @@ def build(db_path: str, chat: str = "", task: int | None = None):
                             audience: int | None = None, offer: str | dict | None = None,
                             sequence: list[dict] | None = None, note: str | None = None,
                             rolling: bool | None = None,
-                            always_review: bool | None = None) -> str:
+                            always_review: bool | None = None,
+                            send_to_risky: bool | None = None) -> str:
         args = {"plan": plan, "campaign": campaign, "name": name, "audience": audience,
                 "offer": offer, "sequence": sequence, "note": note, "rolling": rolling,
-                "always_review": always_review}
+                "always_review": always_review, "send_to_risky": send_to_risky}
         return await acting("edit_campaign", args, lambda turn: a.edit_campaign(
             turn, plan, campaign, name=name, audience=audience, offer=offer, sequence=sequence,
-            note=note, rolling=rolling, always_review=always_review))
+            note=note, rolling=rolling, always_review=always_review,
+            send_to_risky=send_to_risky))
 
     @tool("What a campaign would take from its audience now, counted (ready, catch-all, to "
           "check, left out by each rule, firms, days at today's send cap); no address.")

@@ -30,6 +30,7 @@ from harvey import queries, registers
 from harvey.modules.loader import load_manifests
 import harvey.overlay.queries  # noqa: F401  (registers the overlay's statements)
 from harvey.overlay import schema as overlay
+from harvey.overlay import triggers
 
 SMALL = 50_000
 
@@ -105,6 +106,13 @@ OVERLAY_STATS = {
                         ("campaign_member_email", "200000 1 1"),
                         ("campaign_member_prospect", "200000 1"),
                         ("campaign_member_contact", "180000 1")],
+    # Each campaign's candidates (a few campaigns of a big audience each)
+    # and the change log a busy day leaves (schema 38).
+    "campaign_candidate": [("campaign_candidate", "600000 100000 1"),
+                           ("campaign_candidate_recheck", "20000 4000 2"),
+                           ("campaign_candidate_overlap", "15000 2"),
+                           ("campaign_candidate_suppressed", "3000 2")],
+    "contact_change": [(None, "200000")],
 }
 
 # The Email module's own tables at a busy install's size (an address's cold
@@ -580,6 +588,58 @@ def test_a_campaigns_lookups_by_address_read_the_outbox_and_prospects_by_index(o
             if table in EMAIL_STATS and table not in st.scans:
                 whole[st.name] = step
     assert whole == {}
+
+
+def test_a_rolls_reads_and_the_candidates_hooks_go_by_their_indexes(overlay_con):
+    """A roll (schema 38): the log by its seq, a campaign's due rows by its
+    partial index, the due addresses' contacts by (kind, value); and the
+    triggers' hooks (triggers.CHANGES), each the same statement as its
+    trigger runs, by the address or the small partial indexes."""
+    expect = {
+        "overlay.campaigns.changed": "SEARCH contact_change USING INTEGER PRIMARY KEY",
+        "overlay.campaigns.candidates_due": "INDEX campaign_candidate_recheck (campaign=?",
+        "overlay.campaigns.candidates_settle": "SEARCH campaign_candidate USING PRIMARY KEY "
+                                               "(campaign=? AND email=?)",
+        "overlay.campaigns.prune_changes": "SEARCH contact_change USING INTEGER PRIMARY KEY",
+    }
+    for name, start in expect.items():
+        plan = explain(overlay_con, queries.sql(name), queries.get(name).params)
+        assert any(start in p for p in plan), (name, plan)
+    plan = explain(overlay_con, queries.sql("overlay.campaigns.contact_ids"), ('["a"]', 1))
+    assert any(p.startswith("SEARCH c USING") and "(kind=? AND value=?)" in p for p in plan), plan
+    hooks = {
+        "UPDATE campaign_candidate SET recheck_at = 1 WHERE email = 'a@example.com' "
+        "AND why = 5 AND campaign != 'c'": "campaign_candidate_overlap",
+        "UPDATE campaign_candidate SET recheck_at = 1 WHERE why = 5 AND campaign != 'c' "
+        "AND email IN (SELECT email FROM campaign_member WHERE campaign = 'c')":
+            "campaign_candidate_overlap",
+        "UPDATE campaign_candidate SET recheck_at = 1 WHERE why = 3 "
+        "AND (2 != 1 OR email = 'example.com')": "campaign_candidate_suppressed",
+    }
+    for sql, index in hooks.items():
+        plan = explain(overlay_con, sql)
+        assert any(index in p for p in plan), (sql, plan)
+        assert not any(p.startswith("SCAN campaign_candidate") and index not in p
+                       for p in plan), (sql, plan)
+    # A record leaving a group logs the survivor's addresses and those of
+    # the records still in it: by the link's key and firm_merged.
+    for sql, index in {
+            "SELECT l.contact FROM link l CROSS JOIN contact c WHERE 1 != 0 AND l.firm = 7 "
+            "AND c.id = l.contact AND c.kind = 1": "USING PRIMARY KEY (firm=?)",
+            "SELECT l.contact FROM firm g CROSS JOIN link l CROSS JOIN contact c "
+            "WHERE 1 != 0 AND g.live = 7 AND g.live != 0 AND l.firm = g.id AND c.id = l.contact "
+            "AND c.kind = 1": "firm_merged"}.items():
+        plan = explain(overlay_con, sql)
+        assert any(index in p for p in plan), (sql, plan)
+        assert not any(p.startswith(("SCAN l", "SCAN g", "SCAN c")) for p in plan), (sql, plan)
+    # The text the triggers run is the text checked here.
+    for fragment in ("WHERE OLD.live != 0 AND l.firm = OLD.live AND c.id = l.contact",
+                     "WHERE OLD.live != 0 AND g.live = OLD.live AND g.live != 0 AND l.firm = g.id",
+                     "WHERE email = NEW.email AND why = 5 AND campaign != NEW.campaign",
+                     "WHERE why = 5 AND campaign != NEW.id\n    AND email IN (SELECT email FROM "
+                     "campaign_member WHERE campaign = NEW.id)",
+                     "WHERE why = 3 AND (NEW.scope != 1 OR email = NEW.value)"):
+        assert fragment in triggers.CHANGES, fragment
 
 
 def test_adapters_answer_on_fixture_files(files, overlay_con):

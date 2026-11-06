@@ -138,7 +138,7 @@ async def test_a_draft_on_file_becomes_an_auto_draft_with_members_and_sends_noth
     state = StateManager(str(path))
     await state.init_db()
     con = sqlite3.connect(path)
-    assert schema.version(con) == schema.LATEST == 37 and schema.missing(con) == []
+    assert schema.version(con) == schema.LATEST == 38 and schema.missing(con) == []
     con.close()
     c = await state.campaign_record("c1")
     assert (c["status"], c["origin"], c["account_id"]) == ("draft", "auto", 1)
@@ -271,8 +271,9 @@ async def test_rolling_adds_new_matches_through_every_rule_and_caps_their_checks
 
     c["rolled_at"] -= campaigns.ROLL_EVERY_SECONDS + 1
     counts = await campaigns.roll(state, cfg, c)
-    assert (counts["added"], counts["suppressed"], counts["overlap"], counts["already"]) == (
-        3, 1, 1, 1)
+    # Only the contacts that changed are read: alfa, a member already, isn't.
+    assert (counts["added"], counts["suppressed"], counts["overlap"], counts["already"],
+            counts["whole"]) == (3, 1, 1, 0, False)
     rolled = [m for m in await state.campaign_members(cid) if m["added_by"] == 2]
     assert {m["status_name"] for m in rolled} == {"waiting"} and len(rolled) == 3
 
@@ -923,7 +924,7 @@ def test_the_outbox_is_indexed_by_address_on_a_new_file_and_an_old_one(tmp_path)
     schema.create(old, version=36)
     assert old.execute("SELECT 1 FROM sqlite_master WHERE name = 'idx_outbox_to_email'") \
         .fetchone() is None
-    assert schema.step_up(old) == schema.LATEST == 37
+    assert schema.step_up(old) == schema.LATEST == 38
     for con in (new, old):
         cols = [r[2] for r in con.execute("PRAGMA index_info('idx_outbox_to_email')")]
         assert cols == ["to_email", "kind", "status", "sent_at"]

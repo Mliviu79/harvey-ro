@@ -511,18 +511,21 @@ class Actions:
         return await self._campaign_act(turn, "save_audience", arguments, plan, work)
 
     async def create_campaign(self, turn: str, plan, name, audience, offer, sequence, note,
-                              rolling: bool = False, always_review: bool = False) -> dict:
+                              rolling: bool = False, always_review: bool = False,
+                              send_to_risky: bool | None = None) -> dict:
         from harvey.agent import outreach
 
         arguments = {"plan": plan, "name": name, "audience": audience, "offer": offer,
                      "steps": len(sequence) if isinstance(sequence, list) else 0,
-                     "rolling": bool(rolling), "always_review": bool(always_review)}
+                     "rolling": bool(rolling), "always_review": bool(always_review),
+                     "send_to_risky": send_to_risky}
         return await self._campaign_act(turn, "create_campaign", arguments, plan,
                                         lambda state, config: outreach.create(
                                             state, config, int(plan), self.chat, name=name,
                                             audience=audience, offer=offer, sequence=sequence,
                                             note=note, rolling=rolling,
-                                            always_review=always_review))
+                                            always_review=always_review,
+                                            send_to_risky=send_to_risky))
 
     async def edit_campaign(self, turn: str, plan, campaign, **fields) -> dict:
         from harvey.agent import outreach

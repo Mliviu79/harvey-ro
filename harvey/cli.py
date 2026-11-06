@@ -3790,7 +3790,9 @@ def _counts_line(counts: dict) -> str:
             f"untrusted, {counts.get('suppressed', 0)} do-not-contact, "
             f"{counts.get('overlap', 0)} in another campaign or emailed lately, "
             f"{counts.get('answered', 0)} answered, {counts.get('risky_held', 0)} catch-all "
-            f"held (send_to_risky off); personal: {sum(personal.values())}{sample}; "
+            f"held (send_to_risky off); catch-all "
+            f"{'taken' if counts.get('send_to_risky') else 'held'}; "
+            f"personal: {sum(personal.values())}{sample}; "
             f"~{counts.get('days_at_cap', 0)} day(s) at today's cap")
 
 
@@ -3873,7 +3875,9 @@ def cmd_campaigns(args):
                     campaigns.create_campaign, provider=config.channels.email.provider,
                     address=config.persona.email, name=args.name, audience_id=args.audience,
                     query=args.query or "", rolling=args.rolling, sequence=sequence,
-                    li_note=note, review="always" if args.review_always else "inherit")
+                    li_note=note, review="always" if args.review_always else "inherit",
+                    send_to_risky=(config.channels.email.send_to_risky
+                                   if args.send_to_risky is None else args.send_to_risky))
                 print(f"\n  Draft campaign {cid} made. Start it with harvey campaigns start "
                       f"{cid}.\n")
             elif action == "start":
@@ -3895,7 +3899,14 @@ def cmd_campaigns(args):
                 print(f"  filter: {await state.campaigns_call(campaigns.frozen_query, c)}")
                 print(f"  members: {c['members'] or '-'}  sent: {c['sent']}  "
                       f"replies: {c['replies']}")
-                print(f"  steps: {len(c['sequence'])}  account: {c['account_id']}")
+                print(f"  steps: {len(c['sequence'])}  account: {c['account_id']}  "
+                      f"catch-all: {'taken' if campaigns.risky_allowed(c, config) else 'held'}")
+                taken = await state.campaigns_call(campaigns.candidate_counts, c["id"],
+                                                   write=False)
+                left = {k: v for k, v in taken.items() if k != "members"}
+                if left:
+                    print("  left out as last decided: " + ", ".join(
+                        f"{n} {k}" for k, n in sorted(left.items())))
                 held = await campaigns.checks_held(state)
                 if held and (c["members"] or {}).get("waiting"):
                     print(f"  {c['members']['waiting']} address(es) wait for a check: "
@@ -4558,6 +4569,9 @@ def main():
                    help="A JSON list of {subject, body, delay_days}")
     r.add_argument("--review-always", action="store_true",
                    help="Every email waits for you, even on autopilot")
+    r.add_argument("--send-to-risky", action=argparse.BooleanOptionalAction, default=None,
+                   help="Take and stage catch-all addresses (default: the setting's "
+                        "channels.email.send_to_risky; never past it); set while a draft only")
     r = csub.add_parser("members", help="Its members")
     r.add_argument("id")
     r.add_argument("--status", default="")

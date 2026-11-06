@@ -37,11 +37,13 @@ READABLE = {
     "actions": "id action_type agent created_at",
     "audience": "id name filter_json created_at updated_at archived",
     "batch": "id ref",
+    "campaign_candidate": "campaign email:personal contact state why recheck_at checked_at",
     "campaign_member": "campaign email:personal contact firm person prospect_id status personal added_by "
                        "added_at last_step last_sent_at ended_at end_reason",
     "campaigns": "id name channel instantly_campaign_id sequence_json prospect_ids_json status "
                  "created_at audience_id audience_query rolling rolled_at account_id profile_id "
-                 "offer_json li_note review origin started_at ended_at updated_at",
+                 "offer_json li_note review origin started_at ended_at updated_at send_to_risky "
+                 "candidate_seq checked_all_at",
     "capability": "id module name",
     "contact": "id kind value:personal display:personal line_type status do_not_contact first_seen last_seen "
                "n_firms best_trust",

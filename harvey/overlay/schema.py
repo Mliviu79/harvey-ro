@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 37).
+"""The overlay's tables (harvey.db schema 38).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 37
+LATEST = 38
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1109,11 +1109,66 @@ def _to_37(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_37)
 
 
+# ── Schema 38: each campaign's candidates, and the contacts that changed ──
+
+SCHEMA_38 = """
+-- Every address a campaign's filter matched when it was last decided
+-- (harvey/campaigns.py add_members): a member, or left out with why
+-- (CANDIDATE_WHY). recheck_at: when it is to be decided again although
+-- nothing about its contact changed (another campaign's cold email turns
+-- 90 days old, the campaign holding it ended, a do-not-contact entry was
+-- undone); NULL when only a change can let it in.
+CREATE TABLE campaign_candidate (
+  campaign TEXT NOT NULL, email TEXT NOT NULL, contact INTEGER,
+  state INTEGER NOT NULL, why INTEGER NOT NULL DEFAULT 0,
+  recheck_at INTEGER, checked_at INTEGER NOT NULL,
+  PRIMARY KEY (campaign, email)
+) WITHOUT ROWID;
+CREATE INDEX campaign_candidate_recheck ON campaign_candidate(campaign, recheck_at)
+  WHERE recheck_at IS NOT NULL;
+-- The rows the hooks set due by address: held by another campaign, and
+-- on the do-not-contact list (overlay/triggers.py CHANGES).
+CREATE INDEX campaign_candidate_overlap ON campaign_candidate(email) WHERE why = 5;
+CREATE INDEX campaign_candidate_suppressed ON campaign_candidate(email) WHERE why = 3;
+-- The email contacts whose facts a campaign decides by changed (status,
+-- do-not-contact, a link added, removed, re-trusted or given a person, its
+-- firm merged or separated): one row per change, written by triggers, read by a rolling
+-- campaign from its cursor (campaigns.candidate_seq) and pruned below the
+-- slowest one. AUTOINCREMENT: a seq is never given twice, pruned or not.
+CREATE TABLE contact_change (seq INTEGER PRIMARY KEY AUTOINCREMENT, contact INTEGER NOT NULL);
+-- send_to_risky: whether this campaign takes and stages catch-all
+-- addresses (NULL until the campaign cycle fills it from the setting, on
+-- a campaign made before it); candidate_seq: the last change its roll
+-- read; checked_all_at: when its whole filter was last read.
+ALTER TABLE campaigns ADD COLUMN send_to_risky INTEGER;
+ALTER TABLE campaigns ADD COLUMN candidate_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE campaigns ADD COLUMN checked_all_at INTEGER;
+"""
+# campaign_candidate.state
+CANDIDATE_STATE = {"excluded": 0, "member": 1}
+# campaign_candidate.why: the add_members rule that left it out (0 a member).
+CANDIDATE_WHY = {"": 0, "left_out": 1, "untrusted": 2, "suppressed": 3, "answered": 4,
+                 "overlap": 5, "risky_held": 6}
+
+
+def _to_38(con: sqlite3.Connection) -> None:
+    """Schema 38: campaign_candidate, contact_change and its triggers, and
+    the campaigns' send_to_risky and roll cursor. Nothing on file is
+    decided here: a campaign made before takes the setting's send_to_risky
+    in the next campaign cycle, and a rolling one reads its whole filter
+    once at its next roll (checked_all_at NULL), which writes its
+    candidates."""
+    from harvey.overlay import triggers
+
+    _script(con, SCHEMA_38)
+    _script(con, triggers.CHANGES)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
-         (37, _to_37))
+         (37, _to_37), (38, _to_38))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:
@@ -1214,20 +1269,34 @@ def _columns(con: sqlite3.Connection) -> dict[str, set[str]]:
     return {t: {r[1] for r in con.execute(f"PRAGMA main.table_info(\"{t}\")")} for t in tables}
 
 
+def _has_table(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?",
+                       (name,)).fetchone() is not None
+
+
 def guard_names(con: sqlite3.Connection) -> tuple[str, ...]:
-    """The guards this file should have: schema 26's with its tables."""
-    if con.execute("SELECT 1 FROM main.sqlite_master WHERE type = 'table' "
-                   "AND name = 'suppression'").fetchone():
-        return GUARD_NAMES + SUPPRESSION_GUARD_NAMES
-    return GUARD_NAMES
+    """The guards this file should have: schema 26's and schema 38's (the
+    contact change log, triggers.CHANGES) with their tables."""
+    from harvey.overlay.triggers import CHANGE_NAMES
+
+    out = GUARD_NAMES
+    if _has_table(con, "suppression"):
+        out += SUPPRESSION_GUARD_NAMES
+    if _has_table(con, "contact_change"):
+        out += CHANGE_NAMES
+    return out
 
 
 def install_guards(con: sqlite3.Connection) -> None:
     """Create the guards and the full-text sync triggers that are missing."""
+    from harvey.overlay.triggers import CHANGES
+
     have = {r[0] for r in con.execute("SELECT name FROM main.sqlite_master WHERE type = 'trigger'")}
     script = LOCAL_FTS_SYNC + GUARDS
-    if len(guard_names(con)) > len(GUARD_NAMES):
+    if _has_table(con, "suppression"):
         script += SUPPRESSION_GUARDS
+    if _has_table(con, "contact_change"):
+        script += CHANGES
     buf = ""
     for line in script.splitlines(keepends=True):
         buf += line

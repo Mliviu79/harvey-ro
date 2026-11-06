@@ -161,3 +161,24 @@ def test_a_started_campaigns_note_is_refused_through_patch(client, gmail):
     assert client.get(f"/api/campaigns/{cid}").json()["campaign"]["li_note"] == NOTE
     record = client.get(f"/api/campaigns/{cid}/record.json").json()
     assert record["li_note"] == NOTE
+
+
+def test_send_to_risky_is_chosen_on_the_draft_and_previewed(client, monkeypatch):
+    cfg = config(send_to_risky=True)
+    monkeypatch.setattr(dash, "_load_config_quietly", lambda: cfg)
+    _seed(client.db_path, "office@alfa.example.com")
+    assert client.get("/api/campaigns/setup").json()["send_to_risky"] is True
+    # The new campaign takes the setting's unless the wizard says.
+    made = client.post("/api/campaigns", json={"name": "X", "li_note": NOTE, "query": "kind=email",
+                                               "sequence": SEQUENCE}).json()
+    assert made["campaign"]["send_to_risky"] is True
+    preview = client.post("/api/audiences/preview",
+                          json={"query": "kind=email", "send_to_risky": False}).json()
+    assert preview["counts"]["send_to_risky"] is False
+    cid = made["id"]
+    assert client.patch(f"/api/campaigns/{cid}", json={"send_to_risky": False}).status_code == 200
+    assert client.post(f"/api/campaigns/{cid}/start").json()["campaign"]["status"] == "active"
+    r = client.patch(f"/api/campaigns/{cid}", json={"send_to_risky": True})
+    assert r.status_code == 400
+    detail = client.get(f"/api/campaigns/{cid}").json()["campaign"]
+    assert detail["send_to_risky"] is False and detail["candidates"] == {"members": 1}

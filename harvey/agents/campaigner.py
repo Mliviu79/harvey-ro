@@ -4,7 +4,9 @@ After the heartbeat has read replies and drained the outbox, every active
 campaign, in turn from where the last cycle stopped:
 
   1. rolls its audience, when it is rolling and an hour has passed
-     (campaigns.roll: the frozen filter, every rule of add_members);
+     (campaigns.roll: the contacts that changed since its last roll and
+     its candidates come due, through its frozen filter and every rule of
+     add_members; its whole filter once a week);
   2. has its waiting members checked by a verification tier, oldest first
      across campaigns, CHECKS_PER_CYCLE in all, inside email_verify's
      monthly allowance and the install's day and month spend limits (and,
@@ -21,7 +23,10 @@ campaign, in turn from where the last cycle stopped:
   4. has those members staged into the outbox, for review (autopilot
      approves at send time).
 
-A campaign that doesn't roll finishes once no member is open.
+The contact change log is pruned first, below the slowest active rolling
+campaign's cursor. A campaign that doesn't roll finishes once no member is
+open. Catch-all addresses go by each campaign's own send_to_risky
+(campaigns.risky_allowed).
 """
 
 from __future__ import annotations
@@ -52,6 +57,10 @@ class CampaignCycle:
         """One cycle over the active campaigns made by the user. True when
         anything was done (rolled, checked, written or staged)."""
         await self.state.sync_sending_account(self.config)
+        await self.state.campaigns_call(
+            campaigns.fill_send_to_risky,
+            bool(getattr(self.config.channels.email, "send_to_risky", False)))
+        await self.state.campaigns_call(campaigns.prune_changes)
         active = [c for c in await self.state.campaigns_call(
             campaigns.list_campaigns, ["active"], write=False) if c["origin"] == "user"]
         if not active:
@@ -91,7 +100,6 @@ class CampaignCycle:
         enabled = frozenset(await switches.enabled_ids(self.state))
         if VERIFY[0] not in enabled:
             return False
-        allow_risky = bool(getattr(self.config.channels.email, "send_to_risky", False))
         self.audience.spend = verify_costs.InstallSpend.of(self.state, self.config)
         held = await campaigns.checks_held(self.state)
         if held:
@@ -100,6 +108,7 @@ class CampaignCycle:
             await campaigns.hold_checks(self.state, None)
         checks = 0
         for c in active:
+            allow_risky = campaigns.risky_allowed(c, self.config)
             roll_left = await campaigns.roll_checks_left(self.state, c["id"])
             for m in await self.state.campaign_members(c["id"], status="waiting"):
                 if checks >= CHECKS_PER_CYCLE or await verify_costs.checks_left(self.state) <= 0:
@@ -151,7 +160,7 @@ class CampaignCycle:
                          if x.id == c["id"]), None)
         if campaign is None or not campaign.sequence:
             return 0
-        allow_risky = bool(getattr(self.config.channels.email, "send_to_risky", False))
+        allow_risky = campaigns.risky_allowed(c, self.config)
         sendable = SENDABLE_EMAIL_STATUSES_WITH_RISKY if allow_risky else SENDABLE_EMAIL_STATUSES
         picked = []
         for m in await self.state.campaign_members(c["id"], status="ready", limit=200):

@@ -169,6 +169,10 @@ TABLE_NOTES = {
     "prospects": "the Email module's prospect cards",
     "campaigns": "email campaigns",
     "campaign_member": "who a campaign writes to and how far each got",
+    "campaign_candidate": "every address a campaign's filter matched, as last decided: a "
+                          "member (state 1) or left out (state 0) by the rule in why "
+                          "(1 invalid or guess, 2 untrusted, 3 do-not-contact, 4 answered, "
+                          "5 another campaign or emailed lately, 6 catch-all held)",
     "outbox": "outgoing email (status and times only)",
     "suppression": "the do-not-contact list",
     "jobs": "background jobs, one per search, read, check",

@@ -23,6 +23,23 @@ one function, add_members, so no address skips a rule:
                    (recorded; the note itself is decided when step 1 is
                    staged, so the preview shows what is sent)
 
+Catch-all addresses go by the campaign's own ``send_to_risky`` (copied from
+the setting when it is made, changed only while it is a draft), never past
+the setting, which the send gate still reads (risky_allowed).
+
+**Candidates.** Every address a campaign decided on is a
+``campaign_candidate`` row: a member, or left out with the rule's code and,
+for a rule that lapses on its own, when to decide it again (``recheck_at``:
+another campaign's cold email turns OVERLAP_DAYS old; the campaign holding
+it ends, or a do-not-contact entry is undone, set by triggers). Triggers
+log every email contact whose facts these rules read changed
+(``contact_change``), and a rolling campaign keeps a cursor in that log:
+its roll decides only the contacts changed since, still matching its
+frozen filter, and its rows that came due, never the whole filter again,
+except once every FULL_CHECK_SECONDS (what no change row says, such as a
+firm's register facts or signals moving it into the filter) or when the
+log was pruned past its cursor.
+
 ``campaign_member`` is keyed on (campaign, address) and holds each
 address's progress in that campaign; ``prospects`` stays the card for each
 address (outbox and conversations key on it) and its status a summary.
@@ -43,7 +60,9 @@ from datetime import datetime, timedelta, timezone
 
 from harvey import queries
 from harvey.overlay import queries as _named  # noqa: F401  (registers the statements)
-from harvey.overlay.schema import MEMBER_ADDED_BY, MEMBER_STATUS
+from harvey.overlay.schema import (
+    CANDIDATE_STATE, CANDIDATE_WHY, EMAIL, MEMBER_ADDED_BY, MEMBER_STATUS,
+)
 from harvey.overlay.schema import SUPPRESSION_REASON as SUPPRESSION_REASON_CODES
 
 logger = logging.getLogger("harvey.campaigns")
@@ -58,8 +77,10 @@ CAMPAIGN_STATUSES = ("draft", "active", "paused", "finished", "archived")
 
 # An address that got cold email isn't taken by another campaign for this long.
 OVERLAP_DAYS = 90
-# A rolling campaign reads its filter again at most this often.
+# A rolling campaign reads what changed at most this often, and its whole
+# filter again this often (what the change log doesn't hold).
 ROLL_EVERY_SECONDS = 3600
+FULL_CHECK_SECONDS = 7 * 86400
 # Addresses a roll added that may be checked by a verifier, per campaign and
 # day (a roll can add many unchecked addresses; each check costs a credit).
 ROLL_CHECKS_PER_DAY = 50
@@ -213,7 +234,7 @@ def update_audience(con: sqlite3.Connection, audience_id, *, name: str | None = 
 CAMPAIGN_COLS = ("id", "name", "status", "sequence_json", "created_at", "audience_id",
                  "audience_query", "rolling", "rolled_at", "account_id", "profile_id",
                  "offer_json", "li_note", "review", "origin", "started_at", "ended_at",
-                 "updated_at")
+                 "updated_at", "send_to_risky", "candidate_seq", "checked_all_at")
 
 
 def _campaign(row) -> dict:
@@ -224,7 +245,24 @@ def _campaign(row) -> dict:
         except (ValueError, TypeError):
             c[key[:-5]] = default
     c["rolling"] = bool(c["rolling"])
+    if c["send_to_risky"] is not None:
+        c["send_to_risky"] = bool(c["send_to_risky"])
     return c
+
+
+def risky_allowed(c: dict | None, config) -> bool:
+    """Whether a campaign takes and stages catch-all addresses: its own
+    send_to_risky (the setting's while it has none), and never past the
+    setting (channels.email.send_to_risky), which the send gate reads."""
+    setting = bool(getattr(config.channels.email, "send_to_risky", False))
+    own = (c or {}).get("send_to_risky")
+    return setting and (own is None or bool(own))
+
+
+def fill_send_to_risky(con: sqlite3.Connection, setting: bool) -> int:
+    """A campaign made before campaigns had their own send_to_risky takes
+    the setting's (the campaign cycle, once)."""
+    return _x(con, "overlay.campaigns.fill_risky", (int(bool(setting)),)).rowcount
 
 
 def get_campaign(con: sqlite3.Connection, campaign_id: str) -> dict | None:
@@ -251,7 +289,7 @@ def list_campaigns(con: sqlite3.Connection, statuses=None) -> list[dict]:
 # The fields _touch writes (overlay.campaigns.save), in its order.
 _SAVED = ("name", "status", "sequence_json", "audience_id", "audience_query", "rolling",
           "rolled_at", "offer_json", "li_note", "review", "started_at", "ended_at",
-          "updated_at")
+          "updated_at", "send_to_risky", "candidate_seq", "checked_all_at")
 
 
 def _touch(con, campaign_id: str, **fields) -> None:
@@ -298,9 +336,11 @@ def validate_sequence(steps) -> list[dict]:
 def create_campaign(con: sqlite3.Connection, *, provider: str, address: str, name: str,
                     audience_id=None, query: str = "", rolling: bool = False,
                     offer: dict | None = None, sequence=None, li_note: str = "",
-                    review: str = "inherit", account_id: int | None = None) -> str:
+                    review: str = "inherit", account_id: int | None = None,
+                    send_to_risky: bool = False) -> str:
     """A draft campaign made by the user. Refused unless the mail provider
-    is one Harvey sends through (Gmail, SMTP, Microsoft 365)."""
+    is one Harvey sends through (Gmail, SMTP, Microsoft 365).
+    ``send_to_risky``: the setting's, unless the caller chose."""
     from harvey.integrations.mail_provider import NATIVE_PROVIDERS
     from harvey.state import _new_id
 
@@ -324,7 +364,7 @@ def create_campaign(con: sqlite3.Connection, *, provider: str, address: str, nam
         datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), audience_id,
         clean_query(query) if query and audience_id is None else "", int(bool(rolling)),
         acct["id"], acct["profile_id"], json.dumps(_offer(offer), ensure_ascii=False),
-        (li_note or "").strip(), review, _now()))
+        (li_note or "").strip(), review, _now(), int(bool(send_to_risky))))
     return campaign_id
 
 
@@ -337,8 +377,9 @@ def _offer(offer) -> dict:
 
 def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict:
     """Edit a campaign: name, offer, sequence, review and rolling at any
-    time before it finishes; its audience and its legitimate-interest note
-    only while it is a draft."""
+    time before it finishes; its audience, its legitimate-interest note and
+    its send_to_risky only while it is a draft (the start decided every
+    address by them)."""
     c = get_campaign(con, campaign_id)
     if c is None:
         raise Refused("Campania nu există. No such campaign.")
@@ -369,6 +410,18 @@ def update_campaign(con: sqlite3.Connection, campaign_id: str, **fields) -> dict
         out["review"] = fields["review"]
     if fields.get("rolling") is not None:
         out["rolling"] = int(bool(fields["rolling"]))
+    if fields.get("send_to_risky") is not None:
+        risky = fields["send_to_risky"]
+        if not isinstance(risky, bool):
+            raise Refused("send_to_risky is true or false")
+        # (A campaign made before it had one takes the setting's in the
+        # next cycle: nothing to compare yet.)
+        if c["status"] != "draft" and c["send_to_risky"] is not None \
+                and risky != c["send_to_risky"]:
+            raise Refused("Adresele catch-all se aleg înainte de pornire. Whether catch-all "
+                          "addresses are taken is chosen before the campaign starts.")
+        if c["status"] == "draft":
+            out["send_to_risky"] = int(risky)
     for key in ("audience_id", "query"):
         if fields.get(key) is not None:
             if c["status"] != "draft":
@@ -547,21 +600,41 @@ def overlap(con: sqlite3.Connection, email: str, campaign_id: str) -> str:
     """Why another campaign holds this address now ("" when none does):
     it is open in an active or paused campaign, or it got cold email in the
     last OVERLAP_DAYS."""
+    return _held(con, email, campaign_id)[0]
+
+
+def _held(con: sqlite3.Connection, email: str, campaign_id: str) -> tuple[str, int | None]:
+    """overlap's reason, and when it lapses on its own (unix seconds: the
+    cold email turns OVERLAP_DAYS old), None when only an event ends it
+    (the other campaign's membership ending: a trigger sets the candidate
+    due) or nothing known does."""
     email = normalize(email)
     row = _x(con, "overlay.campaigns.held_by", (email, campaign_id, _OPEN)).fetchone()
     if row:
-        return f"in campaign {row[0]!r}"
+        return f"in campaign {row[0]!r}", None
     since = (datetime.now(timezone.utc).replace(tzinfo=None)
              - timedelta(days=OVERLAP_DAYS)).isoformat()
     row = _x(con, "overlay.campaigns.sent_lately", (email, since, campaign_id)).fetchone()
     if row and row[0]:
-        return f"cold email sent {str(row[0])[:10]}"
+        return f"cold email sent {str(row[0])[:10]}", _lapses(row[0])
     # Contacted with no cold email on file (an earlier release sent it
     # through Instantly, or it was sent by hand): when is unknown, so it
     # counts as recent.
     if _x(con, "overlay.campaigns.contacted_elsewhere", (email,)).fetchone():
-        return CONTACTED_ELSEWHERE
-    return ""
+        return CONTACTED_ELSEWHERE, None
+    return "", None
+
+
+def _lapses(sent_at) -> int | None:
+    """When a cold email sent at ``sent_at`` (the outbox's naive UTC ISO
+    text) stops holding its address."""
+    try:
+        at = datetime.fromisoformat(str(sent_at).replace("Z", ""))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return int((at + timedelta(days=OVERLAP_DAYS)).timestamp()) + 1
 
 
 def already_contacted(con: sqlite3.Connection, email: str, campaign_id: str,
@@ -591,33 +664,57 @@ def _empty_counts() -> dict:
             "personal": {"named": 0, "free_mail": 0, "natural_person": 0}}
 
 
-async def candidate_rows(state, *, query: str | None = None, emails=None) -> list[dict]:
+async def candidate_rows(state, *, query: str | None = None, emails=None,
+                         only=None) -> list[dict]:
     """The email contacts a query string (the page's filters) or a list of
-    addresses names, as overlay.reads.audience_rows gives them."""
+    addresses names, as overlay.reads.audience_rows gives them. ``only``
+    (contact ids): of those, the ones the query's filter keeps (a roll's
+    changed contacts), read by their ids, never the whole filter."""
     if emails is not None:
         return await state.read("audience_rows", None, [normalize(e) for e in emails])
     from harvey.contact_query import filter_from_query
 
     f, _ = await filter_from_query(state, query or "")
+    if only is not None:
+        return await state.read("audience_rows", f, None, sorted(set(only))) if only else []
     return await state.read("audience_rows", f)
 
 
 async def add_members(state, config, campaign_id: str, rows: list[dict], added_by: str,
-                      *, dry_run: bool = False) -> dict:
+                      *, dry_run: bool = False, send_to_risky: bool | None = None) -> dict:
     """Take ``rows`` (candidate_rows) into a campaign, each through every
     rule (the module docstring), and return the counts. ``dry_run``: the
     preview, nothing written. A member gets its prospect card (made when
     the address has none) and starts waiting for a check (unchecked),
-    ready (verified, or catch-all with send_to_risky on)."""
+    ready (verified, or catch-all the campaign takes: risky_allowed;
+    ``send_to_risky`` decides instead, for a preview of a campaign not
+    made yet). Each address decided is written as the campaign's
+    candidate (a member, or left out with why and when to decide again)."""
     from harvey import email_rules, suppression
     from harvey.config import live_do_not_contact
 
-    allow_risky = bool(getattr(config.channels.email, "send_to_risky", False))
     listed = live_do_not_contact(config)
     counts = _empty_counts()
     take: list[tuple[dict, str, int]] = []
+    # (email, contact, state, why, recheck_at) of every address decided.
+    decided: list[tuple] = []
+
+    def out(row, why: str, recheck=None) -> None:
+        counts[why] += 1
+        decided.append((normalize(row["email"]), row.get("contact_id"),
+                        CANDIDATE_STATE["excluded"], CANDIDATE_WHY[why], recheck))
+
+    # (Before anything is read: a hook that sets a row due from here on is
+    # kept when the decisions are written.)
+    since = _now()
 
     def screen(con):
+        c = get_campaign(con, campaign_id) if campaign_id else None
+        if send_to_risky is None:
+            allow_risky = risky_allowed(c, config)
+        else:
+            allow_risky = bool(send_to_risky) and risky_allowed(None, config)
+        counts["send_to_risky"] = allow_risky
         index = suppression.Index(con)
         answered_firms = _answered_firms(con)
         for row in rows:
@@ -625,33 +722,37 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
             email = normalize(row["email"])
             if member(con, campaign_id, email) is not None:
                 counts["already"] += 1
+                decided.append((email, row.get("contact_id"), CANDIDATE_STATE["member"], 0,
+                                None))
                 continue
             if row["status"] not in ("verified", "risky", "unchecked"):
-                counts["left_out"] += 1
+                out(row, "left_out")
                 continue
             if row["trust"] not in ("confirmed", "likely"):
-                counts["untrusted"] += 1
+                out(row, "untrusted")
                 continue
             firm = [row["company_id"]] if row.get("company_id") else None
             if row["do_not_contact"] or (index and index.hit(email, firm)) or (
                     listed and suppression.check(con, email, firm, listed)):
-                counts["suppressed"] += 1
+                out(row, "suppressed")
                 continue
             p = _x(con, "overlay.campaigns.prospect_status", (email,)).fetchone()
             if (p and p[0] in ANSWERED) or (row.get("company_id")
                                             and str(row["company_id"]) in answered_firms):
-                counts["answered"] += 1         # they, or someone at their company
+                out(row, "answered")            # they, or someone at their company
                 continue
-            if overlap(con, email, campaign_id):
-                counts["overlap"] += 1
+            held, lapses = _held(con, email, campaign_id)
+            if held:
+                out(row, "overlap", lapses)
                 continue
             if row["status"] == "risky" and not allow_risky:
-                counts["risky_held"] += 1
+                out(row, "risky_held")
                 continue
             status = {"verified": "ready", "risky": "ready", "unchecked": "waiting"}[row["status"]]
             counts[{"verified": "ready", "risky": "risky",
                     "unchecked": "to_verify"}[row["status"]]] += 1
             take.append((row, status, 0))
+            decided.append((email, row.get("contact_id"), CANDIDATE_STATE["member"], 0, None))
 
     await state._in_tx(screen, write=False)
     firms = {row.get("company_id") for row, _, _ in take}
@@ -683,7 +784,31 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
              row.get("person_id") or 0, prospect_id, M[status], reason,
              MEMBER_ADDED_BY[added_by], _now())).rowcount)
         counts["added"] += added
+    if campaign_id and decided:
+        await state._in_tx(lambda con: _put_candidates(con, campaign_id, decided, since))
     return counts
+
+
+def _put_candidates(con: sqlite3.Connection, campaign_id: str, decided, since: int) -> None:
+    """Write the decisions made from ``since`` on, keeping a recheck_at a
+    hook set meanwhile (overlay.campaigns.candidate_put)."""
+    now = _now()
+    sql = queries.sql("overlay.campaigns.candidate_put")
+    con.executemany(sql, [(campaign_id, email, contact, st, why, recheck, now, since)
+                          for email, contact, st, why, recheck in decided])
+
+
+def candidate_counts(con: sqlite3.Connection, campaign_id: str) -> dict:
+    """A campaign's candidates: members, and those left out by each rule
+    (the add_members counts' names), as last decided."""
+    names = {v: k for k, v in CANDIDATE_WHY.items()}
+    out: dict = {"members": 0}
+    for st, why, n in _x(con, "overlay.campaigns.candidate_counts", (campaign_id,)):
+        if st == CANDIDATE_STATE["member"]:
+            out["members"] += n
+        else:
+            out[names.get(why, str(why))] = out.get(names.get(why, str(why)), 0) + n
+    return out
 
 
 def _answered_firms(con: sqlite3.Connection) -> set[str]:
@@ -720,10 +845,13 @@ async def _prospect_card(state, row: dict, status: str) -> str:
 
 
 async def preview(state, config, *, query: str | None = None, emails=None,
-                  campaign_id: str = "") -> dict:
-    """What a campaign would take, counted (nothing written)."""
+                  campaign_id: str = "", send_to_risky: bool | None = None) -> dict:
+    """What a campaign would take, counted (nothing written): by its own
+    send_to_risky, else ``send_to_risky``, else the setting's (the counts'
+    ``send_to_risky`` says which way catch-all addresses went)."""
     rows = await candidate_rows(state, query=query, emails=emails)
-    return await add_members(state, config, campaign_id or "", rows, "snapshot", dry_run=True)
+    return await add_members(state, config, campaign_id or "", rows, "snapshot", dry_run=True,
+                             send_to_risky=None if campaign_id else send_to_risky)
 
 
 def frozen_query(con: sqlite3.Connection, c: dict) -> str:
@@ -764,13 +892,17 @@ async def start(state, config, campaign_id: str) -> dict:
         raise Refused("Campania nu are o secvență. The campaign has no sequence.",
                       need="sequence")
     query = await state._in_tx(lambda con: frozen_query(con, c), write=False)
+    # (The log's mark before the filter is read: a change made while it is
+    # read is read again by the first roll.)
+    top, _ = await state._in_tx(change_marks, write=False)
     counts = _empty_counts()
     if query:
         rows = await candidate_rows(state, query=query)
         counts = await add_members(state, config, campaign_id, rows, "snapshot")
     await state._in_tx(lambda con: _touch(con, campaign_id, status="active",
                                           audience_query=query, started_at=_now(),
-                                          rolled_at=_now()))
+                                          rolled_at=_now(), candidate_seq=top,
+                                          checked_all_at=_now()))
     await _members_told(state, campaign_id, counts, "snapshot")
     return counts
 
@@ -816,10 +948,44 @@ async def remove_by_hand(state, campaign_id: str, emails) -> int:
     return await state._in_tx(run)
 
 
-async def roll(state, config, c: dict, now: int | None = None) -> dict | None:
-    """A rolling campaign reads its frozen filter again (at most once per
-    ROLL_EVERY_SECONDS) and takes the new matches through every rule.
-    Members that stop matching stay. None when it wasn't due."""
+def change_marks(con: sqlite3.Connection) -> tuple[int, int | None]:
+    """(the last seq the contact change log gave, the lowest it still
+    keeps or None when it keeps none)."""
+    top, low = _x(con, "overlay.campaigns.change_marks").fetchone()
+    return int(top or 0), (None if low is None else int(low))
+
+
+def _whole(c: dict, now: int, top: int, low: int | None) -> bool:
+    """Whether a roll reads the campaign's whole filter: never read whole
+    yet (a campaign started before candidates were kept), not for
+    FULL_CHECK_SECONDS, or the log no longer holds every change since its
+    cursor (pruned while it wasn't rolling)."""
+    cursor = int(c.get("candidate_seq") or 0)
+    if not c.get("checked_all_at") or now - int(c["checked_all_at"]) >= FULL_CHECK_SECONDS:
+        return True
+    first = low if low is not None else top + 1
+    return first > cursor + 1
+
+
+def _to_decide(con: sqlite3.Connection, campaign_id: str, cursor: int, top: int,
+               now: int) -> tuple[set[int], list[str]]:
+    """A roll's work: the contacts changed after ``cursor`` (up to
+    ``top``), and the addresses of its candidates due by ``now``."""
+    changed = {r[0] for r in _x(con, "overlay.campaigns.changed", (cursor, top))}
+    due = [r[0] for r in _x(con, "overlay.campaigns.candidates_due", (campaign_id, now))]
+    if due:
+        changed |= {r[0] for r in _x(con, "overlay.campaigns.contact_ids",
+                                     (json.dumps(due), EMAIL))}
+    return changed, due
+
+
+async def roll(state, config, c: dict, now: int | None = None, *,
+               whole: bool = False) -> dict | None:
+    """A rolling campaign (at most once per ROLL_EVERY_SECONDS) takes the
+    new matches of its frozen filter through every rule: the contacts that
+    changed since its last roll and its candidates that came due, or, when
+    _whole says so (or ``whole``), everything its filter matches. Members
+    that stop matching stay. None when it wasn't due."""
     now = _now() if now is None else now
     if not c.get("rolling") or c["status"] != "active":
         return None
@@ -828,12 +994,44 @@ async def roll(state, config, c: dict, now: int | None = None) -> dict | None:
     await state._in_tx(lambda con: _touch(con, c["id"], rolled_at=now))
     if not c.get("audience_query"):
         return None
-    rows = await candidate_rows(state, query=c["audience_query"])
+    top, low = await state._in_tx(change_marks, write=False)
+    whole = whole or _whole(c, now, top, low)
+    due: list[str] = []
+    if whole:
+        rows = await candidate_rows(state, query=c["audience_query"])
+    else:
+        ids, due = await state._in_tx(lambda con: _to_decide(
+            con, c["id"], int(c.get("candidate_seq") or 0), top, now), write=False)
+        rows = await candidate_rows(state, query=c["audience_query"], only=ids)
     counts = await add_members(state, config, c["id"], rows, "rolling")
+    counts["whole"] = whole
+
+    def moved_on(con):
+        # Due rows the filter no longer matches: nothing to wait for. (The
+        # ones it matched were decided again, their recheck_at with them.)
+        if due:
+            _x(con, "overlay.campaigns.candidates_settle",
+               (_now(), c["id"], json.dumps(due), now))
+        fields = {"candidate_seq": top}
+        if whole:
+            fields["checked_all_at"] = now
+        _touch(con, c["id"], **fields)
+
+    await state._in_tx(moved_on)
     if counts["added"]:
         logger.info(f"Campaigns: '{c['name']}' took {counts['added']} new address(es).")
         await _members_told(state, c["id"], counts, "rolling")
     return counts
+
+
+def prune_changes(con: sqlite3.Connection) -> int:
+    """Drop the change log's rows every active rolling campaign has read
+    (all of them when none rolls; a paused one reads its whole filter when
+    it rolls again). Returns how many."""
+    top, _ = change_marks(con)
+    slowest = _x(con, "overlay.campaigns.slowest_cursor").fetchone()[0]
+    upto = top if slowest is None else min(int(slowest), top)
+    return _x(con, "overlay.campaigns.prune_changes", (upto,)).rowcount
 
 
 async def roll_checks_left(state, campaign_id: str) -> int:

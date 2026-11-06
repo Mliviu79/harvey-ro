@@ -447,17 +447,23 @@ async def save_audience(state, name: str, query: str) -> int:
 
 async def new_campaign(state, config, body: dict) -> str:
     """A draft campaign from the wizard's request ({"name", "audience_id"
-    or "query", "rolling", "offer", "sequence", "li_note", "review"}),
-    sending from the settings' account: its id. campaigns.Refused when it
-    can't be made (no native provider, no name, no such audience, a bad
-    sequence)."""
+    or "query", "rolling", "offer", "sequence", "li_note", "review",
+    "send_to_risky"}), sending from the settings' account: its id.
+    send_to_risky is the setting's unless the request says. campaigns.Refused
+    when it can't be made (no native provider, no name, no such audience, a
+    bad sequence)."""
     from harvey import campaigns
 
     address = getattr(getattr(config, "persona", None), "email", "") or ""
+    risky = body.get("send_to_risky")
+    if risky is None:
+        risky = bool(getattr(config.channels.email, "send_to_risky", False))
+    elif not isinstance(risky, bool):
+        raise campaigns.Refused("send_to_risky is true or false")
     return await state.campaigns_call(
         campaigns.create_campaign, provider=config.channels.email.provider,
         address=address, name=str(body.get("name") or ""),
         audience_id=body.get("audience_id"), query=str(body.get("query") or ""),
         rolling=bool(body.get("rolling")), offer=body.get("offer"),
         sequence=body.get("sequence") or None, li_note=str(body.get("li_note") or ""),
-        review=str(body.get("review") or "inherit"))
+        review=str(body.get("review") or "inherit"), send_to_risky=bool(risky))

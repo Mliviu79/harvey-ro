@@ -323,6 +323,10 @@ statement("overlay.read.contacts.value_like",
           "SELECT id FROM contact WHERE value LIKE ? ESCAPE '\\'", params=("%07%",),
           scans={"contact": "the search box's words in a contact's value: read once per "
                             "search, as schema 24 did"})
+# The same for a few contacts by id (a rolling campaign's changed ones).
+statement("overlay.read.contacts.value_like_of",
+          f"SELECT c.id FROM {_J} CROSS JOIN contact c WHERE c.id = j.value "
+          "AND c.value LIKE ? ESCAPE '\\'", params=(*_IDS, "%07%"), drives="j")
 statement("overlay.read.persons_like",
           "SELECT id, firm FROM person WHERE name_norm LIKE ? ESCAPE '\\'", params=("%ana%",))
 statement("overlay.read.linked_persons",
@@ -1239,7 +1243,8 @@ statement("overlay.campaigns.audience_update",
           "updated_at = ? WHERE id = ?", params=("n", None, 1, 1))
 _CAMPAIGN = ("SELECT id, name, status, sequence_json, created_at, audience_id, audience_query, "
              "rolling, rolled_at, account_id, profile_id, offer_json, li_note, review, origin, "
-             "started_at, ended_at, updated_at FROM campaigns ")
+             "started_at, ended_at, updated_at, send_to_risky, candidate_seq, checked_all_at "
+             "FROM campaigns ")
 statement("overlay.campaigns.get", _CAMPAIGN + "WHERE id = ?", params=("c",))
 # (statuses: NULL lists every campaign.)
 statement("overlay.campaigns.list",
@@ -1265,16 +1270,18 @@ statement("overlay.campaigns.reply_counts",
 statement("overlay.campaigns.add",
           "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status, "
           "created_at, audience_id, audience_query, rolling, account_id, profile_id, offer_json, "
-          "li_note, review, origin, updated_at) VALUES (?, ?, 'email', ?, '[]', 'draft', ?, ?, ?, "
-          "?, ?, ?, ?, ?, ?, 'user', ?)",
-          params=("c", "n", "[]", "2026-01-01", None, "", 0, 1, None, "{}", "", "inherit", 1))
+          "li_note, review, origin, updated_at, send_to_risky) VALUES (?, ?, 'email', ?, '[]', "
+          "'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)",
+          params=("c", "n", "[]", "2026-01-01", None, "", 0, 1, None, "{}", "", "inherit", 1, 0))
 # Every field _touch may change, written back whole (read in the same
 # transaction): a field set to NULL is set to NULL.
 statement("overlay.campaigns.save",
           "UPDATE campaigns SET name = ?, status = ?, sequence_json = ?, audience_id = ?, "
           "audience_query = ?, rolling = ?, rolled_at = ?, offer_json = ?, li_note = ?, "
-          "review = ?, started_at = ?, ended_at = ?, updated_at = ? WHERE id = ?",
-          params=("n", "draft", "[]", None, "", 0, None, "{}", "", "inherit", None, None, 1, "c"))
+          "review = ?, started_at = ?, ended_at = ?, updated_at = ?, send_to_risky = ?, "
+          "candidate_seq = ?, checked_all_at = ? WHERE id = ?",
+          params=("n", "draft", "[]", None, "", 0, None, "{}", "", "inherit", None, None, 1, 0,
+                  0, None, "c"))
 statement("overlay.campaigns.review",
           "SELECT review FROM campaigns WHERE id = ?", params=("c",))
 # The Outbox's note on a paused campaign's approved emails, and taking it off.
@@ -1394,3 +1401,57 @@ statement("overlay.campaigns.opt_outs",
                                 "campaign's record (an export)"})
 statement("overlay.campaigns.member_firms",
           "SELECT email, firm FROM campaign_member WHERE campaign = ?", params=("c",))
+
+# ── Each campaign's candidates and the contact change log (schema 38) ──
+# An address decided: a member, or left out with why and when to decide it
+# again (campaigns.add_members). A recheck_at a hook set while it was being
+# decided (from the decision's start to now) stays: the decision may not
+# have seen what the hook saw.
+statement("overlay.campaigns.candidate_put",
+          "INSERT INTO campaign_candidate (campaign, email, contact, state, why, recheck_at, "
+          "checked_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (campaign, email) DO UPDATE SET "
+          "contact = excluded.contact, state = excluded.state, why = excluded.why, "
+          "recheck_at = CASE WHEN excluded.state = 0 AND campaign_candidate.recheck_at "
+          "BETWEEN ? AND excluded.checked_at THEN campaign_candidate.recheck_at "
+          "ELSE excluded.recheck_at END, checked_at = excluded.checked_at",
+          params=("c", "a@example.com", 1, 0, 5, None, 1, 1))
+# A campaign's candidates counted by state and why (its page, harvey
+# campaigns show): its primary key's prefix.
+statement("overlay.campaigns.candidate_counts",
+          "SELECT state, why, COUNT(*) FROM campaign_candidate WHERE campaign = ? "
+          "GROUP BY state, why", params=("c",),
+          scans={"campaign_candidate": "one campaign's candidates counted for its page "
+                                       "(its audience's size): its primary key's prefix"})
+# The rows whose recheck_at has come, and those of them a roll didn't
+# decide again (they no longer match its filter): nothing more to wait for.
+statement("overlay.campaigns.candidates_due",
+          "SELECT email FROM campaign_candidate INDEXED BY campaign_candidate_recheck "
+          "WHERE campaign = ? AND recheck_at IS NOT NULL AND recheck_at <= ?", params=("c", 1))
+# (Strictly before the roll's time: a hook that set one due as the roll
+# ran set it to that time or later, and it is decided at the next roll.)
+statement("overlay.campaigns.candidates_settle",
+          "UPDATE campaign_candidate SET recheck_at = NULL, checked_at = ? "
+          f"WHERE campaign = ? AND email IN {_LIST} AND recheck_at IS NOT NULL "
+          "AND recheck_at < ?", params=(1, "c", '["a@example.com"]', 1))
+# Email contacts by address (the due rows'; a contact found again has a new id).
+statement("overlay.campaigns.contact_ids",
+          f"SELECT c.id FROM json_each(?) j CROSS JOIN contact c "
+          "WHERE c.kind = ? AND c.value = j.value", params=('["a@example.com"]', 1), drives="j")
+# The log: the last seq given (pruned or not) and the lowest still kept;
+# the contacts changed in a range of it; pruning below the slowest cursor.
+statement("overlay.campaigns.change_marks",
+          "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'contact_change'), 0), "
+          "(SELECT MIN(seq) FROM contact_change)",
+          scans={"sqlite_sequence": "one row per table with AUTOINCREMENT: a few"})
+statement("overlay.campaigns.changed",
+          "SELECT DISTINCT contact FROM contact_change WHERE seq > ? AND seq <= ?",
+          params=(0, 10))
+statement("overlay.campaigns.slowest_cursor",
+          "SELECT MIN(candidate_seq) FROM campaigns WHERE rolling = 1 AND status = 'active'",
+          scans={"campaigns": "the campaigns, a handful"})
+statement("overlay.campaigns.prune_changes",
+          "DELETE FROM contact_change WHERE seq <= ?", params=(10,))
+# A campaign made before schema 38 takes the setting's send_to_risky.
+statement("overlay.campaigns.fill_risky",
+          "UPDATE campaigns SET send_to_risky = ? WHERE send_to_risky IS NULL", params=(0,),
+          scans={"campaigns": "the campaigns, a handful"})
