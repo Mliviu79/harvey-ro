@@ -68,7 +68,7 @@ FORBIDDEN = frozenset({
     "assign_task", "tasks", "cancel_task", "schedule_wake", "propose_plan", "close_plan",
     "discover", "registry_pull", "find_contacts", "verify_contacts", "cancel_run",
     "create_campaign", "request_start", "pause_campaign", "suppress", "draft_reply",
-    "remember", "forget", "save_playbook", "save_set", "save_audience"})
+    "remember", "forget", "save_playbook", "save_set", "refresh_set", "save_audience"})
 
 
 # ── The output a profile's answer is checked against ──

@@ -1376,3 +1376,35 @@ def test_nothing_about_the_classifier_recommends_a_provider_or_model():
         assert "the cheapest" not in low and "cel mai bun" not in low, where
         for word in ("suggest", "sugera", "sugest", "default model", "model implicit"):
             assert word not in low, (where, word)
+
+
+def test_a_site_taken_back_or_a_merge_undone_restarts_the_background_walk(tmp_path):
+    """Both make a firm the paid walk passed searchable again: its kept
+    stretch is forgotten, so the next walk sees it (not after a day)."""
+    from harvey import finder
+
+    db = tmp_path / "harvey.db"
+    walk = json.dumps([{"searchers": [["serper", "web_search"]], "since": 1, "hi": [1, 1],
+                        "lo": [1, 1]}])
+
+    async def go():
+        s = await _state(db)
+        cid = await _firm_with_found_site(s)
+        await s.set_setting(finder.PAID_WALK_KEY, walk)
+        await s.reject_found_site("999999", batch="b", detail="")
+        kept = await s.get_setting(finder.PAID_WALK_KEY)
+        await s.reject_found_site(cid, batch="b", detail="not it")
+        after_reject = await s.get_setting(finder.PAID_WALK_KEY)
+        a = await s.add_company(Company(name="EXEMPLU UNU SRL", location="Iasi, Iasi, Romania"))
+        b = await s.add_company(Company(name="EXEMPLU UNU SRL", location="Iasi, Iasi, Romania",
+                                        domain="unu.example"))
+        await s.merge_companies(a, b)
+        await s.set_setting(finder.PAID_WALK_KEY, walk)
+        merged = await s.get_setting(finder.PAID_WALK_KEY)
+        await s.undo_merge(b)
+        return kept, after_reject, merged, await s.get_setting(finder.PAID_WALK_KEY)
+
+    kept, after_reject, merged, after_undo = run(go())
+    # (Nothing taken back: the walk stays.)
+    assert kept == walk and merged == walk
+    assert after_reject == "" and after_undo == ""

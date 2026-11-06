@@ -448,6 +448,207 @@ def test_a_filter_set_and_a_select_set_are_resolved_server_side_and_never_return
     assert error and "set of registry" in text
 
 
+def _seed_firm(db, name, place="Brașov, Brașov, Romania") -> str:
+    async def add():
+        s = StateManager(str(db))
+        await s.init_db()
+        return await s.add_company(Company(name=name, location=place, source="registry:onrc"))
+    return _run(add())
+
+
+def test_a_set_is_frozen_at_save_and_refreshed_only_by_refresh_set(db, monkeypatch):
+    from harvey.agent import views
+
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    error, f = _one(db, "save_set", {"name": "Brașov", "filter": {"county": "Brașov"}})
+    assert not error and f["count"] == 2
+    error, c = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"})
+    assert not error and c["count"] == 3
+    assert _q(db, "SELECT set_id, COUNT(*) FROM agent_set_member GROUP BY set_id") == [
+        (f["set"], 2), (c["set"], 3)]
+    # A firm added since isn't in it, and the action runs neither the
+    # filter nor the SELECT again.
+    _seed_firm(db, "PI EXAMPLE SRL")
+
+    def never(*a, **k):
+        raise AssertionError("an action resolved a frozen set again")
+    with monkeypatch.context() as m:
+        m.setattr(views, "_with_reader", never)
+        m.setattr(actions, "_select_values", never)
+        _, by_filter = _one(db, "find_contacts", {"plan": plan_id, "set": f["set"]})
+    assert by_filter["queued"] == 2
+    assert by_filter["set"] == {"set": f["set"], "held": 2, "taken": 2, "followed_merge": 0,
+                                "skipped_gone": 0}
+    # refresh_set: under an approved plan of the chat, counts only.
+    error, text = _one(db, "refresh_set", {"plan": plan_id + 1, "set": f["set"]})
+    assert error
+    error, out = _one(db, "refresh_set", {"plan": plan_id, "set": f["set"]})
+    assert not error, out
+    assert out == {"plan": plan_id, "set": f["set"], "old_count": 2, "count": 3, "added": 1,
+                   "removed": 0}
+    rows = [r[3:] for r in _actions(db) if r[3] == "refresh_set"]
+    assert [r[:5] for r in rows] == [("refresh_set", None, 0.0, 0.0, "refused"),
+                                     ("refresh_set", None, 0.0, 0.0, "ok")]
+    assert rows[1][5] == "2 -> 3"
+    error, listed = _one(db, "sets", {})
+    by_id = {x["set"]: x for x in listed["sets"]}
+    assert by_id[f["set"]]["count"] == 3 and by_id[f["set"]]["refreshed_at"]
+    assert by_id[c["set"]]["frozen_at"] and by_id[c["set"]]["refreshed_at"] is None
+    # No answer carries an id the set holds.
+    for fid in [*db_ids]:
+        assert f"[{fid}" not in json.dumps(listed) + json.dumps(out)
+
+
+def test_an_action_follows_a_merged_firm_and_skips_a_removed_contact(db):
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    _, firms = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"})
+
+    async def merge():
+        s = StateManager(str(db))
+        await s.init_db()
+        await s.merge_companies(db_ids[0], db_ids[1])
+    _run(merge())
+    error, out = _one(db, "find_contacts", {"plan": plan_id, "set": firms["set"]})
+    assert not error, out
+    assert out["set"] == {"set": firms["set"], "held": 3, "taken": 2, "followed_merge": 1,
+                          "skipped_gone": 0}
+    assert out["queued"] == 2
+    # Contacts: one removed since is skipped.
+    con = sqlite3.connect(db)
+    now = int(time.time())
+    con.executemany("INSERT INTO contact (id, kind, value, first_seen, last_seen) "
+                    "VALUES (?, 1, ?, ?, ?)",
+                    [(i, f"office{i}@nu.example", now, now) for i in (7, 8)])
+    con.commit()
+    a = actions.Actions(str(db), CHAT)
+    sid = _run(a.save_set("Contacte", sql="SELECT id FROM contact", of="contacts"))["set"]
+    con.execute("DELETE FROM contact WHERE id = 8")
+    con.commit()
+    con.close()
+    chosen = _run(a._resolve(sid, None, "contacts", 10))
+    assert chosen["ids"] == [7]
+    assert chosen["set"] == {"set": sid, "held": 2, "taken": 1, "followed_merge": 0,
+                             "skipped_gone": 1}
+
+
+def test_a_set_past_its_limit_is_refused_with_its_count_and_nothing_kept(db, monkeypatch):
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    monkeypatch.setattr(actions, "SET_MAX", 1)
+    for args, n in (({"name": "x", "filter": {"county": "Brașov"}}, 2),
+                    ({"name": "x", "sql": "SELECT id FROM firm"}, 3)):
+        error, text = _one(db, "save_set", args)
+        assert error and f"would hold {n}, more than 1" in text, text
+    assert _q(db, "SELECT COUNT(*) FROM agent_set") == [(0,)]
+    assert _q(db, "SELECT COUNT(*) FROM agent_set_member") == [(0,)]
+    # A refresh past it leaves the set as it was.
+    monkeypatch.setattr(actions, "SET_MAX", 3)
+    _, s = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"})
+    _seed_firm(db, "PI EXAMPLE SRL")
+    error, text = _one(db, "refresh_set", {"plan": plan_id, "set": s["set"]})
+    assert error and "would hold 4, more than 3" in text
+    assert _q(db, "SELECT n, refreshed_at FROM agent_set") == [(3, None)]
+    assert _q(db, "SELECT COUNT(*) FROM agent_set_member") == [(3,)]
+    assert _actions(db)[-1][3:8] == ("refresh_set", None, 0.0, 0.0, "refused")
+
+
+def test_a_big_set_is_written_and_read_in_pieces(db, monkeypatch):
+    """Past SQLite's limit on variables: the ids are written one row at a
+    time and read back in JSON arrays of SET_CHUNK."""
+    n = 40_000
+    con = sqlite3.connect(db)
+    con.executemany("INSERT INTO contact (id, kind, value, first_seen, last_seen) "
+                    "VALUES (?, 1, ?, 1, 1)", ((i, f"c{i}@nu.example") for i in range(1, n + 1)))
+    con.commit()
+    con.close()
+    pieces = []
+    real = actions.queries.sql
+
+    def counted(name, *a):
+        if name == "overlay.agent.contacts_on_file":
+            pieces.append(name)
+        return real(name, *a)
+    monkeypatch.setattr(actions.queries, "sql", counted)
+    a = actions.Actions(str(db), CHAT)
+    out = _run(a.save_set("Toate", sql="SELECT id FROM contact", of="contacts"))
+    assert out == {"set": out["set"], "count": n}
+    con = sqlite3.connect(db)
+    con.execute("DELETE FROM contact WHERE id IN (5, 6, 39999)")
+    con.commit()
+    con.close()
+    chosen = _run(a._resolve(out["set"], None, "contacts", n))
+    assert len(chosen["ids"]) == n - 3 and chosen["set"]["skipped_gone"] == 3
+    assert len(pieces) == -(-n // actions.SET_CHUNK)
+    # More than the action takes: refused, with the count.
+    error = pytest.raises(readonly.Refused, _run, a._resolve(out["set"], None, "contacts", 100))
+    assert f"holds {n - 3:,}: this action takes at most 100" in str(error.value)
+
+
+def test_a_set_saved_before_ids_were_kept_is_frozen_by_its_first_use(db, tmp_path):
+    from harvey.overlay import schema
+
+    old = sqlite3.connect(tmp_path / "old.db", isolation_level=None)
+    schema.create(old, version=38)
+    old.execute("INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at) "
+                "VALUES ('c', 'n', 'filter', 'firms', 'county=BV', 2, 1)")
+    assert schema.step_up(old) == schema.LATEST == 39 and schema.missing(old) == []
+    assert old.execute("SELECT n, frozen_at, refreshed_at FROM agent_set").fetchall() == [
+        (2, None, None)]
+    old.close()
+    # On the fixture's file: a set as one saved before, unfrozen.
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at) "
+                "VALUES (?, 'Brașov', 'filter', 'firms', 'county=Bra%C8%99ov', 2, 1)", (CHAT,))
+    con.commit()
+    con.close()
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    error, out = _one(db, "find_contacts", {"plan": plan_id, "set": 1})
+    assert not error and out["queued"] == 2 and out["set"]["held"] == 2, out
+    assert _q(db, "SELECT n, frozen_at IS NOT NULL FROM agent_set") == [(2, 1)]
+    _seed_firm(db, "PI EXAMPLE SRL")
+    _cancel_all(db)
+    _, again = _one(db, "find_contacts", {"plan": plan_id, "set": 1})
+    assert again["set"]["held"] == 2
+
+
+def test_a_refresh_that_fails_writing_is_recorded_as_an_action(db, monkeypatch):
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    _, s = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"})
+
+    async def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(actions.Actions, "_keep", locked)
+    error, text = _one(db, "refresh_set", {"plan": plan_id, "set": s["set"]})
+    assert error
+    assert _actions(db)[-1][3:9] == ("refresh_set", None, 0.0, 0.0, "error",
+                                     "OperationalError")
+    assert _q(db, "SELECT COUNT(*) FROM agent_set_member") == [(3,)]
+
+
+def test_deleting_a_chat_drops_the_ids_its_sets_hold(db, client):
+    _, s = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"})
+    _chat(db, "chat-b", "turn-b")
+    _, kept = _one(db, "save_set", {"name": "Toate", "sql": "SELECT id FROM firm"}, "chat-b")
+    assert client.delete(f"/api/agent/chats/{CHAT}").status_code == 200
+    assert _q(db, "SELECT set_id, COUNT(*) FROM agent_set_member GROUP BY set_id") == [
+        (kept["set"], 3)]
+    # (The set's row stays: an action's record names it.)
+    assert _q(db, "SELECT id, n FROM agent_set ORDER BY id") == [(s["set"], 3),
+                                                                (kept["set"], 3)]
+
+
+def test_the_docs_name_the_schema_this_release_creates():
+    from harvey.overlay import schema
+
+    text = (Path(__file__).resolve().parents[1] / "CLAUDE.md").read_text(encoding="utf-8")
+    assert f"`data/harvey.db`, schema {schema.LATEST}," in text
+    assert f"A new install creates schema {schema.LATEST};" in text
+
+
 # ── The same path as the dashboard ──
 
 def _jobs_of(db, batch):
@@ -618,9 +819,10 @@ def test_actions_write_only_plans_sets_actions_and_the_runs_they_queue(db):
                ("query", {"sql": "SELECT COUNT(*) FROM firm"})])
     after = _counts(db)
     changed = {t for t in after if after[t] != before.get(t)}
-    assert changed <= {"agent_plan", "agent_set", "agent_action", "agent_tool_call", "jobs",
-                       "job_batches"}, changed
-    assert {"agent_plan", "agent_set", "agent_action", "jobs", "job_batches"} <= changed
+    assert changed <= {"agent_plan", "agent_set", "agent_set_member", "agent_action",
+                       "agent_tool_call", "jobs", "job_batches"}, changed
+    assert {"agent_plan", "agent_set", "agent_set_member", "agent_action", "jobs",
+            "job_batches"} <= changed
     # (No setting: not the Discover tab's remembered sources, not its pause.)
     assert _q(db, "SELECT key, value FROM settings ORDER BY key") == settings
 
@@ -628,6 +830,7 @@ def test_actions_write_only_plans_sets_actions_and_the_runs_they_queue(db):
 def test_query_still_cant_write_and_cant_read_the_agents_own_tables(db):
     for sql in ("UPDATE agent_plan SET status = 'approved'", "SELECT * FROM agent_plan",
                 "SELECT * FROM agent_action", "SELECT definition FROM agent_set",
+                "SELECT member FROM agent_set_member",
                 "INSERT INTO jobs (id, kind, lane) VALUES ('x', 'discover', 'osm')"):
         error, text = _one(db, "query", {"sql": sql})
         assert error, sql

@@ -488,11 +488,16 @@ def build(db_path: str, chat: str = "", task: int | None = None):
 
     @tool(f"Save a set an action can take, by name ({actions.SET_NAME_CHARS} characters at "
           "most): a filter (the Contacts and Companies "
-          "pages' filters, as for counts()) or sql, one read-only SELECT returning one column "
-          "of ids, of 'firms' (firm.id), 'contacts' (contact ids, e.g. link.contact) or "
-          "'registry' (reg.firms.reg registration numbers), run through query()'s rules (5 "
-          "seconds; an action takes at most its own limit of them). Returns its id and how "
-          "many it holds now; the ids are never returned. "
+          "pages' filters, as for counts()) of 'firms' (the firms it selects, as counts() "
+          "counts them) or 'contacts' (the contacts it keeps), or sql, one read-only SELECT "
+          "returning one column of ids, of 'firms' (firm.id), 'contacts' (contact ids, e.g. "
+          "link.contact) or 'registry' (reg.firms.reg registration numbers), run through "
+          f"query()'s rules ({readonly.QUERY_SECONDS:g} seconds). The set is frozen: its ids "
+          "are resolved now, once, and every action that takes it acts on exactly those (a "
+          "firm merged since is taken as the firm it was merged into, one removed is "
+          f"skipped); refresh_set() resolves it again. At most {actions.SET_MAX:,} ids: past "
+          "that it is refused with the count, nothing saved; an action takes at most its own "
+          "limit of them. Returns its id and how many it holds; the ids are never returned. "
           + FILTER_DOC + ".", writes)
     async def save_set(name: str, filter: dict | None = None, sql: str = "",
                        of: str = "firms") -> str:
@@ -500,9 +505,20 @@ def build(db_path: str, chat: str = "", task: int | None = None):
         return await t.call("save_set", args, lambda: a.save_set(name, filter, sql, of))
 
     @tool(f"The sets saved in this chat (the newest {actions.SETS_LIMIT}): id, name, kind "
-          "(filter or select), what it holds, how many when saved, when.")
+          "(filter or select), what it holds, how many ids it holds, when it was saved, "
+          "frozen (its ids resolved; none: a set saved before sets were kept as ids, "
+          "resolved by the first action that takes it) and last refreshed.")
     async def sets() -> str:
         return await t.call("sets", {}, a.sets)
+
+    @tool("Resolve a set of this chat again from its filter or SELECT, under an approved "
+          f"plan of the chat (free; the same bounds as save_set: at most {actions.SET_MAX:,} "
+          "ids, else refused and the set left as it was), and replace its ids. Returns how "
+          "many it held, how many it holds now, how many were added and removed: counts "
+          "only.", writes)
+    async def refresh_set(plan: int, set: int) -> str:
+        args = {"plan": plan, "set": set}
+        return await acting("refresh_set", args, lambda turn: a.refresh_set(turn, plan, set))
 
     @tool("Queue a Discover run under an approved plan, as the Discover tab does: sources "
           "(search source keys, e.g. ['osm'] or ['serper']), phrases (search words; none: the "
@@ -528,12 +544,14 @@ def build(db_path: str, chat: str = "", task: int | None = None):
             turn, plan, sources, phrases, cities, preset, depth, max_spend,
             websites_max_spend, find_websites, classify_max_spend, areas))
 
+    from harvey.modules.job_kinds import REGS_MAX
+
     @tool("Queue a registry pull under an approved plan, as the Registry page does: filters "
           "(the registry's: words, county, locality, status, min/max_turnover, "
           "min/max_employees, unknown, employer, vat, micro) or set (a SELECT set of "
-          "'registry' registration numbers). Free; websites_max_spend for paid website "
-          "lookups of the firms it saves, classify_max_spend for the classifier, both from "
-          "the plan's budget.", queues)
+          f"'registry' registration numbers, {REGS_MAX:,} at most). Free; websites_max_spend "
+          "for paid website lookups of the firms it saves, classify_max_spend for the "
+          "classifier, both from the plan's budget.", queues)
     async def registry_pull(plan: int, filters: dict | None = None, set: int | None = None,
                             websites_max_spend: float = 0.0,
                             classify_max_spend: float = 0.0) -> str:
@@ -544,7 +562,7 @@ def build(db_path: str, chat: str = "", task: int | None = None):
             turn, plan, filters, set, websites_max_spend, classify_max_spend))
 
     @tool("Queue the contact finder under an approved plan, as Contacts → Find contacts "
-          "does: set (a filter set or a set of firms) or filter; max_spend (website searches "
+          "does: set (a set of firms: its frozen ids) or filter; max_spend (website searches "
           "and address checks, USD; 0: websites read only, free), classify_max_spend (its "
           "classifier calls; 0: none, a site no register fact settles waits), force (search "
           "again what was searched), limit. Firms with a contact already are skipped unless "
@@ -559,7 +577,7 @@ def build(db_path: str, chat: str = "", task: int | None = None):
             turn, plan, set, filter, max_spend, classify_max_spend, force, limit))
 
     @tool("Queue a verification of contacts by the classifier under an approved plan, as "
-          "Contacts → Verify does: set (a filter set or a set of contacts) or filter, "
+          "Contacts → Verify does: set (a set of contacts: its frozen ids) or filter, "
           "max_spend (what its calls may cost, USD, 0 or more), limit (200 by default, "
           f"{contact_check.MAX_LINKS:,} at most).",
           queues)
@@ -591,7 +609,8 @@ def build(db_path: str, chat: str = "", task: int | None = None):
 
     @tool("Save an audience under an approved plan, as Contacts → Salvează ca public does: a "
           f"name (at most {campaign_rules.NAME_CHARS} characters) and a filter (the Contacts "
-          "page's: email contacts only) or set (a filter set). Free. Returns its id and what a campaign would take "
+          "page's: email contacts only) or set (a filter set: its filter, read again by the "
+          "campaign as an audience is, not its frozen ids). Free. Returns its id and what a campaign would take "
           "from it, counted (ready, catch-all, to check, and what each rule leaves out: "
           "invalid or a guess, untrusted, do-not-contact, in another campaign, answered), "
           "never an address. " + FILTER_DOC + ".", writes)

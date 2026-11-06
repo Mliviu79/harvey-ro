@@ -19,8 +19,11 @@ changes a setting: those are never offered as tools.
 
 Actions take a filter (the Contacts and Companies pages' own) or a set the
 agent saved (agent_set: a filter, or one read-only SELECT of ids run
-through query()'s gate), never a list of rows: a set's ids are resolved
-here, at the action, and never returned to the model.
+through query()'s gate), never a list of rows. A set's ids are resolved
+once, when it is saved (refresh_set resolves them again), and kept in
+agent_set_member: an action reads those, following a merged firm to its
+survivor and skipping what was removed since, and never runs the filter
+or the SELECT again. The ids never reach the model: only counts.
 
 This is the one place the agent's tool server writes Harvey's database
 (besides the record of its calls): through its own StateManager, reached
@@ -30,6 +33,7 @@ only by these functions. query() stays on its read-only connection.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from urllib.parse import parse_qsl, urlencode
 
@@ -40,8 +44,17 @@ SET_KINDS = ("filter", "select")
 # What a SELECT set's one column holds: Harvey's firm ids, contact ids, or
 # the trade registry's registration numbers (reg.firms.reg).
 SET_OF = ("firms", "contacts", "registry")
+# What a filter set holds: the firms it selects (as counts() counts them),
+# or the contacts it keeps (as the Contacts page lists them).
+FILTER_OF = ("firms", "contacts")
 SET_NAME_CHARS = 80
 SETS_LIMIT = 50
+# The most ids a set holds (as many as a Find-contacts run takes): a save or
+# a refresh past it is refused with the count, and nothing of it is kept.
+SET_MAX = 50_000
+# The ids followed (firms) or checked (contacts) a statement, one JSON
+# array each: a set's size never meets SQLite's limit on variables.
+SET_CHUNK = 5_000
 
 
 def _cap(name: str, value, default: float | None = 0.0) -> float:
@@ -130,32 +143,40 @@ class Actions:
     # ── Sets ──
 
     async def save_set(self, name, filter=None, sql: str = "", of: str = "firms") -> dict:
-        """A set by a filter or by one SELECT of ids: its id and how many it
-        holds now, nothing else."""
+        """A set by a filter or by one SELECT of ids, resolved now and kept
+        as ids: its id and how many it holds, nothing else."""
         state = await self.state()
         name = " ".join(str(name or "").split())[:SET_NAME_CHARS]
         if not name:
             raise readonly.Refused("give the set a name")
         if bool(filter) == bool((sql or "").strip()):
             raise readonly.Refused("a set is a filter or a SELECT, one of the two")
+        of_ = str(of or "firms")
         if filter:
-            raw = _filter_args(filter)
-            f, args = await views._filter(state, raw)
-            n = (await asyncio.to_thread(views._with_reader, self.db_path,
-                                         lambda r: r.firm_counts(f)))["firms"]
-            kind, of_, definition = "filter", "firms", urlencode(args)
+            if of_ not in FILTER_OF:
+                raise readonly.Refused(f"a filter set holds {' or '.join(FILTER_OF)}")
+            _, args = await views._filter(state, _filter_args(filter))
+            kind, definition = "filter", urlencode(args)
         else:
-            of_ = str(of or "firms")
             if of_ not in SET_OF:
                 raise readonly.Refused(f"of is one of {', '.join(SET_OF)}")
-            values = await asyncio.to_thread(_select_values, self.db_path, sql, of_)
-            kind, definition, n = "select", readonly.check_statement(sql), len(values)
+            kind, definition = "select", readonly.check_statement(sql)
+        ids = await self._members_now(kind, of_, definition)
+        now = int(time.time())
         async with state._connect() as db:
-            cur = await db.execute(queries.sql("overlay.agent.set_add"),
-                                   (self.chat, name, kind, of_, definition, n, int(time.time())))
-            set_id = cur.lastrowid
-            await db.commit()
-        return {"set": set_id, "count": n}
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(queries.sql("overlay.agent.set_add"),
+                                       (self.chat, name, kind, of_, definition, len(ids), now,
+                                        now))
+                set_id = cur.lastrowid
+                await db.executemany(queries.sql("overlay.agent.set_member_add"),
+                                     [(set_id, v) for v in ids])
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return {"set": set_id, "count": len(ids)}
 
     async def sets(self) -> dict:
         state = await self.state()
@@ -163,8 +184,37 @@ class Actions:
             async with db.execute(queries.sql("overlay.agent.sets_chat"),
                                   (self.chat, SETS_LIMIT)) as cur:
                 rows = await cur.fetchall()
-        return {"sets": [dict(zip(("set", "name", "kind", "of", "count", "created_at"), r))
-                         for r in rows]}
+        return {"sets": [dict(zip(("set", "name", "kind", "of", "count", "created_at",
+                                   "frozen_at", "refreshed_at"), r)) for r in rows]}
+
+    async def refresh_set(self, turn: str, plan, set_id) -> dict:
+        """A set of this chat resolved again from its filter or SELECT (the
+        same bounds as a save), its ids replaced in one transaction, under
+        an approved plan of the chat: free, recorded as an action, refusals
+        too. Counts only."""
+        state = await self.state()
+        arguments = {"plan": plan, "set": set_id}
+        try:
+            plans.usable(await plans.get(state, plan), plan, self.chat)
+            s = await self._set(set_id)
+            ids = await self._members_now(s["kind"], s["of"], s["definition"])
+        except (readonly.Refused, plans.Refused, ValueError, LookupError) as e:
+            why = str(e).strip("'\"")
+            await plans.record(state, plan, self.chat, turn, "refresh_set", arguments,
+                               plans.REFUSED, why)
+            raise readonly.Refused(why) from None
+        try:
+            old = await self._keep(s["id"], ids, refreshed=True)
+        except Exception as e:
+            await plans.record(state, plan, self.chat, turn, "refresh_set", arguments,
+                               plans.ERROR, type(e).__name__)
+            raise
+        before, after = frozenset(old), frozenset(ids)
+        out = {"set": s["id"], "old_count": len(before), "count": len(after),
+               "added": len(after - before), "removed": len(before - after)}
+        await plans.record(state, plan, self.chat, turn, "refresh_set", arguments, plans.OK,
+                           f"{out['old_count']} -> {out['count']}")
+        return {"plan": int(plan), **out}
 
     async def _set(self, set_id) -> dict:
         state = await self.state()
@@ -177,12 +227,97 @@ class Actions:
                 row = await cur.fetchone()
         if row is None or row[1] != self.chat:
             raise readonly.Refused(f"no set {set_id} in this chat: sets() lists them")
-        return dict(zip(("id", "chat", "name", "kind", "of", "definition", "n", "created_at"),
-                        row))
+        return dict(zip(("id", "chat", "name", "kind", "of", "definition", "n", "created_at",
+                         "frozen_at", "refreshed_at"), row))
+
+    async def _members_now(self, kind: str, of: str, definition: str) -> list:
+        """The ids a set's filter or SELECT gives now, each once, at most
+        SET_MAX (refused past it, with how many)."""
+        if kind == "filter":
+            f, _ = await views._filter(await self.state(), dict(parse_qsl(definition)))
+            ids = await asyncio.to_thread(
+                views._with_reader, self.db_path,
+                lambda r: r.matching(f) if of == "firms" else r.contact_ids(f))
+            ids = list(dict.fromkeys(ids))
+            if len(ids) > SET_MAX:
+                raise readonly.Refused(f"the set would hold {len(ids):,}, more than "
+                                       f"{SET_MAX:,}: narrow it")
+            return ids
+        return await asyncio.to_thread(_select_values, self.db_path, definition, of, SET_MAX)
+
+    async def _keep(self, set_id: int, ids: list, *, refreshed: bool = False,
+                    unfrozen_only: bool = False) -> list:
+        """The set's ids replaced by ``ids`` and its count with them, in one
+        write transaction; returns the ids it held before. ``unfrozen_only``:
+        only while the set is still unfrozen (a set saved before schema 39,
+        frozen by its first use; two first uses keep the first's)."""
+        state = await self.state()
+        now = int(time.time())
+        async with state._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                if unfrozen_only:
+                    async with db.execute(queries.sql("overlay.agent.set"), (set_id,)) as cur:
+                        row = await cur.fetchone()
+                    if row is None or row[8] is not None:
+                        await db.rollback()
+                        return []
+                async with db.execute(queries.sql("overlay.agent.set_members"),
+                                      (set_id,)) as cur:
+                    old = [r[0] for r in await cur.fetchall()]
+                await db.execute(queries.sql("overlay.agent.set_members_clear"), (set_id,))
+                await db.executemany(queries.sql("overlay.agent.set_member_add"),
+                                     [(set_id, v) for v in ids])
+                await db.execute(queries.sql("overlay.agent.set_frozen"),
+                                 (len(ids), now, now if refreshed else None, set_id))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return old
+
+    async def _members(self, s: dict) -> list:
+        """The ids set ``s`` holds; an unfrozen one (saved before schema 39)
+        is resolved and kept first."""
+        if s["frozen_at"] is None:
+            ids = await self._members_now(s["kind"], s["of"], s["definition"])
+            await self._keep(s["id"], ids, unfrozen_only=True)
+        state = await self.state()
+        async with state._connect() as db:
+            async with db.execute(queries.sql("overlay.agent.set_members"), (s["id"],)) as cur:
+                return [r[0] for r in await cur.fetchall()]
+
+    async def _follow(self, of: str, members: list) -> tuple[list, int, int]:
+        """(the ids an action takes, how many were followed to the firm they
+        were merged into, how many were skipped): a firm id to its live
+        firm (each once), a contact id while it is on file, a registration
+        number as kept (the registry pull resolves it). In pieces of
+        SET_CHUNK, each one JSON array."""
+        if of == "registry":
+            return list(members), 0, 0
+        state = await self.state()
+        name = "overlay.read.live_of" if of == "firms" else "overlay.agent.contacts_on_file"
+        out: dict = {}
+        followed = skipped = 0
+        async with state._connect() as db:
+            for at in range(0, len(members), SET_CHUNK):
+                chunk = members[at:at + SET_CHUNK]
+                async with db.execute(queries.sql(name), (json.dumps(chunk),)) as cur:
+                    rows = await cur.fetchall()
+                found = {r[0]: r[-1] for r in rows}
+                for m in chunk:
+                    live = found.get(m)
+                    if live is None:
+                        skipped += 1
+                        continue
+                    followed += live != m
+                    out.setdefault(live, None)
+        return list(out), followed, skipped
 
     async def _resolve(self, set_id, filter, takes: str, cap: int) -> dict:
-        """What an action selects: {"filter": {...}} or {"ids": [...]} from
-        a set of this chat (resolved now) or a filter."""
+        """What an action selects: {"filter": {...}}, or {"ids": [...], "set":
+        its counts} from a set of this chat (its kept ids, followed), at
+        most ``cap`` of them."""
         if set_id not in (None, "") and filter:
             raise readonly.Refused("give a set or a filter, not both")
         if set_id in (None, ""):
@@ -195,18 +330,22 @@ class Actions:
             _, args = await views._filter(await self.state(), raw)
             return {"filter": args}
         s = await self._set(set_id)
-        if s["kind"] == "filter":
-            if takes == "registry":
-                raise readonly.Refused("a registry pull takes the registry's filters or a "
-                                       "set of registration numbers (of='registry'), not a "
-                                       "Contacts filter")
-            return {"filter": dict(parse_qsl(s["definition"]))}
+        if s["kind"] == "filter" and takes == "registry":
+            raise readonly.Refused("a registry pull takes the registry's filters or a "
+                                   "set of registration numbers (of='registry'), not a "
+                                   "Contacts filter")
         if s["of"] != takes:
+            hint = (" (save_set with the filter and of='contacts' keeps the contacts it "
+                    "selects)" if s["kind"] == "filter" else "")
             raise readonly.Refused(f"this action takes a set of {takes}; set {s['id']} holds "
-                                   f"{s['of']}")
-        values = await asyncio.to_thread(_select_values, self.db_path, s["definition"],
-                                         s["of"], cap)
-        return {"ids": values}
+                                   f"{s['of']}{hint}")
+        members = await self._members(s)
+        ids, followed, skipped = await self._follow(s["of"], members)
+        if len(ids) > cap:
+            raise readonly.Refused(f"set {s['id']} holds {len(ids):,}: this action takes at "
+                                   f"most {cap:,} (save a narrower set)")
+        return {"ids": ids, "set": {"set": s["id"], "held": len(members), "taken": len(ids),
+                                    "followed_merge": followed, "skipped_gone": skipped}}
 
     # ── Runs ──
 
@@ -314,6 +453,7 @@ class Actions:
         arguments = {"filters": filters or {}, "set": set,
                      "websites_max_spend": websites_max_spend,
                      "classify_max_spend": classify_max_spend}
+        taken: dict = {}
 
         async def prepare(state):
             source = next((s["key"] for s in discover_sources() if s["job"] == "registry_pull"),
@@ -324,10 +464,11 @@ class Actions:
                 if filters:
                     raise readonly.Refused("give the registry's filters or a set, not both")
                 chosen = await self._resolve(set, None, "registry", REGS_MAX)
+                taken.update(chosen["set"])
                 f = {"regs": [str(r) for r in chosen["ids"]]}
                 if not f["regs"]:
-                    return {"plan": int(plan), "queued": 0,
-                            "note": "the set holds no registration number now"}
+                    return {"plan": int(plan), "queued": 0, "set": chosen["set"],
+                            "note": "the set holds no registration number"}
             elif isinstance(filters, dict) and filters:
                 f = dict(filters)
                 f.pop("regs", None)
@@ -338,7 +479,7 @@ class Actions:
                     "find_websites": True, "websites_max_spend": websites_max_spend,
                     "classify_max_spend": classify_max_spend}
             return await self._discovery(state, body)
-        return await self._act(turn, "registry_pull", arguments, plan, prepare)
+        return _with_set(await self._act(turn, "registry_pull", arguments, plan, prepare), taken)
 
     async def _discovery(self, state, body: dict):
         """The Discover run's request read as /api/discover/run reads it
@@ -395,6 +536,7 @@ class Actions:
         arguments = {"set": set, "filter": filter or {}, "max_spend": max_spend,
                      "classify_max_spend": classify_max_spend, "force": bool(force),
                      "limit": limit}
+        taken: dict = {}
 
         async def prepare(state):
             cap = _cap("max_spend", max_spend)
@@ -402,6 +544,7 @@ class Actions:
             chosen = await self._resolve(set, filter, "firms", launch.FIND_MAX)
             body = {"force": bool(force), "limit": limit}
             if "ids" in chosen:
+                taken.update(chosen["set"])
                 body.update(filter={}, company_ids=[str(i) for i in chosen["ids"]])
             else:
                 body["filter"] = chosen["filter"]
@@ -419,7 +562,7 @@ class Actions:
                     state, [c["id"] for c in selected], max_spend=cap, force=bool(force),
                     classify_max_spend=classify_cap)
             return (cap, classify_cap), _find_summary(estimate), queue
-        return await self._act(turn, "find_contacts", arguments, plan, prepare)
+        return _with_set(await self._act(turn, "find_contacts", arguments, plan, prepare), taken)
 
     async def verify_contacts(self, turn: str, plan, set=None, filter=None, max_spend=0.0,
                               limit=None) -> dict:
@@ -430,6 +573,7 @@ class Actions:
         from harvey.modules.job_kinds import enqueue_contact_checks
 
         arguments = {"set": set, "filter": filter or {}, "max_spend": max_spend, "limit": limit}
+        taken: dict = {}
 
         async def prepare(state):
             cap = _cap("max_spend", max_spend)
@@ -439,6 +583,7 @@ class Actions:
             chosen = await self._resolve(set, filter, "contacts", contact_check.MAX_LINKS)
             body = {"limit": limit}
             if "ids" in chosen:
+                taken.update(chosen["set"])
                 body["contact_ids"] = [int(i) for i in chosen["ids"]]
             else:
                 body["filter"] = chosen["filter"]
@@ -457,7 +602,8 @@ class Actions:
             return (0.0, cap), {k: estimate.get(k) for k in (
                 "links", "companies", "calls", "usd_typical", "usd_high", "price_known",
                 "note")}, queue
-        return await self._act(turn, "verify_contacts", arguments, plan, prepare)
+        return _with_set(await self._act(turn, "verify_contacts", arguments, plan, prepare),
+                         taken)
 
     # ── Campaigns (outreach.py): free, through the Campaigns page's code ──
 
@@ -723,6 +869,14 @@ class Actions:
         return {"run": run, "cancelled_jobs": n}
 
 
+def _with_set(out: dict, taken: dict) -> dict:
+    """An action's answer with the counts of the set it took (held, taken,
+    followed to a merge's survivor, skipped as gone), when it took one."""
+    if taken and "set" not in out:
+        out = {**out, "set": dict(taken)}
+    return out
+
+
 def _filter_args(raw) -> dict:
     """A filter as the Contacts page's arguments: a dict, or its query
     string."""
@@ -733,34 +887,29 @@ def _filter_args(raw) -> dict:
     return {k: v for k, v in raw.items() if v is not None and v != ""}
 
 
-def _select_values(db_path: str, sql: str, of: str, cap: int | None = None) -> list:
-    """The ids a SELECT set holds now, run through query()'s gate on a
-    read-only connection: firm or contact ids (whole numbers) or
-    registration numbers (text)."""
-    from harvey import contact_check, launch
-    from harvey.modules.job_kinds import REGS_MAX
-
-    cap = cap or {"firms": launch.FIND_MAX, "contacts": contact_check.MAX_LINKS,
-                  "registry": REGS_MAX}[of]
+def _select_values(db_path: str, sql: str, of: str, cap: int) -> list:
+    """The ids a SELECT set gives now, run through query()'s gate on a
+    read-only connection, each once, at most ``cap``: firm or contact ids
+    (whole numbers) or registration numbers (text)."""
     con, _ = readonly.connect(db_path)
     try:
         values = readonly.column_values(con, sql, cap=cap)
     finally:
         con.close()
-    out = []
+    out: dict = {}
     for v in values:
         if of == "registry":
             if not isinstance(v, str) or not v.strip():
                 raise readonly.Refused("a set of='registry' selects registration numbers "
                                        "(reg.firms.reg, text)")
-            out.append(v.strip())
+            out.setdefault(v.strip(), None)
             continue
         if isinstance(v, str) and v.strip().isdigit():
             v = int(v.strip())
         if not isinstance(v, int) or isinstance(v, bool):
             raise readonly.Refused(f"a set of='{of}' selects {of[:-1]} ids (whole numbers)")
-        out.append(v)
-    return out
+        out.setdefault(v, None)
+    return list(out)
 
 
 def _find_summary(e: dict) -> dict:

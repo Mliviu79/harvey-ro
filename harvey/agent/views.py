@@ -150,7 +150,8 @@ SCHEMA_NOTES = [
     "are left out): jobs() and plan_status() give each job's error_class instead.",
     "A set for an action (save_set with sql) is one SELECT of one column: firm ids "
     "(`firm.id`, of='firms'), contact ids (`link.contact`, of='contacts') or registration "
-    "numbers (`reg.firms.reg`, of='registry').",
+    "numbers (`reg.firms.reg`, of='registry'). It is run once, when the set is saved (or "
+    "refreshed): actions take the ids it gave then.",
 ]
 
 TABLE_NOTES = {

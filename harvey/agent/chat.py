@@ -802,8 +802,9 @@ class Hub:
 
     async def delete(self, chat_id: str) -> None:
         """Delete a chat: its answer stopped and its process closed, then
-        its messages and their tool calls, and its tasks' tool calls
-        (usage_events stay: the plan's accounting). Its open plans close (a proposed one rejected, an
+        its messages and their tool calls, its tasks' tool calls and the
+        ids its sets hold (usage_events stay: the plan's accounting; the
+        sets' rows stay, as its actions' record names them). Its open plans close (a proposed one rejected, an
         approved one done: its runs finish under their caps; the plans and
         their actions stay on file). Refused while another Harvey process
         serves it."""
@@ -824,6 +825,7 @@ class Hub:
             await _write(self.state, ("overlay.agent.delete_chat_calls", (chat_id,)),
                          ("overlay.agent.delete_chat_task_calls", (chat_id,)),
                          ("overlay.agent.delete_chat_messages", (chat_id,)),
+                         ("overlay.agent.delete_chat_set_members", (chat_id,)),
                          ("overlay.agent.plans_chat_deleted", (now, now, chat_id)),
                          ("overlay.agent.delete_chat", (chat_id,)))
             self.chats.pop(chat_id, None)

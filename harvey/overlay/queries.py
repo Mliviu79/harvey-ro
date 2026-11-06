@@ -397,6 +397,10 @@ statement("overlay.read.next_paid",
           "AND (created, id) < (?, ?) AND (created, id) > (?, ?) "
           "ORDER BY created DESC, id DESC LIMIT ?",
           params=(2**62, 2**62, -1, -1, 50), scans=_WALKED)
+# The walk forgotten when a firm it passed becomes searchable again (a
+# found website taken back, a merge undone): the next one starts over.
+statement("overlay.finder.paid_walk_reset",
+          "DELETE FROM settings WHERE key = ?", params=("finder_paid_walk",))
 statement("overlay.read.searched_by",
           f"SELECT DISTINCT s.target FROM {_J} CROSS JOIN search s WHERE s.is_person = 0 "
           "AND s.target = j.value AND s.module = ? AND s.capability = ? AND s.at >= ? "
@@ -840,6 +844,12 @@ statement("overlay.agent.delete_chat_calls",
           params=("c",))
 statement("overlay.agent.delete_chat_messages",
           "DELETE FROM agent_message WHERE chat = ?", params=("c",))
+# A deleted chat's sets keep their row (an action's record names it), not
+# their ids: no action takes a set of a chat that is gone.
+statement("overlay.agent.delete_chat_set_members",
+          "DELETE FROM agent_set_member WHERE set_id IN "
+          "(SELECT id FROM agent_set INDEXED BY agent_set_chat WHERE chat = ?)",
+          params=("c",))
 statement("overlay.agent.delete_chat", "DELETE FROM agent_chat WHERE id = ?", params=("c",))
 # The chats some Harvey process has a live process for (their leases).
 statement("overlay.agent.chat_leases",
@@ -924,14 +934,34 @@ statement("overlay.agent.actions_plan",
           "FROM agent_action INDEXED BY agent_action_plan WHERE plan = ? "
           "ORDER BY id DESC LIMIT ?", params=(1, 50))
 statement("overlay.agent.set_add",
-          "INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at) "
-          "VALUES (?, ?, ?, ?, ?, ?, ?)", params=("c", "n", "filter", "firms", "{}", 0, 1))
+          "INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at, frozen_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          params=("c", "n", "filter", "firms", "{}", 0, 1, 1))
 statement("overlay.agent.set",
-          "SELECT id, chat, name, kind, of, definition, n, created_at FROM agent_set "
-          "WHERE id = ?", params=(1,))
+          "SELECT id, chat, name, kind, of, definition, n, created_at, frozen_at, refreshed_at "
+          "FROM agent_set WHERE id = ?", params=(1,))
 statement("overlay.agent.sets_chat",
-          "SELECT id, name, kind, of, n, created_at FROM agent_set INDEXED BY agent_set_chat "
+          "SELECT id, name, kind, of, n, created_at, frozen_at, refreshed_at "
+          "FROM agent_set INDEXED BY agent_set_chat "
           "WHERE chat = ? ORDER BY id DESC LIMIT ?", params=("c", 50))
+# A set's ids (schema 39): written once when it is saved or refreshed (the
+# old ones cleared first, in the same transaction), read by its primary key
+# by an action; its count and when, kept on the set.
+statement("overlay.agent.set_members",
+          "SELECT member FROM agent_set_member WHERE set_id = ?", params=(1,))
+statement("overlay.agent.set_member_add",
+          "INSERT OR IGNORE INTO agent_set_member (set_id, member) VALUES (?, ?)", params=(1, 1))
+statement("overlay.agent.set_members_clear",
+          "DELETE FROM agent_set_member WHERE set_id = ?", params=(1,))
+# (frozen_at stays the first freeze's; a refresh sets refreshed_at.)
+statement("overlay.agent.set_frozen",
+          "UPDATE agent_set SET n = ?, frozen_at = COALESCE(frozen_at, ?), refreshed_at = ? "
+          "WHERE id = ?", params=(1, 1, None, 1))
+# The contact ids of a piece of a set still on file (a removed one is
+# skipped); a firm id's live firm is overlay.read.live_of.
+statement("overlay.agent.contacts_on_file",
+          f"SELECT c.id FROM {_J} CROSS JOIN contact c WHERE c.id = j.value",
+          params=_IDS, drives="j")
 
 # ── What wakes the agent, and its memory (schema 34, harvey/agent/wakes.py,
 # memory.py) ──

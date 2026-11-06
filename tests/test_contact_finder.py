@@ -1046,3 +1046,35 @@ def test_the_background_walk_keeps_one_stretch_for_each_set_of_searches(tmp_path
     serper_walk = next(w for w in walks if len(w["searchers"]) == 1)
     # The two searched by serper stay its stretch.
     assert (serper_walk["hi"][1], serper_walk["lo"][1]) == (int(ids[2]), int(ids[1]))
+
+
+def test_a_walk_forgotten_while_it_reads_is_not_written_back(tmp_path):
+    """A found website taken back or a merge undone while next_paid reads
+    forgets the walk (Store.forget_paid_walk): the stretch that read
+    gives isn't kept over it, so the next walk starts over."""
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        serper = finder.searchers({"serper"}, ENV)
+        old = await _company(s, name="EXEMPLU VECHI SRL", location="Iasi, Iasi, Romania")
+        new = await _company(s, name="EXEMPLU NOU SRL", location="Iasi, Iasi, Romania")
+        await s.record_search("company", new, "serper", serper[0].capability)
+        first = await finder.next_paid(s, 1, serper)
+        kept = await s.get_setting(finder.PAID_WALK_KEY)
+        real = s.read
+
+        async def forgotten_meanwhile(name, *a):
+            out = await real(name, *a)
+            if name == "next_paid":
+                with sqlite3.connect(db) as con:
+                    con.execute("DELETE FROM settings WHERE key = ?", (finder.PAID_WALK_KEY,))
+            return out
+        s.read = forgotten_meanwhile
+        await s.record_search("company", old, "serper", serper[0].capability)
+        second = await finder.next_paid(s, 1, serper)
+        return old, first, kept, second, await s.get_setting(finder.PAID_WALK_KEY)
+
+    old, first, kept, second, after = run(go())
+    assert first == [old] and kept and second == []
+    assert not after

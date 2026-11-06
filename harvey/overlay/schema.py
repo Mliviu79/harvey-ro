@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 38).
+"""The overlay's tables (harvey.db schema 39).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 38
+LATEST = 39
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1164,11 +1164,40 @@ def _to_38(con: sqlite3.Connection) -> None:
     _script(con, triggers.CHANGES)
 
 
+# ── Schema 39: the agent's sets, frozen as ids ──
+
+SCHEMA_39 = """
+-- The ids an agent_set holds (harvey/agent/actions.py): resolved once from
+-- its filter or SELECT when it is saved (or refreshed), and read by every
+-- action that takes it; the filter or SELECT is never run again by an
+-- action. member: a firm id, a contact id or a registration number, as the
+-- set's of says (no type: an id stays an integer, a number its text).
+CREATE TABLE agent_set_member (
+  set_id INTEGER NOT NULL, member NOT NULL,
+  PRIMARY KEY (set_id, member)
+) WITHOUT ROWID;
+-- frozen_at: when its members were resolved (n how many; NULL: a set saved
+-- before, resolved by the first action or refresh that takes it);
+-- refreshed_at: its last refresh_set.
+ALTER TABLE agent_set ADD COLUMN frozen_at INTEGER;
+ALTER TABLE agent_set ADD COLUMN refreshed_at INTEGER;
+"""
+
+
+def _to_39(con: sqlite3.Connection) -> None:
+    """Schema 39: agent_set_member and the sets' frozen_at and refreshed_at.
+    A set saved before stays unfrozen (frozen_at NULL): its filter or
+    SELECT reads the registers and the clock query() runs on, which a
+    schema step has neither of, so the first action or refresh_set that
+    takes it resolves it, as an action did before, and keeps its ids."""
+    _script(con, SCHEMA_39)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
-         (37, _to_37), (38, _to_38))
+         (37, _to_37), (38, _to_38), (39, _to_39))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

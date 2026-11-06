@@ -843,6 +843,7 @@ class Store:
                (fid, batch, int(time.time()), json.dumps(payload, ensure_ascii=False)))
         self.record_search("company", fid, "contact_finder", "judge_site", looked_for="website",
                            outcome="nothing", batch_id="", detail=(detail or f"not {host}")[:500])
+        self.forget_paid_walk()
         return {"removed": len(evidence), "contacts": len(dropped["contacts"]),
                 "contacts_kept": dropped["contacts_kept"], "people": len(dropped["persons"]),
                 "keys": len(dropped["keys"]), "searches": len(withdrawn)}
@@ -1705,7 +1706,18 @@ class Store:
         # An undo says the merge was wrong, not that they are two
         # companies: the pair goes back on the list.
         self._decide(row[1], fid, "pending")
+        self.forget_paid_walk()
         return {"survivor": str(row[1]), "merged": str(fid), "merge_id": row[0]}
+
+    def forget_paid_walk(self) -> None:
+        """The background's paid walk (finder.next_paid) starts over: a firm
+        it passed as done can be searched again (its found website taken
+        back, so its lookup no longer counts; a merged record live again),
+        which its kept stretch would skip until the walk's daily reset."""
+        from harvey.finder import PAID_WALK_KEY
+        from harvey.queries import sql
+
+        self.x(sql("overlay.finder.paid_walk_reset"), (PAID_WALK_KEY,))
 
     def undo_group(self, company_id) -> list[dict]:
         fid = self.firm(company_id)

@@ -66,6 +66,7 @@ EXCLUDED_TABLES = {
     "agent_tool_call": "the record of the agent's own calls",
     "agent_plan": "the agent's own plans: plan_status() reads them",
     "agent_set": "the agent's own saved sets: sets() lists them",
+    "agent_set_member": "the ids the agent's sets hold: an action reads them, never the model",
     "agent_action": "the record of the agent's own actions: plan_status() reads them",
     "agent_event": "what wakes the agent: plan_status() counts them",
     "agent_note": "the agent's own notes: notes() reads them",
@@ -523,7 +524,8 @@ def column_values(con: sqlite3.Connection, sql: str, *, cap: int,
     and clock as a query() (an agent's saved set, resolved server side:
     the values never reach the model). Refused for anything a query()
     refuses, a statement with more than one column, or more than ``cap``
-    rows. Repeats are kept once, in order."""
+    distinct values (with how many it returns, counted on the same clock,
+    when that count finishes in time). Repeats are kept once, in order."""
     text = check_statement(sql)
     seen: dict = {}
     with _Clock(con, seconds) as clock:
@@ -531,16 +533,36 @@ def column_values(con: sqlite3.Connection, sql: str, *, cap: int,
             cur = con.execute(text)
             if len(cur.description or ()) != 1:
                 raise Refused("a set's SELECT returns one column (the ids)")
+            column = cur.description[0][0]
             for (value,) in cur:
                 if value is None:
                     continue
                 seen.setdefault(value, None)
                 if len(seen) > cap:
-                    raise Refused(f"the set holds more than {cap:,}: narrow it")
+                    cur.close()
+                    seen.clear()
+                    n = _distinct(con, text, column, clock.late)
+                    raise Refused((f"the set would hold {n:,}, more than {cap:,}" if n
+                                   else f"the set holds more than {cap:,}") + ": narrow it")
             cur.close()
         except (sqlite3.Error, sqlite3.Warning) as e:
             raise clock.refusal(e) from None
     return list(seen)
+
+
+def _distinct(con, text: str, column: str, late: list) -> int | None:
+    """How many distinct values (NULL left out) a one-column ``text``
+    returns, or None when counting them takes longer than the clock
+    leaves."""
+    name = '"' + str(column).replace('"', '""') + '"'
+    try:
+        # (A newline before the parenthesis: a trailing -- comment stays one.)
+        n = con.execute(f"SELECT COUNT({name}) FROM (SELECT DISTINCT * FROM ({text}\n))"
+                        ).fetchone()[0]
+    except sqlite3.Error:
+        late.clear()
+        return None
+    return int(n)
 
 
 def _total(con, text: str, params, late: list) -> dict:

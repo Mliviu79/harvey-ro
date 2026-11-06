@@ -1898,6 +1898,11 @@ class Reader:
             return None
         return self.one("SELECT id FROM contact_kinds WHERE kind = ?", (kind,))
 
+    def contact_ids(self, f) -> list[int]:
+        """Every contact the Contacts page's filter keeps (as contact_counts
+        counts them), in no particular order: an agent's set, frozen."""
+        return self._contact_ids(f, self.firm_set(f), self.predicates(f))
+
     def _contact_ids(self, f, s: FirmSet | None, p: dict, only=None) -> list[int]:
         """Every contact the filter keeps; ``only`` (contact ids): of those,
         the ones it keeps, read by their ids and their firms' (a rolling

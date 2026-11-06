@@ -1381,15 +1381,18 @@ async def next_paid(state, limit: int, available: list[Searcher] | None = None) 
     if not available:
         return []
     # (Where the walk got to: overlay.reads.Reader.next_paid.)
+    kept = await state.get_setting(PAID_WALK_KEY)
     try:
-        walks = json.loads(await state.get_setting(PAID_WALK_KEY) or "[]")
+        walks = json.loads(kept or "[]")
     except (TypeError, ValueError):
         walks = []
     walks = [w for w in walks if isinstance(w, dict)] if isinstance(walks, list) else []
     sig = paid_walk_searchers(available)
     walk = next((w for w in walks if w.get("searchers") == sig), None)
     ids, after = await state.read("next_paid", int(limit), available, walk)
-    if after != walk:
+    # (Forgotten meanwhile, Store.forget_paid_walk: the stretch read from it
+    # may have passed a firm searchable again, so the next walk starts over.)
+    if after != walk and await state.get_setting(PAID_WALK_KEY) == kept:
         rest = [w for w in walks if w.get("searchers") != after.get("searchers")]
         await state.set_setting(PAID_WALK_KEY, json.dumps([after, *rest][:PAID_WALKS]))
     return ids

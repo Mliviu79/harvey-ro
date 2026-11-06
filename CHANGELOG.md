@@ -9,6 +9,19 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The agent's sets are frozen at save.** A set the agent saves, by a
+  filter or by a SELECT, is resolved once and kept as its ids (schema 39,
+  `agent_set_member`), at most 50,000 (past that it is refused with the
+  count and nothing is kept). Every action that takes it acts on exactly
+  those ids, what the user saw counted: a firm merged since is taken as
+  the firm it was merged into, a contact removed since is skipped, and the
+  action's answer counts both. A filter set can now hold contacts too, for
+  a verification (a filter set of firms is no longer taken there: save the
+  filter again with `of='contacts'`). The new `refresh_set` action, free
+  and under an approved plan, resolves a set again and says how many ids
+  were added and removed. Sets saved before are resolved by their first
+  use. Deleting a chat drops the ids its sets hold.
+
 - **Each campaign keeps its candidates, and a rolling campaign reads only
   what changed.** Every address a campaign's filter matched is kept as
   decided (schema 38, `campaign_candidate`): a member, or left out with
@@ -1388,6 +1401,11 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **The background's paid walk sees a firm that became searchable again
+  at once.** Taking a found website back, or undoing a merge, now makes
+  the walk over companies with no website start over, instead of passing
+  those firms until its daily reset.
 
 - **Settings fits a phone.** A settings row (the background-search card
   among them) no longer sizes its text to its content on a narrow screen,
