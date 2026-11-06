@@ -1563,7 +1563,7 @@ async def set_brain(request: Request):
     and with no model (a blank one leaves the pick to a catalog that can
     hide it); a login the panel doesn't offer is refused unless it is the
     one already set, and an API key's login until a key is saved
-    (/api/brain/key)."""
+    (/api/brain/key) and while neither USD cap is set (brain_spend.NO_CAP)."""
     from harvey import brain_auth
     from harvey.config import BRAIN_KEYS, ConfigError, set_brain_settings
     try:
@@ -1602,6 +1602,12 @@ async def set_brain(request: Request):
     if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
         return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key first: "
                        "paste it in the key box.", 409)
+    if auth == brain_auth.API_KEY and not any(
+            (values[k] if k in values else getattr(current, k, None)) not in (None, "")
+            for k in ("usd_per_day", "usd_per_month")):
+        # (Billed per token, a cap is what the brain stops at: brain_spend.)
+        return _refuse("Set a USD cap for the day or the month: on an API key Harvey stops "
+                       "its calls at it, and makes none without one.", 400)
     try:
         path = set_brain_settings(values, _resolve_config_file())
     except ConfigError as e:
@@ -5049,7 +5055,9 @@ async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0
     if not before:
         # (The newest messages shown: its wake answers are read.)
         await chat.mark_read(state, chat_id)
-    return {**found, "plans": await plans.for_chat(state, chat_id),
+    from harvey import brain_spend
+    return {**found, "plans": await plans.for_chat(
+                state, chat_id, billed=brain_spend.api_key(_active_brain())),
             "refused": chat.refusal(_load_config_quietly())}
 
 
@@ -5906,6 +5914,27 @@ async def get_today():
                                                " (the agent's lane is paused)"),
                 "action": "Open the Queue", "tab": "queue",
             })
+
+        # With an API key, approved plans with no budget: their wakes and
+        # tasks wait, since a run's model calls cost money (one item for
+        # them all; each plan's card says it too).
+        from harvey import brain_spend
+        if brain_spend.api_key(_active_brain()):
+            from harvey.agent import plans as agent_plans
+            free = [p["id"] for p in await agent_plans.listed(state, status=agent_plans.APPROVED,
+                                                              limit=500)
+                    if p["budget_usd"] <= agent_plans.EPSILON]
+            if free:
+                stats["agent_free_plans"] = len(free)
+                items.append({
+                    "key": "agent-free-plans", "tone": "note", "plans": free,
+                    "title": f"{len(free)} approved plan(s) with a $0 budget get no wakes or tasks",
+                    "detail": ("On an API key the agent's own model calls are billed, and a wake "
+                               "or a task holds what it may cost of its plan's budget first: a "
+                               "plan with none can't. The agent can still act under it when you "
+                               "chat; ask it for a plan with a budget for work between visits."),
+                    "action": "Open Chat", "tab": "chat",
+                })
 
         # Campaign addresses waiting for a check the spend rules refuse.
         from harvey import campaigns

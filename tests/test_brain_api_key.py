@@ -145,10 +145,17 @@ def test_the_claude_key_is_checked_saved_under_harveys_name_and_never_echoed(
     # The generic .env editor can't write it.
     client.post("/api/settings/env", json={brain_auth.CLAUDE_KEY_ENV: "sk-ant-other"})
     assert brain_auth.claude_key() == FAKE_KEY
-    # Now API-key mode can be chosen, with caps.
+    # Now API-key mode can be chosen, with a cap: never without one.
+    r = client.post("/api/brain", json={"auth": "api_key", "usd_per_day": "",
+                                        "usd_per_month": ""})
+    assert r.status_code == 400 and "Set a USD cap" in r.json()["message"]
+    assert not (client.dir / "harvey.local.yaml").exists()
     r = client.post("/api/brain", json={"auth": "api_key", "usd_per_day": "2.5",
                                         "usd_per_month": ""})
     assert r.status_code == 200, r.text
+    # (Clearing the last cap later is refused the same way.)
+    r = client.post("/api/brain", json={"usd_per_day": ""})
+    assert r.status_code == 400 and "Set a USD cap" in r.json()["message"]
     saved = load_brain_config(str(client.dir / "harvey.local.yaml"))
     assert (saved.auth, saved.usd_per_day, saved.usd_per_month) == ("api_key", 2.5, None)
     shown = client.get("/api/brain").json()
@@ -190,7 +197,7 @@ def test_the_codex_key_goes_to_codex_and_unlink_removes_its_file(client, monkeyp
     assert client.get("/api/brain").json()["key_set"] == {"claude": False, "codex": True}
     r = client.post("/api/brain", json={"provider": "codex", "model": "gpt-6-luna",
                                         "auth": "api_key", "codex_usd_per_mtok_in": "1.25",
-                                        "codex_usd_per_mtok_out": "10"})
+                                        "codex_usd_per_mtok_out": "10", "usd_per_month": "20"})
     assert r.status_code == 200, r.text
     assert client.delete("/api/brain/key?provider=codex").json()["auth"] == "terminal"
     assert not (brain_auth.account_dir("codex") / "auth.json").exists()
@@ -234,24 +241,62 @@ def test_the_key_is_injected_only_in_api_key_mode(monkeypatch, tmp_path):
 
 # ── The brain's USD caps ──
 
+class _Stdin:
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class _Proc:
+    """A stand-in Claude CLI: ``events`` (stream-json lines) then a result
+    costing ``cost``; read whole (communicate) or a line at a time (the
+    metered read of API-key mode), where it stops writing once killed."""
     returncode = 0
 
-    def __init__(self, cost):
+    def __init__(self, cost, events=()):
         self.cost = cost
+        self.killed = False
+        result = {"type": "result", "result": "ok", "session_id": "s", "num_turns": 1,
+                  "total_cost_usd": cost, "usage": {"input_tokens": 100, "output_tokens": 10}}
+        self.lines = [json.dumps(e).encode() + b"\n" for e in [*events, result]]
+        self.stdin = _Stdin()
+        proc = self
+
+        class Out:
+            async def read(self, n=-1):
+                if proc.killed or not proc.lines:
+                    return b""
+                return proc.lines.pop(0)
+
+        class Err:
+            async def read(self):
+                return b""
+        self.stdout, self.stderr = Out(), Err()
 
     async def communicate(self, data=None):
-        return (json.dumps({"type": "result", "result": "ok", "session_id": "s",
-                            "num_turns": 1, "total_cost_usd": self.cost,
-                            "usage": {"input_tokens": 100, "output_tokens": 10}}).encode(), b"")
+        return b"".join(self.lines), b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
 
 
-def _calls(monkeypatch, cost=0.25):
+def _calls(monkeypatch, cost=0.25, events=()):
     started = []
 
     async def fake_exec(*cmd, **kwargs):
         started.append(kwargs["env"])
-        return _Proc(cost)
+        proc = _Proc(cost, events)
+        started.append(proc)
+        return proc
     monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
     return started
 
@@ -272,10 +317,121 @@ async def test_a_cap_reached_refuses_the_call_before_it_is_made(state, monkeypat
     assert await brain.is_within_budget(max_percent=80) is False
     assert "USD cap for the day ($0.50" in brain.budget_why and "$0.55 spent" in brain.budget_why
     assert await brain.think("hi", max_retries=0) == ""
-    assert len(started) == 1                              # the second call never started
+    assert len(started) == 2                              # the second call never started
     # A month cap counts the same rows; 0 is no calls at all.
     zero = Brain(state, BrainConfig(auth="api_key", usd_per_month=0))
     assert await zero.is_within_budget() is False and "for the month" in zero.budget_why
+
+
+@pytest.mark.asyncio
+async def test_api_key_mode_with_no_cap_makes_no_call(state, monkeypatch):
+    # (A harvey.local.yaml written by hand loads, but nothing is billed
+    # without a cap to stop at.)
+    started = _calls(monkeypatch)
+    brain = Brain(state, BrainConfig(auth="api_key"))
+    assert await brain.is_within_budget() is False and brain.budget_why == brain_spend.NO_CAP
+    assert await brain.think("hi", max_retries=0) == "" and started == []
+    assert "set a USD cap" in await brain_spend.refusal(state, brain.config)
+    assert await brain_spend.refusal(state, BrainConfig(usd_per_day=None)) == ""   # subscription
+
+
+@pytest.mark.asyncio
+async def test_a_brain_call_is_stopped_at_what_is_left_of_its_cap(state, monkeypatch):
+    # $0.30 left of $0.50: the stream's second model call (Opus 5.5 rates,
+    # 100k fresh input = $0.40) passes it, so the CLI is ended there, no
+    # retry is made, and what the stream counted is charged.
+    await _spent(state, 0.2)
+    events = [{"type": "stream_event", "event": {"type": "message_start", "message": {
+                   "id": "m1", "model": "claude-opus-5-5",
+                   "usage": {"input_tokens": 10_000, "output_tokens": 1}}}},
+              {"type": "stream_event", "event": {"type": "message_start", "message": {
+                   "id": "m2", "model": "claude-opus-5-5",
+                   "usage": {"input_tokens": 100_000, "output_tokens": 1}}}},
+              {"type": "assistant", "message": {"id": "m2", "content": [
+                   {"type": "text", "text": "never read"}]}}]
+    started = _calls(monkeypatch, cost=0.9, events=events)
+    brain = Brain(state, BrainConfig(auth="api_key", usd_per_day=0.5))
+    assert await brain.think("hi", max_retries=3) == ""
+    proc = started[1]
+    assert proc.killed and len(started) == 2                       # one call, no retry
+    assert "stopped at the brain's USD cap" in brain.budget_why and "$0.30" in brain.budget_why
+    async with state._connect() as db:
+        async with db.execute("SELECT source, cost_usd FROM usage_events WHERE agent = '' "
+                              "ORDER BY id") as c:
+            rows = await c.fetchall()
+    # (Its result never came: counted at least at what the stream counted,
+    # $0.04 + $0.40, here less than a turn's bound.)
+    assert rows[-1][0] == "api_key_estimate" and rows[-1][1] >= 0.44 - 1e-9
+    assert await brain.is_within_budget() is False
+
+
+@pytest.mark.asyncio
+async def test_a_metered_call_reads_a_reply_longer_than_a_streams_line_limit(state, monkeypatch):
+    # (A real pipe: a stream-json line holding a whole reply passes the
+    # 64 KiB a StreamReader's readline() takes, which failed every call.)
+    import sys
+
+    reply = "x" * 200_000
+    script = ("import json, sys\nsys.stdin.read()\nr = 'x' * 200_000\n"
+              "print(json.dumps({'type': 'assistant', 'message': {'id': 'm1', "
+              "'model': 'claude-sonnet-5-5', 'content': [{'type': 'text', 'text': r}], "
+              "'usage': {'input_tokens': 10, 'output_tokens': 10}}}))\n"
+              "print(json.dumps({'type': 'result', 'result': r, 'session_id': 's', "
+              "'num_turns': 1, 'total_cost_usd': 0.01, 'usage': {'input_tokens': 10}}))\n")
+    real = asyncio.create_subprocess_exec
+
+    async def fake_exec(*cmd, **kwargs):
+        kwargs.pop("env", None)
+        return await real(sys.executable, "-c", script, **kwargs)
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
+    brain = Brain(state, BrainConfig(auth="api_key", usd_per_day=5.0))
+    assert await brain.think("hi", max_retries=0) == reply
+    assert await brain_spend.spent(state, "day") == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_started_call_that_fails_mid_read_is_still_counted(state, monkeypatch):
+    class Breaks(_Proc):
+        def __init__(self):
+            super().__init__(0.1)
+
+            class Out:
+                async def read(self, n=-1):
+                    raise RuntimeError("pipe broke")
+            self.stdout = Out()
+
+    async def fake_exec(*cmd, **kwargs):
+        return Breaks()
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
+    brain = Brain(state, BrainConfig(auth="api_key", model="sonnet", usd_per_day=5.0))
+    assert await brain.think("hi", max_retries=0) == ""
+    one = await brain_spend.run_worst_usd(state, brain.config, 1)
+    assert one > 0 and await brain_spend.spent(state, "day") == pytest.approx(one)
+
+
+def test_runs_side_by_side_share_what_is_left_of_the_cap():
+    # (Three chats at once used to each get the whole room: $1 left, each
+    # could spend $1.)
+    cfg = BrainConfig(auth="api_key", model="sonnet", usd_per_day=5.0)
+    row = brain_spend.price_row("sonnet")
+    per_call = 200_000 * row["input"] / 1e6                     # $0.40
+
+    def call(mid):
+        return {"type": "stream_event", "event": {"type": "message_start", "message": {
+            "id": mid, "usage": {"input_tokens": 200_000}}}}
+    first = brain_spend.Meter(cfg, room=1.0)
+    assert first.feed(call("a1")) is False                      # $0.40 in flight
+    # A run starting now gets what is left less what is in flight...
+    second = brain_spend.Meter(cfg, room=1.0)
+    assert second.room == pytest.approx(1.0 - per_call)
+    assert second.feed(call("b1")) is False                     # $0.80 together
+    # ...and either one stops once the runs together reach it.
+    assert first.feed(call("a2")) is True and first.why == "cap"
+    assert second.feed({"type": "keep_alive"}) is True
+    # A closed run (its cost recorded) is no longer taken off a new one's room.
+    first.close()
+    second.close()
+    assert brain_spend.Meter(cfg, room=1.0).room == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
@@ -308,8 +464,9 @@ async def test_on_a_subscription_the_caps_and_money_dont_apply(state, monkeypatc
 async def test_codex_is_priced_from_its_tokens_or_refused_under_a_cap_with_no_price(state):
     cfg = BrainConfig(provider="codex", model="gpt-6-luna", auth="api_key", usd_per_day=1.0)
     assert await brain_spend.refusal(state, cfg) == brain_spend.NO_PRICE
-    # No cap: an unpriced Codex call runs (and counts nothing).
-    assert await brain_spend.refusal(state, cfg.model_copy(update={"usd_per_day": None})) == ""
+    # No cap: no call at all (there is nothing to stop at).
+    assert await brain_spend.refusal(state, cfg.model_copy(
+        update={"usd_per_day": None})) == brain_spend.NO_CAP
     priced = cfg.model_copy(update={"codex_usd_per_mtok_in": 1.25, "codex_usd_per_mtok_out": 10})
     assert await brain_spend.refusal(state, priced) == ""
     brain = Brain(state, priced)
@@ -347,6 +504,12 @@ async def test_an_unpriced_codex_calls_tokens_count_once_a_price_is_entered(stat
 class _TimedOut:
     returncode = None
 
+    def __init__(self):
+        class Hangs:
+            async def read(self, n=-1):
+                await asyncio.sleep(3600)
+        self.stdin, self.stdout, self.stderr = _Stdin(), Hangs(), Hangs()
+
     async def communicate(self, data=None):
         await asyncio.sleep(3600)
 
@@ -363,9 +526,10 @@ async def test_a_claude_call_that_times_out_with_an_api_key_is_counted_never_zer
     async def fake_exec(*cmd, **kwargs):
         return _TimedOut()
     monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
-    brain = Brain(state, BrainConfig(auth="api_key", usd_per_day=1.0))
+    brain = Brain(state, BrainConfig(auth="api_key", usd_per_day=5.0))
     assert await brain.think("hi", max_retries=0, timeout=0.05) == ""
-    assert await brain_spend.spent(state, "day") == pytest.approx(brain_spend.TURN_USD_FLOOR)
+    one = await brain_spend.run_worst_usd(state, brain.config, 1)
+    assert one > 0 and await brain_spend.spent(state, "day") == pytest.approx(one)
     # On a subscription a timed-out call records nothing, as before.
     sub = Brain(state, BrainConfig())
     assert await sub.think("hi", max_retries=0, timeout=0.05) == ""
@@ -377,23 +541,37 @@ async def test_a_claude_call_that_times_out_with_an_api_key_is_counted_never_zer
 @pytest.mark.asyncio
 async def test_a_result_with_tokens_and_no_cost_is_counted_at_a_turns_bound(state, monkeypatch):
     _calls(monkeypatch, cost=None)
-    brain = Brain(state, BrainConfig(auth="api_key"))
+    brain = Brain(state, BrainConfig(auth="api_key", model="sonnet", usd_per_day=5.0))
     assert await brain.think("hi", max_retries=0) == "ok"
-    assert await brain_spend.spent(state, "day") == pytest.approx(brain_spend.TURN_USD_FLOOR)
+    one = await brain_spend.run_worst_usd(state, brain.config, 1)
+    assert await brain_spend.spent(state, "day") == pytest.approx(one)
     # (Not the turn costs a wake's worst case is learnt from.)
-    assert await brain_spend.per_turn_usd(state, brain.config) == brain_spend.TURN_USD_FLOOR
+    assert await brain_spend.per_turn_usd(state, brain.config) == pytest.approx(
+        brain_spend.turn_bound_usd(brain.config)[1])
 
 
-def test_a_runs_worst_case_is_its_turns_at_the_most_a_turn_cost(tmp_path):
+def test_a_runs_worst_case_is_its_turns_at_its_models_prices(tmp_path):
     state = StateManager(str(tmp_path / "harvey.db"))
     run(state.init_db())
-    claude = BrainConfig(auth="api_key")
-    assert run(brain_spend.run_worst_usd(state, claude, 12)) == pytest.approx(
-        12 * brain_spend.TURN_USD_FLOOR)
+    # Sonnet 5.5's row ($2 in, $10 out, $4 an hour's cache write, $0.20 a
+    # read): the first turn writes 60k, each turn reads 60k, writes 20k and
+    # writes out 4k.
+    claude = BrainConfig(auth="api_key", model="sonnet")
+    first, turn = brain_spend.turn_bound_usd(claude)
+    assert first == pytest.approx(60_000 * 4.0 / 1e6)
+    assert turn == pytest.approx((60_000 * 0.2 + 20_000 * 4.0 + 4_000 * 10.0) / 1e6)
+    assert run(brain_spend.run_worst_usd(state, claude, 12)) == pytest.approx(first + 12 * turn)
+    # (An Opus-class turn is dearer than the old flat $0.10 bound.)
+    assert brain_spend.turn_bound_usd(claude.model_copy(update={"model": "opus"}))[1] > 0.10
+    # A blank or unknown model is priced at each price's dearest, never less.
+    dearest = brain_spend.turn_bound_usd(claude.model_copy(update={"model": ""}))
+    assert dearest == brain_spend.turn_bound_usd(claude.model_copy(update={"model": "x-9"}))
+    assert dearest[1] >= max(brain_spend.turn_bound_usd(claude.model_copy(
+        update={"model": r["model"]}))[1] for r in brain_spend.price_table()["models"])
     # A dearer turn seen in the last days raises it.
-    run(state.record_usage_event(agent="agent", task="wake", cost_usd=0.9, num_turns=3,
+    run(state.record_usage_event(agent="agent", task="wake", cost_usd=1.5, num_turns=3,
                                  source="api_key"))
-    assert run(brain_spend.run_worst_usd(state, claude, 12)) == pytest.approx(12 * 0.3)
+    assert run(brain_spend.run_worst_usd(state, claude, 12)) == pytest.approx(first + 12 * 0.5)
     codex = BrainConfig(provider="codex", model="m", auth="api_key")
     assert run(brain_spend.run_worst_usd(state, codex, 8)) is None
     codex = codex.model_copy(update={"codex_usd_per_mtok_in": 2.0, "codex_usd_per_mtok_out": 8.0})
@@ -492,3 +670,184 @@ def test_the_agents_codex_runner_takes_the_key_codex_saved(monkeypatch):
     terminal = type("C", (), {"brain": BrainConfig(provider="codex", model="m")})()
     monkeypatch.setattr(codex, "check_native_auth", lambda home, api=False: home)
     assert run(driver.check(terminal)).api_key is False
+
+
+# ── The price table and the meter ──
+
+def test_the_price_table_is_dated_sourced_and_resolves_aliases_and_ids():
+    table = brain_spend.price_table()
+    assert table["checked"] and table["source"].startswith("https://")
+    fields = set(brain_spend.PRICE_FIELDS)
+    assert all(fields <= set(r) and all(r[k] > 0 for k in fields) for r in table["models"])
+    opus = brain_spend.price_row("opus")
+    assert opus["model"] == table["aliases"]["opus"] and "unknown" not in opus
+    # A dated, a [1m] or a provider-prefixed id is its family's row; the
+    # longest one wins (5.5 is not 5).
+    assert brain_spend.price_row("claude-opus-5-5-20261101")["model"] == "claude-opus-5-5"
+    assert brain_spend.price_row("claude-opus-5[1m]")["model"] == "claude-opus-5"
+    assert brain_spend.price_row("anthropic.claude-sonnet-5-5")["model"] == "claude-sonnet-5-5"
+    for unknown in ("", "claude-next", "claude-opus-55"):
+        row = brain_spend.price_row(unknown)
+        assert row.get("unknown") and all(
+            row[k] == max(r[k] for r in table["models"]) for k in fields)
+
+
+def test_a_claude_calls_cost_counts_each_field_and_the_cache_by_its_lifetime():
+    row = brain_spend.price_row("sonnet")
+    usage = {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000,
+             "cache_creation_input_tokens": 3_000_000, "output_tokens": 1_000_000,
+             "cache_creation": {"ephemeral_5m_input_tokens": 1_000_000,
+                                "ephemeral_1h_input_tokens": 1_000_000}}
+    # (The write the split doesn't name is priced at the hour's.)
+    assert brain_spend.claude_usd(usage, "sonnet") == pytest.approx(
+        row["input"] + row["cache_read"] + row["cache_write_5m"] + 2 * row["cache_write_1h"]
+        + row["output"])
+    no_split = {"cache_creation_input_tokens": 1_000_000}
+    assert brain_spend.claude_usd(no_split, "sonnet") == pytest.approx(row["cache_write_1h"])
+
+
+def test_the_meter_counts_each_call_once_and_its_streamed_output():
+    cfg = BrainConfig(auth="api_key", model="sonnet")
+    row = brain_spend.price_row("sonnet")
+    meter = brain_spend.Meter(cfg, limit=1.0)
+    start = {"type": "stream_event", "event": {"type": "message_start", "message": {
+        "id": "m1", "model": "claude-sonnet-5-5", "usage": {"input_tokens": 100_000}}}}
+    assert meter.feed(start) is False
+    # The same call seen again (its assistant event) isn't counted twice.
+    meter.feed({"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 100_000},
+                                                 "content": []}})
+    assert meter.cost == pytest.approx(100_000 * row["input"] / 1e6)
+    # Output not reported yet counts from what it streamed (3 chars a token).
+    meter.feed({"type": "stream_event", "event": {"type": "content_block_delta",
+                                                  "delta": {"type": "text_delta",
+                                                            "text": "x" * 30_000}}})
+    assert meter.cost == pytest.approx((100_000 * row["input"] + 10_000 * row["output"]) / 1e6)
+    # Its reported output, once larger, takes over; a second call adds up.
+    meter.feed({"type": "stream_event", "event": {"type": "message_delta",
+                                                  "usage": {"output_tokens": 20_000}}})
+    before = meter.cost
+    assert before == pytest.approx((100_000 * row["input"] + 20_000 * row["output"]) / 1e6)
+    meter.feed({"type": "stream_event", "event": {"type": "message_start", "message": {
+        "id": "m2", "usage": {"input_tokens": 500_000}}}})
+    assert meter.cost == pytest.approx(before + 500_000 * row["input"] / 1e6)
+    assert meter.reached is True and meter.limit == 1.0
+    # No limit: counted, never reached; a run that costs nothing never
+    # reaches a limit of 0.
+    free = BrainConfig(provider="codex", auth="api_key", codex_usd_per_mtok_in=0,
+                       codex_usd_per_mtok_out=0)
+    zero = brain_spend.Meter(free, 0.0)
+    assert zero.feed({"type": "usage", "tokens": {"input_tokens": 10**6}}) is False
+
+
+def test_the_codex_meter_counts_the_thread_less_the_live_process_baseline():
+    cfg = BrainConfig(provider="codex", model="m", auth="api_key",
+                      codex_usd_per_mtok_in=2.0, codex_usd_per_mtok_out=10.0)
+    # (A live chat's process: its earlier answers' tokens aren't this one's.)
+    baseline = {"m": {"inputTokens": 400_000, "cacheReadInputTokens": 100_000,
+                      "cacheCreationInputTokens": 0, "outputTokens": 50_000}}
+    meter = brain_spend.Meter(cfg, 1.0, baseline=baseline)
+    meter.feed({"type": "usage", "tokens": {"input_tokens": 600_000, "cache_read_tokens": 100_000,
+                                            "cache_creation_tokens": 0, "output_tokens": 60_000}})
+    assert meter.cost == pytest.approx((200_000 * 2.0 + 10_000 * 10.0) / 1e6)
+    assert not meter.reached
+    meter.feed({"type": "usage", "tokens": {"input_tokens": 1_000_000, "cache_read_tokens": 100_000,
+                                            "cache_creation_tokens": 0, "output_tokens": 60_000}})
+    assert meter.reached
+
+
+def test_the_agents_codex_driver_writes_the_threads_tokens_for_the_meter():
+    from harvey.agent import driver
+
+    proc = driver.CodexProcess.__new__(driver.CodexProcess)
+    proc.thread_id, proc._turn_id, proc._done_turns, proc._token_usage = "thr", "", set(), None
+    got = []
+    proc._put = got.append
+    proc._on("thread/tokenUsage/updated", {"threadId": "thr", "tokenUsage": {
+        "total": {"inputTokens": 1200, "cachedInputTokens": 200, "outputTokens": 40}}})
+    assert got == [{"type": "usage", "provider": "codex", "tokens": {
+        "input_tokens": 1000, "cache_read_tokens": 200, "cache_creation_tokens": 0,
+        "output_tokens": 40}}]
+
+
+# ── A provider switch keeps what still applies ──
+
+def test_a_provider_switch_keeps_the_login_only_where_it_applies(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(brain_auth, "ENV_FILE", env_file)
+    monkeypatch.delenv(brain_auth.CLAUDE_KEY_ENV, raising=False)
+    monkeypatch.setattr(brain_auth, "AUTH_DIR", tmp_path / "auth")
+    assert brain_auth.carried_auth("terminal", "codex") == ("terminal", "")
+    assert brain_auth.carried_auth("account", "claude") == ("account", "")
+    auth, why = brain_auth.carried_auth("api_key", "claude")
+    assert auth == "terminal" and "No Claude API key is saved" in why
+    env_file.write_text(f"{brain_auth.CLAUDE_KEY_ENV}={FAKE_KEY}\n", encoding="utf-8")
+    assert brain_auth.carried_auth("api_key", "claude") == ("api_key", "")
+    assert brain_auth.carried_auth("api_key", "codex")[0] == "terminal"
+
+
+def test_train_with_another_provider_keeps_the_key_mode_caps_and_prices(monkeypatch, capsys):
+    from harvey import cli
+    import harvey.config as config_mod
+    import harvey.trainer as trainer_mod
+
+    saved = BrainConfig(provider="claude", model="sonnet", auth="api_key", usd_per_day=3.0,
+                        codex_usd_per_mtok_in=1.25, codex_usd_per_mtok_out=10.0)
+    monkeypatch.setattr(config_mod, "load_brain_config", lambda *a: saved)
+    used = []
+
+    class FakeTrainer:
+        def __init__(self, brain_config=None):
+            used.append(brain_config)
+
+        async def train(self, url, max_pages=100):
+            return None
+    monkeypatch.setattr(trainer_mod, "Trainer", FakeTrainer)
+    args = type("A", (), {"url": "https://example.com", "max_pages": 5, "provider": "codex",
+                          "model": "gpt-6-luna", "reasoning_effort": None})()
+    monkeypatch.setattr(brain_auth, "key_set", lambda p: p == "codex")
+    cli.cmd_train(args)
+    [cfg] = used
+    assert (cfg.provider, cfg.model, cfg.auth) == ("codex", "gpt-6-luna", "api_key")
+    assert (cfg.usd_per_day, cfg.codex_usd_per_mtok_in, cfg.codex_usd_per_mtok_out) == (
+        3.0, 1.25, 10.0)
+    # No key for the provider switched to: the terminal login, said.
+    monkeypatch.setattr(brain_auth, "key_set", lambda p: False)
+    cli.cmd_train(args)
+    assert used[-1].auth == "terminal" and used[-1].usd_per_day == 3.0
+    assert "No Codex API key is saved" in capsys.readouterr().out
+
+
+# ── The plan card and Today ──
+
+def test_the_plan_card_and_today_say_a_free_plan_gets_no_runs_on_a_key(client, monkeypatch):
+    from harvey.agent import plans
+
+    state = StateManager(str(client.dir / "harvey.db"))
+
+    async def go():
+        async with state._connect() as db:
+            await db.execute("INSERT INTO agent_chat (id, title, created_at, last_at) "
+                             "VALUES ('c1', 'Test', 1, 1)")
+            await db.commit()
+        ids = []
+        for budget in (0.0, 2.0):
+            p = await plans.propose(state, "c1", "t0", "A fictional goal", ["One step"],
+                                    budget, 72)
+            await plans.decide(state, p["id"], True, plans.BY_DASHBOARD, budget_usd=budget)
+            ids.append(p["id"])
+        return ids
+    free, paid = run(go())
+    monkeypatch.setattr(dash, "_active_brain",
+                        lambda: BrainConfig(auth="api_key", usd_per_day=3.0))
+    cards = {p["id"]: p for p in client.get("/api/agent/chats/c1/messages").json()["plans"]}
+    assert cards[free]["billed"] and cards[free]["no_runs"] is True
+    assert cards[paid]["no_runs"] is False and cards[paid]["agent_usd"] == 0
+    today = client.get("/api/today").json()
+    [item] = [i for i in today["items"] if i["key"] == "agent-free-plans"]
+    assert item["plans"] == [free] and today["stats"]["agent_free_plans"] == 1
+    # On a subscription neither says anything.
+    monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig())
+    cards = client.get("/api/agent/chats/c1/messages").json()["plans"]
+    assert not any("no_runs" in p or "billed" in p for p in cards)
+    assert not [i for i in client.get("/api/today").json()["items"]
+                if i["key"] == "agent-free-plans"]

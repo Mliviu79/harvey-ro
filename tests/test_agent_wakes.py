@@ -42,7 +42,8 @@ CHAT = "chat-w"
 # logged-out CLI's result, loop tool calls until interrupted, die exits
 # with an error, hang never answers, stream streams partial text and never
 # ends, closes closes its own plan (close_plan, as the agent's tool does)
-# then answers. FAKE_COST: what its result says the run cost. Every message
+# then answers. FAKE_COST: what its result says the run cost; FAKE_INPUT:
+# the fresh input tokens each model call reports as it starts. Every message
 # is logged (FAKE_CLI_LOG) as one JSON line.
 FAKE = r'''
 import json, os, select, sys
@@ -87,7 +88,8 @@ def tool_round(n, k):
     from harvey.agent import tools
     mid = f"m{n}-{k}"
     out({"type": "stream_event", "event": {"type": "message_start", "message": {
-        "id": mid, "usage": {"input_tokens": 900, "cache_read_input_tokens": 100}}}})
+        "id": mid, "usage": {"input_tokens": int(os.environ.get("FAKE_INPUT", "900")),
+                             "cache_read_input_tokens": 100}}}})
     out({"type": "assistant", "message": {"id": mid, "content": [
         {"type": "tool_use", "id": f"t{n}-{k}", "name": "mcp__harvey__plan_status",
          "input": {"plan": 1}}]}})
@@ -418,8 +420,10 @@ def test_the_wakes_answer_lands_in_the_chat_with_why_it_woke(state, fake):
 # ── A wake billed to an API key (brain.auth: api_key, harvey/brain_spend.py) ──
 
 def _api_key_config(monkeypatch, **brain):
+    # (Sonnet's prices: a wake's worst case is 12 turns at its row.)
     cfg = _config()
-    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", **brain})
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", "model": "sonnet",
+                                             "usd_per_day": 50.0, **brain})
     monkeypatch.setattr(chat, "_config", lambda: cfg)
     return cfg
 
@@ -429,6 +433,7 @@ def test_an_api_key_wakes_cost_goes_into_its_job_and_its_plans_money(state, fake
 
     _api_key_config(monkeypatch)
     monkeypatch.setenv("FAKE_COST", "0.42")
+    worst = _run(brain_spend.run_worst_usd(state, chat._config().brain, chat.MAX_TURNS))
     plan_id = _plan(state, budget=5.0)
     _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
     held = {}
@@ -441,8 +446,8 @@ def test_an_api_key_wakes_cost_goes_into_its_job_and_its_plans_money(state, fake
     monkeypatch.setattr(plans, "hold_run", watch)
     job = _work_wake(state)
     assert job.status == "done"
-    # Held before it ran: its worst case (12 turns at the default turn bound).
-    assert held["usd"] == pytest.approx(chat.MAX_TURNS * brain_spend.TURN_USD_FLOOR)
+    # Held before it ran: its worst case (12 turns at the model's prices).
+    assert held["usd"] == pytest.approx(worst) and 0.10 * chat.MAX_TURNS < worst < 5.0
     assert held["money"]["committed_usd"] == pytest.approx(held["usd"])
     # What it really cost: into its job, the plan's money and the day's spend.
     assert job.actual_cost == pytest.approx(0.42)
@@ -467,12 +472,12 @@ def test_an_api_key_wake_that_dies_with_no_result_is_charged_never_zero(state, f
     plan_id = _plan(state, budget=5.0)
     _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
     job = _work_wake(state)
-    assert job.actual_cost == pytest.approx(brain_spend.TURN_USD_FLOOR)
-    assert _run(plans.money(state, plan_id))["spent_usd"] == pytest.approx(
-        brain_spend.TURN_USD_FLOOR)
+    one = _run(brain_spend.run_worst_usd(state, chat._config().brain, 1))
+    assert one > 0 and job.actual_cost == pytest.approx(one)
+    assert _run(plans.money(state, plan_id))["spent_usd"] == pytest.approx(one)
     assert _q(state, "SELECT source, cost_usd FROM usage_events") == [
-        ("api_key_estimate", pytest.approx(brain_spend.TURN_USD_FLOOR))]
-    assert _run(brain_spend.spent(state, "day")) == pytest.approx(brain_spend.TURN_USD_FLOOR)
+        ("api_key_estimate", pytest.approx(one))]
+    assert _run(brain_spend.spent(state, "day")) == pytest.approx(one)
 
 
 def test_on_a_subscription_a_wake_that_dies_costs_nothing(state, fake, monkeypatch):
@@ -485,15 +490,18 @@ def test_on_a_subscription_a_wake_that_dies_costs_nothing(state, fake, monkeypat
 
 
 def test_an_api_key_wake_waits_when_its_plan_cant_cover_its_worst_case(state, fake, monkeypatch):
+    from harvey import brain_spend
+
     _api_key_config(monkeypatch)
-    plan_id = _plan(state, budget=1.0)           # less than 12 turns at $0.10
+    worst = _run(brain_spend.run_worst_usd(state, chat._config().brain, chat.MAX_TURNS))
+    plan_id = _plan(state, budget=1.0)           # less than its worst case
     _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
     other = _plan(state, budget=5.0, chat_id="chat-w2")
     _run(wakes.note(state, other, "reply", "r2", {"intent": "interested"}))
     job = _work_wake(state)
     # Not run, not failed: queued again for later, no try used, its job says why.
     assert job.status == "queued" and job.attempts == 0
-    assert "budget can't cover it" in job.error and "$1.20" in job.error
+    assert "budget can't cover it" in job.error and f"${worst:.2f}" in job.error
     assert fake() == []                                           # the CLI never started
     assert _q(state, "SELECT COUNT(*) FROM usage_events") == [(0,)]
     # Its plan's, not the lane's: the agent's lane doesn't rest, and another
@@ -510,6 +518,57 @@ def test_an_unpriced_codex_key_never_starts_a_wake(state, fake, monkeypatch):
     job = _work_wake(state)
     assert job.status == "queued" and "no price entered" in job.error
     assert fake() == []
+
+
+def test_an_api_key_wake_is_stopped_at_its_hold_and_says_so_in_its_chat(
+        state, fake, monkeypatch):
+    # (Each model call starts with 500k fresh input at Sonnet's $2 a
+    # million: $1 a call, so the second passes the wake's hold.)
+    from harvey import brain_spend
+
+    _api_key_config(monkeypatch)
+    monkeypatch.setenv("FAKE_WAKE", "loop")
+    monkeypatch.setenv("FAKE_INPUT", "500000")
+    monkeypatch.setenv("FAKE_COST", "2.1")
+    worst = _run(brain_spend.run_worst_usd(state, chat._config().brain, chat.MAX_TURNS))
+    assert 1.0 < worst < 2.0
+    plan_id = _plan(state, budget=5.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    # Ended as Stop ends it, not failed: its events read, its chat told why.
+    assert job.status == "done" and job.result["stopped"] == "budget"
+    # (Stopped as its second model call started: one turn finished.)
+    assert job.result["turns"] == 1
+    [(status, text, unread)] = _q(state, "SELECT m.status, m.text, c.unread FROM agent_message m "
+                                         "JOIN agent_chat c ON c.id = m.chat")
+    assert status == "error:budget" and f"${worst:.2f}" in text and unread == 1
+    assert _q(state, "SELECT seen_at IS NOT NULL FROM agent_event") == [(1,)]
+    # What it cost (the CLI's result after the interrupt) is charged.
+    assert job.actual_cost == pytest.approx(2.1)
+    assert _run(plans.money(state, plan_id))["agent_usd"] == pytest.approx(2.1)
+
+
+def test_an_api_key_wake_is_stopped_at_the_brains_cap_when_less_is_left_than_its_hold(
+        state, fake, monkeypatch):
+    # (A plan's budget covers the wake's hold, but only $1 is left of the
+    # brain's day cap: $0.60 a model call, so the second call passes the
+    # cap, well before the hold.)
+    from harvey import brain_spend
+
+    _api_key_config(monkeypatch, usd_per_day=1.0)
+    monkeypatch.setenv("FAKE_WAKE", "loop")
+    monkeypatch.setenv("FAKE_INPUT", "300000")
+    monkeypatch.setenv("FAKE_COST", "1.2")
+    worst = _run(brain_spend.run_worst_usd(state, chat._config().brain, chat.MAX_TURNS))
+    assert worst > 1.5
+    plan_id = _plan(state, budget=5.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    assert job.status == "done" and job.result["stopped"] == "budget"
+    assert job.result["turns"] == 1
+    [(status, text)] = _q(state, "SELECT status, text FROM agent_message")
+    assert status == "error:budget" and "brain's USD cap" in text and "$1.00" in text
+    assert job.actual_cost == pytest.approx(1.2)
 
 
 def test_on_a_subscription_a_wake_holds_and_costs_nothing(state, fake, monkeypatch):

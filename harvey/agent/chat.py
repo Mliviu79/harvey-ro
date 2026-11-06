@@ -30,7 +30,11 @@ never drive the same chat, while different chats run side by side.
 Each answer has at most MAX_TURNS turns, counted here whatever the CLI's
 own --max-turns counts; Stop and the turn limit ask the CLI to interrupt (a
 control request) and end the process when no result follows within
-STOP_GRACE_SECONDS. A failed or stopped answer can be retried: the same
+STOP_GRACE_SECONDS. With an API key (harvey/brain_spend.py) an answer is
+also stopped that way when what it has cost, counted from its stream,
+reaches what was left of the brain's day and month caps when it started
+(``budget``: the text it wrote kept with why). A failed or stopped answer
+can be retried: the same
 message again in the same chat, the earlier attempt kept on file as
 ``retried`` (harvey agent log shows it; the Chat tab shows the retry).
 
@@ -108,7 +112,7 @@ STOPPED = "stopped"
 OK = "ok"
 # An answer that is an error says which (the dashboard says it in its own
 # words); its text is the detail, in English.
-ERRORS = ("login", "max_turns", "failed", "timeout", "stopped")
+ERRORS = ("login", "max_turns", "failed", "timeout", "stopped", "budget")
 # Why a message (or a change to a chat) is refused before anything is
 # written.
 REFUSALS = ("empty", "too_long", "codex", "budget", "busy", "elsewhere", "cli", "full",
@@ -591,6 +595,9 @@ class Answer:
         self.done = False
         self.stop_reason = ""
         self.stopping = asyncio.Event()
+        # With an API key: its meter (brain_spend.Meter), stopped at what was
+        # left of the brain's caps when it started.
+        self.meter = None
         self._changed = asyncio.Condition()
 
     async def emit(self, event: dict) -> None:
@@ -622,6 +629,17 @@ class Answer:
 
 
 _STOP, _TIMEOUT = object(), object()
+
+
+def _budget_detail(answer: Answer) -> str:
+    """An answer stopped at the brain's USD caps: why, then the text it
+    wrote before (kept, as the user saw it)."""
+    meter = answer.meter
+    left = meter.line if meter is not None else 0.0
+    why = (f"stopped at the brain's USD cap: ${left:.2f} was left of it when the answer "
+           "started (brain.usd_per_day / usd_per_month)")
+    written = "".join(e.get("text") or "" for e in answer.events if e.get("type") == "text")
+    return why + ("\n\n" + written.strip() if written.strip() else "")
 
 
 def _usage_delta(now: dict, before: dict) -> dict:
@@ -1025,6 +1043,12 @@ class Live:
                     await self.close_process(kill=True)
                 raise
             answer = Answer(self.chat_id, turn)
+            if getattr(brain, "api_key", False):
+                from harvey import brain_spend
+
+                answer.meter = brain_spend.Meter(
+                    brain.config, room=await brain_spend.room(self.state, brain.config),
+                    baseline=self.last_usage)
             self.answer = answer
             await answer.emit({"type": "start", "chat": self.chat_id})
             self._task = asyncio.ensure_future(self._answer(answer, missed + text, brain, fresh))
@@ -1110,6 +1134,9 @@ class Live:
         try:
             await self._make(answer, text, brain, fresh)
         finally:
+            if answer.meter is not None:
+                # (Its cost is recorded: no longer in flight.)
+                answer.meter.close()
             await self._end_stream(answer)
 
     async def _make(self, answer: Answer, text: str, brain, fresh: bool) -> None:
@@ -1187,6 +1214,12 @@ class Live:
                 elif kind == "result":
                     result = event
                     break
+                meter = answer.meter
+                if meter is not None and not answer.stopping.is_set() and meter.feed(event):
+                    # (What was left of the brain's caps is reached: stopped
+                    # as Stop does it, what it wrote kept.)
+                    meter.stopped = True
+                    answer.stop("budget")
             await self._emit_calls(answer, last_call)
         except asyncio.CancelledError:
             ended = ended or "stopped"
@@ -1254,8 +1287,9 @@ class Live:
             detail = {"stopped": "stopped before the answer was finished",
                       "max_turns": f"stopped after {MAX_TURNS} turns without an answer",
                       "timeout": f"no answer after {ANSWER_TIMEOUT_SECONDS} s",
+                      "budget": _budget_detail(answer),
                       "failed": "the chat's process was taken over"}.get(ended, "")
-            code = ended if ended in ("stopped", "max_turns", "timeout") else "failed"
+            code = ended if ended in ("stopped", "max_turns", "timeout", "budget") else "failed"
             # (No result: the process is gone, was ended, or is no longer to
             # be trusted mid-answer. Reaped, its folders removed and the
             # lease let go now, its stderr read to the end; the next message
@@ -1276,10 +1310,11 @@ class Live:
         payload = result
         subtype = str(payload.get("subtype") or "")
         response = str(payload.get("result") or "").strip()
-        if ended in ("stopped", "max_turns", "timeout"):
+        if ended in ("stopped", "max_turns", "timeout", "budget"):
             detail = {"stopped": "stopped before the answer was finished",
                       "max_turns": f"stopped after {MAX_TURNS} turns without an answer",
-                      "timeout": f"no answer after {ANSWER_TIMEOUT_SECONDS} s"}[ended]
+                      "timeout": f"no answer after {ANSWER_TIMEOUT_SECONDS} s",
+                      "budget": _budget_detail(answer)}[ended]
             await self._finish(answer, brain, payload, ended, detail, turns, started)
         elif subtype == "error_max_turns":
             await self._finish(answer, brain, payload, "max_turns",
@@ -1315,7 +1350,8 @@ class Live:
                     {"usage": {}, "num_turns": turns, "is_error": True,
                      "duration_ms": int((time.monotonic() - started) * 1000)},
                     agent="agent", task="chat", label=answer.turn,
-                    unknown_turns=min(MAX_TURNS, int(turns or 0) + 1))
+                    unknown_turns=min(MAX_TURNS, int(turns or 0) + 1),
+                    at_least=answer.meter.cost if answer.meter is not None else 0.0)
             else:
                 delta = _usage_delta(payload.get("modelUsage") or {}, self.last_usage)
                 if isinstance(payload.get("modelUsage"), dict):

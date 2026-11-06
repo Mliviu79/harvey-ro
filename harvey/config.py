@@ -612,7 +612,8 @@ class BrainConfig(BaseModel):
     Harvey's own calls may cost, checked before each one. Claude's CLI
     reports each call's cost; Codex's doesn't, so its calls are priced
     from ``codex_usd_per_mtok_in`` / ``_out`` (USD per million tokens),
-    and with a cap set and no price they don't run.
+    and with no price they don't run. With no cap set no API-key call is
+    made at all (brain_spend.NO_CAP).
     """
 
     provider: str = "claude"

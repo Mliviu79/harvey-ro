@@ -273,6 +273,10 @@ def _run(state, work, timeout=60):
     return asyncio.run(main())
 
 
+def _run_async(coro):
+    return asyncio.run(coro)
+
+
 async def _say(h, chat_id, text):
     """Send ``text`` to a chat (None: a new one) and follow the answer to
     its end: its events (the chat's id is on the first)."""
@@ -773,6 +777,28 @@ def test_an_answer_stops_at_its_turn_limit_whatever_the_cli_counts(state, fake, 
     # The CLI's own limit says the same.
     events = _run(state, lambda h: _say(h, None, "TURNS"))
     assert events[-1]["code"] == "max_turns"
+
+
+def test_with_an_api_key_an_answer_stops_at_what_is_left_of_the_brains_cap(
+        state, fake, monkeypatch):
+    # (Each model call of the stand-in: 1,000 fresh input, 500 read and 100
+    # written to the cache at Sonnet's prices, $0.0025; $0.006 is left, so
+    # the third call passes it.)
+    from harvey import brain_spend
+
+    cfg = _config()
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", "model": "sonnet",
+                                             "usd_per_day": 0.006})
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    events = _run(state, lambda h: _say(h, None, "LOOP"))
+    end = events[-1]
+    assert end["type"] == "error" and end["code"] == "budget"
+    assert "stopped at the brain's USD cap: $0.01 was left" in end["detail"]
+    assert len([e for e in events if e["type"] == "tool_use"]) == 2
+    [(status, text)] = _q(state, "SELECT status, text FROM agent_message WHERE role = 'agent'")
+    assert status == "error:budget" and text == end["detail"]
+    # Charged (its result had tokens and no cost: never $0).
+    assert _run_async(brain_spend.spent(state, "day")) > 0
 
 
 def test_a_process_with_no_message_closes_and_lets_the_chat_go(state, fake, monkeypatch):

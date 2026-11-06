@@ -1181,6 +1181,7 @@ function todayItemText(it, stats) {
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
+    case 'agent-free-plans': return tr(t('today.item.agent_free_plans', {n: s.agent_free_plans || 0}), t('today.item.agent_free_plans_detail'), t('today.item.agent_free_plans_action'));
     case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
     case 'campaign-checks': return tr(t('today.item.campaign_checks', {n: s.campaign_checks_waiting || 0}),
       checksHeldText(it.code, it.detail), t('today.item.campaign_checks_action'));
@@ -5232,6 +5233,10 @@ async function saveModel() {
     showToast(t('model.key_needed'), 'error');
     return;
   }
+  if (body.auth === 'api_key' && !String(body.usd_per_day ?? '').trim() && !String(body.usd_per_month ?? '').trim()) {
+    showToast(t('model.cap_needed'), 'error');
+    return;
+  }
   _modelBusy = true;
   try {
     if (body.auth === 'api_key' && key) {
@@ -7277,6 +7282,10 @@ function renderPlanCard(p) {
   if (p.status !== 'proposed' && p.status !== 'rejected') {
     html += '<div class="small plan-money">' + escHtml(t('chat.plan.money', {committed: fmtUsd(p.committed_usd || 0, 2),
       spent: fmtUsd(p.spent_usd || 0, 2), budget: fmtUsd(p.budget_usd, 2), remaining: fmtUsd(p.remaining_usd || 0, 2)})) + '</div>';
+    // (On an API key the agent's own model calls are money: their line, and
+    // why a plan with no budget gets no wakes or tasks.)
+    if (p.billed) html += '<div class="small muted plan-agent-usd">' + escHtml(t('chat.plan.agent_usd', {usd: fmtUsd(p.agent_usd || 0, 4)})) + '</div>';
+    if (p.no_runs) html += '<div class="small plan-no-runs">' + escHtml(t('chat.plan.no_runs')) + '</div>';
     const runs = (p.runs || []).filter(r => r.batch_id);
     if (runs.length) {
       html += '<div class="plan-runs"><div class="muted small">' + escHtml(t('chat.plan.runs')) + '</div><ul>' + runs.map(r =>
@@ -7568,7 +7577,7 @@ function wakeLabel(w) {
   return parts.join('; ') || t('chat.wake.woken');
 }
 
-const CHAT_ERRORS = {login: 1, max_turns: 1, failed: 1, timeout: 1, stopped: 1};
+const CHAT_ERRORS = {login: 1, max_turns: 1, failed: 1, timeout: 1, stopped: 1, budget: 1};
 const CHAT_REFUSALS = {empty: 1, too_long: 1, codex: 1, budget: 1, busy: 1, elsewhere: 1, cli: 1,
                        full: 1, missing: 1, retry: 1, waking: 1};
 

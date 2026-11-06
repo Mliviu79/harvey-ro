@@ -144,10 +144,17 @@ def cmd_train(args):
         }
         if overrides:
             if "provider" in overrides and overrides["provider"] != brain_config.provider:
-                # A different provider never inherits the other one's model
-                # (the brain's USD caps stay: they are the install's).
-                caps = {k: getattr(brain_config, k) for k in ("usd_per_day", "usd_per_month")}
-                brain_config = BrainConfig(**overrides, **caps)
+                # A different provider never inherits the other one's model;
+                # its login stays when it still applies (an API key only
+                # with one saved for it), and so do the USD caps and Codex's
+                # prices (brain_auth.carried_auth, CARRIED_MONEY).
+                from harvey import brain_auth
+
+                auth, why = brain_auth.carried_auth(brain_config.auth, overrides["provider"])
+                if why:
+                    print(f"  {why}")
+                money = {k: getattr(brain_config, k) for k in brain_auth.CARRIED_MONEY}
+                brain_config = BrainConfig(**overrides, auth=auth, **money)
             else:
                 brain_config = BrainConfig(**{**brain_config.model_dump(), **overrides})
     except (ConfigError, ValidationError) as e:

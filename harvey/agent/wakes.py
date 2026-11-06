@@ -34,7 +34,9 @@ Before each wake: the plan's share (is_within_budget, of the Claude plan
 or the ChatGPT plan, or with an API key the brain's USD caps: over it, the
 lane rests and the wake waits), the driver usable (its CLI, its login),
 with an API key its worst case held of its plan's budget and the install's
-spend limits (brain_spend.hold_run: else it waits too), and the chat's
+spend limits (brain_spend.hold_run: else it waits too; a run that reaches
+its hold as it streams is stopped there, its chat saying so with what it
+wrote: brain_spend.Meter), and the chat's
 lease: while a live chat process holds it (the user is in that chat), the
 wake waits and tries a little later, which is no failure. A logged-out CLI pauses the agent's
 lane until the user resumes it; a spent quota rests it, with the reason on
@@ -520,7 +522,8 @@ async def run(ctx) -> dict:
         await hold(state, why, BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=BUDGET_RETRY_SECONDS)
     exe = await runner(config, "wakes")
-    await hold_cost(ctx, plan_id, brain, config, chat.MAX_TURNS, "wake")
+    held_usd = await hold_cost(ctx, plan_id, brain, config, chat.MAX_TURNS, "wake")
+    meter = await _meter(state, brain, held_usd)
     owner = OWNER_PREFIX + ctx.job.id
     lease = chat._lease(plan["chat"])
     if not await acquire_lease(state, owner, chat.LEASE_TTL_SECONDS, lease):
@@ -536,15 +539,18 @@ async def run(ctx) -> dict:
         payload, turns, usage, ended, err, exit_code = await _ask(
             state, exe, plan["chat"], content, getattr(getattr(config, "brain", None),
                                                        "model", "") or "", calling,
-            stop=getattr(ctx, "stop_reason", None), auth=driver.auth(config))
+            stop=getattr(ctx, "stop_reason", None), auth=driver.auth(config), meter=meter)
     except asyncio.CancelledError:
         # (Cut off, by the worker's shutdown: its process is ended, and a
         # call it made counts all the same.)
         if calling.get("started"):
             try:
-                await asyncio.shield(_charge_cut_off(ctx, brain, calling, started, turn))
+                await asyncio.shield(_charge_cut_off(ctx, brain, calling, started, turn,
+                                                     meter=meter))
             except Exception:
                 pass
+        if meter is not None:
+            meter.close()
         raise
     finally:
         keeper.cancel()
@@ -552,8 +558,11 @@ async def run(ctx) -> dict:
             await _write(state, "overlay.agent.chat_turn_if", ("", plan["chat"], turn))
         finally:
             await release_lease(state, owner, lease)
-    tokens, cost = await _record(state, brain, payload, turns, started, turn)
+    tokens, cost = await _record(state, brain, payload, turns, started, turn,
+                                 at_least=meter.cost if meter else 0.0)
     await brain_spend.charge(ctx, brain.config, cost)
+    if meter is not None:
+        meter.close()
     stop = getattr(ctx, "stop_reason", None)
     if ended != "stopped" and stop is not None and await stop():
         # (Asked to stop after its last poll, while its answer came in: it
@@ -569,33 +578,66 @@ async def run(ctx) -> dict:
     response = str((payload or {}).get("result") or "").strip()
     answered = payload is not None and not payload.get("is_error") and bool(response) \
         and not ended
-    if not answered:
+    if not answered and ended != "budget":
         await no_answer(state, payload, response, err, ended, exit_code,
                         provider=_provider_of(exe))
     await state.delete_setting(HOLD_KEY)
     why_woke = label(events)
     quiet = answered and silent(response)
     if not quiet:
-        # (The turn limit: the chat says the wake stopped, its events read.)
-        status = "ok" if answered else "error:max_turns"
-        text = response if answered else (
-            f"stopped after {chat.MAX_TURNS} turns without an answer")
+        # (The turn limit, or its hold reached: the chat says the wake
+        # stopped, with what it wrote, its events read.)
+        if answered:
+            status, text = "ok", response
+        elif ended == "budget":
+            status, text = "error:budget", budget_text(meter, plan_id, calling.get("text"))
+        else:
+            status, text = "error:max_turns", (
+                f"stopped after {chat.MAX_TURNS} turns without an answer")
         now = _now()
         context = chat.context_of(payload, usage)
         async with state._connect() as db:
             cur = await db.execute(queries.sql("overlay.agent.add_wake"),
                                    (turn, text, status, plan["chat"], now, now, tokens, context,
                                     json.dumps(why_woke, ensure_ascii=False), plan["chat"]))
-            if status == "ok" and cur.rowcount:
+            if status in ("ok", "error:budget") and cur.rowcount:
                 await db.execute(queries.sql("overlay.agent.chat_unread_add"),
                                  (now, plan["chat"]))
             await db.commit()
     await _write(state, "overlay.agent.events_seen",
                  (_now(), turn, json.dumps([e["id"] for e in events])))
     await ctx.say(f"  plan {plan_id}: {len(events)} event(s), "
-                  + ("nothing to say" if quiet else "answered in its chat"))
-    return {"plan": plan_id, "chat": plan["chat"], "turn": turn, "events": len(events),
-            "silent": quiet, "turns": turns, "tokens": tokens, "label": why_woke["label"]}
+                  + ("nothing to say" if quiet else
+                     f"stopped at {meter.line:.2f} USD ({meter.why})" if ended == "budget"
+                     else "answered in its chat"))
+    out = {"plan": plan_id, "chat": plan["chat"], "turn": turn, "events": len(events),
+           "silent": quiet, "turns": turns, "tokens": tokens, "label": why_woke["label"]}
+    if ended == "budget":
+        out["stopped"] = "budget"
+    return out
+
+
+async def _meter(state, brain, held_usd: float):
+    """With an API key, the meter a wake or a task runs under: stopped at
+    its hold or at what is left of the brain's day and month caps, the
+    first reached (brain_spend.Meter). None on a subscription."""
+    if not brain.api_key:
+        return None
+    return brain_spend.Meter(brain.config, held_usd,
+                             room=await brain_spend.room(state, brain.config))
+
+
+def budget_text(meter, plan_id: int, written: str = "") -> str:
+    """What a run stopped by its meter says (the chat's message, a task's
+    problem): why, then what it wrote before (masked where it is kept)."""
+    if meter.why == "cap":
+        why = (f"stopped at the brain's USD cap: ${meter.line:.2f} was left of it when the "
+               "run started (brain.usd_per_day / usd_per_month)")
+    else:
+        why = (f"stopped at its budget: the run reached the ${meter.line:.2f} it held of "
+               f"plan {int(plan_id)}'s budget")
+    written = (written or "").strip()
+    return why + ("\n\n" + written if written else "")
 
 
 def turn_limit(payload, ended: str) -> bool:
@@ -655,7 +697,7 @@ async def _keep(state, owner: str, lease: str) -> None:
 async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                calling: dict | None = None, stop=None, *, task: int | None = None,
                max_turns: int | None = None, timeout: float = TIMEOUT_SECONDS,
-               auth: str = "terminal"):
+               auth: str = "terminal", meter=None):
     """One message to a new CLI process and its answer: (the result or
     None, turns, the last model call's usage, how it ended early or "",
     stderr's tail, the exit code). At most ``max_turns`` turns
@@ -664,7 +706,10 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
     task's tools only (tasks.py). ``auth``: the login (brain.auth). ``calling`` is told when the process
     started and its turns so far. ``stop()`` (the job's stop_reason) is
     asked every STOP_POLL_SECONDS: when it says to stop, the CLI is ended
-    at once and it ends "stopped"."""
+    at once and it ends "stopped". ``meter`` (brain_spend.Meter, API-key
+    mode) is fed every event: when it reaches the run's hold, the CLI is
+    interrupted as at the turn limit and it ends "budget". ``calling``
+    keeps the text the run wrote so far (``text``)."""
     calling = {} if calling is None else calling
     from harvey.agent import chat, driver
     from harvey.modules import jobs
@@ -679,6 +724,7 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                                  f"{e}") from None
     calling["started"] = True
     turns, ids, usage, ended, result = 0, set(), None, "", None
+    written, streaming = [], []
     deadline = time.monotonic() + timeout
     # (Asked on a clock, not only when the stream goes quiet: a wake that
     # streams without a pause is stopped all the same.)
@@ -713,9 +759,14 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
             if kind == "stream_event":
                 e = event.get("event") or {}
                 if e.get("type") == "message_start":
+                    streaming.clear()
                     u = (e.get("message") or {}).get("usage")
                     if isinstance(u, dict) and isinstance(u.get("input_tokens"), (int, float)):
                         usage = u
+                delta = e.get("delta") or {}
+                if e.get("type") == "content_block_delta" and delta.get("type") == "text_delta" \
+                        and isinstance(delta.get("text"), str):
+                    streaming.append(delta["text"])
             elif kind == "assistant":
                 message = event.get("message") or {}
                 u = message.get("usage")
@@ -727,6 +778,12 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
                     calling["turns"] = turns
                     if mid:
                         ids.add(mid)
+                texts = [b["text"] for b in message.get("content") or []
+                         if isinstance(b, dict) and b.get("type") == "text"
+                         and isinstance(b.get("text"), str) and b["text"].strip()]
+                if texts:
+                    written.extend(texts)
+                    streaming.clear()
             elif kind == "user" and turns >= max_turns:
                 ended = "max_turns"
                 result = await _interrupted(proc)
@@ -738,7 +795,14 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
             elif kind == "result":
                 result = event
                 break
+            if meter is not None and meter.feed(event):
+                meter.stopped = True
+                ended = "budget"
+                result = await _interrupted(proc)
+                break
     finally:
+        calling["text"] = "\n\n".join(written + (["".join(streaming)] if streaming else [])
+                                      ).strip()
         if reading is not None:
             reading.cancel()
         if result is None:
@@ -797,12 +861,13 @@ async def _interrupted(proc) -> dict | None:
 
 
 async def _charge_cut_off(ctx, brain, calling: dict, started: float, turn: str,
-                          task: str = "wake", limit: int = 0) -> None:
+                          task: str = "wake", limit: int = 0, meter=None) -> None:
     """A run cut off mid-call (the worker's shutdown): the call counted, and
     with an API key what it may have cost (a turn's bound for each turn it
-    was in) charged to its job, so its next try's hold and its plan see it."""
+    was in, never less than its stream counted) charged to its job, so its
+    next try's hold and its plan see it."""
     _, cost = await _record(ctx.state, brain, None, calling.get("turns", 0), started, turn,
-                            task=task, limit=limit)
+                            task=task, limit=limit, at_least=meter.cost if meter else 0.0)
     await brain_spend.charge(ctx, brain.config, cost)
 
 
@@ -826,13 +891,14 @@ async def hold_cost(ctx, plan_id: int, brain, config, turns: int, what: str) -> 
 
 
 async def _record(state, brain, payload, turns: int, started: float, turn: str,
-                  task: str = "wake", limit: int = 0) -> tuple[int, float]:
+                  task: str = "wake", limit: int = 0, at_least: float = 0.0) -> tuple[int, float]:
     """The run's usage in usage_events (agent ``agent``, task ``task``: a
     wake's, or ``task.<profile>`` for a task's): (its tokens, what it cost:
     money with an API key, brain_spend), tokens 0 when it ended with no
     result (still counted as a call; with an API key its cost unknown, so
     counted at a turn's bound for the turns it ran and the one it was in,
-    at most ``limit``, its turn limit: chat.MAX_TURNS by default)."""
+    at most ``limit``, its turn limit: chat.MAX_TURNS by default, and
+    never below ``at_least``, what its stream was counted at)."""
     from harvey.agent import chat
 
     ms = int((time.monotonic() - started) * 1000)
@@ -842,7 +908,8 @@ async def _record(state, brain, payload, turns: int, started: float, turn: str,
             cost = await brain._record_usage(
                 {"usage": {}, "num_turns": turns, "is_error": True, "duration_ms": ms},
                 agent="agent", task=task, label=turn,
-                unknown_turns=min(limit or chat.MAX_TURNS, int(turns or 0) + 1))
+                unknown_turns=min(limit or chat.MAX_TURNS, int(turns or 0) + 1),
+                at_least=at_least)
             return 0, float(cost or 0.0)
         model_usage = payload.get("modelUsage") if isinstance(payload.get("modelUsage"),
                                                               dict) else {}

@@ -236,11 +236,14 @@ async def status(state, plan_id, chat: str | None = None) -> dict:
             "remaining_usd": round(max(0.0, plan["budget_usd"] - m["committed_usd"]), 6)}
 
 
-async def for_chat(state, chat: str) -> list[dict]:
+async def for_chat(state, chat: str, billed: bool = False) -> list[dict]:
     """A chat's plans, oldest first, each with its money and runs (the Chat
     tab's cards), its campaigns (outreach.for_plan: their counts, a start
     asked for), its tasks (tasks.for_plan: each with its result line, and
-    their tokens) and an approved one's wakes to come (wakes.pending)."""
+    their tokens) and an approved one's wakes to come (wakes.pending).
+    ``billed`` (the brain on an API key): each says so (its ``agent_usd``
+    is then money), and an approved plan with no budget is marked
+    ``no_runs``: its wakes and tasks can't hold what they may cost."""
     from harvey.agent import outreach, tasks, wakes
 
     out = []
@@ -248,6 +251,9 @@ async def for_chat(state, chat: str) -> list[dict]:
         m = await money(state, plan["id"])
         p = {**plan, **m, "remaining_usd": round(
             max(0.0, plan["budget_usd"] - m["committed_usd"]), 6)}
+        if billed:
+            p["billed"] = True
+            p["no_runs"] = plan["status"] == APPROVED and plan["budget_usd"] <= EPSILON
         if plan["status"] == APPROVED:
             p["wakes"] = await wakes.pending(state, plan["id"])
         if plan["status"] not in (PROPOSED, REJECTED):

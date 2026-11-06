@@ -83,6 +83,23 @@ def active_brain_status(raw: str, provider: str) -> dict:
 _STREAM_EVENTS = ("system", "assistant", "user", "stream_event", "rate_limit_event")
 
 
+
+# What a metered read takes from the CLI's stdout at a time.
+READ_CHUNK = 1 << 16
+
+
+def _metered(line: bytes, meter) -> bool:
+    """One stream-json line fed to ``meter`` (its result isn't: the CLI's
+    own figure is read from it): whether the limit is reached."""
+    text = line.strip()
+    if not text.startswith(b"{"):
+        return False
+    try:
+        event = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(event, dict) and event.get("type") != "result" and meter.feed(event)
+
 class BrainUnavailable(Exception):
     """The provider can't be used until the operator acts. Raised only where
     a caller must leave its input untouched for a later retry."""
@@ -324,6 +341,7 @@ class Brain:
                 await asyncio.sleep(delay)
             if await self._over_usd_cap():
                 return ""
+            meter = await self._meter()
 
             process = None
             try:
@@ -342,10 +360,16 @@ class Brain:
                         stderr=asyncio.subprocess.PIPE,
                     )
                     try:
-                        stdout, stderr = await asyncio.wait_for(
-                            process.communicate(prompt.encode("utf-8")),
-                            timeout=timeout,
-                        )
+                        if meter is None:
+                            stdout, stderr = await asyncio.wait_for(
+                                process.communicate(prompt.encode("utf-8")),
+                                timeout=timeout,
+                            )
+                        else:
+                            stdout, stderr = await asyncio.wait_for(
+                                self._read_metered(process, prompt, meter),
+                                timeout=timeout,
+                            )
                     except asyncio.TimeoutError:
                         logger.error(
                             f"Claude call timed out after {timeout:.0f}s. Killing process.")
@@ -372,8 +396,29 @@ class Brain:
                         raise
                 if stdout is None:
                     last_error = "timeout"
-                    await self._count_unreported(agent, task, session_id)
+                    await self._count_unreported(agent, task, session_id,
+                                                 at_least=meter.cost if meter else 0.0)
                     continue  # retry
+
+                if meter is not None and meter.stopped:
+                    # (Stopped at what was left of the brain's caps: what it
+                    # cost is charged, its partial reply isn't an answer,
+                    # and no retry is made.)
+                    _, payload, limits = self._parse_stream(
+                        (stdout or b"").decode(errors="replace"))
+                    try:
+                        await self.state.increment_usage()
+                        await self._record_usage(payload or {"usage": {}, "is_error": True},
+                                                 agent=agent, task=task,
+                                                 label=session_id or "",
+                                                 unknown_turns=0 if payload else 1,
+                                                 at_least=meter.cost)
+                    except Exception as e:
+                        logger.warning(f"Failed to record usage event: {e}")
+                    self.budget_why = (f"the call was stopped at the brain's USD cap: "
+                                       f"${meter.line:.2f} was left of it")
+                    logger.info(f"Claude call stopped: {self.budget_why}.")
+                    return ""
 
                 if process.returncode != 0:
                     error = stderr.decode(errors="replace").strip()
@@ -472,7 +517,15 @@ class Brain:
             except Exception as e:
                 logger.error(f"Brain error: {e}")
                 last_error = str(e)
+                if process is not None:
+                    # (A call that started is billed all the same.)
+                    await self._count_unreported(agent, task, session_id,
+                                                 at_least=meter.cost if meter else 0.0)
                 continue
+            finally:
+                if meter is not None:
+                    # (Its cost is recorded: no longer in flight.)
+                    meter.close()
 
         logger.error(
             f"Brain call failed after {max_retries + 1} attempts. "
@@ -510,16 +563,33 @@ class Brain:
                 await asyncio.sleep(delay)
             if await self._over_usd_cap():
                 return ""
+            meter = await self._meter()
             try:
+                # (Metered only with an API key: a subscription's call is
+                # made as before.)
                 result = await self.codex.run(
-                    prompt, timeout=timeout, skip_if=lambda: self.paused_reason)
+                    prompt, timeout=timeout, skip_if=lambda: self.paused_reason,
+                    **({"meter": meter} if meter is not None else {}))
             except CodexError as e:
                 if e.kind == "paused":
                     logger.debug(f"Codex call skipped: {e}")
                     return ""
+                if e.kind == "budget":
+                    # (Stopped at what was left of the brain's caps: its
+                    # tokens so far charged, no retry.)
+                    try:
+                        await self.state.increment_usage(provider="codex")
+                        await self._record_codex_usage(e.result, agent=agent, task=task,
+                                                       label=session_id or "")
+                    except Exception as err:
+                        logger.warning(f"Failed to record usage event: {err}")
+                    self.budget_why = str(e)
+                    logger.info(f"Codex call stopped: {e}.")
+                    return ""
                 if e.kind in _UNREPORTED_CODEX_KINDS:
                     # (A turn that may have run, its tokens unknown.)
-                    await self._count_unreported(agent, task, session_id)
+                    await self._count_unreported(agent, task, session_id,
+                                                 at_least=meter.cost if meter else 0.0)
                 last_error = str(e)
                 if e.retryable:
                     logger.warning(f"Codex call failed: {e}")
@@ -539,17 +609,21 @@ class Brain:
                 # CancelledError is not an Exception, so shutdown propagates.
                 logger.error(f"Codex call failed unexpectedly ({type(e).__name__}).")
                 return ""
-
-            try:
-                await self.state.increment_usage(provider="codex")
-            except Exception as e:
-                logger.warning(f"Failed to record usage counter: {e}")
-            try:
-                await self._record_codex_usage(result, agent=agent, task=task,
-                                               label=session_id or "")
-            except Exception as e:
-                logger.warning(f"Failed to record usage event: {e}")
-            return result.text
+            else:
+                try:
+                    await self.state.increment_usage(provider="codex")
+                except Exception as e:
+                    logger.warning(f"Failed to record usage counter: {e}")
+                try:
+                    await self._record_codex_usage(result, agent=agent, task=task,
+                                                   label=session_id or "")
+                except Exception as e:
+                    logger.warning(f"Failed to record usage event: {e}")
+                return result.text
+            finally:
+                if meter is not None:
+                    # (Its cost is recorded: no longer in flight.)
+                    meter.close()
 
         logger.error(
             f"Codex call failed after {max_retries + 1} attempts. "
@@ -557,18 +631,66 @@ class Brain:
         )
         return ""
 
-    async def _count_unreported(self, agent: str, task: str, label) -> None:
+    async def _count_unreported(self, agent: str, task: str, label,
+                                at_least: float = 0.0) -> None:
         """With an API key: a call that ended with no result (timed out,
         died) was billed all the same, so it is counted at a turn's bound
-        (brain_spend.unknown_usd), never as $0. Nothing on a subscription."""
+        (brain_spend.unknown_usd), never as $0, nor below what its stream
+        was counted at. Nothing on a subscription."""
         if not self.api_key:
             return
         try:
             await self._record_usage({"usage": {}, "num_turns": 1, "is_error": True},
                                      agent=agent, task=task, label=label or "",
-                                     unknown_turns=1)
+                                     unknown_turns=1, at_least=at_least)
         except Exception as e:
             logger.warning(f"Failed to record usage event: {e}")
+
+    async def _meter(self):
+        """With an API key, the meter a call runs under: stopped at what is
+        left of the brain's caps (brain_spend.Meter). None on a
+        subscription."""
+        if not self.api_key:
+            return None
+        from harvey import brain_spend
+
+        return brain_spend.Meter(self.config,
+                                 room=await brain_spend.room(self.state, self.config))
+
+    @staticmethod
+    async def _read_metered(process, prompt: str, meter) -> tuple[bytes, bytes]:
+        """communicate(), reading the stream a line at a time into ``meter``:
+        when it reaches its limit the CLI is ended (``meter.stopped``) and
+        what it wrote so far is returned."""
+        process.stdin.write(prompt.encode("utf-8"))
+        try:
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        process.stdin.close()
+        errors = asyncio.ensure_future(process.stderr.read())
+        # (Read in chunks, never readline(): a stream-json line holds a
+        # whole reply, past a stream's 64 KiB line limit.)
+        read, pending = [], b""
+        try:
+            while True:
+                chunk = await process.stdout.read(READ_CHUNK)
+                if not chunk:
+                    break
+                read.append(chunk)
+                *lines, pending = (pending + chunk).split(b"\n")
+                if any(_metered(line, meter) for line in lines):
+                    meter.stopped = True
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    break
+            await process.wait()
+            return b"".join(read), await errors
+        finally:
+            if not errors.done():
+                errors.cancel()
 
     async def _over_usd_cap(self) -> bool:
         """With an API key: whether the brain's USD caps hold the next call
@@ -678,7 +800,7 @@ class Brain:
 
     async def _record_usage(
         self, payload: dict | None, agent: str, task: str, label: str,
-        unknown_turns: int = 0,
+        unknown_turns: int = 0, at_least: float = 0.0,
     ) -> float:
         """Write per-model usage rows from a CLI result payload. Returns
         what they cost (brain_spend: with an API key, money; else the
@@ -687,7 +809,9 @@ class Brain:
         With an API key a cost that is unknown is never $0: a payload with
         tokens and no cost, or one marked ``unknown_turns`` (a call that
         ended with no result: the turns it may have used), is counted at
-        brain_spend.unknown_usd. Nothing changes on a subscription."""
+        brain_spend.unknown_usd, and never below ``at_least`` (what its
+        stream was counted at: brain_spend.Meter). Nothing changes on a
+        subscription."""
         if not payload:
             return 0.0
 
@@ -743,7 +867,8 @@ class Brain:
             # (An unpriced Codex call keeps its tokens instead.)
             if (unknown_turns or tokens) and all(x == brain_spend.SOURCE for x in sources):
                 turns = unknown_turns or max(1, num_turns)
-                estimate = await brain_spend.unknown_usd(self.state, self.config, turns)
+                estimate = max(await brain_spend.unknown_usd(self.state, self.config, turns),
+                               float(at_least or 0.0))
                 if estimate > 0:
                     if not rows:
                         rows.append({"model": ""})

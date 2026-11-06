@@ -1361,6 +1361,9 @@ class _Turn:
     rate_limits: dict | None = None
     violation: str = ""
     model_responses: int = 0
+    # With an API key: brain_spend.Meter, and whether it reached its limit.
+    meter: object = None
+    over_budget: bool = False
 
     @property
     def answer(self) -> str | None:
@@ -1400,12 +1403,15 @@ class CodexClient:
             self._lock = asyncio.Lock()
         return self._lock
 
-    async def run(self, prompt: str, timeout: float, skip_if=None) -> CodexResult:
+    async def run(self, prompt: str, timeout: float, skip_if=None, meter=None) -> CodexResult:
         """One isolated turn. ``skip_if`` (returns a reason or "") is checked
         once this call holds the runtime lock, so calls queued behind one
-        that discovered a persistent problem don't start runtimes too."""
+        that discovered a persistent problem don't start runtimes too.
+        ``meter`` (brain_spend.Meter, API-key mode): fed the thread's tokens
+        as they are reported; when it reaches its limit the turn is ended
+        (CodexError kind ``budget``, its ``result`` what it used)."""
         return await self._bounded(
-            timeout, lambda deadline: self._run(prompt, deadline), skip_if)
+            timeout, lambda deadline: self._run(prompt, deadline, meter), skip_if)
 
     async def read_rate_limits(self, timeout: float = 30.0) -> dict | None:
         """Live ChatGPT-plan windows for budgeting. No prompt is sent. None
@@ -1578,14 +1584,14 @@ class CodexClient:
             "hooks/list", {"cwds": [server.workspace]}, deadline))
         return thread_id, model
 
-    async def _run(self, prompt: str, deadline: float) -> CodexResult:
+    async def _run(self, prompt: str, deadline: float, meter=None) -> CodexResult:
         server = _AppServer(self._resolve_codex())
         started = time.monotonic()
         try:
             thread_id, model = await self._attested_thread(server, deadline)
 
             # Isolation verified — only now does untrusted text leave Harvey.
-            turn = _Turn(thread_id=thread_id, model=model)
+            turn = _Turn(thread_id=thread_id, model=model, meter=meter)
             server.on_message = lambda method, params: self._on_turn_message(turn, method, params)
             turn_params = {
                 "threadId": thread_id,
@@ -1596,9 +1602,20 @@ class CodexClient:
             started_turn = await server.request("turn/start", turn_params, deadline)
             if isinstance(started_turn, dict) and isinstance(started_turn.get("turn"), dict):
                 self._accept_terminal(turn, started_turn["turn"])
-            while not turn.status and not turn.violation:
+            while not turn.status and not turn.violation and not turn.over_budget:
                 await server.dispatch(await server.read_message(deadline))
 
+            if turn.over_budget and not turn.status:
+                # (Ended here: closing the runtime ends the turn.)
+                meter.stopped = True
+                err = CodexError(
+                    f"the call was stopped at the brain's USD cap: ${meter.line:.2f} was left "
+                    "of it", kind="budget")
+                err.result = CodexResult(
+                    text="", model=model, thread_id=thread_id,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    usage=normalize_usage(turn.token_usage), rate_limits=turn.rate_limits)
+                raise err
             if turn.violation:
                 raise CodexError(
                     f"Codex attempted a forbidden {turn.violation} item; the call "
@@ -1705,6 +1722,9 @@ class CodexClient:
                 turn.violation = "repeated model responses"
         elif method == "thread/tokenUsage/updated":
             turn.token_usage = params.get("tokenUsage")
+            if turn.meter is not None and turn.meter.feed(
+                    {"type": "usage", "tokens": normalize_usage(turn.token_usage)}):
+                turn.over_budget = True
         elif method == "account/rateLimits/updated":
             snapshot = params.get("rateLimits")
             if bucket_applies(snapshot, turn.model):

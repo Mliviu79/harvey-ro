@@ -1049,3 +1049,26 @@ async def test_a_refused_login_saves_nothing(fake, tmp_path, monkeypatch):
         await hc.login_api_key(home, FAKE_KEY, timeout=30)
     assert FAKE_KEY not in str(err.value)
     assert not hc.has_api_key_login(home)
+
+
+@pytest.mark.asyncio
+async def test_a_metered_call_ends_when_its_tokens_reach_the_limit(fake, native_home):
+    # (API-key mode: the thread's tokens at the prices entered, 1,200 in at
+    # $1 and 40 out at $10 a million = $0.0016, past a $0.001 limit.)
+    from harvey import brain_spend
+    from harvey.config import BrainConfig
+
+    cfg = BrainConfig(provider="codex", model="gpt-6-luna", codex_usd_per_mtok_in=1.0,
+                      codex_usd_per_mtok_out=10.0)
+    meter = brain_spend.Meter(cfg, 0.001)
+    with pytest.raises(hc.CodexError) as err:
+        await _client(native_home).run(PROMPT, timeout=30, meter=meter)
+    assert err.value.kind == "budget" and "$0.00 was left" in str(err.value)
+    assert meter.stopped and meter.cost == pytest.approx(0.0016)
+    assert err.value.result.usage["input_tokens"] == 1000
+    assert err.value.result.usage["cache_read_tokens"] == 200
+    assert _leftover_runtimes() == []
+    # Under a limit it answers as before.
+    roomy = brain_spend.Meter(cfg, 1.0)
+    result = await _client(native_home).run(PROMPT, timeout=30, meter=roomy)
+    assert result.text and not roomy.stopped

@@ -215,6 +215,26 @@ def auth_of(brain) -> str:
     return getattr(brain, "auth", "") or TERMINAL
 
 
+# What a provider switch (harvey train --provider, harvey setup) carries
+# over besides the login: the brain's USD caps (the install's) and Codex's
+# token prices (read only by Codex, so kept for when it is the brain again).
+CARRIED_MONEY = ("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in",
+                 "codex_usd_per_mtok_out")
+
+
+def carried_auth(auth: str, provider: str) -> tuple[str, str]:
+    """The login a switch to ``provider`` keeps, and a line saying why it
+    didn't ("" when it did): an API key only when one is saved for that
+    provider, else the terminal login. A linked account folder is kept
+    (it is the provider's own, and an empty one fails as not logged in)."""
+    auth = auth or TERMINAL
+    if auth == API_KEY and not key_set(provider):
+        label = "Codex" if provider == "codex" else "Claude"
+        return TERMINAL, (f"No {label} API key is saved, so the brain uses the terminal login "
+                          f"for {label}: save a key in Settings → Model to bill it instead.")
+    return auth, ""
+
+
 def _clean(value, limit: int = 40) -> str:
     """A field from a CLI's answer, made safe to show and log."""
     return re.sub(r"[^A-Za-z0-9._:+ -]", "?", str(value or ""))[:limit]

@@ -1073,8 +1073,8 @@ select.form-input { cursor: pointer; }
 .module-terms { margin-top: var(--sp-2); font-size: var(--fs-caption); color: var(--wait); background: var(--wait-bg); padding: 8px 10px; border-radius: var(--r-sm); max-width: 72ch; text-wrap: pretty; }
 /* Date publice: the local official datasets, above the modules */
 .pd-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: center; margin-top: var(--sp-3); }
-.pd-setting { display: inline-flex; gap: 6px; align-items: center; font-size: var(--fs-caption); color: var(--text-2); }
-.pd-setting input[type="number"] { width: 5ch; }
+.pd-setting { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 100%; font-size: var(--fs-caption); color: var(--text-2); }
+.pd-setting input[type="number"] { width: 5ch; flex: none; }
 .module-problems ul { margin: 6px 0 0 18px; }
 .module-problems li { overflow-wrap: anywhere; }
 @media (max-width: 600px) {
@@ -1304,7 +1304,11 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   table.data tr.detail-row { display: block; }
   table.data .ct-name .avatar { display: none; }
   .co-name, .co-phone, .co-email, .co-acts { min-width: 0; }
-  .module-row { flex-direction: column; align-items: flex-start; gap: var(--sp-3); }
+  /* Stretch, as for the module list: at flex-start a row's text sizes to
+     its content (a long description, Settings' background-search share)
+     and a narrow phone scrolls sideways; the switch keeps its own width. */
+  .module-row { flex-direction: column; align-items: stretch; gap: var(--sp-3); }
+  .module-row > .switch { align-self: flex-start; }
 
   /* The run log becomes one small card per run: what ran on its own line,
      then state, when, records and cost, so no column hides off-screen. */

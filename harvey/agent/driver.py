@@ -27,15 +27,18 @@ notifications into those events: an agent message's start and text deltas,
 a Harvey tool call as an assistant event with its tool_use (and its end as a
 user event: the call's outcome is read from agent_tool_call, as for Claude),
 each model response as an assistant event (one turn, which Harvey counts
-against chat.MAX_TURNS), and the turn's end as the result, with the final
-answer and the thread's token counts. During a turn anything else (a shell,
+against chat.MAX_TURNS), the thread's token counts as they are updated (a
+``usage`` event, for an API-key run's meter: brain_spend.Meter), and the
+turn's end as the result, with the final answer and the thread's token
+counts. During a turn anything else (a shell,
 a file change, a web search, another server's tool, a server request such
 as an approval or an elicitation) ends the answer and the runtime at once:
 the answer fails, saying so, and nothing ran.
 
 Codex's usage is its ChatGPT plan's: no per-token cost, and the share Harvey
 may use is the same ``usage.max_daily_claude_percent`` of the plan's windows
-the brain reads (Brain.is_within_budget, CodexQuotaClient).
+the brain reads (Brain.is_within_budget, CodexQuotaClient). With an API key
+its tokens are priced at the prices entered (harvey/brain_spend.py).
 """
 
 from __future__ import annotations
@@ -590,6 +593,12 @@ class CodexProcess:
                 return "too many model responses"
         elif method == "thread/tokenUsage/updated":
             self._token_usage = params.get("tokenUsage")
+            # (The thread's tokens so far, for a run's meter in API-key
+            # mode: brain_spend.Meter. Nothing else reads it.)
+            from harvey.codex import normalize_usage
+
+            self._put({"type": "usage", "provider": CODEX,
+                       "tokens": normalize_usage(self._token_usage)})
         elif method == "turn/completed" and isinstance(turn, dict):
             for item in turn.get("items") or []:
                 why = self._forbidden(item)

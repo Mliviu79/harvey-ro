@@ -217,9 +217,9 @@ def _current_money() -> dict:
         brain = load_brain_config(str(_config_file()))
     except Exception:
         return {}
-    return {k: getattr(brain, k, None) for k in ("usd_per_day", "usd_per_month",
-                                           "codex_usd_per_mtok_in", "codex_usd_per_mtok_out")
-            if getattr(brain, k, None) is not None}
+    from harvey.brain_auth import CARRIED_MONEY
+
+    return {k: getattr(brain, k, None) for k in CARRIED_MONEY if getattr(brain, k, None) is not None}
 
 
 class SetupWizard:
@@ -285,8 +285,15 @@ class SetupWizard:
         """Pick the brain provider and verify its CLI is installed and working
         (Codex: its model is asked once its login is seen, from the
         account's live list)."""
-        auth = _current_auth()
-        if _ask_provider() == "codex":
+        from harvey import brain_auth
+
+        provider = _ask_provider()
+        # (The login kept when it still applies to the provider chosen: an
+        # API key only with one saved for it.)
+        auth, why = brain_auth.carried_auth(_current_auth(), provider)
+        if why:
+            _print_harvey(why)
+        if provider == "codex":
             await self._check_codex(auth)
         else:
             self.brain_config = _ask_model("claude", auth=auth)

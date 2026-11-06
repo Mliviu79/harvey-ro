@@ -40,7 +40,9 @@ RESEARCH = {"areas": [{"area": "Brașov", "why": "1.200 de firme fără site"}],
 # --task), logs the message it was given (FAKE_CLI_LOG), records one tool
 # call the way the task's server records it, and answers FAKE_ANSWER (a
 # file holding the text), or: FAKE_TASK=login a logged-out CLI's result,
-# die exits with an error, loop calls tools until it is interrupted.
+# die exits with an error, loop calls tools until it is interrupted
+# (FAKE_INPUT: the input tokens each model call reports, with a line of
+# text before its tool call).
 FAKE = r'''
 import json, os, select, sys
 
@@ -84,8 +86,12 @@ def result(text, error=False, subtype="success"):
 def tool_round(k):
     from harvey.agent import tools
     mid = f"m{k}"
-    out({"type": "assistant", "message": {"id": mid, "content": [
-        {"type": "tool_use", "id": f"t{k}", "name": "mcp__harvey__counts", "input": {}}]}})
+    message = {"id": mid, "content": [
+        {"type": "tool_use", "id": f"t{k}", "name": "mcp__harvey__counts", "input": {}}]}
+    if os.environ.get("FAKE_INPUT"):
+        message["usage"] = {"input_tokens": int(os.environ["FAKE_INPUT"])}
+        message["content"].insert(0, {"type": "text", "text": f"Am numărat firmele ({k})."})
+    out({"type": "assistant", "message": message})
     tools.Tools(db, chat, task).record("counts", {}, "firms=3", 5, "ok")
     out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": f"t{k}"}]}})
 
@@ -396,7 +402,8 @@ def test_an_api_key_tasks_cost_counts_in_its_plan_and_a_short_budget_holds_it(
     from harvey import brain_spend
 
     cfg = _config()
-    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key"})
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", "model": "sonnet",
+                                             "usd_per_day": 50.0})
     monkeypatch.setattr(chat, "_config", lambda: cfg)
     monkeypatch.setenv("FAKE_COST", "0.31")
     # A free plan can't pay for a billed task: it waits, the CLI never starts.
@@ -411,10 +418,35 @@ def test_an_api_key_tasks_cost_counts_in_its_plan_and_a_short_budget_holds_it(
     task = _assign(state, paid)
     job = _work(state)
     assert job.status == "done" and job.actual_cost == pytest.approx(0.31)
-    assert tasks.TASK_TURNS * brain_spend.TURN_USD_FLOOR <= 2.0
+    assert _run(brain_spend.run_worst_usd(state, cfg.brain, tasks.TASK_TURNS)) <= 2.0
     money = _run(plans.money(state, paid))
     assert money["committed_usd"] == pytest.approx(0.31) == money["agent_usd"]
     assert _q(state, "SELECT task, source FROM usage_events") == [("task.researcher", "api_key")]
+
+
+def test_an_api_key_task_is_stopped_at_its_hold_keeping_what_it_wrote(
+        state, fake, monkeypatch):
+    from harvey import brain_spend
+
+    cfg = _config()
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", "model": "sonnet",
+                                             "usd_per_day": 50.0})
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    monkeypatch.setenv("FAKE_TASK", "loop")
+    monkeypatch.setenv("FAKE_INPUT", "400000")              # $0.80 a call at Sonnet's $2
+    monkeypatch.setenv("FAKE_COST", "1.6")
+    worst = _run(brain_spend.run_worst_usd(state, cfg.brain, tasks.TASK_TURNS))
+    assert 0.8 < worst < 1.6
+    plan = _plan(state, budget=3.0)
+    task = _assign(state, plan)
+    job = _work(state)
+    assert job.status == "done" and job.result["stopped"] == "budget"
+    ended = _task(state, task["id"])
+    assert ended["status"] == "failed" and f"${worst:.2f}" in ended["problem"]
+    assert "Am numărat firmele (0)." in ended["result"]["raw"]
+    assert job.actual_cost == pytest.approx(1.6)
+    # Its plan is told it ended (a task_done event).
+    assert _q(state, "SELECT kind FROM agent_event") == [("task_done",)]
 
 
 @pytest.mark.parametrize("answer, why", [

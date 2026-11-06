@@ -27,8 +27,8 @@ minor versions can still change behaviour.
   backstop. Claude's CLI reports each call's cost; Codex's doesn't, so its
   tokens are priced from `brain.codex_usd_per_mtok_in` / `_out`, and with a
   cap set and no price no Codex call is made. In API-key mode an agent
-  wake or task holds its worst case (its turn limit at the most a turn has
-  cost, $0.10 a turn at least for Claude) of its plan's budget and of
+  wake or task holds its worst case (its turn limit at the most a turn may
+  cost) of its plan's budget and of
   `spend.per_day_usd` / `per_month_usd` before it starts, and waits when
   that doesn't fit; what it cost then goes into its job, so the plan's
   committed money and the install's spend limits count it; a plan whose
@@ -893,6 +893,34 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **API-key mode stops at its limit.** A call billed per token is now
+  counted as it streams and stopped, the way Stop does it, when it reaches
+  its line: a chat answer or a brain call what was left of
+  `brain.usd_per_day` / `usd_per_month` when it started, an agent wake or
+  task the worst case it held of its plan's budget or what was left of the
+  caps, whichever is less. Runs side by side in one Harvey (chats, wakes,
+  tasks, brain calls) share what is left of the caps instead of each
+  spending all of it. What it wrote is kept
+  (the chat says it stopped at its budget, with the text; a task ends
+  failed with it), and what it cost is counted. Claude's calls are priced
+  from `harvey/reference/model_prices.json` (input, output, cache writes
+  and reads per million tokens for each Claude model, with the date it was
+  checked and the pricing page), a model it doesn't list at the dearest
+  prices; Codex's from the prices you enter. A wake's or task's worst case
+  is priced the same way, replacing the flat $0.10 a turn, which an
+  Opus-class first turn writing its prompt to the cache already passed.
+- **API-key mode needs a USD cap.** Settings → Model (and `POST /api/brain`)
+  won't switch to an API key, or clear the last cap, without a daily or
+  monthly cap; a hand-edited `harvey.local.yaml` with none still loads, but
+  no call is made ("set a USD cap").
+- **A $0 plan on an API key says why it gets no wakes.** Its card says so,
+  Today has one item for all such plans, and the card shows the agent's own
+  model spend on a line of its own.
+- **Switching provider keeps what still applies.** `harvey train
+  --provider` and `harvey setup` keep `brain.auth` when it still applies to
+  the provider chosen (an API key only with one saved for it, else the
+  terminal login, said) and keep the USD caps and Codex's prices.
+
 - **Calls never go to another provider behind your back.** Every Claude
   child now runs without the variables that send calls elsewhere and bill
   them outside the login you chose: `ANTHROPIC_BASE_URL`,
@@ -1286,6 +1314,14 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Settings fits a phone.** A settings row (the background-search card
+  among them) no longer sizes its text to its content on a narrow screen,
+  which could push the page sideways.
+- **A long reply on an API key.** A brain call metered as it streams read
+  the CLI a line at a time, and a line past 64 KiB (a long reply) failed
+  the call; it is read in chunks now. A call that fails once started is
+  counted, never as $0.
 
 - **A key in `.env` no longer moves Claude to per-token billing.** The
   Claude CLI Harvey starts (the brain, the agent's chats, wakes and tasks,

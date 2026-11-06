@@ -607,7 +607,8 @@ async def run(ctx) -> dict:
         await wakes.hold(state, why, wakes.BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=wakes.BUDGET_RETRY_SECONDS)
     exe = await wakes.runner(config, "tasks")
-    await wakes.hold_cost(ctx, plan["id"], brain, config, TASK_TURNS, "task")
+    held_usd = await wakes.hold_cost(ctx, plan["id"], brain, config, TASK_TURNS, "task")
+    meter = await wakes._meter(state, brain, held_usd)
     if not await _write(state, "overlay.agent.task_start", (_now(), tid)):
         # (Cancelled since it was read: no run.)
         return {"task": tid, "skipped": "the task is no longer open"}
@@ -620,7 +621,8 @@ async def run(ctx) -> dict:
         payload, turns, usage, ended, err, exit_code = await wakes._ask(
             state, exe, task["chat"], content,
             getattr(getattr(config, "brain", None), "model", "") or "", calling, stop=stop,
-            task=tid, max_turns=TASK_TURNS, timeout=TIMEOUT_SECONDS, auth=driver.auth(config))
+            task=tid, max_turns=TASK_TURNS, timeout=TIMEOUT_SECONDS, auth=driver.auth(config),
+            meter=meter)
     except asyncio.CancelledError:
         # (Cut off by the worker's shutdown: back to the queue; a call it
         # made counts all the same.)
@@ -628,13 +630,18 @@ async def run(ctx) -> dict:
             try:
                 await asyncio.shield(wakes._charge_cut_off(ctx, brain, calling, started,
                                                            task["turn"], task=label,
-                                                           limit=TASK_TURNS))
+                                                           limit=TASK_TURNS, meter=meter))
             except Exception:
                 pass
+        if meter is not None:
+            meter.close()
         raise
     tokens, cost = await wakes._record(state, brain, payload, turns, started, task["turn"],
-                                       task=label, limit=TASK_TURNS)
+                                       task=label, limit=TASK_TURNS,
+                                       at_least=meter.cost if meter else 0.0)
     await brain_spend.charge(ctx, brain.config, cost)
+    if meter is not None:
+        meter.close()
     if ended != "stopped" and stop is not None and await stop():
         ended = "stopped"
     if ended == "stopped":
@@ -642,6 +649,16 @@ async def run(ctx) -> dict:
         await _end(state, tid, CANCELLED, problem="stopped")
         await ctx.say(f"  task {tid}: stopped")
         return {"task": tid, "stopped": True, "turns": turns, "tokens": tokens}
+    if ended == "budget":
+        # (Stopped at its hold: failed, what it wrote kept masked as its raw
+        # answer, and its plan told.)
+        written = (calling.get("text") or "").strip()
+        await _end(state, tid, FAILED, problem=wakes.budget_text(meter, plan["id"]),
+                   result={"raw": _masked(written)[:RAW_CHARS]} if written else None,
+                   tokens=tokens)
+        await ctx.say(f"  task {tid}: stopped at {meter.line:.2f} USD ({meter.why})")
+        return {"task": tid, "status": FAILED, "stopped": "budget", "turns": turns,
+                "tokens": tokens}
     response = str((payload or {}).get("result") or "").strip()
     answered = payload is not None and not payload.get("is_error") and bool(response) \
         and not ended

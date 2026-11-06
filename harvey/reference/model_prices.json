@@ -1,0 +1,32 @@
+{
+ "version": 1,
+ "about": "What Claude's models cost on an API key, in USD per million tokens: input, output, a prompt-cache write (5-minute and 1-hour), a cache read. Harvey prices the agent's running calls with it while they stream, and the worst case of a wake or a task before it starts (harvey/brain_spend.py). A model not listed is priced at the dearest row, so an unknown name never costs less than it may. Anthropic's first-party rates; check the source when a price changes.",
+ "checked": "2026-11-06",
+ "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+ "unit": "usd_per_million_tokens",
+ "notes": [
+  "A cache write is 1.25x the input price for 5 minutes and 2x for an hour; a call whose usage doesn't say which is priced at the hour's.",
+  "Claude Haiku 5.5 is priced at its rates for prompts over 100K tokens (the dearer tier): a call is never counted below them."
+ ],
+ "aliases": {
+  "opus": "claude-opus-5-5",
+  "sonnet": "claude-sonnet-5-5",
+  "haiku": "claude-haiku-5-5"
+ },
+ "models": [
+  {"model": "claude-fable-5-1", "input": 10.0, "output": 50.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "cache_read": 0.25},
+  {"model": "claude-mythos-5-1", "input": 10.0, "output": 50.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "cache_read": 0.25},
+  {"model": "claude-fable-5", "input": 10.0, "output": 50.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0},
+  {"model": "claude-mythos-5", "input": 10.0, "output": 50.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0},
+  {"model": "claude-opus-5-5", "input": 4.0, "output": 20.0, "cache_write_5m": 5.0, "cache_write_1h": 8.0, "cache_read": 0.2},
+  {"model": "claude-opus-5", "input": 5.0, "output": 25.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
+  {"model": "claude-opus-4-8", "input": 5.0, "output": 25.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
+  {"model": "claude-opus-4-7", "input": 5.0, "output": 25.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
+  {"model": "claude-opus-4-6", "input": 5.0, "output": 25.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
+  {"model": "claude-sonnet-5-5", "input": 2.0, "output": 10.0, "cache_write_5m": 2.5, "cache_write_1h": 4.0, "cache_read": 0.2},
+  {"model": "claude-sonnet-5", "input": 2.0, "output": 10.0, "cache_write_5m": 2.5, "cache_write_1h": 4.0, "cache_read": 0.2},
+  {"model": "claude-sonnet-4-6", "input": 3.0, "output": 15.0, "cache_write_5m": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3},
+  {"model": "claude-haiku-5-5", "input": 0.5, "output": 2.5, "cache_write_5m": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05},
+  {"model": "claude-haiku-4-5", "input": 1.0, "output": 5.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1}
+ ]
+}
