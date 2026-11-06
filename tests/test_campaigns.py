@@ -6,6 +6,7 @@ land in their campaign. All data is fictional."""
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -137,7 +138,7 @@ async def test_a_draft_on_file_becomes_an_auto_draft_with_members_and_sends_noth
     state = StateManager(str(path))
     await state.init_db()
     con = sqlite3.connect(path)
-    assert schema.version(con) == schema.LATEST == 36 and schema.missing(con) == []
+    assert schema.version(con) == schema.LATEST == 37 and schema.missing(con) == []
     con.close()
     c = await state.campaign_record("c1")
     assert (c["status"], c["origin"], c["account_id"]) == ("draft", "auto", 1)
@@ -911,3 +912,100 @@ def test_the_changelog_has_one_heading_of_each_kind_per_release():
     for release in re.split(r"^## ", text, flags=re.M)[1:]:
         headings = re.findall(r"^### (.+)$", release, flags=re.M)
         assert len(headings) == len(set(headings)), (release.splitlines()[0], headings)
+
+
+# ── The campaign SQL: named, and by an index ──
+
+def test_the_outbox_is_indexed_by_address_on_a_new_file_and_an_old_one(tmp_path):
+    new = sqlite3.connect(":memory:")
+    schema.create(new)
+    old = sqlite3.connect(tmp_path / "old.db", isolation_level=None)
+    schema.create(old, version=36)
+    assert old.execute("SELECT 1 FROM sqlite_master WHERE name = 'idx_outbox_to_email'") \
+        .fetchone() is None
+    assert schema.step_up(old) == schema.LATEST == 37
+    for con in (new, old):
+        cols = [r[2] for r in con.execute("PRAGMA index_info('idx_outbox_to_email')")]
+        assert cols == ["to_email", "kind", "status", "sent_at"]
+
+
+def test_campaigns_runs_only_named_statements():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "harvey" / "campaigns.py").read_text(
+        encoding="utf-8")
+    assert len(re.findall(r"\b(?:SELECT|INSERT INTO|UPDATE \w+ SET|DELETE FROM)\b", text)) == 0
+    assert text.count(".execute(") == 1           # the helper that runs a named one
+
+
+@pytest.mark.asyncio
+async def test_touch_writes_the_fields_it_was_given_and_keeps_the_rest(state):
+    cid, _ = await new_campaign(state, start=False)
+    before = await state.campaigns_call(campaigns.get_campaign, cid, write=False)
+    await state.campaigns_call(campaigns.update_campaign, cid, query="kind=email&q=alfa")
+    after = await state.campaigns_call(campaigns.get_campaign, cid, write=False)
+    assert after["audience_id"] is None and after["audience_query"] == "kind=email&q=alfa"
+    assert {k: after[k] for k in ("name", "status", "sequence", "li_note", "review")} == \
+        {k: before[k] for k in ("name", "status", "sequence", "li_note", "review")}
+    with pytest.raises(ValueError, match="not a campaign field"):
+        await state.campaigns_call(campaigns._touch, cid, origin="auto")
+
+
+@pytest.mark.asyncio
+async def test_an_audience_is_renamed_or_archived_one_field_at_a_time(state):
+    aid = await state.campaigns_call(campaigns.save_audience, "Brașov", "kind=email")
+    assert not await state.campaigns_call(campaigns.update_audience, aid)
+    assert await state.campaigns_call(campaigns.update_audience, aid, archived=True)
+    a = await state.campaigns_call(campaigns.get_audience, aid, write=False)
+    assert (a["name"], a["archived"]) == ("Brașov", 1)
+    assert await state.campaigns_call(campaigns.update_audience, aid, name="Sibiu")
+    a = await state.campaigns_call(campaigns.get_audience, aid, write=False)
+    assert (a["name"], a["archived"]) == ("Sibiu", 1)
+    assert [x["id"] for x in await state.campaigns_call(campaigns.audiences, write=False)] == []
+    assert [x["id"] for x in await state.campaigns_call(campaigns.audiences, True,
+                                                        write=False)] == [aid]
+
+
+@pytest.mark.asyncio
+async def test_list_campaigns_filters_by_status_and_counts_members(state):
+    await contact(state, "office@alfa.example.com")
+    active, _ = await new_campaign(state, name="Activă")
+    draft, _ = await new_campaign(state, name="Ciornă", start=False)
+    every = {c["id"]: c for c in await state.campaigns_call(campaigns.list_campaigns,
+                                                            write=False)}
+    assert set(every) == {active, draft} and every[active]["member_total"] == 1
+    drafts = await state.campaigns_call(campaigns.list_campaigns, ["draft"], write=False)
+    assert [c["id"] for c in drafts] == [draft]
+
+
+@pytest.mark.asyncio
+async def test_a_big_preview_counts_personal_addresses_over_its_first_ones(state, monkeypatch):
+    cfg = config()
+    for name in ("alfa", "beta", "gama"):
+        await contact(state, f"office@{name}.example.com")
+    delta = await contact(state, "office@delta.example.com")
+    await contact(state, "exemplu.fictiv.0002@gmail.com", firm=delta)
+    asked = []
+    real = state.read
+
+    async def read(method, *args, **kwargs):
+        if method == "address_facts":
+            asked.append(args[0])
+        return await real(method, *args, **kwargs)
+
+    monkeypatch.setattr(state, "read", read)
+    exact = await campaigns.preview(state, cfg, query="kind=email")
+    assert len(asked) == 5 and exact["personal_sample"] == 0
+    assert sum(exact["personal"].values()) == 1
+    asked.clear()
+    monkeypatch.setattr(campaigns, "PREVIEW_PERSONAL", 2)
+    sampled = await campaigns.preview(state, cfg, query="kind=email")
+    assert len(asked) == 2 and sampled["personal_sample"] == 2
+    # Every other number is the same, and taking them still decides each one.
+    for key in ("total", "ready", "risky", "to_verify", "firms", "days_at_cap", "overlap"):
+        assert sampled[key] == exact[key], key
+    asked.clear()
+    cid, counts = await new_campaign(state, cfg)
+    assert counts["added"] == 5 and len(asked) == 5 and counts["personal_sample"] == 0
+    assert {m["email"]: m["personal"] for m in await state.campaign_members(cid)}[
+        "exemplu.fictiv.0002@gmail.com"] != 0

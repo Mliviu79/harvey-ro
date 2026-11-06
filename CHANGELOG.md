@@ -1220,6 +1220,29 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A campaign's checks of an address read by an index.** Whether another
+  campaign holds an address, or it got cold email lately (every candidate
+  of a preview, a start and an hourly roll), read the outbox through its
+  status index, and a prospect card by its address read every card: the
+  outbox now has an index by address (schema 37, made when the file is
+  opened) and the card is read through its own. Every statement of the
+  campaigns is now a named one the query-plan test checks.
+- **A big campaign preview is quick.** Whether an address is personal reads
+  every firm it is linked to; the preview now decides it for the first 200
+  addresses it would take and says so ("counted among the first 200"),
+  where it used to read them all. Its other numbers are unchanged, and a
+  start or a roll still decides it for every member.
+- **The background's walk over companies with no website doesn't start
+  from the top every time.** It used to page from the first company each
+  top-up, so with most of them searched every top-up read them all again,
+  page by page. It now goes on below the stretch every search has covered
+  (kept in the settings), reading only the companies added since above it:
+  the same companies, in the same order. It keeps one such stretch for
+  each set of searches it is given (which have free allowance left changes
+  by the minute), and starts over when a pass reaches the end with nothing
+  left and once a day, so a search undone or past its refresh age is seen
+  again.
+
 - **CLAUDE.md described the brain's isolation backwards.** It said brain calls
   pass `--dangerously-skip-permissions`; they run with no tools at all, in safe
   mode with no settings files, an empty working folder and the prompt on stdin.

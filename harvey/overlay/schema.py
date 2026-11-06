@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 36).
+"""The overlay's tables (harvey.db schema 37).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 36
+LATEST = 37
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1093,10 +1093,27 @@ def _to_36(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_36)
 
 
+# ── Schema 37: the outbox by address ──
+
+SCHEMA_37 = """
+-- The outbox by address: whether an address got cold email lately, or this
+-- campaign's first email already (campaigns.overlap, already_contacted, a
+-- campaign's preview and every roll), the newest one sent to it (a reply's
+-- campaign), and its queued emails taken out of a campaign.
+CREATE INDEX idx_outbox_to_email ON outbox(to_email, kind, status, sent_at);
+"""
+
+
+def _to_37(con: sqlite3.Connection) -> None:
+    """Schema 37: the outbox's index by address. Nothing on file changes."""
+    _script(con, SCHEMA_37)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
-         (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36))
+         (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
+         (37, _to_37))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

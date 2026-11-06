@@ -107,6 +107,22 @@ OVERLAY_STATS = {
                         ("campaign_member_contact", "180000 1")],
 }
 
+# The Email module's own tables at a busy install's size (an address's cold
+# email is a row or two, a prospect card one): their index searches are
+# judged by these. A whole read of them is checked for the campaigns'
+# statements only (test_a_campaigns_lookups...): the pages traced in
+# test_overlay_reads still read them whole in raw SQL of their own.
+EMAIL_STATS = {
+    "outbox": [(None, "300000"), ("sqlite_autoindex_outbox_1", "300000 1"),
+               ("uq_outbox_campaign_step", "250000 5000 1 1"),
+               ("idx_outbox_status_send_at", "300000 20000 2"),
+               ("idx_outbox_prospect", "300000 2"), ("idx_outbox_to_email", "300000 2 2 1 1")],
+    "prospects": [(None, "200000"), ("sqlite_autoindex_prospects_1", "200000 1"),
+                  ("uq_prospects_email", "200000 1"), ("idx_prospects_status", "200000 20000"),
+                  ("idx_prospects_status_updated", "200000 20000 2"),
+                  ("idx_prospects_company_id", "200000 3")],
+}
+
 # The registers whose loads analyse their file (registry.build and the
 # statements' load run ANALYZE); the taxpayer file and ANAF's answers have
 # no statistics, so the fixtures leave them without too.
@@ -281,7 +297,7 @@ def files(tmp_path_factory) -> Path:
     build_anaf(d / "anaf.db")
     con = sqlite3.connect(d / "harvey25.db", isolation_level=None)
     overlay.create(con)
-    _inject(con, "main", OVERLAY_STATS)
+    _inject(con, "main", {**OVERLAY_STATS, **EMAIL_STATS})
     con.close()
     return d
 
@@ -539,6 +555,31 @@ def test_the_agents_counts_read_firms_by_key_and_their_small_indexes(overlay_con
                  "overlay.agent.delete_chat_calls"):
         plan = explain(overlay_con, queries.sql(name), queries.get(name).params)
         assert not any(p.startswith("SCAN") and "USING" not in p for p in plan), (name, plan)
+
+
+def test_a_campaigns_lookups_by_address_read_the_outbox_and_prospects_by_index(overlay_con):
+    """overlap() and already_contacted, for every candidate of a preview or
+    a roll: the outbox by address (schema 37) and a prospect card by its
+    address (its partial index, which a bare ``email = ?`` misses)."""
+    for name in ("overlay.campaigns.sent_lately", "overlay.campaigns.first_sent",
+                 "overlay.campaigns.cancel_after", "overlay.campaigns.cancel_address"):
+        plan = explain(overlay_con, queries.sql(name), queries.get(name).params)
+        assert plan[0].startswith("SEARCH outbox USING INDEX idx_outbox_to_email (to_email=?"), \
+            (name, plan)
+    plan = explain(overlay_con, queries.sql("overlay.campaigns.prospect_status"), ("a",))
+    assert plan == ["SEARCH prospects USING INDEX uq_prospects_email (email=?)"], plan
+    before = "SELECT status FROM prospects WHERE email = ?"
+    assert explain(overlay_con, before, ("a",)) == ["SCAN prospects"]
+    # No campaign statement reads the outbox or the prospect cards whole
+    # unless it says why.
+    whole = {}
+    for st in queries.named("overlay.campaigns."):
+        for step in explain(overlay_con, st.sql, st.params):
+            m = re.match(r"SCAN (\w+)", step)
+            table = m and aliases(st.sql).get(m.group(1), m.group(1))
+            if table in EMAIL_STATS and table not in st.scans:
+                whole[st.name] = step
+    assert whole == {}
 
 
 def test_adapters_answer_on_fixture_files(files, overlay_con):

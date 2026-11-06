@@ -41,6 +41,8 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
+from harvey import queries
+from harvey.overlay import queries as _named  # noqa: F401  (registers the statements)
 from harvey.overlay.schema import MEMBER_ADDED_BY, MEMBER_STATUS
 from harvey.overlay.schema import SUPPRESSION_REASON as SUPPRESSION_REASON_CODES
 
@@ -64,6 +66,9 @@ ROLL_CHECKS_PER_DAY = 50
 ROLL_CHECKS_KEY = "campaign_roll_checks:"
 # Why waiting addresses aren't being checked (checks_held).
 CHECKS_HELD_KEY = "campaign_checks_held"
+# A preview decides whether an address is personal (each a read of every
+# firm it is linked to) for this many of the addresses it would take.
+PREVIEW_PERSONAL = 200
 # The legitimate-interest note a campaign needs before it starts.
 LI_NOTE_MIN = 80
 # A campaign's or an audience's name, and each offer field, at most.
@@ -108,24 +113,30 @@ def normalize(email) -> str:
     return (email or "").strip().lower()
 
 
+def _x(con: sqlite3.Connection, name: str, params=()):
+    """Run the named statement ``name`` (harvey/overlay/queries.py)."""
+    return con.execute(queries.sql(name), params)
+
+
+# The open statuses as one bound list (the statements' json_each).
+_OPEN = json.dumps(OPEN_MEMBER)
+
+
 # ── Sending accounts ──
 
 def sync_account(con: sqlite3.Connection, provider: str, address: str) -> int:
     """Row 1 as today's settings say (channels.email.provider,
     persona.email): the account every campaign sends from until a second
     one exists. Returns its id."""
-    con.execute("INSERT OR IGNORE INTO sending_account (id, label, created_at) "
-                "VALUES (1, 'settings', ?)", (_now(),))
-    con.execute("UPDATE sending_account SET provider = ?, address = ? WHERE id = 1 "
-                "AND (provider != ? OR address != ?)",
-                (provider or "", normalize(address), provider or "", normalize(address)))
+    _x(con, "overlay.campaigns.account_add", (_now(),))
+    _x(con, "overlay.campaigns.account_sync",
+       (provider or "", normalize(address), provider or "", normalize(address)))
     return 1
 
 
 def accounts(con: sqlite3.Connection) -> list[dict]:
     cols = ("id", "label", "provider", "address", "profile_id", "enabled", "created_at")
-    return [dict(zip(cols, r)) for r in con.execute(
-        f"SELECT {', '.join(cols)} FROM sending_account ORDER BY id")]
+    return [dict(zip(cols, r)) for r in _x(con, "overlay.campaigns.accounts")]
 
 
 def account(con: sqlite3.Connection, account_id) -> dict | None:
@@ -152,9 +163,8 @@ def save_audience(con: sqlite3.Connection, name: str, query: str) -> int:
         raise Refused("Dă-i un nume publicului. Give the audience a name.")
     query = clean_query(query)
     now = _now()
-    cur = con.execute("INSERT INTO audience (name, filter_json, created_at, updated_at) "
-                      "VALUES (?, ?, ?, ?)",
-                      (name, json.dumps({"v": 1, "query": query}), now, now))
+    cur = _x(con, "overlay.campaigns.audience_add",
+             (name, json.dumps({"v": 1, "query": query}), now, now))
     return int(cur.lastrowid)
 
 
@@ -172,19 +182,15 @@ def clean_query(query: str) -> str:
 
 
 def audiences(con: sqlite3.Connection, archived: bool = False) -> list[dict]:
-    rows = [_audience(r) for r in con.execute(
-        "SELECT id, name, filter_json, created_at, updated_at, archived FROM audience "
-        + ("" if archived else "WHERE archived = 0 ") + "ORDER BY id DESC")]
-    used = dict(con.execute("SELECT audience_id, COUNT(*) FROM campaigns "
-                            "WHERE audience_id IS NOT NULL GROUP BY audience_id").fetchall())
+    rows = [_audience(r) for r in _x(con, "overlay.campaigns.audiences", (int(bool(archived)),))]
+    used = dict(_x(con, "overlay.campaigns.audience_use").fetchall())
     for r in rows:
         r["campaigns"] = used.get(r["id"], 0)
     return rows
 
 
 def get_audience(con: sqlite3.Connection, audience_id) -> dict | None:
-    row = con.execute("SELECT id, name, filter_json, created_at, updated_at, archived "
-                      "FROM audience WHERE id = ?", (audience_id,)).fetchone()
+    row = _x(con, "overlay.campaigns.audience", (audience_id,)).fetchone()
     return _audience(row) if row else None
 
 
@@ -192,19 +198,14 @@ def update_audience(con: sqlite3.Connection, audience_id, *, name: str | None = 
                     archived: bool | None = None) -> bool:
     """Rename or (un)archive. An audience is never deleted: a campaign may
     name it, and a running campaign keeps its own frozen copy anyway."""
-    sets, params = [], []
-    if name is not None:
-        if not name.strip():
-            raise Refused("Dă-i un nume publicului. Give the audience a name.")
-        sets.append("name = ?")
-        params.append(name.strip()[:NAME_CHARS])
-    if archived is not None:
-        sets.append("archived = ?")
-        params.append(int(bool(archived)))
-    if not sets:
+    if name is not None and not name.strip():
+        raise Refused("Dă-i un nume publicului. Give the audience a name.")
+    if name is None and archived is None:
         return False
-    return con.execute(f"UPDATE audience SET {', '.join(sets)}, updated_at = ? WHERE id = ?",
-                       (*params, _now(), audience_id)).rowcount == 1
+    return _x(con, "overlay.campaigns.audience_update",
+              (None if name is None else name.strip()[:NAME_CHARS],
+               None if archived is None else int(bool(archived)), _now(),
+               audience_id)).rowcount == 1
 
 
 # ── Campaign rows ──
@@ -227,28 +228,18 @@ def _campaign(row) -> dict:
 
 
 def get_campaign(con: sqlite3.Connection, campaign_id: str) -> dict | None:
-    row = con.execute(f"SELECT {', '.join(CAMPAIGN_COLS)} FROM campaigns WHERE id = ?",
-                      (campaign_id,)).fetchone()
+    row = _x(con, "overlay.campaigns.get", (campaign_id,)).fetchone()
     return _campaign(row) if row else None
 
 
 def list_campaigns(con: sqlite3.Connection, statuses=None) -> list[dict]:
-    where = ""
-    params: tuple = ()
-    if statuses:
-        where = f"WHERE status IN ({','.join('?' * len(statuses))}) "
-        params = tuple(statuses)
-    out = [_campaign(r) for r in con.execute(
-        f"SELECT {', '.join(CAMPAIGN_COLS)} FROM campaigns {where}ORDER BY created_at DESC",
-        params)]
+    listed = json.dumps(list(statuses)) if statuses else None
+    out = [_campaign(r) for r in _x(con, "overlay.campaigns.list", (listed, listed))]
     counts: dict = {}
-    for campaign, status, n in con.execute(
-            "SELECT campaign, status, COUNT(*) FROM campaign_member GROUP BY campaign, status"):
+    for campaign, status, n in _x(con, "overlay.campaigns.member_counts"):
         counts.setdefault(campaign, {})[MEMBER_NAMES.get(status, str(status))] = n
-    sent = dict(con.execute("SELECT campaign_id, COUNT(*) FROM outbox WHERE status = 'sent' "
-                            "AND kind = 'sequence' GROUP BY campaign_id").fetchall())
-    replies = dict(con.execute("SELECT campaign_id, COUNT(*) FROM conversations "
-                               "WHERE campaign_id != '' GROUP BY campaign_id").fetchall())
+    sent = dict(_x(con, "overlay.campaigns.sent_counts").fetchall())
+    replies = dict(_x(con, "overlay.campaigns.reply_counts").fetchall())
     for c in out:
         c["members"] = counts.get(c["id"], {})
         c["member_total"] = sum(c["members"].values())
@@ -257,10 +248,24 @@ def list_campaigns(con: sqlite3.Connection, statuses=None) -> list[dict]:
     return out
 
 
+# The fields _touch writes (overlay.campaigns.save), in its order.
+_SAVED = ("name", "status", "sequence_json", "audience_id", "audience_query", "rolling",
+          "rolled_at", "offer_json", "li_note", "review", "started_at", "ended_at",
+          "updated_at")
+
+
 def _touch(con, campaign_id: str, **fields) -> None:
+    """Change some of a campaign's fields: the row is read and written back
+    whole in the caller's transaction."""
     fields["updated_at"] = _now()
-    sets = ", ".join(f"{k} = ?" for k in fields)
-    con.execute(f"UPDATE campaigns SET {sets} WHERE id = ?", (*fields.values(), campaign_id))
+    unknown = set(fields) - set(_SAVED)
+    if unknown:
+        raise ValueError(f"not a campaign field: {sorted(unknown)}")
+    row = _x(con, "overlay.campaigns.get", (campaign_id,)).fetchone()
+    if row is None:
+        return
+    now = {**dict(zip(CAMPAIGN_COLS, row)), **fields}
+    _x(con, "overlay.campaigns.save", (*(now[k] for k in _SAVED), campaign_id))
 
 
 def validate_sequence(steps) -> list[dict]:
@@ -313,17 +318,13 @@ def create_campaign(con: sqlite3.Connection, *, provider: str, address: str, nam
     if acct is None or not acct["enabled"]:
         raise Refused("Contul de trimitere nu există. No such sending account.")
     campaign_id = _new_id()
-    con.execute(
-        "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status, "
-        "created_at, audience_id, audience_query, rolling, account_id, profile_id, offer_json, "
-        "li_note, review, origin, updated_at) VALUES (?, ?, 'email', ?, '[]', 'draft', ?, ?, ?, "
-        "?, ?, ?, ?, ?, ?, 'user', ?)",
-        (campaign_id, name, json.dumps(validate_sequence(sequence) if sequence else [],
-                                       ensure_ascii=False),
-         datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), audience_id,
-         clean_query(query) if query and audience_id is None else "", int(bool(rolling)),
-         acct["id"], acct["profile_id"], json.dumps(_offer(offer), ensure_ascii=False), (li_note or "").strip(),
-         review, _now()))
+    _x(con, "overlay.campaigns.add",
+       (campaign_id, name, json.dumps(validate_sequence(sequence) if sequence else [],
+                                      ensure_ascii=False),
+        datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), audience_id,
+        clean_query(query) if query and audience_id is None else "", int(bool(rolling)),
+        acct["id"], acct["profile_id"], json.dumps(_offer(offer), ensure_ascii=False),
+        (li_note or "").strip(), review, _now()))
     return campaign_id
 
 
@@ -424,25 +425,19 @@ def _note_paused(con: sqlite3.Connection, campaign_id: str, paused: bool) -> Non
     from harvey.state import CAMPAIGN_PAUSED
 
     if paused:
-        con.execute("UPDATE outbox SET error = ? WHERE campaign_id = ? AND kind = 'sequence' "
-                    "AND status = 'approved' AND COALESCE(error, '') = ''",
-                    (CAMPAIGN_PAUSED, campaign_id))
+        _x(con, "overlay.campaigns.note_paused", (CAMPAIGN_PAUSED, campaign_id))
     else:
-        con.execute("UPDATE outbox SET error = '' WHERE campaign_id = ? AND kind = 'sequence' "
-                    "AND status = 'approved' AND error = ?", (campaign_id, CAMPAIGN_PAUSED))
+        _x(con, "overlay.campaigns.note_resumed", (campaign_id, CAMPAIGN_PAUSED))
 
 
 def end(con: sqlite3.Connection, campaign_id: str, reason: str) -> int:
     """Finish a campaign: what it has waiting to go out is cancelled and its
     open members stop. Returns how many emails were cancelled."""
     now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-    cancelled = con.execute(
-        "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? WHERE campaign_id = ? "
-        "AND kind = 'sequence' AND status IN ('pending_review', 'approved')",
-        (f"campaign {reason}"[:300], now, campaign_id)).rowcount
-    con.execute(f"UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? "
-                f"WHERE campaign = ? AND status IN ({','.join('?' * len(OPEN_MEMBER))})",
-                (M["stopped"], _now(), reason[:200], campaign_id, *OPEN_MEMBER))
+    cancelled = _x(con, "overlay.campaigns.cancel_queued",
+                   (f"campaign {reason}"[:300], now, campaign_id)).rowcount
+    _x(con, "overlay.campaigns.end_members",
+       (M["stopped"], _now(), reason[:200], campaign_id, _OPEN))
     _touch(con, campaign_id, status="finished", ended_at=_now())
     _tell_plan(con, campaign_id, "stopped")
     return cancelled
@@ -461,9 +456,7 @@ def finish_if_done(con: sqlite3.Connection, campaign_id: str) -> bool:
     c = get_campaign(con, campaign_id)
     if c is None or c["status"] != "active" or c["rolling"]:
         return False
-    if con.execute(f"SELECT 1 FROM campaign_member WHERE campaign = ? AND status IN "
-                   f"({','.join('?' * len(OPEN_MEMBER))}) LIMIT 1",
-                   (campaign_id, *OPEN_MEMBER)).fetchone():
+    if _x(con, "overlay.campaigns.has_open", (campaign_id, _OPEN)).fetchone():
         return False
     # Started with nobody (its filter matched no one): nothing will join
     # it either, so it finishes too.
@@ -486,34 +479,33 @@ def _member(row) -> dict:
 
 
 def member(con: sqlite3.Connection, campaign_id: str, email: str) -> dict | None:
-    row = con.execute(f"SELECT {', '.join(MEMBER_COLS)} FROM campaign_member "
-                      "WHERE campaign = ? AND email = ?", (campaign_id, normalize(email))).fetchone()
+    row = _x(con, "overlay.campaigns.member", (campaign_id, normalize(email))).fetchone()
     return _member(row) if row else None
 
 
 def members(con: sqlite3.Connection, campaign_id: str, status: str = "", limit: int = 500,
             offset: int = 0) -> list[dict]:
-    where, params = "WHERE campaign = ?", [campaign_id]
     if status:
         if status not in MEMBER_STATUS:
             raise Refused(f"unknown member status {status!r}")
-        where += " AND status = ?"
-        params.append(M[status])
-    return [_member(r) for r in con.execute(
-        f"SELECT {', '.join(MEMBER_COLS)} FROM campaign_member {where} "
-        "ORDER BY added_at, email LIMIT ? OFFSET ?", (*params, int(limit), int(offset)))]
+        rows = _x(con, "overlay.campaigns.members_status",
+                  (campaign_id, M[status], int(limit), int(offset)))
+    else:
+        rows = _x(con, "overlay.campaigns.members", (campaign_id, int(limit), int(offset)))
+    return [_member(r) for r in rows]
 
 
 def set_member(con: sqlite3.Connection, campaign_id: str, email: str, status: str,
                reason: str = "", **fields) -> bool:
     """Move a member on (``fields``: last_step, last_sent_at). A final
     status records when and why it ended."""
-    sets = {"status": M[status], **fields}
-    if M[status] not in OPEN_MEMBER:
-        sets.update(ended_at=_now(), end_reason=reason[:200])
-    cols = ", ".join(f"{k} = ?" for k in sets)
-    return con.execute(f"UPDATE campaign_member SET {cols} WHERE campaign = ? AND email = ?",
-                       (*sets.values(), campaign_id, normalize(email))).rowcount == 1
+    unknown = set(fields) - {"last_step", "last_sent_at"}
+    if unknown:
+        raise ValueError(f"not a member field: {sorted(unknown)}")
+    ended = int(M[status] not in OPEN_MEMBER)
+    return _x(con, "overlay.campaigns.set_member",
+              (M[status], fields.get("last_step"), fields.get("last_sent_at"), ended, _now(),
+               ended, reason[:200], campaign_id, normalize(email))).rowcount == 1
 
 
 def stop_after(con: sqlite3.Connection, campaign_id: str, email: str, step: int,
@@ -522,12 +514,10 @@ def stop_after(con: sqlite3.Connection, campaign_id: str, email: str, step: int,
     cut off and may have reached them): what it still had queued after it
     in this campaign is cancelled, and its place ends with ``reason``, so a
     campaign that doesn't roll can finish. True when the member ended."""
-    con.execute("UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
-                "WHERE campaign_id = ? AND to_email = ? AND kind = 'sequence' AND step > ? "
-                "AND status IN ('pending_review', 'approved')",
-                (f"step {int(step)} {reason}"[:300],
-                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), campaign_id,
-                 normalize(email), int(step)))
+    _x(con, "overlay.campaigns.cancel_after",
+       (f"step {int(step)} {reason}"[:300],
+        datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), normalize(email),
+        campaign_id, int(step)))
     m = member(con, campaign_id, email)
     if m is None or m["status"] not in OPEN_MEMBER:
         return False
@@ -539,10 +529,8 @@ def stop_after(con: sqlite3.Connection, campaign_id: str, email: str, step: int,
 def end_memberships(con: sqlite3.Connection, email: str, status: str, reason: str) -> int:
     """Every open membership of an address ends (it replied, was suppressed
     or bounced): in every campaign, whatever its state."""
-    return con.execute(
-        f"UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? WHERE email = ? "
-        f"AND status IN ({','.join('?' * len(OPEN_MEMBER))})",
-        (M[status], _now(), reason[:200], normalize(email), *OPEN_MEMBER)).rowcount
+    return _x(con, "overlay.campaigns.end_address",
+              (M[status], _now(), reason[:200], normalize(email), _OPEN)).rowcount
 
 
 def stop_colleagues(con: sqlite3.Connection, prospect_ids, reason: str) -> int:
@@ -551,11 +539,8 @@ def stop_colleagues(con: sqlite3.Connection, prospect_ids, reason: str) -> int:
     ids = list(prospect_ids)
     if not ids:
         return 0
-    return con.execute(
-        f"UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? "
-        f"WHERE prospect_id IN ({','.join('?' * len(ids))}) "
-        f"AND status IN ({','.join('?' * len(OPEN_MEMBER))})",
-        (M["stopped"], _now(), reason[:200], *ids, *OPEN_MEMBER)).rowcount
+    return _x(con, "overlay.campaigns.end_prospects",
+              (M["stopped"], _now(), reason[:200], json.dumps(ids), _OPEN)).rowcount
 
 
 def overlap(con: sqlite3.Connection, email: str, campaign_id: str) -> str:
@@ -563,27 +548,18 @@ def overlap(con: sqlite3.Connection, email: str, campaign_id: str) -> str:
     it is open in an active or paused campaign, or it got cold email in the
     last OVERLAP_DAYS."""
     email = normalize(email)
-    row = con.execute(
-        f"SELECT c.name FROM campaign_member m JOIN campaigns c ON c.id = m.campaign "
-        f"WHERE m.email = ? AND m.campaign != ? AND c.status IN ('active', 'paused') "
-        f"AND m.status IN ({','.join('?' * len(OPEN_MEMBER))}) LIMIT 1",
-        (email, campaign_id, *OPEN_MEMBER)).fetchone()
+    row = _x(con, "overlay.campaigns.held_by", (email, campaign_id, _OPEN)).fetchone()
     if row:
         return f"in campaign {row[0]!r}"
     since = (datetime.now(timezone.utc).replace(tzinfo=None)
              - timedelta(days=OVERLAP_DAYS)).isoformat()
-    row = con.execute("SELECT MAX(sent_at) FROM outbox WHERE to_email = ? AND kind = 'sequence' "
-                      "AND status = 'sent' AND campaign_id != ? AND sent_at >= ?",
-                      (email, campaign_id, since)).fetchone()
+    row = _x(con, "overlay.campaigns.sent_lately", (email, since, campaign_id)).fetchone()
     if row and row[0]:
         return f"cold email sent {str(row[0])[:10]}"
     # Contacted with no cold email on file (an earlier release sent it
     # through Instantly, or it was sent by hand): when is unknown, so it
     # counts as recent.
-    if con.execute("SELECT 1 FROM prospects p WHERE p.email = ? AND p.status = 'contacted' "
-                   "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.prospect_id = p.id "
-                   "AND o.kind = 'sequence' AND o.status = 'sent') LIMIT 1",
-                   (email,)).fetchone():
+    if _x(con, "overlay.campaigns.contacted_elsewhere", (email,)).fetchone():
         return CONTACTED_ELSEWHERE
     return ""
 
@@ -593,9 +569,8 @@ def already_contacted(con: sqlite3.Connection, email: str, campaign_id: str,
     """For a first email: why it would be a second one ("" when it isn't):
     this campaign already sent this address its first email (another row),
     or another campaign's sequence holds it or wrote to it lately."""
-    row = con.execute("SELECT 1 FROM outbox WHERE to_email = ? AND campaign_id = ? "
-                      "AND kind = 'sequence' AND step = 1 AND status = 'sent' AND id != ? LIMIT 1",
-                      (normalize(email), campaign_id, outbox_id)).fetchone()
+    row = _x(con, "overlay.campaigns.first_sent",
+             (normalize(email), campaign_id, outbox_id)).fetchone()
     if row:
         return "already contacted"
     why = overlap(con, email, campaign_id)
@@ -603,7 +578,7 @@ def already_contacted(con: sqlite3.Connection, email: str, campaign_id: str,
 
 
 def review_always(con: sqlite3.Connection, campaign_id: str) -> bool:
-    row = con.execute("SELECT review FROM campaigns WHERE id = ?", (campaign_id or "",)).fetchone()
+    row = _x(con, "overlay.campaigns.review", (campaign_id or "",)).fetchone()
     return bool(row and row[0] == "always")
 
 
@@ -612,7 +587,7 @@ def review_always(con: sqlite3.Connection, campaign_id: str) -> bool:
 def _empty_counts() -> dict:
     return {"total": 0, "ready": 0, "risky": 0, "to_verify": 0, "risky_held": 0,
             "left_out": 0, "untrusted": 0, "suppressed": 0, "overlap": 0, "answered": 0,
-            "already": 0, "added": 0, "firms": 0,
+            "already": 0, "added": 0, "firms": 0, "personal_sample": 0,
             "personal": {"named": 0, "free_mail": 0, "natural_person": 0}}
 
 
@@ -640,7 +615,6 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
     allow_risky = bool(getattr(config.channels.email, "send_to_risky", False))
     listed = live_do_not_contact(config)
     counts = _empty_counts()
-    firms: set = set()
     take: list[tuple[dict, str, int]] = []
 
     def screen(con):
@@ -663,7 +637,7 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
                     listed and suppression.check(con, email, firm, listed)):
                 counts["suppressed"] += 1
                 continue
-            p = con.execute("SELECT status FROM prospects WHERE email = ?", (email,)).fetchone()
+            p = _x(con, "overlay.campaigns.prospect_status", (email,)).fetchone()
             if (p and p[0] in ANSWERED) or (row.get("company_id")
                                             and str(row["company_id"]) in answered_firms):
                 counts["answered"] += 1         # they, or someone at their company
@@ -680,16 +654,22 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
             take.append((row, status, 0))
 
     await state._in_tx(screen, write=False)
+    firms = {row.get("company_id") for row, _, _ in take}
+    counts["firms"] = len(firms - {None})
+    # (Whether an address is personal reads every firm it is linked to: a
+    # member records it, a preview counts it over its first PREVIEW_PERSONAL
+    # addresses and says so when it took more.)
+    decide = take[:PREVIEW_PERSONAL] if dry_run else take
+    if dry_run and len(take) > PREVIEW_PERSONAL:
+        counts["personal_sample"] = PREVIEW_PERSONAL
     kept = []
-    for row, status, _ in take:
+    for row, status, _ in decide:
         reason = email_rules.personal_reason(row["email"], await state.read(
             "address_facts", row["email"]))
         if reason:
             counts["personal"][{email_rules.NAMED: "named", email_rules.FREE_MAIL: "free_mail",
                                 email_rules.NATURAL_PERSON: "natural_person"}[reason]] += 1
-        firms.add(row.get("company_id"))
         kept.append((row, status, reason))
-    counts["firms"] = len(firms - {None})
     sendable = counts["ready"] + counts["risky"] + counts["to_verify"]
     cap = max(int(getattr(config.channels.email, "max_daily_sends", 0) or 0), 1)
     counts["days_at_cap"] = math.ceil(sendable / cap) if sendable else 0
@@ -697,12 +677,11 @@ async def add_members(state, config, campaign_id: str, rows: list[dict], added_b
         return counts
     for row, status, reason in kept:
         prospect_id = await _prospect_card(state, row, status)
-        added = await state._in_tx(lambda con: con.execute(
-            "INSERT OR IGNORE INTO campaign_member (campaign, email, contact, firm, person, "
-            "prospect_id, status, personal, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?)", (campaign_id, normalize(row["email"]), row["contact_id"], row.get("firm"),
-                      row.get("person_id") or 0, prospect_id, M[status], reason,
-                      MEMBER_ADDED_BY[added_by], _now())).rowcount)
+        added = await state._in_tx(lambda con: _x(
+            con, "overlay.campaigns.member_add",
+            (campaign_id, normalize(row["email"]), row["contact_id"], row.get("firm"),
+             row.get("person_id") or 0, prospect_id, M[status], reason,
+             MEMBER_ADDED_BY[added_by], _now())).rowcount)
         counts["added"] += added
     return counts
 
@@ -713,11 +692,11 @@ def _answered_firms(con: sqlite3.Connection) -> set[str]:
     email domain too (state.colleague_who_replied)."""
     from harvey.state import COMPANY_STOP_KEY
 
-    return {str(r[0]) for r in con.execute(
-        "SELECT DISTINCT (SELECT CASE f.live WHEN 0 THEN f.id ELSE f.live END FROM firm f "
-        "WHERE f.id = p.company_id) FROM settings s JOIN prospects p "
-        "ON s.key = ? || p.id WHERE s.key LIKE ? AND p.company_id != ''",
-        (COMPANY_STOP_KEY, COMPANY_STOP_KEY + "%")) if r[0] is not None}
+    # (The marks' keys as a range: the prefix up to the one after it.)
+    end = COMPANY_STOP_KEY[:-1] + chr(ord(COMPANY_STOP_KEY[-1]) + 1)
+    return {str(r[0]) for r in _x(con, "overlay.campaigns.answered_firms",
+                                  (COMPANY_STOP_KEY, end, len(COMPANY_STOP_KEY) + 1))
+            if r[0] is not None}
 
 
 async def _prospect_card(state, row: dict, status: str) -> str:
@@ -828,11 +807,10 @@ async def remove_by_hand(state, campaign_id: str, emails) -> int:
             if m is None or m["status"] not in OPEN_MEMBER:
                 continue
             set_member(con, campaign_id, email, "removed", "taken out by you")
-            con.execute("UPDATE outbox SET status = 'cancelled', error = 'taken out of the "
-                        "campaign', updated_at = ? WHERE campaign_id = ? AND to_email = ? "
-                        "AND kind = 'sequence' AND status IN ('pending_review', 'approved')",
-                        (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-                         campaign_id, email))
+            _x(con, "overlay.campaigns.cancel_address",
+               ("taken out of the campaign",
+                datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), email,
+                campaign_id))
             n += 1
         return n
     return await state._in_tx(run)
@@ -923,8 +901,7 @@ def record(con: sqlite3.Connection, campaign_id: str) -> dict:
     c = get_campaign(con, campaign_id)
     if c is None:
         raise Refused("Campania nu există. No such campaign.")
-    acks = con.execute("SELECT version, text_sha, at, by FROM acknowledgement WHERE kind = ? "
-                       "ORDER BY at", (acknowledgement.KIND,)).fetchall()
+    acks = _x(con, "overlay.campaigns.acknowledgements", (acknowledgement.KIND,)).fetchall()
     started = c["started_at"]
     # The one in force when it started (else, a draft, the latest given).
     ack = next((a for a in reversed(acks) if started and a[2] <= int(started)), None) \
@@ -941,12 +918,7 @@ def record(con: sqlite3.Connection, campaign_id: str) -> dict:
     # Its cold email, and the answers sent in its conversations.
     sends = [{"email": r[0], "step": r[1], "subject": r[2], "sent_at": r[3] or "",
               "source_note": r[4] or "", "message_id": r[5] or "", "kind": r[6]}
-             for r in con.execute(
-                 "SELECT to_email, step, subject, sent_at, source_note, message_id, kind "
-                 "FROM outbox WHERE status = 'sent' AND ((campaign_id = ? AND kind = 'sequence') "
-                 "OR (kind = 'reply' AND conversation_id IN "
-                 "(SELECT id FROM conversations WHERE campaign_id = ?))) "
-                 "ORDER BY sent_at, step", (campaign_id, campaign_id))]
+             for r in _x(con, "overlay.campaigns.record_sends", (campaign_id, campaign_id))]
     opt_outs = _opt_outs(con, campaign_id, members_out)
     return {
         "campaign": {"id": c["id"], "name": c["name"], "status": c["status"],
@@ -973,15 +945,12 @@ def _opt_outs(con: sqlite3.Connection, campaign_id: str, members_out: list[dict]
 
     scopes = suppression.SUPPRESSION_SCOPE
     codes = [SUPPRESSION_REASON_CODES[r] for r in OPT_OUT_REASONS]
-    rows = con.execute(
-        f"SELECT scope, value, reason, campaign, at, by, undone_at, undo_note FROM suppression "
-        f"WHERE reason IN ({','.join('?' * len(codes))}) ORDER BY at, id", codes).fetchall()
+    rows = _x(con, "overlay.campaigns.opt_outs", (json.dumps(codes),)).fetchall()
     if not rows:
         return []
     firm_rows = any(r[0] == scopes["firm"] for r in rows)
     covers: dict[tuple[int, str], set[str]] = {}
-    firms = {r[0]: r[1] for r in con.execute(
-        "SELECT email, firm FROM campaign_member WHERE campaign = ?", (campaign_id,))}
+    firms = {r[0]: r[1] for r in _x(con, "overlay.campaigns.member_firms", (campaign_id,))}
     for m in members_out:
         email = m["email"]
         local, _, host = email.rpartition("@")

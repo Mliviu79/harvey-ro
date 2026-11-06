@@ -939,3 +939,110 @@ def test_discover_runs_only_the_registrys_job_from_its_filters(client, monkeypat
     r = client.post("/api/discover/run", json={"providers": ["onrc.other_lookup"],
                                                "filters": {"onrc.other_lookup": {"words": "x"}}})
     assert r.status_code == 400 and "can't be run from Discover" in r.json()["message"]
+
+
+def test_the_background_walk_goes_on_where_it_stopped_with_todays_results(tmp_path,
+                                                                          monkeypatch):
+    """next_paid keeps where its walk got to (a stretch whose firms were all
+    searched): each call gives what a walk from the top would, in the same
+    order, a firm added since first, and starts over at the end."""
+    from harvey.overlay import reads
+
+    db = tmp_path / "harvey.db"
+    monkeypatch.setattr(reads, "PAID_WALK_PAGE", 3)
+
+    async def go():
+        s = await _state(db)
+        serper = finder.searchers({"serper"}, ENV)
+        ids = [await _company(s, name=f"EXEMPLU {n} SRL", location="Brașov, Brașov, Romania")
+               for n in ("UNU", "DOI", "TREI", "PATRU", "CINCI", "SASE", "SAPTE", "OPT")]
+
+        async def from_the_top(limit):
+            got, _ = await s.read("next_paid", limit, serper, None)
+            return got
+
+        async def searched(cid):
+            await s.record_search("company", cid, "serper", serper[0].capability)
+
+        seen = []
+        for i in range(5):
+            if i == 2:
+                ids.append(await _company(s, name="EXEMPLU NOU SRL",
+                                          location="Sibiu, Sibiu, Romania"))
+            want = await from_the_top(2)
+            got = await finder.next_paid(s, 2, serper)
+            seen.append((got, want, json.loads(await s.get_setting(finder.PAID_WALK_KEY))[0]))
+            for cid in got:
+                await searched(cid)
+        return ids, seen, await finder.next_paid(s, 2, serper), \
+            json.loads(await s.get_setting(finder.PAID_WALK_KEY))[0]
+
+    ids, seen, last, walk = run(go())
+    newest_first = list(reversed(ids[:8]))
+    assert [got for got, _, _ in seen] == [want for _, want, _ in seen]
+    assert seen[0][0] == newest_first[:2] and seen[1][0] == newest_first[2:4]
+    # Added after the walk began: first on the next call.
+    assert seen[2][0] == [ids[8], newest_first[4]]
+    # The stretch: nothing searched at first; then the two searched since.
+    assert seen[0][2]["hi"] is None
+    assert (seen[1][2]["hi"][1], seen[1][2]["lo"][1]) == tuple(map(int, newest_first[:2]))
+    assert seen[4][0] == [ids[0]] and last == []
+    # Everything searched: the walk reached the end and starts over.
+    assert walk["hi"] is None and walk["lo"] is None
+
+
+def test_the_background_walk_starts_over_after_a_day(tmp_path):
+    db = tmp_path / "harvey.db"
+
+    async def go():
+        s = await _state(db)
+        serper = finder.searchers({"serper"}, ENV)
+        oldest = await _company(s, name="EXEMPLU PRIM SRL", location="Iasi, Iasi, Romania")
+        old = await _company(s, name="EXEMPLU VECHI SRL", location="Iasi, Iasi, Romania")
+        new = await _company(s, name="EXEMPLU NOU SRL", location="Iasi, Iasi, Romania")
+        await s.record_search("company", new, "serper", serper[0].capability)
+        first = await finder.next_paid(s, 1, serper)
+        await s.record_search("company", old, "serper", serper[0].capability)
+        second = await finder.next_paid(s, 1, serper)
+        # The newest firm's search fails after all: within the day the
+        # walk's stretch still holds it; a day on, it is seen again.
+        with sqlite3.connect(db) as con:
+            con.execute("UPDATE search SET outcome = 0 WHERE target = ?", (int(new),))
+        kept = await finder.next_paid(s, 1, serper)
+        walk = json.loads(await s.get_setting(finder.PAID_WALK_KEY))[0]
+        await s.set_setting(finder.PAID_WALK_KEY,
+                            json.dumps([{**walk, "since": walk["since"] - 86400}]))
+        return oldest, old, new, first, second, kept, await finder.next_paid(s, 1, serper)
+
+    oldest, old, new, first, second, kept, again = run(go())
+    assert (first, second, kept) == ([old], [oldest], [oldest])
+    assert again == [new]
+
+
+def test_the_background_walk_keeps_one_stretch_for_each_set_of_searches(tmp_path):
+    """Which searches have free allowance left changes by the minute: a
+    call with another set doesn't throw away the walk of the first."""
+    db = tmp_path / "harvey.db"
+    env = {**ENV, "tinyfish_api_key": "test-key"}
+
+    async def go():
+        s = await _state(db)
+        serper = finder.searchers({"serper"}, ENV)
+        both = finder.searchers({"serper", "tinyfish"}, env)
+        assert len(both) > len(serper)
+        ids = [await _company(s, name=f"EXEMPLU {n} SRL", location="Cluj, Cluj, Romania")
+               for n in ("UNU", "DOI", "TREI")]
+        for cid in ids[1:]:
+            await s.record_search("company", cid, "serper", serper[0].capability)
+        first = await finder.next_paid(s, 1, serper)
+        await finder.next_paid(s, 1, both)
+        walks = json.loads(await s.get_setting(finder.PAID_WALK_KEY))
+        return ids, first, walks, await finder.next_paid(s, 1, serper)
+
+    ids, first, walks, again = run(go())
+    assert first == again == [ids[0]]
+    kept = {json.dumps(w["searchers"]): w for w in walks}
+    assert len(kept) == 2
+    serper_walk = next(w for w in walks if len(w["searchers"]) == 1)
+    # The two searched by serper stay its stretch.
+    assert (serper_walk["hi"][1], serper_walk["lo"][1]) == (int(ids[2]), int(ids[1]))

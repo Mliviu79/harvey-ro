@@ -3725,13 +3725,15 @@ def cmd_suppress(args):
 def _counts_line(counts: dict) -> str:
     """A snapshot's or preview's counts, for the terminal."""
     personal = counts.get("personal") or {}
+    # (A preview counts personal addresses over its first ones only.)
+    sample = f" of the first {counts['personal_sample']}" if counts.get("personal_sample") else ""
     return (f"{counts.get('ready', 0)} ready, {counts.get('risky', 0)} catch-all, "
             f"{counts.get('to_verify', 0)} to check (a verifier credit each); left out: "
             f"{counts.get('left_out', 0)} invalid or guess, {counts.get('untrusted', 0)} "
             f"untrusted, {counts.get('suppressed', 0)} do-not-contact, "
             f"{counts.get('overlap', 0)} in another campaign or emailed lately, "
             f"{counts.get('answered', 0)} answered, {counts.get('risky_held', 0)} catch-all "
-            f"held (send_to_risky off); personal: {sum(personal.values())}; "
+            f"held (send_to_risky off); personal: {sum(personal.values())}{sample}; "
             f"~{counts.get('days_at_cap', 0)} day(s) at today's cap")
 
 

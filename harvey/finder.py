@@ -69,6 +69,7 @@ doesn't stop it, and the heartbeat doesn't call it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -1358,19 +1359,40 @@ async def next_free(state, limit: int) -> list[str]:
     return await state.read("next_free", int(limit))
 
 
+# Where the background's walks over the companies with no website got to:
+# one for each set of searches it was given (which searches have some of
+# their free allowance left changes by the minute), the newest first.
+PAID_WALK_KEY = "finder_paid_walk"
+PAID_WALKS = 8
+
+
 async def next_paid(state, limit: int, available: list[Searcher] | None = None) -> list[str]:
     """Companies with no contact and no website that at least one of the
     search modules able to find them (``available``; every one on and set
     up when None) hasn't searched yet, newest first: the background's paid
     work, when a day's budget is set. A module added later brings back
     the companies the others found nothing for."""
+    from harvey.overlay.reads import paid_walk_searchers
+
     if available is None:
         from harvey.modules import switches
 
         available = searchers(await switches.enabled_ids(state), _env())
     if not available:
         return []
-    return await state.read("next_paid", int(limit), available)
+    # (Where the walk got to: overlay.reads.Reader.next_paid.)
+    try:
+        walks = json.loads(await state.get_setting(PAID_WALK_KEY) or "[]")
+    except (TypeError, ValueError):
+        walks = []
+    walks = [w for w in walks if isinstance(w, dict)] if isinstance(walks, list) else []
+    sig = paid_walk_searchers(available)
+    walk = next((w for w in walks if w.get("searchers") == sig), None)
+    ids, after = await state.read("next_paid", int(limit), available, walk)
+    if after != walk:
+        rest = [w for w in walks if w.get("searchers") != after.get("searchers")]
+        await state.set_setting(PAID_WALK_KEY, json.dumps([after, *rest][:PAID_WALKS]))
+    return ids
 
 
 # ── A selection (the Contacts and Companies pages' Find contacts) ──

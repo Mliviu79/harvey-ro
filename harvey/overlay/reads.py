@@ -71,6 +71,12 @@ NAME_ORDER_FROM = 200_000
 # A cohort this big or smaller is sorted by name at once and kept; a bigger
 # one is read off the name index a page at a time.
 COHORT_SORTED_MAX = 20_000
+# finder.next_paid's keyset walk: its page, the keys above and below every
+# firm, and how long a walk's done stretch is trusted before it starts over.
+PAID_WALK_PAGE = 1000
+PAID_TOP = (2**62, 2**62)
+PAID_BOTTOM = (-2**62, -2**62)
+PAID_WALK_SECONDS = 86400
 # Past this many identifiers given since the counts job kept the register
 # sets (a big pull), every first visit would read them all again from the
 # registers: the worker runs the job again instead (bitmaps.py).
@@ -266,6 +272,11 @@ class FirmSet:
 
     def count(self, total: int) -> int:
         return total - self.size() if self.neg else self.size()
+
+
+def paid_walk_searchers(searchers) -> list[list[str]]:
+    """The set of searches a next_paid walk was made for, as it keeps it."""
+    return sorted([s.module, s.capability] for s in searchers or ())
 
 
 class Reader:
@@ -3322,36 +3333,95 @@ class Reader:
             out += [r[0] for r in self.x("overlay.read.next_shallow", (int(limit) - len(out),))]
         return [str(i) for i in out]
 
-    def next_paid(self, limit: int, searchers) -> list[str]:
+    def next_paid(self, limit: int, searchers,
+                  walk: dict | None = None) -> tuple[list[str], dict]:
         """finder.next_paid on the overlay: firms with no contact and no
         site, named, that a search module able to find them hasn't searched
-        yet, newest first."""
+        yet, newest first; and the walk to keep for the next call.
+
+        ``walk`` (finder.PAID_WALK_KEY) remembers a stretch of the walk,
+        from ``hi`` down to ``lo`` (keys (created, id)), whose firms were
+        all searched by every one of these searchers (or are unnamed) when
+        it was walked: the next call reads the firms above it (those added
+        since), then goes on below it, so the same firms come back in the
+        same order without the stretch being read again. It starts over
+        when the searchers change, a pass reaches the end with nothing
+        left, or it is PAID_WALK_SECONDS old (a search cleared, or aged
+        past its refresh_days, is seen again)."""
+        sig = paid_walk_searchers(searchers)
+        now = int(time.time())
+        if (not isinstance(walk, dict) or walk.get("searchers") != sig
+                or now - int(walk.get("since") or 0) >= PAID_WALK_SECONDS):
+            walk = {"searchers": sig, "since": now, "hi": None, "lo": None}
+        else:
+            walk = dict(walk)
         if not searchers:
-            return []
-        out: list[str] = []
-        at = 0
+            return [], walk
         caps = []
         for s in searchers:
             mid, cid = self.module_id(s.module), self.capability_id(s.module, s.capability)
             caps.append((mid, cid, self._cutoff(s.module, s.capability)))
-        while len(out) < limit:
-            batch = [r[0] for r in self.x("overlay.read.next_paid", (1000, at))]
-            if not batch:
-                break
-            at += len(batch)
-            left = set(batch)
+
+        def left(batch: list[int]) -> list[int]:
+            # (The batch's firms some searcher hasn't searched, and named.)
             done_by_all = set(batch)
             for mid, cid, cut in caps:
                 if mid is None or cid is None:
                     done_by_all = set()
                     break
-                done = {r[0] for r in self.x("overlay.read.searched_by",
-                                             (json.dumps(batch), mid, cid, cut))}
-                done_by_all &= done
-            left -= done_by_all
-            named = self.sort_keys([b for b in batch if b in left], "name")
-            out += [str(b) for b in batch if b in left and named.get(b)][:limit - len(out)]
-        return out
+                done_by_all &= {r[0] for r in self.x("overlay.read.searched_by",
+                                                     (json.dumps(batch), mid, cid, cut))}
+            rest = [b for b in batch if b not in done_by_all]
+            named = self.sort_keys(rest, "name")
+            return [b for b in rest if named.get(b)]
+
+        out: list[str] = []
+        page = PAID_WALK_PAGE
+        hi, lo = walk["hi"], walk["lo"]
+        if hi is not None:
+            # The firms above the stretch (added since): when all of them
+            # are done, the stretch reaches up to the newest.
+            upper, newest, clean = PAID_TOP, None, True
+            while len(out) < limit:
+                rows = self.x("overlay.read.next_paid", (*upper, *hi, page)).fetchall()
+                if not rows:
+                    break
+                newest = newest or [rows[0][1], rows[0][0]]
+                todo = left([r[0] for r in rows])
+                clean = clean and not todo
+                out += [str(b) for b in todo][:limit - len(out)]
+                upper = (rows[-1][1], rows[-1][0])
+                if len(rows) < page:
+                    break
+            else:
+                clean = False
+            if clean and newest:
+                walk["hi"] = newest
+        if len(out) < limit:
+            # Below the stretch (from the top when there is none): it grows
+            # over the firms done, up to the first one that isn't.
+            upper = tuple(lo) if lo is not None else PAID_TOP
+            growing = True
+            while len(out) < limit:
+                rows = self.x("overlay.read.next_paid", (*upper, *PAID_BOTTOM, page)).fetchall()
+                todo = left([r[0] for r in rows]) if rows else []
+                if growing:
+                    waiting = set(todo)
+                    for fid, created in rows:
+                        if fid in waiting:
+                            growing = False
+                            break
+                        if walk["hi"] is None:
+                            walk["hi"] = [created, fid]
+                        walk["lo"] = [created, fid]
+                out += [str(b) for b in todo][:limit - len(out)]
+                if len(rows) < page:
+                    if growing:
+                        # The end with nothing left: the next call starts over.
+                        walk = {"searchers": sig, "since": now, "hi": None, "lo": None}
+                    break
+                upper = (rows[-1][1], rows[-1][0])
+        return out, walk
 
     def select(self, f, ids=None, force: bool = False, limit: int = 1000) -> list[dict]:
         """finder.select on the overlay: the firms a Find-contacts run takes

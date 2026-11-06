@@ -385,10 +385,14 @@ statement("overlay.read.next_shallow",
           "AND (website IS NOT NULL OR domain IS NOT NULL) AND n_contacts > 0 "
           "AND site_read_at IS NOT NULL AND site_read_deep IS NULL " + _NOT_WAITING +
           "ORDER BY created DESC, id DESC LIMIT ?", params=(50,), bounded=True)
+# A page of them below a key and above another, newest first (a keyset
+# walk: (created, id) is the index's order).
 statement("overlay.read.next_paid",
-          "SELECT id FROM firm INDEXED BY firm_no_contact WHERE live = 0 AND n_contacts = 0 "
-          "AND website IS NULL AND domain IS NULL ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
-          params=(50, 0), scans=_WALKED)
+          "SELECT id, created FROM firm INDEXED BY firm_no_contact WHERE live = 0 "
+          "AND n_contacts = 0 AND website IS NULL AND domain IS NULL "
+          "AND (created, id) < (?, ?) AND (created, id) > (?, ?) "
+          "ORDER BY created DESC, id DESC LIMIT ?",
+          params=(2**62, 2**62, -1, -1, 50), scans=_WALKED)
 statement("overlay.read.searched_by",
           f"SELECT DISTINCT s.target FROM {_J} CROSS JOIN search s WHERE s.is_person = 0 "
           "AND s.target = j.value AND s.module = ? AND s.capability = ? AND s.at >= ? "
@@ -1169,3 +1173,194 @@ statement("overlay.agent.delete_chat_task_calls",
 statement("overlay.agent.task_requeue",
           "UPDATE agent_task SET status = 'queued' WHERE id = ? AND status = 'running'",
           params=(1,))
+
+# ── Audiences, campaigns and their members (harvey/campaigns.py, schema 27;
+# the outbox by address, schema 37) ──
+# A list a statement takes is bound as one JSON array (json_each), so its
+# text is the same whatever its length: campaigns.OPEN_MEMBER, prospect
+# ids, do-not-contact reasons, campaign statuses.
+_LIST = "(SELECT value FROM json_each(?))"
+_OPEN = "[0, 1, 2, 3]"
+statement("overlay.campaigns.account_add",
+          "INSERT OR IGNORE INTO sending_account (id, label, created_at) "
+          "VALUES (1, 'settings', ?)", params=(1,))
+statement("overlay.campaigns.account_sync",
+          "UPDATE sending_account SET provider = ?, address = ? WHERE id = 1 "
+          "AND (provider != ? OR address != ?)", params=("gmail", "a@example.com", "", ""))
+statement("overlay.campaigns.accounts",
+          "SELECT id, label, provider, address, profile_id, enabled, created_at "
+          "FROM sending_account ORDER BY id")
+statement("overlay.campaigns.audience_add",
+          "INSERT INTO audience (name, filter_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
+          params=("n", "{}", 1, 1))
+_AUDIENCE = "SELECT id, name, filter_json, created_at, updated_at, archived FROM audience "
+# (archived: 1 lists the archived ones too.)
+statement("overlay.campaigns.audiences",
+          _AUDIENCE + "WHERE archived = 0 OR ? ORDER BY id DESC", params=(0,),
+          scans={"audience": "the saved audiences, a handful, listed whole"})
+statement("overlay.campaigns.audience", _AUDIENCE + "WHERE id = ?", params=(1,))
+statement("overlay.campaigns.audience_use",
+          "SELECT audience_id, COUNT(*) FROM campaigns WHERE audience_id IS NOT NULL "
+          "GROUP BY audience_id",
+          scans={"campaigns": "the campaigns, a handful, counted per audience"})
+# A rename or an (un)archive: NULL leaves a field as it is.
+statement("overlay.campaigns.audience_update",
+          "UPDATE audience SET name = COALESCE(?, name), archived = COALESCE(?, archived), "
+          "updated_at = ? WHERE id = ?", params=("n", None, 1, 1))
+_CAMPAIGN = ("SELECT id, name, status, sequence_json, created_at, audience_id, audience_query, "
+             "rolling, rolled_at, account_id, profile_id, offer_json, li_note, review, origin, "
+             "started_at, ended_at, updated_at FROM campaigns ")
+statement("overlay.campaigns.get", _CAMPAIGN + "WHERE id = ?", params=("c",))
+# (statuses: NULL lists every campaign.)
+statement("overlay.campaigns.list",
+          _CAMPAIGN + f"WHERE ? IS NULL OR status IN {_LIST} ORDER BY created_at DESC",
+          params=(None, None),
+          scans={"campaigns": "the campaigns, a handful, listed whole"})
+statement("overlay.campaigns.member_counts",
+          "SELECT campaign, status, COUNT(*) FROM campaign_member INDEXED BY "
+          "campaign_member_status GROUP BY campaign, status",
+          scans={"campaign_member": "every campaign's members counted by status for the "
+                                    "Campaigns page: its (campaign, status) index read whole"})
+statement("overlay.campaigns.sent_counts",
+          "SELECT campaign_id, COUNT(*) FROM outbox INDEXED BY uq_outbox_campaign_step "
+          "WHERE campaign_id != '' AND kind = 'sequence' AND status = 'sent' "
+          "GROUP BY campaign_id",
+          scans={"outbox": "every campaign's cold email sent, counted for the Campaigns "
+                           "page: the campaigns' sequence index read whole"})
+statement("overlay.campaigns.reply_counts",
+          "SELECT campaign_id, COUNT(*) FROM conversations INDEXED BY "
+          "idx_conversations_campaign_id WHERE campaign_id != '' GROUP BY campaign_id",
+          scans={"conversations": "every campaign's conversations counted for the Campaigns "
+                                  "page: its index read whole"})
+statement("overlay.campaigns.add",
+          "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status, "
+          "created_at, audience_id, audience_query, rolling, account_id, profile_id, offer_json, "
+          "li_note, review, origin, updated_at) VALUES (?, ?, 'email', ?, '[]', 'draft', ?, ?, ?, "
+          "?, ?, ?, ?, ?, ?, 'user', ?)",
+          params=("c", "n", "[]", "2026-01-01", None, "", 0, 1, None, "{}", "", "inherit", 1))
+# Every field _touch may change, written back whole (read in the same
+# transaction): a field set to NULL is set to NULL.
+statement("overlay.campaigns.save",
+          "UPDATE campaigns SET name = ?, status = ?, sequence_json = ?, audience_id = ?, "
+          "audience_query = ?, rolling = ?, rolled_at = ?, offer_json = ?, li_note = ?, "
+          "review = ?, started_at = ?, ended_at = ?, updated_at = ? WHERE id = ?",
+          params=("n", "draft", "[]", None, "", 0, None, "{}", "", "inherit", None, None, 1, "c"))
+statement("overlay.campaigns.review",
+          "SELECT review FROM campaigns WHERE id = ?", params=("c",))
+# The Outbox's note on a paused campaign's approved emails, and taking it off.
+statement("overlay.campaigns.note_paused",
+          "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET error = ? "
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' "
+          "AND status = 'approved' AND COALESCE(error, '') = ''", params=("p", "c"))
+statement("overlay.campaigns.note_resumed",
+          "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET error = '' "
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' "
+          "AND status = 'approved' AND error = ?", params=("c", "p"))
+statement("overlay.campaigns.cancel_queued",
+          "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET status = 'cancelled', "
+          "error = ?, updated_at = ? WHERE campaign_id = ? AND campaign_id != '' "
+          "AND kind = 'sequence' AND status IN ('pending_review', 'approved')",
+          params=("e", "2026-01-01", "c"))
+statement("overlay.campaigns.end_members",
+          "UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? "
+          f"WHERE campaign = ? AND status IN {_LIST}", params=(6, 1, "r", "c", _OPEN))
+statement("overlay.campaigns.has_open",
+          f"SELECT 1 FROM campaign_member WHERE campaign = ? AND status IN {_LIST} LIMIT 1",
+          params=("c", _OPEN))
+_MEMBER = ("SELECT campaign, email, contact, firm, person, prospect_id, status, personal, "
+           "added_by, added_at, last_step, last_sent_at, ended_at, end_reason "
+           "FROM campaign_member ")
+statement("overlay.campaigns.member", _MEMBER + "WHERE campaign = ? AND email = ?",
+          params=("c", "a@example.com"))
+# A campaign's members in the order they joined (a page; the record takes
+# them all): its members sorted, a campaign's tens of thousands at most.
+statement("overlay.campaigns.members",
+          _MEMBER + "WHERE campaign = ? ORDER BY added_at, email LIMIT ? OFFSET ?",
+          params=("c", 500, 0), bounded=True)
+statement("overlay.campaigns.members_status",
+          _MEMBER + "WHERE campaign = ? AND status = ? ORDER BY added_at, email LIMIT ? OFFSET ?",
+          params=("c", 1, 500, 0), bounded=True)
+# A member moved on: NULL keeps last_step and last_sent_at; a final status
+# (ended 1) records when and why it ended.
+statement("overlay.campaigns.set_member",
+          "UPDATE campaign_member SET status = ?, last_step = COALESCE(?, last_step), "
+          "last_sent_at = COALESCE(?, last_sent_at), "
+          "ended_at = CASE WHEN ? THEN ? ELSE ended_at END, "
+          "end_reason = CASE WHEN ? THEN ? ELSE end_reason END WHERE campaign = ? AND email = ?",
+          params=(1, None, None, 0, 1, 0, "", "c", "a@example.com"))
+# One address's queued emails in a campaign: those after a step, or all.
+statement("overlay.campaigns.cancel_after",
+          "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+          "WHERE to_email = ? AND campaign_id = ? AND kind = 'sequence' AND step > ? "
+          "AND status IN ('pending_review', 'approved')",
+          params=("e", "2026-01-01", "a@example.com", "c", 1))
+statement("overlay.campaigns.cancel_address",
+          "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+          "WHERE to_email = ? AND campaign_id = ? AND kind = 'sequence' "
+          "AND status IN ('pending_review', 'approved')",
+          params=("e", "2026-01-01", "a@example.com", "c"))
+statement("overlay.campaigns.end_address",
+          "UPDATE campaign_member INDEXED BY campaign_member_email "
+          "SET status = ?, ended_at = ?, end_reason = ? "
+          f"WHERE email = ? AND status IN {_LIST}", params=(5, 1, "r", "a@example.com", _OPEN))
+statement("overlay.campaigns.end_prospects",
+          "UPDATE campaign_member INDEXED BY campaign_member_prospect "
+          "SET status = ?, ended_at = ?, end_reason = ? "
+          f"WHERE prospect_id IN {_LIST} AND status IN {_LIST}",
+          params=(6, 1, "r", '["p"]', _OPEN))
+# Why another campaign holds an address (campaigns.overlap): open in an
+# active or paused campaign, cold email sent to it lately, or contacted
+# with no cold email on file.
+statement("overlay.campaigns.held_by",
+          "SELECT c.name FROM campaign_member m INDEXED BY campaign_member_email "
+          "CROSS JOIN campaigns c ON c.id = m.campaign "
+          f"WHERE m.email = ? AND m.campaign != ? AND m.status IN {_LIST} "
+          "AND c.status IN ('active', 'paused') LIMIT 1",
+          params=("a@example.com", "c", _OPEN), drives="m")
+statement("overlay.campaigns.sent_lately",
+          "SELECT MAX(sent_at) FROM outbox INDEXED BY idx_outbox_to_email WHERE to_email = ? "
+          "AND kind = 'sequence' AND status = 'sent' AND sent_at >= ? AND campaign_id != ?",
+          params=("a@example.com", "2026-01-01", "c"))
+statement("overlay.campaigns.contacted_elsewhere",
+          "SELECT 1 FROM prospects p INDEXED BY uq_prospects_email WHERE p.email = ? "
+          "AND p.email != '' AND p.status = 'contacted' AND NOT EXISTS "
+          "(SELECT 1 FROM outbox o INDEXED BY idx_outbox_prospect WHERE o.prospect_id = p.id "
+          "AND o.kind = 'sequence' AND o.status = 'sent') LIMIT 1", params=("a@example.com",))
+statement("overlay.campaigns.first_sent",
+          "SELECT 1 FROM outbox INDEXED BY idx_outbox_to_email WHERE to_email = ? "
+          "AND kind = 'sequence' AND status = 'sent' AND campaign_id = ? AND step = 1 "
+          "AND id != ? LIMIT 1", params=("a@example.com", "c", ""))
+statement("overlay.campaigns.prospect_status",
+          "SELECT status FROM prospects INDEXED BY uq_prospects_email WHERE email = ? "
+          "AND email != ''", params=("a@example.com",))
+statement("overlay.campaigns.member_add",
+          "INSERT OR IGNORE INTO campaign_member (campaign, email, contact, firm, person, "
+          "prospect_id, status, personal, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+          "?, ?)", params=("c", "a@example.com", 1, 1, 0, "p", 1, 0, 1, 1))
+# The live firms where someone answered (state.stop_company's marks).
+statement("overlay.campaigns.answered_firms",
+          "SELECT DISTINCT (SELECT CASE f.live WHEN 0 THEN f.id ELSE f.live END FROM firm f "
+          "WHERE f.id = p.company_id) FROM settings s CROSS JOIN prospects p "
+          "WHERE s.key >= ? AND s.key < ? AND p.id = substr(s.key, ?) AND p.company_id != ''",
+          params=("company_stop:", "company_stop;", 14), drives="s")
+# The record: the acknowledgements, the cold email and answers sent, the
+# opt-outs, and the members' firms.
+statement("overlay.campaigns.acknowledgements",
+          "SELECT version, text_sha, at, by FROM acknowledgement WHERE kind = ? ORDER BY at",
+          params=("cold_email",))
+statement("overlay.campaigns.record_sends",
+          "SELECT to_email, step, subject, sent_at, source_note, message_id, kind FROM outbox "
+          "INDEXED BY uq_outbox_campaign_step WHERE campaign_id = ? AND campaign_id != '' "
+          "AND kind = 'sequence' AND status = 'sent' "
+          "UNION ALL SELECT o.to_email, o.step, o.subject, o.sent_at, o.source_note, "
+          "o.message_id, o.kind FROM conversations c INDEXED BY idx_conversations_campaign_id "
+          "CROSS JOIN outbox o INDEXED BY idx_outbox_prospect WHERE c.campaign_id = ? "
+          "AND o.prospect_id = c.prospect_id AND o.conversation_id = c.id AND o.kind = 'reply' "
+          "AND o.status = 'sent' ORDER BY 4, 2", params=("c", "c"), bounded=True)
+statement("overlay.campaigns.opt_outs",
+          "SELECT scope, value, reason, campaign, at, by, undone_at, undo_note FROM suppression "
+          f"WHERE reason IN {_LIST} ORDER BY at, id", params=('[1, 2]',),
+          scans={"suppression": "the do-not-contact list's opt-outs, read whole for one "
+                                "campaign's record (an export)"})
+statement("overlay.campaigns.member_firms",
+          "SELECT email, firm FROM campaign_member WHERE campaign = ?", params=("c",))

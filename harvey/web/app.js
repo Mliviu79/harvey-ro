@@ -6607,6 +6607,7 @@ function previewHtml(c) {
     line('cw.c.overlap', c.overlap) + line('cw.c.answered', c.answered) + line('cw.c.risky_held', c.risky_held) +
     line('cw.c.personal', (p.named || 0) + (p.free_mail || 0) + (p.natural_person || 0)) +
     line('cw.c.firms', c.firms) + '</ul>' +
+    (c.personal_sample ? '<p class="small muted">' + escHtml(t('cw.c.personal_sample', {m: fmtN(c.personal_sample)})) + '</p>' : '') +
     (c.days_at_cap ? '<p class="small muted">' + escHtml(t('cw.c.days', {n: c.days_at_cap, cap: (_cp.setup || {}).max_daily_sends || 0})) + '</p>' : '');
 }
 
