@@ -4,7 +4,9 @@ Runs on the operator's Claude subscription (Claude Code headless, the
 default) or, when ``brain.provider: codex`` is configured, their ChatGPT
 subscription through an isolated Codex runtime (see harvey/codex.py). The
 provider is fixed per Brain; a failing provider never falls back to the
-other one.
+other one. With ``brain.auth: api_key`` the calls are billed per token
+instead, and the brain's USD caps hold them before each call
+(harvey/brain_spend.py).
 """
 
 import asyncio
@@ -50,6 +52,9 @@ BRAIN_STATUS_KEY = "brain_status"
 # CLI version, model choice, an unsafe Codex config layer). After one, the
 # Brain stops starting runtimes until something changes.
 _PERSISTENT_CODEX_KINDS = {"setup", "auth", "isolation"}
+# Codex failures that can come after the model was asked: with an API key
+# such a call is counted at a turn's bound (brain_spend.unknown_usd).
+_UNREPORTED_CODEX_KINDS = {"timeout", "turn_failed"}
 # Re-check a paused provider at least this often even if nothing changed
 # on disk (e.g. a managed config layer was fixed).
 PROVIDER_RECHECK_SECONDS = 1800
@@ -103,13 +108,18 @@ class Brain:
         self._usage_limited_until = 0.0
         self._usage_pause_recorded = False
         self._status_synced = False
+        # Why the last budget check said no, in Harvey's words ("" when it
+        # didn't, or when only a subscription's share was used: callers say
+        # that one themselves).
+        self.budget_why = ""
         from harvey import brain_auth
         self.auth = brain_auth.auth_of(self.config)
+        self.api_key = self.auth == brain_auth.API_KEY
         if self.provider == "codex":
             from harvey.codex import CodexClient, CodexQuotaClient
             self.codex = CodexClient(
                 model=self.model, reasoning_effort=self.config.reasoning_effort,
-                native_home=brain_auth.codex_home(self.auth),
+                native_home=brain_auth.codex_home(self.auth), api_key=self.api_key,
             )
             self.quota = CodexQuotaClient(self.codex)
         else:
@@ -273,6 +283,10 @@ class Brain:
 
         ``agent``/``task`` label the call in the usage_events ledger so the
         dashboard can attribute tokens and cost to specific work.
+
+        With an API key, every attempt is first checked against the brain's
+        USD caps (brain_spend.refusal): reached, nothing is sent and "" is
+        returned.
         """
         if self.provider == "codex":
             return await self._think_codex(
@@ -308,6 +322,8 @@ class Brain:
                     f"(attempt {attempt + 1}/{max_retries + 1})..."
                 )
                 await asyncio.sleep(delay)
+            if await self._over_usd_cap():
+                return ""
 
             process = None
             try:
@@ -356,12 +372,23 @@ class Brain:
                         raise
                 if stdout is None:
                     last_error = "timeout"
+                    await self._count_unreported(agent, task, session_id)
                     continue  # retry
 
                 if process.returncode != 0:
                     error = stderr.decode(errors="replace").strip()
-                    _, _, limits = self._parse_stream(
+                    _, failed, limits = self._parse_stream(
                         (stdout or b"").decode(errors="replace"))
+                    if self.api_key:
+                        # (Billed all the same: its result's cost, or a
+                        # turn's bound when it gave none.)
+                        try:
+                            await self._record_usage(failed or {"usage": {}, "is_error": True},
+                                                     agent=agent, task=task,
+                                                     label=session_id or "",
+                                                     unknown_turns=0 if failed else 1)
+                        except Exception as e:
+                            logger.warning(f"Failed to record usage event: {e}")
                     if limits:
                         from harvey.integrations import quota
 
@@ -402,6 +429,8 @@ class Brain:
                                              label=session_id or "")
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
+                if payload is None:
+                    await self._count_unreported(agent, task, session_id)
 
                 if payload is None and raw and not response:
                     logger.error("Claude's output ended without a result.")
@@ -479,6 +508,8 @@ class Brain:
                     f"(attempt {attempt + 1}/{max_retries + 1})..."
                 )
                 await asyncio.sleep(delay)
+            if await self._over_usd_cap():
+                return ""
             try:
                 result = await self.codex.run(
                     prompt, timeout=timeout, skip_if=lambda: self.paused_reason)
@@ -486,6 +517,9 @@ class Brain:
                 if e.kind == "paused":
                     logger.debug(f"Codex call skipped: {e}")
                     return ""
+                if e.kind in _UNREPORTED_CODEX_KINDS:
+                    # (A turn that may have run, its tokens unknown.)
+                    await self._count_unreported(agent, task, session_id)
                 last_error = str(e)
                 if e.retryable:
                     logger.warning(f"Codex call failed: {e}")
@@ -523,11 +557,67 @@ class Brain:
         )
         return ""
 
-    async def _record_codex_usage(self, result, agent: str, task: str, label: str):
-        """One usage row per Codex call. ChatGPT plans aren't billed per
-        token, so cost is recorded as 0 rather than estimated."""
+    async def _count_unreported(self, agent: str, task: str, label) -> None:
+        """With an API key: a call that ended with no result (timed out,
+        died) was billed all the same, so it is counted at a turn's bound
+        (brain_spend.unknown_usd), never as $0. Nothing on a subscription."""
+        if not self.api_key:
+            return
+        try:
+            await self._record_usage({"usage": {}, "num_turns": 1, "is_error": True},
+                                     agent=agent, task=task, label=label or "",
+                                     unknown_turns=1)
+        except Exception as e:
+            logger.warning(f"Failed to record usage event: {e}")
+
+    async def _over_usd_cap(self) -> bool:
+        """With an API key: whether the brain's USD caps hold the next call
+        back (logged; brain_spend.refusal). Always False on a subscription."""
+        if not self.api_key:
+            return False
+        from harvey import brain_spend
+
+        try:
+            why = await brain_spend.refusal(self.state, self.config)
+        except Exception as e:
+            # (Spend that can't be read isn't room to spend.)
+            why = f"the brain's spend couldn't be read ({type(e).__name__})"
+        if why:
+            self.budget_why = why
+            logger.info(f"{self.provider_label} call not sent: {why}.")
+            return True
+        return False
+
+    def _cost(self, row: dict) -> tuple[float, str]:
+        """(cost, source) of one usage row: as the CLI reported it, source
+        ``result_json`` / ``codex_app_server``, on a subscription (where
+        Codex's is 0: ChatGPT plans aren't billed per token); with an API
+        key, source brain_spend.SOURCE, and Codex's tokens at the prices
+        entered."""
+        if not self.api_key:
+            return (float(row.get("cost_usd") or 0.0),
+                    "codex_app_server" if self.provider == "codex" else "result_json")
+        from harvey import brain_spend
+
+        if self.provider == "codex":
+            if not brain_spend.priced(self.config):
+                # (Its tokens kept, priced when the spend is read.)
+                return 0.0, brain_spend.SOURCE_UNPRICED
+            cost = brain_spend.token_cost(
+                self.config, row.get("input_tokens"), row.get("output_tokens"),
+                row.get("cache_read_tokens"), row.get("cache_creation_tokens"))
+            return cost, brain_spend.SOURCE
+        return float(row.get("cost_usd") or 0.0), brain_spend.SOURCE
+
+    async def _record_codex_usage(self, result, agent: str, task: str, label: str) -> float:
+        """One usage row per Codex call: cost 0 on a ChatGPT plan, which
+        isn't billed per token; with an API key, its tokens at the prices
+        entered. Returns the cost."""
         if not agent and label.startswith("harvey-"):
             agent = label[len("harvey-"):].split("-")[0]
+        usage = dict(result.usage)
+        usage.pop("cost_usd", None)
+        cost, source = self._cost(usage)
         await self.state.record_usage_event(
             agent=agent,
             task=task or label,
@@ -535,10 +625,12 @@ class Brain:
             model=result.model,
             duration_ms=result.duration_ms,
             num_turns=1,
-            source="codex_app_server",
+            source=source,
             provider="codex",
-            **result.usage,
+            cost_usd=cost,
+            **usage,
         )
+        return cost
 
     @staticmethod
     def _parse_result_payload(raw: str) -> tuple[str, dict | None]:
@@ -585,11 +677,19 @@ class Brain:
         return str(payload.get("result") or ""), payload, infos
 
     async def _record_usage(
-        self, payload: dict | None, agent: str, task: str, label: str
-    ):
-        """Write per-model usage rows from a CLI result payload."""
+        self, payload: dict | None, agent: str, task: str, label: str,
+        unknown_turns: int = 0,
+    ) -> float:
+        """Write per-model usage rows from a CLI result payload. Returns
+        what they cost (brain_spend: with an API key, money; else the
+        CLI's own figure, which isn't billed).
+
+        With an API key a cost that is unknown is never $0: a payload with
+        tokens and no cost, or one marked ``unknown_turns`` (a call that
+        ended with no result: the turns it may have used), is counted at
+        brain_spend.unknown_usd. Nothing changes on a subscription."""
         if not payload:
-            return
+            return 0.0
 
         if not agent and label.startswith("harvey-"):
             # Callers historically pass labels like "harvey-scout-score".
@@ -627,7 +727,32 @@ class Brain:
                     "cost_usd": float(payload.get("total_cost_usd") or 0.0),
                 })
 
+        total = 0.0
+        sources = []
         for row in rows:
+            # (The agent's Codex runs give their result in this shape too:
+            # harvey/agent/driver.py.)
+            row["cost_usd"], source = self._cost(row)
+            sources.append(source)
+            total += row["cost_usd"]
+        if self.api_key and total <= 0:
+            from harvey import brain_spend
+
+            tokens = sum(int(r.get(k) or 0) for r in rows for k in (
+                "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"))
+            # (An unpriced Codex call keeps its tokens instead.)
+            if (unknown_turns or tokens) and all(x == brain_spend.SOURCE for x in sources):
+                turns = unknown_turns or max(1, num_turns)
+                estimate = await brain_spend.unknown_usd(self.state, self.config, turns)
+                if estimate > 0:
+                    if not rows:
+                        rows.append({"model": ""})
+                        sources.append(brain_spend.SOURCE)
+                    rows[0]["cost_usd"] = estimate
+                    sources[0] = brain_spend.SOURCE_ESTIMATE
+                    num_turns = turns
+                    total = estimate
+        for row, source in zip(rows, sources):
             await self.state.record_usage_event(
                 agent=agent,
                 task=task or label,
@@ -635,12 +760,11 @@ class Brain:
                 duration_ms=duration_ms,
                 num_turns=num_turns,
                 is_error=is_error,
-                # (The agent's Codex runs give their result in this shape
-                # too: harvey/agent/driver.py.)
-                source="codex_app_server" if self.provider == "codex" else "result_json",
+                source=source,
                 provider=self.provider,
                 **row,
             )
+        return total
 
     async def think_json(
         self,
@@ -710,13 +834,27 @@ class Brain:
         against max_percent so Harvey always leaves the remainder for the
         user's own interactive work. Fallback when those are unavailable:
         Harvey's own call counter for this provider against max_daily_calls.
+
+        With an API key there is no plan: the brain's USD caps
+        (brain_spend.refusal) take the windows' place, and the call counter
+        stays as a backstop. ``budget_why`` says why it said no.
         """
+        self.budget_why = ""
         await self._expire_usage_pause()
         if time.monotonic() < self._usage_limited_until:
             # Codex said the plan is out of usage: an unreadable quota must
             # not be mistaken for room to spend.
             logger.info(f"{self.paused_reason}; waiting for it to reset.")
             return False
+        if self.api_key:
+            if await self._over_usd_cap():
+                return False
+            calls = await self.check_usage()
+            if calls >= max_daily_calls:
+                self.budget_why = (f"Harvey made its {max_daily_calls} {self.provider_label} "
+                                   "calls for today (the daily call limit)")
+                return False
+            return True
         if max_percent is not None:
             try:
                 windows = await self.quota.get_utilization()

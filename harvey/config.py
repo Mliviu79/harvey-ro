@@ -587,9 +587,10 @@ CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 # the login the user made outside Harvey (the CLI's own folder: what every
 # install had before, and the default); ``account``, a login the CLI keeps
 # in a folder of Harvey's own (data/auth/<provider>); ``api_key``, a key
-# billed per token. BRAIN_AUTH_READY are those this release can run.
+# billed per token (held by brain.usd_per_day / usd_per_month,
+# harvey/brain_spend.py). BRAIN_AUTH_READY are those this release can run.
 BRAIN_AUTH_MODES = ("terminal", "account", "api_key")
-BRAIN_AUTH_READY = ("terminal", "account")
+BRAIN_AUTH_READY = ("terminal", "account", "api_key")
 
 # Model names are passed to a CLI, so they must look like a model name and
 # never like a flag ("-x") or anything a shell would treat specially.
@@ -605,12 +606,23 @@ class BrainConfig(BaseModel):
     your own Claude Code / Codex settings are never read or changed.
     ``auth`` says which login the CLI uses (BRAIN_AUTH_MODES; absent:
     ``terminal``, the CLI's own login, as before).
+
+    With ``auth: api_key`` the calls are billed per token, and
+    ``usd_per_day`` / ``usd_per_month`` (UTC; None: no cap) hold what
+    Harvey's own calls may cost, checked before each one. Claude's CLI
+    reports each call's cost; Codex's doesn't, so its calls are priced
+    from ``codex_usd_per_mtok_in`` / ``_out`` (USD per million tokens),
+    and with a cap set and no price they don't run.
     """
 
     provider: str = "claude"
     model: str = ""  # empty = the provider's own default
     reasoning_effort: str = ""  # codex only; empty = model default
     auth: str = "terminal"  # BRAIN_AUTH_MODES
+    usd_per_day: float | None = None
+    usd_per_month: float | None = None
+    codex_usd_per_mtok_in: float | None = None
+    codex_usd_per_mtok_out: float | None = None
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -641,6 +653,22 @@ class BrainConfig(BaseModel):
         if v not in BRAIN_AUTH_READY:
             raise ValueError(f"brain.auth '{v}' isn't available in this version of Harvey. "
                              f"Use one of: {', '.join(BRAIN_AUTH_READY)}.")
+        return v
+
+    @field_validator("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in",
+                     "codex_usd_per_mtok_out", mode="before")
+    @classmethod
+    def _valid_usd(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        if isinstance(v, bool):
+            raise ValueError("must be a number of dollars, 0 or more")
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("must be a number of dollars, 0 or more") from None
+        if not (math.isfinite(v) and v >= 0):
+            raise ValueError("must be a number of dollars, 0 or more")
         return v
 
     @field_validator("reasoning_effort", mode="before")
@@ -948,7 +976,8 @@ def set_require_approval(value: bool, path=None) -> Path:
     return written
 
 
-BRAIN_KEYS = ("provider", "model", "reasoning_effort", "auth")
+BRAIN_KEYS = ("provider", "model", "reasoning_effort", "auth", "usd_per_day", "usd_per_month",
+              "codex_usd_per_mtok_in", "codex_usd_per_mtok_out")
 
 
 def set_brain_settings(values: dict, path=None) -> Path:

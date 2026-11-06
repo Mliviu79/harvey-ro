@@ -525,8 +525,9 @@ def _current_provider() -> str:
 
 
 # Keys a module reads that Settings never writes: TrulyInbox's are saved by
-# its own connect flow, which checks the key against the mailbox first.
-ENV_OWN_FLOW = ("TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID")
+# its own connect flow, which checks the key against the mailbox first, and
+# the brain's Claude API key by Settings → Model's (/api/brain/key).
+ENV_OWN_FLOW = ("TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID", "HARVEY_BRAIN_ANTHROPIC_KEY")
 
 
 def _present_env_keys() -> set[str]:
@@ -1555,11 +1556,14 @@ async def get_brain(full: bool = False, refresh: bool = False, provider: str = "
 
 @app.post("/api/brain")
 async def set_brain(request: Request):
-    """Save Settings → Model: {provider, model, reasoning_effort, auth},
-    each optional, into harvey.local.yaml (config.set_brain_settings). Codex
-    is refused where it can't run (Windows), and with no model (a blank one
-    leaves the pick to a catalog that can hide it); a login the panel
-    doesn't offer is refused unless it is the one already set."""
+    """Save Settings → Model: {provider, model, reasoning_effort, auth,
+    usd_per_day, usd_per_month, codex_usd_per_mtok_in, codex_usd_per_mtok_out},
+    each optional, into harvey.local.yaml (config.set_brain_settings; a
+    blank amount clears it). Codex is refused where it can't run (Windows),
+    and with no model (a blank one leaves the pick to a catalog that can
+    hide it); a login the panel doesn't offer is refused unless it is the
+    one already set, and an API key's login until a key is saved
+    (/api/brain/key)."""
     from harvey import brain_auth
     from harvey.config import BRAIN_KEYS, ConfigError, set_brain_settings
     try:
@@ -1595,6 +1599,9 @@ async def set_brain(request: Request):
     auth = (values.get("auth") or current.auth).lower()
     if auth not in brain_auth.OFFERED and auth != current.auth:
         return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
+    if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
+        return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key first: "
+                       "paste it in the key box.", 409)
     try:
         path = set_brain_settings(values, _resolve_config_file())
     except ConfigError as e:
@@ -1611,6 +1618,92 @@ async def set_brain(request: Request):
             "brain": {k: getattr(saved, k) for k in BRAIN_KEYS}}
 
 
+@app.post("/api/brain/key")
+async def save_brain_key(request: Request):
+    """Save an API key for the brain (brain.auth: api_key): {provider, key}.
+    Checked first with a free call (brain_auth.check_key: the provider's
+    list of models, no model call), then kept: Claude's in .env under
+    brain_auth.CLAUDE_KEY_ENV, Codex's by Codex itself in data/auth/codex
+    (brain_auth.link_codex_key). The key is never returned or logged: the
+    answer says only that one is set."""
+    from harvey import brain_auth
+    from harvey.config import BRAIN_PROVIDERS
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return _refuse("expected {provider, key}", 400)
+    provider = str(body.get("provider") or "").strip().lower()
+    key = body.get("key")
+    if provider not in BRAIN_PROVIDERS:
+        return _refuse("Say which provider the key is for: claude or codex.", 400)
+    if not isinstance(key, str):
+        return _refuse("Paste the API key.", 400)
+    key = key.strip()
+    if provider == "codex":
+        why = brain_auth.codex_refusal()
+        if why:
+            return _refuse(why, 409)
+    problem = await brain_auth.check_key(provider, key)
+    if problem:
+        return _refuse(problem, 400)
+    if provider == "codex":
+        from harvey import codex
+        try:
+            await brain_auth.link_codex_key(key)
+        except codex.CodexError as e:
+            return _refuse(str(e), 409)
+    else:
+        async with _env_lock:
+            try:
+                _write_env_file({brain_auth.CLAUDE_KEY_ENV: key})
+            except Exception as e:
+                logger.warning("Failed to write .env: %s", type(e).__name__)
+                return _refuse("Could not write the .env file.", 500)
+    brain_auth.forget()
+    state = _state()
+    await state.init_db()
+    await state.log_action("brain_key", "dashboard", {"provider": provider, "saved": True})
+    return {"success": True, "provider": provider, "key_set": True}
+
+
+@app.delete("/api/brain/key")
+async def delete_brain_key(provider: str = ""):
+    """Unlink an API key: Claude's cleared from .env, Codex's removed from
+    data/auth/codex. A brain on that provider's API key goes back to the
+    terminal login, so no call is made with a key that isn't there."""
+    from harvey import brain_auth
+    from harvey.config import BRAIN_PROVIDERS, ConfigError, set_brain_settings
+    provider = (provider or "").strip().lower()
+    if provider not in BRAIN_PROVIDERS:
+        return _refuse("Say which provider's key to remove: claude or codex.", 400)
+    if provider == "codex":
+        brain_auth.unlink_codex_key()
+    else:
+        async with _env_lock:
+            try:
+                _write_env_file({brain_auth.CLAUDE_KEY_ENV: ""})
+            except Exception as e:
+                logger.warning("Failed to write .env: %s", type(e).__name__)
+                return _refuse("Could not write the .env file.", 500)
+            os.environ.pop(brain_auth.CLAUDE_KEY_ENV, None)
+    current, _ = _brain_config_or_error()
+    auth = current.auth if current else ""
+    if current is not None and current.provider == provider and auth == brain_auth.API_KEY:
+        try:
+            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
+            auth = brain_auth.TERMINAL
+        except ConfigError as e:
+            return _refuse(str(e), 409)
+    brain_auth.forget()
+    _quota_clients.clear()
+    state = _state()
+    await state.init_db()
+    await state.log_action("brain_key", "dashboard", {"provider": provider, "saved": False})
+    return {"success": True, "provider": provider, "key_set": False, "auth": auth}
+
+
 def _active_provider() -> str:
     brain = _active_brain()
     return brain.provider if brain else ""
@@ -1623,6 +1716,9 @@ def _quota_client_for(provider: str, model: str = "", auth: str = "terminal"):
     configured model."""
     from harvey import brain_auth
 
+    if auth == brain_auth.API_KEY:
+        # (An API key has no plan to read: the brain's USD caps hold it.)
+        return None
     if provider == "claude":
         # (Claude's readings are kept in the database, so the reader holds
         # nothing of its own.)
@@ -1670,6 +1766,15 @@ async def get_usage():
 
     brain = _active_brain()
     provider = brain.provider if brain else ""
+    from harvey import brain_spend
+    money = None
+    if brain is not None and brain_spend.api_key(brain):
+        try:
+            state = _state()
+            await state.init_db()
+            money = await brain_spend.totals(state, brain)
+        except Exception as e:
+            logger.debug("API-key spend not read: %s", e)
     quota = None
     try:
         client = _quota_client_for(provider, brain.model if brain else "",
@@ -1685,7 +1790,12 @@ async def get_usage():
         # Whose quota this is, even when it couldn't be read, so the UI shows
         # "unavailable" for the active provider instead of hiding the gauge.
         "quota_provider": provider,
-        "quota_status": ("available" if quota else "unavailable") if provider else "",
+        "quota_status": ("available" if quota else "unavailable")
+        if provider and money is None else "",
+        # With an API key (brain.auth: api_key): today's and this month's
+        # spend beside the brain's USD caps, in place of the plan's windows.
+        "billing": "api_key" if money is not None else "subscription",
+        "money": money,
         "by_provider": by_provider,
         "totals": totals,
         "by_day": by_day,

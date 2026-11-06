@@ -2230,18 +2230,47 @@ function quotaCardHtml(data) {
   return html;
 }
 
+// API-key mode: today's and this month's spend of Harvey's own calls, each
+// beside its cap (brain.usd_per_day / usd_per_month) as a bar.
+function moneyCardHtml(m) {
+  if (!m) return '';
+  let html = '<h2>' + escHtml(t('use.money_title')) + '</h2>';
+  for (const [label, spent, cap] of [[t('use.money_today'), m.today_usd, m.usd_per_day],
+                                     [t('use.money_month'), m.month_usd, m.usd_per_month]]) {
+    const x = fmtUsd(spent || 0, 2);
+    const pct = cap > 0 ? Math.min(100, Math.max(0, 100 * (spent || 0) / cap)) : 100;
+    html += '<div class="progress-wrap"><div class="progress-label"><span class="text">' + escHtml(label) +
+      '</span><span class="pct">' + escHtml(cap == null ? t('use.money_nocap', {x: x})
+        : t('use.money_of', {x: x, y: fmtUsd(cap, 2)})) + '</span></div>' +
+      (cap == null ? '' : '<div class="progress-bar"><div class="progress-fill ' + (pct >= 80 ? 'yellow' : 'green') +
+        '" style="width:' + pct + '%"></div></div>') + '</div>';
+  }
+  html += '<p class="muted">' + escHtml(t(m.priced ? 'use.money_note' : 'use.money_no_price')) + '</p>';
+  return html;
+}
+
 async function loadUsage() {
   const data = await api('/api/usage');
   const statsEl = document.getElementById('usage-stats');
   if (!data) { statsEl.innerHTML = offlineState(); return; }
 
+  // With an API key there is no plan: the money beside the brain's caps
+  // takes the quota's place, and the lede says calls are billed.
+  // (Not named "api": it would shadow api(), called above.)
+  const billed = data.billing === 'api_key';
+  const billing = document.getElementById('usage-billing');
+  if (billing) {
+    billing.setAttribute('data-i18n', billed ? 'use.billing_api' : 'use.billing_sub');
+    billing.textContent = t(billed ? 'use.billing_api' : 'use.billing_sub');
+  }
   const quotaEl = document.getElementById('usage-quota');
-  const qHtml = quotaCardHtml(data);
+  const qHtml = billed ? moneyCardHtml(data.money) : quotaCardHtml(data);
   quotaEl.innerHTML = qHtml;
   quotaEl.style.display = qHtml ? 'block' : 'none';
 
   // Totals cards — usage-first (calls is the headline; tokens as chips).
-  // No dollars: on a subscription plan usage isn't billed per token.
+  // No dollars here: on a subscription plan usage isn't billed per token
+  // (with an API key the money card above has them).
   const tot = data.totals || {};
   const card = (label, p) => {
     p = p || {};
@@ -5020,8 +5049,11 @@ function backgroundSearchLine(bg, noSite) {
 // Codex), the model, Codex's reasoning effort, how the CLI is logged in
 // (brain.auth: only the ways whose flow exists are offered) and its status.
 // Codex's models are its account's live list (/api/brain?full=1), read
-// when Codex is chosen.
+// when Codex is chosen. With an API key: the key box (checked with a free
+// call and saved by /api/brain/key, never shown again), the brain's USD
+// caps, Codex's token prices, and Unlink.
 let _model = null, _modelFull = {}, _modelPick = null, _modelBusy = false;
+const MODEL_MONEY = ['usd_per_day', 'usd_per_month', 'codex_usd_per_mtok_in', 'codex_usd_per_mtok_out'];
 
 async function loadModelCard(refresh) {
   const el = document.getElementById('model-card');
@@ -5029,7 +5061,8 @@ async function loadModelCard(refresh) {
   const s = await api('/api/brain' + (refresh ? '?refresh=1' : ''));
   _model = s && !s.error ? s : null;
   _modelPick = _model ? {provider: _model.provider, model: _model.model,
-                         reasoning_effort: _model.reasoning_effort, auth: _model.auth} : null;
+                         reasoning_effort: _model.reasoning_effort, auth: _model.auth, key: ''} : null;
+  if (_modelPick) for (const k of MODEL_MONEY) _modelPick[k] = _model[k] == null ? '' : String(_model[k]);
   if (refresh) _modelFull = {};
   renderModelCard();
   if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
@@ -5047,12 +5080,28 @@ async function loadProviderStatus(provider, refresh) {
   renderModelCard();
 }
 
+// An API key's line: set or not, and today's (this month's) spend beside
+// the caps.
+function modelSpendBits(s) {
+  const m = s.spend;
+  if (!m) return [];
+  const usd = v => fmtUsd(v || 0, 2);
+  const bits = [m.usd_per_day == null ? t('model.spend_today', {x: usd(m.today_usd)})
+    : t('model.spend_today_of', {x: usd(m.today_usd), y: usd(m.usd_per_day)})];
+  if (m.usd_per_month != null) bits.push(t('model.spend_month_of', {x: usd(m.month_usd), y: usd(m.usd_per_month)}));
+  if (!m.priced) bits.push(t('model.no_price'));
+  return bits;
+}
+
 function modelStatusLine(s) {
   if (!s) return '';
   const bits = [];
   const cli = s.cli || {};
   if (cli.version) bits.push(t('model.cli_version', {v: cli.version}));
-  if (s.linked === true) {
+  if (s.auth === 'api_key' && s.linked !== null && s.linked !== undefined) {
+    bits.push(t(s.linked ? 'model.key_set' : 'model.key_none'));
+    if (s.linked) bits.push(...modelSpendBits(s));
+  } else if (s.linked === true) {
     const as = s.linked_as || {};
     bits.push(t('model.linked_as', {how: [as.method, as.plan].filter(Boolean).join(' · ') || '-'}));
   } else if (s.linked === false) {
@@ -5074,6 +5123,7 @@ function renderModelCard() {
   if (!_model) { el.innerHTML = '<p class="muted">' + escHtml(t('model.unreadable')) + '</p>'; return; }
   const p = _modelPick;
   const codex = p.provider === 'codex';
+  const keySet = !!((_model.key_set || {})[p.provider]);
   // Codex's status is always its full one (its models); Claude's is the
   // saved one's, or its own read when the switch isn't saved yet.
   const full = codex || p.provider !== _model.provider ? _modelFull[p.provider] : null;
@@ -5120,15 +5170,38 @@ function renderModelCard() {
           escHtml(e) + '</option>').join('') + '</select></div>' : '') +
     '</div></div>' +
     '<div class="settings-row"><div><h3>' + escHtml(t('model.link')) + '</h3>' +
-      '<p class="desc">' + escHtml(t(codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
+      '<p class="desc">' + escHtml(t(p.auth === 'api_key' ? (codex ? 'model.api_codex' : 'model.api_claude')
+                                     : codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
       '<div class="fields">' +
       ways.map(w => radio('auth', w, t('model.auth.' + w), p.auth === w, false,
                           w === 'account' && _model.folder ? _model.folder : '')).join('') +
+      (p.auth === 'api_key' ? modelKeyFields(p, codex, keySet) : '') +
       modelStatusLine(shown || (p.provider === _model.provider ? _model : null)) +
       '<div class="btn-group"><button class="btn btn-primary btn-sm" id="model-save" onclick="saveModel()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.save')) + '</button>' +
-      '<button class="btn btn-ghost btn-sm" onclick="loadModelCard(true)">' + escHtml(t('model.recheck')) + '</button></div>' +
+      '<button class="btn btn-ghost btn-sm" onclick="loadModelCard(true)">' + escHtml(t('model.recheck')) + '</button>' +
+      (p.auth === 'api_key' && keySet ? '<button class="btn btn-ghost btn-sm" id="model-unlink" onclick="unlinkModelKey()"' +
+        (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink')) + '</button>' : '') + '</div>' +
     '</div></div>';
+}
+
+// The API key's box (a password field: what was saved is never shown), the
+// brain's USD caps, and Codex's token prices (its CLI reports no cost).
+function modelKeyFields(p, codex, keySet) {
+  const field = (id, key, label, ph) =>
+    '<div class="form-group"><label class="form-label" for="' + id + '">' + escHtml(label) + '</label>' +
+    '<input class="form-input" id="' + id + '" type="number" min="0" step="any" inputmode="decimal" value="' +
+      escHtml(p[key] || '') + '" placeholder="' + escHtml(ph) + '" oninput="pickModel(' + jsq(key) + ', this.value)"></div>';
+  return '<div class="form-group"><label class="form-label" for="model-key">' + escHtml(t('model.key')) + '</label>' +
+      '<input class="form-input" id="model-key" type="password" autocomplete="off" spellcheck="false" value="' +
+        escHtml(p.key || '') + '" placeholder="' + escHtml(t(keySet ? 'model.key_ph_set' : 'model.key_ph')) +
+        '" oninput="pickModel(\'key\', this.value)"></div>' +
+    '<p class="small muted">' + escHtml(t('model.caps_note')) + '</p>' +
+    field('model-usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
+    field('model-usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph')) +
+    (codex ? '<p class="small muted">' + escHtml(t('model.price_note')) + '</p>' +
+      field('model-price-in', 'codex_usd_per_mtok_in', t('model.price_in'), t('model.price_ph')) +
+      field('model-price-out', 'codex_usd_per_mtok_out', t('model.price_out'), t('model.price_ph')) : '');
 }
 
 function pickModel(key, value) {
@@ -5149,12 +5222,34 @@ function pickModel(key, value) {
 async function saveModel() {
   if (!_modelPick || _modelBusy) return;
   const body = Object.assign({}, _modelPick);
+  const key = String(body.key || '').trim();
+  delete body.key;
   if (body.provider === 'codex' && !String(body.model || '').trim()) {
     showToast(t('model.codex_blank'), 'error');
     return;
   }
+  if (body.auth === 'api_key' && !key && !((_model.key_set || {})[body.provider])) {
+    showToast(t('model.key_needed'), 'error');
+    return;
+  }
   _modelBusy = true;
   try {
+    if (body.auth === 'api_key' && key) {
+      // (Checked with a free call, then saved; the box is emptied either
+      // way, and the key never comes back from the server.)
+      const saved = await api('/api/brain/key', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({provider: body.provider, key: key}),
+      });
+      _modelPick.key = '';
+      const box = document.getElementById('model-key');
+      if (box) box.value = '';
+      if (!saved || !saved.success) {
+        showToast(failMsg(saved, t('model.failed')), 'error');
+        return;
+      }
+      showToast(t('model.key_saved'), 'success');
+    }
     const res = await api('/api/brain', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
     });
@@ -5163,6 +5258,21 @@ async function saveModel() {
     } else {
       showToast(failMsg(res, t('model.failed')), 'error');
     }
+  } finally {
+    _modelBusy = false;
+  }
+  loadModelCard(true);
+}
+
+// Unlink: the saved key removed (Claude's from .env, Codex's from its own
+// file), and a brain on it back to the terminal login.
+async function unlinkModelKey() {
+  if (!_modelPick || _modelBusy) return;
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain/key?provider=' + encodeURIComponent(_modelPick.provider), {method: 'DELETE'});
+    if (res && res.success) showToast(t('model.unlinked'), 'success');
+    else showToast(failMsg(res, t('model.failed')), 'error');
   } finally {
     _modelBusy = false;
   }

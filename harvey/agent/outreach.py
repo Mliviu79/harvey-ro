@@ -596,7 +596,8 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
     handler = reply_handler(state, config)
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await handler.brain.is_within_budget(max_percent=percent):
-        raise Refused("Harvey's share of the Claude plan is used for now "
+        raise Refused(f"{handler.brain.budget_why}: try later" if handler.brain.budget_why else
+                      "Harvey's share of the Claude plan is used for now "
                       "(usage.max_daily_claude_percent): try later")
     # (It waits for the user even on autopilot, approved by them one at a
     # time: autopilot is the user's consent to Harvey's own answers, not to

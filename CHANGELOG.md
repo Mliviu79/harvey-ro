@@ -9,6 +9,37 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The brain on an API key, with dollar caps.** Settings → Model now
+  offers **API key** for Claude and for Codex beside the terminal login.
+  The key goes in a password box and is checked with a free call (the
+  provider's list of models: no model call) before it is kept: Claude's in
+  `.env` under `HARVEY_BRAIN_ANTHROPIC_KEY`, a name only Harvey reads,
+  passed to the Claude CLI as `ANTHROPIC_API_KEY` only while `brain.auth:
+  api_key` is chosen (with a config folder of its own, `data/auth/
+  claude-key`); Codex's handed to Codex's own login (`account/login/start`)
+  in `data/auth/codex`, where Codex keeps it in its own file and Harvey
+  keeps no copy. The key is never shown again, returned or logged: the
+  panel says only "API key set". **Unlink** removes it and puts the brain
+  back on the terminal login. `brain.usd_per_day` and `brain.usd_per_month`
+  (UTC) cap what Harvey's own calls cost (the brain's, the agent's chats,
+  wakes and tasks), checked before every call; reached, no call is made
+  until the day or month turns, and the daily call counter stays as a
+  backstop. Claude's CLI reports each call's cost; Codex's doesn't, so its
+  tokens are priced from `brain.codex_usd_per_mtok_in` / `_out`, and with a
+  cap set and no price no Codex call is made. In API-key mode an agent
+  wake or task holds its worst case (its turn limit at the most a turn has
+  cost, $0.10 a turn at least for Claude) of its plan's budget and of
+  `spend.per_day_usd` / `per_month_usd` before it starts, and waits when
+  that doesn't fit; what it cost then goes into its job, so the plan's
+  committed money and the install's spend limits count it; a plan whose
+  budget is short holds only its own runs, never other plans'. A cost that
+  isn't reported is never read as $0: a call that timed out, died or was
+  stopped before its result counts as a turn's worst case for each turn it
+  ran, and an unpriced Codex call keeps its tokens, priced once you enter
+  the prices. The chat is held by the brain's caps only. The Usage tab and `harvey usage` show
+  today's and this month's dollars beside the caps instead of the plan's
+  windows. On a subscription nothing changes.
+
 - **Settings → Model.** The dashboard now says and sets how Harvey thinks:
   Claude or Codex (Codex greyed out on Windows, with why), the model
   (Claude's aliases opus, sonnet and haiku, or blank for the CLI's
@@ -861,6 +892,16 @@ minor versions can still change behaviour.
   CSV downloads carry dashboard authorization and escape spreadsheet formulas.
 
 ### Changed
+
+- **Calls never go to another provider behind your back.** Every Claude
+  child now runs without the variables that send calls elsewhere and bill
+  them outside the login you chose: `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_CUSTOM_HEADERS`, `AWS_BEARER_TOKEN_BEDROCK`, and every
+  `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry), `CLAUDE_CODE_SKIP_*`,
+  `ANTHROPIC_BEDROCK_*`, `ANTHROPIC_VERTEX_*`, `ANTHROPIC_FOUNDRY_*` and
+  `VERTEX_REGION_*` setting, in every mode. (Before, they were passed
+  through.) The opt-in isolation test against a local stand-in API turns
+  this off for itself only.
 
 - **No model is suggested by name for Codex.** `harvey setup` and `harvey
   train --provider codex` list the models your account offers that Harvey

@@ -24,9 +24,11 @@ and MCP servers, and saves a transcript of the prompt under
   an enclosing Claude Code session removed, and so are the credentials
   Harvey's own environment may hold (CREDENTIAL_ENV: an API key or token in
   .env would otherwise move every call to per-token billing without a
-  word). The login is the one ``brain.auth`` names (harvey/brain_auth.py:
-  the CLI's own, or Harvey's account folder). Proxy and provider variables
-  are left exactly as they are.
+  word), and so are the variables that send the calls to another provider
+  or endpoint, billed outside the login Harvey chose (PROVIDER_ENV: Bedrock,
+  Vertex, Foundry, a base URL). The login is the one ``brain.auth`` names
+  (harvey/brain_auth.py: the CLI's own, Harvey's account folder, or the
+  API key saved in Settings → Model). Proxy variables are left as they are.
 
 The output is stream-json (``--verbose``): one JSON event a line, the last
 the result the brain reads, and among them the CLI's ``rate_limit_event``,
@@ -116,7 +118,20 @@ STRIPPED_ENV = (
 
 # Credentials a Claude child never inherits, whatever brain.auth says
 # (brain_auth.claude_env adds what a mode needs, after they are dropped).
-CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+# HARVEY_BRAIN_ANTHROPIC_KEY is the key Settings → Model saves
+# (brain_auth.CLAUDE_KEY_ENV): only ever passed on as ANTHROPIC_API_KEY.
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                  "HARVEY_BRAIN_ANTHROPIC_KEY")
+
+# Variables that route a call to another provider or endpoint, billed
+# outside the login brain.auth names (Amazon Bedrock, Google Vertex,
+# Microsoft Foundry, a gateway's base URL, headers that could carry another
+# credential): never inherited, in any mode. The names, then the prefixes
+# (each provider's own settings). Tests that run the real CLI against a
+# local stand-in API empty both (the only way a base URL gets through).
+PROVIDER_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "AWS_BEARER_TOKEN_BEDROCK")
+PROVIDER_ENV_PREFIXES = ("CLAUDE_CODE_USE_", "CLAUDE_CODE_SKIP_", "ANTHROPIC_BEDROCK_",
+                         "ANTHROPIC_VERTEX_", "ANTHROPIC_FOUNDRY_", "VERTEX_REGION_")
 
 HELP_TIMEOUT_SECONDS = 30
 
@@ -198,15 +213,18 @@ def find_claude(env: dict | None = None) -> str | None:
 
 def runtime_env(cwd: str, base: dict | None = None, *, safe: bool = True,
                 auth: str = "terminal") -> dict:
-    """The child's environment: the operator's, minus instruction sources
-    and credentials, plus what the login ``auth`` (brain.auth) needs
+    """The child's environment: the operator's, minus instruction sources,
+    credentials and other providers' routes, plus what the login ``auth``
+    (brain.auth) needs
     (``safe`` False: without safe mode, which keeps MCP servers out: the
     agent's call)."""
     from harvey import brain_auth
 
     env = dict(os.environ if base is None else base)
-    for key in STRIPPED_ENV + CREDENTIAL_ENV:
+    for key in STRIPPED_ENV + CREDENTIAL_ENV + PROVIDER_ENV:
         env.pop(key, None)
+    for key in [k for k in env if k.upper().startswith(PROVIDER_ENV_PREFIXES)]:
+        env.pop(key)
     env.update(brain_auth.claude_env(auth))
     env.pop("CLAUDE_CODE_SAFE_MODE", None)
     env["PWD"] = cwd

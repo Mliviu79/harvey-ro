@@ -144,8 +144,10 @@ def cmd_train(args):
         }
         if overrides:
             if "provider" in overrides and overrides["provider"] != brain_config.provider:
-                # A different provider never inherits the other one's model.
-                brain_config = BrainConfig(**overrides)
+                # A different provider never inherits the other one's model
+                # (the brain's USD caps stay: they are the install's).
+                caps = {k: getattr(brain_config, k) for k in ("usd_per_day", "usd_per_month")}
+                brain_config = BrainConfig(**overrides, **caps)
             else:
                 brain_config = BrainConfig(**{**brain_config.model_dump(), **overrides})
     except (ConfigError, ValidationError) as e:
@@ -340,9 +342,13 @@ def cmd_usage(args):
         # such; one is never shown as the other.
         windows = None
         provider = brain_config.provider if brain_config else None
+        from harvey import brain_spend
+        api = brain_config is not None and brain_spend.api_key(brain_config)
         try:
             from harvey import brain_auth
-            if provider == "codex":
+            if api:
+                pass  # (An API key has no plan to read: its money is shown instead.)
+            elif provider == "codex":
                 from harvey.codex import CodexClient, CodexQuotaClient
                 windows = await CodexQuotaClient(CodexClient(
                     model=brain_config.model,
@@ -354,9 +360,20 @@ def cmd_usage(args):
             pass
 
         label = {"claude": "Claude", "codex": "Codex"}.get(provider, "Brain")
-        print(f"\n  {label} Usage")
+        print(f"\n  {label} Usage" + (" (API key, billed per token)" if api else ""))
         print("  " + "=" * 52)
-        if windows:
+        if api:
+            money = await brain_spend.totals(state, brain_config)
+            for name, period in (("Today (UTC)", "day"), ("This month", "month")):
+                spent = money["today_usd" if period == "day" else "month_usd"]
+                cap = money[f"usd_per_{period}"]
+                of = (f" of ${cap:.2f} (brain.usd_per_{period})" if cap is not None
+                      else " (no cap)")
+                print(f"  {name:<16} ${spent:.2f}{of}")
+            if not money["priced"]:
+                print("  No price entered for Codex's tokens (brain.codex_usd_per_mtok_in / _out):")
+                print("  with a cap set, no call is made until there is one.")
+        elif windows:
             labels = {"five_hour": "5-hour window", "seven_day": "Weekly",
                       "limit_reached": "Usage limit"}
             for key, w in windows.items():
@@ -412,10 +429,14 @@ def cmd_usage(args):
                     f"    {row['task']:<22} {row['calls']:>5} calls  "
                     f"{row['output_tokens']:>10,} out tokens"
                 )
-        print(
-            "\n  Subscription plans aren't billed per token — these are usage"
-            "\n  counts, not costs.\n"
-        )
+        if api:
+            print("\n  With an API key every call is billed per token: the caps above are"
+                  "\n  checked before each one.\n")
+        else:
+            print(
+                "\n  Subscription plans aren't billed per token — these are usage"
+                "\n  counts, not costs.\n"
+            )
 
     asyncio.run(_usage())
 

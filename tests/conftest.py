@@ -67,7 +67,7 @@ def _no_checkout_env_file(monkeypatch, tmp_path_factory):
 # Keys a classifier, a search or a verifier could be reached with: never
 # taken from the developer's environment into a test.
 _LIVE_KEYS = ("DEEPINFRA_API_KEY", "TYPESAFE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-              "GROQ_API_KEY")
+              "GROQ_API_KEY", "HARVEY_BRAIN_ANTHROPIC_KEY")
 
 
 @pytest.fixture(autouse=True)
@@ -154,7 +154,8 @@ REAL_CODEX_STATUS = _brain_auth.codex_status
 def _no_login_status(monkeypatch, tmp_path_factory):
     """Settings → Model's status never starts a real CLI in tests (it would
     run 'claude auth status' or Codex's app-server), and the account
-    folders are a temporary one, never the checkout's data/auth. Tests of
+    folders are a temporary one, never the checkout's data/auth (nor its
+    .env, where the brain's API key is read). Tests of
     the status take the real ones above, with a stand-in CLI."""
     def unknown(*a, **k):
         return {"cli": {"ok": True, "version": "", "problem": ""}, "linked": None,
@@ -163,6 +164,8 @@ def _no_login_status(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(_brain_auth, "claude_status", unknown)
     monkeypatch.setattr(_brain_auth, "codex_status", unknown)
     monkeypatch.setattr(_brain_auth, "AUTH_DIR", tmp_path_factory.mktemp("auth"))
+    # (The brain's API key is read from .env: never the checkout's.)
+    monkeypatch.setattr(_brain_auth, "ENV_FILE", tmp_path_factory.mktemp("env") / ".env")
     _brain_auth.forget()
     yield
     _brain_auth.forget()

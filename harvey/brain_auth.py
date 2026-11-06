@@ -13,9 +13,17 @@ Model says about it.
   and whether it is logged in is the CLI's own ``claude auth status``. The
   dashboard's link flow that fills these folders comes later; until then a
   status says the folder isn't linked yet.
-- ``api_key`` (config.BRAIN_AUTH_MODES, not yet in BRAIN_AUTH_READY): a key
-  billed per token. claude_env() is the one place a mode adds to a Claude
-  child's environment.
+- ``api_key``: a key billed per token, saved once from Settings → Model
+  after a free check (check_key: the provider's model list, no model
+  call). Claude's is kept in .env under CLAUDE_KEY_ENV, a name only Harvey
+  reads, and passed to a Claude child as ANTHROPIC_API_KEY in this mode
+  only, with CLAUDE_CONFIG_DIR a folder of Harvey's own (data/auth/
+  claude-key), so no other login there can be used instead. Codex's is
+  given to Codex itself (``account/login/start``, codex.login_api_key) in
+  data/auth/codex, where Codex keeps it in its own file: Harvey keeps no
+  copy. The calls' cost is held by brain.usd_per_day / usd_per_month
+  (harvey/brain_spend.py). claude_env() is the one place a mode adds to a
+  Claude child's environment.
 
 Whatever the mode, credentials in Harvey's own environment never reach a
 child: claude_runtime.runtime_env drops CREDENTIAL_ENV (so a key added to
@@ -44,9 +52,22 @@ from harvey.paths import PROJECT_ROOT
 
 TERMINAL, ACCOUNT, API_KEY = "terminal", "account", "api_key"
 AUTH_DIR = PROJECT_ROOT / "data" / "auth"
-# The ways to link the panel offers: the others' flows aren't in this
-# release (their buttons stay hidden; the data model already knows them).
-OFFERED = (TERMINAL,)
+# Harvey's .env, where the Claude key is kept (read afresh, so a key
+# removed from Settings stops being used without a restart).
+ENV_FILE = PROJECT_ROOT / ".env"
+# The ways to link the panel offers: the account link's flow isn't in this
+# release (its button stays hidden; the data model already knows it).
+OFFERED = (TERMINAL, API_KEY)
+# The .env name of the Claude API key Settings → Model saves: no CLI reads
+# it (claude_runtime.CREDENTIAL_ENV drops it from every child), so a key
+# saved here never moves a terminal or account login to per-token billing.
+CLAUDE_KEY_ENV = "HARVEY_BRAIN_ANTHROPIC_KEY"
+# The free checks of a key: the provider's list of models (no model call).
+ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
+ANTHROPIC_VERSION = "2023-06-01"
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+KEY_CHECK_SECONDS = 15
+KEY_MAX_CHARS = 512
 
 # The Claude CLI's documented model aliases ("" is the CLI's own default);
 # any other model name is typed in.
@@ -67,9 +88,17 @@ def account_dir(provider: str) -> Path:
     return AUTH_DIR / ("codex" if provider == "codex" else "claude")
 
 
+def key_dir() -> Path:
+    """Claude's config folder in API-key mode (no login of any kind in it)."""
+    return AUTH_DIR / "claude-key"
+
+
 def ensure_account_dir(provider: str) -> Path:
     """data/auth/<provider>, made (with data/auth) owner-only."""
-    path = account_dir(provider)
+    return _owner_only(account_dir(provider))
+
+
+def _owner_only(path: Path) -> Path:
     for folder in (AUTH_DIR, path):
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -79,21 +108,107 @@ def ensure_account_dir(provider: str) -> Path:
     return path
 
 
+def claude_key() -> str:
+    """The Claude API key Settings → Model saved ("" when none): read from
+    .env each time (the environment only when there is no .env). Never
+    logged, shown or returned by any endpoint."""
+    try:
+        if ENV_FILE.is_file():
+            from dotenv import dotenv_values
+
+            return (dotenv_values(ENV_FILE).get(CLAUDE_KEY_ENV) or "").strip()
+    except Exception:
+        return ""
+    return (os.environ.get(CLAUDE_KEY_ENV) or "").strip()
+
+
 def claude_env(auth: str) -> dict:
     """What ``auth`` adds to a Claude child's environment (after
     claude_runtime.runtime_env has dropped CREDENTIAL_ENV): nothing for the
-    terminal login, CLAUDE_CONFIG_DIR for a linked account."""
+    terminal login, CLAUDE_CONFIG_DIR for a linked account, and for an API
+    key the saved key as ANTHROPIC_API_KEY with a config folder of its own
+    (no key saved: the folder alone, so the call fails as not logged in
+    rather than using another login)."""
     if auth == ACCOUNT:
         return {"CLAUDE_CONFIG_DIR": str(ensure_account_dir("claude"))}
+    if auth == API_KEY:
+        env = {"CLAUDE_CONFIG_DIR": str(_owner_only(key_dir()))}
+        key = claude_key()
+        if key:
+            env["ANTHROPIC_API_KEY"] = key
+        return env
     return {}
 
 
 def codex_home(auth: str) -> Path | None:
     """Where Codex's login is taken from: Harvey's folder for a linked
-    account, else None (codex.native_codex_home(): ~/.codex or CODEX_HOME)."""
-    if auth == ACCOUNT:
+    account or an API key, else None (codex.native_codex_home(): ~/.codex
+    or CODEX_HOME)."""
+    if auth in (ACCOUNT, API_KEY):
         return ensure_account_dir("codex")
     return None
+
+
+def key_set(provider: str) -> bool:
+    """Whether an API key is saved for ``provider`` (Claude's in .env,
+    Codex's in its own file in data/auth/codex)."""
+    if provider == "codex":
+        from harvey import codex
+
+        return codex.has_api_key_login(account_dir("codex"))
+    return bool(claude_key())
+
+
+async def check_key(provider: str, key: str, *, transport=None) -> str:
+    """"" when ``key`` is accepted by its provider, else why not, checked
+    with a free call: the list of models (Anthropic's for Claude, OpenAI's
+    for Codex), never a model call. The key is never part of the answer."""
+    import httpx
+
+    key = (key or "").strip()
+    if not key or len(key) > KEY_MAX_CHARS or any(c.isspace() for c in key):
+        return "Paste the whole API key (one line, no spaces)."
+    if provider == "codex":
+        url, host = OPENAI_MODELS_URL, "api.openai.com"
+        headers = {"Authorization": f"Bearer {key}"}
+    else:
+        url, headers, host = ANTHROPIC_MODELS_URL, {
+            "x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, "api.anthropic.com"
+    try:
+        async with httpx.AsyncClient(timeout=KEY_CHECK_SECONDS, follow_redirects=False,
+                                     transport=transport) as client:
+            res = await client.get(url, headers=headers)
+    except httpx.HTTPError as e:
+        return f"Couldn't reach {host} to check the key ({type(e).__name__}): try again."
+    if res.status_code == 200:
+        return ""
+    if res.status_code in (401, 403):
+        return f"{host} refused this key (HTTP {res.status_code}): check it and paste it again."
+    return f"Couldn't check the key: {host} answered HTTP {res.status_code}. Try again."
+
+
+async def link_codex_key(key: str) -> None:
+    """Give Codex the API key: its app-server's own login into data/auth/
+    codex (codex.login_api_key), which Codex keeps in its own file there.
+    Raises codex.CodexError."""
+    from harvey import codex
+
+    await codex.login_api_key(ensure_account_dir("codex"), key)
+
+
+def unlink_codex_key() -> bool:
+    """Remove the API key Codex keeps in data/auth/codex (a ChatGPT login
+    there is left alone). True when one was removed."""
+    from harvey import codex
+
+    home = account_dir("codex")
+    if not codex.has_api_key_login(home):
+        return False
+    try:
+        (home / "auth.json").unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def auth_of(brain) -> str:
@@ -165,6 +280,19 @@ def claude_status(auth: str) -> dict:
         out["cli"]["problem"] = out["problem"] = str(e)
         return out
     out["cli"]["ok"] = True
+    if auth == API_KEY:
+        # (The key is Harvey's to know about: the CLI isn't asked whether
+        # it is logged in, only whether it runs.)
+        try:
+            out["cli"]["version"] = parse_version(_run_claude(exe, ["--version"], auth).stdout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        out["linked"] = key_set("claude")
+        if out["linked"]:
+            out["linked_as"] = {"method": API_KEY}
+        else:
+            out["problem"] = "No API key saved: paste one in Settings → Model."
+        return out
     try:
         out["cli"]["version"] = parse_version(_run_claude(exe, ["--version"], auth).stdout)
         res = _run_claude(exe, ["auth", "status"], auth)
@@ -201,6 +329,11 @@ def codex_status(brain, full: bool) -> dict:
         out["cli"]["problem"] = out["problem"] = str(e)
         return out
     home = codex_home(auth)
+    api = auth == API_KEY
+    if api and not key_set("codex"):
+        out["linked"] = False
+        out["problem"] = "No API key saved: paste one in Settings → Model."
+        return out
     if home is not None and not (home / "auth.json").exists():
         out["linked"] = False
         out["problem"] = f"Not linked yet: no login in {_shown(home)}."
@@ -214,7 +347,8 @@ def codex_status(brain, full: bool) -> dict:
                 out["problem"] = str(e)
                 return out
         return out
-    client = codex.CodexClient(model=getattr(brain, "model", "") or "", native_home=home)
+    client = codex.CodexClient(model=getattr(brain, "model", "") or "", native_home=home,
+                               api_key=api)
     try:
         found = asyncio.run(client.describe(timeout=CODEX_DESCRIBE_SECONDS))
     except codex.CodexError as e:
@@ -222,10 +356,13 @@ def codex_status(brain, full: bool) -> dict:
         out["problem"] = str(e)
         return out
     account = found.get("account") or {}
-    out["linked"] = account.get("type") == "chatgpt"
+    out["linked"] = account.get("type") == ("apiKey" if api else "chatgpt")
     out["linked_as"] = {k: v for k, v in (("method", account.get("type")),
                                            ("plan", account.get("plan"))) if v}
-    if account.get("type") and account.get("type") != "chatgpt":
+    if api:
+        if not out["linked"]:
+            out["problem"] = "Codex doesn't report the API key: save it again in Settings → Model."
+    elif account.get("type") and account.get("type") != "chatgpt":
         out["problem"] = ("Codex is logged in with an API key or another provider: Harvey "
                           "uses a ChatGPT plan only. Run 'codex login' with ChatGPT.")
     elif not account.get("type"):
@@ -240,7 +377,8 @@ async def codex_models(brain, timeout: float = CODEX_DESCRIBE_SECONDS) -> list[d
     codex.CodexError."""
     from harvey import codex
 
-    client = codex.CodexClient(model="", native_home=codex_home(auth_of(brain)))
+    auth = auth_of(brain)
+    client = codex.CodexClient(model="", native_home=codex_home(auth), api_key=auth == API_KEY)
     return (await client.describe(timeout=timeout)).get("models") or []
 
 
@@ -258,7 +396,9 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
     {provider, model, reasoning_effort, auth, offered, folder, cli {ok,
     version, problem}, linked (True, False, None: unknown), linked_as
     {method, plan[, api]}, problem, last_error, models, codex_refused,
-    checked_at}. Kept KEEP_SECONDS (``full``: KEEP_FULL_SECONDS), a failed
+    checked_at, key_set {claude, codex} (whether a key is saved, never the
+    key), the brain's USD caps and Codex's prices, and in API-key mode
+    ``spend`` (brain_spend.totals)}. Kept KEEP_SECONDS (``full``: KEEP_FULL_SECONDS), a failed
     one KEEP_FAILED_SECONDS; ``force`` asks again."""
     from harvey.config import BrainConfig
 
@@ -286,9 +426,20 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
             raw = await state.get_setting(BRAIN_STATUS_KEY) or ""
         except Exception:
             raw = ""
+    spend = None
+    if auth == API_KEY and state is not None:
+        from harvey import brain_spend
+        try:
+            spend = await brain_spend.totals(state, brain)
+        except Exception:
+            spend = None
     return {"provider": provider, "model": brain.model,
             "reasoning_effort": brain.reasoning_effort, "auth": auth,
-            "offered": list(OFFERED),
+            "offered": list(OFFERED), "spend": spend,
+            "key_set": {p: key_set(p) for p in ("claude", "codex")},
+            "usd_per_day": brain.usd_per_day, "usd_per_month": brain.usd_per_month,
+            "codex_usd_per_mtok_in": brain.codex_usd_per_mtok_in,
+            "codex_usd_per_mtok_out": brain.codex_usd_per_mtok_out,
             "folder": _shown(account_dir(provider)) if auth == ACCOUNT else "",
             "codex_refused": codex_refusal(), "last_error": last_error(raw, provider),
             **found}

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -41,7 +42,7 @@ CHAT = "chat-w"
 # logged-out CLI's result, loop tool calls until interrupted, die exits
 # with an error, hang never answers, stream streams partial text and never
 # ends, closes closes its own plan (close_plan, as the agent's tool does)
-# then answers. Every message
+# then answers. FAKE_COST: what its result says the run cost. Every message
 # is logged (FAKE_CLI_LOG) as one JSON line.
 FAKE = r'''
 import json, os, select, sys
@@ -78,8 +79,8 @@ def result(text, error=False, subtype="success"):
          "session_id": "s", "duration_ms": 500, "num_turns": 2,
          "usage": {"input_tokens": 900, "output_tokens": 40},
          "modelUsage": {"claude-test": {"inputTokens": 900, "outputTokens": 40,
-                                        "cacheReadInputTokens": 0,
-                                        "cacheCreationInputTokens": 0, "costUSD": 0.0}}})
+                                        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                                        "costUSD": float(os.environ.get("FAKE_COST", "0"))}}})
 
 
 def tool_round(n, k):
@@ -412,6 +413,113 @@ def test_the_wakes_answer_lands_in_the_chat_with_why_it_woke(state, fake):
     primed = _run(chat.prime(state, CHAT, "t9", "Și acum?"))
     assert f"(Harvey woke on its own, after run {batch} finished" in primed
     assert "Harvey: Rularea s-a terminat" in primed and "(tool plan_status(" in primed
+
+
+# ── A wake billed to an API key (brain.auth: api_key, harvey/brain_spend.py) ──
+
+def _api_key_config(monkeypatch, **brain):
+    cfg = _config()
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key", **brain})
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    return cfg
+
+
+def test_an_api_key_wakes_cost_goes_into_its_job_and_its_plans_money(state, fake, monkeypatch):
+    from harvey import brain_spend
+
+    _api_key_config(monkeypatch)
+    monkeypatch.setenv("FAKE_COST", "0.42")
+    plan_id = _plan(state, budget=5.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    held = {}
+    real_hold = plans.hold_run
+
+    async def watch(st, pid, job_id, usd, spent=0.0):
+        await real_hold(st, pid, job_id, usd, spent)
+        held["money"] = await plans.money(st, pid)
+        held["usd"] = usd
+    monkeypatch.setattr(plans, "hold_run", watch)
+    job = _work_wake(state)
+    assert job.status == "done"
+    # Held before it ran: its worst case (12 turns at the default turn bound).
+    assert held["usd"] == pytest.approx(chat.MAX_TURNS * brain_spend.TURN_USD_FLOOR)
+    assert held["money"]["committed_usd"] == pytest.approx(held["usd"])
+    # What it really cost: into its job, the plan's money and the day's spend.
+    assert job.actual_cost == pytest.approx(0.42)
+    money = _run(plans.money(state, plan_id))
+    assert money["committed_usd"] == pytest.approx(0.42)
+    assert money["spent_usd"] == money["agent_usd"] == pytest.approx(0.42)
+    assert _run(jobs.spent_since(state, "start of day")) == pytest.approx(0.42)
+    assert _q(state, "SELECT task, source, cost_usd FROM usage_events") == [
+        ("wake", "api_key", pytest.approx(0.42))]
+    assert _run(brain_spend.spent(state, "day")) == pytest.approx(0.42)
+    # An action of the plan sees it: what remains is the budget less it.
+    assert _run(plans.status(state, plan_id))["remaining_usd"] == pytest.approx(5.0 - 0.42)
+
+
+def test_an_api_key_wake_that_dies_with_no_result_is_charged_never_zero(state, fake, monkeypatch):
+    # (Its CLI billed the key, but said nothing of what it cost: the plan
+    # and the brain's caps count the turn it was in at a turn's bound.)
+    from harvey import brain_spend
+
+    _api_key_config(monkeypatch)
+    monkeypatch.setenv("FAKE_WAKE", "die")
+    plan_id = _plan(state, budget=5.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    assert job.actual_cost == pytest.approx(brain_spend.TURN_USD_FLOOR)
+    assert _run(plans.money(state, plan_id))["spent_usd"] == pytest.approx(
+        brain_spend.TURN_USD_FLOOR)
+    assert _q(state, "SELECT source, cost_usd FROM usage_events") == [
+        ("api_key_estimate", pytest.approx(brain_spend.TURN_USD_FLOOR))]
+    assert _run(brain_spend.spent(state, "day")) == pytest.approx(brain_spend.TURN_USD_FLOOR)
+
+
+def test_on_a_subscription_a_wake_that_dies_costs_nothing(state, fake, monkeypatch):
+    monkeypatch.setenv("FAKE_WAKE", "die")
+    plan_id = _plan(state, budget=5.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    assert job.actual_cost == 0.0
+    assert _q(state, "SELECT source, cost_usd FROM usage_events") == [("result_json", 0.0)]
+
+
+def test_an_api_key_wake_waits_when_its_plan_cant_cover_its_worst_case(state, fake, monkeypatch):
+    _api_key_config(monkeypatch)
+    plan_id = _plan(state, budget=1.0)           # less than 12 turns at $0.10
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    other = _plan(state, budget=5.0, chat_id="chat-w2")
+    _run(wakes.note(state, other, "reply", "r2", {"intent": "interested"}))
+    job = _work_wake(state)
+    # Not run, not failed: queued again for later, no try used, its job says why.
+    assert job.status == "queued" and job.attempts == 0
+    assert "budget can't cover it" in job.error and "$1.20" in job.error
+    assert fake() == []                                           # the CLI never started
+    assert _q(state, "SELECT COUNT(*) FROM usage_events") == [(0,)]
+    # Its plan's, not the lane's: the agent's lane doesn't rest, and another
+    # plan's wake runs at once.
+    assert _run(wakes.held(state)) is None
+    assert _work_wake(state).status == "done"
+
+
+def test_an_unpriced_codex_key_never_starts_a_wake(state, fake, monkeypatch):
+    _api_key_config(monkeypatch, provider="codex", model="gpt-6-luna")
+    monkeypatch.setattr(wakes, "runner", lambda config, what: asyncio.sleep(0, "codex"))
+    plan_id = _plan(state, budget=50.0)
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    assert job.status == "queued" and "no price entered" in job.error
+    assert fake() == []
+
+
+def test_on_a_subscription_a_wake_holds_and_costs_nothing(state, fake, monkeypatch):
+    monkeypatch.setenv("FAKE_COST", "0.42")      # (the CLI's notional figure, not billed)
+    plan_id = _plan(state, budget=0.0)           # free work only: a wake still runs
+    _run(wakes.note(state, plan_id, "reply", "r1", {"intent": "interested"}))
+    job = _work_wake(state)
+    assert job.status == "done" and job.actual_cost == 0.0
+    assert _run(plans.money(state, plan_id))["committed_usd"] == 0.0
+    assert _q(state, "SELECT source FROM usage_events") == [("result_json",)]
 
 
 def test_silent_writes_no_message_but_keeps_its_tool_calls(state, fake, monkeypatch):

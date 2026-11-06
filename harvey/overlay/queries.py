@@ -752,6 +752,25 @@ statement("overlay.agent.usage",
           "SELECT agent, task, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
           "SUM(num_turns) FROM usage_events WHERE created_at >= ? GROUP BY agent, task",
           params=("2026-01-01 00:00:00",), bounded=True)
+# What Harvey's own API-key calls cost since a time (brain.usd_per_day /
+# usd_per_month, harvey/brain_spend.py): their own rows only, never the
+# classifier's or a subscription's notional cost.
+# A cost counted at a turn's bound (api_key_estimate) is spend too; an
+# unpriced Codex call's tokens (api_key_unpriced) are priced by the reader.
+statement("overlay.brain.spend_since",
+          "SELECT COALESCE(SUM(CASE WHEN source != 'api_key_unpriced' THEN cost_usd END), 0), "
+          "COALESCE(SUM(CASE WHEN source = 'api_key_unpriced' THEN input_tokens "
+          "+ cache_read_tokens + cache_creation_tokens END), 0), "
+          "COALESCE(SUM(CASE WHEN source = 'api_key_unpriced' THEN output_tokens END), 0) "
+          "FROM usage_events WHERE created_at >= ? "
+          "AND source IN ('api_key', 'api_key_estimate', 'api_key_unpriced')",
+          params=("2026-01-01 00:00:00",))
+# The most an agent's API-key turn cost since a time (a wake's or a task's
+# worst case).
+statement("overlay.brain.agent_turn_cost",
+          "SELECT MAX(cost_usd / num_turns) FROM usage_events WHERE created_at >= ? "
+          "AND source = 'api_key' AND agent = 'agent' AND provider = ? AND num_turns > 0",
+          params=("2026-01-01 00:00:00", "claude"))
 # The chats' messages: the newest (of a chat, or of every chat), a turn's,
 # and the tool calls of some turns.
 _MESSAGE = ("SELECT id, turn, role, text, status, chat, created_at, updated_at, tokens, context, "
@@ -878,6 +897,17 @@ statement("overlay.agent.plan_runs",
           "LEFT JOIN job_batches b ON b.id = a.batch "
           "WHERE a.plan = ? AND a.outcome IN ('reserved', 'ok') ORDER BY a.id", params=(1,),
           drives="a")
+# A plan's own model runs (its wakes, by their dedupe key, and its tasks'
+# jobs): what each spent and holds, for the plan's money in API-key mode
+# (harvey/brain_spend.py), and a run's hold of the plan's budget.
+statement("overlay.agent.plan_model_jobs",
+          "SELECT j.id, j.status, j.actual_cost, j.reserved FROM jobs j INDEXED BY idx_jobs_lane "
+          "WHERE j.lane = 'agent' AND j.dedupe_key = ? "
+          "UNION ALL SELECT j.id, j.status, j.actual_cost, j.reserved "
+          "FROM agent_task t INDEXED BY agent_task_plan JOIN jobs j ON j.id = t.job "
+          "WHERE t.plan = ?", params=("agent_wake:1", 1))
+statement("overlay.agent.run_hold", "UPDATE jobs SET reserved = ? WHERE id = ?",
+          params=(0.0, "j"))
 statement("overlay.agent.action_add",
           "INSERT INTO agent_action (plan, chat, turn, tool, arguments, batch, cap_usd, "
           "classify_cap_usd, outcome, why, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

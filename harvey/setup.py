@@ -189,7 +189,7 @@ def _ask_model(provider: str, codex_models: list | None = None,
         else:
             model = _ask("Model (leave blank for the default)", required=False)
         try:
-            return BrainConfig(provider=provider, model=model, auth=auth)
+            return BrainConfig(provider=provider, model=model, auth=auth, **_current_money())
         except ValidationError:
             print("    (that doesn't look like a model name — try again or leave blank)")
 
@@ -207,6 +207,19 @@ def _current_auth() -> str:
         return load_brain_config(str(_config_file())).auth
     except (ConfigError, OSError):
         return "terminal"
+
+
+def _current_money() -> dict:
+    """The brain's USD caps and Codex's prices in the config setup edits
+    ({} when none): re-running setup never drops them."""
+    from harvey.config import load_brain_config
+    try:
+        brain = load_brain_config(str(_config_file()))
+    except Exception:
+        return {}
+    return {k: getattr(brain, k, None) for k in ("usd_per_day", "usd_per_month",
+                                           "codex_usd_per_mtok_in", "codex_usd_per_mtok_out")
+            if getattr(brain, k, None) is not None}
 
 
 class SetupWizard:
@@ -333,9 +346,10 @@ class SetupWizard:
             _print_harvey(str(e))
             raise SystemExit(1)
 
-        print("  Checking Codex ChatGPT login...", end=" ")
+        print("  Checking Codex " + ("API key" if auth == brain_auth.API_KEY else "ChatGPT login")
+              + "...", end=" ")
         try:
-            check_native_auth(brain_auth.codex_home(auth))
+            check_native_auth(brain_auth.codex_home(auth), auth == brain_auth.API_KEY)
             print("✓ Found")
         except CodexError as e:
             print("✗ Not ready")

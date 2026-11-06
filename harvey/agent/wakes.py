@@ -31,10 +31,12 @@ the plan's chat as an answer marked with why it woke
 (agent_message.wake), counted as unread until the user opens the chat; an
 answer of SILENT writes nothing (its tool calls are still recorded).
 Before each wake: the plan's share (is_within_budget, of the Claude plan
-or the ChatGPT plan: over it, the lane rests and the wake waits), the
-driver usable (its CLI, its login), and the chat's lease: while a live
-chat process holds it (the user is in that chat), the wake waits and tries
-a little later, which is no failure. A logged-out CLI pauses the agent's
+or the ChatGPT plan, or with an API key the brain's USD caps: over it, the
+lane rests and the wake waits), the driver usable (its CLI, its login),
+with an API key its worst case held of its plan's budget and the install's
+spend limits (brain_spend.hold_run: else it waits too), and the chat's
+lease: while a live chat process holds it (the user is in that chat), the
+wake waits and tries a little later, which is no failure. A logged-out CLI pauses the agent's
 lane until the user resumes it; a spent quota rests it, with the reason on
 the Queue page and Today.
 
@@ -53,7 +55,7 @@ import uuid
 from datetime import datetime, timezone
 
 import harvey.overlay.queries  # noqa: F401  (registers the named statements)
-from harvey import queries
+from harvey import brain_spend, queries
 
 logger = logging.getLogger("harvey.agent")
 
@@ -512,11 +514,13 @@ async def run(ctx) -> dict:
     brain = Brain(state, getattr(config, "brain", None))
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await brain.is_within_budget(max_percent=percent):
-        why = (f"Harvey's share of your {brain.provider_label} plan is used for now "
+        why = (f"{brain.budget_why}: the wakes wait" if brain.budget_why else
+               f"Harvey's share of your {brain.provider_label} plan is used for now "
                "(usage.max_daily_claude_percent): the wakes wait")
         await hold(state, why, BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=BUDGET_RETRY_SECONDS)
     exe = await runner(config, "wakes")
+    await hold_cost(ctx, plan_id, brain, config, chat.MAX_TURNS, "wake")
     owner = OWNER_PREFIX + ctx.job.id
     lease = chat._lease(plan["chat"])
     if not await acquire_lease(state, owner, chat.LEASE_TTL_SECONDS, lease):
@@ -538,8 +542,7 @@ async def run(ctx) -> dict:
         # call it made counts all the same.)
         if calling.get("started"):
             try:
-                await asyncio.shield(_record(state, brain, None, calling.get("turns", 0),
-                                             started, turn))
+                await asyncio.shield(_charge_cut_off(ctx, brain, calling, started, turn))
             except Exception:
                 pass
         raise
@@ -549,7 +552,8 @@ async def run(ctx) -> dict:
             await _write(state, "overlay.agent.chat_turn_if", ("", plan["chat"], turn))
         finally:
             await release_lease(state, owner, lease)
-    tokens = await _record(state, brain, payload, turns, started, turn)
+    tokens, cost = await _record(state, brain, payload, turns, started, turn)
+    await brain_spend.charge(ctx, brain.config, cost)
     stop = getattr(ctx, "stop_reason", None)
     if ended != "stopped" and stop is not None and await stop():
         # (Asked to stop after its last poll, while its answer came in: it
@@ -792,28 +796,63 @@ async def _interrupted(proc) -> dict | None:
     return None
 
 
+async def _charge_cut_off(ctx, brain, calling: dict, started: float, turn: str,
+                          task: str = "wake", limit: int = 0) -> None:
+    """A run cut off mid-call (the worker's shutdown): the call counted, and
+    with an API key what it may have cost (a turn's bound for each turn it
+    was in) charged to its job, so its next try's hold and its plan see it."""
+    _, cost = await _record(ctx.state, brain, None, calling.get("turns", 0), started, turn,
+                            task=task, limit=limit)
+    await brain_spend.charge(ctx, brain.config, cost)
+
+
+async def hold_cost(ctx, plan_id: int, brain, config, turns: int, what: str) -> float:
+    """With an API key, the run's worst case held of its plan's budget and
+    the install's spend limits before it starts (brain_spend.hold_run);
+    else the run waits, its job saying why. A reason every run shares (the
+    install's limits, no price entered) also rests the lane, and Today says
+    it; one plan's short budget holds only that plan's run. Nothing on a
+    subscription."""
+    from harvey.modules import jobs
+
+    try:
+        return await brain_spend.hold_run(ctx, plan_id, brain.config,
+                                          getattr(config, "spend", None), turns, what,
+                                          BUDGET_RETRY_SECONDS)
+    except jobs.LaneExhausted as e:
+        if not getattr(e, "plan_only", False):
+            await hold(ctx.state, str(e), BUDGET_RETRY_SECONDS)
+        raise
+
+
 async def _record(state, brain, payload, turns: int, started: float, turn: str,
-                  task: str = "wake") -> int:
+                  task: str = "wake", limit: int = 0) -> tuple[int, float]:
     """The run's usage in usage_events (agent ``agent``, task ``task``: a
-    wake's, or ``task.<profile>`` for a task's): its tokens, 0 when it
-    ended with no result (still counted as a call)."""
+    wake's, or ``task.<profile>`` for a task's): (its tokens, what it cost:
+    money with an API key, brain_spend), tokens 0 when it ended with no
+    result (still counted as a call; with an API key its cost unknown, so
+    counted at a turn's bound for the turns it ran and the one it was in,
+    at most ``limit``, its turn limit: chat.MAX_TURNS by default)."""
     from harvey.agent import chat
 
     ms = int((time.monotonic() - started) * 1000)
     try:
         await state.increment_usage(provider=brain.provider)
         if payload is None:
-            await brain._record_usage({"usage": {}, "num_turns": turns, "is_error": True,
-                                       "duration_ms": ms}, agent="agent", task=task, label=turn)
-            return 0
+            cost = await brain._record_usage(
+                {"usage": {}, "num_turns": turns, "is_error": True, "duration_ms": ms},
+                agent="agent", task=task, label=turn,
+                unknown_turns=min(limit or chat.MAX_TURNS, int(turns or 0) + 1))
+            return 0, float(cost or 0.0)
         model_usage = payload.get("modelUsage") if isinstance(payload.get("modelUsage"),
                                                               dict) else {}
-        await brain._record_usage({"modelUsage": model_usage, "usage": payload.get("usage"),
-                                   "num_turns": turns, "duration_ms": ms,
-                                   "session_id": payload.get("session_id") or "",
-                                   "is_error": bool(payload.get("is_error"))},
-                                  agent="agent", task=task, label=turn)
-        return chat._tokens(model_usage)
+        cost = await brain._record_usage({"modelUsage": model_usage, "usage": payload.get("usage"),
+                                          "total_cost_usd": payload.get("total_cost_usd"),
+                                          "num_turns": turns, "duration_ms": ms,
+                                          "session_id": payload.get("session_id") or "",
+                                          "is_error": bool(payload.get("is_error"))},
+                                         agent="agent", task=task, label=turn)
+        return chat._tokens(model_usage), float(cost or 0.0)
     except Exception as e:
         logger.warning("the agent's usage (%s) not recorded: %s", task, e)
-        return 0
+        return 0, 0.0

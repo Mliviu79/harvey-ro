@@ -489,7 +489,7 @@ _LOGIN_READS = re.compile(r"credentials\.json|find-generic-password|dump-keychai
 
 # The one line that names the token: the credentials dropped from every
 # Claude child's environment (claude_runtime.CREDENTIAL_ENV), never read.
-_DROPPED = 'CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")'
+_DROPPED = 'CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",'
 
 
 def test_no_code_reads_the_claude_login():

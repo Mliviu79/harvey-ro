@@ -132,11 +132,13 @@ def refusal(config) -> str:
 @dataclass(frozen=True)
 class CodexRunner:
     """What a Codex process is started with (check()): ``native_home`` is
-    where its login is taken from (brain_auth.codex_home: None, ~/.codex)."""
+    where its login is taken from (brain_auth.codex_home: None, ~/.codex);
+    ``api_key``, an API key Codex saved there (brain.auth: api_key)."""
     codex_path: str
     model: str = ""
     effort: str = ""
     native_home: Path | None = None
+    api_key: bool = False
 
 
 def auth(config) -> str:
@@ -162,11 +164,12 @@ async def check(config):
                     f"Codex CLI not found. Install it: {codex.CODEX_INSTALL_HINT}", kind="setup")
             await asyncio.to_thread(codex.check_cli_version, path)
             home = brain_auth.codex_home(auth(config))
-            await asyncio.to_thread(codex.check_native_auth, home)
+            api = auth(config) == brain_auth.API_KEY
+            await asyncio.to_thread(codex.check_native_auth, home, api)
         except codex.CodexError as e:
             raise Unusable(str(e), e.kind, CODEX) from None
         return CodexRunner(path, getattr(brain, "model", "") or "",
-                           getattr(brain, "reasoning_effort", "") or "", home)
+                           getattr(brain, "reasoning_effort", "") or "", home, api)
     from harvey import claude_runtime
 
     try:
@@ -367,7 +370,8 @@ class CodexProcess:
 
         server_entry = chat.mcp_config(db_path, chat_id, task=task)["mcpServers"][SERVER]
         client = codex.CodexClient(model=runner.model, reasoning_effort=runner.effort,
-                                   codex_path=runner.codex_path, native_home=runner.native_home)
+                                   codex_path=runner.codex_path, native_home=runner.native_home,
+                                   api_key=runner.api_key)
         server = codex._AppServer(runner.codex_path)
         server.extra_toml = codex_mcp_toml(server_entry)
         server.opted_out = [m for m in codex.OPTED_OUT_NOTIFICATIONS
@@ -402,7 +406,8 @@ class CodexProcess:
             raise
         # (Attested: only now does the conversation reach the model.)
         process = cls(server, thread_id, model, runner.effort)
-        process.login_until = _login_until(server.codex_home)
+        # (An API key doesn't run out: only a ChatGPT login's copy does.)
+        process.login_until = float("inf") if runner.api_key else _login_until(server.codex_home)
         return process
 
     @property

@@ -42,6 +42,17 @@ and gives the runtime an access-only copy (no refresh token). Codex can
 neither change the real login nor renew it; once the login has expired or
 is due for renewal, calls fail with an auth error until the operator's own
 Codex use or ``codex login`` renews it. Harvey never writes the native login.
+
+API-key mode (``brain.auth: api_key``, CodexClient(api_key=True)) is the
+one exception to "ChatGPT only", and only when chosen: the key is given to
+Codex once through its app-server's own login (``login_api_key``:
+``account/login/start`` with ``type: apiKey``) in Harvey's folder
+data/auth/codex, where Codex keeps it in its own auth.json; each call's
+runtime gets a copy of that file, its login method is forced to ``api``
+(required_settings) and ``account/read`` must report an API key. The child's
+environment stays the same allowlist (never OPENAI_API_KEY or
+CODEX_API_KEY): the key travels in the file only. In every other mode the
+three refusals stand exactly as before.
 """
 
 import asyncio
@@ -157,6 +168,18 @@ REQUIRED_SETTINGS = {
     "approval_policy": "never",
     "sandbox_mode": "read-only",
 }
+
+# The login method a runtime is forced to in API-key mode (required_settings).
+API_LOGIN_METHOD = "api"
+
+
+def required_settings(api_key: bool = False) -> dict:
+    """REQUIRED_SETTINGS, with the API-key login method in API-key mode
+    (brain.auth: api_key) and ChatGPT's in every other."""
+    if not api_key:
+        return REQUIRED_SETTINGS
+    return {**REQUIRED_SETTINGS, "forced_login_method": API_LOGIN_METHOD}
+
 
 # Settings that would add instructions, run programs, or reroute requests.
 # Each must be unset (None) or empty in the effective config.
@@ -280,23 +303,42 @@ def find_codex() -> str | None:
     return shutil.which("codex")
 
 
-def check_native_auth(home: Path | None = None) -> Path:
+def check_native_auth(home: Path | None = None, api_key: bool = False) -> Path:
     """Validate the operator's Codex login without reading secrets out.
 
     Returns the auth.json path. Raises CodexError(kind="setup") with an
-    actionable message when Codex isn't logged in with ChatGPT.
+    actionable message when Codex isn't logged in with ChatGPT (``api_key``:
+    when ``home`` holds no API key Codex saved).
     """
-    return _load_native_auth(home)[0]
+    return _load_native_auth(home, api_key=api_key)[0]
 
 
-def _load_native_auth(home: Path | None = None) -> tuple[Path, dict]:
-    """Read the operator's login once, read-only. Never logs its contents."""
+NO_API_KEY = ("No Codex API key is saved for Harvey: paste one in Settings → Model "
+              "(API key).")
+
+
+def has_api_key_login(home: Path) -> bool:
+    """Whether ``home`` holds an API key Codex saved (its auth.json in
+    ``apikey`` mode). The key itself is never read out."""
+    try:
+        _load_native_auth(home, api_key=True)
+    except CodexError:
+        return False
+    return True
+
+
+def _load_native_auth(home: Path | None = None, api_key: bool = False) -> tuple[Path, dict]:
+    """Read the operator's login once, read-only. Never logs its contents.
+    ``api_key``: the API key Codex saved in Harvey's folder (login_api_key),
+    instead of a ChatGPT login."""
     require_supported_platform()
     home = home or native_codex_home()
     auth_file = home / "auth.json"
     try:
         st = auth_file.stat()
     except FileNotFoundError:
+        if api_key:
+            raise _setup_error(NO_API_KEY) from None
         raise _setup_error(
             f"No Codex login found at {auth_file}. Run 'codex login' and sign "
             "in with ChatGPT. Harvey supports Codex's file credential storage "
@@ -319,6 +361,11 @@ def _load_native_auth(home: Path | None = None) -> tuple[Path, dict]:
         raise _setup_error(f"{auth_file} is not readable Codex login data. Run 'codex login'.")
     mode = data.get("auth_mode") if isinstance(data, dict) else None
     tokens = data.get("tokens") if isinstance(data, dict) else None
+    if api_key:
+        key = data.get("OPENAI_API_KEY") if isinstance(data, dict) else None
+        if mode != "apikey" or not isinstance(key, str) or not key.strip():
+            raise _setup_error(NO_API_KEY)
+        return auth_file, data
     if (mode not in (None, "chatgpt") or not isinstance(tokens, dict)
             or not isinstance(tokens.get("access_token"), str) or not tokens["access_token"]
             or not isinstance(tokens.get("id_token"), str) or not tokens["id_token"]):
@@ -390,6 +437,12 @@ def build_access_snapshot(native: dict, now: float | None = None) -> dict:
             "last_refresh": native["last_refresh"]}
 
 
+def build_api_key_snapshot(native: dict) -> dict:
+    """The runtime's copy of the API key Codex saved (only its key and its
+    mode: nothing else from the file)."""
+    return {"auth_mode": "apikey", "OPENAI_API_KEY": native["OPENAI_API_KEY"]}
+
+
 def parse_cli_version(raw: bytes) -> str:
     """``codex --version`` output ("codex-cli 0.159.3") -> "0.159.3"."""
     match = re.search(rb"\b(\d+\.\d+\.\d+(?:[-+.][0-9A-Za-z.-]+)?)\s*$", (raw or b"").strip())
@@ -440,9 +493,10 @@ def _toml_value(value) -> str:
     return json.dumps(str(value))  # a JSON string is a valid TOML basic string
 
 
-def build_private_config_toml() -> str:
-    """The private CODEX_HOME/config.toml every Harvey call runs under."""
-    lines = [f"{k} = {_toml_value(v)}" for k, v in REQUIRED_SETTINGS.items()]
+def build_private_config_toml(api_key: bool = False) -> str:
+    """The private CODEX_HOME/config.toml every Harvey call runs under
+    (``api_key``: logged in with an API key, required_settings)."""
+    lines = [f"{k} = {_toml_value(v)}" for k, v in required_settings(api_key).items()]
     lines += [
         "check_for_update_on_startup = false",
         "notify = []",
@@ -525,13 +579,15 @@ def build_child_env(private_root: str, codex_home: str, base_env=None) -> dict:
     return env
 
 
-def attest_effective_config(response, model_catalog_path: str = "") -> list[str]:
-    """Check config/read output; return inherited MCP server names."""
+def attest_effective_config(response, model_catalog_path: str = "",
+                            api_key: bool = False) -> list[str]:
+    """Check config/read output; return inherited MCP server names.
+    ``api_key``: the runtime of an API-key login (required_settings)."""
     if not isinstance(response, dict) or not isinstance(response.get("config"), dict):
         raise _isolation_error("config/read returned no effective config")
     config = response["config"]
 
-    for key, expected in REQUIRED_SETTINGS.items():
+    for key, expected in required_settings(api_key).items():
         if config.get(key) != expected:
             raise _isolation_error(f"setting '{key}' is not {expected!r}")
 
@@ -986,6 +1042,9 @@ class _AppServer:
     # Set on every entry of the private catalog (the agent's runtime: its
     # MCP tools offered directly, not behind a tool search).
     catalog_overrides: dict = {}
+    # Logged in with an API key (CodexClient(api_key=True)): its config
+    # forces that login method.
+    api_key = False
 
     def __init__(self, codex_path: str):
         self.codex_path = codex_path
@@ -1013,7 +1072,7 @@ class _AppServer:
             os.mkdir(self.workspace, 0o700)
             os.chmod(self.root, 0o700)
             with open(os.path.join(self.codex_home, "config.toml"), "w", encoding="utf-8") as f:
-                f.write(build_private_config_toml() + self.extra_toml)
+                f.write(build_private_config_toml(api_key=self.api_key) + self.extra_toml)
         except OSError as e:
             raise CodexError(
                 f"Could not create Codex's private runtime folder ({type(e).__name__}).",
@@ -1021,7 +1080,8 @@ class _AppServer:
             ) from None
 
     def install_auth(self, snapshot: dict):
-        """Write the access-only login copy (see build_access_snapshot)."""
+        """Write the access-only login copy (see build_access_snapshot; an
+        API key's, build_api_key_snapshot)."""
         path = os.path.join(self.codex_home, "auth.json")
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1224,6 +1284,56 @@ class _AppServer:
             self.on_message(method, message.get("params"))
 
 
+LOGIN_SECONDS = 60
+
+
+async def login_api_key(home: Path, key: str, timeout: float = LOGIN_SECONDS) -> None:
+    """Give Codex an API key to keep (brain.auth: api_key): its app-server's
+    own login, ``account/login/start`` with ``type: apiKey``, run with
+    CODEX_HOME ``home`` (Harvey's data/auth/codex) under the private config
+    every API-key call runs with (file credential storage, the API-key login
+    method, no other endpoint), attested before the key is sent. Codex
+    writes the key to its own auth.json there; Harvey keeps no copy and
+    never logs it. Nothing is sent to a model. Raises CodexError."""
+    require_supported_platform()
+    path = find_codex()
+    if not path:
+        raise _setup_error(f"Codex CLI not found. Install it: {CODEX_INSTALL_HINT}")
+    server = _AppServer(path)
+    server.api_key = True
+    deadline = time.monotonic() + timeout
+    try:
+        async with asyncio.timeout(timeout):
+            server.prepare()
+            # (The private HOME and workspace are the runtime's; the login
+            # goes to Harvey's folder, where the config is the same.)
+            server.codex_home = str(home)
+            config = Path(home) / "config.toml"
+            fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(build_private_config_toml(api_key=True))
+            await server.read_version(deadline)
+            await server.launch(deadline)
+            attest_effective_config(await server.read_config(deadline), api_key=True)
+            started = await server.request(
+                "account/login/start", {"type": "apiKey", "apiKey": key}, deadline)
+            if not isinstance(started, dict) or started.get("type") != "apiKey":
+                raise _setup_error("Codex didn't take the API key.")
+            account = await server.request("account/read", {"refreshToken": False}, deadline)
+            acct = account.get("account") if isinstance(account, dict) else None
+            if not isinstance(acct, dict) or acct.get("type") != "apiKey":
+                raise _setup_error("Codex didn't report the API key after saving it.")
+    except TimeoutError:
+        raise _timeout_error() from None
+    except OSError as e:
+        raise CodexError(f"Could not prepare Codex's login folder ({type(e).__name__}).",
+                         kind="runtime") from None
+    finally:
+        await server.close()
+    if not has_api_key_login(Path(home)):
+        raise _setup_error("Codex didn't save the API key in its login file.")
+
+
 async def _kill_tree(proc):
     """Kill the child and everything it started: the npm ``codex`` wrapper
     runs the native binary as a grandchild that holds the pipes."""
@@ -1262,11 +1372,15 @@ class CodexClient:
     """Runs isolated, tool-less Codex turns on the operator's ChatGPT plan."""
 
     def __init__(self, model: str = "", reasoning_effort: str = "",
-                 codex_path: str | None = None, native_home: Path | None = None):
+                 codex_path: str | None = None, native_home: Path | None = None,
+                 api_key: bool = False):
         self.model = model
         self.reasoning_effort = reasoning_effort
         self._codex_path = codex_path
         self.native_home = native_home
+        # brain.auth api_key: the key Codex saved in native_home, billed per
+        # token (see the module's doc). False: a ChatGPT plan only.
+        self.api_key = bool(api_key)
         self._lock: asyncio.Lock | None = None
         self.last_rate_limits: dict | None = None
         self._announced_default = ""
@@ -1294,7 +1408,10 @@ class CodexClient:
             timeout, lambda deadline: self._run(prompt, deadline), skip_if)
 
     async def read_rate_limits(self, timeout: float = 30.0) -> dict | None:
-        """Live ChatGPT-plan windows for budgeting. No prompt is sent."""
+        """Live ChatGPT-plan windows for budgeting. No prompt is sent. None
+        with an API key: there is no plan (brain.usd_* caps hold it)."""
+        if self.api_key:
+            return None
         return await self._bounded(timeout, self._read_rate_limits)
 
     async def _bounded(self, timeout: float, work, skip_if=None):
@@ -1371,7 +1488,8 @@ class CodexClient:
                 server.install_model_catalog(catalog)
         await server.launch(deadline)
         mcp_names = attest_effective_config(
-            await server.read_config(deadline), server.model_catalog_path)
+            await server.read_config(deadline), server.model_catalog_path,
+            api_key=server.api_key)
         await self._require_chatgpt(server, deadline)
         return model, mcp_names
 
@@ -1379,14 +1497,17 @@ class CodexClient:
         """The runtime's version and route attested with no login in it, then
         the access-only login copy installed (the runtime is stopped: the
         caller launches it again, and attests it again)."""
-        _, native = _load_native_auth(self.native_home)  # fresh every call
-        snapshot = build_access_snapshot(native)
+        # (Read fresh every call.)
+        _, native = _load_native_auth(self.native_home, api_key=self.api_key)
+        snapshot = (build_api_key_snapshot(native) if self.api_key
+                    else build_access_snapshot(native))
+        server.api_key = self.api_key
         server.prepare()
         await server.read_version(deadline)
 
         # Phase 1 — no credentials anywhere in the runtime.
         await server.launch(deadline)
-        attest_effective_config(await server.read_config(deadline))
+        attest_effective_config(await server.read_config(deadline), api_key=self.api_key)
         await server.stop()
 
         # Phase 2 — the same runtime and config, with the access-only login.
@@ -1405,7 +1526,7 @@ class CodexClient:
             await self._logged_in(server, deadline)
             catalog = text_only_catalog(await server.read_catalog(deadline))
             await server.launch(deadline)
-            attest_effective_config(await server.read_config(deadline))
+            attest_effective_config(await server.read_config(deadline), api_key=self.api_key)
             account = await server.request("account/read", {"refreshToken": False}, deadline)
             listed = await self._model_list(server, deadline)
         finally:
@@ -1526,9 +1647,17 @@ class CodexClient:
         return model
 
     async def _require_chatgpt(self, server: _AppServer, deadline: float):
+        """The runtime's account: a ChatGPT one, or in API-key mode (and
+        only then) an API key."""
         account = await server.request("account/read", {"refreshToken": False}, deadline)
         acct = account.get("account") if isinstance(account, dict) else None
         acct_type = acct.get("type") if isinstance(acct, dict) else None
+        if self.api_key:
+            if acct_type == "apiKey":
+                return
+            raise CodexError(
+                "Codex doesn't report the API key Harvey saved: save it again in "
+                "Settings → Model.", kind="auth")
         if acct_type == "chatgpt":
             return
         if acct_type is None:

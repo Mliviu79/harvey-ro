@@ -95,6 +95,8 @@ if SNAPSHOT is not None and SCENARIO == "refresh_atomic":
 
 
 def effective_config():
+    with open(os.path.join(os.environ["CODEX_HOME"], "config.toml"), "rb") as f:
+        written = tomllib.load(f)
     features = {line.split(" = ")[0]: False
                 for line in open(os.path.join(os.environ["CODEX_HOME"], "config.toml"))
                 .read().split("[features]\n", 1)[1].splitlines() if " = " in line}
@@ -102,7 +104,9 @@ def effective_config():
         "project_doc_max_bytes": 0, "include_environment_context": False,
         "include_permissions_instructions": False, "include_apps_instructions": False,
         "include_collaboration_mode_instructions": False, "web_search": "disabled",
-        "forced_login_method": "chatgpt", "cli_auth_credentials_store": "file",
+        # (As written: "api" in API-key mode.)
+        "forced_login_method": written.get("forced_login_method"),
+        "cli_auth_credentials_store": "file",
         "approval_policy": "never", "sandbox_mode": "read-only",
         "model_provider": None, "chatgpt_base_url": "https://chatgpt.com/backend-api/",
         "instructions": None, "developer_instructions": None, "openai_base_url": None,
@@ -258,11 +262,23 @@ for line in sys.stdin:
         send({"method": "remoteControl/status/changed", "params": {"status": "disabled"}})
     elif method == "account/read":
         account = {"type": "chatgpt", "email": "x@example.com", "planType": "plus"}
-        if SCENARIO == "apikey":
+        if SCENARIO == "apikey" or (SNAPSHOT or {}).get("auth_mode") == "apikey":
             account = {"type": "apiKey"}
         if SCENARIO == "logged_out" or SNAPSHOT is None:
             account = None
         result = {"account": account, "requiresOpenaiAuth": True}
+    elif method == "account/login/start":
+        # Like 0.159.3: an API key is written to CODEX_HOME/auth.json as is
+        # (0600), and the answer names its type only.
+        if SCENARIO == "login_refused":
+            send({"id": mid, "error": {"code": -32600, "message": "refused"}})
+            continue
+        if (params or {}).get("type") == "apiKey":
+            fd = os.open(AUTH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": params.get("apiKey")}, f)
+            SNAPSHOT = read_auth()
+            result = {"type": "apiKey"}
     elif method == "account/rateLimits/read":
         general = {"limitId": "codex",
                    "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 1791910000},

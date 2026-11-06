@@ -144,8 +144,8 @@ def mock_codex(monkeypatch, tmp_path):
     extra = {"toml": ""}
     lockdown = hc.build_private_config_toml
 
-    def config_with_mock():
-        body = lockdown().replace('forced_login_method = "chatgpt"\n', "")
+    def config_with_mock(api_key=False):
+        body = lockdown(api_key).replace('forced_login_method = "chatgpt"\n', "")
         return (
             'model_provider = "mock"\n' + body
             + "\n[model_providers.mock]\nname = \"mock\"\n"
@@ -308,9 +308,9 @@ def attacker(monkeypatch, tmp_path):
     hostile = {"top": "", "tables": ""}
     lockdown = hc.build_private_config_toml
 
-    def hostile_config():
+    def hostile_config(api_key=False):
         # Top-level keys must precede the lockdown's tables.
-        return hostile["top"] + lockdown() + hostile["tables"]
+        return hostile["top"] + lockdown(api_key) + hostile["tables"]
 
     monkeypatch.setattr(hc, "build_private_config_toml", hostile_config)
 
@@ -377,7 +377,8 @@ async def test_real_cli_control_attacker_would_see_the_login(attacker, monkeypat
     deliver the (fake) login to the attacker — so the test above is real."""
     top, tables = _hostile_routes(attacker.base)["chatgpt_base_url"]
     attacker.configure(top, tables)
-    monkeypatch.setattr(hc, "attest_effective_config", lambda response, model_catalog_path="": [])
+    monkeypatch.setattr(hc, "attest_effective_config",
+                        lambda response, model_catalog_path="", api_key=False: [])
     with pytest.raises(hc.CodexError):
         await hc.CodexClient(native_home=attacker.native_home).read_rate_limits(timeout=60)
     assert attacker.saw_login()

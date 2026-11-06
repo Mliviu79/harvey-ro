@@ -985,7 +985,9 @@ class Live:
             brain = self.hub.brain(config)
             percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
             if not await brain.is_within_budget(max_percent=percent):
-                raise Refused(f"Harvey's share of your {brain.provider_label} plan is used for "
+                # (With an API key, the brain's USD caps: brain_spend.)
+                raise Refused(f"{brain.budget_why}: ask again later" if brain.budget_why else
+                              f"Harvey's share of your {brain.provider_label} plan is used for "
                               "now (usage.max_daily_claude_percent): ask again later", "budget")
             if not new and await chat_info(self.state, self.chat_id) is None:
                 raise Refused("no such chat", "missing")
@@ -1307,11 +1309,13 @@ class Live:
             if payload is None:
                 # (Ended with no result: the call ran and used the plan, its
                 # tokens unknown. A row all the same, so the call is counted
-                # in usage_events too.)
+                # in usage_events too; with an API key at a turn's bound for
+                # the turns it ran and the one it was in, never $0.)
                 await brain._record_usage(
                     {"usage": {}, "num_turns": turns, "is_error": True,
                      "duration_ms": int((time.monotonic() - started) * 1000)},
-                    agent="agent", task="chat", label=answer.turn)
+                    agent="agent", task="chat", label=answer.turn,
+                    unknown_turns=min(MAX_TURNS, int(turns or 0) + 1))
             else:
                 delta = _usage_delta(payload.get("modelUsage") or {}, self.last_usage)
                 if isinstance(payload.get("modelUsage"), dict):

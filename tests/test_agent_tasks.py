@@ -77,8 +77,8 @@ def result(text, error=False, subtype="success"):
          "session_id": "s", "duration_ms": 500, "num_turns": 2,
          "usage": {"input_tokens": 700, "output_tokens": 60},
          "modelUsage": {"claude-test": {"inputTokens": 700, "outputTokens": 60,
-                                        "cacheReadInputTokens": 0,
-                                        "cacheCreationInputTokens": 0, "costUSD": 0.0}}})
+                                        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                                        "costUSD": float(os.environ.get("FAKE_COST", "0"))}}})
 
 
 def tool_round(k):
@@ -198,12 +198,12 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _plan(state, *, approve=True, chat_id=CHAT) -> int:
+def _plan(state, *, approve=True, chat_id=CHAT, budget=0.0) -> int:
     async def go():
         p = await plans.propose(state, chat_id, "t0", "Contacte pentru dentiștii din Brașov",
-                                ["Caut zonele", "Caut firmele"], 0.0, 72)
+                                ["Caut zonele", "Caut firmele"], budget, 72)
         if approve:
-            await plans.decide(state, p["id"], True, plans.BY_DASHBOARD, budget_usd=0.0)
+            await plans.decide(state, p["id"], True, plans.BY_DASHBOARD, budget_usd=budget)
         return p["id"]
     return _run(go())
 
@@ -389,6 +389,32 @@ def test_a_valid_answer_ends_the_task_done_and_wakes_its_plan(state, fake):
     assert shown["counts"] == {"areas": 1, "phrases": 2, "sources": 1}
     listed = _run(actions.Actions(state.db_path, CHAT).tasks(plan_id))
     assert listed["tasks"][0]["result"] == RESEARCH
+
+
+def test_an_api_key_tasks_cost_counts_in_its_plan_and_a_short_budget_holds_it(
+        state, fake, monkeypatch):
+    from harvey import brain_spend
+
+    cfg = _config()
+    cfg.brain = cfg.brain.model_copy(update={"auth": "api_key"})
+    monkeypatch.setattr(chat, "_config", lambda: cfg)
+    monkeypatch.setenv("FAKE_COST", "0.31")
+    # A free plan can't pay for a billed task: it waits, the CLI never starts.
+    free = _plan(state)
+    task = _assign(state, free)
+    job = _work(state)
+    assert job.status == "queued" and "budget can't cover it" in job.error
+    assert _task(state, task["id"])["status"] == "queued" and fake.lines() == []
+    _run(plans.close(state, free, cancel=True, by=plans.BY_CLI))
+    # One that can: its worst case held, then what it cost counted.
+    paid = _plan(state, budget=2.0)
+    task = _assign(state, paid)
+    job = _work(state)
+    assert job.status == "done" and job.actual_cost == pytest.approx(0.31)
+    assert tasks.TASK_TURNS * brain_spend.TURN_USD_FLOOR <= 2.0
+    money = _run(plans.money(state, paid))
+    assert money["committed_usd"] == pytest.approx(0.31) == money["agent_usd"]
+    assert _q(state, "SELECT task, source FROM usage_events") == [("task.researcher", "api_key")]
 
 
 @pytest.mark.parametrize("answer, why", [

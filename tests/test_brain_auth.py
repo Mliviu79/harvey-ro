@@ -47,13 +47,17 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# The brain's USD caps and Codex's prices, none set.
+NO_MONEY = {"usd_per_day": None, "usd_per_month": None, "codex_usd_per_mtok_in": None,
+            "codex_usd_per_mtok_out": None}
+
+
 # ── brain.auth in the config ──
 
 def test_auth_is_terminal_unless_set():
     assert BrainConfig().auth == "terminal"
     assert BrainConfig(auth=" Account ").auth == "account"
-    with pytest.raises(ValueError, match="isn't available in this version"):
-        BrainConfig(auth="api_key")
+    assert BrainConfig(auth="api-key").auth == "api_key"
     with pytest.raises(ValueError, match="not a way to log in"):
         BrainConfig(auth="password")
 
@@ -75,7 +79,8 @@ def test_saving_brain_settings_keeps_the_file_and_its_comments(tmp_path):
     set_brain_settings({"auth": "account"}, template)
     assert load_brain_config(str(written)).auth == "account"
     before = written.read_bytes()
-    for bad in ({"model": "--dangerous"}, {"auth": "api_key"}, {"colour": "red"}):
+    for bad in ({"model": "--dangerous"}, {"auth": "password"}, {"colour": "red"},
+                {"usd_per_day": "-1"}, {"usd_per_month": "lots"}):
         with pytest.raises(ConfigError):
             set_brain_settings(bad, template)
     assert written.read_bytes() == before
@@ -92,7 +97,7 @@ def test_credentials_never_reach_a_claude_child_in_any_mode(monkeypatch):
         terminal = claude_runtime.runtime_env("/tmp/x", base, safe=safe)
         assert not set(claude_runtime.CREDENTIAL_ENV) & set(terminal)
         assert terminal["CLAUDE_CONFIG_DIR"] == "/home/op/.claude"   # the CLI's own login
-        assert terminal["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1"
+        assert "ANTHROPIC_BASE_URL" not in terminal      # billed outside the login
         account = claude_runtime.runtime_env("/tmp/x", base, safe=safe, auth="account")
         assert not set(claude_runtime.CREDENTIAL_ENV) & set(account)
         folder = Path(account["CLAUDE_CONFIG_DIR"])
@@ -259,7 +264,7 @@ def test_status_is_kept_briefly_and_names_the_last_error(tmp_path, monkeypatch):
     two = run(brain_auth.status(BrainConfig(), state=state))
     assert calls == ["terminal"] and one == two
     assert one["last_error"] == "setup" and one["auth"] == "terminal"
-    assert one["offered"] == ["terminal"]
+    assert one["offered"] == ["terminal", "api_key"]
     assert [m["id"] for m in one["models"]] == ["opus", "sonnet", "haiku"]
     run(brain_auth.status(BrainConfig(), state=state, force=True))
     assert calls == ["terminal", "terminal"]
@@ -292,21 +297,22 @@ def test_the_panel_reads_and_saves_the_brain(client, monkeypatch):
     monkeypatch.setattr(codex, "_PLATFORM", "linux")
     got = client.get("/api/brain").json()
     assert (got["provider"], got["model"], got["auth"]) == ("claude", "", "terminal")
-    assert got["offered"] == ["terminal"] and "account" in got["auth_ready"]
-    assert got["codex_refused"] == ""
+    assert got["offered"] == ["terminal", "api_key"] and "account" in got["auth_ready"]
+    assert got["codex_refused"] == "" and got["key_set"] == {"claude": False, "codex": False}
 
     r = client.post("/api/brain", json={"provider": "codex", "model": ""})
     assert r.status_code == 400 and "Pick a Codex model" in r.json()["message"]
     r = client.post("/api/brain", json={"auth": "account"})
     assert r.status_code == 409                  # no link flow yet: not offered
     r = client.post("/api/brain", json={"auth": "api_key"})
-    assert r.status_code == 409
+    assert r.status_code == 409 and "Save the Claude API key first" in r.json()["message"]
     assert not (client.dir / "harvey.local.yaml").exists()
 
     r = client.post("/api/brain", json={"provider": "codex", "model": "gpt-6-luna",
                                         "reasoning_effort": "low", "auth": "terminal"})
     assert r.status_code == 200 and r.json()["brain"] == {
-        "provider": "codex", "model": "gpt-6-luna", "reasoning_effort": "low", "auth": "terminal"}
+        "provider": "codex", "model": "gpt-6-luna", "reasoning_effort": "low", "auth": "terminal",
+        **NO_MONEY}
     text = (client.dir / "harvey.local.yaml").read_text(encoding="utf-8")
     assert "# Which subscription Harvey thinks with" in text
     assert client.get("/api/brain").json()["model"] == "gpt-6-luna"
@@ -324,7 +330,7 @@ def test_a_provider_switch_never_carries_the_other_ones_model(client, monkeypatc
     # Back to Claude naming no model: Codex's model isn't Claude's.
     r = client.post("/api/brain", json={"provider": "claude"})
     assert r.status_code == 200 and r.json()["brain"] == {
-        "provider": "claude", "model": "", "reasoning_effort": "", "auth": "terminal"}
+        "provider": "claude", "model": "", "reasoning_effort": "", "auth": "terminal", **NO_MONEY}
     # A blank provider is no switch (and no write of the default).
     r = client.post("/api/brain", json={"provider": "", "model": "sonnet"})
     assert r.status_code == 200 and r.json()["brain"]["provider"] == "claude"
@@ -408,7 +414,7 @@ def _panel(lang: str, status: dict, picked: dict | None = None) -> str:
 
 
 CLAUDE = {"provider": "claude", "model": "", "reasoning_effort": "", "auth": "terminal",
-          "offered": ["terminal"], "folder": "", "codex_refused": "", "last_error": "",
+          "offered": ["terminal", "api_key"], "folder": "", "codex_refused": "", "last_error": "",
           "cli": {"ok": True, "version": "2.1.318", "problem": ""}, "linked": True,
           "linked_as": {"method": "claude.ai", "plan": "max"}, "problem": "",
           "models": [{"id": m, "name": m, "efforts": []} for m in ("opus", "sonnet", "haiku")],
@@ -423,8 +429,9 @@ def test_the_panel_offers_only_the_ways_that_work(lang, words):
     html = _panel(lang, CLAUDE)
     for w in words:
         assert w in html, w
-    # The link flows aren't here yet: no button for them.
-    assert 'value="account"' not in html and 'value="api_key"' not in html
+    # The account link's flow isn't here yet: no button for it.
+    assert 'value="account"' not in html and 'value="api_key"' in html
+    assert 'id="model-key"' not in html                  # the key box: API key only
     assert '<option value="opus">' in html and 'id="model-effort"' not in html
 
 
@@ -453,6 +460,32 @@ def test_switching_the_panel_to_claude_shows_claudes_models_and_status():
     assert '<option value="opus">' in html and "gpt-6-luna" not in html
     assert "CLI 2.1.318" in html and "chatgpt" not in html and "0.159.3" not in html
     assert 'id="model-effort"' not in html
+
+
+@pytest.mark.parametrize("lang, words", [
+    ("en", ["API key", "API key set", "today $0.40 of $2.00", "this month $1.10 of $20.00",
+            "Unlink", "Per day (USD)"]),
+    ("ro", ["Cheie API", "cheie API setată", "azi 0,40", "Deconectează",
+            "Pe zi (USD)"]),
+])
+def test_the_panel_in_api_key_mode_has_the_key_box_caps_and_unlink(lang, words):
+    spend = {"today_usd": 0.4, "month_usd": 1.1, "usd_per_day": 2.0, "usd_per_month": 20.0,
+             "priced": True}
+    status = {**CLAUDE, "auth": "api_key", "linked": True, "linked_as": {"method": "api_key"},
+              "key_set": {"claude": True, "codex": False}, "spend": spend,
+              "usd_per_day": 2.0, "usd_per_month": 20.0}
+    html = _panel(lang, status)
+    for w in words:
+        assert w in html, w
+    # The key box is a password field, empty: what was saved never comes back.
+    assert 'id="model-key" type="password"' in html and 'value=""' in html
+    assert 'id="model-unlink"' in html and 'id="model-price-in"' not in html
+    # Codex: its token prices too, and no Unlink with no key saved.
+    codex = {**status, "provider": "codex", "model": "gpt-6-luna", "spend": None,
+             "key_set": {"claude": True, "codex": False}, "linked": False, "linked_as": {}}
+    html = _panel(lang, codex)
+    assert 'id="model-price-in"' in html and 'id="model-price-out"' in html
+    assert 'id="model-unlink"' not in html
 
 
 # ── The agent's language ──
@@ -490,3 +523,43 @@ def test_a_wake_keeps_the_chats_language(tmp_path):
     finally:
         mp.undo()
     assert "in the language of the user's latest message in this chat" in text
+
+
+USAGE_TAB = r'''
+const fs = require('fs'), vm = require('vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+global.localStorage = {getItem: () => process.argv[3], setItem: () => {}};
+vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
+const els = {};
+const el = id => els[id] || (els[id] = {innerHTML: '', textContent: '', style: {},
+                                        setAttribute() {}});
+global.document = {getElementById: el};
+global.escHtml = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+global.offlineState = () => 'offline';
+global.quotaCardHtml = () => 'QUOTA';
+global.api = async () => JSON.parse(process.argv[4]);
+const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
+vm.runInThisContext(pick('// API-key mode: today', 'async function loadOutbox'));
+loadUsage().catch(e => { if (e instanceof ReferenceError && /'api'/.test(e.message)) throw e; })
+  .then(() => console.log(JSON.stringify({quota: els['usage-quota'].innerHTML,
+                                          billing: els['usage-billing'].textContent})));
+'''
+
+
+@pytest.mark.parametrize("lang, words", [
+    ("en", ["Today (UTC)", "of $2.50"]), ("ro", ["2,50"])])
+def test_the_usage_tab_shows_the_money_in_api_key_mode(lang, words):
+    # (loadUsage once named a local "api", which shadowed api() and broke
+    # the Usage tab in every mode.)
+    data = {"billing": "api_key", "totals": {}, "by_day": [], "by_provider": {},
+            "money": {"today_usd": 0.83, "month_usd": 0.83, "usd_per_day": 2.5,
+                      "usd_per_month": 40.0, "priced": True}}
+    res = subprocess.run([_node(), "-e", USAGE_TAB, str(WEB / "app.js"), str(WEB / "i18n.js"),
+                          lang, json.dumps(data)],
+                         text=True, encoding="utf-8", capture_output=True, timeout=60)
+    assert res.returncode == 0, res.stderr[-3000:]
+    out = json.loads(res.stdout.strip().splitlines()[-1])
+    assert "QUOTA" not in out["quota"]
+    for w in words:
+        assert w in out["quota"], w
+    assert out["billing"] and "token" in out["billing"].lower()

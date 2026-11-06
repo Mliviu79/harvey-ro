@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass
 
 import harvey.overlay.queries  # noqa: F401  (registers the named statements)
-from harvey import queries
+from harvey import brain_spend, queries
 
 logger = logging.getLogger("harvey.agent")
 
@@ -601,11 +601,13 @@ async def run(ctx) -> dict:
     brain = Brain(state, getattr(config, "brain", None))
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await brain.is_within_budget(max_percent=percent):
-        why = (f"Harvey's share of your {brain.provider_label} plan is used for now "
+        why = (f"{brain.budget_why}: the agent's wakes and tasks wait" if brain.budget_why else
+               f"Harvey's share of your {brain.provider_label} plan is used for now "
                "(usage.max_daily_claude_percent): the agent's wakes and tasks wait")
         await wakes.hold(state, why, wakes.BUDGET_RETRY_SECONDS)
         raise jobs.LaneExhausted(why, retry_after=wakes.BUDGET_RETRY_SECONDS)
     exe = await wakes.runner(config, "tasks")
+    await wakes.hold_cost(ctx, plan["id"], brain, config, TASK_TURNS, "task")
     if not await _write(state, "overlay.agent.task_start", (_now(), tid)):
         # (Cancelled since it was read: no run.)
         return {"task": tid, "skipped": "the task is no longer open"}
@@ -624,12 +626,15 @@ async def run(ctx) -> dict:
         # made counts all the same.)
         if calling.get("started"):
             try:
-                await asyncio.shield(wakes._record(state, brain, None, calling.get("turns", 0),
-                                                   started, task["turn"], task=label))
+                await asyncio.shield(wakes._charge_cut_off(ctx, brain, calling, started,
+                                                           task["turn"], task=label,
+                                                           limit=TASK_TURNS))
             except Exception:
                 pass
         raise
-    tokens = await wakes._record(state, brain, payload, turns, started, task["turn"], task=label)
+    tokens, cost = await wakes._record(state, brain, payload, turns, started, task["turn"],
+                                       task=label, limit=TASK_TURNS)
+    await brain_spend.charge(ctx, brain.config, cost)
     if ended != "stopped" and stop is not None and await stop():
         ended = "stopped"
     if ended == "stopped":

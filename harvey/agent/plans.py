@@ -16,7 +16,11 @@ is, over its runs: a finished run's actual cost (its searches, address
 checks and classifier calls), a live run's caps (its spend cap and its
 classifier cap, as they are now), and an action still being queued, the
 caps it reserved. The run's own caps then hold it as for any run, and the
-install's day and month limits still apply (jobs.reserve).
+install's day and month limits still apply (jobs.reserve). With an API key
+(brain.auth: api_key, harvey/brain_spend.py) the agent's own model runs
+under the plan count too: a finished wake's or task's model cost (its
+job's actual_cost), and a running one's worst case, held when it started
+(``hold_run``). In the subscription modes they cost nothing.
 
 Reads and writes go through a writable StateManager: the dashboard's and
 the CLI's, or the one inside the agent's tool server (actions.py), never
@@ -193,12 +197,32 @@ def _money(rows) -> tuple[float, float, list[dict]]:
     return committed, spent, runs
 
 
+async def _model_money(db, plan_id: int, exclude: str = "") -> tuple[float, float]:
+    """(committed, spent) of a plan's own model runs, its wakes and tasks
+    (jobs on the agent lane; other than ``exclude``): a finished one's
+    actual cost, a running one's hold (its ``reserved``) when that is more.
+    0 in the subscription modes, where they hold and spend nothing."""
+    committed = spent = 0.0
+    for jid, status, actual, reserved in await _all(
+            db, "overlay.agent.plan_model_jobs", (f"agent_wake:{int(plan_id)}", int(plan_id))):
+        if jid == exclude:
+            continue
+        actual = float(actual or 0.0)
+        spent += actual
+        committed += max(actual, float(reserved or 0.0)) if status == "running" else actual
+    return committed, spent
+
+
 async def money(state, plan_id: int) -> dict:
-    """What a plan has committed and spent, and its runs."""
+    """What a plan has committed and spent (``agent_usd``: of it, the
+    agent's own model runs), and its runs."""
     async with state._connect() as db:
         rows = await _all(db, "overlay.agent.plan_runs", (int(plan_id),))
+        model_committed, model_spent = await _model_money(db, int(plan_id))
     committed, spent, runs = _money(rows)
-    return {"committed_usd": round(committed, 6), "spent_usd": round(spent, 6), "runs": runs}
+    return {"committed_usd": round(committed + model_committed, 6),
+            "spent_usd": round(spent + model_spent, 6), "agent_usd": round(model_spent, 6),
+            "runs": runs}
 
 
 async def status(state, plan_id, chat: str | None = None) -> dict:
@@ -368,6 +392,7 @@ async def reserve(state, plan_id, chat: str, turn: str, tool: str, arguments: di
             try:
                 usable(plan, plan_id, chat)
                 committed, _, _ = _money(await _all(db, "overlay.agent.plan_runs", (pid,)))
+                committed += (await _model_money(db, pid))[0]
                 left = plan["budget_usd"] - committed
                 if want > 0 and want > left + EPSILON:
                     raise Refused(f"over plan {pid}'s budget: this asks for ${want:.2f} and "
@@ -387,6 +412,37 @@ async def reserve(state, plan_id, chat: str, turn: str, tool: str, arguments: di
     if why:
         raise Refused(why)
     return action, await status(state, pid)
+
+
+async def hold_run(state, plan_id, job_id: str, usd: float, spent: float = 0.0) -> None:
+    """Hold ``usd`` of an approved plan's budget for one of its own model
+    runs (a wake, a task: job ``job_id``, which spent ``spent`` before, in
+    an earlier try) about to start, as its job's ``reserved`` (counted
+    while it runs: _model_money). Refused when the
+    plan is no longer approved, or what remains of its budget (its runs,
+    actions and other runs' holds) is less. The check and the hold are one
+    write transaction, as an action's reserve is."""
+    async with state._connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await _expire(db)
+            pid = int(plan_id)
+            plan = _plan(await _one(db, "overlay.agent.plan", (pid,)))
+            if plan is None or plan["status"] != APPROVED:
+                raise Refused(f"plan {pid} is {plan['status'] if plan else 'gone'}")
+            committed, _, _ = _money(await _all(db, "overlay.agent.plan_runs", (pid,)))
+            committed += (await _model_money(db, pid, exclude=job_id))[0] + float(spent)
+            left = plan["budget_usd"] - committed
+            if float(usd) > left + EPSILON:
+                raise Refused(f"plan {pid}'s budget can't cover it: a run may cost up to "
+                              f"${float(usd):.2f} and ${max(0.0, left):.2f} of "
+                              f"${plan['budget_usd']:.2f} remains")
+            await db.execute(queries.sql("overlay.agent.run_hold"),
+                             (float(spent) + float(usd), job_id))
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def settle(state, action: int, outcome: str, *, batch: str = "", why: str = "") -> None:

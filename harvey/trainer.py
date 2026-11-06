@@ -329,6 +329,10 @@ def brain_section(brain_config: BrainConfig) -> dict:
         section["reasoning_effort"] = brain_config.reasoning_effort
     if brain_config.auth != "terminal":
         section["auth"] = brain_config.auth
+    # (The API key's USD caps and Codex's prices: never dropped by a retrain.)
+    for key in ("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in", "codex_usd_per_mtok_out"):
+        if getattr(brain_config, key, None) is not None:
+            section[key] = getattr(brain_config, key)
     return section
 
 

@@ -109,14 +109,18 @@ async def test_claude_env_drops_instruction_sources_but_keeps_login(state, monke
     for key in claude_runtime.STRIPPED_ENV:
         monkeypatch.setenv(key, "/somewhere/else")
     keep = {"HOME": "/home/op", "CLAUDE_CONFIG_DIR": "/home/op/.claude",
-            "ANTHROPIC_BASE_URL": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:2",
-            "CLAUDE_CODE_USE_BEDROCK": "1"}
-    for key, value in keep.items():
+            "HTTPS_PROXY": "http://127.0.0.1:2"}
+    # Routes that bill outside the chosen login: never inherited.
+    billed_elsewhere = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+                        "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": "1",
+                        "ANTHROPIC_VERTEX_PROJECT_ID": "example-project",
+                        "AWS_BEARER_TOKEN_BEDROCK": "fake-token"}
+    for key, value in {**keep, **billed_elsewhere}.items():
         monkeypatch.setenv(key, value)
     captured = _capture(monkeypatch)
     await Brain(state).think("hi")
     env = captured["kwargs"]["env"]
-    for key in claude_runtime.STRIPPED_ENV:
+    for key in [*claude_runtime.STRIPPED_ENV, *billed_elsewhere]:
         assert key not in env, key
     for key, value in keep.items():
         assert env[key] == value, key
@@ -134,7 +138,8 @@ async def test_a_key_in_the_environment_never_reaches_claude(state, monkeypatch)
     env = captured["kwargs"]["env"]
     assert not set(claude_runtime.CREDENTIAL_ENV) & set(env)
     assert set(claude_runtime.CREDENTIAL_ENV) == {
-        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "HARVEY_BRAIN_ANTHROPIC_KEY"}
 
 
 @pytest.mark.asyncio

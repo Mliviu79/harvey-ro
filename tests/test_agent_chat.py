@@ -821,6 +821,23 @@ def test_over_the_budget_a_message_is_refused_and_nothing_written(state, fake, m
     assert live == {} and fake() == []
 
 
+def test_with_an_api_key_a_message_past_the_brains_usd_cap_is_refused_saying_so(
+        state, fake, monkeypatch):
+    async def over(self, *a, **k):
+        # (What Brain.is_within_budget says with an API key past its cap.)
+        self.budget_why = "the brain's USD cap for the day ($1.00, brain.usd_per_day) is reached"
+        return False
+    monkeypatch.setattr(Brain, "is_within_budget", over)
+
+    async def work(h):
+        with pytest.raises(chat.Refused) as e:
+            await h.ask(None, "Ce s-a cheltuit azi?")
+        return e.value
+    refused = _run(state, work)
+    assert refused.code == "budget" and "brain.usd_per_day" in str(refused)
+    assert "max_daily_claude_percent" not in str(refused) and fake() == []
+
+
 def test_codex_where_it_cant_run_and_an_empty_or_long_message_are_refused(state, fake,
                                                                           monkeypatch):
     # (Codex runs the chat on macOS and Linux: elsewhere it is refused.)

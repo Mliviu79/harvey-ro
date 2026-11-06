@@ -936,3 +936,116 @@ def test_usable_models_refuses_what_the_lockdown_cant_run():
 def test_no_model_is_suggested_by_name():
     # The live catalog decides: Harvey ships no model to recommend.
     assert not hasattr(hc, "SUGGESTED_MODEL")
+
+
+# ── API-key mode (brain.auth: api_key): the three refusals open only here ──
+
+FAKE_KEY = "sk-fake-key-for-tests-0000"
+
+
+@pytest.fixture
+def key_home(tmp_path):
+    """Harvey's data/auth/codex with the API key Codex saved (its own
+    file, as 0.159.3 writes it)."""
+    home = tmp_path / "harvey-codex"
+    home.mkdir(mode=0o700)
+    auth = home / "auth.json"
+    auth.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": FAKE_KEY}))
+    auth.chmod(0o600)
+    return home
+
+
+def test_api_key_mode_forces_the_api_login_method_and_nothing_else():
+    assert hc.required_settings() is hc.REQUIRED_SETTINGS
+    assert hc.REQUIRED_SETTINGS["forced_login_method"] == "chatgpt"
+    api = hc.required_settings(api_key=True)
+    assert api == {**hc.REQUIRED_SETTINGS, "forced_login_method": "api"}
+    assert tomllib.loads(hc.build_private_config_toml(api_key=True))["forced_login_method"] == "api"
+    assert tomllib.loads(hc.build_private_config_toml())["forced_login_method"] == "chatgpt"
+    good = _good_effective_config()
+    with pytest.raises(hc.CodexError):
+        hc.attest_effective_config({"config": good}, api_key=True)
+    hc.attest_effective_config({"config": {**good, "forced_login_method": "api"}}, api_key=True)
+    with pytest.raises(hc.CodexError):
+        hc.attest_effective_config({"config": {**good, "forced_login_method": "api"}})
+
+
+def test_an_api_key_login_counts_only_in_api_key_mode(native_home, key_home):
+    # A ChatGPT login is no API key, and an API key no ChatGPT login.
+    assert hc.has_api_key_login(key_home) and not hc.has_api_key_login(native_home)
+    with pytest.raises(hc.CodexError) as err:
+        hc.check_native_auth(key_home)
+    assert FAKE_KEY not in str(err.value) and "ChatGPT" in str(err.value)
+    assert hc.check_native_auth(key_home, api_key=True) == key_home / "auth.json"
+    with pytest.raises(hc.CodexError) as err:
+        hc.check_native_auth(native_home, api_key=True)
+    assert "No Codex API key" in str(err.value)
+    _, data = hc._load_native_auth(key_home, api_key=True)
+    assert hc.build_api_key_snapshot(data) == {"auth_mode": "apikey", "OPENAI_API_KEY": FAKE_KEY}
+
+
+@pytest.mark.asyncio
+async def test_an_api_key_call_runs_with_the_key_in_codexs_file_only(fake, key_home, monkeypatch):
+    for k in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        monkeypatch.setenv(k, "sk-from-the-environment")
+    result = await _client(key_home, api_key=True).run(PROMPT, timeout=30)
+    assert result.text == '{"intent": "interested"}'
+    for server in fake.servers():
+        # The key travels in the runtime's own copy of Codex's file, never
+        # in the environment; the config forces the API-key login method.
+        assert not {"OPENAI_API_KEY", "CODEX_API_KEY"} & set(server["env_keys"])
+        assert 'forced_login_method = "api"' in server["config_toml"]
+        assert server["codex_home"] != str(key_home)
+    logged_in = [s for s in fake.servers() if s["auth"]]
+    assert logged_in and all(s["auth"] == {"auth_mode": "apikey", "OPENAI_API_KEY": FAKE_KEY}
+                             for s in logged_in)
+    assert fake.methods().count("turn/start") == 1
+    # No plan to read with a key: no runtime started for it.
+    before = len(fake.servers())
+    assert await _client(key_home, api_key=True).read_rate_limits() is None
+    assert len(fake.servers()) == before
+
+
+@pytest.mark.asyncio
+async def test_a_chatgpt_account_in_api_key_mode_is_refused(fake, native_home, monkeypatch):
+    # (A ChatGPT login file where the key should be: refused before any
+    # runtime starts, and a runtime reporting ChatGPT is refused too.)
+    with pytest.raises(hc.CodexError):
+        await _client(native_home, api_key=True).run(PROMPT, timeout=30)
+    assert not fake.sent_prompt()
+
+
+@pytest.mark.asyncio
+async def test_login_api_key_hands_the_key_to_codex_in_harveys_folder(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "find_codex", lambda: "codex")
+    home = tmp_path / "data-auth-codex"
+    home.mkdir(mode=0o700)
+    await hc.login_api_key(home, FAKE_KEY, timeout=30)
+    # Codex wrote its own file (0600); Harvey wrote only the config there.
+    assert sorted(p.name for p in home.iterdir()) == ["auth.json", "config.toml"]
+    assert (home / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert hc.has_api_key_login(home)
+    assert tomllib.loads((home / "config.toml").read_text())["forced_login_method"] == "api"
+    # The key went out once, in the login request, after the config was
+    # attested; no model was asked anything.
+    entries = fake.entries()
+    methods = fake.methods()
+    assert methods.index("config/read") < methods.index("account/login/start")
+    assert "turn/start" not in methods and "thread/start" not in methods
+    with_key = [e for e in entries if FAKE_KEY in json.dumps(e)]
+    assert len(with_key) == 1 and with_key[0]["method"] == "account/login/start"
+    assert with_key[0]["params"] == {"type": "apiKey", "apiKey": FAKE_KEY}
+    assert [s["codex_home"] for s in fake.servers()] == [str(home)]
+    assert _leftover_runtimes() == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_login_saves_nothing(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc, "find_codex", lambda: "codex")
+    fake.use("login_refused")
+    home = tmp_path / "data-auth-codex"
+    home.mkdir(mode=0o700)
+    with pytest.raises(hc.CodexError) as err:
+        await hc.login_api_key(home, FAKE_KEY, timeout=30)
+    assert FAKE_KEY not in str(err.value)
+    assert not hc.has_api_key_login(home)
