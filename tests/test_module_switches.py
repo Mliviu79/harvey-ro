@@ -44,7 +44,7 @@ DEFAULT_ON = {
     "brave", "dataforseo", "email_verify", "hunter", "market_us", "osm", "scavio", "serper",
     "tinyfish", "lang_ro", "market_ro", "onrc", "mf_financials", "mf_taxpayers", "anaf",
 }
-DEFAULT_OFF = {"boundaries", "email_outreach", "hiring", "startups", "web_marketing"}
+DEFAULT_OFF = {"boundaries", "email_outreach", "hiring", "npathi", "startups", "web_marketing"}
 # A search module that ships off and reads a key of its own. None ships like
 # that now, so the upgrade rule for one is checked on this fictional one.
 KEYED = "keyed_example"

@@ -357,6 +357,9 @@ class Handler:
         # campaign they belong to is told, in structured fields only
         # (harvey/agent/outreach.py).
         self._touched: set[str] = set()
+        # The messaging channels' HTTP transport (None: the network; tests
+        # give a fake nPathi Chat).
+        self.message_transport = None
 
     @property
     def is_native(self) -> bool:
@@ -378,14 +381,34 @@ class Handler:
         self.skills = self.brain.load_skills_for_agent("handler")
 
         if not self.config.channels.email.enabled:
-            return True
-
-        if not self.is_native:
+            read = True
+        elif not self.is_native:
             # A provider Harvey can't read (Instantly, removed): nothing was
             # read, so nothing may be sent either.
             self.last_read_problem = provider_notice(self.config)
+            read = False
+        else:
+            read = await self._run_native()
+        # Then the SMS and WhatsApp messages people sent in (nPathi Chat,
+        # when its module is on and connected): an SMS reply stops that
+        # person's email sequence before anything is sent. What happens
+        # there never holds email: its own channel waits instead.
+        await self.read_messages()
+        return read
+
+    async def read_messages(self) -> bool:
+        """Read the messaging channels (harvey/agents/messages.py). Never
+        raises but for a brain that stopped being usable."""
+        from harvey.agents.messages import MessageReader
+
+        try:
+            return await MessageReader(self, self.message_transport).run()
+        except BrainUnavailable as e:
+            logger.error(f"Handler: messages are left for later ({e}).")
             return False
-        return await self._run_native()
+        except Exception as e:
+            logger.error(f"Handler: reading messages failed ({type(e).__name__}).")
+            return False
 
     async def _our_text(self, prospect) -> OurText:
         """Everything a reply from this person might quote back from us: what

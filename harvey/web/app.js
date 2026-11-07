@@ -515,7 +515,7 @@ function loadCurrentTab() {
     case 'queue': loadQueue(); break;
     case 'chat': loadChat(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadModelCard(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
+    case 'settings': loadSettings(); loadModelCard(); loadModulesCard(); loadFinderBgCard(); loadVerifyPrices(); loadClassifyCard(); loadChannelsCard(); if (_modules.email) { loadSendingModeCard(); loadAckCard(); } break;
     case 'controls': loadHarveyStatus(); loadLogs(); loadControlSending(); break;
   }
 }
@@ -1179,6 +1179,7 @@ function todayItemText(it, stats) {
       /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
+    case 'message-read-gap': return tr(t('today.item.message_gap', {channel: channelName(it.channel)}), t('today.item.message_gap_detail'), t('today.item.message_gap_action'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
     case 'codex-login': return tr(t('today.item.codex_login'), t('today.item.codex_login_detail'), t('today.item.codex_login_action'));
@@ -5622,6 +5623,89 @@ async function loadFinderBgCard() {
       '<span class="switch-label">' + escHtml(t(bg.on ? 'mod.on' : 'mod.off')) + '</span></label></div>';
 }
 
+// Settings → Channels: nPathi Chat's SMS and WhatsApp, receiving only.
+// The key is a password field, checked by nPathi's account call before it
+// is saved, and never sent back: the card only knows whether one is saved.
+function unixRel(ts) { return ts ? relTime(new Date(ts * 1000).toISOString()) : escHtml(t('ch.never')); }
+
+async function loadChannelsCard() {
+  const el = document.getElementById('channels-card');
+  if (!el) return;
+  const s = await api('/api/channels');
+  if (!s) { el.innerHTML = '<p class="muted">' + escHtml(t('ch.unavailable')) + '</p>'; return; }
+  const intro = '<p class="desc">' + escHtml(t('ch.desc')) + '</p>';
+  if (!s.module_on) {
+    el.innerHTML = '<div class="settings-row"><div><h3>nPathi Chat</h3>' + intro +
+      '<p class="muted small">' + escHtml(t('ch.module_off')) + '</p></div></div>';
+    return;
+  }
+  const a = s.account || {};
+  const state = s.connected ? '<span class="email-tag verified">' + escHtml(t('ch.connected')) + '</span>'
+    : '<span class="email-tag guess">' + escHtml(t('ch.not_connected')) + '</span>';
+  const acct = a.ok
+    ? '<p class="muted small">' + escHtml(t('ch.account', {workspace: a.workspace || '?', plan: a.plan || '?'})) +
+      (typeof a.credits === 'number' ? ' · ' + escHtml(t('ch.credits', {n: fmtN(a.credits)})) : '') +
+      ' · ' + escHtml(t('ch.checked')) + ' ' + unixRel(a.checked_at) + '</p>'
+    : (a.error ? '<p class="small" style="color:var(--bad)">' + escHtml(a.error) + '</p>' : '');
+  const rows = (s.channels || []).map(ch => {
+    const senders = (ch.senders || []).map(x => '<li>' + escHtml(x.name || t('ch.default_route')) +
+      ' <span class="muted small">' + escHtml(x.receives === true ? t('ch.receives') : x.receives === false
+        ? t('ch.no_receive') : t('ch.receive_unknown')) + '</span></li>').join('');
+    const notes = [];
+    if (ch.can_read === false) notes.push(t('ch.cant_read'));
+    if (ch.gap) notes.push(t('ch.gap', {why: ch.gap.reason || ''}));
+    if (ch.problem) notes.push(t('ch.problem', {why: ch.problem}));
+    return '<div class="module-row"><div class="module-text">' +
+      '<h3>' + escHtml(ch.label) + '</h3>' +
+      '<p class="muted small">' + escHtml(t('ch.last_read')) + ' ' + unixRel(ch.last_read_at) + '</p>' +
+      (senders ? '<ul class="small">' + senders + '</ul>' : '<p class="muted small">' + escHtml(t('ch.no_senders')) + '</p>') +
+      notes.map(n => '<p class="small" style="color:var(--bad)">' + escHtml(n) + '</p>').join('') +
+      '</div><label class="switch"><input type="checkbox"' + (ch.receive ? ' checked' : '') +
+      ' onchange="setChannelReceive(' + jsq(ch.id) + ', this.checked)">' +
+      '<span class="track" aria-hidden="true"><span class="thumb"></span></span>' +
+      '<span class="switch-label">' + escHtml(t(ch.receive ? 'ch.receiving' : 'mod.off')) + '</span></label></div>';
+  }).join('');
+  el.innerHTML = '<div class="settings-row"><div><h3>nPathi Chat ' + state + '</h3>' + intro + acct + '</div>' +
+    '<div class="fields">' +
+      '<div class="form-group"><label class="form-label" for="npathi-url">' + escHtml(t('ch.url')) + '</label>' +
+        '<input type="url" class="form-input" id="npathi-url" placeholder="https://chat.example.com" autocomplete="off" value="' +
+        escHtml(s.base_url || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label" for="npathi-key">' + escHtml(t('ch.key')) + '</label>' +
+        '<div class="with-btn"><input type="password" class="form-input" id="npathi-key" autocomplete="off" placeholder="' +
+        escHtml(s.key_set ? t('set.saved_ph') : t('ch.key_ph')) + '">' +
+        '<button class="btn btn-secondary" onclick="toggleVisibility(\'npathi-key\')">' + escHtml(t('common.show')) + '</button></div></div>' +
+      '<div class="btn-group"><button class="btn btn-primary btn-sm" onclick="connectChannels()">' + escHtml(t('ch.connect')) + '</button>' +
+        (s.key_set && s.base_url ? '<button class="btn btn-secondary btn-sm" onclick="testChannels()">' + escHtml(t('ch.test')) + '</button>' : '') +
+      '</div></div></div>' + rows;
+}
+
+async function connectChannels() {
+  const url = String((document.getElementById('npathi-url') || {}).value || '').trim();
+  const key = String((document.getElementById('npathi-key') || {}).value || '').trim();
+  const res = await api('/api/channels/connect', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(key ? {base_url: url, key: key} : {base_url: url}),
+  });
+  showToast(res && res.success ? t('ch.connected_ok') : failMsg(res, t('ch.connect_failed')),
+            res && res.success ? 'success' : 'error');
+  loadChannelsCard();
+}
+
+async function testChannels() {
+  const res = await api('/api/channels/test', {method: 'POST'});
+  showToast(res && res.success ? t('ch.test_ok') : failMsg(res, t('ch.connect_failed')),
+            res && res.success ? 'success' : 'error');
+  loadChannelsCard();
+}
+
+async function setChannelReceive(channel, on) {
+  const res = await api('/api/channels/' + encodeURIComponent(channel), {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({receive: !!on}),
+  });
+  if (!(res && res.success)) showToast(failMsg(res, t('ch.connect_failed')), 'error');
+  loadChannelsCard();
+}
+
 // Settings: what one request to each verification service (and Hunter's
 // pattern lookup) costs past its free allowance on the user's plan. Blank:
 // no price, and a run with a USD cap refuses those requests.
@@ -7441,6 +7525,12 @@ function renderConversations() {
   el.innerHTML = bar + shown.map(convoCard).join('');
 }
 
+// A conversation's or a message's channel, as the dashboard names it.
+function channelName(ch) {
+  const k = 'ch.name.' + ch;
+  return t(k) !== k ? t(k) : String(ch || '');
+}
+
 function convoCard(c) {
   const items = (c.emails || []).map(e => ({ts: e.sent_at, email: e}))
     .concat((c.thread || []).map(m => ({ts: m.timestamp, msg: m})))
@@ -7457,7 +7547,8 @@ function convoCard(c) {
     }
     const m = it.msg, sent = m.sender === 'harvey';
     return '<div class="thread-msg ' + (sent ? 'sent' : 'received') + '"><div class="sender">' +
-      (sent ? 'Harvey' : escHtml(first)) + ' &middot; ' + relTime(m.timestamp) + '</div>' +
+      (sent ? 'Harvey' : escHtml(first)) + (m.channel ? ' &middot; ' + escHtml(channelName(m.channel)) : '') +
+      ' &middot; ' + relTime(m.timestamp) + '</div>' +
       escHtml(m.content) + '</div>';
   }).join('');
   const draft = c.draft
@@ -7465,15 +7556,17 @@ function convoCard(c) {
       '<div class="td-body">' + escHtml(c.draft.body) + '</div>' +
       '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">' + escHtml(t('cv.review')) + icon('arrow') + '</button></div>'
     : '';
-  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || t('cv.unknown');
+  const h = c.handle;
+  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || (h && h.value) || t('cv.unknown');
   const stageKey = 'cv.stage.' + c.stage;
   const stage = c.stage && t(stageKey) !== stageKey ? '<span class="tag">' + escHtml(t(stageKey)) + '</span>' : '';
   return '<div class="convo-card"><div class="convo-head">' +
     '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
     '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
-      escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
+      escHtml([c.company, c.prospect_email, h && h.value !== name ? h.value : ''].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
     // An escalation's intent badge says the same as its status: show one.
-    '<div class="tags">' + (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
+    '<div class="tags">' + (h || (c.channel && c.channel !== 'email') ? '<span class="tag">' + escHtml(channelName((h && h.channel) || c.channel)) + '</span>' : '') +
+      (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
       stage + badge(c.status) + '</div></div>' +
     '<div class="thread">' + (thread || '<p class="muted small">' + escHtml(t('cv.no_messages')) + '</p>') +
     draft + '</div>' + convoActions(c) + '</div>';

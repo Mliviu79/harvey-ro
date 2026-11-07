@@ -58,8 +58,9 @@ logger = logging.getLogger("harvey.agent")
 # Whole tables the agent never reads, each with why.
 EXCLUDED_TABLES = {
     "settings": "Harvey's settings: keys, tokens and mailbox state",
-    "conversations": "email threads: what prospects wrote",
+    "conversations": "email, SMS and WhatsApp threads: what prospects wrote",
     "processed_replies": "inbound message ids",
+    "conversation_handle": "the numbers and handles SMS and WhatsApp messages came from",
     "site_undo": "what a site check took off, with the page text it was read from",
     "agent_message": "the chat itself (the agent is given its history)",
     "agent_chat": "the chats themselves",
@@ -157,7 +158,8 @@ PERSONAL = {
     ("campaign_member", "email"): "an email address",
     ("campaign_candidate", "email"): "an email address",
     ("outbox", "to_email"): "an email address",
-    ("suppression", "value"): "an email address or a domain",
+    ("outbox", "to_phone"): "a phone number",
+    ("suppression", "value"): "an email address, a phone number or a domain",
     ("sending_account", "address"): "an email address",
     ("locations", "phone"): "a phone number",
     ("local_firm", "phone"): "a phone number",

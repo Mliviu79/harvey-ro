@@ -15,6 +15,9 @@ class Message(BaseModel):
     sender: str  # "harvey" or "prospect"
     content: str
     timestamp: datetime = Field(default_factory=_utcnow)
+    # The channel it came on when not the conversation's own (an SMS in an
+    # email thread): "", or sms / waba / wa.
+    channel: str = ""
 
 
 # Sales stages: tracks where the deal is in the pipeline
@@ -43,7 +46,9 @@ class Conversation(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
 
     def thread_json(self) -> str:
-        return json.dumps([m.model_dump(mode="json") for m in self.thread])
+        # (An email message keeps the shape it always had: no channel key.)
+        return json.dumps([{k: v for k, v in m.model_dump(mode="json").items()
+                            if k != "channel" or v} for m in self.thread])
 
     @classmethod
     def thread_from_json(cls, data: str | None) -> list[Message]:

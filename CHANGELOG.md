@@ -9,6 +9,31 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **SMS and WhatsApp replies, read through nPathi Chat.** A new module,
+  `npathi` (off by default), reads the messages people send to your nPathi
+  Chat numbers (SMS over a route that receives, WhatsApp Business, a paired
+  WhatsApp number) into Conversations, in the Handler's cycle. Replies only:
+  Harvey never writes first on these channels (Law 506/2004 art. 12 wants
+  consent, for companies too; WhatsApp forbids cold messages), and answering
+  from Harvey comes in a later version, so a message that wants an answer is
+  handed to you. An opt-out (STOP, "dezabonare", "nu mă mai contactați"...) is
+  read first: the number goes on the do-not-contact list (a new phone scope,
+  `suppression.check(phone=)`) and on nPathi's own list, and a number that
+  belongs to one firm opts its person out, cancels their queued email and
+  stops their company's cold email. Any message from such a number cancels
+  that person's email sequence; a number several firms share, or one Harvey
+  doesn't know, goes to you and stops no firm. nPathi's opt-out list is read
+  in once a day. A read that couldn't reach back to the last one shows on
+  Today until the missing part is read. Settings → Channels (or `harvey
+  channels status|test|connect|enable|disable`) takes the install's https
+  address and the workspace key, checked with nPathi's account call before
+  it is saved and never shown again, and lists each channel's senders and
+  whether a reply can come back to each. Conversations shows the channel and
+  the number masked. Schema 40: the outbox's `channel` (every row on file is
+  email), `to_phone` and `price_credits`, `conversation_handle`, and the
+  phone entries' triggers; the daily send caps and the bounce rate count
+  email only.
+
 - **A large verification is split and queued, not refused.** Verifying
   contacts with the classifier (the agent's `verify_contacts`, Contacts →
   Verify, `harvey contacts verify`) takes any selection up to 50,000

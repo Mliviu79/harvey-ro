@@ -526,8 +526,11 @@ def _current_provider() -> str:
 
 # Keys a module reads that Settings never writes: TrulyInbox's are saved by
 # its own connect flow, which checks the key against the mailbox first, and
-# the brain's Claude API key by Settings → Model's (/api/brain/key).
-ENV_OWN_FLOW = ("TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID", "HARVEY_BRAIN_ANTHROPIC_KEY")
+# the brain's Claude API key by Settings → Model's (/api/brain/key), and
+# nPathi Chat's by Settings → Channels (/api/channels/connect), which checks
+# it with the account call first.
+ENV_OWN_FLOW = ("TRULYINBOX_API_KEY", "TRULYINBOX_WORKSPACE_ID", "HARVEY_BRAIN_ANTHROPIC_KEY",
+                "NPATHI_API_KEY")
 
 
 def _present_env_keys() -> set[str]:
@@ -686,6 +689,118 @@ async def trulyinbox_connect(request: Request):
     await state.init_db()
     await ti.set_choice(state, "connected")
     return {"success": True, "message": d.check_warmup_service(health, warmup).detail}
+
+
+# ── Settings → Channels: nPathi Chat (SMS, WhatsApp), receiving only ──
+
+
+async def _npathi_module_on(state):
+    from harvey.integrations import npathi
+    from harvey.modules import switches
+
+    if not await switches.is_enabled(state, npathi.MODULE):
+        return JSONResponse(_error_body(switches.ModuleOff(npathi.MODULE, "Channels"),
+                                        "message", success=False), status_code=409)
+    return None
+
+
+@app.get("/api/channels")
+async def channels_status():
+    """The Channels card: the module, the address, whether a key is saved
+    (never the key), the last account check and each channel's state."""
+    from harvey import channels
+
+    state = _state()
+    await state.init_db()
+    return await channels.status(state)
+
+
+@app.post("/api/channels/connect")
+async def channels_connect(request: Request):
+    """Check the address and the key (a new one, or the saved one) with
+    nPathi's account call, then keep them: the key in .env, never returned."""
+    from harvey import channels
+    from harvey.integrations import npathi
+
+    state = _state()
+    await state.init_db()
+    refused = await _npathi_module_on(state)
+    if refused is not None:
+        return refused
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    data = data if isinstance(data, dict) else {}
+    url, key = data.get("base_url"), data.get("key")
+    if not isinstance(url, str) or (key is not None and not isinstance(key, str)):
+        return JSONResponse({"success": False, "message": npathi.NO_URL}, status_code=400)
+    url = npathi.normalize_base_url(url)
+    problem = npathi.base_url_problem(url)
+    if problem:
+        return JSONResponse({"success": False, "message": problem}, status_code=400)
+    key = (key or "").strip() or npathi.key_from_env()
+    if not key:
+        return JSONResponse({"success": False, "message": npathi.NO_KEY}, status_code=400)
+    try:
+        await channels.check(state, npathi.Npathi(url, key))
+    except npathi.NpathiError as e:
+        return JSONResponse({"success": False, "message": str(e), "kind": e.kind},
+                            status_code=400)
+    if key != npathi.key_from_env():
+        async with _env_lock:
+            try:
+                _write_env_file({npathi.KEY_ENV: key})
+            except Exception as e:
+                logger.warning("Failed to write .env: %s", type(e).__name__)
+                return {"success": False, "message": "Could not write .env file."}
+    await channels.set_base_url(state, url)
+    return {"success": True, "status": await channels.status(state)}
+
+
+@app.post("/api/channels/test")
+async def channels_test():
+    """Check the saved address and key again (the account and the channels)."""
+    from harvey import channels
+    from harvey.integrations import npathi
+
+    state = _state()
+    await state.init_db()
+    refused = await _npathi_module_on(state)
+    if refused is not None:
+        return refused
+    client = await npathi.client(state)
+    if client is None:
+        return JSONResponse({"success": False, "message": npathi.NO_KEY
+                             if not npathi.key_from_env() else npathi.NO_URL}, status_code=400)
+    try:
+        await channels.check(state, client)
+    except npathi.NpathiError as e:
+        return JSONResponse({"success": False, "message": str(e), "kind": e.kind,
+                             "status": await channels.status(state)}, status_code=400)
+    return {"success": True, "status": await channels.status(state)}
+
+
+@app.post("/api/channels/{channel}")
+async def channels_receive(channel: str, request: Request):
+    """Turn reading one channel's inbound messages on or off."""
+    from harvey import channels
+
+    state = _state()
+    await state.init_db()
+    refused = await _npathi_module_on(state)
+    if refused is not None:
+        return refused
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    on = data.get("receive") if isinstance(data, dict) else None
+    if channel not in channels.CHANNELS or not isinstance(on, bool):
+        return JSONResponse({"success": False, "message": "Say which channel, and receive "
+                             "true or false."}, status_code=400)
+    await channels.set_receiving(state, channel, on)
+    return {"success": True, "status": await channels.status(state)}
 
 
 @app.post("/api/trulyinbox/other")
@@ -4553,11 +4668,19 @@ async def get_conversations():
         "SELECT id, conversation_id, subject, body, send_at FROM outbox "
         f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
         "ORDER BY created_at", tuple(cids)) if cids else [])}
+    # The number (or handle) an SMS or WhatsApp conversation came from,
+    # masked as phones are everywhere else outside Contacts.
+    from harvey.agent.readonly import mask
+
+    handles = await _state().conversation_handles(cids)
     for row in rows:
         try:
             row["thread"] = json.loads(row.get("thread_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["thread"] = []
+        handle = handles.get(row["id"])
+        row["handle"] = ({"channel": handle["channel"], "value": mask(handle["value"])}
+                         if handle else None)
         # A prospect in two campaigns: show the sequence this reply answers.
         camp = row.get("campaign_id") or ""
         row["emails"] = [{k: v for k, v in e.items() if k != "campaign_id"}
@@ -6019,6 +6142,21 @@ async def get_today():
                            "it (harvey sending accept-gap)."),
                 "reason": gap.get("reason") or "",
                 "action": "Open the log", "tab": "controls",
+            })
+
+        # A messaging channel whose read didn't reach back to the last one:
+        # its sends wait (none go out on it yet), and a STOP may be unread.
+        from harvey import channels as messaging
+
+        for channel, gap in (await messaging.gaps(state)).items():
+            items.append({
+                "key": "message-read-gap", "tone": "bad", "channel": channel,
+                "title": f"{channel.upper()} messages weren't all read",
+                "detail": ("The last read of this channel didn't reach back to the one before "
+                           "it, so a message in between (a STOP too) may be unread. Harvey "
+                           "reads the missing part in the next cycles."),
+                "reason": gap.get("reason") or "",
+                "action": "Open settings", "tab": "settings",
             })
 
         # Cold email waits for the operator's acknowledgement.

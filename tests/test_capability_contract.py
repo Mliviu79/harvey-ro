@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Actions act on what core already holds (a selection to export, the outbox
 # to send): they read Harvey's database by design, and get capabilities of
 # their own when actions run as jobs. Every other module is held to the rules.
-ACTIONS = {"export", "email_outreach"}
+ACTIONS = {"export", "email_outreach", "npathi"}
 
 
 @pytest.fixture(scope="module")

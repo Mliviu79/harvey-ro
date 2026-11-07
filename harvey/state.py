@@ -1090,15 +1090,32 @@ class StateManager:
         return await self._in_tx(lambda con: suppression.add(
             con, scope, value, reason, by=by, campaign=campaign, ref=ref, note=note))
 
+    async def suppress_phones(self, phones, reason, *, by: str, note: str = "") -> int:
+        """Numbers onto the do-not-contact list in one write (nPathi's
+        opt-out list); how many entries were new."""
+        from harvey import suppression
+
+        def run(con):
+            made = 0
+            for phone in dict.fromkeys(phones):
+                try:
+                    made += suppression.add(con, "phone", phone, reason, by=by,
+                                            note=note) is not None
+                except suppression.Refused:
+                    continue
+            return made
+
+        return await self._in_tx(run)
+
     async def undo_suppression(self, entry_id: int, *, by: str, note: str = "") -> bool:
         from harvey import suppression
 
         return await self._in_tx(lambda con: suppression.undo(con, entry_id, by=by, note=note))
 
-    async def suppression_check(self, email: str, firm=None, config=None):
-        """suppression.check for one address: the entry (or the line of
-        compliance.do_not_contact, read live from ``config``) that bars it,
-        or None."""
+    async def suppression_check(self, email: str, firm=None, config=None, *, phone: str = ""):
+        """suppression.check for one address (or number: ``phone``): the
+        entry (or the line of compliance.do_not_contact, read live from
+        ``config``) that bars it, or None."""
         from harvey import suppression
 
         listed = ()
@@ -1107,8 +1124,8 @@ class StateManager:
 
             listed = live_do_not_contact(config)
         firms = [firm] if firm not in (None, "") else None
-        return await self._in_tx(lambda con: suppression.check(con, email, firms, listed),
-                                 write=False)
+        return await self._in_tx(
+            lambda con: suppression.check(con, email, firms, listed, phone=phone), write=False)
 
     async def suppressed_emails(self, emails) -> set[str]:
         """Of these addresses, the ones an entry in force bars (address,
@@ -1792,7 +1809,9 @@ class StateManager:
                 row = await cursor.fetchone()
             if row is None:
                 return 0
-            who = " ".join(x for x in (row["first_name"], row["last_name"]) if x) or row["email"]
+            # (A card made for a firm that wrote in by SMS has neither.)
+            who = (" ".join(x for x in (row["first_name"], row["last_name"]) if x)
+                   or row["email"] or "someone who wrote in")
             await db.execute(
                 "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (COMPANY_STOP_KEY + prospect_id, who, _utcnow().isoformat()),
@@ -1831,28 +1850,31 @@ class StateManager:
         return row[0] if row else None
 
     async def count_outbox_sent(self) -> int:
+        """Emails sent, ever: the bounce rate's denominator (email only, so
+        messages on another channel never dilute it)."""
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import queries
+
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'sent'"
-            ) as cursor:
+            async with db.execute(queries.sql("overlay.outbox.email_sent")) as cursor:
                 return (await cursor.fetchone())[0]
 
     async def count_outbox_sent_today(self, kind: str | None = None,
                                       since: str | None = None) -> int:
         """Emails sent today (the UTC day, or since `since`, a naive UTC
-        ISO time); only one kind ("sequence", "reply") if given."""
+        ISO time); only one kind ("sequence", "reply") if given. Email
+        only: the daily caps are the mailbox's."""
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import queries
+
         if since:
-            sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND sent_at >= ?"
-            params: tuple = (since,)
+            name, params = "overlay.outbox.email_sent_since", (since,)
         else:
-            sql = ("SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
-                   "AND date(sent_at) = date('now')")
-            params = ()
+            name, params = "overlay.outbox.email_sent_today", ()
         if kind:
-            sql += " AND kind = ?"
-            params += (kind,)
+            name, params = name + "_kind", params + (kind,)
         async with self._connect() as db:
-            async with db.execute(sql, params) as cursor:
+            async with db.execute(queries.sql(name), params) as cursor:
                 return (await cursor.fetchone())[0]
 
     async def get_step_delay_days(self, campaign_id: str, step: int) -> int | None:
@@ -2601,6 +2623,56 @@ class StateManager:
                                     "created_at": r["created_at"]})
         out.sort(key=lambda n: str(n.get("created_at") or ""), reverse=True)  # newest first
         return out
+
+    # ── Messages people send in: SMS, WhatsApp (harvey/agents/messages.py) ──
+
+    async def _named(self, name: str, params: tuple = (), *, write: bool = False):
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import queries
+
+        async with self._connect() as db:
+            async with db.execute(queries.sql(name), params) as cursor:
+                rows = await cursor.fetchall()
+            if write:
+                await db.commit()
+        return rows
+
+    async def phone_firms(self, phone: str) -> tuple[int | None, list[int]]:
+        """(the phone contact's id, the live firms it is linked to), for a
+        number in E.164; (None, []) when it isn't a contact."""
+        from harvey.overlay.schema import PHONE
+
+        rows = await self._named("overlay.messages.phone_firms", (PHONE, phone))
+        contact = rows[0][0] if rows else None
+        return contact, sorted({r[1] for r in rows})
+
+    async def firm_prospect(self, firm: int, phone: str = "") -> Prospect | None:
+        """A firm's prospect card for a message from it: the one with this
+        number first, else the one Harvey last wrote to; None when it has none."""
+        rows = await self._named("overlay.messages.firm_prospects", (int(firm), phone or ""))
+        return await self.get_prospect(rows[0][0]) if rows else None
+
+    async def handle_conversation(self, channel: str, value: str) -> Conversation | None:
+        """The conversation a number's (or handle's) messages on a channel go
+        to: its newest one that isn't closed, or None."""
+        rows = await self._named("overlay.messages.handle_conversation", (channel, value))
+        return await self.get_conversation(rows[0][0]) if rows else None
+
+    async def put_handle(self, conversation: str, channel: str, value: str, *,
+                         contact: int | None = None, firm: int | None = None,
+                         at: float | None = None, ref: str = "") -> None:
+        await self._named("overlay.messages.handle_put",
+                          (conversation, channel, value, contact, firm,
+                           int(at if at is not None else time.time()), ref), write=True)
+
+    async def conversation_handles(self, conversation_ids) -> dict[str, dict]:
+        """{conversation: {channel, value}} for those with a number or handle
+        (the newest-added one when a conversation has several)."""
+        ids = [c for c in dict.fromkeys(conversation_ids) if c]
+        if not ids:
+            return {}
+        rows = await self._named("overlay.messages.handles", (json.dumps(ids),))
+        return {conv: {"channel": channel, "value": value} for conv, channel, value in rows}
 
     # ── Reply Deduplication ──
 

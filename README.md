@@ -1265,6 +1265,54 @@ enrolls, pauses or changes anything in your TrulyInbox account.
 Already warming with another service? `harvey trulyinbox other` (or *I use
 another service* on the dashboard) and Harvey stops suggesting it.
 
+### SMS and WhatsApp replies through nPathi Chat
+
+People sometimes answer by text instead of email, or write to your number
+first. Harvey can read those messages from nPathi Chat
+(the SMS routes that receive replies: an Android SIM, a phone bridge or a GSM
+modem; the official WhatsApp Business API; a paired WhatsApp number) into the
+same Conversations tab, and it honours a STOP there the way it honours an
+email opt-out.
+
+**Replies only, on purpose.** Harvey never writes first by SMS or WhatsApp,
+and there is no switch for it. Romanian law (Law 506/2004 art. 12, which
+covers companies as well as people) wants prior consent before a commercial
+SMS or messaging-app message, and WhatsApp's own rules forbid cold messages.
+Answering someone who wrote to you is the lawful case, and that is what this
+is for. This version reads; answering from Harvey comes next, so for now a
+message that wants an answer is handed to you.
+
+1. **Turn the module on**: Surse → nPathi Chat, or `harvey modules enable npathi`
+   (it needs the Email module: the same cycle reads both).
+2. **Connect it**: Settings → Channels (or `harvey channels connect`). Enter
+   your install's address (`https://...`; Harvey refuses plain http and private
+   addresses) and a workspace API key with `account.view`, `sms.read` /
+   `waba.read` / `wa.read` for the channels you use, and `unsubscribed.view` and
+   `unsubscribed.manage`. Harvey checks the key with nPathi's account call
+   before it saves it to `.env`, and never shows it again.
+3. **Choose the channels** it reads (SMS and WhatsApp Business are on, a paired
+   WhatsApp number off) on the card or with `harvey channels enable|disable
+   sms|waba|wa`. The card lists each channel's senders and whether a reply can
+   come back to each (an alphanumeric sender ID can't).
+
+Each cycle Harvey reads what came in since its last complete read, newest
+first. Then, per message:
+
+- **STOP first.** STOP, "dezabonare", "nu mă mai contactați" and the other
+  opt-out phrases put the number on the do-not-contact list and on nPathi's own
+  list. When the number belongs to exactly one firm, its person is opted out
+  too, their queued email is cancelled and their company's cold email stops.
+  An opt-out needs no model, so it is recorded even while Claude is
+  unavailable. nPathi's own opt-out list is read into Harvey's once a day.
+- **A number Harvey knows** (one firm's contact) joins that person's
+  conversation: their queued email is cancelled (an SMS reply stops the email
+  sequence) and their company's cold email stops.
+- **A number several firms share, or one Harvey doesn't know**, goes to you as
+  a conversation of its own, and stops no firm.
+
+A read that couldn't reach back to the last one shows on Today until Harvey has
+read the missing part. Reading costs nothing; nPathi bills sends, in credits.
+
 ---
 
 ## Troubleshooting

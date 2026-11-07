@@ -80,7 +80,8 @@ READABLE = {
     "module": "id name",
     "obs": "id firm signal key num confidence module capability run evidence_url at",
     "outbox": "id campaign_id prospect_id conversation_id step kind to_email:personal status send_at "
-              "sent_at provider created_at updated_at approved_by source_note account_id",
+              "sent_at provider created_at updated_at approved_by source_note account_id "
+              "channel to_phone:personal price_credits",
     "person": "id firm name:personal name_norm:personal role source first_seen last_seen",
     "prospects": "id company_id first_name:personal last_name:personal email:personal email_verified "
                  "phone:personal phone_verified linkedin_url:personal title seniority department source source_url:personal status score "

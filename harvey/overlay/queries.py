@@ -1143,13 +1143,16 @@ statement("overlay.agent.campaign_conversations",
           "WHERE o.prospect_id = c.prospect_id AND o.conversation_id = c.id AND o.kind = 'reply' "
           "AND o.status IN ('pending_review', 'approved')), "
           "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].sender') "
+          "END, "
+          "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].channel') "
           "END "
           "FROM conversations c INDEXED BY idx_conversations_campaign_id WHERE c.campaign_id = ? "
           "ORDER BY c.updated_at DESC LIMIT ?", params=("c", 50), bounded=True)
 # One conversation's structured fields: its campaign, intent, stage,
 # status, how many messages its thread holds (never the thread), whether
 # an answer to it waits, who wrote its newest message (prospect or harvey,
-# never what).
+# never what), and the channel that message came on when it wasn't email
+# (sms, waba, wa: an answer there isn't Harvey's yet).
 statement("overlay.agent.conversation",
           "SELECT c.id, c.prospect_id, c.campaign_id, c.intent, c.stage, c.status, "
           "json_array_length(CASE WHEN json_valid(c.thread_json) THEN c.thread_json "
@@ -1158,6 +1161,8 @@ statement("overlay.agent.conversation",
           "WHERE o.prospect_id = c.prospect_id AND o.conversation_id = c.id AND o.kind = 'reply' "
           "AND o.status IN ('pending_review', 'approved')), "
           "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].sender') "
+          "END, "
+          "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].channel') "
           "END "
           "FROM conversations c WHERE c.id = ?", params=("c",))
 # The thread an answer goes into: the newest email sent in it (an answer,
@@ -1492,3 +1497,58 @@ statement("overlay.campaigns.prune_changes",
 statement("overlay.campaigns.fill_risky",
           "UPDATE campaigns SET send_to_risky = ? WHERE send_to_risky IS NULL", params=(0,),
           scans={"campaigns": "the campaigns, a handful"})
+
+# ── The outbox by channel (schema 40) ──
+# Email's own counts: the daily caps and the bounce rate's denominator count
+# email only, so a message on another channel never uses the mailbox's cap
+# or dilutes its bounce rate.
+statement("overlay.outbox.email_sent",
+          "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email'")
+statement("overlay.outbox.email_sent_today",
+          "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
+          "AND date(sent_at) = date('now')")
+statement("overlay.outbox.email_sent_today_kind",
+          "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
+          "AND date(sent_at) = date('now') AND kind = ?", params=("sequence",))
+statement("overlay.outbox.email_sent_since",
+          "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
+          "AND sent_at >= ?", params=("2026-01-01",))
+statement("overlay.outbox.email_sent_since_kind",
+          "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
+          "AND sent_at >= ? AND kind = ?", params=("2026-01-01", "sequence"))
+
+# ── Messages people send in (harvey/agents/messages.py, schema 40) ──
+# The live firms a phone contact is linked to (a shared number: several).
+statement("overlay.messages.phone_firms",
+          "SELECT DISTINCT c.id, CASE f.live WHEN 0 THEN f.id ELSE f.live END "
+          "FROM contact c CROSS JOIN link l INDEXED BY link_contact CROSS JOIN firm f "
+          "WHERE c.kind = ? AND c.value = ? AND l.contact = c.id AND f.id = l.firm",
+          params=(2, "+40722000102"), drives="c")
+# A firm's prospect cards (the one firm a number links to): the one whose
+# number it is first, then the one Harvey wrote to last.
+statement("overlay.messages.firm_prospects",
+          "SELECT p.id FROM prospects p INDEXED BY idx_prospects_company_id "
+          "WHERE p.company_id = ? ORDER BY p.phone = ? DESC, "
+          "(SELECT MAX(o.sent_at) FROM outbox o INDEXED BY idx_outbox_prospect "
+          "WHERE o.prospect_id = p.id AND o.status = 'sent') DESC, p.created_at DESC LIMIT 1",
+          params=("1", "+40722000102"), bounded=True)
+# The conversation a number's messages go to: the newest one not closed.
+statement("overlay.messages.handle_conversation",
+          "SELECT h.conversation FROM conversation_handle h INDEXED BY conversation_handle_value "
+          "CROSS JOIN conversations c ON c.id = h.conversation "
+          "WHERE h.channel = ? AND h.value = ? AND c.status != 'closed' "
+          "ORDER BY c.updated_at DESC LIMIT 1", params=("sms", "+40722000102"), drives="h",
+          bounded=True)
+statement("overlay.messages.handle_put",
+          "INSERT INTO conversation_handle (conversation, channel, value, contact, firm, "
+          "last_inbound_at, provider_ref) VALUES (?, ?, ?, ?, ?, ?, ?) "
+          "ON CONFLICT (conversation, channel, value) DO UPDATE SET "
+          "contact = COALESCE(excluded.contact, contact), firm = COALESCE(excluded.firm, firm), "
+          "last_inbound_at = MAX(COALESCE(last_inbound_at, 0), excluded.last_inbound_at), "
+          "provider_ref = excluded.provider_ref",
+          params=("c", "sms", "+40722000102", 1, 1, 1, "npathi:1"))
+# The handles of the conversations a page shows.
+statement("overlay.messages.handles",
+          "SELECT h.conversation, h.channel, h.value FROM json_each(?) j "
+          "CROSS JOIN conversation_handle h WHERE h.conversation = j.value",
+          params=('["c"]',), drives="j")

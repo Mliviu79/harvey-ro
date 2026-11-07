@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 39).
+"""The overlay's tables (harvey.db schema 40).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 39
+LATEST = 40
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -52,7 +52,7 @@ MOBILE = LINE_TYPE["mobile"]
 CORE_KINDS = ((EMAIL, "email", "Email", "email"), (PHONE, "phone", "Phone", "phone"))
 
 # Do-not-contact entries (suppression.scope, .reason).
-SUPPRESSION_SCOPE = {"address": 1, "domain": 2, "firm": 3}
+SUPPRESSION_SCOPE = {"address": 1, "domain": 2, "firm": 3, "phone": 4}
 SUPPRESSION_REASON = {"unsubscribe": 1, "opt_out": 2, "objection": 3, "by_hand": 4,
                       "bounce": 5, "complaint": 6, "migrated": 7}
 
@@ -1193,11 +1193,77 @@ def _to_39(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_39)
 
 
+# ── Schema 40: messages people send in (SMS, WhatsApp), and phones on the list ──
+
+SCHEMA_40 = """
+-- The channel an outbox row goes out on (email, or a messaging channel:
+-- sms, waba, wa), the number it goes to (E.164) and what nPathi Chat
+-- charged for it in credits. Every row on file is email; nothing stages
+-- another channel yet (answering on them comes later).
+ALTER TABLE outbox ADD COLUMN channel TEXT NOT NULL DEFAULT 'email';
+ALTER TABLE outbox ADD COLUMN to_phone TEXT NOT NULL DEFAULT '';
+ALTER TABLE outbox ADD COLUMN price_credits REAL;
+CREATE INDEX idx_outbox_to_phone ON outbox(to_phone, channel, status, sent_at)
+  WHERE to_phone != '';
+-- The numbers and handles a conversation's messages came from, per
+-- channel (harvey/agents/messages.py): the next message from the same one
+-- joins the same conversation. contact and firm: the contact the number
+-- is and the one firm it links to, when it links to exactly one;
+-- provider_ref: the provider's id of the newest message.
+CREATE TABLE conversation_handle (
+  conversation TEXT NOT NULL, channel TEXT NOT NULL, value TEXT NOT NULL,
+  contact INTEGER, firm INTEGER, last_inbound_at INTEGER,
+  provider_ref TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (conversation, channel, value)
+) WITHOUT ROWID;
+CREATE INDEX conversation_handle_value ON conversation_handle(channel, value);
+"""
+
+# contact.do_not_contact mirrors the live phone entries (E.164) as it does
+# the address ones (SUPPRESSION_GUARDS).
+PHONE_SUPPRESSION_GUARDS = f"""
+CREATE TRIGGER follow_suppression_phone_ins AFTER INSERT ON suppression
+WHEN NEW.scope = 4 AND NEW.undone_at IS NULL BEGIN
+  UPDATE contact SET do_not_contact = 1
+  WHERE kind = {PHONE} AND value = NEW.value AND do_not_contact = 0;
+END;
+CREATE TRIGGER follow_suppression_phone_undo AFTER UPDATE OF undone_at ON suppression
+WHEN NEW.scope = 4 AND OLD.undone_at IS NULL AND NEW.undone_at IS NOT NULL BEGIN
+  UPDATE contact SET do_not_contact = 0
+  WHERE kind = {PHONE} AND value = NEW.value AND do_not_contact != 0
+    AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 4 AND s.value = NEW.value
+                    AND s.undone_at IS NULL);
+END;
+CREATE TRIGGER follow_suppression_phone_contact AFTER INSERT ON contact
+WHEN NEW.kind = {PHONE} AND NEW.do_not_contact = 0
+     AND EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 4 AND s.value = NEW.value
+                 AND s.undone_at IS NULL) BEGIN
+  UPDATE contact SET do_not_contact = 1 WHERE id = NEW.id;
+END;
+CREATE TRIGGER guard_suppressed_phone BEFORE UPDATE OF do_not_contact ON contact
+WHEN NEW.do_not_contact = 0 AND OLD.do_not_contact != 0 AND NEW.kind = {PHONE}
+     AND EXISTS (SELECT 1 FROM suppression s WHERE s.scope = 4 AND s.value = NEW.value
+                 AND s.undone_at IS NULL) BEGIN
+  SELECT RAISE(ABORT, 'this number is on the do-not-contact list: undo its entry instead');
+END;
+"""
+PHONE_SUPPRESSION_GUARD_NAMES = ("follow_suppression_phone_ins", "follow_suppression_phone_undo",
+                                 "follow_suppression_phone_contact", "guard_suppressed_phone")
+
+
+def _to_40(con: sqlite3.Connection) -> None:
+    """Schema 40: the outbox's channel, number and price, conversation_handle,
+    and the phone entries' guards. Every outbox row on file stays email;
+    no phone entry exists yet, so nothing is flagged."""
+    _script(con, SCHEMA_40)
+    _script(con, PHONE_SUPPRESSION_GUARDS)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
-         (37, _to_37), (38, _to_38), (39, _to_39))
+         (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:
@@ -1311,6 +1377,8 @@ def guard_names(con: sqlite3.Connection) -> tuple[str, ...]:
     out = GUARD_NAMES
     if _has_table(con, "suppression"):
         out += SUPPRESSION_GUARD_NAMES
+    if _has_table(con, "conversation_handle"):
+        out += PHONE_SUPPRESSION_GUARD_NAMES
     if _has_table(con, "contact_change"):
         out += CHANGE_NAMES
     return out
@@ -1324,6 +1392,8 @@ def install_guards(con: sqlite3.Connection) -> None:
     script = LOCAL_FTS_SYNC + GUARDS
     if _has_table(con, "suppression"):
         script += SUPPRESSION_GUARDS
+    if _has_table(con, "conversation_handle"):
+        script += PHONE_SUPPRESSION_GUARDS
     if _has_table(con, "contact_change"):
         script += CHANGES
     buf = ""

@@ -67,7 +67,7 @@ def _no_checkout_env_file(monkeypatch, tmp_path_factory):
 # Keys a classifier, a search or a verifier could be reached with: never
 # taken from the developer's environment into a test.
 _LIVE_KEYS = ("DEEPINFRA_API_KEY", "TYPESAFE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-              "GROQ_API_KEY", "HARVEY_BRAIN_ANTHROPIC_KEY")
+              "GROQ_API_KEY", "HARVEY_BRAIN_ANTHROPIC_KEY", "NPATHI_API_KEY")
 
 
 @pytest.fixture(autouse=True)

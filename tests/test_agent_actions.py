@@ -593,7 +593,7 @@ def test_a_set_saved_before_ids_were_kept_is_frozen_by_its_first_use(db, tmp_pat
     schema.create(old, version=38)
     old.execute("INSERT INTO agent_set (chat, name, kind, of, definition, n, created_at) "
                 "VALUES ('c', 'n', 'filter', 'firms', 'county=BV', 2, 1)")
-    assert schema.step_up(old) == schema.LATEST == 39 and schema.missing(old) == []
+    assert schema.step_up(old) == schema.LATEST == 40 and schema.missing(old) == []
     assert old.execute("SELECT n, frozen_at, refreshed_at FROM agent_set").fetchall() == [
         (2, None, None)]
     old.close()

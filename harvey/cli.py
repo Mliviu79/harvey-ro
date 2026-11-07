@@ -3656,6 +3656,115 @@ def cmd_trulyinbox(args):
     raise SystemExit(asyncio.run(_run()))
 
 
+def cmd_channels(args):
+    """nPathi Chat's SMS and WhatsApp channels (receiving only): the status,
+    a check of the key, connecting it, and each channel's switch."""
+    import getpass
+
+    from dotenv import load_dotenv
+
+    from harvey import channels
+    from harvey.integrations import npathi
+    from harvey.modules import switches
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+
+    def when(ts) -> str:
+        if not ts:
+            return "never"
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    def show(st: dict) -> None:
+        print("\n  nPathi Chat (SMS, WhatsApp): replies only; Harvey never writes first.")
+        print(f"  Module:     {'on' if st['module_on'] else 'off (harvey modules enable npathi)'}")
+        print(f"  Address:    {st['base_url'] or 'not set'}"
+              + (f" ({st['base_url_problem']})" if st["base_url_problem"] else ""))
+        print(f"  Key:        {'saved' if st['key_set'] else 'not saved'}")
+        acct = st.get("account") or {}
+        if acct.get("ok"):
+            credits = acct.get("credits")
+            print(f"  Account:    {acct.get('workspace') or '?'}, plan {acct.get('plan') or '?'}"
+                  + (f", {credits:g} credits" if isinstance(credits, (int, float)) else "")
+                  + f" (checked {when(acct.get('checked_at'))})")
+        elif acct.get("error"):
+            print(f"  Account:    not connected: {acct['error']}")
+        for ch in st["channels"]:
+            can = {True: "", False: ", the key can't read it", None: ""}[ch["can_read"]]
+            receives = [x for x in ch["senders"] if x.get("receives")]
+            line = (f"  {ch['label']:<18} {'on' if ch['receive'] else 'off'}{can}; "
+                    f"last read {when(ch['last_read_at'])}; "
+                    f"{len(ch['senders'])} sender(s), {len(receives)} that can receive")
+            print(line)
+            if ch["gap"]:
+                print(f"      gap: {ch['gap'].get('reason')}")
+            if ch["problem"]:
+                print(f"      last read failed: {ch['problem']}")
+        print()
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        action = args.channels_action
+        if action == "status":
+            show(await channels.status(state))
+            return 0
+        if not await switches.is_enabled(state, npathi.MODULE):
+            print(f"\n  {switches.ModuleOff(npathi.MODULE, 'Channels')}\n")
+            return 2
+        if action in ("enable", "disable"):
+            if args.channel not in channels.CHANNELS:
+                print(f"\n  Name a channel: {', '.join(channels.CHANNELS)}.\n")
+                return 1
+            await channels.set_receiving(state, args.channel, action == "enable")
+            print(f"\n  {npathi.LABELS[args.channel]}: receiving "
+                  f"{'on' if action == 'enable' else 'off'}.\n")
+            return 0
+        if action == "connect":
+            url = input("  Your nPathi Chat address (https://...): ").strip()
+            problem = npathi.base_url_problem(npathi.normalize_base_url(url))
+            if problem:
+                print(f"\n  {problem}\n")
+                return 1
+            key = getpass.getpass("  Workspace API key (hidden; Enter keeps the saved one): ")
+            key = key.strip() or npathi.key_from_env()
+            if not key:
+                print(f"\n  {npathi.NO_KEY}\n")
+                return 1
+            try:
+                await channels.check(state, npathi.Npathi(url, key))
+            except npathi.NpathiError as e:
+                print(f"\n  {e}\n")
+                return 1
+            if key != npathi.key_from_env():
+                from harvey.dashboard import _write_env_file
+                try:
+                    _write_env_file({npathi.KEY_ENV: key})
+                except OSError as e:
+                    print(f"\n  The key works, but Harvey couldn't save it to .env: "
+                          f"{type(e).__name__}\n")
+                    return 1
+            await channels.set_base_url(state, url)
+            show(await channels.status(state))
+            return 0
+        client = await npathi.client(state)
+        if client is None:
+            print(f"\n  {npathi.NO_KEY if not npathi.key_from_env() else npathi.NO_URL}\n")
+            return 1
+        try:
+            await channels.check(state, client)
+        except npathi.NpathiError as e:
+            print(f"\n  {e}\n")
+            return 1
+        show(await channels.status(state))
+        return 0
+
+    raise SystemExit(asyncio.run(_run()))
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -4606,6 +4715,15 @@ def main():
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status", "accept-gap"])
     sub.set_defaults(func=cmd_sending)
+
+    sub = subparsers.add_parser(
+        "channels", help="SMS and WhatsApp through nPathi Chat (replies only): status, test "
+                         "the key, connect, or turn a channel's receiving on or off")
+    sub.add_argument("channels_action", nargs="?", default="status",
+                     choices=["status", "test", "connect", "enable", "disable"])
+    sub.add_argument("channel", nargs="?", default="",
+                     help="enable/disable: sms, waba (WhatsApp Business) or wa (WhatsApp)")
+    sub.set_defaults(func=cmd_channels)
 
     sub = subparsers.add_parser(
         "warmup", help="Check if your sending domain is set up and warmed up for cold email")

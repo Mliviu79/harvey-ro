@@ -1,0 +1,61 @@
+# nPathi Chat: SMS and WhatsApp messages people send in, read into
+# Harvey's conversations (harvey/integrations/npathi.py, the Handler's
+# cycle: harvey/agents/messages.py). Replies only: Harvey never writes
+# first on these channels. Romanian law (Law 506/2004 art. 12) wants
+# consent before a commercial SMS or app message, for a company too, and
+# WhatsApp's own rules forbid cold messages. This module reads what
+# arrives; answering is a later change.
+id = "npathi"
+name = "nPathi Chat (SMS, WhatsApp)"
+description = "Reads the SMS and WhatsApp messages people send to your nPathi Chat numbers into Harvey's conversations."
+set = "original"
+kind = "action"
+version = "0.1.0"
+api = 1
+markets = []
+# The Handler's cycle reads the messages (harvey run), and a number is
+# matched to its firm through the contacts the phones module keeps.
+requires = ["phones", "email_outreach"]
+default_enabled = false
+entry = "harvey.integrations.npathi"
+secrets = ["NPATHI_API_KEY"]
+terms_note = "nPathi Chat bills messages in credits on your own plan. Harvey only reads: the account, the channels, inbound messages and the opt-out list, and adds the people who ask Harvey to stop to that list."
+
+[cost]
+as_of = 2026-11-06
+usd = 0.0
+note = "reading costs nothing; nPathi Chat bills sends in credits on your plan"
+
+# The install's own address (https://...): nPathi Chat runs per customer,
+# so there is no default.
+[settings.base_url]
+type = "str"
+max_length = 200
+
+# Which channels' inbound messages are read. SMS covers the Android SIM,
+# phone bridge and GSM modem routes; waba is the official WhatsApp
+# Business API; wa a WhatsApp number paired to the account (unofficial).
+[settings.receive_sms]
+type = "bool"
+default = true
+
+[settings.receive_waba]
+type = "bool"
+default = true
+
+[settings.receive_wa]
+type = "bool"
+default = false
+
+# One request at a time, at most two a second; the X-RateLimit-* headers
+# and Retry-After hold the lane further when nPathi asks.
+[[lanes]]
+id = "npathi"
+min_interval_seconds = 0.5
+
+[[capabilities]]
+id = "read_messages"
+op = "sync"
+inputs = []
+outputs = { records = "conversations" }
+cost = { usd = 0.0, per = "read" }

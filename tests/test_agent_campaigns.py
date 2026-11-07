@@ -394,6 +394,44 @@ class _GuidedBrain(StubBrain):
         return True
 
 
+def test_draft_reply_refuses_a_message_that_came_by_sms(db, monkeypatch):
+    """Harvey doesn't answer on SMS or WhatsApp yet, and an email answer to
+    a text isn't what they asked for: the user answers it."""
+    import harvey.agents.sender as sender_mod
+    from harvey.models.conversation import Message
+
+    monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
+    plan_id = _plan(db)
+    _, cid = _draft(db, plan_id)
+    _start(db, cid)
+    state = StateManager(str(db))
+    _run(_sent_first_email(state, cid, "office@alfa.example.com"))
+    _reply(state, "office@alfa.example.com", "Cât costă?")
+    [convo] = _q(db, "SELECT id FROM conversations")
+    _run(state.update_outbox_item(_q(db, "SELECT id FROM outbox WHERE kind = 'reply'")[0][0],
+                                  status="rejected"))
+    stored = _run(state.get_conversation(convo[0]))
+    stored.thread.append(Message(sender="prospect", content="Sunați-mă", channel="sms"))
+    _run(state.update_conversation(convo[0], thread_json=stored.thread_json()))
+    from harvey.agents.handler import Handler
+    from tests.test_outbox_native import Cfg, Env
+
+    brain = _GuidedBrain()
+
+    def handler(state_, cfg):
+        h = Handler(brain=brain, state=state_, config=Cfg(), env=Env())
+        h.provider = FakeProvider()
+        return h
+    monkeypatch.setattr(outreach, "reply_handler", handler)
+    [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
+    assert c["answerable"] is False
+    error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
+                                          "guidance": "Propune un apel"})
+    assert error and "came by SMS" in why and not brain.prompts
+    assert _q(db, "SELECT COUNT(*) FROM outbox WHERE kind = 'reply' "
+                  "AND status = 'pending_review'") == [(0,)]
+
+
 def test_draft_reply_is_staged_for_review_with_the_guidance(db, monkeypatch):
     import harvey.agents.sender as sender_mod
     from harvey.agents.handler import Handler

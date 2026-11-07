@@ -199,7 +199,7 @@ async def reply(state, convo_id: str, *, asked_to_stop: bool = False) -> int | N
         return None
     if row is None or not row[2]:
         return None
-    cid, prospect_id, campaign_id, intent, stage, status, messages, waiting, _last = row
+    cid, prospect_id, campaign_id, intent, stage, status, messages, waiting, _last, _ch = row
     opted_out = False
     try:
         prospect = await state.get_prospect(prospect_id) if prospect_id else None
@@ -289,8 +289,8 @@ async def conversations(state, campaign_id: str, limit: int = CONVERSATIONS_LIMI
              "stage": _enum(st, STAGES), "status": _enum(s, CONVERSATION_STATUSES),
              "needs_human": s == "needs_human", "answer_waiting": bool(w),
              "answerable": i in ANSWERABLE and s in ("open", "needs_human") and not w
-             and last == "prospect"}
-            for cid, i, st, s, _at, w, last in await _all(
+             and last == "prospect" and not channel}
+            for cid, i, st, s, _at, w, last, channel in await _all(
                 state, "overlay.agent.campaign_conversations", (campaign_id, int(limit)))]
 
 
@@ -565,7 +565,7 @@ async def _conversation(state, plan: int, chat: str, convo_id) -> dict:
     if row is None:
         raise Refused(f"no conversation {convo_id!r}: replies() lists them")
     out = dict(zip(("id", "prospect_id", "campaign_id", "intent", "stage", "status",
-                    "messages", "waiting", "last"), row))
+                    "messages", "waiting", "last", "channel"), row))
     if not out["campaign_id"]:
         raise Refused(f"conversation {out['id']} belongs to no campaign")
     await _own(state, plan, chat, out["campaign_id"])
@@ -591,6 +591,14 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
     if c["last"] != "prospect":
         raise Refused(f"conversation {c['id']}'s newest reply has its answer already: "
                       "nothing new of theirs to answer")
+    if c["channel"]:
+        # (An SMS or WhatsApp message: Harvey doesn't answer on those
+        # channels yet, and an email answer to it isn't what they asked for.)
+        from harvey.integrations import npathi
+
+        raise Refused(f"conversation {c['id']}'s newest message came by "
+                      f"{npathi.LABELS.get(c['channel'], 'another channel')}: the user "
+                      "answers it, on the Conversations page")
     prospect = await state.get_prospect(c["prospect_id"])
     if prospect is None or prospect.status == "opted_out":
         raise Refused(f"conversation {c['id']}'s person asked not to be contacted")

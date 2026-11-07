@@ -6,6 +6,8 @@ contact deleted and found again, and a firm removed and pulled again:
 
 - an address (normalised: lowercase, an international domain in its ASCII
   form); a plus-tagged variant of it is covered too;
+- a phone number (E.164: "+40722000102"), for the messaging channels (an
+  SMS or WhatsApp message that asked to stop, nPathi Chat's opt-out list);
 - a domain, with its subdomains (a free-mail domain is refused: it would
   bar every address there);
 - a firm: "<legal scheme>:<key>" when its records hold a legal identifier
@@ -20,8 +22,8 @@ compliance.do_not_contact list is read next to the table, never copied into
 it, so removing a line from the YAML really removes it. Undoing an entry is
 soft (undone_at): what was asked, and by whom, is never lost.
 
-contact.do_not_contact mirrors the live address entries through triggers
-(overlay/schema.py SUPPRESSION_GUARDS), so the Contacts page's filter and
+contact.do_not_contact mirrors the live address and phone entries through
+triggers (overlay/schema.py SUPPRESSION_GUARDS, PHONE_SUPPRESSION_GUARDS), so the Contacts page's filter and
 counts agree with the list, and nothing can clear the flag while an entry
 stands.
 
@@ -35,9 +37,10 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from harvey.overlay.schema import EMAIL, SUPPRESSION_REASON, SUPPRESSION_SCOPE
+from harvey.overlay.schema import EMAIL, PHONE, SUPPRESSION_REASON, SUPPRESSION_SCOPE
 
-ADDRESS, DOMAIN, FIRM = (SUPPRESSION_SCOPE[k] for k in ("address", "domain", "firm"))
+ADDRESS, DOMAIN, FIRM, PHONE_SCOPE = (SUPPRESSION_SCOPE[k]
+                                      for k in ("address", "domain", "firm", "phone"))
 SCOPE_NAMES = {v: k for k, v in SUPPRESSION_SCOPE.items()}
 REASON_NAMES = {v: k for k, v in SUPPRESSION_REASON.items()}
 # Reasons that are the person's own request: undoing one asks the operator
@@ -57,14 +60,14 @@ BY_AGENT = "agent"
 
 
 class Refused(ValueError):
-    """An entry that can't be made (not an address or domain, a free-mail
-    domain, a firm not on file)."""
+    """An entry that can't be made (not an address, a number or a domain,
+    a free-mail domain, a firm not on file)."""
 
 
 @dataclass(frozen=True)
 class Hit:
     """Why an address must not be emailed: the entry it matched."""
-    scope: str          # address | domain | firm
+    scope: str          # address | phone | domain | firm
     value: str
     reason: str         # a SUPPRESSION_REASON name, or "config"
     id: int = 0         # the entry's id (0: the config list)
@@ -84,6 +87,20 @@ def normalize_address(raw) -> str:
 
     entry = do_not_contact_entry(raw)
     return entry if "@" in entry and EMAIL_RE.match(entry) else ""
+
+
+def normalize_phone(raw) -> str:
+    """A number as entries and contacts keep it (E.164), or "" when it
+    isn't one. Only a number written with its international prefix (+40,
+    0040) is read: without a country, "0722 000 102" names no one."""
+    from harvey.collectors.phones import parse_phone
+    from phonenumbers import PhoneNumberFormat, format_number
+
+    text = str(raw or "").strip()
+    if not text or "@" in text or len(text) > 32:
+        return ""
+    number = parse_phone(text, None)
+    return format_number(number, PhoneNumberFormat.E164) if number is not None else ""
 
 
 def normalize_domain(raw) -> str:
@@ -165,11 +182,12 @@ def firm_anchor(con: sqlite3.Connection, company_id) -> str:
     return keys[0] if keys else f"firm:{group[0]}"
 
 
-def firms_of_address(con: sqlite3.Connection, email: str) -> list[int]:
-    """Every record an email contact is linked to (any link, not one chosen)."""
+def firms_of_address(con: sqlite3.Connection, email: str, kind: int = EMAIL) -> list[int]:
+    """Every record an email contact (or a phone one, ``kind`` PHONE) is
+    linked to (any link, not one chosen)."""
     return [r[0] for r in con.execute(
         "SELECT l.firm FROM link l JOIN contact c ON c.id = l.contact "
-        "WHERE c.kind = ? AND c.value = ?", (EMAIL, email))]
+        "WHERE c.kind = ? AND c.value = ?", (kind, email))]
 
 
 # ── Writing ──
@@ -190,6 +208,10 @@ def add(con: sqlite3.Connection, scope: str, value, reason, *, by: str, campaign
         key = normalize_address(value)
         if not key:
             raise Refused(f"'{value}' is not an email address")
+    elif scope == "phone":
+        key = normalize_phone(value)
+        if not key:
+            raise Refused(f"'{value}' is not a phone number written with its country code")
     elif scope == "domain":
         key = normalize_domain(value)
         if not key:
@@ -290,7 +312,8 @@ class Index:
 
     def __init__(self, con: sqlite3.Connection):
         self.con = con
-        self.by_scope: dict[int, dict[str, tuple[int, int]]] = {ADDRESS: {}, DOMAIN: {}, FIRM: {}}
+        self.by_scope: dict[int, dict[str, tuple[int, int]]] = {
+            ADDRESS: {}, DOMAIN: {}, FIRM: {}, PHONE_SCOPE: {}}
         for entry_id, scope, value, reason in con.execute(
                 "SELECT id, scope, value, reason FROM suppression WHERE undone_at IS NULL "
                 "ORDER BY id"):
@@ -327,6 +350,24 @@ class Index:
                     return found
         return None
 
+    def phone_hit(self, phone: str, firms=None) -> Hit | None:
+        """The entry a number matches: the number itself, then a firm it
+        reaches (``firms``, company ids, and every firm it is linked to).
+        A shared number reaches every firm it is linked to: one of them
+        barred bars the number."""
+        number = normalize_phone(phone)
+        if not number:
+            return None
+        if found := self._hit(PHONE_SCOPE, number):
+            return found
+        if self.by_scope.get(FIRM):
+            ids = [f for f in (firms or ()) if f not in (None, "")]
+            ids += firms_of_address(self.con, number, PHONE)
+            for value in sorted(firm_values(self.con, ids)):
+                if found := self._hit(FIRM, value):
+                    return found
+        return None
+
     def firm_hit(self, company_id) -> Hit | None:
         """The firm entry (or a domain entry for its domain) that covers a firm."""
         values = firm_values(self.con, [company_id])
@@ -342,13 +383,20 @@ class Index:
         return None
 
 
-def check(con: sqlite3.Connection, email: str, firms=None, config_entries=()) -> Hit | None:
-    """Whether ``email`` must not be emailed, and why: an entry in force
-    (address, domain, a firm it reaches) or a line of compliance.do_not_contact
-    (``config_entries``). None: it may be."""
+def check(con: sqlite3.Connection, email: str, firms=None, config_entries=(), *,
+          phone: str = "") -> Hit | None:
+    """Whether ``email`` (or ``phone``, a number: the messaging channels)
+    must not be written to, and why: an entry in force (address, domain,
+    number, a firm it reaches) or a line of compliance.do_not_contact
+    (``config_entries``, addresses and domains). None: it may be."""
     from harvey.gate import do_not_contact_match
 
-    found = Index(con).hit(email, firms)
+    index = Index(con)
+    if phone:
+        found = index.phone_hit(phone, firms)
+        if found is not None or not email:
+            return found
+    found = index.hit(email, firms)
     if found is not None:
         return found
     listed = do_not_contact_match(email or "", config_entries or ())
