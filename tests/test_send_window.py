@@ -784,7 +784,7 @@ def _patch_heartbeat(monkeypatch, cfg, state, calls, stop):
     monkeypatch.setattr(main_mod, "load_env", lambda: SimpleNamespace())
     monkeypatch.setattr(main_mod, "StateManager", lambda: state)
     monkeypatch.setattr(main_mod, "Brain", _Brain)
-    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: True)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c, at=None: True)
     monkeypatch.setattr(main_mod, "_interruptible_sleep", stop_instead_of_sleeping)
     monkeypatch.setattr(harvey.agents.writer, "Writer", agent("write"))
     monkeypatch.setattr(sender_mod, "Sender", agent("send"))
@@ -983,7 +983,7 @@ async def test_email_module_off_writes_sends_and_reads_nothing(state, monkeypatc
     await switches.set_enabled(state, switches.EMAIL_MODULE, False)
     calls, stop = [], asyncio.Event()
     main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
-    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: quiet)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c, at=None: quiet)
     if quiet:  # no mail to wake for: the cycle sleeps out the quiet hours
         monkeypatch.setattr(main_mod, "seconds_until_quiet_hours_end", lambda c: 60)
     await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)

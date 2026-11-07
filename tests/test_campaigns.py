@@ -626,7 +626,7 @@ async def test_the_heartbeat_works_the_campaigns_whatever_else_is_waiting(state,
     await state.set_setting(sender_mod.KILL_SWITCH_KEY, "paused by you")
     calls, stop = [], asyncio.Event()
     _patch_heartbeat(monkeypatch, config(), state, calls, stop)
-    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: False)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c, at=None: False)
 
     class Cycle:
         def __init__(self, *a):

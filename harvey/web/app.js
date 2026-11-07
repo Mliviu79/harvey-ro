@@ -7743,6 +7743,12 @@ async function answerConvo(id) {
     showToast(why, 'error');
     return;
   }
+  if (data.warning === 'window_closes') {
+    // Queued as written, but it can only go once the channel's window has
+    // closed: the provider will refuse it then. Said now, kept on the page.
+    const at = s => new Date(s * 1000).toLocaleString(intlLocale(), {weekday: 'short', hour: '2-digit', minute: '2-digit'});
+    showToast(t('cv.answer_late', {goes: at(data.goes_at), closes: at(data.closes_at)}), 'error');
+  }
   loadConversations();
   loadToday();
 }

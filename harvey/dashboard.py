@@ -4931,9 +4931,19 @@ async def answer_conversation(convo_id: str, request: Request):
                 "wait": "next_pass", "why": ""}
     row = await state.get_outbox_item(item_id) or {}
     status, error = row.get("status") or "approved", row.get("error") or ""
+    late = {}
+    if hold and status == "approved":
+        # (Queued all the same, as you wrote it: but when the earliest it can
+        # go is past the channel's window, the provider will refuse it then,
+        # so you're told now while you can still do something about it.)
+        goes = await sender.goes_at(hold)
+        last = await state.last_inbound(channel, phone)
+        closes = last + channels.SEND_RULES[channel].window_hours * 3600 if last else None
+        if goes is not None and closes is not None and goes > closes:
+            late = {"warning": "window_closes", "goes_at": int(goes), "closes_at": int(closes)}
     return {"success": status != "failed", "outbox_id": item_id, "status": status,
             "wait": wait_code(error) if status == "approved" else "",
-            "why": error, **({"message": error} if status == "failed" else {})}
+            "why": error, **late, **({"message": error} if status == "failed" else {})}
 
 
 @app.post("/api/conversations/{convo_id}/status")

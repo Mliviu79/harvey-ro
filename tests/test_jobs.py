@@ -844,7 +844,7 @@ async def test_with_the_email_module_off_the_heartbeat_does_nothing(state, monke
     monkeypatch.setattr(main_mod, "load_env", lambda: SimpleNamespace())
     monkeypatch.setattr(main_mod, "StateManager", lambda: state)
     monkeypatch.setattr(main_mod, "Brain", NoBrain)
-    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: False)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c, at=None: False)
     monkeypatch.setattr(main_mod, "_interruptible_sleep", one_cycle)
 
     def agent(*a, **k):

@@ -61,11 +61,11 @@ QUIET_HOURS_POLL_SECONDS = 300
 REPLY_READERS = ("read_replies",)
 
 
-def in_quiet_hours(config: HarveyConfig) -> bool:
-    """Check if we're currently in quiet hours."""
+def in_quiet_hours(config: HarveyConfig, at: datetime | None = None) -> bool:
+    """Check if we're in quiet hours now (or at ``at``, an aware time)."""
     qh = config.usage.quiet_hours
     tz = pytz.timezone(qh.timezone)
-    now = datetime.now(tz).time()
+    now = (at.astimezone(tz) if at is not None else datetime.now(tz)).time()
     start = time.fromisoformat(qh.start)
     end = time.fromisoformat(qh.end)
 

@@ -99,7 +99,7 @@ class Harness:
         monkeypatch.setattr(main_mod, "load_config", lambda: self.config)
         monkeypatch.setattr(main_mod, "load_env", lambda: EnvConfig())
         monkeypatch.setattr(main_mod, "StateManager", lambda: self.state)
-        monkeypatch.setattr(main_mod, "in_quiet_hours", lambda config: False)
+        monkeypatch.setattr(main_mod, "in_quiet_hours", lambda config, at=None: False)
 
         async def one_cycle_sleep(seconds, stop_event):
             self.cycles += 1

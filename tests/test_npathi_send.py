@@ -456,7 +456,7 @@ async def test_quiet_hours_always_hold_answers(state, npat, monkeypatch):
             class quiet_hours:
                 start, end, timezone = "00:00", "23:59", "UTC"
 
-    monkeypatch.setattr(main, "in_quiet_hours", lambda config: True)
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config, at=None: True)
     blocked = await MessageSender(state, QuietCfg(), npat.transport()).blocked(
         await _row(state, item))
     assert blocked == ("approved", messenger_mod.WAIT_HOURS)
@@ -665,7 +665,7 @@ def _seed_convo(env, npat, hours_ago=1.0):
 def _no_quiet_hours(monkeypatch):
     import harvey.main as main
 
-    monkeypatch.setattr(main, "in_quiet_hours", lambda config: False)
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config, at=None: False)
 
 
 def test_an_answer_you_write_goes_without_a_second_approval(client, env, dash_npat,  # noqa: F811
@@ -1080,7 +1080,7 @@ def _loop(state, npat, config=None, brain=None):
 def awake(monkeypatch):
     import harvey.main as main
 
-    monkeypatch.setattr(main, "in_quiet_hours", lambda config: False)
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config, at=None: False)
 
 
 @pytest.mark.asyncio
@@ -1165,7 +1165,7 @@ async def test_without_the_model_only_opt_outs_are_handled_and_the_rest_wait(sta
 async def test_quiet_hours_keep_the_model_out_of_the_loop(state, npat, monkeypatch):
     import harvey.main as main
 
-    monkeypatch.setattr(main, "in_quiet_hours", lambda config: True)
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config, at=None: True)
     await _ready(state, npat)
     await _beta(state)
     npat.messages = [_message(9, BOB, "Cât costă?")]
@@ -1205,3 +1205,44 @@ async def test_a_full_worker_runs_the_messaging_passes(state, npat, awake, monke
     stop.set()
     await asyncio.wait_for(task, timeout=15)
     assert (await _row(state, item))["status"] == "sent" and len(owners) == 1
+
+
+def _seed_late(env, npat, channel):
+    """A conversation whose last message came 23 hours ago, with the day's
+    cap on its channel used up: the earliest it can go is tomorrow."""
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    async def seed():
+        state = StateManager(db_path=str(env["db"]))
+        await _ready(state, npat)
+        if channel == "waba":
+            await channels.set_sending(state, "waba", True)
+            await channels.set_route(state, "waba", "waba_number:4")
+        await switches.set_module_setting(state, npathi.MODULE, f"daily_cap_{channel}", 0)
+        _, pid = await _firm(state)
+        return await _convo(state, pid, channel=channel, hours_ago=23.0)
+
+    return asyncio.run(seed())
+
+
+def test_an_answer_that_can_only_go_after_whatsapps_window_is_queued_with_a_warning(  # noqa: F811
+        client, env, dash_npat, monkeypatch):
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_late(env, dash_npat, "waba")
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    data = r.json()
+    assert r.status_code == 200 and (data["status"], data["wait"]) == ("approved", "cap"), data
+    assert data["warning"] == "window_closes" and data["goes_at"] > data["closes_at"]
+    [item] = client.get("/api/outbox").json()["approved"]
+    assert item["approved_by"] == "you" and item["channel"] == "waba"
+
+
+def test_an_sms_answer_held_to_the_next_day_has_no_warning(client, env, dash_npat,  # noqa: F811
+                                                           monkeypatch):
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_late(env, dash_npat, "sms")
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    data = r.json()
+    assert r.status_code == 200 and (data["status"], data["wait"]) == ("approved", "cap"), data
+    assert "warning" not in data

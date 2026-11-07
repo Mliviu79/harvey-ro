@@ -244,25 +244,48 @@ class MessageSender:
                         "second")
         return None
 
-    async def _in_hours(self) -> bool:
+    async def _in_hours(self, at: datetime | None = None) -> bool:
         """Inside the sending hours (Harvey's own time zone) and outside
-        quiet hours, which always apply here."""
+        quiet hours, which always apply here; now, or at ``at``."""
+        return self._hours_open(await channels.send_hours(self.state),
+                                at or datetime.now(timezone.utc))
+
+    def _hours_open(self, hours: tuple[int, int], at: datetime) -> bool:
         from zoneinfo import ZoneInfo
 
         quiet = getattr(getattr(self.config, "usage", None), "quiet_hours", None)
         if quiet is not None:
             from harvey.main import in_quiet_hours
 
-            if in_quiet_hours(self.config):
+            if in_quiet_hours(self.config, at):
                 return False
         try:
             zone = ZoneInfo(operator_timezone(self.config))
         except Exception:
             zone = timezone.utc
-        now = datetime.now(zone)
+        now = at.astimezone(zone)
         minute = now.hour * 60 + now.minute
-        start, end = await channels.send_hours(self.state)
+        start, end = hours
         return start <= minute < end if start <= end else (minute >= start or minute < end)
+
+    async def goes_at(self, hold: "Hold") -> float | None:
+        """The earliest time an answer held by the sending hours or the
+        day's cap could go (epoch seconds), or None when that can't be told
+        (a pause, a missing route...). Looked up in 5-minute steps, two days
+        ahead at most."""
+        if hold.code not in ("hours", "cap"):
+            return None
+        start = datetime.now(timezone.utc)
+        if hold.code == "cap":
+            # (The day's count starts again at UTC midnight.)
+            start = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                                        microsecond=0)
+        hours = await channels.send_hours(self.state)
+        for step in range(0, 2 * 24 * 12):
+            at = start + timedelta(minutes=5 * step)
+            if self._hours_open(hours, at):
+                return at.timestamp()
+        return None
 
     async def _hold(self, item: dict, blocked: tuple[str, str]) -> None:
         status, why = blocked

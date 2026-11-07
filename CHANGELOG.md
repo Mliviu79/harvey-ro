@@ -19,7 +19,9 @@ minor versions can still change behaviour.
   still through every check below: one that could never go is refused in
   the answer box and nothing is queued, one that has to wait (the hours, a
   cap, a pause) waits approved and says why on the conversation and the
-  Outbox row. Harvey's drafts (and the agent's) wait in the Outbox for your
+  Outbox row; when the earliest it can go is past the channel's window
+  (WhatsApp's 24 hours), it is queued all the same and the answer box warns
+  that it will be refused then. Harvey's drafts (and the agent's) wait in the Outbox for your
   approval, one at a time: autopilot never approves one and Approve all
   leaves them. The first
   answer to a number names your firm and carries
