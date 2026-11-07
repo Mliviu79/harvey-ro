@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 40).
+"""The overlay's tables (harvey.db schema 41).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 40
+LATEST = 41
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1259,11 +1259,35 @@ def _to_40(con: sqlite3.Connection) -> None:
     _script(con, PHONE_SUPPRESSION_GUARDS)
 
 
+# ── Schema 41: answers sent on the messaging channels ──
+
+SCHEMA_41 = """
+-- Where nPathi Chat says an answer sent on a messaging channel is (queued,
+-- sent, delivered, read, failed, canceled): read back each cycle until it
+-- is final. '' for email, and for a message not handed over yet.
+ALTER TABLE outbox ADD COLUMN provider_status TEXT NOT NULL DEFAULT '';
+-- A number nPathi Chat said can't be reached on a channel (invalid_number
+-- on that channel, no_whatsapp on both WhatsApp ones): nothing more is sent
+-- to it there. value: E.164; reason: nPathi's failure_reason; at: unix seconds.
+CREATE TABLE channel_unreachable (
+  channel TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  PRIMARY KEY (channel, value)
+) WITHOUT ROWID;
+"""
+
+
+def _to_41(con: sqlite3.Connection) -> None:
+    """Schema 41: the outbox's delivery status from nPathi Chat, and the
+    numbers a channel can't reach. Every row on file keeps ''."""
+    _script(con, SCHEMA_41)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
-         (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40))
+         (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40), (41, _to_41))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

@@ -394,11 +394,15 @@ class _GuidedBrain(StubBrain):
         return True
 
 
-def test_draft_reply_refuses_a_message_that_came_by_sms(db, monkeypatch):
-    """Harvey doesn't answer on SMS or WhatsApp yet, and an email answer to
-    a text isn't what they asked for: the user answers it."""
+def test_draft_reply_answers_a_message_that_came_by_sms_back_on_sms(db, monkeypatch):
+    """An answer to a text goes back as a text, to the number it came from,
+    held for the user like any answer the agent asked for; one with no
+    number to answer is refused."""
+    import time
+
     import harvey.agents.sender as sender_mod
     from harvey.models.conversation import Message
+    from harvey.state import AGENT_DRAFT_HELD
 
     monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
     plan_id = _plan(db)
@@ -424,12 +428,17 @@ def test_draft_reply_refuses_a_message_that_came_by_sms(db, monkeypatch):
         return h
     monkeypatch.setattr(outreach, "reply_handler", handler)
     [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
-    assert c["answerable"] is False
+    assert c["answerable"] is True
     error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
                                           "guidance": "Propune un apel"})
-    assert error and "came by SMS" in why and not brain.prompts
-    assert _q(db, "SELECT COUNT(*) FROM outbox WHERE kind = 'reply' "
-                  "AND status = 'pending_review'") == [(0,)]
+    assert error and "no number to answer" in why and not brain.prompts
+    _run(state.put_handle(convo[0], "sms", "+40722000102", at=time.time() - 60, ref="npathi:1"))
+    out = _ok(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
+                                  "guidance": "Propune un apel"})
+    assert out["waits_for_user"] and any("goes by SMS" in p for p in brain.prompts)
+    assert _q(db, "SELECT channel, to_phone, to_email, status, error FROM outbox "
+                  "WHERE kind = 'reply' AND status = 'pending_review'") == [
+        ("sms", "+40722000102", "", "pending_review", AGENT_DRAFT_HELD)]
 
 
 def test_draft_reply_is_staged_for_review_with_the_guidance(db, monkeypatch):

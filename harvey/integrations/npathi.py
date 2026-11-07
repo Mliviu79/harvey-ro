@@ -3,14 +3,18 @@
 nPathi Chat runs per customer, so its address is the install's own
 (``modules.npathi.base_url``, https only), and the workspace key is
 NPATHI_API_KEY in .env, saved only after the account call accepted it.
-Harvey reads, and writes one thing: the people who asked it to stop go on
-nPathi's opt-out list too (POST /api/v1/unsubscribed, scope all).
+Harvey reads, sends the answers the user approved, and adds the people who
+asked it to stop to nPathi's opt-out list (POST /api/v1/unsubscribed, scope
+all).
 
 - the account (GET /api/v1/me): plan, the key's abilities, credits;
 - the channels this key may use (GET /api/v1/channels/available);
 - inbound messages since a mark (GET /api/v1/messages?direction=in), newest
   first, page by page through meta.next_cursor;
-- the opt-out list (GET /api/v1/unsubscribed), and adding to it.
+- the opt-out list (GET /api/v1/unsubscribed), and adding to it;
+- an answer the user approved (POST /api/v1/messages/sms | waba | whatsapp),
+  where it is afterwards (GET /api/v1/messages/{id}) and the plan's prices
+  (GET /api/v1/rates).
 
 Every request waits its turn on the ``npathi`` lane, and the lane is held
 for as long as nPathi says (Retry-After on a 429, X-RateLimit-Reset when
@@ -70,7 +74,21 @@ READ_ABILITY = {"sms": "sms.read", "waba": "waba.read", "wa": "wa.read"}
 LABELS = {"sms": "SMS", "waba": "WhatsApp Business", "wa": "WhatsApp"}
 # SMS connections that can receive a reply on the number they send from;
 # an alphanumeric sender id can't.
-RECEIVING_CONNECTIONS = ("phone_bridge", "gsm_modem", "android", "sim")
+RECEIVING_CONNECTIONS = ("phone_bridge", "gsm_modem", "android_device", "android", "sim")
+# The connections a send names as {"connection": {type, id}}; an Android
+# SIM by from_sim_id.
+SEND_CONNECTIONS = ("phone_bridge", "gsm_modem", "android_device")
+# Where each channel's answer is sent, and the ability the key needs for it.
+SEND_PATH = {"sms": "/messages/sms", "waba": "/messages/waba", "wa": "/messages/whatsapp"}
+SEND_ABILITY = {"sms": "sms.send", "waba": "waba.send", "wa": "wa.send"}
+# A message's statuses nPathi won't change any more (PublicMessageStatus).
+FINAL_STATUSES = frozenset({"delivered", "read", "failed", "canceled"})
+STATUSES = frozenset({"queued", "sending", "sent", "delivered", "read", "failed", "canceled",
+                      "received", "pending"})
+# Its failure reasons (MessageFailure): anything else is kept as "other".
+FAILURES = frozenset({"canceled", "expired", "unsubscribed", "insufficient_credits",
+                      "no_whatsapp", "invalid_number", "rate_limited", "channel_unavailable",
+                      "whatsapp_rejected", "carrier_rejected", "invalid_recipient", "other"})
 
 KEY_REJECTED = ("nPathi Chat refused the API key (missing, invalid, revoked or expired). "
                 "Create a workspace key in nPathi Chat (API Keys) and connect it again.")
@@ -225,6 +243,30 @@ class Read:
     oldest: float | None = None
 
 
+@dataclass(frozen=True)
+class Outbound:
+    """A message Harvey sent, as nPathi reports it: its id, where it is
+    (STATUSES), why it failed (FAILURES, "" when it didn't) and what it
+    cost in credits (None until nPathi says)."""
+    id: int
+    status: str
+    failure: str = ""
+    price: float | None = None
+    segments: int | None = None
+
+
+def _outbound(data) -> Outbound:
+    row = _dict(data)
+    mid = _int(row.get("id"))
+    if mid is None:
+        raise NpathiError("unreadable", UNREADABLE)
+    status = _str(row.get("status"))
+    failure = _str(row.get("failure_reason"))
+    return Outbound(id=mid, status=status if status in STATUSES else "",
+                    failure=(failure if failure in FAILURES else "other") if failure else "",
+                    price=_number(row.get("price")), segments=_int(row.get("segments")))
+
+
 def _inbound(row: dict) -> Inbound | None:
     mid = _int(row.get("id"))
     if mid is None or row.get("direction") != "in":
@@ -260,7 +302,7 @@ class Npathi:
     # ── One request ──
 
     async def _request(self, method: str, path: str, *, params: dict | None = None,
-                       body: dict | None = None):
+                       body: dict | None = None, idempotency_key: str = ""):
         from harvey.modules import lanes
 
         held, _ = lanes.hold_info(LANE)
@@ -273,8 +315,9 @@ class Npathi:
             content = json.dumps(body, sort_keys=True, separators=(",", ":"))
             headers["Content-Type"] = "application/json"
             # The same request, the same key: a retry within 24 hours gets
-            # the first answer instead of acting twice.
-            headers["Idempotency-Key"] = "harvey-" + hashlib.sha256(
+            # the first answer instead of acting twice. (A send names its
+            # own: its outbox row's, so an edited body can't make it new.)
+            headers["Idempotency-Key"] = idempotency_key or "harvey-" + hashlib.sha256(
                 f"{method} {path} {content}".encode()).hexdigest()[:40]
         try:
             async with httpx.AsyncClient(base_url=self.base_url + API, transport=self._transport,
@@ -422,6 +465,51 @@ class Npathi:
                 if phone and row.get("scope", "all") == "all":
                     out.append({"phone": phone[:32], "at": parse_time(row.get("unsubscribed_at"))})
         return out, complete
+
+    async def send(self, channel: str, to: str, body: str, route: dict, *,
+                   key: str, reference: str = "") -> Outbound:
+        """Send one text answer (``channel``: sms, waba or wa) to ``to``
+        (E.164) from ``route`` (the sender chosen on the Channels card:
+        {type, id}), under ``key`` (the outbox row's own Idempotency-Key:
+        sent again within 24 hours, nPathi answers with the first send)."""
+        if channel not in SEND_PATH:
+            raise NpathiError("setup", f"no channel {channel!r}")
+        payload: dict = {"to": to, "body": body}
+        if reference:
+            payload["reference"] = reference[:191]
+        kind, rid = _str(route.get("type")), _int(route.get("id"))
+        if channel == "sms":
+            if kind in SEND_CONNECTIONS and rid is not None:
+                payload["connection"] = {"type": kind, "id": rid}
+            elif kind in ("android", "sim") and rid is not None:
+                payload["from_sim_id"] = rid
+        elif channel == "waba":
+            payload["type"] = "text"
+            if rid is not None:
+                payload["from_phone_id"] = rid
+        else:
+            payload["type"] = "text"
+            if rid is not None:
+                payload["wa_account_id"] = rid
+        data = await self._request("POST", SEND_PATH[channel], body=payload, idempotency_key=key)
+        return _outbound(data.get("data"))
+
+    async def message(self, message_id: int) -> Outbound:
+        """Where one sent message is now (GET /messages/{id})."""
+        data = await self._request("GET", f"/messages/{int(message_id)}")
+        return _outbound(data.get("data"))
+
+    async def rates(self) -> dict[str, float]:
+        """The plan's credits per message for each channel (GET /rates):
+        {nPathi channel: the highest of its routes' prices}."""
+        data = _dict((await self._request("GET", "/rates")).get("data"))
+        out: dict[str, float] = {}
+        for row in _list(data.get("channels")):
+            row = _dict(row)
+            channel, credits = _str(row.get("channel"))[:40], _number(row.get("credits"))
+            if channel and credits is not None and credits >= 0:
+                out[channel] = max(out.get(channel, 0.0), credits)
+        return out
 
     async def add_unsubscribed(self, phone: str, reason: str = "") -> None:
         """Put a number on nPathi's opt-out list (texts and automated calls)."""

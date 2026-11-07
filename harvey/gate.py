@@ -266,6 +266,52 @@ def pre_send_check(
     return GateResult(ok=not reasons, reasons=reasons)
 
 
+def message_problems(body: str, *, max_chars: int, config, first: bool) -> list[str]:
+    """What the gate refuses in an SMS or WhatsApp answer: empty, longer
+    than the channel takes, a curly brace (nPathi fills {a|b} and
+    {{field}} in itself, so Harvey's text never carries one), more than one
+    link or a link that isn't yours (channels.email.link_domains and your
+    sending address's domain, or your booking page), a banned phrase,
+    HTML; and a first answer to a number that doesn't name your firm
+    (persona.company) or lacks the opt-out line
+    (compliance.message_opt_out_line). [] when none."""
+    from harvey.config import message_opt_out_line
+
+    body = (body or "").strip()
+    reasons: list[str] = []
+    if not body:
+        reasons.append("empty message")
+    if len(body) > max_chars:
+        reasons.append(f"message too long ({len(body)} > {max_chars} characters)")
+    if "{" in body or "}" in body:
+        reasons.append("curly braces in the message (nPathi would fill them in)")
+    links = find_links(body)
+    if len(links) > MAX_LINKS:
+        reasons.append(f"too many links ({len(links)} > {MAX_LINKS})")
+    allowed, prefix = allowed_link_domains(config), _booking_prefix(config)
+    foreign = sorted({host for host, link in links
+                      if not _is_ours(host, allowed) and not _is_booking_page(link, prefix)})
+    if foreign:
+        reasons.append(f"links to {', '.join(foreign[:3])}, not one of your domains "
+                       "(channels.email.link_domains)")
+    lowered = body.lower()
+    hits = [p for p in BANNED_PHRASES if p in lowered]
+    if hits:
+        reasons.append(f"banned phrases: {hits[:3]}")
+    if re.search(r"<\s*(html|body|div|table|img|a)\b", body, re.IGNORECASE):
+        reasons.append("HTML markup in the message (plain text only)")
+    if first:
+        company = str(getattr(getattr(config, "persona", None), "company", "") or "").strip()
+        if not company:
+            reasons.append("a first answer names your firm: set persona.company")
+        elif company.lower() not in lowered:
+            reasons.append(f"a first answer to a number names your firm ({company})")
+        line = message_opt_out_line(config)
+        if line not in body:
+            reasons.append("a first answer to a number carries the opt-out line")
+    return reasons
+
+
 # The merge variables a template may use: the one list. Sender._render
 # fills exactly these (each from the prospect card's field of the same
 # name, MERGE_FIELDS where it differs), written {{name}} with or without

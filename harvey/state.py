@@ -1031,9 +1031,16 @@ class StateManager:
     def _undo_opt_out(con, prospect_id: str, details: dict) -> bool:
         from harvey import suppression
 
-        email = (con.execute("SELECT email FROM prospects WHERE id = ?",
-                             (prospect_id,)).fetchone() or [""])[0]
-        asked = suppression.standing_request(con, email)
+        email, phone = (con.execute("SELECT email, phone FROM prospects WHERE id = ?",
+                                    (prospect_id,)).fetchone() or ["", ""])
+        # Their numbers: their card's, and the ones their SMS or WhatsApp
+        # messages came from (an opt-out by STOP is a phone entry).
+        phones = {suppression.normalize_phone(p) for p in [phone] + [r[0] for r in con.execute(
+            "SELECT h.value FROM conversation_handle h JOIN conversations c "
+            "ON c.id = h.conversation WHERE c.prospect_id = ?", (prospect_id,))]}
+        phones.discard("")
+        asked = suppression.standing_request(con, email) or next(
+            (why for p in sorted(phones) if (why := suppression.standing_request(con, p))), "")
         if asked:
             raise suppression.Refused(
                 f"they asked for it themselves ({asked}): undo it on the do-not-contact list, "
@@ -1054,9 +1061,12 @@ class StateManager:
         con.execute("INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
                     (_new_id(), "opt_out_undone", "dashboard",
                      json.dumps({"prospect_id": prospect_id, **details})))
-        suppression.undo_address(con, email, by="you",
-                                 note=str(details.get("reason") or details.get("note") or ""),
+        note = str(details.get("reason") or details.get("note") or "")
+        suppression.undo_address(con, email, by="you", note=note,
                                  reasons=suppression.READ_IN_THEIR_WORDS)
+        for p in sorted(phones):
+            suppression.undo_address(con, p, by="you", note=note,
+                                     reasons=suppression.READ_IN_THEIR_WORDS)
         return True
 
     # ── The do-not-contact list (harvey/suppression.py) ──
@@ -1090,20 +1100,27 @@ class StateManager:
         return await self._in_tx(lambda con: suppression.add(
             con, scope, value, reason, by=by, campaign=campaign, ref=ref, note=note))
 
-    async def suppress_phones(self, phones, reason, *, by: str, note: str = "") -> int:
+    async def suppress_phones(self, phones, reason, *, by: str, note: str = "",
+                              listed_at: dict | None = None) -> tuple[int, list[str]]:
         """Numbers onto the do-not-contact list in one write (nPathi's
-        opt-out list); how many entries were new."""
+        opt-out list): (how many entries were new, the numbers left off
+        because the user took them off the list in Harvey after
+        ``listed_at`` says the list named them: {number: unix seconds})."""
         from harvey import suppression
 
         def run(con):
-            made = 0
+            made, kept = 0, []
             for phone in dict.fromkeys(phones):
+                if listed_at is not None and suppression.undone_after(
+                        con, phone, listed_at.get(phone)):
+                    kept.append(phone)
+                    continue
                 try:
                     made += suppression.add(con, "phone", phone, reason, by=by,
                                             note=note) is not None
                 except suppression.Refused:
                     continue
-            return made
+            return made, kept
 
         return await self._in_tx(run)
 
@@ -1315,24 +1332,30 @@ class StateManager:
         source_note: str = "",
         account_id: int | None = 1,
         error: str = "",
+        channel: str = "email",
+        to_phone: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
         ``source_note``: the line a first email to a personal address was
         staged with (email_rules; it is in the body too). ``error``: why it
-        waits for you (autopilot never approves a row with one)."""
+        waits for you (autopilot never approves a row with one).
+        ``channel``/``to_phone``: an answer on a messaging channel (sms,
+        waba, wa) to that number (E.164), sent by the messenger, never by
+        the email drain."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, account_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, account_id, channel, to_phone)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to, account_id,
+                    channel or "email", to_phone or "",
                 ),
             )
             if cursor.rowcount > 0 and approved_by:
@@ -1355,14 +1378,20 @@ class StateManager:
         kind: str | None = None,
         follow_ups_only: bool = False,
         skip_held_campaigns: bool = False,
+        channel: str | None = None,
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
         previous step hasn't gone out yet, so they can't fill the page.
         kind: only that kind ("sequence" for cold email).
         follow_ups_only: only sequence emails after the first step.
         skip_held_campaigns: leave out cold email of a paused or draft
-        campaign, which waits, approved, and would fill the page too."""
+        campaign, which waits, approved, and would fill the page too.
+        channel: only that channel's rows ("email" for the email drain,
+        which never sends an SMS or WhatsApp answer)."""
         where, params = [], []
+        if channel:
+            where.append("o.channel = ?")
+            params.append(channel)
         if skip_held_campaigns:
             where.append(f"NOT (o.kind = 'sequence' AND {_HELD_CAMPAIGN})")
         if kind:
@@ -1499,6 +1528,7 @@ class StateManager:
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
         "subject", "body", "send_at", "provider", "unsub_token", "source_note",
+        "price_credits", "provider_status", "approved_by",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -1547,9 +1577,12 @@ class StateManager:
         cutoff = (_utcnow() - older_than).isoformat()
 
         def run(con):
+            # (Email only: an SMS or WhatsApp answer cut off is sent again
+            # under its Idempotency-Key, harvey/agents/messenger.py.)
             rows = con.execute(
                 "SELECT id, kind, campaign_id, to_email, step FROM outbox "
-                "WHERE status = 'sending' AND datetime(updated_at) < datetime(?)",
+                "WHERE status = 'sending' AND channel = 'email' "
+                "AND datetime(updated_at) < datetime(?)",
                 (cutoff,)).fetchall()
             now = _utcnow().isoformat()
             for item_id, kind, campaign_id, to_email, step in rows:
@@ -1672,12 +1705,13 @@ class StateManager:
             else:
                 # Not the ones autopilot held for a look (possible planted
                 # links or a leak), the first answer since an opt-out was
-                # undone, an answer Harvey's agent asked for, nor a first
-                # email the privacy page leaves no room for its other link:
-                # those are looked at one at a time.
+                # undone, an answer Harvey's agent asked for, a first
+                # email the privacy page leaves no room for its other link,
+                # nor an SMS or WhatsApp answer (each goes to someone's
+                # phone and costs credits): those are looked at one at a time.
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
-                    "updated_at = ? WHERE status = 'pending_review' "
+                    "updated_at = ? WHERE status = 'pending_review' AND channel = 'email' "
                     "AND COALESCE(error, '') NOT LIKE ? AND COALESCE(error, '') NOT IN (?, ?, ?)",
                     (now, HELD_FOR_REVIEW + "%", REVIEW_AFTER_UNDO, PRIVACY_LINK_HELD,
                      AGENT_DRAFT_HELD),
@@ -1743,12 +1777,13 @@ class StateManager:
         went out. So what was staged while sending was paused, or before
         autopilot was turned on, is approved by the drain that sends it
         (after the autopilot review), never by the act of staging. The same
-        holds for the Handler's answers (``kind`` reply). Returns how many."""
+        holds for the Handler's answers (``kind`` reply). Email only: an
+        SMS or WhatsApp answer is never approved by autopilot. Returns how many."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'approved', approved_by = 'autopilot', updated_at = ? "
                 "WHERE id IN (SELECT o.id FROM outbox o LEFT JOIN campaigns c "
-                "ON c.id = o.campaign_id WHERE o.status = 'pending_review' "
+                "ON c.id = o.campaign_id WHERE o.status = 'pending_review' AND o.channel = 'email' "
                 "AND o.kind = ? AND COALESCE(o.approved_by, '') = '' "
                 "AND COALESCE(o.error, '') = '' AND (o.send_at IS NULL OR o.send_at <= ?) "
                 "AND (c.id IS NULL OR (c.status = 'active' "
@@ -2673,6 +2708,92 @@ class StateManager:
             return {}
         rows = await self._named("overlay.messages.handles", (json.dumps(ids),))
         return {conv: {"channel": channel, "value": value} for conv, channel, value in rows}
+
+    # ── Answers on the messaging channels (harvey/agents/messenger.py) ──
+
+    async def conversation_reply_handle(self, conversation: str) -> dict | None:
+        """The number an answer to a conversation goes to: its handle that
+        wrote in last ({channel, value, last_inbound_at, contact, firm}),
+        or None when it has none (an email conversation)."""
+        rows = await self._named("overlay.messages.reply_handle", (conversation or "",))
+        if not rows:
+            return None
+        channel, value, at, contact, firm = rows[0]
+        return {"channel": channel, "value": value, "last_inbound_at": at,
+                "contact": contact, "firm": firm}
+
+    async def last_inbound(self, channel: str, value: str) -> int | None:
+        """When a number last wrote in on a channel (unix seconds), any conversation."""
+        rows = await self._named("overlay.messages.last_inbound", (channel, value))
+        return rows[0][0] if rows and rows[0][0] is not None else None
+
+    async def messages_sent_to_since(self, channel: str, phone: str, since_iso: str) -> int:
+        rows = await self._named("overlay.messages.sent_to_since", (phone, channel, since_iso))
+        return int(rows[0][0]) if rows else 0
+
+    async def messages_maybe_sent_to_since(self, channel: str, phone: str,
+                                           since_iso: str) -> int:
+        """Answers to a number failed as possibly sent (MAYBE_SENT_PREFIX) since a time."""
+        rows = await self._named("overlay.messages.maybe_sent_to_since", (
+            phone, channel, len(MAYBE_SENT_PREFIX), MAYBE_SENT_PREFIX, since_iso))
+        return int(rows[0][0]) if rows else 0
+
+    async def messages_sent_today(self, channel: str) -> int:
+        rows = await self._named("overlay.messages.sent_today", (channel,))
+        return int(rows[0][0]) if rows else 0
+
+    async def message_credits_since(self, since_iso: str) -> float:
+        rows = await self._named("overlay.messages.credits_since", (since_iso,))
+        return float(rows[0][0] or 0) if rows else 0.0
+
+    async def unpriced_messages_since(self, since_iso: str) -> int:
+        rows = await self._named("overlay.messages.credits_since", (since_iso,))
+        return int(rows[0][1] or 0) if rows else 0
+
+    async def last_message_price(self, channel: str) -> float | None:
+        rows = await self._named("overlay.messages.last_price", (channel,))
+        return float(rows[0][0]) if rows else None
+
+    async def phone_line_type(self, phone: str) -> str:
+        """A phone contact's line type ("" when it isn't a contact or isn't known)."""
+        from harvey.overlay.schema import LINE_TYPE, PHONE
+
+        rows = await self._named("overlay.messages.line_type", (PHONE, phone))
+        names = {v: k for k, v in LINE_TYPE.items()}
+        return names.get(rows[0][0], "") if rows and rows[0][0] is not None else ""
+
+    async def unreachable(self, channel: str, phone: str) -> str:
+        """nPathi's reason a channel can't reach this number, or ""."""
+        rows = await self._named("overlay.messages.unreachable", (channel, phone))
+        return rows[0][0] or "unreachable" if rows else ""
+
+    async def mark_unreachable(self, channels, phone: str, reason: str) -> None:
+        for channel in channels:
+            await self._named("overlay.messages.mark_unreachable",
+                              (channel, phone, reason, int(time.time())), write=True)
+
+    async def stale_message_sends(self, cutoff_iso: str) -> list[str]:
+        return [r[0] for r in await self._named("overlay.messages.stale_sends", (cutoff_iso,))]
+
+    async def messages_in_flight(self, since_iso: str, limit: int = 50) -> list[dict]:
+        cols = ("id", "channel", "message_id", "to_phone", "conversation_id", "prospect_id")
+        return [dict(zip(cols, r)) for r in await self._named(
+            "overlay.messages.in_flight", (since_iso, int(limit)))]
+
+    async def suppressed_phones(self, phones, firms=None) -> set[str]:
+        """Of these numbers (E.164), the ones an entry in force bars: the
+        number itself, or a firm it reaches (``firms`` too)."""
+        from harvey import suppression
+
+        phones = [p for p in dict.fromkeys(phones) if p]
+        if not phones or not Path(self.db_path).exists():
+            return set()
+
+        def run(con):
+            index = suppression.Index(con)
+            return {p for p in phones if index and index.phone_hit(p, firms) is not None}
+
+        return await self._in_tx(run, write=False)
 
     # ── Reply Deduplication ──
 

@@ -254,9 +254,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.analyst import Analyst
     from harvey.agents.campaigner import CampaignCycle
 
+    from harvey.agents.messenger import MessageSender
+
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
+    messenger = MessageSender(state, config)
     analyst = Analyst(state)
     campaigner = CampaignCycle(state, config, env, writer, sender)
 
@@ -393,6 +396,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             else:
                 await record_send_phase(state, send_hold_reason([], "", ""))
                 await _run_agents([("send_outbox", sender.run())])
+                # The SMS and WhatsApp answers you approved (nPathi Chat):
+                # never in quiet hours, and only after every reply was read.
+                if not send_only:
+                    await _run_agents([("send_messages", messenger.run())])
 
             # Then roll, verify, write and stage each active campaign.
             # Staging only fills the review queue, so it runs whether or not

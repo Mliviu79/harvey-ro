@@ -266,33 +266,58 @@ def undo(con: sqlite3.Connection, entry_id: int, *, by: str, note: str = "") -> 
     return True
 
 
+def _person_key(value) -> tuple[int, str]:
+    """(scope, key) of a person's own entry: an address, else a number."""
+    key = normalize_address(value)
+    if key:
+        return ADDRESS, key
+    key = normalize_phone(value)
+    return (PHONE_SCOPE, key) if key else (0, "")
+
+
 def undo_address(con: sqlite3.Connection, email: str, *, by: str, note: str = "",
                  reasons=PERSON_ASKED) -> int:
-    """Soft-undo the address's entries of these reasons; how many."""
-    key = normalize_address(email)
+    """Soft-undo the address's (or the number's) entries of these reasons;
+    how many."""
+    scope, key = _person_key(email)
     if not key:
         return 0
     marks = ",".join("?" * len(reasons))
     return con.execute(
         f"UPDATE suppression SET undone_at = ?, undone_by = ?, undo_note = ? "
         f"WHERE scope = ? AND value = ? AND undone_at IS NULL AND reason IN ({marks})",
-        (int(time.time()), by or "", (note or "")[:NOTE_MAX], ADDRESS, key,
+        (int(time.time()), by or "", (note or "")[:NOTE_MAX], scope, key,
          *sorted(reasons))).rowcount
 
 
 def standing_request(con: sqlite3.Connection, email: str) -> str:
-    """The reason name of an entry in force for this address that the
-    person asked for and that the one-click undo doesn't lift (an
+    """The reason name of an entry in force for this address (or number)
+    that the person asked for and that the one-click undo doesn't lift (an
     unsubscribe, an objection, a complaint), or ""."""
-    key = normalize_address(email)
+    scope, key = _person_key(email)
     reasons = sorted(PERSON_ASKED - READ_IN_THEIR_WORDS)
     if not key or not reasons:
         return ""
     row = con.execute(
         f"SELECT reason FROM suppression WHERE scope = ? AND value = ? AND undone_at IS NULL "
         f"AND reason IN ({','.join('?' * len(reasons))}) ORDER BY id LIMIT 1",
-        (ADDRESS, key, *reasons)).fetchone()
+        (scope, key, *reasons)).fetchone()
     return REASON_NAMES.get(row[0], "") if row else ""
+
+
+def undone_after(con: sqlite3.Connection, phone: str, at: float | None) -> bool:
+    """Whether the user took this number off the list in Harvey after
+    ``at`` (unix seconds; None: whenever) and no entry for it stands since:
+    nPathi's opt-out list naming it from before then doesn't put it back."""
+    key = normalize_phone(phone)
+    if not key:
+        return False
+    if con.execute("SELECT 1 FROM suppression WHERE scope = ? AND value = ? "
+                   "AND undone_at IS NULL LIMIT 1", (PHONE_SCOPE, key)).fetchone():
+        return False
+    row = con.execute("SELECT MAX(undone_at) FROM suppression WHERE scope = ? AND value = ? "
+                      "AND undone_at IS NOT NULL", (PHONE_SCOPE, key)).fetchone()
+    return bool(row and row[0] is not None and (at is None or row[0] >= at))
 
 
 def agent_entry(con: sqlite3.Connection, email: str) -> bool:

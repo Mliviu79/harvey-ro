@@ -61,6 +61,7 @@ EXCLUDED_TABLES = {
     "conversations": "email, SMS and WhatsApp threads: what prospects wrote",
     "processed_replies": "inbound message ids",
     "conversation_handle": "the numbers and handles SMS and WhatsApp messages came from",
+    "channel_unreachable": "the numbers an SMS or WhatsApp channel can't reach",
     "site_undo": "what a site check took off, with the page text it was read from",
     "agent_message": "the chat itself (the agent is given its history)",
     "agent_chat": "the chats themselves",

@@ -289,8 +289,8 @@ async def conversations(state, campaign_id: str, limit: int = CONVERSATIONS_LIMI
              "stage": _enum(st, STAGES), "status": _enum(s, CONVERSATION_STATUSES),
              "needs_human": s == "needs_human", "answer_waiting": bool(w),
              "answerable": i in ANSWERABLE and s in ("open", "needs_human") and not w
-             and last == "prospect" and not channel}
-            for cid, i, st, s, _at, w, last, channel in await _all(
+             and last == "prospect"}
+            for cid, i, st, s, _at, w, last, _channel in await _all(
                 state, "overlay.agent.campaign_conversations", (campaign_id, int(limit)))]
 
 
@@ -591,18 +591,20 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
     if c["last"] != "prospect":
         raise Refused(f"conversation {c['id']}'s newest reply has its answer already: "
                       "nothing new of theirs to answer")
+    phone = ""
     if c["channel"]:
-        # (An SMS or WhatsApp message: Harvey doesn't answer on those
-        # channels yet, and an email answer to it isn't what they asked for.)
-        from harvey.integrations import npathi
-
-        raise Refused(f"conversation {c['id']}'s newest message came by "
-                      f"{npathi.LABELS.get(c['channel'], 'another channel')}: the user "
-                      "answers it, on the Conversations page")
+        # (An SMS or WhatsApp message: the answer goes back there, to the
+        # number it came from, waiting for the user like any other.)
+        handle = await state.conversation_reply_handle(c["id"])
+        if handle is None or handle["channel"] != c["channel"]:
+            raise Refused(f"conversation {c['id']}'s newest message came by another channel "
+                          "with no number to answer: the user answers it")
+        phone = handle["value"]
     prospect = await state.get_prospect(c["prospect_id"])
     if prospect is None or prospect.status == "opted_out":
         raise Refused(f"conversation {c['id']}'s person asked not to be contacted")
-    hit = await state.suppression_check(prospect.email, firm=prospect.company_id, config=config)
+    hit = await state.suppression_check(prospect.email, firm=prospect.company_id, config=config,
+                                        phone=phone)
     if hit is not None:
         raise Refused(f"conversation {c['id']}'s person or firm is on the do-not-contact list")
     text = guidance_text(guidance)

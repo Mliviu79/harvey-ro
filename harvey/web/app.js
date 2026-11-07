@@ -1179,7 +1179,9 @@ function todayItemText(it, stats) {
       /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
-    case 'message-read-gap': return tr(t('today.item.message_gap', {channel: channelName(it.channel)}), t('today.item.message_gap_detail'), t('today.item.message_gap_action'));
+    case 'message-read-gap': return tr(t('today.item.message_gap', {channel: channelName(it.channel)}),
+      t('today.item.message_gap_detail') + (it.since ? ' ' + t('today.item.message_gap_window', gapWindow(it.since, it.until)) : ''),
+      t('today.item.message_gap_action'));
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
     case 'codex-login': return tr(t('today.item.codex_login'), t('today.item.codex_login_detail'), t('today.item.codex_login_action'));
@@ -2287,6 +2289,17 @@ async function loadUsage() {
       '</div></div>';
   };
   statsEl.innerHTML = card(t('use.today'), tot.today) + card(t('use.week'), tot.week) + card(t('use.month'), tot.month);
+  // The SMS and WhatsApp answers sent through nPathi Chat: credits, not tokens.
+  const m = data.messages;
+  if (m) {
+    const sentToday = Object.values(m.sent_today || {}).reduce((a, b) => a + (b || 0), 0);
+    statsEl.innerHTML += '<div class="stat-card"><div class="label">' + escHtml(t('use.messages')) + '</div>' +
+      '<div class="value">' + fmtN(m.credits_month || 0) + '</div><div class="breakdown">' +
+        '<span class="chip">' + escHtml(t('ch.spend', {today: fmtN(m.credits_today || 0), month: fmtN(m.credits_month || 0)})) +
+          escHtml(m.usd_today !== null && m.usd_today !== undefined ? t('ch.spend_usd', {today: fmtN(m.usd_today), month: fmtN(m.usd_month)}) : '') + '</span>' +
+        '<span class="chip">' + escHtml(t('use.messages_sent', {n: sentToday})) + '</span>' +
+      '</div></div>';
+  }
 
   // Daily columns — output tokens per day (the work done)
   const dailyEl = document.getElementById('usage-daily');
@@ -2374,7 +2387,8 @@ async function loadOutbox() {
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
 
-  const approvable = pending.length - pending.filter(p => heldReason(p)).length;
+  // (SMS and WhatsApp answers are approved one at a time: Approve all leaves them.)
+  const approvable = pending.length - pending.filter(p => heldReason(p) || isMessage(p)).length;
   actions.innerHTML =
     (pending.length && !data.paused && approvable
       ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" title="' +
@@ -2416,18 +2430,23 @@ async function loadOutbox() {
 
   list.innerHTML =
     table(t('ob.approved'), data.approved, [
-      [t('ob.to'), r => r.to_email], [t('ob.step'), r => r.step], [t('ob.subject'), r => r.subject],
+      [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
       [t('ob.sends'), r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
     ]) +
     table(t('ob.sent'), data.sent, [
-      [t('ob.to'), r => r.to_email], [t('ob.step'), r => r.step], [t('ob.subject'), r => r.subject],
-      [t('ob.sent_at'), r => formatDate(r.sent_at), true],
+      [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
+      [t('ob.sent_at'), r => formatDate(r.sent_at) + (r.provider_status ? ' · ' + r.provider_status : ''), true],
     ]) +
     table(t('ob.failed'), data.failed, [
-      [t('ob.to'), r => r.to_email], [t('ob.status'), r => badge(r.status), false, true],
+      [t('ob.to'), outboxTo], [t('ob.status'), r => badge(r.status), false, true],
       [t('ob.reason'), r => r.error, true], [t('ob.updated'), r => formatDate(r.updated_at), true],
     ]);
 }
+
+// Who a row goes to, and what it is: an email's address and subject, an
+// SMS or WhatsApp answer's channel and masked number.
+function outboxTo(r) { return isMessage(r) ? channelName(r.channel) + ' ' + (r.to_phone || '') : r.to_email; }
+function outboxSubject(r) { return isMessage(r) ? t('desk.message', {channel: channelName(r.channel)}) : r.subject; }
 
 const CONTACT_SOURCES = {
   known_company_backfill: 'csrc.team_page',
@@ -2642,6 +2661,11 @@ async function confirmAck() {
 
 // Why autopilot sent this back for a human (sender: gate.autopilot_review).
 const HELD_PREFIX = 'held for your review: ';   // state.HELD_FOR_REVIEW
+// An SMS or WhatsApp answer (nPathi Chat) rather than an email, and the
+// most characters each channel takes (channels.SEND_RULES).
+function isMessage(item) { return !!item && !!item.channel && item.channel !== 'email'; }
+const MESSAGE_MAX = {sms: 300, waba: 4096, wa: 4096};
+
 function heldReason(item) {
   const e = String((item && item.error) || '');
   const why = e.startsWith(HELD_PREFIX) ? e.slice(HELD_PREFIX.length) : '';
@@ -2651,14 +2675,15 @@ function heldReason(item) {
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) => {
-    const who = it.context && it.context.contact ? it.context.contact : it.to_email;
+    const who = it.context && it.context.contact ? it.context.contact : (it.to_email || it.to_phone);
     const parts = String(who || '').split(/[\s@.]+/);
     return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
       '<div class="di-text"><div class="to">' + escHtml(who) +
         (heldReason(it) ? ' <span class="tag t-bad" title="' + escHtml(t('desk.held_title')) + '">' + escHtml(t('desk.held')) + '</span>' : '') +
         '</div>' +
-      '<div class="sub">' + escHtml(it.subject || t('desk.no_subject')) + '</div></div>' +
+      '<div class="sub">' + escHtml(isMessage(it) ? t('desk.message', {channel: channelName(it.channel)})
+        : it.subject || t('desk.no_subject')) + '</div></div>' +
     '</div>';
   }).join('');
 
@@ -2667,13 +2692,17 @@ function renderDesk(items, i) {
   // A reply keeps its subject: Gmail threads by it.
   const fixedSubject = cur.kind === 'reply'
     ? ' readonly title="' + escHtml(t('desk.reply_subject')) + '"' : '';
+  // An SMS or WhatsApp answer has no subject, and a length the channel takes.
+  const msg = isMessage(cur);
+  const chars = msg ? '<div class="muted small">' + escHtml(t('desk.chars', {n: (unsaved.body || '').length,
+    max: MESSAGE_MAX[cur.channel] || 300})) + '</div>' : '';
   const draft = editing
-    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
-        fixedSubject + ' oninput="deskKeep()">' +
-      '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
-        escHtml(unsaved.body) + '</textarea>'
-    : '<div class="subject">' + escHtml(cur.subject || t('desk.no_subject')) + '</div>' +
-      '<div class="body">' + escHtml(cur.body) + '</div>';
+    ? (msg ? '<input id="desk-subject" type="hidden" value="">' : '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
+        fixedSubject + ' oninput="deskKeep()">') +
+      '<textarea id="desk-body" class="desk-edit-body" rows="' + (msg ? 5 : 14) + '" oninput="deskKeep()">' +
+        escHtml(unsaved.body) + '</textarea>' + chars
+    : (msg ? '' : '<div class="subject">' + escHtml(cur.subject || t('desk.no_subject')) + '</div>') +
+      '<div class="body">' + escHtml(cur.body) + '</div>' + chars;
   // Cold email leaves with the footer underneath; show it as it will go out.
   // Not added again when the body already ends with it, as in the Sender.
   const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
@@ -2694,8 +2723,10 @@ function renderDesk(items, i) {
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
-      '<div class="to-line">' + escHtml(t('desk.to')) + ' <b>' + escHtml(cur.to_email) + '</b>' +
-        '<span class="tag">' + escHtml(cur.kind === 'reply' ? t('desk.reply') : t('desk.email_n', {n: cur.step})) + '</span>' +
+      '<div class="to-line">' + escHtml(t('desk.to')) + ' <b>' + escHtml(msg
+          ? t('desk.message_to', {channel: channelName(cur.channel), number: cur.to_phone}) : cur.to_email) + '</b>' +
+        '<span class="tag">' + escHtml(msg ? t('desk.message', {channel: channelName(cur.channel)})
+          : cur.kind === 'reply' ? t('desk.reply') : t('desk.email_n', {n: cur.step})) + '</span>' +
         '<span class="muted">' + escHtml(t('desk.sends', {when: formatDate(cur.send_at)})) + '</span></div>' +
       renderDeskContext(cur.context) +
       (heldReason(cur)
@@ -2736,7 +2767,10 @@ function deskBusy() {
 async function deskSave(id) {
   const subject = document.getElementById('desk-subject').value.trim();
   const body = document.getElementById('desk-body').value.trim();
-  if (!subject || !body) { showToast(t('desk.need_both'), 'error'); return; }
+  const cur = _desk.items.find(x => x.id === id);
+  if (cur && isMessage(cur)) {
+    if (!body) { showToast(t('desk.need_body'), 'error'); return; }
+  } else if (!subject || !body) { showToast(t('desk.need_both'), 'error'); return; }
   let data = null;
   try {
     const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
@@ -5623,10 +5657,95 @@ async function loadFinderBgCard() {
       '<span class="switch-label">' + escHtml(t(bg.on ? 'mod.on' : 'mod.off')) + '</span></label></div>';
 }
 
-// Settings → Channels: nPathi Chat's SMS and WhatsApp, receiving only.
+// Settings → Channels: nPathi Chat's SMS and WhatsApp, reading and answering.
 // The key is a password field, checked by nPathi's account call before it
 // is saved, and never sent back: the card only knows whether one is saved.
 function unixRel(ts) { return ts ? relTime(new Date(ts * 1000).toISOString()) : escHtml(t('ch.never')); }
+
+// A read gap's window as the page says it ({from, to}: local times).
+function gapWindow(since, until) {
+  const at = ts => ts ? formatDate(new Date(ts * 1000).toISOString()) : '?';
+  return {from: at(since), to: at(until)};
+}
+
+// One channel's sending controls: the switch, the sender answers go from
+// (only one a reply can come back to), the daily cap and its own pause.
+function channelSendHtml(ch, sentToday) {
+  const ok = (ch.senders || []).filter(x => x.receives === true);
+  const options = '<option value="">' + escHtml(t('ch.route_none')) + '</option>' + ok.map(x =>
+    '<option value="' + escHtml(x.key) + '"' + (x.key === ch.route_chosen ? ' selected' : '') + '>' +
+      escHtml(x.name || x.key) + '</option>').join('');
+  const notes = [];
+  if (ch.can_send === false) notes.push(t('ch.cant_send'));
+  if (!ch.route) notes.push(t('ch.route_needed'));
+  return '<div class="ch-send">' +
+    '<label class="switch"><input type="checkbox"' + (ch.send ? ' checked' : '') + (ch.route ? '' : ' disabled') +
+      ' onchange="setChannel(' + jsq(ch.id) + ', {send: this.checked})">' +
+      '<span class="track" aria-hidden="true"><span class="thumb"></span></span>' +
+      '<span class="switch-label">' + escHtml(t('ch.send')) + '</span></label>' +
+    '<p class="muted small">' + escHtml((ch.window_hours || 0) >= 48
+      ? t('ch.send_hint_days', {days: fmtN(Math.round(ch.window_hours / 24))})
+      : t('ch.send_hint', {hours: fmtN(ch.window_hours || 0)})) + '</p>' +
+    '<div class="form-group"><label class="form-label" for="ch-route-' + escHtml(ch.id) + '">' + escHtml(t('ch.route')) + '</label>' +
+      '<select class="form-input" id="ch-route-' + escHtml(ch.id) + '" onchange="setChannel(' + jsq(ch.id) + ', {route: this.value})">' +
+      options + '</select></div>' +
+    '<div class="form-group"><label class="form-label" for="ch-cap-' + escHtml(ch.id) + '">' + escHtml(t('ch.cap')) + '</label>' +
+      '<input type="number" min="0" max="500" class="form-input" id="ch-cap-' + escHtml(ch.id) + '" value="' + escHtml(String(ch.daily_cap || 0)) +
+      '" onchange="setChannel(' + jsq(ch.id) + ', {daily_cap: Math.max(0, Math.round(Number(this.value) || 0))})"></div>' +
+    '<p class="muted small">' + escHtml(t('ch.sent_today', {n: fmtN(sentToday || 0), cap: fmtN(ch.daily_cap || 0)})) + '</p>' +
+    '<label class="small"><input type="checkbox"' + (ch.paused ? ' checked' : '') +
+      ' onchange="setChannel(' + jsq(ch.id) + ', {paused: this.checked})"> ' + escHtml(t('ch.pause')) + '</label>' +
+    notes.map(n => '<p class="small" style="color:var(--bad)">' + escHtml(n) + '</p>').join('') +
+  '</div>';
+}
+
+// The sending hours, the credits caps and what was spent.
+function channelSpendHtml(s) {
+  const sp = s.spend || {};
+  const num = v => v === null || v === undefined ? '' : String(v);
+  const field = (id, label, value, type, extra) => '<div class="form-group"><label class="form-label" for="' + id + '">' +
+    escHtml(label) + '</label><input class="form-input" id="' + id + '" type="' + type + '" value="' + escHtml(value) + '"' + (extra || '') + '></div>';
+  const usd = sp.usd_today !== null && sp.usd_today !== undefined
+    ? t('ch.spend_usd', {today: fmtN(sp.usd_today), month: fmtN(sp.usd_month)}) : '';
+  const notes = [];
+  if (s.credits_out) notes.push(t('ch.credits_out'));
+  if ((s.optout_sync || {}).problem_kind === 'forbidden') notes.push(t('ch.sync_forbidden'));
+  if (s.still_listed) notes.push(t('ch.still_listed', {n: s.still_listed}));
+  return '<div class="settings-row"><div><h3>' + escHtml(t('ch.sending_title')) + '</h3>' +
+      '<p class="muted small">' + escHtml(t('ch.spend', {today: fmtN(sp.credits_today || 0), month: fmtN(sp.credits_month || 0)})) + escHtml(usd) + '</p>' +
+      (sp.unpriced ? '<p class="muted small">' + escHtml(t('ch.unpriced', {n: sp.unpriced})) + '</p>' : '') +
+      notes.map(n => '<p class="small" style="color:var(--bad)">' + escHtml(n) + '</p>').join('') +
+      '<p class="muted small">' + escHtml(t('ch.hours_hint')) + '</p></div>' +
+    '<div class="fields">' +
+      field('ch-start', t('ch.hours_start'), (s.send_hours || {}).start || '09:00', 'time') +
+      field('ch-end', t('ch.hours_end'), (s.send_hours || {}).end || '20:00', 'time') +
+      field('ch-cday', t('ch.credits_day'), num(sp.credits_per_day), 'number', ' min="0" step="any" placeholder="' + escHtml(t('ch.blank_none')) + '"') +
+      field('ch-cmonth', t('ch.credits_month'), num(sp.credits_per_month), 'number', ' min="0" step="any" placeholder="' + escHtml(t('ch.blank_none')) + '"') +
+      field('ch-usd', t('ch.usd_per_credit'), num(sp.usd_per_credit), 'number', ' min="0" step="any"') +
+      '<div class="btn-group"><button class="btn btn-secondary btn-sm" onclick="saveChannelSettings()">' + escHtml(t('ch.save')) + '</button></div>' +
+    '</div></div>';
+}
+
+async function setChannel(channel, change) {
+  const res = await api('/api/channels/' + encodeURIComponent(channel), {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(change),
+  });
+  if (!(res && res.success)) showToast(failMsg(res, t('ch.connect_failed')), 'error');
+  loadChannelsCard();
+}
+
+async function saveChannelSettings() {
+  const v = id => String((document.getElementById(id) || {}).value || '').trim();
+  const n = id => v(id) === '' ? null : Number(v(id));
+  const res = await api('/api/channels/settings', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({send_start: v('ch-start'), send_end: v('ch-end'), credits_per_day: n('ch-cday'),
+                          credits_per_month: n('ch-cmonth'), usd_per_credit: n('ch-usd')}),
+  });
+  showToast(res && res.success ? t('ch.saved') : failMsg(res, t('ch.connect_failed')),
+            res && res.success ? 'success' : 'error');
+  loadChannelsCard();
+}
 
 async function loadChannelsCard() {
   const el = document.getElementById('channels-card');
@@ -5653,13 +5772,14 @@ async function loadChannelsCard() {
         ? t('ch.no_receive') : t('ch.receive_unknown')) + '</span></li>').join('');
     const notes = [];
     if (ch.can_read === false) notes.push(t('ch.cant_read'));
-    if (ch.gap) notes.push(t('ch.gap', {why: ch.gap.reason || ''}));
+    if (ch.gap) notes.push(t('ch.gap_window', gapWindow(ch.gap.since, ch.gap.covered_from)));
     if (ch.problem) notes.push(t('ch.problem', {why: ch.problem}));
     return '<div class="module-row"><div class="module-text">' +
       '<h3>' + escHtml(ch.label) + '</h3>' +
       '<p class="muted small">' + escHtml(t('ch.last_read')) + ' ' + unixRel(ch.last_read_at) + '</p>' +
       (senders ? '<ul class="small">' + senders + '</ul>' : '<p class="muted small">' + escHtml(t('ch.no_senders')) + '</p>') +
       notes.map(n => '<p class="small" style="color:var(--bad)">' + escHtml(n) + '</p>').join('') +
+      (s.connected ? channelSendHtml(ch, ((s.spend || {}).sent_today || {})[ch.id]) : '') +
       '</div><label class="switch"><input type="checkbox"' + (ch.receive ? ' checked' : '') +
       ' onchange="setChannelReceive(' + jsq(ch.id) + ', this.checked)">' +
       '<span class="track" aria-hidden="true"><span class="thumb"></span></span>' +
@@ -5676,7 +5796,7 @@ async function loadChannelsCard() {
         '<button class="btn btn-secondary" onclick="toggleVisibility(\'npathi-key\')">' + escHtml(t('common.show')) + '</button></div></div>' +
       '<div class="btn-group"><button class="btn btn-primary btn-sm" onclick="connectChannels()">' + escHtml(t('ch.connect')) + '</button>' +
         (s.key_set && s.base_url ? '<button class="btn btn-secondary btn-sm" onclick="testChannels()">' + escHtml(t('ch.test')) + '</button>' : '') +
-      '</div></div></div>' + rows;
+      '</div></div></div>' + rows + (s.connected ? channelSpendHtml(s) : '');
 }
 
 async function connectChannels() {
@@ -7569,7 +7689,33 @@ function convoCard(c) {
       (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
       stage + badge(c.status) + '</div></div>' +
     '<div class="thread">' + (thread || '<p class="muted small">' + escHtml(t('cv.no_messages')) + '</p>') +
-    draft + '</div>' + convoActions(c) + '</div>';
+    draft + '</div>' + convoAnswer(c) + convoActions(c) + '</div>';
+}
+
+// An answer you write to an SMS or WhatsApp conversation: back to the number
+// it came from, queued in the Outbox for your approval like any other.
+function convoAnswer(c) {
+  if (!c.can_answer || c.draft) return '';
+  const ch = channelName((c.handle && c.handle.channel) || c.channel);
+  const id = 'cv-answer-' + c.id;
+  return '<div class="convo-answer"><label class="form-label" for="' + escHtml(id) + '">' + escHtml(t('cv.answer', {channel: ch})) + '</label>' +
+    '<textarea class="form-input" id="' + escHtml(id) + '" rows="3" maxlength="' + (MESSAGE_MAX[(c.handle || {}).channel] || 300) +
+      '" placeholder="' + escHtml(t('cv.answer_ph')) + '"></textarea>' +
+    '<p class="muted small">' + escHtml(t('cv.answer_note')) + '</p>' +
+    '<button class="btn btn-secondary btn-sm" onclick="answerConvo(' + jsq(c.id) + ')">' + escHtml(t('cv.answer_queue')) + '</button></div>';
+}
+
+async function answerConvo(id) {
+  const el = document.getElementById('cv-answer-' + id);
+  const body = String((el && el.value) || '').trim();
+  if (!body) { showToast(t('desk.need_body'), 'error'); return; }
+  const data = await api('/api/conversations/' + encodeURIComponent(id) + '/answer', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({body: body}),
+  });
+  if (data && data.success) showToast(t('cv.answer_queued'), 'success');
+  else showToast(failMsg(data, t('cv.answer_failed')), 'error');
+  loadConversations();
+  loadToday();
 }
 
 // Harvey answers new replies only on open conversations: an escalated one

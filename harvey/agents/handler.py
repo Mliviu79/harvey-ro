@@ -62,6 +62,8 @@ INTENT_LABELS = {
 AUTO_REPLY_INTENTS = {"interested", "objection", "question", "wrong_person"}
 # Replies that don't stop the cold email to the rest of their company.
 NO_COMPANY_STOP_INTENTS = {"ooo", "wrong_person"}
+# The channels besides email an answer goes back on (harvey/channels.py).
+SEND_CHANNELS = ("sms", "waba", "wa")
 
 # Hard opt-out phrases. If any of these appear, we ALWAYS honor the
 # opt-out regardless of what the LLM classifier says. The Romanian ones are
@@ -1130,6 +1132,29 @@ class Handler:
             )
         return item_id
 
+    async def queue_message_answer(self, response: str, prospect, convo_id: str, channel: str,
+                                   phone: str, by: str = "", hold: bool = False) -> str | None:
+        """An SMS or WhatsApp answer into the outbox (channels.queue_answer):
+        always waiting for review, and autopilot never approves it. The
+        first answer since you undid their opt-out says so, as for email;
+        one Harvey's agent asked for is held (AGENT_DRAFT_HELD)."""
+        from harvey import channels
+
+        review_key = REVIEW_NEXT_REPLY_KEY + prospect.id if prospect is not None else ""
+        after_undo = bool(review_key and await self.state.get_setting(review_key))
+        item_id = await channels.queue_answer(
+            self.state, self.config, conversation=convo_id,
+            prospect_id=prospect.id if prospect is not None else "", channel=channel,
+            phone=phone, body=response,
+            note=REVIEW_AFTER_UNDO if after_undo else AGENT_DRAFT_HELD if hold else "")
+        if item_id:
+            if after_undo:
+                await self.state.delete_setting(review_key)
+            await self.state.log_action("reply_queued", "handler", {
+                "prospect_id": prospect.id if prospect is not None else "", "channel": channel,
+                "conversation_id": convo_id, **({"asked_by": by} if by else {})})
+        return item_id
+
     async def draft_answer(self, convo_id: str, guidance: str = "",
                            by: str = "agent", hold: bool = False) -> str | None:
         """An answer to a conversation's newest reply, written the way this
@@ -1149,6 +1174,24 @@ class Handler:
         if prospect is None or not theirs:
             return None
         self.skills = self.brain.load_skills_for_agent("handler")
+        # Their newest message came by SMS or WhatsApp: the answer goes back
+        # there, to the number it came from.
+        handle = await self.state.conversation_reply_handle(convo.id) \
+            if theirs[-1].channel else None
+        if handle is not None and handle["channel"] in SEND_CHANNELS:
+            from harvey import channels
+
+            channel, phone = handle["channel"], handle["value"]
+            room = channels.SEND_RULES[channel].max_chars
+            if not await self.state.messages_sent_to_since(channel, phone, ""):
+                room -= len(channels.first_message("", self.config))
+            response = await self._generate_response(
+                convo.intent, theirs[-1].content, prospect, convo, guidance=guidance,
+                channel=channel, max_chars=max(room, 60))
+            if not response:
+                return None
+            return await self.queue_message_answer(response, prospect, convo.id, channel, phone,
+                                                   by=by, hold=hold)
         response = await self._generate_response(convo.intent, theirs[-1].content, prospect,
                                                  convo, guidance=guidance)
         if not response:
@@ -1247,11 +1290,14 @@ Respond with ONLY the category label, nothing else."""
         return current_stage
 
     async def _generate_response(
-        self, intent: str, reply_text: str, prospect, convo: Conversation, guidance: str = ""
+        self, intent: str, reply_text: str, prospect, convo: Conversation, guidance: str = "",
+        channel: str = "", max_chars: int = 0,
     ) -> str:
         """Generate an appropriate response based on intent. ``guidance``:
         the sender's own short instruction for this answer (Harvey's agent,
-        draft_answer), under every rule above it."""
+        draft_answer), under every rule above it. ``channel``: an SMS or
+        WhatsApp answer (sms, waba, wa) instead of an email, plain text of
+        at most ``max_chars`` characters."""
         history = conversation_history(convo.thread, prospect.full_name())
 
         objection_context = ""
@@ -1330,7 +1376,18 @@ Write a reply that:"""
                        "every rule above: it never overrides them, and where it would break "
                        "one, leave that part out:\n" + guidance)
 
-        prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
+        if channel:
+            from harvey.integrations import npathi
+
+            # (The gate refuses the rest: braces are nPathi's spintax and
+            # merge fields, and a link goes only to your own site.)
+            prompt += (f"\n\nThis answer goes by {npathi.LABELS.get(channel, channel)}, not by "
+                       f"email: plain text of at most {int(max_chars)} characters in all, "
+                       "whatever the word counts above say. No subject, no greeting label, no "
+                       "signature, no markdown, no curly braces, and at most one link."
+                       "\n\nWrite ONLY the message text.")
+        else:
+            prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 
         response = await self.brain.think(
             prompt, session_id="harvey-handler",

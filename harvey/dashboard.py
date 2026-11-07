@@ -691,7 +691,7 @@ async def trulyinbox_connect(request: Request):
     return {"success": True, "message": d.check_warmup_service(health, warmup).detail}
 
 
-# ── Settings → Channels: nPathi Chat (SMS, WhatsApp), receiving only ──
+# ── Settings → Channels: nPathi Chat (SMS, WhatsApp): reading, and the answers you approve ──
 
 
 async def _npathi_module_on(state):
@@ -781,10 +781,14 @@ async def channels_test():
     return {"success": True, "status": await channels.status(state)}
 
 
-@app.post("/api/channels/{channel}")
-async def channels_receive(channel: str, request: Request):
-    """Turn reading one channel's inbound messages on or off."""
+@app.post("/api/channels/settings")
+async def channels_settings(request: Request):
+    """The sending hours and the credits caps: {send_start, send_end
+    ("HH:MM"), credits_per_day, credits_per_month, usd_per_credit (a number,
+    or null for none)}; any of them."""
     from harvey import channels
+    from harvey.integrations import npathi
+    from harvey.modules import switches
 
     state = _state()
     await state.init_db()
@@ -795,11 +799,73 @@ async def channels_receive(channel: str, request: Request):
         data = await request.json()
     except Exception:
         data = None
-    on = data.get("receive") if isinstance(data, dict) else None
-    if channel not in channels.CHANNELS or not isinstance(on, bool):
-        return JSONResponse({"success": False, "message": "Say which channel, and receive "
-                             "true or false."}, status_code=400)
-    await channels.set_receiving(state, channel, on)
+    if not isinstance(data, dict) or not data:
+        return _refuse("expected the settings to change", 400)
+    for key in ("send_start", "send_end"):
+        if key in data and not (isinstance(data[key], str) and channels._TIME_RE.match(data[key])):
+            return _refuse(f"{key} is a time like 09:00", 400)
+    for key in ("credits_per_day", "credits_per_month", "usd_per_credit"):
+        value = data.get(key)
+        if key in data and value is not None and (isinstance(value, bool) or not isinstance(
+                value, (int, float)) or value < 0):
+            return _refuse(f"{key} is a number of at least 0, or null for none", 400)
+    unknown = set(data) - {"send_start", "send_end", "credits_per_day", "credits_per_month",
+                           "usd_per_credit"}
+    if unknown:
+        return _refuse(f"unknown settings: {', '.join(sorted(unknown))}", 400)
+    for key, value in data.items():
+        await switches.set_module_setting(state, npathi.MODULE, key,
+                                          "" if value is None else value)
+    return {"success": True, "status": await channels.status(state)}
+
+
+@app.post("/api/channels/{channel}")
+async def channels_receive(channel: str, request: Request):
+    """One channel's switches: {receive: bool} reads its inbound messages,
+    {send: bool} sends the answers you approve on it, {route: "<type>:<id>"}
+    chooses the sender they go from (one a reply can come back to; "" none),
+    {daily_cap: n} caps them a day, {paused: bool} its own kill switch."""
+    from harvey import channels
+    from harvey.integrations import npathi
+    from harvey.modules import switches
+
+    state = _state()
+    await state.init_db()
+    refused = await _npathi_module_on(state)
+    if refused is not None:
+        return refused
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    data = data if isinstance(data, dict) else {}
+    checks = {"receive": bool, "send": bool, "paused": bool, "route": str, "daily_cap": int}
+    if channel not in channels.CHANNELS or not data or any(
+            k not in checks or not isinstance(v, checks[k]) or (
+                checks[k] is int and isinstance(v, bool)) for k, v in data.items()):
+        return JSONResponse({"success": False, "message": "Say which channel, and what to "
+                             "change: receive, send, paused (true or false), route or "
+                             "daily_cap."}, status_code=400)
+    if "route" in data:
+        try:
+            await channels.set_route(state, channel, data["route"])
+        except ValueError as e:
+            return _refuse(str(e), 400)
+    if data.get("send") is True and not await channels.route(state, channel):
+        return _refuse("Choose the sender answers go from first (one a reply can come "
+                       "back to).", 409)
+    if "receive" in data:
+        await channels.set_receiving(state, channel, data["receive"])
+    if "send" in data:
+        await channels.set_sending(state, channel, data["send"])
+    if "daily_cap" in data:
+        await switches.set_module_setting(state, npathi.MODULE,
+                                          channels.CAP_SETTING.format(channel), data["daily_cap"])
+    if "paused" in data:
+        if data["paused"]:
+            await state.set_setting(channels.PAUSED_KEY + channel, "paused from dashboard")
+        else:
+            await state.delete_setting(channels.PAUSED_KEY + channel)
     return {"success": True, "status": await channels.status(state)}
 
 
@@ -2088,9 +2154,25 @@ async def get_usage():
     except Exception as e:
         logger.debug("Quota lookup failed: %s", e)
 
+    # The SMS and WhatsApp answers sent through nPathi Chat: credits, not
+    # tokens (and USD when a credit's worth is entered).
+    messages = None
+    try:
+        from harvey import channels
+        from harvey.integrations import npathi
+        from harvey.modules import switches
+
+        state = _state()
+        await state.init_db()
+        if await switches.is_enabled(state, npathi.MODULE):
+            messages = await channels.spend(state)
+    except Exception as e:
+        logger.debug("Messaging spend not read: %s", e)
+
     return {
         "provider": provider,
         "quota": quota,
+        "messages": messages,
         # Whose quota this is, even when it couldn't be read, so the UI shows
         # "unavailable" for the active provider instead of hiding the gauge.
         "quota_provider": provider,
@@ -3101,10 +3183,14 @@ async def _overlay_contact_export(state, f, request: Request) -> tuple[list[dict
     # reaches) as well as compliance.do_not_contact.
     suppressed = await state.suppressed_emails(
         [r["value"] for r in rows if r["kind"] == "email"])
+    # (And the numbers: a STOP, nPathi's opt-out list, a firm they reach.)
+    suppressed |= await state.suppressed_phones(
+        [r["value"] for r in rows if r["kind"] == "phone"])
     out = []
     for r in rows:
-        if r["kind"] == "email" and (r["value"] in suppressed or (
-                blocked and do_not_contact_match(r["value"], blocked))):
+        if r["kind"] in ("email", "phone") and r["value"] in suppressed:
+            continue
+        if r["kind"] == "email" and blocked and do_not_contact_match(r["value"], blocked):
             continue
         if blocked and any(d and do_not_contact_domain_match(d, blocked) for d in r["domains"]):
             continue
@@ -3235,6 +3321,18 @@ async def _with_context_overlay(items: list[dict]) -> list[dict]:
     return items
 
 
+def _outbox_rows(rows: list[dict]) -> list[dict]:
+    """Outbox rows as the page shows them: an SMS or WhatsApp answer's
+    number masked, as phones are everywhere outside Contacts (the page
+    names it by its channel and the masked number)."""
+    from harvey.agent.readonly import mask
+
+    for row in rows:
+        if row.get("to_phone"):
+            row["to_phone"] = mask(row["to_phone"])
+    return rows
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""
@@ -3247,15 +3345,15 @@ async def get_outbox_api():
         return {
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_context(
-                await state.get_outbox(status="pending_review", limit=100)),
+            "pending": _outbox_rows(await _with_context(
+                await state.get_outbox(status="pending_review", limit=100))),
             # Mail going out right now leads the list.
-            "approved": (await state.get_outbox(status="sending", limit=10)
-                         + await state.get_outbox(status="approved", limit=50)),
-            "sent": (await query_db(
+            "approved": _outbox_rows(await state.get_outbox(status="sending", limit=10)
+                                     + await state.get_outbox(status="approved", limit=50)),
+            "sent": _outbox_rows(await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
-            "failed": (await query_db(
+            "failed": _outbox_rows(await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
         }
@@ -3327,11 +3425,32 @@ async def outbox_approve_all():
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+async def _message_problems(state, item: dict, body: str) -> list[str]:
+    """What the gate would refuse in an SMS or WhatsApp answer's text, as
+    it would send it now (a first answer to the number needs the firm's
+    name and the opt-out line)."""
+    from harvey import channels, gate
+
+    rules = channels.SEND_RULES.get(item.get("channel") or "")
+    if rules is None:
+        return ["not a messaging channel"]
+    first = not await state.messages_sent_to_since(item["channel"], item.get("to_phone") or "", "")
+    return gate.message_problems(body, max_chars=rules.max_chars,
+                                 config=_load_config_quietly(), first=first)
+
+
 @app.post("/api/outbox/{item_id}/approve")
 async def outbox_approve(item_id: str):
     try:
         state = _state()
         await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if item and (item.get("channel") or "email") != "email":
+            # An SMS or WhatsApp answer the gate would refuse isn't approved:
+            # it is edited first, while the reviewer can still fix it.
+            problems = await _message_problems(state, item, item.get("body") or "")
+            if problems:
+                return _refuse("The sender would block this message: " + "; ".join(problems))
         n = await state.approve_outbox(item_id)
         return {"success": bool(n)}
     except Exception as e:
@@ -3357,6 +3476,25 @@ async def outbox_edit(item_id: str, request: Request):
             return JSONResponse({"success": False,
                                  "message": "Only drafts awaiting review can be edited."},
                                 status_code=409)
+        if (item.get("channel") or "email") != "email":
+            # An SMS or WhatsApp answer: text only, checked as the messenger
+            # will check it (its length, braces, links, the first answer's
+            # firm name and opt-out line).
+            if not text:
+                return _refuse("The message is empty.", 400)
+            problems = await _message_problems(state, item, text)
+            if problems:
+                return _refuse("The sender would block this message: " + "; ".join(problems),
+                               400)
+            if not await state.edit_outbox_draft(item_id, "", text):
+                return _refuse("Only drafts awaiting review can be edited.")
+            from harvey.state import HELD_FOR_REVIEW
+
+            if (item.get("error") or "").startswith(HELD_FOR_REVIEW):
+                await state.update_outbox_item(item_id, error="")   # (what held it is fixed)
+            await state.log_action("outbox_edited", "dashboard", {
+                "outbox_id": item_id, "channel": item["channel"], "old_body": item.get("body", "")})
+            return {"success": True}
         if item.get("kind") == "reply":
             # Gmail threads a reply by its subject: a new one would land as a
             # fresh, unthreaded email to someone who wrote in. Only the body
@@ -4670,6 +4808,7 @@ async def get_conversations():
         "ORDER BY created_at", tuple(cids)) if cids else [])}
     # The number (or handle) an SMS or WhatsApp conversation came from,
     # masked as phones are everywhere else outside Contacts.
+    from harvey import channels
     from harvey.agent.readonly import mask
 
     handles = await _state().conversation_handles(cids)
@@ -4681,6 +4820,11 @@ async def get_conversations():
         handle = handles.get(row["id"])
         row["handle"] = ({"channel": handle["channel"], "value": mask(handle["value"])}
                          if handle else None)
+        # You can write an answer here when it came by SMS or WhatsApp: it
+        # goes back to the number, through the Outbox.
+        row["can_answer"] = bool(handle and handle["channel"] in channels.SEND_RULES
+                                 and row.get("status") != "closed"
+                                 and row.get("prospect_status") != "opted_out")
         # A prospect in two campaigns: show the sequence this reply answers.
         camp = row.get("campaign_id") or ""
         row["emails"] = [{k: v for k, v in e.items() if k != "campaign_id"}
@@ -4688,6 +4832,60 @@ async def get_conversations():
                          if not camp or e.get("campaign_id") == camp]
         row["draft"] = drafts.get(row["id"])
     return rows
+
+
+@app.post("/api/conversations/{convo_id}/answer")
+async def answer_conversation(convo_id: str, request: Request):
+    """An answer you write to an SMS or WhatsApp conversation: {"body"}. It
+    goes back to the number it came from on that channel, queued in the
+    Outbox like any answer (you approve it there), checked as the
+    messenger checks it."""
+    from harvey import channels
+    from harvey.agents.messenger import OUTSIDE_WINDOW
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    body = str((data or {}).get("body") or "").strip() if isinstance(data, dict) else ""
+    if not body:
+        return _refuse("Write the answer first.", 400)
+    state = _state()
+    await state.init_db()
+    convo = await state.get_conversation(convo_id)
+    if convo is None:
+        return _refuse("No such conversation.", 404)
+    handle = await state.conversation_reply_handle(convo_id)
+    if handle is None or handle["channel"] not in channels.SEND_RULES:
+        return _refuse("This conversation has no SMS or WhatsApp number to answer.", 409)
+    channel, phone = handle["channel"], handle["value"]
+    prospect = await state.get_prospect(convo.prospect_id) if convo.prospect_id else None
+    if prospect is not None and prospect.status == "opted_out":
+        return _refuse("They asked not to be contacted.", 409)
+    config = _load_config_quietly()
+    if await state.suppression_check(prospect.email if prospect else "", firm=(
+            prospect.company_id if prospect else handle.get("firm")), config=config,
+            phone=phone) is not None:
+        return _refuse("This number (or its person or firm) is on the do-not-contact list.", 409)
+    last = await state.last_inbound(channel, phone)
+    if last is None or time.time() - last > channels.SEND_RULES[channel].window_hours * 3600:
+        return _refuse(OUTSIDE_WINDOW[:1].upper() + OUTSIDE_WINDOW[1:] + ".", 409)
+    first = not await state.messages_sent_to_since(channel, phone, "")
+    from harvey import gate
+
+    text = channels.first_message(body, config) if first else body
+    problems = gate.message_problems(text, max_chars=channels.SEND_RULES[channel].max_chars,
+                                     config=config, first=first)
+    if problems:
+        return _refuse("The sender would block this message: " + "; ".join(problems), 400)
+    item = await channels.queue_answer(state, config, conversation=convo_id,
+                                       prospect_id=convo.prospect_id or "", channel=channel,
+                                       phone=phone, body=body)
+    if not item:
+        return _refuse("It couldn't be queued.", 409)
+    await state.log_action("answer_written", "dashboard",
+                           {"conversation_id": convo_id, "channel": channel, "outbox_id": item})
+    return {"success": True, "outbox_id": item, "status": "pending_review"}
 
 
 @app.post("/api/conversations/{convo_id}/status")
@@ -6145,7 +6343,7 @@ async def get_today():
             })
 
         # A messaging channel whose read didn't reach back to the last one:
-        # its sends wait (none go out on it yet), and a STOP may be unread.
+        # its answers wait, and a STOP may be unread.
         from harvey import channels as messaging
 
         for channel, gap in (await messaging.gaps(state)).items():
@@ -6154,8 +6352,9 @@ async def get_today():
                 "title": f"{channel.upper()} messages weren't all read",
                 "detail": ("The last read of this channel didn't reach back to the one before "
                            "it, so a message in between (a STOP too) may be unread. Harvey "
-                           "reads the missing part in the next cycles."),
-                "reason": gap.get("reason") or "",
+                           "reads the missing part in the next cycles, and answers on it wait."),
+                # (The page says the window in its own words.)
+                "since": gap.get("since"), "until": gap.get("covered_from"),
                 "action": "Open settings", "tab": "settings",
             })
 

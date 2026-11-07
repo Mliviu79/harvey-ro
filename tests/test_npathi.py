@@ -332,19 +332,19 @@ async def test_the_key_never_reaches_a_log(fake, caplog):
 
 # ── Schema 40 ──
 
-def test_a_schema_39_file_steps_up_to_40_once(tmp_path):
+def test_a_schema_39_file_steps_up_to_the_latest_once(tmp_path):
     path = tmp_path / "old.db"
     con = sqlite3.connect(path, isolation_level=None)
     schema.create(con, version=39)
     con.execute("INSERT INTO outbox (id, to_email, status) VALUES ('o1', 'a@example.com', 'sent')")
-    assert schema.step_up(con) == schema.LATEST == 40
+    assert schema.step_up(con) == schema.LATEST == 41
     assert schema.missing(con) == []
-    assert con.execute("SELECT channel, to_phone, price_credits FROM outbox").fetchone() == (
-        "email", "", None)
+    assert con.execute("SELECT channel, to_phone, price_credits, provider_status "
+                       "FROM outbox").fetchone() == ("email", "", None, "")
     names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
     assert set(schema.PHONE_SUPPRESSION_GUARD_NAMES) <= names
     assert set(schema.guard_names(con)) <= names
-    assert schema.step_up(con) == 40             # again: nothing to do
+    assert schema.step_up(con) == 41             # again: nothing to do
     con.close()
 
 
@@ -530,7 +530,7 @@ async def test_a_read_that_cant_reach_back_keeps_a_gap_until_it_is_read(state, f
     reader = MessageReader(_handler(state, fake), fake.transport())
     assert await reader.run()
     gap = await channels.read_gap(state, "sms")
-    assert gap and gap["since"] < gap["covered_from"] and "STOP" in gap["reason"]
+    assert gap and gap["since"] < gap["covered_from"] and gap["channel"] == "sms"
     assert await channels.last_read(state, "sms")        # what came after is read on
     monkeypatch.setattr(npathi, "MAX_PAGES", 20)
     assert await MessageReader(_handler(state, fake), fake.transport()).run()
@@ -732,9 +732,10 @@ def test_a_gap_is_a_today_item(client, env):
     async def seed():
         state = StateManager(db_path=str(env["db"]))
         await state.set_setting(channels.GAP_KEY + "sms", json.dumps(
-            {"since": 1, "covered_from": 2, "reason": "the SMS read couldn't reach back"}))
+            {"since": 1, "covered_from": 2, "channel": "sms"}))
 
     asyncio.run(seed())
     items = client.get("/api/today").json()["items"]
     item = next(i for i in items if i["key"] == "message-read-gap")
-    assert item["channel"] == "sms" and "reach back" in item["reason"]
+    # (The window as times: the page says it in its own words.)
+    assert (item["channel"], item["since"], item["until"]) == ("sms", 1, 2)

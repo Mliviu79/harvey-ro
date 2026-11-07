@@ -389,6 +389,11 @@ class PreclearedConfig(BaseModel):
 # recognised as its own text in a quoted reply.
 DEFAULT_OPT_OUT_LINE = 'Nu vă interesează? Răspundeți \u201estop" și nu vă mai scriu.'
 ENGLISH_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# Under the first SMS or WhatsApp answer to a number (an answer only:
+# Harvey never writes first there). Romanian by default; the English one
+# for an install whose email opt-out line is the English one.
+DEFAULT_MESSAGE_OPT_OUT_LINE = "Răspunde STOP ca să nu mai primești mesaje."
+ENGLISH_MESSAGE_OPT_OUT_LINE = "Reply STOP to stop these messages."
 # Under an answer autopilot sent with no one reading it first.
 DEFAULT_AI_DISCLOSURE_LINE = "Acest răspuns a fost scris cu ajutorul unui asistent AI."
 # The replies the Handler always honours as an opt-out on their own; an
@@ -426,9 +431,13 @@ class ComplianceConfig(BaseModel):
     # The line under an answer that autopilot sent by itself (never under
     # cold email, or an answer you approved). "" leaves it off.
     ai_disclosure_line: str = DEFAULT_AI_DISCLOSURE_LINE
+    # Under the first SMS or WhatsApp answer to a number (with the firm's
+    # name before it). "" is the default for the install's language
+    # (message_opt_out_line()); it can't be left off.
+    message_opt_out_line: str = ""
 
     @field_validator("postal_address", "opt_out_line", "privacy_url", "ai_disclosure_line",
-                     mode="before")
+                     "message_opt_out_line", mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
         return "" if v is None else v
@@ -477,6 +486,20 @@ class ComplianceConfig(BaseModel):
                     seen.append(cleaned)
         return seen
 
+    @field_validator("message_opt_out_line")
+    @classmethod
+    def _recognisable_message_opt_out(cls, v: str) -> str:
+        v = " ".join(v.split())
+        if not v:
+            return v
+        if any(bit in v.lower() for bit in ("http", "www.", "@", "{", "}")):
+            raise ValueError("message_opt_out_line can't contain a link, an email address or "
+                             "curly braces")
+        if not _ASKS_FOR_OPT_OUT_RE.search(v):
+            raise ValueError('message_opt_out_line must ask for a reply Harvey recognises as an '
+                             'opt-out, e.g. "Reply STOP" / "Răspunde STOP"')
+        return v[:120]
+
     @field_validator("opt_out_line")
     @classmethod
     def _recognisable_opt_out(cls, v: str) -> str:
@@ -496,6 +519,18 @@ class ComplianceConfig(BaseModel):
                 + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS) + "."
             )
         return v
+
+
+def message_opt_out_line(config) -> str:
+    """The line under a first SMS or WhatsApp answer: the configured one,
+    else the default in the install's language (English when its email
+    opt-out line is the English one)."""
+    compliance = compliance_of(config)
+    own = (compliance.message_opt_out_line or "").strip()
+    if own:
+        return own
+    return (ENGLISH_MESSAGE_OPT_OUT_LINE if compliance.opt_out_line.strip() == ENGLISH_OPT_OUT_LINE
+            else DEFAULT_MESSAGE_OPT_OUT_LINE)
 
 
 def compliance_of(config) -> ComplianceConfig:

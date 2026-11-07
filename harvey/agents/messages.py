@@ -18,8 +18,11 @@ as ``npathi:<id>``). For each message, in this order:
    firm, the message joins that firm's prospect (made for it when the firm
    has none) and its conversation: their queued email is cancelled
    (stop-on-reply works across channels), the Handler's classifier reads its
-   intent, and the company's cold email stops. A conversation that would get
-   an answer goes to the user: answering on these channels comes later.
+   intent, and the company's cold email stops. A message that gets an
+   answer, on a channel answers are sent on, has one drafted by the Handler
+   (its prompt and rules, the channel's length) and queued in the Outbox
+   for the user's approval (never autopilot's); otherwise it goes to the
+   user.
 3. A number shared by several firms (a chain's switchboard) or one Harvey
    doesn't know goes to the user as a conversation of its own; no firm is
    stopped, since nothing says which one wrote.
@@ -263,14 +266,16 @@ class MessageReader:
                 logger.info(f"Messages: {channel} read back completely; its gap is closed.")
             return
         start, end = min(a for a, _ in left), max(b for _, b in left)
-        reason = (f"the {npathi.LABELS[channel]} read couldn't reach back to the last complete "
-                  f"one (unread from {datetime.fromtimestamp(start, timezone.utc):%Y-%m-%d %H:%M} "
-                  f"to {datetime.fromtimestamp(end, timezone.utc):%Y-%m-%d %H:%M} UTC); a STOP "
-                  "in between may be unread")
         if not gap:
-            logger.warning(f"Messages: {reason}.")
+            frm = datetime.fromtimestamp(start, timezone.utc)
+            to = datetime.fromtimestamp(end, timezone.utc)
+            logger.warning(
+                f"Messages: the {npathi.LABELS[channel]} read couldn't reach back to the last "
+                f"complete one (unread from {frm:%Y-%m-%d %H:%M} to {to:%Y-%m-%d %H:%M} UTC); "
+                "a STOP in between may be unread.")
+        # (No sentence kept: the page says it in its own words from the times.)
         await self.state.set_setting(key, json.dumps(
-            {"since": start, "covered_from": end, "reason": reason, "channel": channel}))
+            {"since": start, "covered_from": end, "channel": channel}))
 
     # ── One message ──
 
@@ -350,18 +355,47 @@ class MessageReader:
                                  "why": "The model read the message as a request to stop."},
                                 key, **where)
             return
-        # An answer (AUTO_REPLY_INTENTS) or an escalation: the user's, until
-        # Harvey answers on this channel.
-        status = {"not_interested": "closed", "ooo": "open"}.get(intent, "needs_human")
+        # An answer (AUTO_REPLY_INTENTS) is drafted on the channel it came
+        # on, when answers are sent there, before anything is stored (the
+        # model can still fail); it waits in the Outbox for the user. An
+        # escalation, or a channel answers aren't sent on, is the user's.
+        from harvey.agents.handler import AUTO_REPLY_INTENTS
+
+        response = ""
+        if intent in AUTO_REPLY_INTENTS and phone \
+                and channel in await channels.sending(state):
+            response = await self._draft(channel, handle, phone, text, prospect, intent)
+        status = {"not_interested": "closed", "ooo": "open"}.get(
+            intent, "open" if response else "needs_human")
         convo = await self._record(**where, intent=intent, status=status)
         if intent == "not_interested":
             await state.update_prospect_status(prospect.id, "lost")
+        queued = None
+        if response:
+            queued = await handler.queue_message_answer(response, prospect, convo, channel, phone)
+            if not queued:
+                await state.update_conversation(convo, status="needs_human")
+                status = "needs_human"
         await state.log_action("message_received", "handler",
                                {"prospect_id": prospect.id, "channel": channel, "intent": intent,
-                                "conversation_id": convo})
+                                "conversation_id": convo, "answer_queued": bool(queued)})
         logger.info(f"Messages: {channel} message from {mask(handle)} ({intent})"
-                    + (": handed to you; answering on this channel comes later."
-                       if status == "needs_human" else "."))
+                    + (": an answer waits for your approval in the Outbox." if queued else
+                       ": handed to you." if status == "needs_human" else "."))
+
+    async def _draft(self, channel, handle, phone, text, prospect, intent) -> str:
+        """The Handler's answer to this message, written for the channel
+        (its length less what a first answer adds), on the conversation as
+        it will be; "" when the model gave none. Raises BrainUnavailable."""
+        convo = await self._conversation_for(channel, handle, prospect)
+        convo = convo.model_copy(deep=True) if convo is not None else Conversation(
+            id="", prospect_id=prospect.id, channel=channel)
+        convo.thread.append(Message(sender="prospect", content=text, channel=channel))
+        room = channels.SEND_RULES[channel].max_chars
+        if not await self.state.messages_sent_to_since(channel, phone, ""):
+            room -= len(channels.first_message("", self.handler.config))
+        return await self.handler._generate_response(
+            intent, text, prospect, convo, channel=channel, max_chars=max(room, 60))
 
     async def _opt_out(self, stop: dict, key: str, *, channel, handle, msg, text, prospect,
                        contact, firm) -> None:
@@ -418,17 +452,23 @@ class MessageReader:
         prospect.id = await self.state.add_prospect(prospect)
         return prospect
 
+    async def _conversation_for(self, channel, handle, prospect) -> Conversation | None:
+        """The conversation a message joins: the number's own, else the
+        prospect's open one, else None (a new one)."""
+        convo = await self.state.handle_conversation(channel, handle)
+        for status_now in (("needs_human", "open") if convo is None and prospect else ()):
+            convo = next((c for c in await self.state.get_conversations_by_status(status_now)
+                          if c.prospect_id == prospect.id), None)
+            if convo is not None:
+                break
+        return convo
+
     async def _record(self, *, channel, handle, msg, text, prospect, contact, firm, intent,
                       status, stage: str | None = None) -> str:
         """Add the message to the number's conversation (its own, else the
         prospect's open one, else a new one on this channel); its id."""
         state, handler = self.state, self.handler
-        convo = await state.handle_conversation(channel, handle)
-        for status_now in (("needs_human", "open") if convo is None and prospect else ()):
-            convo = next((c for c in await state.get_conversations_by_status(status_now)
-                          if c.prospect_id == prospect.id), None)
-            if convo is not None:
-                break
+        convo = await self._conversation_for(channel, handle, prospect)
         message = Message(sender="prospect", content=text, channel=channel,
                           timestamp=_naive_utc(msg.created_at))
         if convo is None:
@@ -481,15 +521,40 @@ class MessageReader:
         try:
             entries, complete = await client.unsubscribed()
         except npathi.NpathiError as e:
+            if e.kind == "forbidden":
+                # A key without unsubscribed.view: asking every cycle changes
+                # nothing, so it waits a day (the card says so).
+                await self.state.set_setting(channels.SYNC_KEY, str(int(time.time())))
+                await self.state.set_setting(channels.SYNC_PROBLEM_KEY, json.dumps(
+                    {"kind": e.kind, "at": int(time.time()),
+                     "retry_at": int(time.time() + channels.SYNC_EVERY_SECONDS)}))
+                logger.info("Messages: the key may not read nPathi's opt-out list "
+                            "(unsubscribed.view); tried again in a day.")
+                return
             logger.info(f"Messages: nPathi's opt-out list not read ({e.kind}); "
                         "tried again next cycle.")
             return
-        phones = [p for p in (phone_of(e["phone"]) for e in entries) if p]
-        added = await self.state.suppress_phones(phones, "by_hand", by=npathi.MODULE,
-                                                 note="on nPathi Chat's opt-out list")
+        listed: dict[str, float | None] = {}     # each number: when the list last named it
+        for entry in entries:
+            phone, at = phone_of(entry["phone"]), entry.get("at")
+            if phone:
+                prev = listed.get(phone)
+                listed[phone] = at if prev is None else max(prev, at) if at is not None else prev
+        # A number the user took off the list in Harvey after nPathi's list
+        # named it stays off: nPathi's own list is theirs to change there.
+        added, kept = await self.state.suppress_phones(
+            list(listed), "by_hand", by=npathi.MODULE, note="on nPathi Chat's opt-out list",
+            listed_at=listed)
+        await self.state.set_setting(channels.STILL_LISTED_KEY, json.dumps(
+            {"count": len(kept), "at": int(time.time())}))
+        if await self.state.get_setting(channels.SYNC_PROBLEM_KEY):
+            await self.state.delete_setting(channels.SYNC_PROBLEM_KEY)
         # (A list read part-way is read again in an hour.)
         await self.state.set_setting(channels.SYNC_KEY, str(int(
             time.time() if complete else time.time() - channels.SYNC_EVERY_SECONDS + 3600)))
         if added:
             logger.info(f"Messages: {added} number(s) from nPathi's opt-out list put on the "
                         "do-not-contact list.")
+        if kept:
+            logger.info(f"Messages: {len(kept)} number(s) you took off the do-not-contact list "
+                        "are still on nPathi's opt-out list: remove them there.")

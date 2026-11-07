@@ -3657,8 +3657,9 @@ def cmd_trulyinbox(args):
 
 
 def cmd_channels(args):
-    """nPathi Chat's SMS and WhatsApp channels (receiving only): the status,
-    a check of the key, connecting it, and each channel's switch."""
+    """nPathi Chat's SMS and WhatsApp channels: the status (reading and the
+    answers sent), a check of the key, connecting it, and each channel's
+    reading switch (sending answers is set on Settings → Channels)."""
     import getpass
 
     from dotenv import load_dotenv
@@ -3679,7 +3680,8 @@ def cmd_channels(args):
         return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     def show(st: dict) -> None:
-        print("\n  nPathi Chat (SMS, WhatsApp): replies only; Harvey never writes first.")
+        print("\n  nPathi Chat (SMS, WhatsApp): replies only; Harvey never writes first, and "
+              "every answer waits for your approval.")
         print(f"  Module:     {'on' if st['module_on'] else 'off (harvey modules enable npathi)'}")
         print(f"  Address:    {st['base_url'] or 'not set'}"
               + (f" ({st['base_url_problem']})" if st["base_url_problem"] else ""))
@@ -3699,10 +3701,23 @@ def cmd_channels(args):
                     f"last read {when(ch['last_read_at'])}; "
                     f"{len(ch['senders'])} sender(s), {len(receives)} that can receive")
             print(line)
+            sent = ((st.get("spend") or {}).get("sent_today") or {}).get(ch["id"], 0)
+            print(f"      answers: {'on' if ch.get('send') else 'off'}"
+                  + (f" from {ch['route']}" if ch.get("route") else ", no sender chosen")
+                  + f"; {sent} of {ch.get('daily_cap', 0)} sent today")
             if ch["gap"]:
-                print(f"      gap: {ch['gap'].get('reason')}")
+                print(f"      gap: unread from {when(ch['gap'].get('since'))} "
+                      f"to {when(ch['gap'].get('covered_from'))}")
             if ch["problem"]:
                 print(f"      last read failed: {ch['problem']}")
+        spend = st.get("spend") or {}
+        if spend:
+            print(f"  Credits:    {spend.get('credits_today', 0):g} today, "
+                  f"{spend.get('credits_month', 0):g} this month"
+                  + (f" (caps {spend.get('credits_per_day')}/day, "
+                     f"{spend.get('credits_per_month')}/month)"
+                     if spend.get("credits_per_day") is not None
+                     or spend.get("credits_per_month") is not None else ""))
         print()
 
     async def _run():

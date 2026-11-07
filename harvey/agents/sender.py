@@ -218,6 +218,7 @@ class Sender:
         due_before = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         await self._promote(due_before, QUIET_HOURS_SCAN)
         due = await self.state.get_outbox(
+            channel="email",
             status="approved", due_before=due_before,
             limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, skip_held_campaigns=True,
             kind="sequence",
@@ -227,6 +228,7 @@ class Sender:
             # must not hide a cleared follow-up and prevent the loop waking.
             seen = {item["id"] for item in due}
             follow_ups = await self.state.get_outbox(
+                channel="email",
                 status="approved", due_before=due_before,
                 limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, skip_held_campaigns=True,
                 follow_ups_only=True,
@@ -784,6 +786,7 @@ class Sender:
         # In quiet hours only cold email can go, so only cold email is
         # fetched: replies due ahead of it can't fill the page.
         due = await self.state.get_outbox(
+            channel="email",
             status="approved", due_before=now, limit=budget * 3,
             skip_unready_follow_ups=True, skip_held_campaigns=True,
             kind="sequence" if self.cold_only else None,
@@ -795,6 +798,7 @@ class Sender:
         # query of the same size.
         seen = {item["id"] for item in due}
         unchecked = [] if self.cold_only else await self.state.get_outbox(
+            channel="email",
             status="approved", due_before=now, limit=budget * 3,
             exclude_kind="sequence",
         )
@@ -805,6 +809,7 @@ class Sender:
             # which a stored verdict lets go out. Fetched on their own as well.
             seen.update(item["id"] for item in extra)
             follow_ups = await self.state.get_outbox(
+                channel="email",
                 status="approved", due_before=now, limit=budget * 3,
                 skip_unready_follow_ups=True, skip_held_campaigns=True,
                 follow_ups_only=True,

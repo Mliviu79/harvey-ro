@@ -9,14 +9,42 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Answering SMS and WhatsApp messages people send in.** When the
+  `npathi` module's **Send answers** is on for a channel (Settings →
+  Channels, with the sender answers go from: one a reply can come back to),
+  a message from a number that belongs to one firm, asking or interested,
+  gets an answer drafted by the Handler on that channel (plain text, 300
+  characters for SMS), and you can write one yourself on Conversations.
+  Every answer waits in the Outbox for your approval, one at a time:
+  autopilot never approves one and Approve all leaves them. The first
+  answer to a number names your firm and carries
+  `compliance.message_opt_out_line`. Before each send: only an answer
+  within the channel's window after their message (SMS 30 days, WhatsApp 24
+  hours; no templates yet), never a second one before they answer, the
+  do-not-contact list (the number, the person, the firm, the config list),
+  the sending hours (09:00-20:00) and quiet hours, a daily cap per channel
+  (20), credits caps per day and month, the text's rules (no curly braces,
+  one link to your own site, the banned phrases), and the kill switches
+  (the global one and a channel's own). Each send carries its outbox row's
+  Idempotency-Key, so one cut off goes again without sending twice (one
+  nPathi can't account for fails as possibly sent, and no other answer goes
+  to that number before they write again). With no price known, one answer
+  goes under a credits cap and the next waits until nPathi prices it. A 402
+  pauses the `npathi` lane; delivery is read back for a week (an
+  unsubscribed number goes on the do-not-contact list, an invalid one or one
+  with no WhatsApp is marked unreachable there), and none of it touches
+  email's caps, bounce rate or kill switch. Credits spent show on the card
+  and the Usage tab. The agent's `draft_reply` answers such a conversation on
+  its channel, held for you as always. Schema 41: `outbox.provider_status`
+  and `channel_unreachable`.
+
 - **SMS and WhatsApp replies, read through nPathi Chat.** A new module,
   `npathi` (off by default), reads the messages people send to your nPathi
   Chat numbers (SMS over a route that receives, WhatsApp Business, a paired
   WhatsApp number) into Conversations, in the Handler's cycle. Replies only:
   Harvey never writes first on these channels (Law 506/2004 art. 12 wants
-  consent, for companies too; WhatsApp forbids cold messages), and answering
-  from Harvey comes in a later version, so a message that wants an answer is
-  handed to you. An opt-out (STOP, "dezabonare", "nu mă mai contactați"...) is
+  consent, for companies too; WhatsApp forbids cold messages); answering them
+  is the entry above. An opt-out (STOP, "dezabonare", "nu mă mai contactați"...) is
   read first: the number goes on the do-not-contact list (a new phone scope,
   `suppression.check(phone=)`) and on nPathi's own list, and a number that
   belongs to one firm opts its person out, cancels their queued email and
@@ -1440,6 +1468,17 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Numbers on the do-not-contact list stay out of exports**: `harvey
+  export`, the companies export and the Contacts export leave them out.
+- **Undo opt-out lifts the person's number too** (a STOP by SMS), not only
+  their address; nPathi's own opt-out list stays yours to change there.
+- **nPathi's daily opt-out sync keeps your undo**: a number you took off the
+  list after nPathi's entry for it isn't put back, and the card counts the
+  ones nPathi still lists. A key that may not read that list waits a day,
+  not a cycle, and the card says so.
+- **A read gap is said in the page's language**: the gap keeps its window,
+  and Today and the card word it through their translations.
 
 - **The background's paid walk sees a firm that became searchable again
   at once.** Taking a found website back, or undoing a merge, now makes

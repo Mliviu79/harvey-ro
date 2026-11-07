@@ -111,9 +111,19 @@ async def collect_prospects(
             if not do_not_contact_match(r.get("email") or "", _do_not_contact(config))
             and r.get("email") not in suppressed]
 
+    # A number on the do-not-contact list (a STOP by SMS, nPathi's opt-out
+    # list, a firm it reaches) is left blank, whoever's row it is on.
+    numbers = {}
+    for r in rows:
+        company = companies.get(r.get("company_id") or "", {})
+        numbers[r["id"]] = _e164(r.get("phone") or company.get("phone") or "",
+                                 phone_region(company.get("location") or "", config))
+    barred = await state.suppressed_phones([n for n in numbers.values() if n])
     out = []
     for r in rows:
         company = companies.get(r.get("company_id") or "", {})
+        phone = "" if numbers.get(r["id"]) in barred else (
+            r.get("phone") or company.get("phone") or "")
         out.append({
             "email": r.get("email", ""),
             "first_name": r.get("first_name", ""),
@@ -130,7 +140,7 @@ async def collect_prospects(
             "source": r.get("source", ""),
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
-            "phone": r.get("phone") or company.get("phone") or "",
+            "phone": phone,
             "location": company.get("location") or "",
         })
     return out
@@ -184,6 +194,15 @@ async def collect_companies(state: StateManager, config=None,
         phone, phone_type, other_phones = _phone_columns(
             (c.get("phone") or best.get("phone") or "").strip(), region,
             site_phones.get(c["id"], []))
+        # Numbers on the do-not-contact list (the firm's own entry bars them
+        # all) are left out.
+        listed = await state.suppressed_phones(
+            [n for n in (_e164(x, region) for x in [phone, *other_phones.split("; ")]) if n],
+            firms=[c.get("id")])
+        if _e164(phone, region) in listed:
+            phone, phone_type = "", ""
+        other_phones = "; ".join(x for x in other_phones.split("; ")
+                                 if x and _e164(x, region) not in listed)
         out.append({
             "name": c.get("name", ""),
             "website": c.get("website", ""),
@@ -274,6 +293,23 @@ def _phone_columns(raw: str, region, site: list[str]) -> tuple[str, str, str]:
         seen.add(key)
         others.append(item.display if isinstance(item, PhoneHit) else item)
     return (main.display if main else raw, main.type if main else "", "; ".join(others))
+
+
+def _e164(raw: str, region=None) -> str:
+    """A number as the do-not-contact list keys it (E.164), "" when it
+    can't be read as one."""
+    from phonenumbers import PhoneNumberFormat, format_number
+
+    from harvey.collectors.phones import parse_phone
+
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        number = parse_phone(text, region)
+    except Exception:
+        return ""
+    return format_number(number, PhoneNumberFormat.E164) if number is not None else ""
 
 
 def _do_not_contact(config) -> list[str]:

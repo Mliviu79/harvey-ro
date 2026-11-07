@@ -1144,6 +1144,13 @@ select.form-input { cursor: pointer; }
 .thread-draft .sender .icon { width: 12px; height: 12px; }
 .td-body { font-size: var(--fs-ui); line-height: 1.55; white-space: pre-wrap; margin-bottom: 10px; }
 @media (max-width: 640px) { .thread-email, .thread-draft, .thread-msg { width: auto; max-width: 92%; } }
+/* An answer written to an SMS or WhatsApp conversation, and a channel's
+   sending controls on Settings → Channels. */
+.convo-answer { display: flex; flex-direction: column; gap: 6px; margin-top: var(--sp-3); }
+.convo-answer textarea { width: 100%; max-width: 100%; box-sizing: border-box; resize: vertical; }
+.convo-answer .btn { align-self: flex-start; }
+.ch-send { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px dashed var(--line); }
+.ch-send select, .ch-send input[type="number"] { max-width: 100%; }
 .convo-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
 .convo-actions .muted { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-caption); margin-right: auto; }
 .convo-actions .btn-ghost { margin-left: auto; }

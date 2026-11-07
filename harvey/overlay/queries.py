@@ -1552,3 +1552,74 @@ statement("overlay.messages.handles",
           "SELECT h.conversation, h.channel, h.value FROM json_each(?) j "
           "CROSS JOIN conversation_handle h WHERE h.conversation = j.value",
           params=('["c"]',), drives="j")
+
+# ── Answers sent on the messaging channels (harvey/agents/messenger.py, schema 41) ──
+# The number an answer to a conversation goes to: its handle that wrote in
+# last (the channel and the number, when it came, the contact and firm).
+statement("overlay.messages.reply_handle",
+          "SELECT h.channel, h.value, h.last_inbound_at, h.contact, h.firm "
+          "FROM conversation_handle h WHERE h.conversation = ? "
+          "ORDER BY h.last_inbound_at DESC LIMIT 1", params=("c",), bounded=True)
+# When a number last wrote in on a channel, in any conversation.
+statement("overlay.messages.last_inbound",
+          "SELECT MAX(h.last_inbound_at) FROM conversation_handle h "
+          "INDEXED BY conversation_handle_value WHERE h.channel = ? AND h.value = ?",
+          params=("sms", "+40722000102"))
+# Answers sent (or on their way) to a number on a channel since a time: a
+# second one before they write again is refused, and the first one ever
+# carries the firm's name and the opt-out line.
+statement("overlay.messages.sent_to_since",
+          "SELECT COUNT(*) FROM outbox INDEXED BY idx_outbox_to_phone "
+          "WHERE to_phone = ? AND to_phone != '' AND channel = ? "
+          "AND status IN ('sent', 'sending') AND COALESCE(sent_at, updated_at) >= ?",
+          params=("+40722000102", "sms", "2026-01-01"))
+# Answers to a number on a channel since a time that may have gone out
+# (failed as possibly sent: nPathi couldn't say, or Harvey couldn't finish
+# within a day): one is never followed by another before they write again.
+statement("overlay.messages.maybe_sent_to_since",
+          "SELECT COUNT(*) FROM outbox INDEXED BY idx_outbox_to_phone "
+          "WHERE to_phone = ? AND to_phone != '' AND channel = ? AND status = 'failed' "
+          "AND substr(error, 1, ?) = ? AND updated_at >= ?",
+          params=("+40722000102", "sms", 19, "may have gone out: ", "2026-01-01"))
+# A channel's answers handed to nPathi today (UTC): its daily cap. One
+# nPathi couldn't deliver afterwards (failed, with its sent_at) still counts.
+statement("overlay.messages.sent_today",
+          "SELECT COUNT(*) FROM outbox WHERE status IN ('sent', 'failed') AND channel = ? "
+          "AND sent_at IS NOT NULL AND date(sent_at) = date('now')", params=("sms",))
+# The credits the answers handed to nPathi since a time cost (every
+# messaging channel; a delivery that failed afterwards is charged as nPathi
+# reports it), and how many of them nPathi hasn't priced yet.
+statement("overlay.messages.credits_since",
+          "SELECT COALESCE(SUM(price_credits), 0), COUNT(*) - COUNT(price_credits) FROM outbox "
+          "WHERE status IN ('sent', 'failed') AND channel != 'email' AND sent_at IS NOT NULL "
+          "AND sent_at >= ?",
+          params=("2026-01-01",))
+# The newest price nPathi charged for an answer on a channel.
+statement("overlay.messages.last_price",
+          "SELECT price_credits FROM outbox WHERE status IN ('sent', 'failed') AND channel = ? "
+          "AND sent_at IS NOT NULL AND price_credits IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
+          params=("sms",), bounded=True)
+# A phone contact's line type (SMS goes to a mobile only).
+statement("overlay.messages.line_type",
+          "SELECT c.line_type FROM contact c WHERE c.kind = ? AND c.value = ?",
+          params=(2, "+40722000102"))
+# The numbers a channel can't reach (nPathi's invalid_number, no_whatsapp).
+statement("overlay.messages.unreachable",
+          "SELECT reason FROM channel_unreachable WHERE channel = ? AND value = ?",
+          params=("sms", "+40722000102"))
+statement("overlay.messages.mark_unreachable",
+          "INSERT INTO channel_unreachable (channel, value, reason, at) VALUES (?, ?, ?, ?) "
+          "ON CONFLICT (channel, value) DO UPDATE SET reason = excluded.reason, at = excluded.at",
+          params=("sms", "+40722000102", "invalid_number", 1))
+# Answers whose send was cut off (claimed and never finished): sent again
+# under the same Idempotency-Key.
+statement("overlay.messages.stale_sends",
+          "SELECT id FROM outbox WHERE status = 'sending' AND channel != 'email' "
+          "AND datetime(updated_at) < datetime(?)", params=("2026-01-01",))
+# Answers nPathi has but hasn't finished with (read back each cycle, the
+# oldest first, for a week).
+statement("overlay.messages.in_flight",
+          "SELECT id, channel, message_id, to_phone, conversation_id, prospect_id FROM outbox "
+          "WHERE status = 'sent' AND channel != 'email' AND message_id != '' "
+          "AND provider_status NOT IN ('delivered', 'read', 'failed', 'canceled') "
+          "AND sent_at >= ? ORDER BY sent_at LIMIT ?", params=("2026-01-01", 50), bounded=True)

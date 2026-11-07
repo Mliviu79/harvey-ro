@@ -1279,8 +1279,8 @@ and there is no switch for it. Romanian law (Law 506/2004 art. 12, which
 covers companies as well as people) wants prior consent before a commercial
 SMS or messaging-app message, and WhatsApp's own rules forbid cold messages.
 Answering someone who wrote to you is the lawful case, and that is what this
-is for. This version reads; answering from Harvey comes next, so for now a
-message that wants an answer is handed to you.
+is for: Harvey drafts the answer, you approve it in the Outbox, every time
+(autopilot never sends one).
 
 1. **Turn the module on**: Surse → nPathi Chat, or `harvey modules enable npathi`
    (it needs the Email module: the same cycle reads both).
@@ -1312,6 +1312,41 @@ first. Then, per message:
 
 A read that couldn't reach back to the last one shows on Today until Harvey has
 read the missing part. Reading costs nothing; nPathi bills sends, in credits.
+
+**Answering.** On Settings → Channels, per channel, choose the sender answers
+go from (one a reply can come back to: a SIM, a phone bridge or a GSM modem
+line, a WhatsApp Business number, a paired WhatsApp account; never a sender
+ID) and switch **Send answers** on (the key needs `sms.send` / `waba.send` /
+`wa.send`, and `rates.view` for the prices). Then:
+
+- A message from a number that belongs to one firm, asking a question or
+  showing interest, gets an answer drafted by the Handler (its usual prompt
+  and rules) as plain text, at most 300 characters for SMS. It waits in the
+  **Outbox** with its channel and the number masked: approve, edit or reject
+  it there, one at a time (Approve all leaves these). You can also write an
+  answer yourself on the **Conversations** page; it goes to the Outbox too.
+- The first answer to a number starts with your firm's name
+  (`persona.company`) and ends with an opt-out line
+  (`compliance.message_opt_out_line`; "Răspunde STOP ca să nu mai primești
+  mesaje." by default, the English one on an English install).
+- It goes only while the window after their own message is open (SMS: 30
+  days; WhatsApp: 24 hours; there are no templates yet, so nothing goes
+  outside it), never a second time before they write again, never to a number
+  (or a person or firm) on the do-not-contact list, only inside the sending
+  hours (09:00-20:00 in Harvey's time zone by default; quiet hours always
+  apply), at most 20 a day per channel by default, and inside the credits caps
+  you set. No curly braces (nPathi would fill them in) and at most one link, to
+  your own site.
+- If nPathi says the credits ran out, sending pauses (resume the `npathi` lane
+  on Coadă once credits are added); reading goes on. A number nPathi reports
+  as unsubscribed goes on the do-not-contact list; one it can't reach is
+  marked so for that channel. None of it touches email's daily cap, bounce
+  rate or kill switch.
+- Credits spent show on the card and on the Usage tab (in USD too once you
+  enter what a credit is worth). Exports leave out numbers on the
+  do-not-contact list, and undoing someone's opt-out lifts their number's
+  entry in Harvey too; nPathi's own opt-out list is yours to change there
+  (the card says how many numbers you undid are still on it).
 
 ---
 

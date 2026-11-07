@@ -1,13 +1,13 @@
 # nPathi Chat: SMS and WhatsApp messages people send in, read into
 # Harvey's conversations (harvey/integrations/npathi.py, the Handler's
-# cycle: harvey/agents/messages.py). Replies only: Harvey never writes
-# first on these channels. Romanian law (Law 506/2004 art. 12) wants
-# consent before a commercial SMS or app message, for a company too, and
-# WhatsApp's own rules forbid cold messages. This module reads what
-# arrives; answering is a later change.
+# cycle: harvey/agents/messages.py), and the answers to them, each approved
+# by the user in the Outbox (harvey/agents/messenger.py). Replies only:
+# Harvey never writes first on these channels. Romanian law (Law 506/2004
+# art. 12) wants consent before a commercial SMS or app message, for a
+# company too, and WhatsApp's own rules forbid cold messages.
 id = "npathi"
 name = "nPathi Chat (SMS, WhatsApp)"
-description = "Reads the SMS and WhatsApp messages people send to your nPathi Chat numbers into Harvey's conversations."
+description = "Reads the SMS and WhatsApp messages people send to your nPathi Chat numbers into Harvey's conversations, and sends the answers you approve."
 set = "original"
 kind = "action"
 version = "0.1.0"
@@ -19,12 +19,12 @@ requires = ["phones", "email_outreach"]
 default_enabled = false
 entry = "harvey.integrations.npathi"
 secrets = ["NPATHI_API_KEY"]
-terms_note = "nPathi Chat bills messages in credits on your own plan. Harvey only reads: the account, the channels, inbound messages and the opt-out list, and adds the people who ask Harvey to stop to that list."
+terms_note = "nPathi Chat bills messages in credits on your own plan. Harvey reads the account, the channels, inbound messages and the opt-out list, adds the people who ask Harvey to stop to that list, and sends only the answers you approve, to people who wrote in."
 
 [cost]
 as_of = 2026-11-06
 usd = 0.0
-note = "reading costs nothing; nPathi Chat bills sends in credits on your plan"
+note = "reading costs nothing; nPathi Chat bills each answer sent in credits on your plan"
 
 # The install's own address (https://...): nPathi Chat runs per customer,
 # so there is no default.
@@ -46,6 +46,82 @@ default = true
 [settings.receive_wa]
 type = "bool"
 default = false
+
+# Which channels answers are sent on (each answer still waits for your
+# approval), and from which sender: "<type>:<id>" as the account lists it,
+# one a reply can come back to (a SIM, a phone bridge or a GSM modem line;
+# a WABA number; a paired WhatsApp account). Off until you choose.
+[settings.send_sms]
+type = "bool"
+default = false
+
+[settings.send_waba]
+type = "bool"
+default = false
+
+[settings.send_wa]
+type = "bool"
+default = false
+
+[settings.route_sms]
+type = "str"
+max_length = 80
+
+[settings.route_waba]
+type = "str"
+max_length = 80
+
+[settings.route_wa]
+type = "str"
+max_length = 80
+
+# Answers a day per channel, at most.
+[settings.daily_cap_sms]
+type = "int"
+default = 20
+min = 0
+max = 500
+
+[settings.daily_cap_waba]
+type = "int"
+default = 20
+min = 0
+max = 500
+
+[settings.daily_cap_wa]
+type = "int"
+default = 20
+min = 0
+max = 500
+
+# The hours answers go out in (Harvey's own time zone, usage.quiet_hours;
+# quiet hours always apply as well).
+[settings.send_start]
+type = "str"
+default = "09:00"
+max_length = 5
+
+[settings.send_end]
+type = "str"
+default = "20:00"
+max_length = 5
+
+# Credits caps on the answers sent (UTC day and month; blank: none), and
+# what a credit is worth in USD (blank: caps and spend in credits only).
+[settings.credits_per_day]
+type = "float"
+min = 0.0
+max = 100000.0
+
+[settings.credits_per_month]
+type = "float"
+min = 0.0
+max = 1000000.0
+
+[settings.usd_per_credit]
+type = "float"
+min = 0.0
+max = 100.0
 
 # One request at a time, at most two a second; the X-RateLimit-* headers
 # and Retry-After hold the lane further when nPathi asks.
