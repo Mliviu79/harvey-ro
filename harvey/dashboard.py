@@ -3321,15 +3321,34 @@ async def _with_context_overlay(items: list[dict]) -> list[dict]:
     return items
 
 
-def _outbox_rows(rows: list[dict]) -> list[dict]:
+async def _channel_refusal(state, channel: str):
+    """The 409 for a row on ``channel`` whose module is off (an email while
+    the Email module is off, an SMS while nPathi's is), or None: such a row
+    stays listed, rejectable, and is neither approved nor sent."""
+    from harvey.modules import switches
+
+    problem = switches.channel_problem(await switches.enabled_ids(state), channel)
+    if problem is None:
+        return None
+    return JSONResponse(_error_body(problem, "message", success=False), status_code=409)
+
+
+def _outbox_rows(rows: list[dict], enabled: set[str] | None = None) -> list[dict]:
     """Outbox rows as the page shows them: an SMS or WhatsApp answer's
     number masked, as phones are everywhere outside Contacts (the page
-    names it by its channel and the masked number)."""
+    names it by its channel and the masked number), and, given the modules
+    that are on, ``off_module`` on a row whose channel's module is off (it
+    can't be approved or sent: the page says why)."""
     from harvey.agent.readonly import mask
 
     from harvey.agents.messenger import wait_code
+    from harvey.modules import switches
 
+    owners = switches.channel_owners()
     for row in rows:
+        owner = owners.get(row.get("channel") or "email")
+        if enabled is not None and owner and owner not in enabled:
+            row["off_module"] = owner
         if row.get("to_phone"):
             row["to_phone"] = mask(row["to_phone"])
             # Why an approved answer waits, named for the page to say it.
@@ -3347,14 +3366,17 @@ async def get_outbox_api():
         # A send cut off mid-way shows up under Didn't send even when Harvey
         # isn't running.
         await state.fail_stale_sending_outbox()
+        from harvey.modules import switches
+
+        on = await switches.enabled_ids(state)
         return {
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
             "pending": _outbox_rows(await _with_context(
-                await state.get_outbox(status="pending_review", limit=100))),
+                await state.get_outbox(status="pending_review", limit=100)), on),
             # Mail going out right now leads the list.
             "approved": _outbox_rows(await state.get_outbox(status="sending", limit=10)
-                                     + await state.get_outbox(status="approved", limit=50)),
+                                     + await state.get_outbox(status="approved", limit=50), on),
             "sent": _outbox_rows(await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
@@ -3423,6 +3445,10 @@ async def outbox_approve_all():
     try:
         state = _state()
         await state.init_db()
+        # (Approve all takes email only, so it needs the Email module.)
+        refused = await _channel_refusal(state, "email")
+        if refused:
+            return refused
         n = await state.approve_outbox()
         # Held ones (possible planted link or leak) are approved one by one.
         return {"success": True, "approved": n, "held": await state.count_held_for_review()}
@@ -3450,6 +3476,10 @@ async def outbox_approve(item_id: str):
         state = _state()
         await state.init_db()
         item = await state.get_outbox_item(item_id)
+        if item and item.get("status") == "pending_review":
+            refused = await _channel_refusal(state, item.get("channel") or "email")
+            if refused:
+                return refused
         if item and (item.get("channel") or "email") != "email":
             # An SMS or WhatsApp answer the gate would refuse isn't approved:
             # it is edited first, while the reviewer can still fix it.
@@ -3999,9 +4029,13 @@ async def export_selected_prospects(request: Request):
 # ── Modules: what Harvey is made of, and which parts are on ──
 #
 # The Email switch is the email_outreach module's. Off, the dashboard hides
-# its tabs and the heartbeat writes, sends and reads no mail at all.
+# its tabs (campaigns, the sending settings) and the heartbeat writes, sends
+# and reads no mail at all. "messages" isn't a switch: the Outbox,
+# Conversations and Today are shown while any module with message channels
+# is on (email_outreach, npathi: switches.messaging_shown).
 
 UI_MODULES = {"email": "email_outreach"}
+UI_SHOWN = ("messages",)
 
 
 async def _modules() -> dict:
@@ -4010,7 +4044,8 @@ async def _modules() -> dict:
     state = _state()
     await state.init_db()
     on = await switches.enabled_ids(state)
-    return {name: module_id in on for name, module_id in UI_MODULES.items()}
+    return {**{name: module_id in on for name, module_id in UI_MODULES.items()},
+            "messages": switches.messaging_shown(on)}
 
 
 @app.get("/api/ui/modules")
@@ -4020,7 +4055,7 @@ async def get_ui_modules():
         return {"modules": await _modules()}
     except Exception as e:
         logger.warning("modules read failed: %s", e)
-        return {"modules": dict.fromkeys(UI_MODULES, False)}
+        return {"modules": dict.fromkeys((*UI_MODULES, *UI_SHOWN), False)}
 
 
 @app.post("/api/ui/modules")
@@ -4823,6 +4858,9 @@ async def get_conversations():
     from harvey.agent.readonly import mask
 
     handles = await _state().conversation_handles(cids)
+    from harvey.modules import switches
+
+    on = await switches.enabled_ids(_state())
     for row in rows:
         try:
             row["thread"] = json.loads(row.get("thread_json", "[]"))
@@ -4831,9 +4869,11 @@ async def get_conversations():
         handle = handles.get(row["id"])
         row["handle"] = ({"channel": handle["channel"], "value": mask(handle["value"])}
                          if handle else None)
-        # You can write an answer here when it came by SMS or WhatsApp: it
-        # goes back to the number, through the Outbox.
+        # You can write an answer here when it came by SMS or WhatsApp (and
+        # that channel's module is on): it goes back to the number, through
+        # the Outbox.
         row["can_answer"] = bool(handle and handle["channel"] in channels.SEND_RULES
+                                 and switches.channel_problem(on, handle["channel"]) is None
                                  and row.get("status") != "closed"
                                  and row.get("prospect_status") != "opted_out")
         # A prospect in two campaigns: show the sequence this reply answers.
@@ -4876,6 +4916,9 @@ async def answer_conversation(convo_id: str, request: Request):
     handle = await state.conversation_reply_handle(convo_id)
     if handle is None or handle["channel"] not in channels.SEND_RULES:
         return _refuse("This conversation has no SMS or WhatsApp number to answer.", 409)
+    refused = await _channel_refusal(state, handle["channel"])
+    if refused:
+        return refused
     config = _load_config_quietly()
     if config is None:
         # (Quiet hours, the firm's name and the opt-out line are in it.)
@@ -6305,6 +6348,11 @@ _CHECKS_HELD = {
 }
 
 
+# Today's items that are about email only (see the end of get_today).
+_EMAIL_TODAY = frozenset({"provider", "sends-held", "read-gap", "ack", "precleared-hold",
+                          "campaign-checks", "setup"})
+
+
 @app.get("/api/today")
 async def get_today():
     """What needs a human, right now.
@@ -6327,6 +6375,9 @@ async def get_today():
         approved = await state.get_outbox(status="approved", limit=200)
         paused = await state.get_setting("sending_paused")
         counts = await state.count_prospects_by_status()
+        from harvey.modules import switches
+
+        email_on = await switches.is_enabled(state, switches.EMAIL_MODULE)
 
         convos = await query_db(
             "SELECT COUNT(*) AS n FROM conversations WHERE status = 'open'"
@@ -6348,6 +6399,9 @@ async def get_today():
             "open_conversations": open_convos,
             "needs_human": needs_human,
             "cold_waiting": len([i for i in pending + approved if i.get("kind") == "sequence"]),
+            # SMS and WhatsApp answers among them (the item then doesn't
+            # call them all emails).
+            "messages_pending": len([i for i in pending if (i.get("channel") or "email") != "email"]),
             "email_provider": _current_provider(),
             "unprofiled": unprofiled_count,
         }
@@ -6597,12 +6651,15 @@ async def get_today():
             })
 
         if pending:
+            what = "email" if not stats["messages_pending"] else "item"
             items.append({
                 "key": "outbox", "tone": "warn",
-                "title": (f"{len(pending)} email waiting for approval" if len(pending) == 1
-                          else f"{len(pending)} emails waiting for approval"),
+                "title": (f"{len(pending)} {what} waiting for approval" if len(pending) == 1
+                          else f"{len(pending)} {what}s waiting for approval"),
+                # (Autopilot is email's: with the Email module off nothing
+                # here is approved on its own.)
                 "detail": ("Nothing sends until you approve it. Read them one at a time."
-                           if _require_approval_now() else
+                           if _require_approval_now() or not email_on else
                            "Autopilot sends the rest on its own; these wait for you. "
                            "Read them one at a time."),
                 "action": "Open the decisions desk", "tab": "outbox",
@@ -6617,6 +6674,12 @@ async def get_today():
                 "action": "Read conversations", "tab": "conversations",
             })
 
+        # The items about email only (the mailbox, cold email, campaigns),
+        # marked so the page leaves them out while the Email module is off
+        # and Today is shown for another channel's Outbox and Conversations.
+        for item in items:
+            if item["key"] in _EMAIL_TODAY:
+                item["module"] = "email"
         return {"items": items, "stats": stats}
     except Exception as e:
         logger.exception("today load failed")

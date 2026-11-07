@@ -286,9 +286,11 @@ def test_sending_status_is_read_only_and_says_when_mail_can_go_out(client):
 
 
 def test_email_module_is_off_by_default_and_switches(client):
-    assert client.get("/api/ui/modules").json() == {"modules": {"email": False}}
+    # (messages: the Outbox and Conversations, shown with any channel's module.)
+    assert client.get("/api/ui/modules").json() == {"modules": {"email": False,
+                                                                "messages": False}}
     r = client.post("/api/ui/modules", json={"email": True})
-    assert r.json() == {"success": True, "modules": {"email": True}}
+    assert r.json() == {"success": True, "modules": {"email": True, "messages": True}}
     assert client.get("/api/ui/modules").json()["modules"]["email"] is True
 
     async def setting():
@@ -300,7 +302,8 @@ def test_email_module_is_off_by_default_and_switches(client):
     assert client.get("/api/ui/modules").json()["modules"]["email"] is False
 
 
-@pytest.mark.parametrize("body", [{}, {"email": "yes"}, {"sending": True}, ["email"], None])
+@pytest.mark.parametrize("body", [{}, {"email": "yes"}, {"sending": True}, ["email"], None,
+                                  {"messages": True}])
 def test_module_switch_refuses_anything_else(client, body):
     assert client.post("/api/ui/modules", json=body).status_code == 400
 

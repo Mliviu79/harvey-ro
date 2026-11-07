@@ -115,12 +115,12 @@
       <button data-tab="modules" onclick="showTab('modules', this)"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span class="label" data-i18n="nav.modules">Surse</span></button>
       <button data-tab="chat" onclick="showTab('chat', this)"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span class="label" data-i18n="nav.chat">Chat</span><span class="nav-count" id="nav-chat"></span></button>
     </div>
-    <div class="nav-group" data-module="email" hidden>
-      <div class="nav-label" data-i18n="nav.group.email">Email</div>
+    <div class="nav-group" data-module="messages" hidden>
+      <div class="nav-label" id="nav-group-messages" data-i18n="nav.group.email">Email</div>
       <button data-tab="today" onclick="showTab('today', this)"><svg class="icon" aria-hidden="true"><use href="#i-today"/></svg><span class="label" data-i18n="nav.today">Astăzi</span><span class="nav-count" id="nav-today"></span></button>
       <button data-tab="outbox" onclick="showTab('outbox', this)"><svg class="icon" aria-hidden="true"><use href="#i-outbox"/></svg><span class="label" data-i18n="nav.outbox">Coadă de trimitere</span><span class="nav-count" id="nav-outbox"></span></button>
       <button data-tab="conversations" onclick="showTab('conversations', this)"><svg class="icon" aria-hidden="true"><use href="#i-conversations"/></svg><span class="label" data-i18n="nav.conversations">Conversații</span><span class="nav-count" id="nav-conversations"></span></button>
-      <button data-tab="campaigns" onclick="showTab('campaigns', this)"><svg class="icon" aria-hidden="true"><use href="#i-campaigns"/></svg><span class="label" data-i18n="nav.campaigns">Campanii</span></button>
+      <button data-tab="campaigns" data-module="email" onclick="showTab('campaigns', this)"><svg class="icon" aria-hidden="true"><use href="#i-campaigns"/></svg><span class="label" data-i18n="nav.campaigns">Campanii</span></button>
     </div>
     <div class="nav-group">
       <div class="nav-label" data-i18n="nav.group.system">Sistem</div>
@@ -189,8 +189,8 @@
   </div>
 </div>
 
-<!-- Today: what needs a human (Email module) -->
-<div id="today" class="section" data-module="email">
+<!-- Today: what needs a human (any module with message channels) -->
+<div id="today" class="section" data-module="messages">
   <div class="section-head">
     <div>
       <h2 data-i18n="today.title">Astăzi</h2>
@@ -198,7 +198,7 @@
     </div>
   </div>
 
-  <div id="today-setup"></div>
+  <div id="today-setup" data-module="email" hidden></div>
 
   <div id="today-kpis"></div>
 
@@ -207,16 +207,20 @@
       <div class="subhead" data-i18n="today.needs_you">Așteaptă după tine</div>
       <div id="today-queue"></div>
 
+      <div data-module="email" hidden>
       <div class="subhead" data-i18n="today.pipeline_now">Unde e fiecare pas acum</div>
       <div class="card" id="live-status"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
+      </div>
 
       <div class="subhead"><span data-i18n="today.recent">Activitate recentă</span> <span class="hint"><a href="#" onclick="goTab('activity');return false" data-i18n="common.see_all">Vezi tot</a></span></div>
       <div class="card" id="today-activity"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
     </div>
 
     <aside>
+      <div data-module="email" hidden>
       <div class="subhead" data-i18n="today.by_stage">Contacte pe etape</div>
       <div class="card" id="today-figures"><p class="muted small" data-i18n="common.loading">Se încarcă…</p></div>
+      </div>
       <div class="facts" id="today-facts"></div>
       <div id="today-runs-block">
         <div class="subhead" data-i18n="today.runs">Rulări</div>
@@ -342,8 +346,8 @@
   <div id="campaigns-list"></div>
 </div>
 
-<!-- Outbox: the decisions desk (Email module) -->
-<div id="outbox" class="section" data-module="email">
+<!-- Outbox: the decisions desk (any module with message channels) -->
+<div id="outbox" class="section" data-module="messages">
   <div class="section-head">
     <div>
       <h2 data-i18n="ob.title">Coadă de trimitere</h2>
@@ -356,8 +360,8 @@
   <div id="outbox-list"></div>
 </div>
 
-<!-- Conversations (Email module) -->
-<div id="conversations" class="section" data-module="email">
+<!-- Conversations (any module with message channels) -->
+<div id="conversations" class="section" data-module="messages">
   <div class="section-head"><div><h2 data-i18n="cv.title">Conversații</h2><p data-i18n="cv.lede">Fiecare răspuns primit și cum l-a tratat Harvey.</p></div></div>
   <div id="conversations-list"></div>
 </div>

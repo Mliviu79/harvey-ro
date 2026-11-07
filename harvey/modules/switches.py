@@ -133,6 +133,41 @@ async def require(state, module_id: str, what: str = "") -> None:
         raise ModuleOff(module_id, what)
 
 
+# ── Message channels: the shared Outbox and Conversations ──
+#
+# A module that writes or answers messages declares its channels
+# (``channels`` in its manifest: email_outreach "email", npathi "sms",
+# "waba", "wa"). The Outbox and Conversations are shown while any such
+# module is on, and each row keeps its own channel's rules: one is approved
+# and sent only while the module of its channel is on.
+
+
+def channel_owners(mans=None) -> dict[str, str]:
+    """Each declared message channel and the module it belongs to."""
+    mans = manifests() if mans is None else mans
+    return {channel: m.id for m in mans for channel in m.channels}
+
+
+def messaging_shown(enabled: set[str]) -> bool:
+    """Whether the Outbox and Conversations are shown: some module that
+    writes or answers messages is on."""
+    return any(owner in enabled for owner in channel_owners().values())
+
+
+def channel_problem(enabled: set[str], channel: str) -> ValueError | None:
+    """Why a row on ``channel`` ("email" when blank) can't be approved or
+    sent with these modules on (a ModuleOff naming the channel's module),
+    or None. A channel no module declares has nothing that would send it."""
+    channel = channel or "email"
+    owner = channel_owners().get(channel)
+    if owner is None:
+        return ValueError(f"No module sends on the {channel!r} channel.")
+    if owner not in enabled:
+        return ModuleOff(owner, "Sending an email" if channel == "email"
+                         else f"Sending an answer on {channel}")
+    return None
+
+
 # A module's own settings ([settings] in its manifest), per install.
 SETTING_KEY = "modules.{}.{}"
 

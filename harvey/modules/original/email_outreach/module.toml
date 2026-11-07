@@ -9,6 +9,8 @@ version = "0.3.0"
 api = 1
 markets = []
 requires = ["email_verify"]
+# Its rows in the shared Outbox and Conversations: sent only while it is on.
+channels = ["email"]
 default_enabled = false
 entry = "harvey.main"
 secrets = [

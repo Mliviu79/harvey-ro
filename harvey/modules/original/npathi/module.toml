@@ -17,10 +17,10 @@ version = "0.1.0"
 api = 1
 markets = []
 # A number is matched to its firm through the contacts the phones module
-# keeps. The Email module's pages are where answers are approved (Outbox)
-# and written (Conversations), so it stays on with this one; its heartbeat
-# is no longer needed: the messaging loop doesn't wait on email.
-requires = ["phones", "email_outreach"]
+# keeps. Answers are approved in the Outbox and written on Conversations,
+# which any module with channels brings: the Email module can stay off.
+requires = ["phones"]
+channels = ["sms", "waba", "wa"]
 default_enabled = false
 entry = "harvey.integrations.npathi"
 secrets = ["NPATHI_API_KEY"]

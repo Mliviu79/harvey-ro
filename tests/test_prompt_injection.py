@@ -346,6 +346,8 @@ def test_training_on_your_site_marks_its_domain_as_yours():
     assert bare["channels"]["email"]["link_domains"] == ["acme.example"]
 
 
+# (Approving email needs the Email module on.)
+@pytest.mark.modules_on("email_outreach")
 def test_dashboard_approve_all_says_what_it_left(client):
     import asyncio
     import sqlite3

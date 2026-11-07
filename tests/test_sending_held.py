@@ -182,6 +182,7 @@ def test_when_the_heartbeat_records_a_hold(unread, paused, problem, expected):
     assert send_hold_reason(unread, paused, problem) == expected
 
 
+@pytest.mark.modules_on("email_outreach")   # (autopilot is the Email module's)
 def test_the_outbox_card_on_today_says_which_mode(client, monkeypatch):
     import harvey.dashboard as dash
     from tests.test_outbox_native import _now_iso

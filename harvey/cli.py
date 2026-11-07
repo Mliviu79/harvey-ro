@@ -544,14 +544,22 @@ def cmd_microsoft(args):
 
 
 def cmd_outbox(args):
-    """Review and approve queued outgoing emails."""
+    """Review and approve queued outgoing emails, and SMS and WhatsApp
+    answers. A row is approved only while its channel's module is on."""
+    from harvey.modules import switches
     from harvey.state import StateManager
 
     async def _outbox():
         state = StateManager()
         await state.init_db()
+        on = await switches.enabled_ids(state)
 
         if args.approve_all:
+            # (Approve all takes email only.)
+            problem = switches.channel_problem(on, "email")
+            if problem:
+                print(f"\n  {problem}\n")
+                sys.exit(1)
             n = await state.approve_outbox()
             print(f"\n  Approved {n} email(s). They'll send on schedule.")
             held = await state.count_held_for_review()
@@ -561,6 +569,12 @@ def cmd_outbox(args):
             print()
             return
         if args.approve:
+            item = await state.get_outbox_item(args.approve)
+            problem = switches.channel_problem(on, item.get("channel") or "email") \
+                if item and item.get("status") == "pending_review" else None
+            if problem:
+                print(f"\n  {problem}\n")
+                sys.exit(1)
             n = await state.approve_outbox(args.approve)
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
@@ -579,10 +593,22 @@ def cmd_outbox(args):
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
         print("  " + "=" * 60)
+        owners = switches.channel_owners()
         for item in pending:
-            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
-                  f"→ {item['to_email']}  (send {item['send_at'][:16]})")
-            print(f"  Subject: {item['subject']}")
+            channel = item.get("channel") or "email"
+            if channel == "email":
+                print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+                      f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+                print(f"  Subject: {item['subject']}")
+            else:
+                # (The number masked, as everywhere outside Contacts.)
+                from harvey.agent.readonly import mask
+
+                print(f"\n  [{item['id']}] {channel.upper()} answer → "
+                      f"{mask(item.get('to_phone') or '')}")
+            if owners.get(channel) and owners[channel] not in on:
+                print(f"  (The {owners[channel]} module is off: it can't be approved; "
+                      "reject it, or turn the module on.)")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
@@ -4185,7 +4211,7 @@ def main():
     sub.set_defaults(func=cmd_microsoft)
 
     # harvey outbox
-    sub = subparsers.add_parser("outbox", help="Review/approve queued emails")
+    sub = subparsers.add_parser("outbox", help="Review/approve queued emails and messages")
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")

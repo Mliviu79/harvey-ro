@@ -1056,6 +1056,20 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **The Outbox and Conversations no longer need the Email module.** They
+  (and Today) are shown while any module that writes or answers messages
+  is on: the Email module, or nPathi Chat for SMS and WhatsApp, which no
+  longer requires the Email module. Each row keeps its own channel's rules:
+  it is approved and sent only while its channel's module is on. With the
+  Email module off, an email queued from before stays listed and can be
+  rejected, but approving it (one by one, Approve all, `harvey outbox
+  --approve`) is refused, naming the module; Campaigns, the sending
+  settings and Today's email items stay hidden. With nPathi off, an SMS or
+  WhatsApp answer waits the same way and Conversations offers no answer
+  box. Modules declare their channels in their manifest (`channels`), one
+  module each. The kill switch still stops every channel. Harvey's agent
+  can't draft an answer (`draft_reply`) while the module of the channel it
+  would go by is off.
 - **A rolling campaign's hourly roll no longer reads its whole audience.**
   It reads the contacts that changed since its last roll and its
   candidates that came due (see Added); a roll with one changed contact

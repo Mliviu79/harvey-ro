@@ -577,8 +577,9 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
     Handler with the agent's guidance and queued for review as the Handler
     queues its own, held for the user even on autopilot. Refused when the conversation isn't one to
     answer (an opt-out, an escalation, a no, closed), an answer to it
-    waits already, its person or firm is on the do-not-contact list, or
-    Harvey's share of the Claude plan is used."""
+    waits already, its person or firm is on the do-not-contact list, the
+    module of the channel it would go by is off, or Harvey's share of the
+    Claude plan is used."""
     c = await _conversation(state, plan, chat, convo_id)
     if c["waiting"]:
         raise Refused(f"an answer to conversation {c['id']} waits already: the user reviews "
@@ -600,6 +601,15 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
             raise Refused(f"conversation {c['id']}'s newest message came by another channel "
                           "with no number to answer: the user answers it")
         phone = handle["value"]
+    # (Its channel's module must be on: an email answer while the Email
+    # module is off, or a text while nPathi's is, would wait in the Outbox
+    # with nothing that may send it.)
+    from harvey.modules import switches
+
+    off = switches.channel_problem(await switches.enabled_ids(state), c["channel"] or "email")
+    if off is not None:
+        raise Refused(f"conversation {c['id']}'s answer would go by {c['channel'] or 'email'}: "
+                      f"{off}; the user turns modules on, not the agent")
     prospect = await state.get_prospect(c["prospect_id"])
     if prospect is None or prospect.status == "opted_out":
         raise Refused(f"conversation {c['id']}'s person asked not to be contacted")

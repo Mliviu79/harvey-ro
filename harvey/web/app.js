@@ -1,7 +1,10 @@
 let currentTab = 'overview';
 let _companies = [], _prospects = [], _campaigns = [];
 let _desk = { items: [], i: 0 };
-let _modules = { email: false };   // dashboard modules (visibility only)
+// Dashboard modules (visibility only): email is the Email module's switch;
+// messages (Today, Outbox, Conversations) is on while any module with
+// message channels is (email_outreach, npathi).
+let _modules = { email: false, messages: false };
 
 // ── Appearance ──
 //
@@ -502,7 +505,7 @@ function showTab(id, btn) {
 function loadCurrentTab() {
   switch (currentTab) {
     case 'overview': loadOverview(); break;
-    case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
+    case 'today': if (_modules.email) { loadLiveStatus(); loadFunnel(); loadSetupStatus(); } loadToday(); loadTrend(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
     case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': loadCompanies(); break;
@@ -530,13 +533,20 @@ function applyModules() {
     if (el.classList.contains('section')) return;      // tabs show through showTab
     el.hidden = !_modules[el.dataset.module];
   });
+  // The group's name: Email while the Email module is on, else Messages
+  // (SMS and WhatsApp only).
+  const label = document.getElementById('nav-group-messages');
+  if (label) {
+    label.dataset.i18n = _modules.email ? 'nav.group.email' : 'nav.group.messages';
+    label.textContent = t(label.dataset.i18n);
+  }
   const sec = document.getElementById(currentTab);
   if (sec && sec.dataset.module && !_modules[sec.dataset.module]) showTab('overview');
 }
 
 async function loadModules() {
   const data = await api('/api/ui/modules');
-  if (data && data.modules) _modules = Object.assign({email: false}, data.modules);
+  if (data && data.modules) _modules = Object.assign({email: false, messages: false}, data.modules);
   applyModules();
 }
 
@@ -553,7 +563,7 @@ async function setModule(name, on) {
     body: JSON.stringify({[name]: !!on}),
   });
   if (res && res.success) {
-    _modules = Object.assign({email: false}, res.modules);
+    _modules = Object.assign({email: false, messages: false}, res.modules);
     applyModules();
     showToast(t(on ? 'mod.email.shown' : 'mod.email.hidden'), 'success');
     if (currentTab === 'overview') loadOverview();
@@ -1104,9 +1114,15 @@ function checkHelp(c) {
   return help === key ? (c.help || '') : help;
 }
 
-// ── Today: what needs a human (Email module) ──
+// ── Today: what needs a human (any module with message channels) ──
 
 let _setup = null;
+
+// Today's items to show: those about email only (marked module: email) are
+// left out while the Email module is off.
+function todayItems(data) {
+  return ((data && data.items) || []).filter(i => !i.module || _modules[i.module]);
+}
 
 async function loadToday() {
   const data = await api('/api/today');
@@ -1119,13 +1135,13 @@ async function loadToday() {
     return;
   }
 
-  navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
+  const items = todayItems(data);
+  navCount('nav-today', items.filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
   navCount('nav-conversations', (data.stats || {}).needs_human || 0);
   _todayStats = data.stats || {};
   renderFigures(_todayStats);
 
-  const items = data.items || [];
   if (!items.length) {
     el.innerHTML = '<div class="queue-clear">' +
       '<div class="queue-icon">' + icon('check') + '</div><div>' +
@@ -1175,7 +1191,7 @@ function todayItemText(it, stats) {
     case 'discover': return tr(t('today.item.discover'), t('today.item.discover_detail'), t('today.item.discover_action'));
     case 'profile': return tr(t('today.item.profile', {n: s.unprofiled || 0}), t('today.item.profile_detail'), t('today.item.profile_action'));
     case 'needs-human': return tr(t('today.item.needs_human', {n: s.needs_human || 0}), t('today.item.needs_human_detail'), t('today.item.needs_human_action'));
-    case 'outbox': return tr(t('today.item.outbox', {n: s.outbox_pending || 0}),
+    case 'outbox': return tr(t(s.messages_pending ? 'today.item.outbox_any' : 'today.item.outbox', {n: s.outbox_pending || 0}),
       /Autopilot/.test(it.detail || '') ? t('today.item.outbox_auto') : t('today.item.outbox_detail'), t('today.item.outbox_action'));
     case 'replies': return tr(t('today.item.replies', {n: s.open_conversations || 0}), t('today.item.replies_detail'), t('today.item.replies_action'));
     case 'read-gap': return tr(t('today.item.read_gap'), t('today.item.read_gap_detail'), t('today.item.open_log'));
@@ -2360,7 +2376,10 @@ async function loadUsage() {
 // wait in the rail.
 
 async function loadOutbox() {
-  const [data, mode] = await Promise.all([api('/api/outbox'), api('/api/sending-mode')]);
+  // (Approval or autopilot, the postal notice and Approve all are email's:
+  // with the Email module off the Outbox holds SMS and WhatsApp answers.)
+  const email = !!_modules.email;
+  const [data, mode] = await Promise.all([api('/api/outbox'), email ? api('/api/sending-mode') : null]);
   _sendingMode = mode && !mode.error ? mode : null;
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
@@ -2388,9 +2407,9 @@ async function loadOutbox() {
   navCount('nav-outbox', pending.length);
 
   // (SMS and WhatsApp answers are approved one at a time: Approve all leaves them.)
-  const approvable = pending.length - pending.filter(p => heldReason(p) || isMessage(p)).length;
+  const approvable = pending.length - pending.filter(p => heldReason(p) || isMessage(p) || p.off_module).length;
   actions.innerHTML =
-    (pending.length && !data.paused && approvable
+    (email && pending.length && !data.paused && approvable
       ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" title="' +
         escHtml(t('ob.approve_all_title')) + '">' + escHtml(t('ob.approve_all', {n: approvable})) + '</button>' : '') +
     (data.paused
@@ -2405,7 +2424,7 @@ async function loadOutbox() {
     : '');
   // Only once there is mail to warn about: a fresh install sends nothing.
   const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;
-  if (data.compliance_notice && anyMail) {
+  if (email && data.compliance_notice && anyMail) {
     banner.innerHTML +=
       '<div class="banner wait">' + icon('alert') + '<div><b>' + escHtml(t('ob.postal')) + '</b>' +
         '<p>' + escHtml(data.compliance_notice) + '</p></div></div>';
@@ -2715,7 +2734,8 @@ function renderDesk(items, i) {
   const actions = editing
     ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">' + escHtml(t('common.save')) + '</button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(null)">' + escHtml(t('common.cancel')) + '</button>'
-    : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')">' +
+    : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')"' +
+        (cur.off_module ? ' disabled' : '') + '>' +
         escHtml(t('desk.approve')) + ' <kbd>A</kbd></button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
         escHtml(t('desk.edit')) + ' <kbd>E</kbd></button>' +
@@ -2731,6 +2751,13 @@ function renderDesk(items, i) {
           : cur.kind === 'reply' ? t('desk.reply') : t('desk.email_n', {n: cur.step})) + '</span>' +
         '<span class="muted">' + escHtml(t('desk.sends', {when: formatDate(cur.send_at)})) + '</span></div>' +
       renderDeskContext(cur.context) +
+      // A row whose channel's module is off (an email from before the Email
+      // module was turned off): listed and rejectable, never approved.
+      (cur.off_module
+        ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>' +
+          escHtml(t('desk.module_off', {name: moduleName(cur.off_module)})) + '</b>' +
+          '<div>' + escHtml(t('desk.module_off_detail')) + '</div></div></div>'
+        : '') +
       (heldReason(cur)
         ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>' + escHtml(t('desk.held_title')) + '</b>' +
           '<div>' + escHtml(heldReason(cur)) + '. ' + escHtml(t('desk.held_detail')) + '</div></div></div>'
@@ -8854,10 +8881,10 @@ setInterval(() => {
 // Email-module nav counts stay live wherever you are, so "something needs
 // me" is visible from any tab without polling that tab's contents.
 setInterval(async () => {
-  if (document.hidden || _locked || _upgradeShown || !_modules.email || currentTab === 'today') return;
+  if (document.hidden || _locked || _upgradeShown || !_modules.messages || currentTab === 'today') return;
   const data = await api('/api/today');
   if (!data) return;
-  navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
+  navCount('nav-today', todayItems(data).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
 }, 20000);
 

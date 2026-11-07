@@ -394,6 +394,7 @@ class _GuidedBrain(StubBrain):
         return True
 
 
+@pytest.mark.modules_on("npathi")
 def test_draft_reply_answers_a_message_that_came_by_sms_back_on_sms(db, monkeypatch):
     """An answer to a text goes back as a text, to the number it came from,
     held for the user like any answer the agent asked for; one with no
@@ -441,6 +442,7 @@ def test_draft_reply_answers_a_message_that_came_by_sms_back_on_sms(db, monkeypa
         ("sms", "+40722000102", "", "pending_review", AGENT_DRAFT_HELD)]
 
 
+@pytest.mark.modules_on("email_outreach")
 def test_draft_reply_is_staged_for_review_with_the_guidance(db, monkeypatch):
     import harvey.agents.sender as sender_mod
     from harvey.agents.handler import Handler
@@ -516,6 +518,40 @@ def test_draft_reply_is_staged_for_review_with_the_guidance(db, monkeypatch):
     assert _q(db, "SELECT COUNT(*) FROM suppression WHERE undone_at IS NULL") == [(1,)]
 
 
+def test_draft_reply_is_refused_while_its_channels_module_is_off(db, monkeypatch):
+    """With the Email module off no email answer is queued for the agent
+    (the Outbox may be shown for nPathi's texts, and an email there could
+    only wait); the model isn't asked."""
+    import harvey.agents.sender as sender_mod
+    from harvey.agents.handler import Handler
+    from tests.test_outbox_native import Cfg, Env
+
+    monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
+    plan_id = _plan(db)
+    _, cid = _draft(db, plan_id)
+    _start(db, cid)
+    state = StateManager(str(db))
+    _run(_sent_first_email(state, cid, "office@alfa.example.com"))
+    _reply(state, "office@alfa.example.com", "Cât costă?")
+    [convo] = _q(db, "SELECT id FROM conversations")
+    _run(state.update_outbox_item(_q(db, "SELECT id FROM outbox WHERE kind = 'reply'")[0][0],
+                                  status="rejected"))
+    brain = _GuidedBrain()
+
+    def handler(state_, cfg):
+        h = Handler(brain=brain, state=state_, config=Cfg(), env=Env())
+        h.provider = FakeProvider()
+        return h
+    monkeypatch.setattr(outreach, "reply_handler", handler)
+    error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
+                                          "guidance": "Propune un apel"})
+    assert error and "email_outreach" in why and "which is off" in why
+    assert brain.prompts == []
+    assert _q(db, "SELECT COUNT(*) FROM outbox WHERE kind = 'reply' "
+                  "AND status = 'pending_review'") == [(0,)]
+
+
+@pytest.mark.modules_on("email_outreach")
 def test_an_answered_reply_is_not_drafted_again_and_one_handed_to_you_waits(db, monkeypatch):
     import harvey.agents.sender as sender_mod
     from harvey.agents.handler import Handler

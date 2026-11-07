@@ -143,6 +143,11 @@ class Manifest:
     # attach alias, file name in data/, the scheme its rows are keyed by,
     # the adapter module, and the signals it reads, [[register.reads]]).
     register: dict = field(default_factory=dict)
+    # The message channels it writes or answers on (outbox.channel values:
+    # "email", "sms"...): one module each. While any module that declares
+    # one is on, the Outbox and Conversations are shown; a row is sent only
+    # while its own channel's module is on.
+    channels: tuple[str, ...] = ()
 
     def summary(self) -> dict:
         """The row ``harvey modules list`` prints."""
@@ -353,6 +358,17 @@ def _check_capabilities(raw, where: str, problems: list[str]) -> tuple[dict, ...
                             "max_results (a cell is split when it comes back full)")
         out.append(dict(cap))
     return tuple(out)
+
+
+def _check_channels(raw, where: str, problems: list[str]) -> tuple[str, ...]:
+    out = _str_list(raw, "channels", where, problems)
+    for channel in out:
+        if not _ID.match(channel):
+            problems.append(f"{where}: channel {channel!r} must be lower case letters, "
+                            "digits and _")
+    if len(set(out)) != len(out):
+        problems.append(f"{where}: a channel is declared twice")
+    return out
 
 
 def _check_settings(raw, where: str, problems: list[str]) -> dict:
@@ -587,6 +603,7 @@ def _build(raw: dict, path: Path, data_only: bool, where: str,
         boundaries=regions,
         identifiers=_check_identifiers(raw.get("identifiers"), where, problems),
         register=_check_register(raw.get("register"), where, problems),
+        channels=_check_channels(raw.get("channels"), where, problems),
     )
 
 
@@ -690,6 +707,15 @@ def cross_check(manifests) -> list[str]:
             if r["code"] not in owner:
                 problems.append(f"{m.path}: register reads {r['code']}, which no module "
                                 "declares in [[signals]]")
+    # A message channel is one module's: the one whose switch decides
+    # whether its rows may be sent.
+    channel_owner: dict[str, Manifest] = {}
+    for m in manifests:
+        for channel in m.channels:
+            first = channel_owner.setdefault(channel, m)
+            if first is not m:
+                problems.append(f"{m.path}: channel {channel!r} is already declared by "
+                                f"{first.id} ({first.path})")
     # A capability's lane must be one a manifest declares, or its requests
     # would go out unpaced (lanes.wait refuses one it doesn't know).
     declared = {lane["id"] for m in manifests for lane in m.lanes}

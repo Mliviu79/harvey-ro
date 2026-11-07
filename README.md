@@ -1152,6 +1152,13 @@ contacts). The Email
 switch in Settings is the email campaigns module. Off, the dashboard hides
 its tabs and `harvey run` writes, sends and reads no email at all; it only
 looks for companies and contacts. On, sending works as your config says.
+A module that writes or answers messages names its channels in its
+manifest (`channels`: the email module's `email`, nPathi's `sms`, `waba`
+and `wa`; one module each). The Outbox, Conversations and Today show
+while any of them is on, and each row keeps its own channel's rules: it is
+approved and sent only while its channel's module is on (`harvey outbox`
+says so too), and the kill switch (`harvey sending pause`) stops every
+channel.
 
 What a module can do is a list of capabilities in its manifest: a search
 over an area, a lookup by name and town, a read of a company's site. Each
@@ -1282,8 +1289,11 @@ Answering someone who wrote to you is the lawful case, and that is what this
 is for: Harvey drafts the answer, you approve it in the Outbox, every time
 (autopilot never sends one).
 
-1. **Turn the module on**: Surse → nPathi Chat, or `harvey modules enable npathi`
-   (it needs the Email module: the same cycle reads both).
+1. **Turn the module on**: Surse → nPathi Chat, or `harvey modules enable npathi`.
+   The Email module can stay off: the Outbox, Conversations and Today show
+   while either is on, and with Email off they hold only SMS and WhatsApp
+   (an email queued from before stays listed, to reject, and can't be
+   approved until the Email module is on again).
 2. **Connect it**: Settings → Channels (or `harvey channels connect`). Enter
    your install's address (`https://...`; Harvey refuses plain http and private
    addresses) and a workspace API key with `account.view`, `sms.read` /
