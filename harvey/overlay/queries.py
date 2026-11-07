@@ -1599,6 +1599,13 @@ statement("overlay.messages.last_price",
           "SELECT price_credits FROM outbox WHERE status IN ('sent', 'failed') AND channel = ? "
           "AND sent_at IS NOT NULL AND price_credits IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
           params=("sms",), bounded=True)
+# The answers approved and not sent yet of the conversations a page shows
+# (one you wrote, held by the sending hours or a cap): said with why.
+statement("overlay.messages.waiting",
+          "SELECT o.id, o.conversation_id, o.body, o.status, o.error, o.send_at FROM outbox o "
+          "WHERE o.status IN ('approved', 'sending') AND o.channel != 'email' "
+          "AND o.kind = 'reply' AND o.conversation_id IN (SELECT value FROM json_each(?))",
+          params=('["c"]',))
 # A phone contact's line type (SMS goes to a mobile only).
 statement("overlay.messages.line_type",
           "SELECT c.line_type FROM contact c WHERE c.kind = ? AND c.value = ?",

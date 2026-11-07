@@ -1,10 +1,12 @@
 """The messaging channels: SMS and WhatsApp through nPathi Chat.
 
 People send Harvey an SMS or a WhatsApp message; Harvey reads it into a
-conversation (harvey/agents/messages.py, in the Handler's cycle), and an
-answer to it is drafted by the Handler (or written by the user on the
-Conversations page), waits in the Outbox for the user's approval and is sent
-by harvey/agents/messenger.py. Harvey never writes first on these channels:
+conversation (harvey/agents/messages.py), and an answer to it is drafted by
+the Handler and waits in the Outbox for the user's approval, or is written
+by the user on the Conversations page and approved as they write it;
+harvey/agents/messenger.py sends it, through every check. Both run in the
+channels' own loop, apart from email (harvey/agents/message_loop.py).
+Harvey never writes first on these channels:
 Law 506/2004 art. 12 wants prior consent for a commercial SMS or app
 message, for a company as much as for a person, and WhatsApp's rules forbid
 cold messages. So an answer goes only to a number that wrote in on that
@@ -25,7 +27,7 @@ What is kept per install, in the settings table:
 - ``npathi:optout_sync_at`` and ``npathi:optout_pending:<number>``: nPathi's
   opt-out list read once a day, and Harvey's own opt-outs still to add to it;
   ``npathi:optout_sync_problem``: why the last read of that list failed (a
-  key without unsubscribed.view waits a day, not a cycle);
+  key without unsubscribed.view waits a day, not a pass);
   ``npathi:still_listed``: the numbers the user took off the do-not-contact
   list in Harvey that nPathi's list still holds (theirs to remove there);
 - ``npathi:rates``: the plan's prices per channel (GET /rates), a day;
@@ -163,7 +165,7 @@ async def check(state, client: npathi.Npathi) -> dict:
 async def status(state) -> dict:
     """What the settings card and ``harvey channels status`` show: whether
     the module is on, the address, whether a key is saved, the last account
-    check, and per channel its switches, whether the key may read and send
+    check, the channels a credits cap holds for want of a price, and per channel its switches, whether the key may read and send
     on it, its senders (each with whether a reply can come back to it) and
     the one chosen for answers, its daily cap, when it was last read
     completely, any gap and the last failure; the sending hours, the
@@ -215,6 +217,9 @@ async def status(state) -> dict:
         "send_hours": {"start": f"{start // 60:02d}:{start % 60:02d}",
                        "end": f"{end // 60:02d}:{end % 60:02d}"},
         "spend": await spend(state),
+        # The channels answers are sent on whose price isn't known while a
+        # credits cap is set: their answers wait (credits_room's UNPRICED).
+        "unpriced_cap": await unpriced_under_cap(state),
         "credits_out": await _lane_paused(state),
         "optout_sync": {"at": float(await state.get_setting(SYNC_KEY) or 0) or None,
                         "problem_kind": sync_problem.get("kind", ""),
@@ -437,40 +442,63 @@ async def spend(state) -> dict:
     }
 
 
+# What credits_room says when a cap is set and the price isn't known.
+UNPRICED = "unpriced"
+
+
+async def price_known(state, channel: str) -> bool:
+    """Whether the most an answer on ``channel`` can cost is known: a rate
+    kept from the rates endpoint, or the last price an answer there was
+    charged. No request is made."""
+    kept = await rates(state, None)
+    return any(sub in kept for sub in npathi.CHANNELS[channel]) or \
+        await state.last_message_price(channel) is not None
+
+
+async def unpriced_under_cap(state) -> list[str]:
+    """The channels answers are sent on whose price isn't known, while a
+    credits cap is set ([] with no cap)."""
+    caps = await credit_caps(state)
+    if caps.get("credits_per_day") is None and caps.get("credits_per_month") is None:
+        return []
+    return [ch for ch in await sending(state) if not await price_known(state, ch)]
+
+
 async def credits_room(state, worst: float | None) -> str:
     """Why an answer costing at most ``worst`` credits can't go now under
-    the caps ("" when it can). An unknown price (no rates, no price paid
-    yet) lets one answer go under a cap until nPathi says what it cost; the
-    next one waits for that price, and an answer sent and not priced yet
-    counts at this one's price, so a cap isn't passed by answers nobody
-    priced."""
+    the caps ("" when it can). With a cap set and the price unknown (no
+    rate, no price paid yet) it is UNPRICED: nothing goes until the key may
+    read the rates or the cap is lifted; with no cap the price doesn't
+    matter. An answer sent and not priced yet counts at this one's price,
+    so a cap isn't passed by answers nobody priced."""
     caps = await credit_caps(state)
-    cost = worst or 0.0
     for key, since, what in (("credits_per_day", _utc_day_start(), "today's"),
                              ("credits_per_month", _utc_month_start(), "this month's")):
         cap = caps.get(key)
         if cap is None:
             continue
+        if worst is None:
+            return UNPRICED
         spent = await state.message_credits_since(since)
         unpriced = await state.unpriced_messages_since(since)
-        if worst is None and unpriced:
-            return (f"{what} credits cap: the price of an answer sent isn't known yet "
-                    "(nPathi Chat says it once it is sent)")
-        # (An answer sent and not priced yet counts at this one's price.)
-        if spent + unpriced * cost + cost > float(cap) + 1e-9:
+        if spent + unpriced * worst + worst > float(cap) + 1e-9:
             return f"{what} credits cap ({spent:g} of {float(cap):g} used)"
     return ""
 
 
 async def queue_answer(state, config, *, conversation: str, prospect_id: str, channel: str,
-                       phone: str, body: str, note: str = "") -> str | None:
-    """Queue an SMS or WhatsApp answer to a conversation: always waiting for
-    review (autopilot never approves one: state.promote_for_autopilot is
-    email only), to ``phone`` on ``channel``. The first answer ever to that
-    number there gets the firm's name and the opt-out line (first_message).
-    What the gate would refuse in it (too long, a brace, a link) is said on
-    the row, so the Outbox shows it held until it is edited; ``note``: why
-    else it waits (an answer the agent asked for). Its id, or None."""
+                       phone: str, body: str, note: str = "", approved: bool = False) -> str | None:
+    """Queue an SMS or WhatsApp answer to a conversation, to ``phone`` on
+    ``channel``. Harvey's own drafts and the agent's wait for review
+    (autopilot never approves one: state.promote_for_autopilot is email
+    only); ``approved``: one the user wrote on the Conversations page,
+    approved by them as they write it (approved_by "you"), the messenger's
+    every check still ahead of it, ``note`` then why it waits. The first
+    answer ever to that number there gets the firm's name and the opt-out
+    line (first_message). What the gate would refuse in it (too long, a
+    brace, a link) is said on the row, so the Outbox shows it held until it
+    is edited; ``note``: why else it waits (an answer the agent asked for).
+    Its id, or None."""
     from harvey import gate
     from harvey.state import HELD_FOR_REVIEW
 
@@ -480,9 +508,12 @@ async def queue_answer(state, config, *, conversation: str, prospect_id: str, ch
     text = first_message(body, config) if first else (body or "").strip()
     problems = gate.message_problems(text, max_chars=SEND_RULES[channel].max_chars,
                                      config=config, first=first)
+    if approved and problems:
+        return None
     return await state.add_outbox_item(
         prospect_id=prospect_id or "", conversation_id=conversation, kind="reply",
-        to_email="", subject="", body=text, status="pending_review", provider=npathi.MODULE,
+        to_email="", subject="", body=text,
+        status="approved" if approved else "pending_review", provider=npathi.MODULE,
         send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-        channel=channel, to_phone=phone,
+        channel=channel, to_phone=phone, approved_by="you" if approved else "",
         error=note or ((HELD_FOR_REVIEW + "; ".join(problems))[:300] if problems else ""))

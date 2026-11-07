@@ -662,25 +662,194 @@ def _seed_convo(env, npat, hours_ago=1.0):
     return asyncio.run(seed())
 
 
-def test_you_can_write_an_answer_in_conversations(client, env, dash_npat):  # noqa: F811
+def _no_quiet_hours(monkeypatch):
+    import harvey.main as main
+
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config: False)
+
+
+def test_an_answer_you_write_goes_without_a_second_approval(client, env, dash_npat,  # noqa: F811
+                                                            monkeypatch):
+    _no_quiet_hours(monkeypatch)
     convo = _seed_convo(env, dash_npat)
     [row] = [c for c in client.get("/api/conversations").json() if c["id"] == convo]
     assert row["can_answer"] and ANN not in json.dumps(row)
     r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine la 10?"})
-    assert r.status_code == 200 and r.json()["status"] == "pending_review"
+    assert r.status_code == 200 and r.json()["status"] == "sent", r.json()
+    [sent] = dash_npat.sent
+    assert "Vă sun mâine la 10?" in sent["body"]["body"] and sent["body"]["to"] == ANN
     out = client.get("/api/outbox").json()
-    [item] = out["pending"]
-    assert item["channel"] == "sms" and item["to_phone"] == "+4072****" and item["subject"] == ""
-    assert "Vă sun mâine la 10?" in item["body"]
+    assert out["pending"] == [] and out["approved"] == []
+    [item] = out["sent"]
+    assert item["approved_by"] == "you" and item["to_phone"] == "+4072****"
     assert ANN not in json.dumps(out)
+
+
+def test_an_answer_you_write_the_gate_would_block_is_refused_and_not_queued(  # noqa: F811
+        client, env, dash_npat, monkeypatch):
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
     bad = client.post(f"/api/conversations/{convo}/answer", json={"body": "{Salut|Bună}"})
     assert bad.status_code == 400 and "curly braces" in bad.json()["message"]
+    assert bad.json()["code"] == "text"
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+    assert dash_npat.sent == []
+
+
+def test_an_answer_you_write_to_a_listed_number_is_refused(client, env, dash_npat,  # noqa: F811
+                                                           monkeypatch):
+    from harvey.state import StateManager
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+    asyncio.run(StateManager(db_path=str(env["db"])).suppress("phone", ANN, "by_hand", by="you"))
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    assert r.status_code == 409 and r.json()["code"] == "dnc" and ANN not in r.text
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+    assert dash_npat.sent == []
 
 
 def test_an_answer_outside_the_window_is_refused_in_conversations(client, env, dash_npat):  # noqa: F811
     convo = _seed_convo(env, dash_npat, hours_ago=31 * 24)
     r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
     assert r.status_code == 409 and "window" in r.json()["message"]
+    assert r.json()["code"] == "window"
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("hold,wait", [("hours", "hours"), ("cap", "cap"),
+                                       ("paused", "paused"), ("credits", "credits")])
+def test_an_answer_you_write_that_must_wait_stays_approved_and_says_why(  # noqa: F811
+        client, env, dash_npat, monkeypatch, hold, wait):
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+
+    async def setup():
+        state = StateManager(db_path=str(env["db"]))
+        if hold == "hours":
+            await switches.set_module_setting(state, npathi.MODULE, "send_start", "00:00")
+            await switches.set_module_setting(state, npathi.MODULE, "send_end", "00:00")
+        elif hold == "cap":
+            await switches.set_module_setting(state, npathi.MODULE, "daily_cap_sms", 0)
+        elif hold == "paused":
+            await state.set_setting("sending_paused", "paused from dashboard")
+        else:
+            await switches.set_module_setting(state, npathi.MODULE, "credits_per_day", 0.1)
+
+    asyncio.run(setup())
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    data = r.json()
+    assert r.status_code == 200 and (data["status"], data["wait"]) == ("approved", wait), data
+    assert dash_npat.sent == []
+    out = client.get("/api/outbox").json()
+    [item] = out["approved"]
+    assert item["approved_by"] == "you" and item["wait"] == wait and out["pending"] == []
+    [row] = [c for c in client.get("/api/conversations").json() if c["id"] == convo]
+    assert row["waiting"]["wait"] == wait and row["waiting"]["id"] == data["outbox_id"]
+
+
+def test_an_answer_you_write_while_a_pass_runs_goes_on_the_next(client, env, dash_npat,  # noqa: F811
+                                                               monkeypatch):
+    from harvey.agents import message_loop
+    from harvey.state import StateManager
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+
+    async def hold_lease():
+        from harvey.modules.worker import acquire_lease
+
+        assert await acquire_lease(StateManager(db_path=str(env["db"])), "another-pass",
+                                   name=message_loop.LEASE)
+
+    asyncio.run(hold_lease())
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    assert r.status_code == 200 and r.json()["wait"] == "next_pass"
+    assert dash_npat.sent == []
+    [item] = client.get("/api/outbox").json()["approved"]
+    assert item["status"] == "approved" and item["approved_by"] == "you"
+
+
+def test_a_second_answer_you_write_while_one_waits_is_refused(client, env, dash_npat,  # noqa: F811
+                                                             monkeypatch):
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+
+    async def outside_hours():
+        state = StateManager(db_path=str(env["db"]))
+        await switches.set_module_setting(state, npathi.MODULE, "send_start", "00:00")
+        await switches.set_module_setting(state, npathi.MODULE, "send_end", "00:00")
+
+    asyncio.run(outside_hours())
+    first = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    assert first.status_code == 200 and first.json()["wait"] == "hours"
+    # (A double click, or a second answer written before the first went.)
+    again = client.post(f"/api/conversations/{convo}/answer", json={"body": "Sau poimâine?"})
+    assert again.status_code == 409 and again.json()["code"] == "waiting"
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 1
+    assert dash_npat.sent == []
+
+
+def test_an_answer_you_write_waits_for_the_next_pass_when_sending_it_now_fails(  # noqa: F811
+        client, env, dash_npat, monkeypatch):
+    from harvey.agents import message_loop
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+
+    async def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(message_loop, "send_now", locked)
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    assert r.status_code == 200 and r.json()["wait"] == "next_pass", r.text
+    [item] = client.get("/api/outbox").json()["approved"]
+    assert item["approved_by"] == "you" and dash_npat.sent == []
+
+
+def test_an_answer_you_write_with_no_price_known_under_a_cap_waits(client, env, dash_npat,  # noqa: F811
+                                                                   monkeypatch):
+    from harvey.modules import switches
+    from harvey.state import StateManager
+
+    _no_quiet_hours(monkeypatch)
+    convo = _seed_convo(env, dash_npat)
+    dash_npat.rates, dash_npat.price = [], None
+    asyncio.run(switches.set_module_setting(StateManager(db_path=str(env["db"])),
+                                            npathi.MODULE, "credits_per_month", 50.0))
+    r = client.post(f"/api/conversations/{convo}/answer", json={"body": "Vă sun mâine?"})
+    assert r.status_code == 200 and (r.json()["status"], r.json()["wait"]) == (
+        "approved", "unpriced"), r.text
+    assert dash_npat.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_retry_with_no_price_known_under_a_cap_waits(state, npat):
+    from harvey.modules import switches
+
+    await _ready(state, npat)
+    npat.rates, npat.price = [], None
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    item = await _answer(state, convo, pid)
+    npat.status_for["POST /messages/sms"] = [
+        (409, {"error": {"code": "idempotency_in_progress", "message": "x"}}, {})]
+    assert await _sender(state, npat).run() == 0
+    assert (await _row(state, item))["error"] == messenger_mod.WAIT_RETRY
+    # A cap set meanwhile: the retry waits for a price like any answer.
+    await switches.set_module_setting(state, npathi.MODULE, "credits_per_day", 5.0)
+    assert await _sender(state, npat).run() == 0 and npat.sent == []
+    assert (await _row(state, item))["error"] == messenger_mod.WAIT_UNPRICED
 
 
 def test_approve_refuses_an_answer_the_gate_would_block(client, env, dash_npat):  # noqa: F811
@@ -762,7 +931,7 @@ async def test_an_answer_that_may_have_gone_is_never_followed_by_another(state, 
 
 
 @pytest.mark.asyncio
-async def test_with_no_price_known_a_cap_lets_one_answer_go_until_it_is_priced(state, npat):
+async def test_with_no_price_known_a_cap_holds_answers_and_no_cap_lets_them_go(state, npat):
     from harvey.modules import switches
 
     await _ready(state, npat)
@@ -770,18 +939,38 @@ async def test_with_no_price_known_a_cap_lets_one_answer_go_until_it_is_priced(s
     await switches.set_module_setting(state, npathi.MODULE, "credits_per_day", 10.0)
     _, pid = await _firm(state)
     convo = await _convo(state, pid)
-    await _answer(state, convo, pid)
+    item = await _answer(state, convo, pid)
+    blocked = await _sender(state, npat).blocked(await _row(state, item))
+    assert blocked == ("approved", messenger_mod.WAIT_UNPRICED) and blocked.code == "unpriced"
+    assert await _sender(state, npat).run() == 0 and npat.sent == []
+    assert (await _row(state, item))["error"] == messenger_mod.WAIT_UNPRICED
+    assert (await channels.status(state))["unpriced_cap"] == ["sms"]
+    # The month's cap alone holds it too.
+    await switches.set_module_setting(state, npathi.MODULE, "credits_per_day", None)
+    await switches.set_module_setting(state, npathi.MODULE, "credits_per_month", 100.0)
+    assert (await _sender(state, npat).blocked(await _row(state, item))).code == "unpriced"
+    # With no cap the price doesn't matter.
+    await switches.set_module_setting(state, npathi.MODULE, "credits_per_month", None)
+    assert (await channels.status(state))["unpriced_cap"] == []
     assert await _sender(state, npat).run() == 1
+
+
+@pytest.mark.asyncio
+async def test_a_price_paid_lets_answers_go_under_a_cap(state, npat):
+    from harvey.modules import switches
+
+    await _ready(state, npat)
+    npat.rates = []
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    await _answer(state, convo, pid)
+    assert await _sender(state, npat).run() == 1               # no cap yet: 0.8 paid
+    await switches.set_module_setting(state, npathi.MODULE, "credits_per_day", 10.0)
     _, pid2 = await _firm(state, phone=BOB)
     convo2 = await _convo(state, pid2, phone=BOB)
     item = await _answer(state, convo2, pid2, phone=BOB)
-    assert await _sender(state, npat).blocked(await _row(state, item)) == (
-        "approved", messenger_mod.WAIT_CREDITS)
-    # nPathi says what the first one cost: the next goes.
-    mid = npat.sent[0]["row"]["id"]
-    npat.later[mid] = {"price": 0.5}
-    await _sender(state, npat).read_back(npathi.Npathi(URL, KEY, transport=npat.transport()))
     assert await _sender(state, npat).blocked(await _row(state, item)) is None
+    assert (await channels.status(state))["unpriced_cap"] == []
 
 
 @pytest.mark.asyncio
@@ -839,3 +1028,180 @@ def test_a_message_opt_out_line_too_long_is_refused_not_cut():
         ComplianceConfig(message_opt_out_line="Mulțumim. " * 13 + "Răspunde STOP.")
     line = ComplianceConfig(message_opt_out_line="Răspunde STOP ca să nu mai primești mesaje.")
     assert line.message_opt_out_line.endswith("STOP ca să nu mai primești mesaje.")
+
+
+# ── The messaging loop, apart from email ──
+
+class LoopBrain(RecordingBrain):
+    """The brain the loop asks: usable, within its budget unless told."""
+
+    def __init__(self, intent="question", within=True):
+        super().__init__(intent)
+        self.within = within
+
+    async def preflight(self):
+        return ""
+
+    async def is_within_budget(self, *_a, **_k):
+        return self.within
+
+
+class LoopCfg(SendCfg):
+    class usage:
+        max_daily_claude_percent = 80
+
+        class quiet_hours:
+            start, end, timezone = "22:00", "07:00", "UTC"
+
+
+class InstantlyCfg(LoopCfg):
+    """A mail provider Harvey can't send or read through."""
+
+    class channels(SendCfg.channels):
+        class email(SendCfg.channels.email):
+            provider = "instantly"
+
+
+async def _beta(state):
+    """Another firm, with Bob's number (Alfa's is Ana's)."""
+    beta = await state.add_company(Company(name="Beta SRL", domain="beta.example.com"))
+    await state.add_contacts(beta, [contacts.Found("phone", BOB, source="phones")])
+    return beta
+
+
+def _loop(state, npat, config=None, brain=None):
+    from harvey.agents.message_loop import Loop
+
+    return Loop(state, config=config or LoopCfg(), env=Env(), brain=brain or LoopBrain(),
+                transport=npat.transport())
+
+
+@pytest.fixture
+def awake(monkeypatch):
+    import harvey.main as main
+
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config: False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config", [LoopCfg, InstantlyCfg])
+async def test_the_loop_reads_and_sends_whatever_email_is_doing(state, npat, awake, monkeypatch,
+                                                                config):
+    from harvey.agents.handler import Handler
+
+    async def mailbox_down(self):
+        raise RuntimeError("the mailbox can't be read")
+
+    monkeypatch.setattr(Handler, "_run_native", mailbox_down)
+    await state.note_sends_held("replies couldn't all be read and handled.")
+    await state.set_setting("mail_read_gap:harvey@x.co", json.dumps({"since": 1}))
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    approved = await _answer(state, convo, pid)
+    await _beta(state)
+    npat.messages = [_message(7, BOB, "Bună ziua, cât costă?")]
+    brain = LoopBrain()
+    out = await _loop(state, npat, config(), brain).run("test-pass")
+    assert out == {"read": True, "sent": 1}
+    assert (await _row(state, approved))["status"] == "sent"
+    # Bob's message was read and an answer drafted: it waits for you.
+    drafted = await state.get_outbox(status="pending_review", channel="sms")
+    assert [d["to_phone"] for d in drafted] == [BOB] and brain.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_the_kill_switch_still_stops_the_loops_sends(state, npat, awake):
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    item = await _answer(state, convo, pid)
+    await state.set_setting("sending_paused", "paused from dashboard")
+    assert (await _loop(state, npat).run("test-pass"))["sent"] == 0
+    row = await _row(state, item)
+    assert npat.sent == [] and (row["status"], row["error"]) == (
+        "approved", messenger_mod.WAIT_PAUSED)
+
+
+@pytest.mark.asyncio
+async def test_never_two_passes_at_once(state, npat, awake):
+    from harvey.agents import message_loop
+
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    item = await _answer(state, convo, pid)
+    async with message_loop.held(state, "one-pass") as got:
+        assert got
+        assert await _loop(state, npat).run("another-pass") is None
+        assert not await message_loop.send_now(state, item, SendCfg(), npat.transport())
+        async with message_loop.held(state, "a-third") as third:
+            assert not third
+    assert npat.sent == []
+    # Released: the next pass runs.
+    assert (await _loop(state, npat).run("another-pass"))["sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_without_the_model_only_opt_outs_are_handled_and_the_rest_wait(state, npat,
+                                                                              awake):
+    await _ready(state, npat)
+    await _firm(state)
+    await _beta(state)
+    npat.messages = [_message(8, ANN, "STOP"), _message(9, BOB, "Cât costă?")]
+    brain = LoopBrain(within=False)
+    out = await _loop(state, npat, brain=brain).run("test-pass")
+    assert out["read"] is False and brain.calls == 0
+    assert await state.suppression_check("", phone=ANN) is not None
+    assert await state.is_reply_processed("npathi:8")
+    assert not await state.is_reply_processed("npathi:9")
+    # Within its budget again: Bob's message is handled on the next pass.
+    brain.within = True
+    assert (await _loop(state, npat, brain=brain).run("test-pass"))["read"] is True
+    assert await state.is_reply_processed("npathi:9") and brain.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_keep_the_model_out_of_the_loop(state, npat, monkeypatch):
+    import harvey.main as main
+
+    monkeypatch.setattr(main, "in_quiet_hours", lambda config: True)
+    await _ready(state, npat)
+    await _beta(state)
+    npat.messages = [_message(9, BOB, "Cât costă?")]
+    brain = LoopBrain()
+    assert (await _loop(state, npat, brain=brain).run("test-pass"))["read"] is False
+    assert brain.calls == 0 and not await state.is_reply_processed("npathi:9")
+
+
+@pytest.mark.asyncio
+async def test_a_full_worker_runs_the_messaging_passes(state, npat, awake, monkeypatch):
+    from harvey.agents import message_loop
+    from harvey.modules.worker import Worker
+
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    item = await _answer(state, convo, pid)
+    ran = asyncio.Event()
+    owners = []
+
+    class TestLoop(message_loop.Loop):
+        def __init__(self, st):
+            super().__init__(st, config=LoopCfg(), env=Env(), brain=LoopBrain(),
+                             transport=npat.transport())
+
+        async def run(self, owner):
+            owners.append(owner)
+            try:
+                return await super().run(owner)
+            finally:
+                ran.set()
+
+    monkeypatch.setattr(message_loop, "Loop", TestLoop)
+    stop = asyncio.Event()
+    task = asyncio.create_task(Worker(state, poll=0.05).run(stop))
+    await asyncio.wait_for(ran.wait(), timeout=10)
+    stop.set()
+    await asyncio.wait_for(task, timeout=15)
+    assert (await _row(state, item))["status"] == "sent" and len(owners) == 1

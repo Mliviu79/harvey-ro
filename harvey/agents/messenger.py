@@ -8,9 +8,15 @@ it), and never a second one before they write again. Harvey never writes
 first on these channels.
 
 Every row was approved by the user (approved_by "you"): the Handler queues
-them waiting for review, autopilot never approves one
-(state.promote_for_autopilot is email only), and a row approved any other
-way goes back to the Outbox. Before each send, in this order (blocked):
+its drafts (and the agent's) waiting for review, an answer the user writes
+on the Conversations page is approved as they write it, autopilot never
+approves one (state.promote_for_autopilot is email only), and a row approved
+any other way goes back to the Outbox. It runs in the messaging channels'
+own loop (harvey/agents/message_loop.py), apart from email, and an answer
+the user wrote is tried at once. Before each send (blocked; the channel
+switched off, paused or with no sender is said first, then 1 (refusal(),
+which the Conversations page asks before it queues anything), then the rest
+of 2):
 
 1. refused, for good (the row fails with why): an unknown channel; a number
    that isn't E.164, or for SMS one whose contact is known not to be a
@@ -21,13 +27,14 @@ way goes back to the Outbox. Before each send, in this order (blocked):
    gate.message_problems refuses in the text (length, a curly brace, a
    link that isn't yours, a banned phrase, and on a first answer the
    firm's name and the opt-out line); a second message before they answered;
-2. waiting, approved (the row says why and is tried each cycle): the channel
+2. waiting, approved (the row says why and is tried each pass): the channel
    switched off or its sender not chosen (or one a reply can't come back
    to); sending paused (the global kill switch, the channel's own, or the
    npathi lane, paused when nPathi said the credits ran out); the channel's
    last read failed or didn't reach back (a STOP may be unread); outside
    the sending hours or in quiet hours; the channel's daily cap; the
-   credits caps.
+   credits caps, and with a cap set an answer whose price isn't known (no
+   rate, no price paid yet on the channel).
 
 A send carries the row's own Idempotency-Key, so a send cut off (Harvey
 stopped between claiming the row and recording the answer) is sent again
@@ -55,7 +62,7 @@ from harvey.state import MAYBE_SENT_PREFIX
 
 logger = logging.getLogger("harvey.messenger")
 
-# Answers sent per channel in one cycle, at most.
+# Answers sent per channel in one pass, at most.
 MAX_SENDS_PER_CYCLE = 5
 # A claimed answer not finished after this long was cut off mid-send.
 STALE_AFTER = timedelta(minutes=10)
@@ -65,7 +72,7 @@ IDEMPOTENT_SECONDS = 23 * 3600
 # Delivery is read back this long after the send.
 READ_BACK_DAYS = 7
 # nPathi's answers about an Idempotency-Key: the first send under it still
-# running (tried again next cycle), or what became of it unknown (failed as
+# running (tried again next pass), or what became of it unknown (failed as
 # possibly sent: never sent again).
 IDEMPOTENT_BUSY = frozenset({"idempotency_in_progress"})
 IDEMPOTENT_UNKNOWN = frozenset({"idempotency_conflict", "idempotency_response_unavailable",
@@ -80,10 +87,37 @@ WAIT_READ = "waiting: this channel's messages weren't all read, so a STOP may be
 WAIT_HOURS = "waiting: outside the sending hours"
 WAIT_CAP = "waiting: this channel's daily cap is reached"
 WAIT_CREDITS = "waiting: the credits cap is reached"
+WAIT_UNPRICED = ("waiting: a credits cap is set and the price of an answer here isn't known "
+                 "(give the nPathi key access to the rates, or lift the cap)")
 WAIT_RETRY = "waiting: nPathi Chat didn't take it this time; it is tried again under the same key"
 WAIT_NO_CREDITS = "waiting: nPathi Chat says the workspace is out of credits"
 OUTSIDE_WINDOW = ("they haven't written on this channel within its window, and Harvey only "
                   "answers (no templates yet)")
+
+
+# The waits a row keeps (its error) by the name the page says them with.
+WAIT_CODES = {NEEDS_YOU: "needs_you", WAIT_OFF: "off", WAIT_ROUTE: "route",
+              WAIT_PAUSED: "paused", WAIT_READ: "read", WAIT_HOURS: "hours", WAIT_CAP: "cap",
+              WAIT_CREDITS: "credits", WAIT_UNPRICED: "unpriced", WAIT_RETRY: "retry",
+              WAIT_NO_CREDITS: "no_credits"}
+
+
+class Hold(tuple):
+    """Why an answer can't go now: (status, why), as blocked() always gave
+    it, with ``code`` naming the reason for the page, which says it in the
+    viewer's language (the sentence is the row's, the log's and the CLI's)."""
+
+    code: str
+
+    def __new__(cls, status: str, why: str, code: str = ""):
+        hold = super().__new__(cls, (status, why))
+        hold.code = code
+        return hold
+
+
+def wait_code(error: str) -> str:
+    """The name of the wait an approved row's error says ("" for none)."""
+    return WAIT_CODES.get(error or "", "")
 
 
 def _iso(ts: float) -> str:
@@ -104,7 +138,7 @@ class MessageSender:
     async def run(self) -> int:
         """Read back what was sent, send what is approved and may go; how
         many were sent. Never raises: a messaging failure never stops the
-        heartbeat or the mailbox."""
+        loop it runs in, and nothing here waits on email."""
         try:
             client = await npathi.client(self.state, transport=self.transport)
             if client is None:
@@ -124,69 +158,90 @@ class MessageSender:
 
     # ── The rails ──
 
-    async def blocked(self, item: dict, client=None) -> tuple[str, str] | None:
-        """Why this answer can't go now, as (status, why): "failed" for a
-        refusal, "approved" for a wait, "pending_review" for one you haven't
-        approved; None when it may go."""
+    async def blocked(self, item: dict, client=None) -> Hold | None:
+        """Why this answer can't go now, as (status, why) with its ``code``:
+        "failed" for a refusal, "approved" for a wait, "pending_review" for
+        one you haven't approved; None when it may go."""
+        state = self.state
+        channel = item.get("channel") or ""
+        if channel not in channels.SEND_RULES:
+            return Hold("failed", f"no messaging channel {channel!r}", "channel")
+        if item.get("approved_by") != "you":
+            return Hold("pending_review", NEEDS_YOU, "needs_you")
+        if channel not in await channels.sending(state):
+            return Hold("approved", WAIT_OFF, "off")
+        if await channels.paused(state, channel):
+            return Hold("approved", WAIT_PAUSED, "paused")
+        if await channels.route(state, channel) is None:
+            return Hold("approved", WAIT_ROUTE, "route")
+        if refused := await self.refusal(item):
+            return refused
+        if await channels.read_gap(state, channel) or await state.get_setting(
+                channels.PROBLEM_KEY + channel):
+            return Hold("approved", WAIT_READ, "read")
+        if not await self._in_hours():
+            return Hold("approved", WAIT_HOURS, "hours")
+        if await state.messages_sent_today(channel) >= await channels.daily_cap(state, channel):
+            return Hold("approved", WAIT_CAP, "cap")
+        worst = await channels.worst_credits(state, channel, item.get("body") or "", client)
+        room = await channels.credits_room(state, worst)
+        if room == channels.UNPRICED:
+            return Hold("approved", WAIT_UNPRICED, "unpriced")
+        if room:
+            return Hold("approved", WAIT_CREDITS, "credits")
+        return None
+
+    async def refusal(self, item: dict) -> Hold | None:
+        """What refuses this answer for good (a "failed" Hold), whatever the
+        channel's switches and the hours say; None when nothing does. The
+        Conversations page asks it first, so an answer you write that could
+        never go is refused there and never queued."""
         state = self.state
         channel, phone = item.get("channel") or "", item.get("to_phone") or ""
         rules = channels.SEND_RULES.get(channel)
         if rules is None:
-            return "failed", f"no messaging channel {channel!r}"
-        if item.get("approved_by") != "you":
-            return "pending_review", NEEDS_YOU
-        if channel not in await channels.sending(state):
-            return "approved", WAIT_OFF
-        if await channels.paused(state, channel):
-            return "approved", WAIT_PAUSED
-        if await channels.route(state, channel) is None:
-            return "approved", WAIT_ROUTE
+            return Hold("failed", f"no messaging channel {channel!r}", "channel")
         if not phone or suppression.normalize_phone(phone) != phone:
-            return "failed", "gate: the recipient isn't a number in international form (E.164)"
+            return Hold("failed", "gate: the recipient isn't a number in international form "
+                        "(E.164)", "e164")
         if rules.needs_mobile and (await state.phone_line_type(phone)) not in (
                 "", "unknown", "mobile"):
-            return "failed", "gate: SMS goes to a mobile only, and this number isn't one"
+            return Hold("failed", "gate: SMS goes to a mobile only, and this number isn't one",
+                        "not_mobile")
         handle = await state.conversation_reply_handle(item.get("conversation_id") or "") \
             if item.get("kind") == "reply" else None
         if handle is None or handle["channel"] != channel or handle["value"] != phone:
-            return "failed", "gate: only an answer to a message they sent on this channel"
+            return Hold("failed", "gate: only an answer to a message they sent on this channel",
+                        "not_answer")
         last = await state.last_inbound(channel, phone)
         if last is None or time.time() - last > rules.window_hours * 3600:
-            return "failed", "gate: " + OUTSIDE_WINDOW
+            return Hold("failed", "gate: " + OUTSIDE_WINDOW, "window")
         if why := await state.unreachable(channel, phone):
-            return "failed", f"gate: nPathi Chat can't reach this number here ({why})"
+            return Hold("failed", f"gate: nPathi Chat can't reach this number here ({why})",
+                        "unreachable")
         prospect = await state.get_prospect(item["prospect_id"]) if item.get("prospect_id") \
             else None
         if prospect is not None and prospect.status == "opted_out":
-            return "failed", "gate: they asked not to be contacted"
+            return Hold("failed", "gate: they asked not to be contacted", "opted_out")
         hit = await state.suppression_check(
             prospect.email if prospect is not None else "",
             firm=prospect.company_id if prospect is not None else handle.get("firm"),
             config=self.config, phone=phone)
         if hit is not None:
             # (Named by its kind, not its value: the number stays masked.)
-            return "failed", (f"gate: on the do-not-contact list ({hit.scope}, "
-                              f"{hit.reason.replace('_', ' ')})")
+            return Hold("failed", (f"gate: on the do-not-contact list ({hit.scope}, "
+                                   f"{hit.reason.replace('_', ' ')})"), "dnc")
         mine = 1 if item.get("status") == "sending" else 0
         first = await state.messages_sent_to_since(channel, phone, "") - mine <= 0
         problems = gate.message_problems(item.get("body") or "", max_chars=rules.max_chars,
                                          config=self.config, first=first)
         if problems:
-            return "failed", ("gate: " + "; ".join(problems))[:300]
+            return Hold("failed", ("gate: " + "; ".join(problems))[:300], "text")
         # (One that may have gone out counts: it is never followed by another.)
         if await state.messages_sent_to_since(channel, phone, _iso(last)) - mine > 0 or \
                 await state.messages_maybe_sent_to_since(channel, phone, _iso(last)):
-            return "failed", "gate: a second message before they answered the first"
-        if await channels.read_gap(state, channel) or await state.get_setting(
-                channels.PROBLEM_KEY + channel):
-            return "approved", WAIT_READ
-        if not await self._in_hours():
-            return "approved", WAIT_HOURS
-        if await state.messages_sent_today(channel) >= await channels.daily_cap(state, channel):
-            return "approved", WAIT_CAP
-        worst = await channels.worst_credits(state, channel, item.get("body") or "", client)
-        if await channels.credits_room(state, worst):
-            return "approved", WAIT_CREDITS
+            return Hold("failed", "gate: a second message before they answered the first",
+                        "second")
         return None
 
     async def _in_hours(self) -> bool:
@@ -226,21 +281,33 @@ class MessageSender:
                                                 limit=MAX_SENDS_PER_CYCLE * 4, channel=channel):
             if sent >= MAX_SENDS_PER_CYCLE:
                 break
-            blocked = await self.blocked(item, client)
-            if blocked:
-                await self._hold(item, blocked)
-                continue
-            # Claim it (a new message from them, a rejection or a STOP may
-            # have cancelled it since), then check again on the row as it is.
-            if not await self.state.claim_outbox_item(item["id"]):
-                continue
-            item = await self.state.get_outbox_item(item["id"]) or item
-            blocked = await self.blocked(item, client)
-            if blocked:
-                await self._hold(item, blocked)
-                continue
-            sent += await self._send(client, item)
+            sent += await self._try(client, item)
         return sent
+
+    async def send_one(self, client, item_id: str) -> int:
+        """Try one approved answer now (the one you just wrote): sent (1),
+        or held or refused with why on its row as the drain would (0)."""
+        item = await self.state.get_outbox_item(item_id)
+        if item is None or item.get("status") != "approved" or \
+                (item.get("channel") or "email") == "email":
+            return 0
+        return await self._try(client, item)
+
+    async def _try(self, client, item: dict) -> int:
+        blocked = await self.blocked(item, client)
+        if blocked:
+            await self._hold(item, blocked)
+            return 0
+        # Claim it (a new message from them, a rejection or a STOP may
+        # have cancelled it since), then check again on the row as it is.
+        if not await self.state.claim_outbox_item(item["id"]):
+            return 0
+        item = await self.state.get_outbox_item(item["id"]) or item
+        blocked = await self.blocked(item, client)
+        if blocked:
+            await self._hold(item, blocked)
+            return 0
+        return await self._send(client, item)
 
     async def _cut_off(self, client) -> None:
         """Answers claimed and never finished: back in line, to go again
@@ -306,7 +373,7 @@ class MessageSender:
             return 0
         if e.code in IDEMPOTENT_BUSY:
             # (nPathi is still working on the first send under this key: the
-            # next cycle's retry gets its answer.)
+            # next pass's retry gets its answer.)
             await self.state.update_outbox_item(item["id"], status="approved", error=WAIT_RETRY)
             return 0
         if e.code in IDEMPOTENT_UNKNOWN:
@@ -324,7 +391,7 @@ class MessageSender:
             return 0
         # rate, unreachable, server, unreadable, key, setup: maybe not sent.
         await self.state.update_outbox_item(item["id"], status="approved", error=WAIT_RETRY)
-        logger.info(f"Messenger: an answer waits for the next cycle ({e.kind}).")
+        logger.info(f"Messenger: an answer waits for the next pass ({e.kind}).")
         return 0
 
     async def _thread(self, item: dict) -> None:
@@ -351,7 +418,7 @@ class MessageSender:
             except npathi.NpathiError as e:
                 if e.kind in ("not_found", "refused"):
                     continue
-                logger.info(f"Messenger: delivery not read back ({e.kind}); next cycle.")
+                logger.info(f"Messenger: delivery not read back ({e.kind}); next pass.")
                 return
             fields = {"provider_status": out.status or "queued"}
             if out.price is not None:

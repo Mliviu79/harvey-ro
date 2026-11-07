@@ -14,9 +14,14 @@ minor versions can still change behaviour.
   Channels, with the sender answers go from: one a reply can come back to),
   a message from a number that belongs to one firm, asking or interested,
   gets an answer drafted by the Handler on that channel (plain text, 300
-  characters for SMS), and you can write one yourself on Conversations.
-  Every answer waits in the Outbox for your approval, one at a time:
-  autopilot never approves one and Approve all leaves them. The first
+  characters for SMS), and you can write one yourself on Conversations,
+  which sends it without a second approval (writing it is your approval),
+  still through every check below: one that could never go is refused in
+  the answer box and nothing is queued, one that has to wait (the hours, a
+  cap, a pause) waits approved and says why on the conversation and the
+  Outbox row. Harvey's drafts (and the agent's) wait in the Outbox for your
+  approval, one at a time: autopilot never approves one and Approve all
+  leaves them. The first
   answer to a number names your firm and carries
   `compliance.message_opt_out_line`. Before each send: only an answer
   within the channel's window after their message (SMS 30 days, WhatsApp 24
@@ -28,8 +33,15 @@ minor versions can still change behaviour.
   (the global one and a channel's own). Each send carries its outbox row's
   Idempotency-Key, so one cut off goes again without sending twice (one
   nPathi can't account for fails as possibly sent, and no other answer goes
-  to that number before they write again). With no price known, one answer
-  goes under a credits cap and the next waits until nPathi prices it. A 402
+  to that number before they write again). With a credits cap set and no
+  price known (no rate the key may read, nothing sent on the channel yet),
+  answers wait and the card says the key needs the rates or a first price;
+  with no cap the price doesn't hold them. Messaging runs in a loop of its
+  own beside the job worker (the dashboard's, `harvey worker`, `harvey run`),
+  a pass a minute under a lease, so a mailbox that can't be read, a mail
+  provider Harvey can't send through or the heartbeat stopping early never
+  holds SMS or WhatsApp; the model is asked only for the messages that need
+  it, never in quiet hours or past its budget (an opt-out needs none). A 402
   pauses the `npathi` lane; delivery is read back for a week (an
   unsubscribed number goes on the do-not-contact list, an invalid one or one
   with no WhatsApp is marked unreachable there), and none of it touches

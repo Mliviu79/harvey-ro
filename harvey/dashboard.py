@@ -3327,9 +3327,14 @@ def _outbox_rows(rows: list[dict]) -> list[dict]:
     names it by its channel and the masked number)."""
     from harvey.agent.readonly import mask
 
+    from harvey.agents.messenger import wait_code
+
     for row in rows:
         if row.get("to_phone"):
             row["to_phone"] = mask(row["to_phone"])
+            # Why an approved answer waits, named for the page to say it.
+            if row.get("status") == "approved":
+                row["wait"] = wait_code(row.get("error") or "")
     return rows
 
 
@@ -4806,6 +4811,12 @@ async def get_conversations():
         "SELECT id, conversation_id, subject, body, send_at FROM outbox "
         f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
         "ORDER BY created_at", tuple(cids)) if cids else [])}
+    # An SMS or WhatsApp answer approved and not sent yet (one you wrote,
+    # held by the sending hours or a cap): shown with why it waits.
+    from harvey.agents.messenger import wait_code
+
+    waiting = {c: {**w, "wait": wait_code(w["error"]) if w["status"] == "approved" else ""}
+               for c, w in (await _state().messages_waiting(cids)).items()}
     # The number (or handle) an SMS or WhatsApp conversation came from,
     # masked as phones are everywhere else outside Contacts.
     from harvey import channels
@@ -4831,17 +4842,24 @@ async def get_conversations():
                          for e in emails.get(row.get("prospect_id"), [])
                          if not camp or e.get("campaign_id") == camp]
         row["draft"] = drafts.get(row["id"])
+        row["waiting"] = waiting.get(row["id"])
     return rows
 
 
 @app.post("/api/conversations/{convo_id}/answer")
 async def answer_conversation(convo_id: str, request: Request):
     """An answer you write to an SMS or WhatsApp conversation: {"body"}. It
-    goes back to the number it came from on that channel, queued in the
-    Outbox like any answer (you approve it there), checked as the
-    messenger checks it."""
+    goes back to the number it came from on that channel, approved by you
+    as you write it (no second approval in the Outbox), and is sent at once
+    when every check the messenger makes lets it (or by the messaging
+    channels' next pass). Refused for good (the window, the do-not-contact
+    list, an opt-out, the text's rules, a second message...): nothing is
+    queued, and ``code`` names why for the page. Held (the sending hours,
+    a cap, a pause): queued approved, waiting, with ``wait`` and ``why``."""
     from harvey import channels
-    from harvey.agents.messenger import OUTSIDE_WINDOW
+    from harvey.agents import message_loop
+    from harvey.agents.messenger import MessageSender, wait_code
+    from harvey.integrations import npathi
 
     try:
         data = await request.json()
@@ -4858,34 +4876,64 @@ async def answer_conversation(convo_id: str, request: Request):
     handle = await state.conversation_reply_handle(convo_id)
     if handle is None or handle["channel"] not in channels.SEND_RULES:
         return _refuse("This conversation has no SMS or WhatsApp number to answer.", 409)
-    channel, phone = handle["channel"], handle["value"]
-    prospect = await state.get_prospect(convo.prospect_id) if convo.prospect_id else None
-    if prospect is not None and prospect.status == "opted_out":
-        return _refuse("They asked not to be contacted.", 409)
     config = _load_config_quietly()
-    if await state.suppression_check(prospect.email if prospect else "", firm=(
-            prospect.company_id if prospect else handle.get("firm")), config=config,
-            phone=phone) is not None:
-        return _refuse("This number (or its person or firm) is on the do-not-contact list.", 409)
-    last = await state.last_inbound(channel, phone)
-    if last is None or time.time() - last > channels.SEND_RULES[channel].window_hours * 3600:
-        return _refuse(OUTSIDE_WINDOW[:1].upper() + OUTSIDE_WINDOW[1:] + ".", 409)
+    if config is None:
+        # (Quiet hours, the firm's name and the opt-out line are in it.)
+        return _refuse("Harvey's settings can't be read, so nothing is sent.", 409)
+    channel, phone = handle["channel"], handle["value"]
     first = not await state.messages_sent_to_since(channel, phone, "")
-    from harvey import gate
-
     text = channels.first_message(body, config) if first else body
-    problems = gate.message_problems(text, max_chars=channels.SEND_RULES[channel].max_chars,
-                                     config=config, first=first)
-    if problems:
-        return _refuse("The sender would block this message: " + "; ".join(problems), 400)
-    item = await channels.queue_answer(state, config, conversation=convo_id,
-                                       prospect_id=convo.prospect_id or "", channel=channel,
-                                       phone=phone, body=body)
-    if not item:
+    item = {"channel": channel, "to_phone": phone, "kind": "reply", "conversation_id": convo_id,
+            "prospect_id": convo.prospect_id or "", "approved_by": "you", "status": "approved",
+            "body": text}
+    sender = MessageSender(state, config)
+    refused = await sender.refusal(item)
+    if refused:
+        why = refused[1].removeprefix("gate: ")
+        if refused.code == "text":
+            why = "The sender would block this message: " + why
+        return JSONResponse({"success": False, "message": why[:1].upper() + why[1:],
+                             "code": refused.code,
+                             "detail": refused[1].removeprefix("gate: ")},
+                            status_code=400 if refused.code == "text" else 409)
+    if await state.messages_waiting([convo_id]):
+        # (One already approved and not sent: a second would be a second
+        # message before they answered, refused at send time; a double
+        # click must not queue it.)
+        return JSONResponse({"success": False, "code": "waiting",
+                             "message": "An answer you approved here hasn't gone yet: "
+                                        "reject it in the Outbox to write another."},
+                            status_code=409)
+    client = await npathi.client(state)
+    hold = await sender.blocked(item, client)
+    if hold and hold[0] == "failed":
+        return JSONResponse({"success": False, "message": hold[1], "code": hold.code},
+                            status_code=409)
+    item_id = await channels.queue_answer(
+        state, config, conversation=convo_id, prospect_id=convo.prospect_id or "",
+        channel=channel, phone=phone, body=body, approved=True,
+        note=hold[1] if hold else "")
+    if not item_id:
         return _refuse("It couldn't be queued.", 409)
     await state.log_action("answer_written", "dashboard",
-                           {"conversation_id": convo_id, "channel": channel, "outbox_id": item})
-    return {"success": True, "outbox_id": item, "status": "pending_review"}
+                           {"conversation_id": convo_id, "channel": channel, "outbox_id": item_id,
+                            "approved_by": "you"})
+    try:
+        tried = not hold and await message_loop.send_now(state, item_id, config)
+    except Exception as e:
+        # (It is queued, approved: the next pass sends it. The page must
+        # not say it failed, or it would be written again.)
+        logger.warning(f"Conversations: an answer waits for the next pass ({type(e).__name__}).")
+        tried = False
+    if not hold and not tried:
+        # (A pass holds the lease: it, or the next one, sends it.)
+        return {"success": True, "outbox_id": item_id, "status": "approved",
+                "wait": "next_pass", "why": ""}
+    row = await state.get_outbox_item(item_id) or {}
+    status, error = row.get("status") or "approved", row.get("error") or ""
+    return {"success": status != "failed", "outbox_id": item_id, "status": status,
+            "wait": wait_code(error) if status == "approved" else "",
+            "why": error, **({"message": error} if status == "failed" else {})}
 
 
 @app.post("/api/conversations/{convo_id}/status")

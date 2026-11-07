@@ -1,5 +1,6 @@
 """Messages people send in on SMS and WhatsApp (nPathi Chat), read in the
-Handler's cycle.
+messaging channels' own loop (harvey/agents/message_loop.py), apart from
+email, with the Handler's classifier and writer.
 
 Each channel that is on is read from its last complete read (less a ten
 minute overlap; a week back the first time), newest first, page by page,
@@ -73,9 +74,12 @@ STOP_WORDS = frozenset({
     "renunt", "anulare", "sterge", "stergeti-ma",
 })
 DEDUP_PREFIX = "npathi:"
+# Why a message that needs the model waits when may_think says no (quiet
+# hours, the brain's budget, a brain that can't be used).
+NOT_NOW = "the model isn't asked now"
 # nPathi's answers to adding a number that asking again won't change (a
 # 422: a number it doesn't take): the number is dropped from the ones still
-# to add, so it can't hold the others behind it every cycle.
+# to add, so it can't hold the others behind it every pass.
 FINAL_REFUSALS = ("refused",)
 
 
@@ -125,10 +129,14 @@ def _naive_utc(ts: float | None) -> datetime:
 class MessageReader:
     """One Handler's reader of the messaging channels."""
 
-    def __init__(self, handler, transport=None):
+    def __init__(self, handler, transport=None, may_think=None):
         self.handler = handler
         self.state = handler.state
         self.transport = transport
+        # Whether the model may be asked now (an async callable; None: yes).
+        # No: a message that needs it (its intent, an answer) is read again
+        # on a later pass; an opt-out and stop-on-reply need none.
+        self.may_think = may_think
 
     async def run(self) -> bool:
         """Read every channel that is on. True when each was read and every
@@ -181,7 +189,7 @@ class MessageReader:
                         break
                     await self._problem(channel, e.kind, str(e))
                     logger.warning(f"Messages: {channel} not read ({e.kind}); "
-                                   "it is read from the same point next cycle.")
+                                   "it is read from the same point next pass.")
                     return False
                 for msg in read.messages:
                     found.setdefault(msg.id, msg)
@@ -200,18 +208,19 @@ class MessageReader:
             if await self.state.is_reply_processed(key):
                 continue
             if brain_down and not _stop_of(_text(msg)):
-                continue        # needs the model: read again next cycle
+                continue        # needs the model: read again next pass
             consumed = True
             self.handler._touched = set()
             try:
                 await self._handle(channel, msg, key)
-            except BrainUnavailable:
+            except BrainUnavailable as e:
                 # An opt-out needs no model: the ones after this message are
                 # still recorded now (their email must not go out meanwhile).
                 consumed = complete = False
                 if not brain_down:
-                    logger.error("Messages: the model is unavailable; only opt-outs are "
-                                 "handled now, the rest are read again next cycle.")
+                    log = logger.info if str(e) == NOT_NOW else logger.error
+                    log(f"Messages: {NOT_NOW if str(e) == NOT_NOW else 'the model is unavailable'}"
+                        "; only opt-outs are handled now, the rest are read again next pass.")
                 brain_down = True
             except Exception as e:
                 complete = False
@@ -233,7 +242,7 @@ class MessageReader:
 
     async def _retry(self, key: str, channel: str) -> bool:
         """A message that couldn't be handled: True to read it again next
-        cycle (the channel's mark waits meanwhile); after the Handler's
+        pass (the channel's mark waits meanwhile); after the Handler's
         STOP_RETRIES tries it goes to you, so one message can't hold the
         channel forever."""
         from harvey.agents.handler import STOP_RETRIES, STOP_RETRY_KEY
@@ -347,6 +356,8 @@ class MessageReader:
         if any(p in _flat(text) for p in ESCALATION_PATTERNS):
             intent = "escalate"
         else:
+            if self.may_think is not None and not await self.may_think():
+                raise BrainUnavailable(NOT_NOW)
             intent = await handler._classify_intent(text, prospect)
         if intent not in NO_COMPANY_STOP_INTENTS:
             await handler._stop_colleagues(prospect)
@@ -496,7 +507,7 @@ class MessageReader:
     # ── nPathi's opt-out list ──
 
     async def _sync_opt_outs(self, client: npathi.Npathi) -> None:
-        """Harvey's own opt-outs nPathi hasn't got yet, every cycle; nPathi's
+        """Harvey's own opt-outs nPathi hasn't got yet, every pass; nPathi's
         list into the do-not-contact list once a day (reason by_hand, by
         npathi: a STOP nPathi recorded itself, or one the user added there)."""
         pending = await self.state.settings_with_prefix(channels.PENDING_KEY)
@@ -507,7 +518,7 @@ class MessageReader:
             except npathi.NpathiError as e:
                 if e.kind not in FINAL_REFUSALS:
                     logger.info(f"Messages: nPathi's opt-out list not updated ({e.kind}); "
-                                "tried again next cycle.")
+                                "tried again next pass.")
                     break
                 logger.info(f"Messages: nPathi's opt-out list refused a number ({e.kind}); "
                             "it stays on Harvey's own list.")
@@ -522,7 +533,7 @@ class MessageReader:
             entries, complete = await client.unsubscribed()
         except npathi.NpathiError as e:
             if e.kind == "forbidden":
-                # A key without unsubscribed.view: asking every cycle changes
+                # A key without unsubscribed.view: asking every pass changes
                 # nothing, so it waits a day (the card says so).
                 await self.state.set_setting(channels.SYNC_KEY, str(int(time.time())))
                 await self.state.set_setting(channels.SYNC_PROBLEM_KEY, json.dumps(
@@ -532,7 +543,7 @@ class MessageReader:
                             "(unsubscribed.view); tried again in a day.")
                 return
             logger.info(f"Messages: nPathi's opt-out list not read ({e.kind}); "
-                        "tried again next cycle.")
+                        "tried again next pass.")
             return
         listed: dict[str, float | None] = {}     # each number: when the list last named it
         for entry in entries:

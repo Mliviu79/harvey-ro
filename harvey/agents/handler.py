@@ -391,20 +391,17 @@ class Handler:
             read = False
         else:
             read = await self._run_native()
-        # Then the SMS and WhatsApp messages people sent in (nPathi Chat,
-        # when its module is on and connected): an SMS reply stops that
-        # person's email sequence before anything is sent. What happens
-        # there never holds email: its own channel waits instead.
-        await self.read_messages()
+        # (The SMS and WhatsApp messages people send in are read in the
+        # messaging channels' own loop, harvey/agents/message_loop.py.)
         return read
 
-    async def read_messages(self) -> bool:
-        """Read the messaging channels (harvey/agents/messages.py). Never
-        raises but for a brain that stopped being usable."""
+    async def read_messages(self, may_think=None) -> bool:
+        """Read the messaging channels (harvey/agents/messages.py), asking
+        the model only while ``may_think`` says so. Never raises."""
         from harvey.agents.messages import MessageReader
 
         try:
-            return await MessageReader(self, self.message_transport).run()
+            return await MessageReader(self, self.message_transport, may_think).run()
         except BrainUnavailable as e:
             logger.error(f"Handler: messages are left for later ({e}).")
             return False

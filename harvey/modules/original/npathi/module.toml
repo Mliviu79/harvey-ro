@@ -1,7 +1,10 @@
 # nPathi Chat: SMS and WhatsApp messages people send in, read into
-# Harvey's conversations (harvey/integrations/npathi.py, the Handler's
-# cycle: harvey/agents/messages.py), and the answers to them, each approved
-# by the user in the Outbox (harvey/agents/messenger.py). Replies only:
+# Harvey's conversations (harvey/integrations/npathi.py,
+# harvey/agents/messages.py), and the answers to them, each approved by the
+# user: Harvey's drafts in the Outbox, the user's own as they write them on
+# the Conversations page (harvey/agents/messenger.py). Both run in the
+# channels' own loop beside the worker's jobs, apart from email
+# (harvey/agents/message_loop.py). Replies only:
 # Harvey never writes first on these channels. Romanian law (Law 506/2004
 # art. 12) wants consent before a commercial SMS or app message, for a
 # company too, and WhatsApp's own rules forbid cold messages.
@@ -13,8 +16,10 @@ kind = "action"
 version = "0.1.0"
 api = 1
 markets = []
-# The Handler's cycle reads the messages (harvey run), and a number is
-# matched to its firm through the contacts the phones module keeps.
+# A number is matched to its firm through the contacts the phones module
+# keeps. The Email module's pages are where answers are approved (Outbox)
+# and written (Conversations), so it stays on with this one; its heartbeat
+# is no longer needed: the messaging loop doesn't wait on email.
 requires = ["phones", "email_outreach"]
 default_enabled = false
 entry = "harvey.integrations.npathi"
@@ -47,8 +52,8 @@ default = true
 type = "bool"
 default = false
 
-# Which channels answers are sent on (each answer still waits for your
-# approval), and from which sender: "<type>:<id>" as the account lists it,
+# Which channels answers are sent on (each answer is still approved by
+# you), and from which sender: "<type>:<id>" as the account lists it,
 # one a reply can come back to (a SIM, a phone bridge or a GSM modem line;
 # a WABA number; a paired WhatsApp account). Off until you choose.
 [settings.send_sms]

@@ -24,7 +24,9 @@ longer each time; a source out of credit pauses its whole lane.
 Quiet hours are the Email module's: the worker runs at any hour. A full
 worker also looks, every minute, for a wake of Harvey's agent that is due
 (harvey/agent/wakes.py), and a job that finishes its run tells the plans
-that run is of.
+that run is of; and it runs the SMS and WhatsApp channels' passes beside
+its jobs, one at a time (harvey/agents/message_loop.py), so messages are
+read and answered with or without the heartbeat.
 """
 
 from __future__ import annotations
@@ -355,6 +357,9 @@ class Worker:
         self._next_wakes = 0.0
         self._next_codex_login = 0.0
         self._codex_login: asyncio.Task | None = None
+        self._next_messages = 0.0
+        self._messages: asyncio.Task | None = None
+        self._messaging = None
         self._renewer: _Renewer | None = None
 
     def lost_leases(self) -> set[str]:
@@ -412,6 +417,15 @@ class Worker:
                     self._next_codex_login = time.monotonic() + CODEX_LOGIN_EVERY_SECONDS
                     if self._codex_login is None or self._codex_login.done():
                         self._codex_login = asyncio.create_task(_renew_codex_login(self.state))
+                if self.full and time.monotonic() >= self._next_messages:
+                    from harvey.agents import message_loop
+
+                    self._next_messages = time.monotonic() + message_loop.EVERY_SECONDS
+                    if self._messages is None or self._messages.done():
+                        if self._messaging is None:
+                            self._messaging = message_loop.Loop(self.state)
+                        self._messages = asyncio.create_task(
+                            _messaging_pass(self._messaging, f"{self.name}:messaging"))
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(_first(stop, self._wake), timeout=self.poll)
@@ -443,9 +457,10 @@ class Worker:
 
     async def _shutdown(self) -> None:
         self.stopping = True
-        if self._codex_login is not None and not self._codex_login.done():
-            self._codex_login.cancel()
-            await asyncio.gather(self._codex_login, return_exceptions=True)
+        for task in (self._codex_login, self._messages):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         running = [t for t in self._tasks.values() if not t.done()]
         if running:
             # Running jobs stop at their next page and go back to the queue.
@@ -628,6 +643,13 @@ async def _renew_codex_login(state) -> None:
         await codex_link.renew_if_due(state)
     except Exception as e:
         logger.warning("worker: renewing the linked Codex login failed: %s", e)
+
+
+async def _messaging_pass(loop, owner: str) -> None:
+    try:
+        await loop.run(owner)
+    except Exception as e:
+        logger.warning("worker: the messaging channels' pass failed: %s", e)
 
 
 async def _sweep_wakes(state) -> None:

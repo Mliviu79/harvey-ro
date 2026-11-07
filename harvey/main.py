@@ -6,7 +6,9 @@ campaigns the user made (agents/campaigner.py). Finding companies, reading
 their sites and loading public data are jobs the worker runs
 (harvey/modules/worker.py). With the Email module off it does nothing at
 all, and with a mail provider Harvey doesn't support (Instantly, removed)
-it sends and reads nothing, says why, and leaves the worker running.
+it sends and reads nothing, says why, and leaves the worker running. SMS
+and WhatsApp aren't the heartbeat's: the worker reads and answers them in
+their own loop (harvey/agents/message_loop.py), whatever email is doing.
 """
 
 import asyncio
@@ -254,12 +256,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.analyst import Analyst
     from harvey.agents.campaigner import CampaignCycle
 
-    from harvey.agents.messenger import MessageSender
-
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
-    messenger = MessageSender(state, config)
     analyst = Analyst(state)
     campaigner = CampaignCycle(state, config, env, writer, sender)
 
@@ -396,10 +395,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             else:
                 await record_send_phase(state, send_hold_reason([], "", ""))
                 await _run_agents([("send_outbox", sender.run())])
-                # The SMS and WhatsApp answers you approved (nPathi Chat):
-                # never in quiet hours, and only after every reply was read.
-                if not send_only:
-                    await _run_agents([("send_messages", messenger.run())])
+                # (SMS and WhatsApp are read and answered in their own loop,
+                # beside the worker's jobs: harvey/agents/message_loop.py.)
 
             # Then roll, verify, write and stage each active campaign.
             # Staging only fills the review queue, so it runs whether or not

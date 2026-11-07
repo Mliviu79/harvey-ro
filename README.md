@@ -1295,15 +1295,21 @@ is for: Harvey drafts the answer, you approve it in the Outbox, every time
    sms|waba|wa`. The card lists each channel's senders and whether a reply can
    come back to each (an alphanumeric sender ID can't).
 
-Each cycle Harvey reads what came in since its last complete read, newest
-first. Then, per message:
+Messaging runs on its own, apart from email: every minute the job worker
+(the dashboard's, `harvey worker` or `harvey run`) reads what came in since
+the last complete read, newest first, then sends the approved answers that
+may go, one pass at a time. A mailbox that can't be read, a mail provider
+Harvey can't send through or a held cold-email queue doesn't stop it; the
+module off, the kill switches, quiet hours and the sending hours still do.
+Then, per message:
 
 - **STOP first.** STOP, "dezabonare", "nu mă mai contactați" and the other
   opt-out phrases put the number on the do-not-contact list and on nPathi's own
   list. When the number belongs to exactly one firm, its person is opted out
   too, their queued email is cancelled and their company's cold email stops.
   An opt-out needs no model, so it is recorded even while Claude is
-  unavailable. nPathi's own opt-out list is read into Harvey's once a day.
+  unavailable, out of its budget or resting in quiet hours (the messages that
+  need the model wait for a later pass). nPathi's own opt-out list is read into Harvey's once a day.
 - **A number Harvey knows** (one firm's contact) joins that person's
   conversation: their queued email is cancelled (an SMS reply stops the email
   sequence) and their company's cold email stops.
@@ -1324,7 +1330,13 @@ ID) and switch **Send answers** on (the key needs `sms.send` / `waba.send` /
   and rules) as plain text, at most 300 characters for SMS. It waits in the
   **Outbox** with its channel and the number masked: approve, edit or reject
   it there, one at a time (Approve all leaves these). You can also write an
-  answer yourself on the **Conversations** page; it goes to the Outbox too.
+  answer yourself on the **Conversations** page: writing it is your approval,
+  so it goes at once, with no second approval in the Outbox, still through
+  every check below. One that could never go (outside the window, a listed
+  number, the text's rules, a second message, one already waiting there) is
+  refused in the box and nothing is queued; one that has to wait (the
+  sending hours, a cap, a pause) waits approved, and the conversation and
+  the Outbox say why.
 - The first answer to a number starts with your firm's name
   (`persona.company`) and ends with an opt-out line
   (`compliance.message_opt_out_line`; "Răspunde STOP ca să nu mai primești
@@ -1335,7 +1347,9 @@ ID) and switch **Send answers** on (the key needs `sms.send` / `waba.send` /
   (or a person or firm) on the do-not-contact list, only inside the sending
   hours (09:00-20:00 in Harvey's time zone by default; quiet hours always
   apply), at most 20 a day per channel by default, and inside the credits caps
-  you set. No curly braces (nPathi would fill them in) and at most one link, to
+  you set. With a credits cap set, an answer whose price Harvey can't know (the
+  key can't read the rates and nothing was sent on that channel yet) waits,
+  and the card says so; with no cap, the price doesn't hold it. No curly braces (nPathi would fill them in) and at most one link, to
   your own site.
 - If nPathi says the credits ran out, sending pauses (resume the `npathi` lane
   on Coadă once credits are added); reading goes on. A number nPathi reports

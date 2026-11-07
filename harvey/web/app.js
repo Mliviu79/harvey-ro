@@ -2432,6 +2432,8 @@ async function loadOutbox() {
     table(t('ob.approved'), data.approved, [
       [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
       [t('ob.sends'), r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
+      // Why an approved SMS or WhatsApp answer waits (the sending hours, a cap...).
+      [t('ob.waits'), r => isMessage(r) && r.error ? msgWhy(r.wait, r.error) : '', true],
     ]) +
     table(t('ob.sent'), data.sent, [
       [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
@@ -5709,6 +5711,7 @@ function channelSpendHtml(s) {
     ? t('ch.spend_usd', {today: fmtN(sp.usd_today), month: fmtN(sp.usd_month)}) : '';
   const notes = [];
   if (s.credits_out) notes.push(t('ch.credits_out'));
+  if ((s.unpriced_cap || []).length) notes.push(t('ch.unpriced_cap', {channels: s.unpriced_cap.map(channelName).join(', ')}));
   if ((s.optout_sync || {}).problem_kind === 'forbidden') notes.push(t('ch.sync_forbidden'));
   if (s.still_listed) notes.push(t('ch.still_listed', {n: s.still_listed}));
   return '<div class="settings-row"><div><h3>' + escHtml(t('ch.sending_title')) + '</h3>' +
@@ -7676,6 +7679,14 @@ function convoCard(c) {
       '<div class="td-body">' + escHtml(c.draft.body) + '</div>' +
       '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">' + escHtml(t('cv.review')) + icon('arrow') + '</button></div>'
     : '';
+  // An answer approved and not sent yet (held by the sending hours, a cap,
+  // a pause): with why it waits.
+  const w = c.waiting;
+  const waiting = w
+    ? '<div class="thread-draft"><div class="sender">' + icon('queue') + escHtml(t('cv.waiting')) + '</div>' +
+      '<div class="td-body">' + escHtml(w.body) + '</div>' +
+      (w.status === 'approved' && w.error ? '<p class="muted small">' + escHtml(t('cv.waiting_why', {why: msgWhy(w.wait, w.error)})) + '</p>' : '') + '</div>'
+    : '';
   const h = c.handle;
   const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || (h && h.value) || t('cv.unknown');
   const stageKey = 'cv.stage.' + c.stage;
@@ -7689,19 +7700,27 @@ function convoCard(c) {
       (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
       stage + badge(c.status) + '</div></div>' +
     '<div class="thread">' + (thread || '<p class="muted small">' + escHtml(t('cv.no_messages')) + '</p>') +
-    draft + '</div>' + convoAnswer(c) + convoActions(c) + '</div>';
+    draft + waiting + '</div>' + convoAnswer(c) + convoActions(c) + '</div>';
+}
+
+// Why an SMS or WhatsApp answer can't go (now, or ever), in the viewer's
+// language, from the code the server names; its own sentence otherwise.
+function msgWhy(code, fallback, detail) {
+  return code && hasKey('en', 'msg.why.' + code) ? t('msg.why.' + code, {detail: detail || ''}) : (fallback || '');
 }
 
 // An answer you write to an SMS or WhatsApp conversation: back to the number
-// it came from, queued in the Outbox for your approval like any other.
+// it came from, approved by you as you send it (no second approval in the
+// Outbox), and sent when every check lets it.
 function convoAnswer(c) {
-  if (!c.can_answer || c.draft) return '';
+  if (!c.can_answer || c.draft || c.waiting) return '';
   const ch = channelName((c.handle && c.handle.channel) || c.channel);
   const id = 'cv-answer-' + c.id;
   return '<div class="convo-answer"><label class="form-label" for="' + escHtml(id) + '">' + escHtml(t('cv.answer', {channel: ch})) + '</label>' +
     '<textarea class="form-input" id="' + escHtml(id) + '" rows="3" maxlength="' + (MESSAGE_MAX[(c.handle || {}).channel] || 300) +
       '" placeholder="' + escHtml(t('cv.answer_ph')) + '"></textarea>' +
     '<p class="muted small">' + escHtml(t('cv.answer_note')) + '</p>' +
+    '<p class="small" style="color:var(--bad)" id="cv-answer-why-' + escHtml(c.id) + '" hidden></p>' +
     '<button class="btn btn-secondary btn-sm" onclick="answerConvo(' + jsq(c.id) + ')">' + escHtml(t('cv.answer_queue')) + '</button></div>';
 }
 
@@ -7712,8 +7731,18 @@ async function answerConvo(id) {
   const data = await api('/api/conversations/' + encodeURIComponent(id) + '/answer', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({body: body}),
   });
-  if (data && data.success) showToast(t('cv.answer_queued'), 'success');
-  else showToast(failMsg(data, t('cv.answer_failed')), 'error');
+  if (data && data.success && data.status === 'sent') showToast(t('cv.answer_sent'), 'success');
+  else if (data && data.success && data.wait === 'next_pass') showToast(t('cv.answer_queued'), 'success');
+  else if (data && data.success) showToast(t('cv.answer_waits', {why: msgWhy(data.wait, data.why)}), 'success');
+  else {
+    // Refused: said in the answer box, and nothing was queued.
+    let why = data && data.code ? msgWhy(data.code, data.message, data.detail) : failMsg(data, t('cv.answer_failed'));
+    why = why.charAt(0).toUpperCase() + why.slice(1);
+    const box = document.getElementById('cv-answer-why-' + id);
+    if (box) { box.textContent = why; box.hidden = false; }
+    showToast(why, 'error');
+    return;
+  }
   loadConversations();
   loadToday();
 }

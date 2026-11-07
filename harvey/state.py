@@ -2711,6 +2711,20 @@ class StateManager:
 
     # ── Answers on the messaging channels (harvey/agents/messenger.py) ──
 
+    async def messages_waiting(self, conversation_ids) -> dict[str, dict]:
+        """{conversation: {id, body, status, error, send_at}}: its SMS or
+        WhatsApp answer approved and not sent yet (any one of them when
+        there are several: the page offers no second while one waits)."""
+        ids = [c for c in dict.fromkeys(conversation_ids) if c]
+        if not ids:
+            return {}
+        rows = await self._named("overlay.messages.waiting", (json.dumps(ids),))
+        out: dict[str, dict] = {}
+        for item_id, convo, body, status, error, send_at in rows:
+            out[convo] = {"id": item_id, "body": body, "status": status, "error": error or "",
+                          "send_at": send_at}
+        return out
+
     async def conversation_reply_handle(self, conversation: str) -> dict | None:
         """The number an answer to a conversation goes to: its handle that
         wrote in last ({channel, value, last_inbound_at, contact, firm}),
