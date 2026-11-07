@@ -827,3 +827,15 @@ async def test_an_sms_to_a_number_of_unknown_line_type_may_go(state, npat):
     await _ready(state, npat)
     item, blocked = await _blocked(state, npat, line="unknown")
     assert blocked is None
+
+
+def test_a_message_opt_out_line_too_long_is_refused_not_cut():
+    from pydantic import ValidationError
+
+    from harvey.config import ComplianceConfig
+
+    # Cutting at 120 would drop the STOP the check found past it.
+    with pytest.raises(ValidationError):
+        ComplianceConfig(message_opt_out_line="Mulțumim. " * 13 + "Răspunde STOP.")
+    line = ComplianceConfig(message_opt_out_line="Răspunde STOP ca să nu mai primești mesaje.")
+    assert line.message_opt_out_line.endswith("STOP ca să nu mai primești mesaje.")

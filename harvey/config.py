@@ -492,13 +492,15 @@ class ComplianceConfig(BaseModel):
         v = " ".join(v.split())
         if not v:
             return v
+        if len(v) > 120:
+            raise ValueError("message_opt_out_line is at most 120 characters")
         if any(bit in v.lower() for bit in ("http", "www.", "@", "{", "}")):
             raise ValueError("message_opt_out_line can't contain a link, an email address or "
                              "curly braces")
         if not _ASKS_FOR_OPT_OUT_RE.search(v):
             raise ValueError('message_opt_out_line must ask for a reply Harvey recognises as an '
                              'opt-out, e.g. "Reply STOP" / "Răspunde STOP"')
-        return v[:120]
+        return v
 
     @field_validator("opt_out_line")
     @classmethod
