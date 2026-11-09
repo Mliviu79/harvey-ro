@@ -288,6 +288,11 @@ HISTORY_LATEST_CAP = 12_000       # the message being answered
 HISTORY_ALWAYS_RECENT = 6
 
 
+def is_email(convo) -> bool:
+    """An email conversation (an older one has no channel on file)."""
+    return (getattr(convo, "channel", "") or "email") == "email"
+
+
 def conversation_history(thread, prospect_name: str) -> str:
     """The thread as the reply prompt shows it, oldest first.
 
@@ -569,9 +574,11 @@ class Handler:
         # left unprocessed and the retry starts from the same stored state,
         # so the thread never gets the message twice or its stage advanced
         # twice. (Stop-on-reply above is idempotent and stays first.)
+        # (Their open email conversation: an email never joins one of
+        # their SMS or WhatsApp conversations, whose answers go there.)
         existing_convos = await self.state.get_conversations_by_status("open")
         stored = next(
-            (c for c in existing_convos if c.prospect_id == prospect.id), None
+            (c for c in existing_convos if c.prospect_id == prospect.id and is_email(c)), None
         )
         if stored is not None:
             convo = stored.model_copy(deep=True)
@@ -1001,7 +1008,7 @@ class Handler:
         await self._stop_colleagues(prospect)
         message = Message(sender="prospect", content=f"[{lead_email}] {reply_text}")
         stored = next((c for c in await self.state.get_conversations_by_status("open")
-                       if c.prospect_id == prospect.id), None)
+                       if c.prospect_id == prospect.id and is_email(c)), None)
         if stored is not None:
             stored.thread.append(message)
             await self.state.update_conversation(stored.id, thread_json=stored.thread_json(),

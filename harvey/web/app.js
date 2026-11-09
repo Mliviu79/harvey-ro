@@ -2476,9 +2476,16 @@ async function loadOutbox() {
       [t('ob.sent_at'), r => formatDate(r.sent_at) + (r.provider_status ? ' · ' + r.provider_status : ''), true],
     ]) +
     table(t('ob.failed'), data.failed, [
-      [t('ob.to'), outboxTo], [t('ob.status'), r => badge(r.status), false, true],
+      [t('ob.to'), outboxTo], [t('ob.status'), obStatusBadge, false, true],
       [t('ob.reason'), r => r.error, true], [t('ob.updated'), r => formatDate(r.updated_at), true],
     ]);
+}
+
+// A message you removed has its own word ('removed' is also a campaign
+// member's status, said otherwise there).
+function obStatusBadge(r) {
+  if (r.status !== 'removed') return badge(r.status);
+  return '<span class="badge t-idle">' + escHtml(t('ob.st_removed')) + '</span>';
 }
 
 // An approved message that hasn't gone can still be edited (it stays

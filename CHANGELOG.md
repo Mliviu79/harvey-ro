@@ -1535,6 +1535,23 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Loose ends of removing and answering.** A campaign email removed in
+  the moment staging wrote it no longer leaves its person staged with
+  nothing to send: the step is drafted again, once (and staging no
+  longer reopens a person who replied while it ran). The Outbox's
+  Didn't send list says **Removed** (Șters) for a message you removed,
+  not a campaign member's "Taken out". A drain's note or new send time
+  is never written over a message that ended meanwhile (removed,
+  rejected, cancelled, sent or failed). An SMS or WhatsApp answer whose
+  send was tried and then rejected, cancelled or refused counts as
+  possibly sent, so no second one goes to that number before they write
+  again; nor does another answer while a tried one waits to go again. "Held for review" counts email only, as the autopilot card and
+  Approve all mean it. An email reply joins the person's email
+  conversation and a text joins that number's conversation on its own
+  channel, never each other's. Harvey's agent sees a conversation as
+  answerable in `replies()` only when `draft_reply` would take it (new
+  reasons: `plan`, for a campaign not of an approved plan of that chat,
+  `no_number`, `opted_out`, `listed`, `budget`).
 - **`harvey outbox --approve` checks an SMS or WhatsApp answer's text** as
   the dashboard's Approve does: one the sender would block (curly braces,
   too long, a link that isn't yours, a first answer without your firm's

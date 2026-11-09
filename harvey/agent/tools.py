@@ -713,7 +713,8 @@ def build(db_path: str, chat: str = "", task: int | None = None):
           "prompt: it reads their reply, you don't. Queued in the Outbox, where it waits for "
           "the user's own approval even on autopilot; never sent here. Refused for a conversation Harvey doesn't "
           "answer (opt-out, escalation, a no, out of office, closed), one with an answer "
-          "waiting, or a person or firm on the do-not-contact list. Free (a Claude call).",
+          "waiting, a text with no number to answer, or a person or firm on the "
+          "do-not-contact list: what replies() says of each. Free (a Claude call).",
           writes)
     async def draft_reply(plan: int, conversation: str, guidance: str) -> str:
         args = {"plan": plan, "conversation": conversation, "guidance": guidance}

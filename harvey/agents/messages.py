@@ -465,11 +465,12 @@ class MessageReader:
 
     async def _conversation_for(self, channel, handle, prospect) -> Conversation | None:
         """The conversation a message joins: the number's own, else the
-        prospect's open one, else None (a new one)."""
+        prospect's open one on this channel (never an email conversation,
+        whose answers go by email), else None (a new one)."""
         convo = await self.state.handle_conversation(channel, handle)
         for status_now in (("needs_human", "open") if convo is None and prospect else ()):
             convo = next((c for c in await self.state.get_conversations_by_status(status_now)
-                          if c.prospect_id == prospect.id), None)
+                          if c.prospect_id == prospect.id and c.channel == channel), None)
             if convo is not None:
                 break
         return convo

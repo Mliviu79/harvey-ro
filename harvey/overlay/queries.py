@@ -1147,7 +1147,7 @@ statement("overlay.agent.campaign_conversations",
           "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].sender') "
           "END, "
           "CASE WHEN json_valid(c.thread_json) THEN json_extract(c.thread_json, '$[#-1].channel') "
-          "END "
+          "END, c.prospect_id "
           "FROM conversations c INDEXED BY idx_conversations_campaign_id WHERE c.campaign_id = ? "
           "ORDER BY c.updated_at DESC LIMIT ?", params=("c", 50), bounded=True)
 # One conversation's structured fields: its campaign, intent, stage,
@@ -1519,6 +1519,13 @@ statement("overlay.outbox.email_sent_since_kind",
           "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
           "AND sent_at >= ? AND kind = ?", params=("2026-01-01", "sequence"))
 
+# Emails autopilot held for a human, still waiting (the note starts with
+# state.HELD_FOR_REVIEW).
+statement("overlay.outbox.email_held_for_review",
+          "SELECT COUNT(*) FROM outbox INDEXED BY idx_outbox_status_send_at "
+          "WHERE status = 'pending_review' AND channel = 'email' AND substr(error, 1, ?) = ?",
+          params=(22, "held for your review: "))
+
 # Removing or editing a row that hasn't gone: only while it waits (pending
 # or approved) and nothing was ever handed over for it (no provider message
 # id, no send attempt kept under npathi:attempt:<id>: an SMS or WhatsApp
@@ -1548,6 +1555,14 @@ statement("overlay.outbox.first_on_file",
           "SELECT 1 FROM outbox INDEXED BY uq_outbox_campaign_step WHERE campaign_id = ? "
           "AND campaign_id != '' AND prospect_id = ? AND step = 1 AND kind = 'sequence' "
           "AND status != 'removed' LIMIT 1", params=("c", "p"))
+# How many of these steps of a campaign's emails to a person have their row
+# (any status but removed): staging marks the member staged only when each
+# has (campaigns.staged), so a step removed while it staged comes again.
+statement("overlay.campaigns.steps_on_file",
+          "SELECT COUNT(DISTINCT step) FROM outbox INDEXED BY uq_outbox_campaign_step "
+          "WHERE campaign_id = ? AND campaign_id != '' AND prospect_id = ? "
+          "AND kind = 'sequence' AND status != 'removed' "
+          "AND step IN (SELECT value FROM json_each(?))", params=("c", "p", "[1, 2]"))
 
 # ── Messages people send in (harvey/agents/messages.py, schema 40) ──
 # The live firms a phone contact is linked to (a shared number: several).
@@ -1564,11 +1579,14 @@ statement("overlay.messages.firm_prospects",
           "(SELECT MAX(o.sent_at) FROM outbox o INDEXED BY idx_outbox_prospect "
           "WHERE o.prospect_id = p.id AND o.status = 'sent') DESC, p.created_at DESC LIMIT 1",
           params=("1", "+40722000102"), bounded=True)
-# The conversation a number's messages go to: the newest one not closed.
+# The conversation a number's messages go to: the newest one on that
+# channel not closed (never an email conversation an earlier release let a
+# text join).
 statement("overlay.messages.handle_conversation",
           "SELECT h.conversation FROM conversation_handle h INDEXED BY conversation_handle_value "
           "CROSS JOIN conversations c ON c.id = h.conversation "
           "WHERE h.channel = ? AND h.value = ? AND c.status != 'closed' "
+          "AND c.channel = h.channel "
           "ORDER BY c.updated_at DESC LIMIT 1", params=("sms", "+40722000102"), drives="h",
           bounded=True)
 statement("overlay.messages.handle_put",
@@ -1607,12 +1625,19 @@ statement("overlay.messages.sent_to_since",
           params=("+40722000102", "sms", "2026-01-01"))
 # Answers to a number on a channel since a time that may have gone out
 # (failed as possibly sent: nPathi couldn't say, or Harvey couldn't finish
-# within a day): one is never followed by another before they write again.
+# within a day; rejected or cancelled after a send was tried, under its
+# npathi:attempt:<id>; or tried and waiting to go again under its key, other
+# than the one asking): one is never followed by another before they write
+# again.
 statement("overlay.messages.maybe_sent_to_since",
           "SELECT COUNT(*) FROM outbox INDEXED BY idx_outbox_to_phone "
-          "WHERE to_phone = ? AND to_phone != '' AND channel = ? AND status = 'failed' "
-          "AND substr(error, 1, ?) = ? AND updated_at >= ?",
-          params=("+40722000102", "sms", 19, "may have gone out: ", "2026-01-01"))
+          "WHERE to_phone = ? AND to_phone != '' AND channel = ? AND updated_at >= ? "
+          "AND ((status = 'failed' AND substr(error, 1, ?) = ?) "
+          "OR (status IN ('rejected', 'cancelled') AND COALESCE(message_id, '') != '') "
+          "OR (status IN ('rejected', 'cancelled', 'pending_review', 'approved') "
+          "AND id != ? AND EXISTS (SELECT 1 FROM settings s WHERE s.key = ? || outbox.id)))",
+          params=("+40722000102", "sms", "2026-01-01", 19, "may have gone out: ", "o1",
+                  "npathi:attempt:"))
 # A channel's answers handed to nPathi today (UTC): its daily cap. One
 # nPathi couldn't deliver afterwards (failed, with its sent_at) still counts.
 statement("overlay.messages.sent_today",

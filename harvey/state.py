@@ -219,6 +219,11 @@ _PREV_UNSENT = (_prev_step("p.status IN ('pending_review', 'approved', 'sending'
                                            "'sending', 'removed')"))
 
 
+# Outbox statuses a row ends in: no drain's note or new send time is
+# written over why it ended (update_outbox_item).
+OUTBOX_ENDED = ["sent", "failed", "rejected", "cancelled", "removed"]
+
+
 def _company_answered(p: str) -> str:
     """SQL: someone at prospect ``p``'s company has replied."""
     return (f"EXISTS (SELECT 1 FROM prospects c, settings s "
@@ -1549,13 +1554,18 @@ class StateManager:
         """Write these columns of one row. ``if_status`` / ``if_updated``:
         only while the row still has the status (or the updated_at) it was
         read with, so a decision made on a stale read (a drain's hold) never
-        brings back a row you removed, rejected or edited since. Returns
-        rows changed."""
+        brings back a row you removed, rejected or edited since. A write of
+        its note or send time alone (a drain moving it back, or saying why
+        it waits) never touches a row that ended meanwhile: what it says
+        stays why it ended. Returns rows changed."""
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
         if not fields:
             return 0
         sets = ", ".join(f"{k} = ?" for k in fields)
         where, params = "id = ?", [item_id]
+        if "status" not in fields and fields.keys() & {"error", "send_at"}:
+            where += f" AND status NOT IN ({','.join('?' * len(OUTBOX_ENDED))})"
+            params += OUTBOX_ENDED
         if if_status is not None:
             where += " AND status = ?"
             params.append(if_status)
@@ -1902,13 +1912,13 @@ class StateManager:
                 return (await cursor.fetchone())[0]
 
     async def count_held_for_review(self) -> int:
-        """Emails autopilot sent back for a human, still waiting."""
-        async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'pending_review' AND error LIKE ?",
-                (HELD_FOR_REVIEW + "%",),
-            ) as cursor:
-                return (await cursor.fetchone())[0]
+        """Emails autopilot sent back for a human, still waiting: what
+        autopilot's card and Approve all speak of (email only; an SMS or
+        WhatsApp answer the gate would refuse carries the same note, and
+        is never autopilot's nor Approve all's)."""
+        rows = await self._named("overlay.outbox.email_held_for_review",
+                                 (len(HELD_FOR_REVIEW), HELD_FOR_REVIEW))
+        return int(rows[0][0]) if rows else 0
 
     async def cancel_pending_outbox_for_prospect(
         self, prospect_id: str, reason: str = "stop_on_reply"
@@ -2840,10 +2850,18 @@ class StateManager:
         return int(rows[0][0]) if rows else 0
 
     async def messages_maybe_sent_to_since(self, channel: str, phone: str,
-                                           since_iso: str) -> int:
-        """Answers to a number failed as possibly sent (MAYBE_SENT_PREFIX) since a time."""
+                                           since_iso: str, but: str = "") -> int:
+        """Answers to a number that may have gone, since a time: failed as
+        possibly sent (MAYBE_SENT_PREFIX), rejected or cancelled after a
+        send was tried (a provider message id, or the attempt kept under
+        its Idempotency-Key: the first try may have reached them), or tried
+        and waiting to go again under its key (any but row ``but``, the one
+        asking)."""
+        from harvey import channels
+
         rows = await self._named("overlay.messages.maybe_sent_to_since", (
-            phone, channel, len(MAYBE_SENT_PREFIX), MAYBE_SENT_PREFIX, since_iso))
+            phone, channel, since_iso, len(MAYBE_SENT_PREFIX), MAYBE_SENT_PREFIX,
+            but or "", channels.ATTEMPT_KEY))
         return int(rows[0][0]) if rows else 0
 
     async def messages_sent_today(self, channel: str) -> int:

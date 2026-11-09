@@ -931,6 +931,74 @@ async def test_an_answer_that_may_have_gone_is_never_followed_by_another(state, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ended", ["rejected", "cancelled"])
+async def test_an_answer_tried_then_stopped_still_counts_as_maybe_sent(state, npat, ended):
+    """Its send was tried (it waited to go again under its key) before you
+    rejected it, or a cancel took it: the first try may have reached them,
+    so no second answer goes before they write again."""
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    first = await _answer(state, convo, pid)
+    npat.status_for["POST /messages/sms"] = [
+        (409, {"error": {"code": "idempotency_in_progress", "message": "x"}}, {})]
+    assert await _sender(state, npat).run() == 0
+    assert (await _row(state, first))["error"] == messenger_mod.WAIT_RETRY
+    if ended == "rejected":
+        assert await state.reject_outbox_item(first) == 1
+    else:
+        assert await state.cancel_pending_outbox_for_prospect(pid) == 1
+    item = await _answer(state, convo, pid, body="Exemplu Consult: altceva.\n"
+                         "Răspunde STOP ca să nu mai primești mesaje.")
+    blocked = await _sender(state, npat).blocked(await _row(state, item))
+    assert blocked[0] == "failed" and "second message" in blocked[1]
+    # One never tried counts for nothing.
+    _, pid2 = await _firm(state, phone=BOB)
+    convo2 = await _convo(state, pid2, phone=BOB)
+    untried = await _answer(state, convo2, pid2, phone=BOB)
+    assert await state.reject_outbox_item(untried) == 1
+    again = await _answer(state, convo2, pid2, phone=BOB)
+    assert await _sender(state, npat).blocked(await _row(state, again)) is None
+
+
+@pytest.mark.asyncio
+async def test_no_other_answer_goes_while_a_tried_one_waits_to_go_again(state, npat):
+    """Its send was tried and it waits to go again under its key: another
+    answer to that number (one you approved beside it) never goes first,
+    as nPathi may deliver the first; the tried one itself still goes."""
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    first = await _answer(state, convo, pid)
+    npat.status_for["POST /messages/sms"] = [
+        (409, {"error": {"code": "idempotency_in_progress", "message": "x"}}, {})]
+    assert await _sender(state, npat).run() == 0
+    assert (await _row(state, first))["error"] == messenger_mod.WAIT_RETRY
+    other = await _answer(state, convo, pid, body="Exemplu Consult: altceva.\n"
+                          "Răspunde STOP ca să nu mai primești mesaje.")
+    blocked = await _sender(state, npat).blocked(await _row(state, other))
+    assert blocked[0] == "failed" and "second message" in blocked[1]
+    assert await _sender(state, npat).blocked(await _row(state, first)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_tried_answer_refused_later_fails_as_maybe_sent(state, npat):
+    await _ready(state, npat)
+    _, pid = await _firm(state)
+    convo = await _convo(state, pid)
+    first = await _answer(state, convo, pid)
+    npat.status_for["POST /messages/sms"] = [
+        (409, {"error": {"code": "idempotency_in_progress", "message": "x"}}, {})]
+    assert await _sender(state, npat).run() == 0
+    # (They're put on the list before the next pass tries it again.)
+    await state.suppress("phone", ANN, "opt_out", by="reply")
+    assert await _sender(state, npat).run() == 0
+    row = await _row(state, first)
+    assert row["status"] == "failed" and row["error"].startswith(MAYBE_SENT_PREFIX)
+    assert "do-not-contact" in row["error"]
+
+
+@pytest.mark.asyncio
 async def test_with_no_price_known_a_cap_holds_answers_and_no_cap_lets_them_go(state, npat):
     from harvey.modules import switches
 

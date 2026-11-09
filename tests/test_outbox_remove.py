@@ -458,3 +458,186 @@ async def test_an_approved_row_with_no_approver_on_file_can_still_be_edited(stat
     assert await state.edit_outbox_item(item, "Re: o întrebare", "Alt text.", was=row,
                                         status="pending_review", approved_by="",
                                         error="") == 1
+
+
+# ── A step removed while staging writes it ──
+
+@pytest.mark.asyncio
+async def test_a_step_removed_while_it_is_staged_is_drafted_again(state, monkeypatch):  # noqa: F811
+    cfg = config()
+    email = "office@alfa.example.com"
+    await contact(state, email)
+    cid, _ = await new_campaign(state, cfg)
+    sender, _ = make_sender(state, cfg, monkeypatch)
+    writer = StubWriter()
+    add, removed = state.add_outbox_item, []
+
+    async def removed_as_it_is_written(**kw):
+        # (You remove the first email between staging writing it and
+        # marking its member staged: then the member is still ready, so
+        # the removal moves nothing back.)
+        item = await add(**kw)
+        if item and kw.get("step") == 1 and not removed:
+            assert await member_status(state, cid, email) == "ready"
+            assert await state.remove_outbox_item(item, by="dashboard") == 1
+            removed.append(item)
+        return item
+
+    monkeypatch.setattr(state, "add_outbox_item", removed_as_it_is_written)
+    await cycle(state, cfg, sender, writer).run()
+    assert removed
+    # The step has no row: the member stays ready, to be drafted again.
+    assert await member_status(state, cid, email) == "ready"
+    await cycle(state, cfg, sender, writer).run()
+    live = sorted(r["step"] for r in await state.get_outbox(limit=10)
+                  if r["status"] != "removed")
+    assert live == [1, 2]                               # each once: no duplicate
+    assert await member_status(state, cid, email) == "staged"
+
+
+@pytest.mark.asyncio
+async def test_staging_never_reopens_a_member_that_ended_while_it_staged(state,  # noqa: F811
+                                                                     monkeypatch):
+    cfg = config()
+    email = "office@alfa.example.com"
+    await contact(state, email)
+    cid, _ = await new_campaign(state, cfg)
+    sender, _ = make_sender(state, cfg, monkeypatch)
+    add = state.add_outbox_item
+
+    async def replied_meanwhile(**kw):
+        item = await add(**kw)
+        if kw.get("step") == 2:
+            await state.end_memberships(email, "replied", "they wrote")
+        return item
+
+    monkeypatch.setattr(state, "add_outbox_item", replied_meanwhile)
+    await cycle(state, cfg, sender, StubWriter()).run()
+    assert await member_status(state, cid, email) == "replied"
+
+
+# ── The Didn't send list says Removed, not a member's "taken out" ──
+
+def test_a_removed_row_has_its_own_word_in_both_languages():
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    web = Path(__file__).resolve().parent.parent / "harvey" / "web"
+    script = r'''
+const fs = require('fs'), vm = require('vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+global.localStorage = {getItem: () => process.argv[3], setItem: () => {}};
+vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
+global.escHtml = s => String(s == null ? '' : s);
+global.badge = s => '<b>' + t('st.' + s) + '</b>';
+const from = app.indexOf('function obStatusBadge');
+vm.runInThisContext(app.slice(from, app.indexOf('\n}\n', from) + 3));
+console.log(JSON.stringify({removed: obStatusBadge({status: 'removed'}),
+                            failed: obStatusBadge({status: 'failed'}), member: t('st.removed')}));
+'''
+    out = {}
+    for lang in ("ro", "en"):
+        res = subprocess.run([node, "-e", script, str(web / "app.js"), str(web / "i18n.js"), lang],
+                             text=True, encoding="utf-8", capture_output=True, timeout=60)
+        assert res.returncode == 0, res.stderr[-2000:]
+        out[lang] = json.loads(res.stdout)
+    assert "Șters" in out["ro"]["removed"] and "Removed" in out["en"]["removed"]
+    for lang in ("ro", "en"):
+        assert out[lang]["member"] not in out[lang]["removed"]
+        assert out[lang]["failed"].startswith("<b>")
+
+
+# ── The drain's page and its count agree with the follow-up order ──
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before", [(), ("removed",), ("removed", "pending_review"),
+                                    ("removed", "approved"), ("removed", "sent"),
+                                    ("removed", "rejected"), ("removed", "cancelled"),
+                                    ("approved",), ("sent",), ("rejected",)])
+async def test_the_page_and_the_count_agree_with_the_follow_up_order(state, monkeypatch,  # noqa: F811
+                                                                    before):
+    _, cid, sender, _, _, rows = await _staged(state, monkeypatch)
+    step1, step2 = rows[1]["id"], rows[2]["id"]
+    with sqlite3.connect(state.db_path) as con:
+        con.execute("DELETE FROM outbox WHERE id = ?", (step1,))
+        for n, status in enumerate(before):
+            con.execute(
+                "INSERT INTO outbox (id, campaign_id, prospect_id, step, kind, to_email, subject, "
+                "body, status, send_at, sent_at, created_at) VALUES (?, ?, ?, 1, 'sequence', ?, "
+                "'s', 'b', ?, '2026-01-01T09:00:00', ?, ?)",
+                (f"prev{n}", cid, rows[2]["prospect_id"], rows[2]["to_email"], status,
+                 "2026-01-01T09:00:00" if status == "sent" else None, f"2026-01-0{n + 1}"))
+        con.execute("UPDATE outbox SET status = 'approved', send_at = '2026-01-01T09:00:00' "
+                    "WHERE id = ?", (step2,))
+    item = await _row(state, step2)
+    order = await sender._follow_up_order(item)
+    # Off the page only while the drain would wait for the step before it;
+    # one it would cancel or send is on it.
+    on_page = step2 in {r["id"] for r in await state.get_outbox(
+        status="approved", skip_unready_follow_ups=True, limit=50)}
+    assert on_page == (order != "wait")
+    # (An approved step before it is counted on its own.)
+    counted = await state.count_due_cold_outbox("2099-01-01T00:00:00")
+    assert counted - before.count("approved") == (0 if order == "wait" else 1)
+
+
+# ── A drain's note never lands on a row that ended meanwhile ──
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", ["removed", "rejected", "cancelled", "sent", "failed"])
+async def test_a_note_or_new_time_alone_never_changes_an_ended_row(state, ended):  # noqa: F811
+    _, pid = await _firm(state)
+    item = await _answer(state, await _convo(state, pid), pid)
+    await state.update_outbox_item(item, status=ended, error="why it ended")
+    assert await state.update_outbox_item(item, error="waiting: something") == 0
+    assert await state.update_outbox_item(item, send_at="2099-01-01T00:00:00") == 0
+    row = await _row(state, item)
+    assert row["error"] == "why it ended" and row["send_at"] != "2099-01-01T00:00:00"
+    # (A write that moves its status on still works: it says where it goes.)
+    assert await state.update_outbox_item(item, status="failed", error="x") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_read_gap_note_never_lands_on_an_email_removed_meanwhile(state,  # noqa: F811
+                                                                         monkeypatch):
+    from harvey.agents.sender import READ_GAP_KEY
+
+    _, _, sender, provider, _, rows = await _staged(state, monkeypatch)
+    item = rows[1]["id"]
+    await state.approve_outbox(item)
+    await state.update_outbox_item(item, send_at="2026-01-01T09:00:00")
+    await state.set_setting(READ_GAP_KEY, "{}")
+    read = state.get_outbox
+
+    async def removed_after_the_read(*a, **k):
+        page = await read(*a, **k)
+        if any(r["id"] == item for r in page):
+            await state.remove_outbox_item(item, by="dashboard")
+        return page
+
+    monkeypatch.setattr(state, "get_outbox", removed_after_the_read)
+    await sender._drain_due()
+    row = await _row(state, item)
+    assert (row["status"], row["error"]) == ("removed", REMOVED_BY_YOU)
+    assert provider.sent == []
+
+
+# ── Held for review: email's count ──
+
+@pytest.mark.asyncio
+async def test_the_held_for_review_count_is_emails_only(state):  # noqa: F811
+    from harvey.state import HELD_FOR_REVIEW
+
+    _, pid = await _firm(state)
+    await state.add_outbox_item(
+        prospect_id=pid, to_email="ana@alfa.example.com", subject="Re: o întrebare",
+        body="Mulțumesc.", send_at="2026-01-01T09:00:00", kind="reply",
+        error=HELD_FOR_REVIEW + "a link to another site")
+    convo = await _convo(state, pid)
+    text = await _answer(state, convo, pid, approved=False)
+    await state.update_outbox_item(text, error=HELD_FOR_REVIEW + "too long")
+    assert await state.count_held_for_review() == 1

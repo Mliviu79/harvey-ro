@@ -239,7 +239,8 @@ class MessageSender:
             return Hold("failed", ("gate: " + "; ".join(problems))[:300], "text")
         # (One that may have gone out counts: it is never followed by another.)
         if await state.messages_sent_to_since(channel, phone, _iso(last)) - mine > 0 or \
-                await state.messages_maybe_sent_to_since(channel, phone, _iso(last)):
+                await state.messages_maybe_sent_to_since(channel, phone, _iso(last),
+                                                         but=item.get("id") or ""):
             return Hold("failed", "gate: a second message before they answered the first",
                         "second")
         return None
@@ -322,7 +323,7 @@ class MessageSender:
         return await self._try(client, item)
 
     async def _try(self, client, item: dict) -> int:
-        blocked = await self.blocked(item, client)
+        blocked = await self._tried_hold(item, await self.blocked(item, client))
         if blocked:
             await self._hold(item, blocked)
             return 0
@@ -331,11 +332,21 @@ class MessageSender:
         if not await self.state.claim_outbox_item(item["id"]):
             return 0
         item = await self.state.get_outbox_item(item["id"]) or item
-        blocked = await self.blocked(item, client)
+        blocked = await self._tried_hold(item, await self.blocked(item, client))
         if blocked:
             await self._hold(item, blocked)
             return 0
         return await self._send(client, item)
+
+    async def _tried_hold(self, item: dict, blocked):
+        """A refusal of an answer whose send was tried before (it waited to
+        go again under its key) fails it as possibly sent: the first try
+        may have reached them, so nothing follows it before they write."""
+        if not blocked or blocked[0] != "failed" or blocked[1].startswith(MAYBE_SENT_PREFIX):
+            return blocked
+        if not await self.state.get_setting(channels.ATTEMPT_KEY + item["id"]):
+            return blocked
+        return Hold("failed", MAYBE_SENT_PREFIX + blocked[1], getattr(blocked, "code", ""))
 
     async def _cut_off(self, client) -> None:
         """Answers claimed and never finished: back in line, to go again

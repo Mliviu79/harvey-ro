@@ -456,12 +456,15 @@ def test_draft_reply_answers_a_message_that_came_by_sms_back_on_sms(db, monkeypa
         h.provider = FakeProvider()
         return h
     monkeypatch.setattr(outreach, "reply_handler", handler)
+    # replies() says what draft_reply will: no number to answer it on.
     [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
-    assert c["answerable"] is True
+    assert c["answerable"] is False and c["why"] == "no_number"
     error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
                                           "guidance": "Propune un apel"})
     assert error and "no number to answer" in why and not brain.prompts
     _run(state.put_handle(convo[0], "sms", "+40722000102", at=time.time() - 60, ref="npathi:1"))
+    [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
+    assert c["answerable"] is True
     out = _ok(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
                                   "guidance": "Propune un apel"})
     assert out["waits_for_user"] and any("goes by SMS" in p for p in brain.prompts)
@@ -644,6 +647,100 @@ def test_an_answered_reply_is_not_drafted_again_and_one_handed_to_you_waits(db, 
     assert _run(state.promote_for_autopilot("9999-01-01T00:00:00", 10, kind="reply")) == 0
     assert _q(db, "SELECT status FROM outbox WHERE id = ?", out["outbox"]) == [
         ("pending_review",)]
+
+
+@pytest.mark.modules_on("email_outreach")
+def test_replies_says_what_draft_reply_refuses_by_the_same_checks(db, monkeypatch):
+    """Answerable in replies() is exactly what draft_reply takes: its person
+    or firm on the do-not-contact list, Harvey's share of the Claude plan
+    used, each named by its code and refused by draft_reply alike."""
+    import harvey.agents.sender as sender_mod
+    from harvey.agents.handler import Handler
+    from tests.test_outbox_native import Cfg, Env
+
+    monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
+    plan_id = _plan(db)
+    _, cid = _draft(db, plan_id)
+    _start(db, cid)
+    state = StateManager(str(db))
+    _run(_sent_first_email(state, cid, "office@alfa.example.com"))
+    _reply(state, "office@alfa.example.com", "Cât costă?")
+    [convo] = _q(db, "SELECT id FROM conversations")
+    _run(state.update_outbox_item(_q(db, "SELECT id FROM outbox WHERE kind = 'reply'")[0][0],
+                                  status="rejected"))
+    brain = _GuidedBrain()
+    spent = {"used": True}
+
+    async def within(*a, **k):
+        brain.budget_why = ""
+        return not spent["used"]
+    brain.is_within_budget = within
+
+    def handler(state_, cfg):
+        h = Handler(brain=brain, state=state_, config=Cfg(), env=Env())
+        h.provider = FakeProvider()
+        return h
+    monkeypatch.setattr(outreach, "reply_handler", handler)
+
+    def listed():
+        [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
+        error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
+                                              "guidance": "Propune un apel"})
+        return c, error, why
+
+    c, error, why = listed()
+    assert (c["answerable"], c.get("why")) == (False, "budget")
+    assert error and "share of the Claude plan" in why and not brain.prompts
+    spent["used"] = False
+    [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
+    assert c["answerable"] is True
+    # Their address on the do-not-contact list (their own status unchanged).
+    _run(state.suppress("address", "office@alfa.example.com", "by_hand", by="dashboard"))
+    c, error, why = listed()
+    assert (c["answerable"], c.get("why")) == (False, "listed")
+    assert error and "do-not-contact list" in why and not brain.prompts
+    assert set(outreach.UNANSWERABLE) >= {"no_number", "opted_out", "listed", "budget"}
+
+
+@pytest.mark.modules_on("email_outreach")
+def test_replies_answers_only_for_a_campaign_of_an_approved_plan_of_this_chat(db, monkeypatch):
+    """draft_reply takes a conversation only under an approved plan of the
+    chat that made its campaign: replies() says "plan" for another chat's
+    campaign and for one whose plan was closed, never answerable."""
+    import harvey.agents.sender as sender_mod
+    from harvey.agents.handler import Handler
+    from tests.test_outbox_native import Cfg, Env
+
+    monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
+    plan_id = _plan(db)
+    _, cid = _draft(db, plan_id)
+    _start(db, cid)
+    state = StateManager(str(db))
+    _run(_sent_first_email(state, cid, "office@alfa.example.com"))
+    _reply(state, "office@alfa.example.com", "Cât costă?")
+    [convo] = _q(db, "SELECT id FROM conversations")
+    _run(state.update_outbox_item(_q(db, "SELECT id FROM outbox WHERE kind = 'reply'")[0][0],
+                                  status="rejected"))
+    brain = _GuidedBrain()
+
+    def handler(state_, cfg):
+        h = Handler(brain=brain, state=state_, config=Cfg(), env=Env())
+        h.provider = FakeProvider()
+        return h
+    monkeypatch.setattr(outreach, "reply_handler", handler)
+    [c] = _ok(db, "replies", {"campaign": cid})["conversations"]
+    assert c["answerable"] is True
+    # Another chat sees the campaign's conversations, none answerable there.
+    [c] = _ok(db, "replies", {"campaign": cid}, chat="chat-d")["conversations"]
+    assert (c["answerable"], c.get("why")) == (False, "plan")
+    # The plan closed: nothing is answerable under it, as draft_reply says.
+    _run(plans.close(state, plan_id, cancel=False, by=plans.BY_DASHBOARD))
+    [c] = _ok(db, "replies", {"campaign": cid})["conversations"]
+    assert (c["answerable"], c.get("why")) == (False, "plan")
+    error, why = _one(db, "draft_reply", {"plan": plan_id, "conversation": convo[0],
+                                          "guidance": "Propune un apel"})
+    assert error and not brain.prompts
+    assert outreach.UNANSWERABLE[0] == "plan"
 
 
 def test_always_review_goes_on_but_only_the_user_takes_it_off(db):

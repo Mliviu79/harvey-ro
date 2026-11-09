@@ -508,6 +508,45 @@ async def test_an_sms_reply_cancels_the_email_sequence(state, fake):
 
 
 @pytest.mark.asyncio
+async def test_an_email_and_a_text_never_join_each_others_conversation(state, fake):
+    """A text joins the number's own conversation on that channel, never the
+    person's email one (whose answers go by email), and an email reply
+    never joins an SMS conversation (whose answers go by SMS)."""
+    from harvey.agents.handler import Handler
+    from harvey.integrations.mail_provider import InboundMessage
+    from harvey.models.conversation import Conversation, Message
+    from tests.test_outbox_native import FakeProvider
+
+    await _connect(state)
+    firm = await _firm(state, "Alfa SRL", "alfa.example.com", ANN)
+    ann = await _person(state, firm, "ana@alfa.example.com", ANN)
+    email_convo = await state.add_conversation(Conversation(
+        id="", prospect_id=ann, channel="email", intent="question", status="open",
+        thread=[Message(sender="prospect", content="Cât costă?")]))
+    fake.messages = [_message(1, ANN, "Vă sun eu mâine.")]
+    assert await MessageReader(_handler(state, fake), fake.transport()).run()
+    by_channel = {c.channel: c for c in await _conversations(state)}
+    assert set(by_channel) == {"email", "sms"}
+    assert by_channel["email"].id == email_convo and len(by_channel["email"].thread) == 1
+    sms = by_channel["sms"]
+    assert [m.channel for m in sms.thread] == ["sms"]
+    assert await state.conversation_handles([email_convo]) == {}
+    # Their email reply joins the email conversation, never the SMS one.
+    await state.update_conversation(sms.id, status="open")
+    await state.update_conversation(email_convo, status="closed")
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(provider_id="in1", from_email="ana@alfa.example.com",
+                                       subject="Re: o întrebare", body="Și prețul pe an?")]
+    handler = Handler(brain=StubBrain(intent="question"), state=state, config=Cfg(), env=Env())
+    handler.provider = provider
+    await handler._run_native()
+    after = {c.id: c for c in await _conversations(state)}
+    assert [m.channel for m in after[sms.id].thread] == ["sms"]
+    [new] = [c for c in after.values() if c.id not in (sms.id, email_convo)]
+    assert new.channel == "email" and new.thread[-1].content.endswith("Și prețul pe an?")
+
+
+@pytest.mark.asyncio
 async def test_a_firm_with_no_prospect_gets_one_and_counts_as_answered(state, fake):
     await _connect(state)
     firm = await _firm(state, "Alfa SRL", "alfa.example.com", ANN)

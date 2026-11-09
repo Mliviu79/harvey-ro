@@ -381,6 +381,8 @@ class Sender:
         """Render + schedule an active campaign's ready members into the
         outbox (``emails``: only those). Always waiting for review: autopilot
         approves when a drain is about to send it (promote_for_autopilot)."""
+        from harvey import campaigns
+
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
             return
@@ -444,9 +446,10 @@ class Sender:
                 if item_id:
                     staged += 1
             # (A member whose step you removed after an earlier one went is
-            # still in its sequence.)
-            await self.state.set_campaign_member(
-                campaign.id, email, "in_sequence" if member.get("last_step") else "staged")
+            # still in its sequence; one removed while this staged stays
+            # ready, to be drafted again: campaigns.staged.)
+            await self.state.campaigns_call(campaigns.staged, campaign.id, email, prospect.id,
+                                            [step.step for step in campaign.sequence])
             # Conditional: never overwrite a status set while staging
             # (marked sent by hand, a reply).
             await self.state.queue_prospect_if_unsent(prospect.id)

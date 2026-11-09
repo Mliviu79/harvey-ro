@@ -64,10 +64,14 @@ ANSWERABLE = ("interested", "objection", "question", "wrong_person")
 GUIDANCE_CHARS = 500
 CONVERSATIONS_LIMIT = 50
 REASON_CHARS = 200
-# Why a conversation isn't answerable, in the order draft_reply checks it:
-# an answer waits, an intent Harvey doesn't answer, closed, nothing new of
-# theirs, the module of its channel off.
-UNANSWERABLE = ("answer_waiting", "intent", "status", "answered", "module_off")
+# Why a conversation isn't answerable, in the order draft_reply checks it
+# (its campaign not of an approved plan of this chat, then unanswerable,
+# then budget_refusal): no such plan, an answer waits, an intent Harvey
+# doesn't answer, closed, nothing new of theirs, a text with no number to
+# answer, the module of its channel off, the person opted out, the person or
+# firm on the do-not-contact list, Harvey's share of the Claude plan used.
+UNANSWERABLE = ("plan", "answer_waiting", "intent", "status", "answered", "no_number",
+                "module_off", "opted_out", "listed", "budget")
 
 
 class Refused(ValueError):
@@ -287,21 +291,87 @@ async def status(state, campaign_id) -> dict:
             "bounced": members.get("bounced", 0), "checks_held": held}
 
 
-async def conversations(state, campaign_id: str, limit: int = CONVERSATIONS_LIMIT) -> list[dict]:
+async def unanswerable(state, config, c: dict, on=None) -> tuple[str, str, str]:
+    """Why draft_reply won't answer conversation ``c`` (its structured
+    fields: overlay.agent.conversation's), short of the budget
+    (budget_refusal, asked last): (code from UNANSWERABLE, the sentence it
+    is refused with, the number an SMS or WhatsApp answer goes to). The
+    code is "" when it may be answered. replies() says the same codes."""
+    from harvey.modules import switches
+
+    who = f"conversation {c['id']}"
+    if c["waiting"]:
+        return ("answer_waiting", f"an answer to {who} waits already: the user reviews it in "
+                "the Outbox", "")
+    if c["intent"] not in ANSWERABLE:
+        return ("intent", f"{who} is {c['intent'] or 'unclassified'}: Harvey doesn't answer "
+                "that (the user does, on the Conversations page)", "")
+    if c["status"] not in ("open", "needs_human"):
+        return "status", f"{who} is {c['status']}", ""
+    if c["last"] != "prospect":
+        return ("answered", f"{who}'s newest reply has its answer already: nothing new of "
+                "theirs to answer", "")
+    phone = ""
+    if c["channel"]:
+        # (An SMS or WhatsApp message: the answer goes back there, to the
+        # number it came from, waiting for the user like any other.)
+        handle = await state.conversation_reply_handle(c["id"])
+        if handle is None or handle["channel"] != c["channel"]:
+            return ("no_number", f"{who}'s newest message came by another channel with no "
+                    "number to answer: the user answers it", "")
+        phone = handle["value"]
+    # (Its channel's module must be on: an email answer while the Email
+    # module is off, or a text while nPathi's is, would wait in the Outbox
+    # with nothing that may send it.)
+    on = on if on is not None else await switches.enabled_ids(state)
+    off = switches.channel_problem(on, c["channel"] or "email")
+    if off is not None:
+        return ("module_off", f"{who}'s answer would go by {c['channel'] or 'email'}: {off}; "
+                "the user turns modules on, not the agent", phone)
+    prospect = await state.get_prospect(c["prospect_id"])
+    if prospect is None or prospect.status == "opted_out":
+        return "opted_out", f"{who}'s person asked not to be contacted", phone
+    hit = await state.suppression_check(prospect.email, firm=prospect.company_id, config=config,
+                                        phone=phone)
+    if hit is not None:
+        return "listed", f"{who}'s person or firm is on the do-not-contact list", phone
+    return "", "", phone
+
+
+async def budget_refusal(state, config, handler=None) -> str:
+    """Why no answer can be drafted now for want of Claude (Harvey's share
+    of the plan used, or its caps), "" when one can: draft_reply's last
+    check, and replies()'s (asked once a call)."""
+    handler = handler or reply_handler(state, config)
+    percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
+    if await handler.brain.is_within_budget(max_percent=percent):
+        return ""
+    return (f"{handler.brain.budget_why}: try later" if handler.brain.budget_why else
+            "Harvey's share of the Claude plan is used for now "
+            "(usage.max_daily_claude_percent): try later")
+
+
+async def conversations(state, config, campaign_id: str, limit: int = CONVERSATIONS_LIMIT,
+                        *, under_plan: bool = True) -> list[dict]:
     """A campaign's newest conversations: ids and their enums, never text.
     ``answerable`` is whether draft_reply would take it; when not, ``why``
-    says which of its checks it fails first (UNANSWERABLE)."""
+    says which of its checks it fails first (UNANSWERABLE: ``under_plan``
+    false, the campaign not of an approved plan of the chat asking, then
+    unanswerable, then budget_refusal, asked once)."""
     from harvey.modules import switches
 
     on = await switches.enabled_ids(state)
+    budget = None
     out = []
-    for cid, i, st, s, _at, w, last, channel in await _all(
+    for cid, i, st, s, _at, w, last, channel, prospect_id in await _all(
             state, "overlay.agent.campaign_conversations", (campaign_id, int(limit))):
-        why = ("answer_waiting" if w else
-               "intent" if i not in ANSWERABLE else
-               "status" if s not in ("open", "needs_human") else
-               "answered" if last != "prospect" else
-               "module_off" if switches.channel_problem(on, channel or "email") else "")
+        why, _, _ = ("plan", "", "") if not under_plan else await unanswerable(
+            state, config, {"id": cid, "prospect_id": prospect_id, "intent": i, "status": s,
+                            "waiting": w, "last": last, "channel": channel}, on)
+        if not why:
+            if budget is None:
+                budget = await budget_refusal(state, config)
+            why = "budget" if budget else ""
         row = {"conversation": cid, "campaign": campaign_id, "intent": _enum(i, INTENTS),
                "stage": _enum(st, STAGES), "status": _enum(s, CONVERSATION_STATUSES),
                "needs_human": s == "needs_human", "answer_waiting": bool(w),
@@ -554,9 +624,12 @@ async def pause(state, plan: int, chat: str, campaign_id) -> dict:
             "note": "paused: only the user resumes it, on the Campaigns page"}
 
 
-async def replies(state, campaign_ids: list[str], limit: int = CONVERSATIONS_LIMIT) -> dict:
+async def replies(state, config, campaign_ids: list[str],
+                  limit: int = CONVERSATIONS_LIMIT, *, chat: str | None = None) -> dict:
     """These campaigns' conversations counted by intent, stage and status,
-    and the newest ones' ids with their enums (no text)."""
+    and the newest ones' ids with their enums (no text) and whether
+    draft_reply would answer each (conversations()); in ``chat``: only a
+    campaign of an approved plan of that chat may be (answerable_under)."""
     by_intent: dict = {}
     by_stage: dict = {}
     by_status: dict = {}
@@ -567,7 +640,9 @@ async def replies(state, campaign_ids: list[str], limit: int = CONVERSATIONS_LIM
                          (by_stage, _enum(stage, STAGES) or "none"),
                          (by_status, _enum(st, CONVERSATION_STATUSES) or "none")):
                 d[k] = d.get(k, 0) + n
-        listed += await conversations(state, cid, limit)
+        listed += await conversations(state, config, cid, limit,
+                                      under_plan=chat is None
+                                      or await answerable_under(state, chat, cid))
     listed = listed[:max(1, min(int(limit or CONVERSATIONS_LIMIT), CONVERSATIONS_LIMIT))]
     return {"total": sum(by_status.values()), "by_intent": by_intent, "by_stage": by_stage,
             "by_status": by_status, "needs_human": by_status.get("needs_human", 0),
@@ -593,6 +668,22 @@ def reply_handler(state, config):
     return Handler(Brain(state, config.brain), state, config, load_env())
 
 
+async def answerable_under(state, chat: str, campaign_id) -> bool:
+    """Whether draft_reply may answer this campaign's conversations from
+    ``chat``: the campaign was made under a plan of that chat, approved and
+    not expired (draft_reply's first checks: plans.usable, _own)."""
+    from harvey.agent import plans
+
+    link = await link_of(state, campaign_id)
+    if link is None or link["chat"] != chat:
+        return False
+    try:
+        plans.usable(await plans.get(state, link["plan"]), link["plan"], chat)
+    except plans.Refused:
+        return False
+    return True
+
+
 async def _conversation(state, plan: int, chat: str, convo_id) -> dict:
     row = await _one(state, "overlay.agent.conversation", (str(convo_id or ""),))
     if row is None:
@@ -614,51 +705,16 @@ async def draft_reply(state, config, plan: int, chat: str, convo_id, guidance) -
     module of the channel it would go by is off, or Harvey's share of the
     Claude plan is used."""
     c = await _conversation(state, plan, chat, convo_id)
-    if c["waiting"]:
-        raise Refused(f"an answer to conversation {c['id']} waits already: the user reviews "
-                      "it in the Outbox")
-    if c["intent"] not in ANSWERABLE:
-        raise Refused(f"conversation {c['id']} is {c['intent'] or 'unclassified'}: Harvey "
-                      "doesn't answer that (the user does, on the Conversations page)")
-    if c["status"] not in ("open", "needs_human"):
-        raise Refused(f"conversation {c['id']} is {c['status']}")
-    if c["last"] != "prospect":
-        raise Refused(f"conversation {c['id']}'s newest reply has its answer already: "
-                      "nothing new of theirs to answer")
-    phone = ""
-    if c["channel"]:
-        # (An SMS or WhatsApp message: the answer goes back there, to the
-        # number it came from, waiting for the user like any other.)
-        handle = await state.conversation_reply_handle(c["id"])
-        if handle is None or handle["channel"] != c["channel"]:
-            raise Refused(f"conversation {c['id']}'s newest message came by another channel "
-                          "with no number to answer: the user answers it")
-        phone = handle["value"]
-    # (Its channel's module must be on: an email answer while the Email
-    # module is off, or a text while nPathi's is, would wait in the Outbox
-    # with nothing that may send it.)
-    from harvey.modules import switches
-
-    off = switches.channel_problem(await switches.enabled_ids(state), c["channel"] or "email")
-    if off is not None:
-        raise Refused(f"conversation {c['id']}'s answer would go by {c['channel'] or 'email'}: "
-                      f"{off}; the user turns modules on, not the agent")
-    prospect = await state.get_prospect(c["prospect_id"])
-    if prospect is None or prospect.status == "opted_out":
-        raise Refused(f"conversation {c['id']}'s person asked not to be contacted")
-    hit = await state.suppression_check(prospect.email, firm=prospect.company_id, config=config,
-                                        phone=phone)
-    if hit is not None:
-        raise Refused(f"conversation {c['id']}'s person or firm is on the do-not-contact list")
+    why, refused, _ = await unanswerable(state, config, c)
+    if why:
+        raise Refused(refused)
     text = guidance_text(guidance)
     if not text:
         raise Refused("give short guidance for the answer: what it should say or ask")
     handler = reply_handler(state, config)
-    percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
-    if not await handler.brain.is_within_budget(max_percent=percent):
-        raise Refused(f"{handler.brain.budget_why}: try later" if handler.brain.budget_why else
-                      "Harvey's share of the Claude plan is used for now "
-                      "(usage.max_daily_claude_percent): try later")
+    refused = await budget_refusal(state, config, handler)
+    if refused:
+        raise Refused(refused)
     # (It waits for the user even on autopilot, approved by them one at a
     # time: autopilot is the user's consent to Harvey's own answers, not to
     # one the agent asked for. AGENT_DRAFT_HELD: no autopilot promotion, no

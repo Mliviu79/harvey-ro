@@ -591,6 +591,25 @@ def redraft(con: sqlite3.Connection, campaign_id: str, email: str) -> bool:
     return set_member(con, campaign_id, email, "ready")
 
 
+def staged(con: sqlite3.Connection, campaign_id: str, email: str, prospect_id: str,
+           steps) -> bool:
+    """Staging wrote a ready member's emails: it is staged (in sequence once
+    a step went), in the same write that checks every one of ``steps`` has
+    its row in the outbox. One you removed meanwhile (removing it before
+    this saw the member staged moved nothing back) leaves it ready, so the
+    next cycle drafts that step again; a member moved on meanwhile (a
+    reply, an opt-out) keeps its status. True when it was marked."""
+    m = member(con, campaign_id, email)
+    wanted = sorted({int(s) for s in steps})
+    if m is None or m["status"] != M["ready"] or not wanted:
+        return False
+    held = _x(con, "overlay.campaigns.steps_on_file",
+              (campaign_id, prospect_id or "", json.dumps(wanted))).fetchone()[0]
+    if held < len(wanted):
+        return False
+    return set_member(con, campaign_id, email, "in_sequence" if m["last_step"] else "staged")
+
+
 def end_memberships(con: sqlite3.Connection, email: str, status: str, reason: str) -> int:
     """Every open membership of an address ends (it replied, was suppressed
     or bounced): in every campaign, whatever its state."""

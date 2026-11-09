@@ -739,13 +739,20 @@ class Actions:
             if verb == "replies":
                 if (campaign in (None, "")) == (plan in (None, "")):
                     raise readonly.Refused("give a campaign or a plan, one of the two")
+                # (Whether each could be answered is draft_reply's own
+                # checks, which read the settings.)
+                config = _config()
+                if config is None:
+                    raise readonly.Refused("Harvey's settings can't be read")
                 if campaign not in (None, ""):
                     await outreach.status(state, campaign)
                     return {"campaign": str(campaign),
-                            **await outreach.replies(state, [str(campaign)])}
+                            **await outreach.replies(state, config, [str(campaign)],
+                                                     chat=self.chat)}
                 p = await plans.status(state, plan, chat=self.chat)
                 ids = [link["campaign"] for link in await outreach.of_plan(state, p["id"])]
-                return {"plan": p["id"], "campaigns": ids, **await outreach.replies(state, ids)}
+                return {"plan": p["id"], "campaigns": ids,
+                        **await outreach.replies(state, config, ids, chat=self.chat)}
         except (outreach.Refused, plans.Refused) as e:
             raise readonly.Refused(str(e)) from None
         raise ValueError(verb)
