@@ -1,4 +1,4 @@
-"""The Claude account linked in Harvey (``brain.auth: account``): linking it
+"""The Claude account linked in Harvey (``brain.claude.auth: account``): linking it
 from Settings → Model by relaying the CLI's own login.
 
 Harvey never signs in to Claude itself, and never reads, keeps or shows a
@@ -444,7 +444,7 @@ async def start(state, kind: str = "subscription", on_linked=None) -> dict:
     """Start a link of a ``kind`` account (subscription or console):
     status()'s waiting_code answer with the page to open, once the CLI
     printed it. ``on_linked`` (async, no arguments) runs once the account
-    is in place: the dashboard sets brain.auth there. Raises LinkError."""
+    is in place: the dashboard sets brain.claude.auth there. Raises LinkError."""
     global _link
     from harvey import codex_link
     from harvey.modules import worker
@@ -576,7 +576,7 @@ async def _follow(link: _Link, on_linked) -> None:
             try:
                 await on_linked()
             except Exception as e:
-                logger.warning("claude link: saving brain.auth failed (%s)", type(e).__name__)
+                logger.warning("claude link: saving brain.claude.auth failed (%s)", type(e).__name__)
                 link.why = "config"
         if linked:
             # (Said only once brain.auth is saved: the panel reloads on it.)

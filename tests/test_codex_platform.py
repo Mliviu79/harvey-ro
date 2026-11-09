@@ -146,7 +146,7 @@ def test_windows_setup_checks_refuse_codex(native_home, on_windows):
 async def test_windows_quota_and_brain_pause_cleanly(on_windows, tmp_path):
     import json as _json
 
-    from harvey.brain import BRAIN_STATUS_KEY, Brain
+    from harvey.brain import Brain, status_key
     from harvey.config import BrainConfig
     from harvey.state import StateManager
 
@@ -156,7 +156,7 @@ async def test_windows_quota_and_brain_pause_cleanly(on_windows, tmp_path):
     assert await brain.quota.get_utilization() is None
     problem = await brain.preflight()
     assert "macOS and Linux" in problem
-    stored = _json.loads(await state.get_setting(BRAIN_STATUS_KEY))
+    stored = _json.loads(await state.get_setting(status_key("codex")))
     assert stored["status"] == "paused" and stored["kind"] == "setup"
     assert await brain.think("hi") == ""
 

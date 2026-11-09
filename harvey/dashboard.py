@@ -1690,14 +1690,19 @@ def _active_brain():
         return None
 
 
-async def _brain_status() -> dict:
-    """Last recorded brain health transition ({} if none): lets the
-    dashboard say "Codex paused: <why>" instead of looking healthy."""
-    from harvey.brain import BRAIN_STATUS_KEY, active_brain_status
-    rows = await query_db("SELECT value FROM settings WHERE key = ?", (BRAIN_STATUS_KEY,))
-    # Only the configured provider's health (a stale Codex pause isn't
-    # Claude's).
-    return active_brain_status(rows[0]["value"], _active_provider()) if rows else {}
+async def _brain_status(provider: str = "") -> dict:
+    """A provider's last recorded health transition ({} if none; ``provider``
+    "": the default's): lets the dashboard say "Codex paused: <why>"
+    instead of looking healthy. Each provider's own (a Codex pause isn't
+    Claude's)."""
+    from harvey.brain import stored_status
+    default = _active_provider()
+    provider = provider or default
+    if not provider:
+        return {}
+    state = _state()
+    await state.init_db()
+    return await stored_status(state, provider, default or None)
 
 
 def _brain_config_or_error():
@@ -1713,105 +1718,142 @@ def _brain_config_or_error():
 @app.get("/api/brain")
 async def get_brain(full: bool = False, refresh: bool = False, provider: str = "",
                     auth: str = ""):
-    """Settings → Model: the provider, model, reasoning effort and login
-    (brain.auth) with its status (brain_auth.status: the CLI's version
-    check, linked as what, the last error's class; ``full`` with Codex's
-    account and its models, ``refresh`` asks the CLIs again). ``provider``
-    (claude, codex): that provider's status for the panel before a switch
-    is saved, under ``auth`` (the login picked there) when that provider
-    offers it, else the login the switch carries (brain_auth.carried_auth:
-    the account linked in Harvey for it, when there is one)."""
+    """Settings → Model: both providers side by side ({default, providers:
+    {claude, codex}}, brain_auth.statuses), each with its own model,
+    reasoning effort, login (auth) and status (the CLI's version check,
+    linked as what, the last error's class; ``full`` with Codex's account
+    and its models, ``refresh`` asks the CLIs again); the default
+    provider's fields also at the top, as before. ``provider`` (claude,
+    codex): that provider's status alone (the panel's, ``full`` for Codex's
+    models), under ``auth`` (the login picked there and not saved yet) when
+    that provider offers it."""
     from harvey import brain_auth
-    from harvey.config import BRAIN_AUTH_READY, BRAIN_PROVIDERS, CODEX_REASONING_EFFORTS, BrainConfig
+    from harvey.config import BRAIN_AUTH_READY, BRAIN_PROVIDERS, CODEX_REASONING_EFFORTS
     brain, error = _brain_config_or_error()
     if brain is None:
         return JSONResponse({"error": error}, status_code=500)
-    if provider and provider != brain.provider:
-        if provider not in BRAIN_PROVIDERS:
-            return JSONResponse({"error": f"'{provider}' is not a brain provider"}, status_code=400)
-        picked = auth.lower() if auth.lower() in brain_auth.offered(provider) else ""
-        brain = BrainConfig(provider=provider,
-                            auth=picked or brain_auth.carried_auth(brain.auth, provider, brain.provider)[0])
-    elif auth and auth.lower() != brain.auth and auth.lower() in brain_auth.offered(provider or brain.provider):
-        brain = BrainConfig(provider=brain.provider, model=brain.model,
-                            reasoning_effort=brain.reasoning_effort, auth=auth.lower())
     state = _state()
     await state.init_db()
-    out = await brain_auth.status(brain, state=state, full=full, force=refresh)
-    out.update({"efforts": list(CODEX_REASONING_EFFORTS), "auth_ready": list(BRAIN_AUTH_READY),
-                "file": _resolve_config_file().name})
-    return out
+    extra = {"efforts": list(CODEX_REASONING_EFFORTS), "auth_ready": list(BRAIN_AUTH_READY),
+             "file": _resolve_config_file().name}
+    if provider:
+        provider = provider.lower()
+        if provider not in BRAIN_PROVIDERS:
+            return JSONResponse({"error": f"'{provider}' is not a brain provider"}, status_code=400)
+        view = brain.for_provider(provider)
+        if auth and auth.lower() != view.auth and auth.lower() in brain_auth.offered(provider):
+            view = view.model_copy(deep=True)
+            view.auth = auth.lower()
+        out = await brain_auth.status(view, state=state, full=full, force=refresh,
+                                      default=brain.provider)
+        out["default"] = provider == brain.provider
+        out.update(extra)
+        return out
+    both = await brain_auth.statuses(brain, state=state, full=full, force=refresh)
+    return {**both["providers"][brain.provider], **both, **extra}
 
 
 @app.post("/api/brain")
 async def set_brain(request: Request):
-    """Save Settings → Model: {provider, model, reasoning_effort, auth,
-    usd_per_day, usd_per_month, codex_usd_per_mtok_in, codex_usd_per_mtok_out},
-    each optional, into harvey.local.yaml (config.set_brain_settings; a
-    blank amount clears it). Codex is refused where it can't run (Windows),
-    and with no model (a blank one leaves the pick to a catalog that can
-    hide it); a login the panel doesn't offer is refused unless it is the
-    one already set, and an API key's login until a key is saved
-    (/api/brain/key) and while neither USD cap is set (brain_spend.NO_CAP)."""
+    """Save Settings → Model into harvey.local.yaml (config.set_brain_settings):
+    ``{"provider": p, ...}`` that provider's own settings (model,
+    reasoning_effort for Codex, auth, usd_per_day, usd_per_month, and
+    Codex's codex_usd_per_mtok_in / _out; each optional, a blank amount
+    clears it), which never touch the other provider's; ``{"default": p}``
+    the default provider (what runs on its own, and a new chat's). Codex is
+    refused where it can't run (Windows), and saved or made the default
+    with no model (a blank one leaves the pick to a catalog that can hide
+    it); a login the panel doesn't offer is refused unless it is the one
+    already set, Link account's until it is linked, an API key's until a
+    key is saved (/api/brain/key), and either billed login while neither USD
+    cap is set (brain_spend.NO_CAP)."""
     from harvey import brain_auth
-    from harvey.config import BRAIN_KEYS, ConfigError, set_brain_settings
+    from harvey.config import BRAIN_PROVIDERS, ConfigError, provider_keys, set_brain_settings
     try:
         body = await request.json()
     except ValueError:
         body = None
-    if not isinstance(body, dict) or not body or set(body) - set(BRAIN_KEYS):
-        return _refuse("expected {provider, model, reasoning_effort, auth}", 400)
+    if not isinstance(body, dict) or not body:
+        return _refuse("expected {provider, model, reasoning_effort, auth, ...} or {default}", 400)
     current, error = _brain_config_or_error()
     if current is None:
         return _refuse(error, 409)
-    values = {k: str(v if v is not None else "").strip() for k, v in body.items()}
-    if not values.get("provider"):
-        values.pop("provider", None)
-    provider = values.setdefault("provider", current.provider).lower()
-    if provider != current.provider:
-        # A model (and an effort) is one provider's: a switch that names
-        # none never carries the other one's along.
-        values.setdefault("model", "")
-        values.setdefault("reasoning_effort", "")
-    if provider == "codex":
-        why = brain_auth.codex_refusal()
-        if why:
-            return _refuse(why, 409)
-        model = values["model"] if "model" in values else (
-            current.model if current.provider == "codex" else "")
-        if not model:
-            return _refuse("Pick a Codex model: with none, Harvey would take the first one the "
-                           "catalog lists, and an account's catalog can hide it, so every call "
-                           "would fail.", 400)
-    else:
-        values["reasoning_effort"] = ""
-    auth = (values.get("auth") or (brain_auth.carried_auth(current.auth, provider, current.provider)[0]
-                                   if provider != current.provider else current.auth)).lower()
-    if not values.get("auth") and auth != current.auth:
-        values["auth"] = auth
-    if auth not in brain_auth.offered(provider) and auth != current.auth:
-        return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
-    if auth == brain_auth.ACCOUNT and provider == "codex" and auth != current.auth:
-        from harvey import codex_link
-        if not codex_link.is_linked():
-            return _refuse("Link the ChatGPT account first: press Link account.", 409)
-    if auth == brain_auth.ACCOUNT and provider != "codex" and (
-            auth != current.auth or provider != current.provider):
-        from harvey import claude_link
-        if not claude_link.has_account():
-            return _refuse("Link the Claude account first: press Link account.", 409)
-    if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
-        return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key first: "
-                       "paste it in the key box.", 409)
-    if brain_auth.billed(provider, auth) and not any(
-            (values[k] if k in values else getattr(current, k, None)) not in (None, "")
-            for k in ("usd_per_day", "usd_per_month")):
-        # (Billed per token, a cap is what the brain stops at: brain_spend.)
-        return _refuse("Set a USD cap for the day or the month: billed per token (an API key "
-                       "or a Console account), Harvey stops its calls at it, and makes none "
-                       "without one.", 400)
+    default = str(body.get("default") or "").strip().lower()
+    provider = str(body.get("provider") or "").strip().lower()
+    values = {k: str(v if v is not None else "").strip() for k, v in body.items()
+              if k not in ("provider", "default")}
+    if default and default not in BRAIN_PROVIDERS:
+        return _refuse(f"'{default}' is not a brain provider: claude or codex.", 400)
+    if values and not provider:
+        return _refuse("Say which provider these settings are for: claude or codex.", 400)
+    if provider and provider not in BRAIN_PROVIDERS:
+        return _refuse(f"'{provider}' is not a brain provider: claude or codex.", 400)
+    if not values and not default:
+        return _refuse("expected {provider, model, reasoning_effort, auth, ...} or {default}", 400)
+    if provider and set(values) - set(provider_keys(provider)):
+        return _refuse(f"Not a {provider} setting: "
+                       f"{', '.join(sorted(set(values) - set(provider_keys(provider))))}.", 400)
+    if values:
+        mine = current.for_provider(provider)
+        if provider == "codex":
+            why = brain_auth.codex_refusal()
+            if why:
+                return _refuse(why, 409)
+            if not (values["model"] if "model" in values else mine.model):
+                return _refuse("Pick a Codex model: with none, Harvey would take the first one "
+                               "the catalog lists, and an account's catalog can hide it, so "
+                               "every call would fail.", 400)
+        auth = (values.get("auth") or mine.auth).lower()
+        if "auth" in values:
+            values["auth"] = auth
+        if auth not in brain_auth.offered(provider) and auth != mine.auth:
+            return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
+        if auth == brain_auth.ACCOUNT and auth != mine.auth:
+            if provider == "codex":
+                from harvey import codex_link
+                if not codex_link.is_linked():
+                    return _refuse("Link the ChatGPT account first: press Link account.", 409)
+            else:
+                from harvey import claude_link
+                if not claude_link.has_account():
+                    return _refuse("Link the Claude account first: press Link account.", 409)
+        if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
+            return _refuse(f"Save the {'Codex' if provider == 'codex' else 'Claude'} API key "
+                           "first: paste it in the key box.", 409)
+        if brain_auth.billed(provider, auth) and not any(
+                (values[k] if k in values else getattr(mine, k, None)) not in (None, "")
+                for k in ("usd_per_day", "usd_per_month")):
+            # (Billed per token, a cap is what the brain stops at: brain_spend.)
+            return _refuse("Set a USD cap for the day or the month: billed per token (an API "
+                           "key or a Console account), Harvey stops its calls at it, and "
+                           "makes none without one.", 400)
+    writes = [(provider, values)] if values else []
+    if default and default != current.provider:
+        if default == "codex":
+            why = brain_auth.codex_refusal()
+            if why:
+                return _refuse(why, 409)
+            model = values.get("model") if provider == "codex" and "model" in values \
+                else current.codex.model
+            if not model:
+                return _refuse("Pick a Codex model first: Codex can't be the default without "
+                               "one.", 400)
+        # (Linked in Harvey while the other one was the default, before each
+        # provider kept its own login: that account is its login now.)
+        linked = brain_auth.linked_auth(current, default)
+        if linked and not (provider == default and "auth" in values):
+            if provider == default:
+                values["auth"] = linked
+            else:
+                writes.append((default, {"auth": linked}))
+        writes.append((None, {"provider": default}))
     try:
-        path = set_brain_settings(values, _resolve_config_file())
+        path = None
+        for which, these in writes:
+            path = set_brain_settings(these, _resolve_config_file(), provider=which)
+        if path is None:
+            from harvey.config import local_config_file
+            path = local_config_file(_resolve_config_file())
     except ConfigError as e:
         return _refuse(str(e), 400)
     brain_auth.forget()
@@ -1820,10 +1862,31 @@ async def set_brain(request: Request):
     await state.init_db()
     saved, _ = _brain_config_or_error()
     await state.log_action("brain_settings", "dashboard", {
-        "provider": saved.provider, "model": saved.model, "auth": saved.auth,
-        "reasoning_effort": saved.reasoning_effort, "file": path.name})
+        "default": saved.provider, **({"provider": provider, "model": saved.block(provider).model,
+                                      "auth": saved.block(provider).auth,
+                                      "reasoning_effort": saved.block(provider).reasoning_effort}
+                                     if provider else {}),
+        "file": path.name})
     return {"success": True, "file": path.name, "loop_running": bool(_check_harvey_pid()),
-            "brain": {k: getattr(saved, k) for k in BRAIN_KEYS}}
+            "brain": {"default": saved.provider,
+                      **{p: {k: getattr(saved.block(p), k) for k in provider_keys(p)}
+                         for p in BRAIN_PROVIDERS}}}
+
+
+async def _set_provider_auth(provider: str, auth: str, only_from: str = "") -> str:
+    """Set ``provider``'s own login (brain.<provider>.auth), whatever the
+    default is; with ``only_from``, only when it is that login now (an
+    unlink puts back the terminal login only where the one removed was in
+    use). Returns the login it has now."""
+    from harvey.config import set_brain_settings
+    current, _ = _brain_config_or_error()
+    if current is None:
+        return ""
+    have = current.block(provider).auth
+    if have == auth or (only_from and have != only_from):
+        return have
+    set_brain_settings({"auth": auth}, _resolve_config_file(), provider=provider)
+    return auth
 
 
 @app.post("/api/brain/key")
@@ -1880,9 +1943,10 @@ async def save_brain_key(request: Request):
 async def delete_brain_key(provider: str = ""):
     """Unlink an API key: Claude's cleared from .env, Codex's removed from
     data/auth/codex. A brain on that provider's API key goes back to the
-    terminal login, so no call is made with a key that isn't there."""
+    terminal login (that provider's own; the other's untouched), so no call
+    is made with a key that isn't there."""
     from harvey import brain_auth
-    from harvey.config import BRAIN_PROVIDERS, ConfigError, set_brain_settings
+    from harvey.config import BRAIN_PROVIDERS, ConfigError
     provider = (provider or "").strip().lower()
     if provider not in BRAIN_PROVIDERS:
         return _refuse("Say which provider's key to remove: claude or codex.", 400)
@@ -1896,14 +1960,11 @@ async def delete_brain_key(provider: str = ""):
                 logger.warning("Failed to write .env: %s", type(e).__name__)
                 return _refuse("Could not write the .env file.", 500)
             os.environ.pop(brain_auth.CLAUDE_KEY_ENV, None)
-    current, _ = _brain_config_or_error()
-    auth = current.auth if current else ""
-    if current is not None and current.provider == provider and auth == brain_auth.API_KEY:
-        try:
-            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
-            auth = brain_auth.TERMINAL
-        except ConfigError as e:
-            return _refuse(str(e), 409)
+    try:
+        # (That provider's own login only, whatever the default is.)
+        auth = await _set_provider_auth(provider, brain_auth.TERMINAL, only_from=brain_auth.API_KEY)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
     brain_auth.forget()
     _quota_clients.clear()
     state = _state()
@@ -1918,8 +1979,9 @@ async def start_codex_link():
     login in an app-server of Harvey's own (codex_link.start). Answers
     {status: pending, url, code, expires_in}: the user opens the url and
     types the code there (it is theirs to see; it is never logged). Once
-    linked, the login is in data/auth/codex and a Codex brain is set to
-    it. One link at a time per install."""
+    linked, the login is in data/auth/codex and Codex's own login
+    (brain.codex.auth) is set to it, whatever the default provider is. One
+    link at a time per install."""
     from harvey import brain_auth, codex_link
     why = brain_auth.codex_refusal()
     if why:
@@ -1928,11 +1990,8 @@ async def start_codex_link():
     await state.init_db()
 
     async def linked():
-        current, _ = _brain_config_or_error()
-        if current is not None and current.provider == "codex" \
-                and current.auth != brain_auth.ACCOUNT:
-            from harvey.config import set_brain_settings
-            set_brain_settings({"auth": brain_auth.ACCOUNT}, _resolve_config_file())
+        # (Codex's own login, whatever the default is: Claude's untouched.)
+        await _set_provider_auth("codex", brain_auth.ACCOUNT)
         brain_auth.forget()
         _quota_clients.clear()
         await state.log_action("brain_link", "dashboard", {"provider": "codex", "linked": True})
@@ -1965,21 +2024,17 @@ async def unlink_codex_account():
     data/auth/codex (an API key kept there is left alone). A brain on it
     goes back to the terminal login."""
     from harvey import brain_auth, codex_link
-    from harvey.config import ConfigError, set_brain_settings
+    from harvey.config import ConfigError
     state = _state()
     await state.init_db()
     try:
         removed = await codex_link.unlink(state)
     except codex_link.LinkError as e:
         return _refuse(str(e), 409)
-    current, _ = _brain_config_or_error()
-    auth = current.auth if current else ""
-    if current is not None and current.provider == "codex" and auth == brain_auth.ACCOUNT:
-        try:
-            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
-            auth = brain_auth.TERMINAL
-        except ConfigError as e:
-            return _refuse(str(e), 409)
+    try:
+        auth = await _set_provider_auth("codex", brain_auth.TERMINAL, only_from=brain_auth.ACCOUNT)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
     brain_auth.forget()
     _quota_clients.clear()
     await state.log_action("brain_link", "dashboard", {"provider": "codex", "linked": False})
@@ -1993,8 +2048,9 @@ async def start_claude_link(request: Request):
     staging folder of Harvey's own (claude_link.start) and answers
     {status: waiting_code, url, expires_in}: the user opens the url, signs
     in, and pastes the code the page gives (POST .../link/code). Once
-    linked, the account is in data/auth/claude and a Claude brain is set to
-    it. One link at a time per install."""
+    linked, the account is in data/auth/claude and Claude's own login
+    (brain.claude.auth) is set to it, whatever the default provider is. One
+    link at a time per install."""
     from harvey import brain_auth, claude_link
     try:
         body = await request.json()
@@ -2008,11 +2064,8 @@ async def start_claude_link(request: Request):
     await state.init_db()
 
     async def linked():
-        current, _ = _brain_config_or_error()
-        if current is not None and current.provider != "codex" \
-                and current.auth != brain_auth.ACCOUNT:
-            from harvey.config import set_brain_settings
-            set_brain_settings({"auth": brain_auth.ACCOUNT}, _resolve_config_file())
+        # (Claude's own login, whatever the default is: Codex's untouched.)
+        await _set_provider_auth("claude", brain_auth.ACCOUNT)
         brain_auth.forget()
         _quota_clients.clear()
         await state.log_action("brain_link", "dashboard",
@@ -2064,21 +2117,17 @@ async def unlink_claude_account():
     ``claude auth logout`` in data/auth/claude, then the folder removed. A
     brain on it goes back to the terminal login."""
     from harvey import brain_auth, claude_link
-    from harvey.config import ConfigError, set_brain_settings
+    from harvey.config import ConfigError
     state = _state()
     await state.init_db()
     try:
         removed = await claude_link.unlink(state)
     except claude_link.LinkError as e:
         return _refuse(str(e), 409)
-    current, _ = _brain_config_or_error()
-    auth = current.auth if current else ""
-    if current is not None and current.provider != "codex" and auth == brain_auth.ACCOUNT:
-        try:
-            set_brain_settings({"auth": brain_auth.TERMINAL}, _resolve_config_file())
-            auth = brain_auth.TERMINAL
-        except ConfigError as e:
-            return _refuse(str(e), 409)
+    try:
+        auth = await _set_provider_auth("claude", brain_auth.TERMINAL, only_from=brain_auth.ACCOUNT)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
     brain_auth.forget()
     _quota_clients.clear()
     await state.log_action("brain_link", "dashboard", {"provider": "claude", "linked": False})
@@ -2115,6 +2164,31 @@ def _quota_client_for(provider: str, model: str = "", auth: str = "terminal"):
     return _quota_clients[key]
 
 
+async def _provider_usage(brain) -> dict:
+    """One provider's part of the Usage tab: its plan's gauge (``quota``,
+    None when it couldn't be read), or with an API key its spend beside its
+    own caps (``money``: brain_spend.totals)."""
+    from harvey import brain_spend
+    money = quota = None
+    if brain_spend.api_key(brain):
+        try:
+            state = _state()
+            await state.init_db()
+            money = await brain_spend.totals(state, brain)
+        except Exception as e:
+            logger.debug("API-key spend not read: %s", e)
+    else:
+        try:
+            client = _quota_client_for(brain.provider, brain.model, brain.auth)
+            if client is not None:
+                quota = await client.get_utilization()
+        except Exception as e:
+            logger.debug("Quota lookup failed: %s", e)
+    return {"quota": quota, "money": money,
+            "quota_status": ("available" if quota else "unavailable") if money is None else "",
+            "billing": "api_key" if money is not None else "subscription"}
+
+
 @app.get("/api/usage")
 async def get_usage():
     """Token/cost accounting + live subscription quota for the Usage tab."""
@@ -2147,24 +2221,17 @@ async def get_usage():
 
     brain = _active_brain()
     provider = brain.provider if brain else ""
-    from harvey import brain_spend
-    money = None
-    if brain is not None and brain_spend.api_key(brain):
-        try:
-            state = _state()
-            await state.init_db()
-            money = await brain_spend.totals(state, brain)
-        except Exception as e:
-            logger.debug("API-key spend not read: %s", e)
-    quota = None
-    try:
-        client = _quota_client_for(provider, brain.model if brain else "",
-                                   brain.auth if brain else "terminal")
-        if client is not None:
-            quota = await client.get_utilization()
-    except Exception as e:
-        logger.debug("Quota lookup failed: %s", e)
-
+    # Each provider set up (the default, one whose settings name anything,
+    # or one Harvey used in the last 30 days): its own gauge, or with an API
+    # key its own spend beside its own caps.
+    used = {r["provider"] for r in by_provider if r.get("provider")}
+    providers = {}
+    for p in ("claude", "codex"):
+        if brain is None or not (p == provider or brain.block(p).model_fields_set or p in used):
+            continue
+        providers[p] = {**await _provider_usage(brain.for_provider(p)), "default": p == provider}
+    mine = providers.get(provider) or {"quota": None, "money": None}
+    quota, money = mine["quota"], mine["money"]
     # The SMS and WhatsApp answers sent through nPathi Chat: credits, not
     # tokens (and USD when a credit's worth is entered).
     messages = None
@@ -2193,6 +2260,9 @@ async def get_usage():
         # spend beside the brain's USD caps, in place of the plan's windows.
         "billing": "api_key" if money is not None else "subscription",
         "money": money,
+        # Every provider set up, side by side: {provider: {quota,
+        # quota_status, billing, money, default}}.
+        "providers": providers,
         "by_provider": by_provider,
         "totals": totals,
         "by_day": by_day,
@@ -5720,7 +5790,7 @@ async def act_on_lane(lane: str, action: str):
 # ── Chat: the chats with Harvey's agent (harvey/agent/chat.py) ──
 
 def _chat_refused(e) -> JSONResponse:
-    status = {"empty": 400, "too_long": 400, "retry": 400, "missing": 404,
+    status = {"empty": 400, "too_long": 400, "retry": 400, "missing": 404, "provider": 400,
               "budget": 429}.get(e.code, 409)
     return JSONResponse({"success": False, "code": e.code, "message": str(e)},
                         status_code=status)
@@ -5729,10 +5799,11 @@ def _chat_refused(e) -> JSONResponse:
 @app.get("/api/agent/chats")
 async def get_agent_chats(q: str = "", limit: int = 100):
     """The chats, newest activity first ({id, title, created_at, last_at,
-    answering}), those whose title holds ``q``; why the chat can't run with
-    these settings (``refused``: Codex where it isn't supported); who
-    answers (``provider``, claude or codex, and ``model``, "" for its
-    default)."""
+    answering, provider: its own, None for the default's}), those whose
+    title holds ``q``; why a new chat on the default provider can't run
+    (``refused``: Codex where it isn't supported); the default provider
+    (``provider``, claude or codex, and ``model``, "" for its default); and
+    both providers for the picker (``providers``: _chat_providers)."""
     from harvey.agent import chat
 
     state = _state()
@@ -5742,14 +5813,41 @@ async def get_agent_chats(q: str = "", limit: int = 100):
     return {"chats": await chat.chats(state, q, limit),
             "refused": chat.refusal(config),
             "provider": getattr(brain, "provider", "claude") or "claude",
-            "model": getattr(brain, "model", "") or ""}
+            "model": getattr(brain, "model", "") or "",
+            "providers": await _chat_providers(state, config)}
+
+
+async def _chat_providers(state, config) -> list[dict]:
+    """The providers a chat can be on, for the Chat tab's picker: [{id,
+    default, model, refused (can't run on this platform), paused (why its
+    calls are paused now, brain.stored_status), billed}]. No CLI is
+    asked: a provider that can't be started is refused when it is picked."""
+    from harvey import brain_spend
+    from harvey.agent import chat
+    from harvey.brain import stored_status
+
+    out = []
+    default = chat.default_provider(config)
+    for p in chat.PROVIDERS:
+        view = chat.for_chat(config, p)
+        brain = getattr(view, "brain", None)
+        stored = await stored_status(state, p, default)
+        out.append({"id": p, "default": p == default,
+                    "model": getattr(brain, "model", "") or "",
+                    "refused": chat.refusal(view),
+                    "paused": str(stored.get("reason") or "")[:300]
+                    if stored.get("status") == "paused" else "",
+                    "billed": bool(brain is not None and brain_spend.api_key(brain))})
+    return out
 
 
 @app.post("/api/agent/chats")
 async def create_agent_chat(request: Request):
-    """A new chat with its first message, {"text"} (its title is made from
-    it): {"success", "chat", "turn"}, the answer started at once (follow it
-    with /api/agent/chats/{chat}/stream?turn=). Refused before anything is
+    """A new chat with its first message, {"text", "provider"} (its title
+    is made from it; ``provider``, claude or codex: the one it runs on,
+    the default provider when absent): {"success", "chat", "turn"}, the
+    answer started at once (follow it with
+    /api/agent/chats/{chat}/stream?turn=). Refused before anything is
     written, with ``code`` (chat.REFUSALS)."""
     from harvey.agent import chat
 
@@ -5758,7 +5856,8 @@ async def create_agent_chat(request: Request):
     await state.init_db()
     try:
         answer = await chat.hub(state).ask(None, str(body.get("text") or ""),
-                                           config=_load_config_quietly())
+                                           config=_load_config_quietly(),
+                                           provider=str(body.get("provider") or "") or None)
     except chat.Refused as e:
         return _chat_refused(e)
     return {"success": True, "chat": answer.chat, "turn": answer.turn}
@@ -5766,13 +5865,21 @@ async def create_agent_chat(request: Request):
 
 @app.patch("/api/agent/chats/{chat_id}")
 async def rename_agent_chat(chat_id: str, request: Request):
-    """Rename a chat: {"title"}. {"success", "chat"}."""
+    """Rename a chat, {"title"}, or move it to another provider between
+    messages, {"provider"} (chat.Hub.set_provider: refused while an answer
+    or a wake is under way, busy / waking, and for a provider that can't
+    run here or now, codex / cli, with why). {"success", "chat"}."""
     from harvey.agent import chat
 
     body = await _json_body(request)
     state = _state()
     await state.init_db()
     try:
+        if "provider" in body:
+            found = await chat.hub(state).set_provider(chat_id, str(body.get("provider") or ""),
+                                                      config=_load_config_quietly())
+            if "title" not in body:
+                return {"success": True, "chat": found}
         return {"success": True, "chat": await chat.rename(state, chat_id,
                                                            str(body.get("title") or ""))}
     except chat.Refused as e:
@@ -5820,9 +5927,11 @@ async def get_agent_chat_messages(chat_id: str, limit: int = 50, before: int = 0
         # (The newest messages shown: its wake answers are read.)
         await chat.mark_read(state, chat_id)
     from harvey import brain_spend
+    # (The chat's own provider: its plans are billed, or refused, by it.)
+    config, provider = await chat.config_for_chat(state, chat_id, _load_config_quietly())
     return {**found, "plans": await plans.for_chat(
-                state, chat_id, billed=brain_spend.api_key(_active_brain())),
-            "refused": chat.refusal(_load_config_quietly())}
+                state, chat_id, billed=brain_spend.api_key(getattr(config, "brain", None))),
+            "provider": provider, "refused": chat.refusal(config)}
 
 
 @app.post("/api/agent/chats/{chat_id}/messages")
@@ -6557,6 +6666,23 @@ async def get_today():
                            "once it's fixed. harvey status --check says what's wrong."),
                 "action": "Open the log", "tab": "controls",
             })
+        # The other provider paused: only the chats (and their wakes and
+        # tasks) on it wait.
+        default = _active_provider()
+        for other in ("claude", "codex"):
+            if not default or other == default:
+                continue
+            found = await _brain_status(other)
+            if found.get("status") == "paused":
+                label = "Codex" if other == "codex" else "Claude"
+                items.append({
+                    "key": "brain-paused-other", "tone": "warn", "provider": other,
+                    "title": f"{label} is paused: the chats on it wait",
+                    "detail": (str(found.get("reason") or "It can't be used right now.")[:300] +
+                               f" Everything on {'Claude' if other == 'codex' else 'Codex'}, "
+                               "the default, goes on."),
+                    "action": "Open Settings", "tab": "settings",
+                })
 
         # A provider Harvey can't send or read through (Instantly, removed).
         from harvey.config import provider_notice
@@ -6695,9 +6821,9 @@ async def get_today():
 
         # The Codex account linked in Harvey couldn't be renewed: calls
         # are refused until it is linked again.
-        codex_brain = _active_brain()
-        if codex_brain is not None and codex_brain.provider == "codex" \
-                and getattr(codex_brain, "auth", "") == "account":
+        # (Codex's own login, whether or not it is the default.)
+        configured = _active_brain()
+        if configured is not None and configured.codex.auth == "account":
             from harvey import codex_link
             linked = await codex_link.renewal_status(state)
             if linked.get("expired"):
@@ -6712,12 +6838,10 @@ async def get_today():
 
         # The Claude account linked in Harvey is logged out (signed out
         # or revoked): calls fail until it is linked again.
-        claude_brain = codex_brain                       # (the brain read above)
-        if claude_brain is not None and claude_brain.provider != "codex" \
-                and getattr(claude_brain, "auth", "") == "account":
+        if configured is not None and configured.claude.auth == "account":
             from harvey import brain_auth, claude_link
             if claude_link.has_account():
-                found = await brain_auth.status(claude_brain, state=state)
+                found = await brain_auth.status(configured.for_provider("claude"), state=state)
                 if found.get("linked") is False:
                     items.append({
                         "key": "claude-login", "tone": "warn",
@@ -6745,11 +6869,18 @@ async def get_today():
         # tasks wait, since a run's model calls cost money (one item for
         # them all; each plan's card says it too).
         from harvey import brain_spend
-        if brain_spend.api_key(_active_brain()):
-            from harvey.agent import plans as agent_plans
-            free = [p["id"] for p in await agent_plans.listed(state, status=agent_plans.APPROVED,
-                                                              limit=500)
-                    if p["budget_usd"] <= agent_plans.EPSILON]
+        if configured is not None and any(brain_spend.api_key(configured.for_provider(p))
+                                          for p in ("claude", "codex")):
+            from harvey.agent import chat as agent_chat, plans as agent_plans
+            free = []
+            for p in await agent_plans.listed(state, status=agent_plans.APPROVED, limit=500):
+                if p["budget_usd"] > agent_plans.EPSILON:
+                    continue
+                # (Billed by its chat's provider.)
+                info = await agent_chat.chat_info(state, p["chat"])
+                own = (info or {}).get("provider") or configured.provider
+                if brain_spend.api_key(configured.for_provider(own)):
+                    free.append(p["id"])
             if free:
                 stats["agent_free_plans"] = len(free)
                 items.append({

@@ -236,13 +236,15 @@ async def test_codex_pause_is_sticky_until_the_login_or_cli_changes(state):
     assert await brain.preflight() == "login expired"
     assert await brain.preflight() == "login expired"  # nothing changed: no re-check
     assert brain.codex.preflights == 1
-    stored = json.loads(await state.get_setting(brain_mod.BRAIN_STATUS_KEY))
+    # (Codex's own status: a pause of it says nothing about Claude.)
+    stored = json.loads(await state.get_setting(brain_mod.status_key("codex")))
     assert stored["status"] == "paused" and stored["reason"] == "login expired"
+    assert await brain_mod.stored_status(state, "claude") == {}
 
     brain.codex.print = ("auth-v2",)  # the operator renewed the login
     assert await brain.preflight() == ""
     assert brain.codex.preflights == 2
-    stored = json.loads(await state.get_setting(brain_mod.BRAIN_STATUS_KEY))
+    stored = json.loads(await state.get_setting(brain_mod.status_key("codex")))
     assert stored["status"] == "ok"
 
 
@@ -353,7 +355,7 @@ def test_trainer_uses_and_writes_back_the_selection(tmp_path, monkeypatch):
     trainer = trainer_mod.Trainer()
     assert trainer.brain.provider == "codex" and trainer.brain.model == "gpt-5.5"
     built = trainer._build_config({"product_name": "W"}, {}, {}, "acme.example")
-    assert built["brain"] == {"provider": "codex", "model": "gpt-5.5"}
+    assert built["brain"] == {"provider": "codex", "codex": {"model": "gpt-5.5"}}
     # The written config loads back with the same selection.
     assert HarveyConfig(**built).brain == BrainConfig(provider="codex", model="gpt-5.5")
 
@@ -395,8 +397,12 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(setup_mod, "_ask", lambda *a, **k: "2")
     cli.cmd_train(args)
-    assert seen["config"] == BrainConfig(provider="codex", model="gpt-5.6-luna",
-                                         reasoning_effort="low")
+    # (Codex the default, with its own model and effort; Claude's own model
+    # stays Claude's.)
+    picked = seen["config"]
+    assert (picked.provider, picked.model, picked.reasoning_effort) == (
+        "codex", "gpt-5.6-luna", "low")
+    assert picked.claude.model == "claude-opus-4-8"
 
     args.provider, args.reasoning_effort = None, None
     cli.cmd_train(args)
@@ -469,7 +475,8 @@ def test_setup_writes_the_selection(tmp_path, monkeypatch):
     wizard._write_config()
     local = tmp_path / "harvey.local.yaml"           # setup never writes harvey.yaml
     assert not config_file.exists()
-    assert yaml.safe_load(local.read_text())["brain"] == {"provider": "codex", "model": "gpt-5.5"}
+    assert yaml.safe_load(local.read_text())["brain"] == {"provider": "codex",
+                                                           "codex": {"model": "gpt-5.5"}}
 
     # Re-running setup over a trained config updates the selection too.
     wizard.brain_config = BrainConfig()
@@ -499,7 +506,7 @@ async def test_codex_setup_does_not_require_claude(monkeypatch, tmp_path):
         listed.append(brain.auth)
         return LISTED
     monkeypatch.setattr("harvey.brain_auth.codex_models", models)
-    monkeypatch.setattr(setup_mod, "_current_auth", lambda: "terminal")
+    monkeypatch.setattr(setup_mod, "_current_brain", lambda: BrainConfig())
     answers = iter(["codex", "1"])
     monkeypatch.setattr(setup_mod, "_ask", lambda *a, **k: next(answers))
     wizard = setup_mod.SetupWizard()
@@ -780,3 +787,29 @@ def test_cli_status_hides_another_providers_pause(monkeypatch, tmp_path, capsys)
                       config=BrainConfig(provider="codex", model="gpt-5.5"),
                       setting=_STALE_CODEX_PAUSE)
     assert "Codex PAUSED" in out
+
+
+def test_an_older_harveys_pause_of_the_other_provider_stays_hidden(client, monkeypatch):
+    # (An older Harvey kept one pause, under one key, for its one provider:
+    # it hid it once the other provider was chosen. Read now, it is the
+    # default provider's only, never a warning about the provider not in use.)
+    asyncio.run(StateManager(str(client.db_path)).set_setting(
+        brain_mod.BRAIN_STATUS_KEY, _STALE_CODEX_PAUSE))
+    monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig())  # now Claude
+    today = client.get("/api/today").json()
+    assert "brain-paused-other" not in [i.get("key") for i in today.get("items", [])]
+    assert brain_mod.status_key("codex") not in str(today)
+
+    async def stored(default):
+        state = StateManager(str(client.db_path))
+        return (await brain_mod.stored_status(state, "codex", default=default),
+                await brain_mod.stored_status(state, "codex"))
+    hidden, as_before = asyncio.run(stored("claude"))
+    assert hidden == {} and as_before["status"] == "paused"
+    assert asyncio.run(stored("codex"))[0]["status"] == "paused"
+    # (Codex's own record, once it writes one, is Codex's whatever the default.)
+    asyncio.run(StateManager(str(client.db_path)).set_setting(
+        brain_mod.status_key("codex"), _STALE_CODEX_PAUSE))
+    assert asyncio.run(stored("claude"))[0]["status"] == "paused"
+    today = client.get("/api/today").json()
+    assert "brain-paused-other" in [i.get("key") for i in today.get("items", [])]

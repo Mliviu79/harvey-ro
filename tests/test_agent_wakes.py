@@ -636,17 +636,20 @@ def test_a_rejected_rate_limit_event_rests_the_lane_until_later(state, fake, mon
     assert _q(state, "SELECT COUNT(*) FROM agent_message") == [(0,)]
 
 
-def test_a_logged_out_cli_pauses_the_agents_lane(state, fake, monkeypatch):
+def test_a_logged_out_cli_holds_only_its_providers_wakes(state, fake, monkeypatch):
     monkeypatch.setenv("FAKE_WAKE", "login")
     plan_id = _plan(state)
     _run(wakes.note(state, plan_id, "reply", "r1", {}))
     job = _work_wake(state)
-    assert job.status == "queued" and job.attempts == 0
-    paused = _run(jobs.lane_paused(state, wakes.AGENT_LANE))
-    assert "claude login" in paused
+    # (It waits, no try used: the lane isn't paused, so the wakes of chats
+    # on the other provider go on.)
+    assert job.status == "queued" and job.attempts == 0 and job.not_before
+    assert not _run(jobs.lane_paused(state, wakes.AGENT_LANE))
     assert _q(state, "SELECT COUNT(*) FROM agent_message") == [(0,)]
     assert _q(state, "SELECT seen_at FROM agent_event") == [(None,)]
-    assert _run(wakes.held(state))["paused"] is True
+    held = _run(wakes.held(state))
+    assert "claude login" in held["why"] and held["provider"] == "claude"
+    assert held["paused"] is False
 
 
 def test_a_failed_wake_keeps_its_events_and_the_next_waits(state, fake, monkeypatch):

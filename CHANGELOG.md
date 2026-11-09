@@ -9,6 +9,32 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Claude and Codex side by side.** Both providers can be set up at
+  once, each with its own login, model, Codex's reasoning effort, USD caps
+  and Codex's prices (`brain.claude`, `brain.codex`): linking, unlinking or
+  saving a key for one never touches the other's. Settings → Model has a
+  card for each, and a **Default provider** (Codex needs a model saved
+  first, and stays unavailable on Windows): the default runs everything
+  that runs on its own (writing, answers including SMS and WhatsApp drafts,
+  analysis, training, campaign sequences). Each chat has its own provider,
+  picked when you start it (the default preselected) and changeable between
+  messages from the picker in the chat's head (`harvey agent chat
+  --provider`, `harvey agent ask --provider`); the next message starts the
+  new provider with the conversation so far. A plan's wakes and tasks run
+  on its chat's provider and are priced by it. Harvey never switches on its
+  own: a provider that can't be used (logged out, its share or quota used,
+  its caps reached, its CLI unusable) holds only the chats, wakes and tasks
+  on it, which say why; the other provider's go on (a logged-out CLI, or
+  one that can't be started, no longer pauses the agent's whole lane: its
+  wakes and tasks wait and look again every 30 minutes). A pause an older
+  Harvey recorded counts for the default provider only, as it did then.
+  API-key caps count each
+  provider's own calls. The Usage tab, `harvey usage` and `harvey status
+  --check` show both when both are set up. An older flat `brain:` section
+  keeps loading as the default provider's settings, and the first save
+  writes the new shape (the comments outside it stay). Schema 43:
+  `agent_chat.provider`.
+
 - **Removing a message that hasn't gone, and editing every one.** Each
   unsent row of the Outbox (waiting for review or approved, any channel)
   has **Remove** beside Edit, Approve and Reject (`POST

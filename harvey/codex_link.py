@@ -1,4 +1,4 @@
-"""The Codex account linked in Harvey (``brain.auth: account``): linking it
+"""The Codex account linked in Harvey (``brain.codex.auth: account``): linking it
 from Settings → Model, and keeping it renewed.
 
 Linking. POST /api/brain/codex/link starts a ChatGPT device-code login
@@ -180,7 +180,7 @@ def _fresh_staging() -> Path:
 async def start(state, on_linked=None) -> dict:
     """Start a link (status()'s pending answer, with the url and code).
     ``on_linked`` (async, no arguments) runs once the login is in place:
-    the dashboard sets brain.auth there. Raises LinkError."""
+    the dashboard sets brain.codex.auth there. Raises LinkError."""
     global _link
     from harvey import codex
     from harvey.modules import worker
@@ -243,7 +243,7 @@ async def _follow(state, link: _Link, on_linked) -> None:
             try:
                 await on_linked()
             except Exception as e:
-                logger.warning("codex link: saving brain.auth failed: %s", e)
+                logger.warning("codex link: saving brain.codex.auth failed: %s", e)
                 link.kind = "config"
         if linked:
             # (Said only once brain.auth is saved: the panel reloads on it.)

@@ -65,25 +65,81 @@ def test_auth_is_terminal_unless_set():
 def test_saving_brain_settings_keeps_the_file_and_its_comments(tmp_path):
     template = tmp_path / "harvey.yaml"
     template.write_text(TEMPLATE, encoding="utf-8")
-    written = set_brain_settings({"provider": "codex", "model": "gpt-6-luna",
-                                  "reasoning_effort": "high", "auth": "terminal"}, template)
+    written = set_brain_settings({"model": "gpt-6-luna", "reasoning_effort": "high",
+                                  "auth": "terminal"}, template, provider="codex")
+    set_brain_settings({"provider": "codex"}, template)
     assert written == tmp_path / "harvey.local.yaml"
     assert template.read_text(encoding="utf-8") == TEMPLATE        # the template untouched
     text = written.read_text(encoding="utf-8")
     assert "# Which subscription Harvey thinks with" in text and "# Harvey's settings" in text
     assert "auth" not in text                    # a default never chosen stays absent
-    assert load_brain_config(str(written)) == BrainConfig(
-        provider="codex", model="gpt-6-luna", reasoning_effort="high")
+    assert yaml.safe_load(text)["brain"] == {"provider": "codex", "codex": {
+        "model": "gpt-6-luna", "reasoning_effort": "high"}}
+    loaded = load_brain_config(str(written))
+    assert (loaded.provider, loaded.model, loaded.reasoning_effort) == ("codex", "gpt-6-luna", "high")
     assert yaml.safe_load(text)["usage"] == {"max_daily_claude_percent": 80}
 
-    set_brain_settings({"auth": "account"}, template)
-    assert load_brain_config(str(written)).auth == "account"
+    # One provider's login never touches the other's.
+    set_brain_settings({"auth": "account"}, template, provider="claude")
+    loaded = load_brain_config(str(written))
+    assert loaded.claude.auth == "account" and loaded.codex.auth == "terminal"
+    assert loaded.auth == "terminal"                       # (the default's, Codex's)
     before = written.read_bytes()
-    for bad in ({"model": "--dangerous"}, {"auth": "password"}, {"colour": "red"},
-                {"usd_per_day": "-1"}, {"usd_per_month": "lots"}):
+    for bad, which in (({"model": "--dangerous"}, "claude"), ({"auth": "password"}, "codex"),
+                       ({"colour": "red"}, "claude"), ({"usd_per_day": "-1"}, "codex"),
+                       ({"usd_per_month": "lots"}, "claude"),
+                       ({"reasoning_effort": "low"}, "claude"),     # Codex's only
+                       ({"model": "opus"}, None), ({"provider": "gemini"}, None)):
         with pytest.raises(ConfigError):
-            set_brain_settings(bad, template)
+            set_brain_settings(bad, template, provider=which)
     assert written.read_bytes() == before
+
+
+FLAT = """# Harvey's settings (fictional)
+persona:
+  name: H  # the sender
+brain:
+  provider: codex
+  model: gpt-6-luna
+  auth: account
+  reasoning_effort: low
+  usd_per_day: 3
+# Usage comes after.
+usage:
+  max_daily_claude_percent: 80  # leave the rest for you
+"""
+
+
+def test_an_older_flat_brain_loads_and_the_first_save_writes_the_new_shape(tmp_path):
+    local = tmp_path / "harvey.local.yaml"
+    local.write_text(FLAT, encoding="utf-8")
+    # The flat keys are the default provider's (Codex's effort is Codex's);
+    # the other provider is the terminal login with no model.
+    loaded = load_brain_config(str(local))
+    assert (loaded.provider, loaded.model, loaded.auth, loaded.usd_per_day) == (
+        "codex", "gpt-6-luna", "account", 3.0)
+    assert loaded.reasoning_effort == "low"
+    assert (loaded.claude.auth, loaded.claude.model) == ("terminal", "")
+    claude = BrainConfig(provider="claude", reasoning_effort="high")
+    assert claude.codex.reasoning_effort == "high" and claude.claude.reasoning_effort == ""
+
+    set_brain_settings({"model": "sonnet"}, local, provider="claude")
+    text = local.read_text(encoding="utf-8")
+    assert yaml.safe_load(text)["brain"] == {
+        "provider": "codex", "claude": {"model": "sonnet"},
+        "codex": {"model": "gpt-6-luna", "reasoning_effort": "low", "auth": "account",
+                  "usd_per_day": 3.0}}
+    # Only brain: changed: every comment outside it stays.
+    for kept in ("# Harvey's settings", "name: H  # the sender", "# Usage comes after.",
+                 "max_daily_claude_percent: 80  # leave the rest for you"):
+        assert kept in text, kept
+    again = load_brain_config(str(local))
+    assert again.codex.model_dump() == loaded.codex.model_dump()
+    assert (again.provider, again.claude.model) == ("codex", "sonnet")
+    # A save with nothing to change leaves the file as it is.
+    before = local.read_bytes()
+    set_brain_settings({"model": "sonnet"}, local, provider="claude")
+    assert local.read_bytes() == before
 
 
 # ── The children's environment ──
@@ -296,49 +352,69 @@ def test_the_panel_reads_and_saves_the_brain(client, monkeypatch):
 
     monkeypatch.setattr(codex, "_PLATFORM", "linux")
     got = client.get("/api/brain").json()
+    assert got["default"] == "claude" and set(got["providers"]) == {"claude", "codex"}
+    # (The default's fields stay at the top, as the page and setup read them.)
     assert (got["provider"], got["model"], got["auth"]) == ("claude", "", "terminal")
-    assert got["offered"] == ["terminal", "account", "api_key"] and "account" in got["auth_ready"]
-    assert got["codex_refused"] == "" and got["key_set"] == {"claude": False, "codex": False}
+    mine = got["providers"]["claude"]
+    assert mine["default"] is True and got["providers"]["codex"]["default"] is False
+    assert mine["offered"] == ["terminal", "account", "api_key"] and "account" in got["auth_ready"]
+    assert got["codex_refused"] == "" and mine["key_set"] == {"claude": False, "codex": False}
 
     r = client.post("/api/brain", json={"provider": "codex", "model": ""})
     assert r.status_code == 400 and "Pick a Codex model" in r.json()["message"]
-    r = client.post("/api/brain", json={"auth": "account"})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "account"})
     assert r.status_code == 409                  # no account linked yet
-    r = client.post("/api/brain", json={"auth": "api_key"})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "api_key"})
     assert r.status_code == 409 and "Save the Claude API key first" in r.json()["message"]
+    r = client.post("/api/brain", json={"default": "codex"})
+    assert r.status_code == 400 and "Codex model" in r.json()["message"]
+    r = client.post("/api/brain", json={"model": "opus"})
+    assert r.status_code == 400 and "Say which provider" in r.json()["message"]
     assert not (client.dir / "harvey.local.yaml").exists()
 
     r = client.post("/api/brain", json={"provider": "codex", "model": "gpt-6-luna",
                                         "reasoning_effort": "low", "auth": "terminal"})
-    assert r.status_code == 200 and r.json()["brain"] == {
-        "provider": "codex", "model": "gpt-6-luna", "reasoning_effort": "low", "auth": "terminal",
-        **NO_MONEY}
+    assert r.status_code == 200
+    saved = r.json()["brain"]
+    assert saved["default"] == "claude"          # saving Codex never made it the default
+    assert saved["codex"] == {"model": "gpt-6-luna", "reasoning_effort": "low",
+                              "auth": "terminal", **NO_MONEY}
     text = (client.dir / "harvey.local.yaml").read_text(encoding="utf-8")
     assert "# Which subscription Harvey thinks with" in text
+    both = client.get("/api/brain").json()["providers"]
+    assert both["codex"]["model"] == "gpt-6-luna" and both["claude"]["model"] == ""
+
+    # The default: Codex now (it has a model), then back.
+    r = client.post("/api/brain", json={"default": "codex"})
+    assert r.status_code == 200 and r.json()["brain"]["default"] == "codex"
     assert client.get("/api/brain").json()["model"] == "gpt-6-luna"
-    # Back to Claude: Codex's effort goes with it.
     r = client.post("/api/brain", json={"provider": "claude", "model": "sonnet"})
-    assert r.json()["brain"]["reasoning_effort"] == ""
+    assert r.json()["brain"]["claude"]["model"] == "sonnet"
+    assert r.json()["brain"]["default"] == "codex"
+    assert "reasoning_effort" not in r.json()["brain"]["claude"]
+    r = client.post("/api/brain", json={"default": "claude"})
+    loaded = load_brain_config(str(client.dir / "harvey.local.yaml"))
+    assert (loaded.provider, loaded.model, loaded.codex.model) == ("claude", "sonnet", "gpt-6-luna")
 
 
-def test_a_provider_switch_never_carries_the_other_ones_model(client, monkeypatch):
+def test_each_provider_keeps_its_own_model(client, monkeypatch):
     from harvey import codex
 
     monkeypatch.setattr(codex, "_PLATFORM", "linux")
     assert client.post("/api/brain", json={"provider": "codex", "model": "gpt-6-luna",
                                            "reasoning_effort": "low"}).status_code == 200
-    # Back to Claude naming no model: Codex's model isn't Claude's.
-    r = client.post("/api/brain", json={"provider": "claude"})
-    assert r.status_code == 200 and r.json()["brain"] == {
-        "provider": "claude", "model": "", "reasoning_effort": "", "auth": "terminal", **NO_MONEY}
-    # A blank provider is no switch (and no write of the default).
-    r = client.post("/api/brain", json={"provider": "", "model": "sonnet"})
-    assert r.status_code == 200 and r.json()["brain"]["provider"] == "claude"
-    assert r.json()["brain"]["model"] == "sonnet"
-    # To Codex naming no model: refused, not Claude's model sent to Codex.
-    r = client.post("/api/brain", json={"provider": "codex"})
-    assert r.status_code == 400 and "Pick a Codex model" in r.json()["message"]
-    assert load_brain_config(str(client.dir / "harvey.local.yaml")).model == "sonnet"
+    assert client.post("/api/brain", json={"default": "codex"}).status_code == 200
+    # Claude's settings are Claude's: Codex's model and effort aren't carried.
+    r = client.post("/api/brain", json={"provider": "claude", "model": ""})
+    assert r.status_code == 200 and r.json()["brain"]["claude"] == {
+        "model": "", "auth": "terminal", "usd_per_day": None, "usd_per_month": None}
+    r = client.post("/api/brain", json={"provider": "claude", "reasoning_effort": "low"})
+    assert r.status_code == 400 and "Not a claude setting" in r.json()["message"]
+    # To Claude as the default: its own model, none of Codex's.
+    assert client.post("/api/brain", json={"default": "claude"}).status_code == 200
+    loaded = load_brain_config(str(client.dir / "harvey.local.yaml"))
+    assert (loaded.model, loaded.reasoning_effort) == ("", "")
+    assert (loaded.codex.model, loaded.codex.reasoning_effort) == ("gpt-6-luna", "low")
 
 
 def test_the_brain_endpoints_need_the_token(client):
@@ -356,6 +432,8 @@ def test_codex_is_refused_where_it_cant_run(client, monkeypatch):
     monkeypatch.setattr(codex, "_PLATFORM", "win32")
     assert "Windows" in client.get("/api/brain").json()["codex_refused"]
     r = client.post("/api/brain", json={"provider": "codex", "model": "gpt-6-luna"})
+    assert r.status_code == 409 and "Windows" in r.json()["message"]
+    r = client.post("/api/brain", json={"default": "codex"})
     assert r.status_code == 409 and "Windows" in r.json()["message"]
 
 
@@ -393,25 +471,36 @@ global.safeHref = u => /^https?:\/\//i.test(String(u || '').trim()) ? escHtml(St
 const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
 vm.runInThisContext(pick('let _model = null', '// Settings: the background'));
 const s = JSON.parse(process.argv[4]);
-_model = s;
-_modelPick = {provider: s.provider, model: s.model, reasoning_effort: s.reasoning_effort, auth: s.auth};
-if (s.provider === 'codex') _modelFull.codex = s;
 const other = process.argv[5] ? JSON.parse(process.argv[5]) : null;
-if (other) { _modelFull[other.provider] = other; _modelPick.provider = other.provider;
-             _modelPick.model = ''; _modelPick.reasoning_effort = ''; }
+const providers = {};
+providers[s.provider] = s;
+const second = s.provider === 'codex' ? 'claude' : 'codex';
+providers[second] = other || {provider: second, model: '', auth: 'terminal', offered: ['terminal'],
+                              cli: {ok: true, version: '', problem: ''}, linked: null};
+adoptModel({default: s.default_provider || s.provider, providers: providers,
+            codex_refused: s.codex_refused || '', efforts: s.efforts || []});
+// (Codex's own read, with its models.)
+_modelFull.codex = providers.codex;
 renderModelCard();
 console.log(JSON.stringify({html: els['model-card'].innerHTML}));
 '''
 
 
 def _panel(lang: str, status: dict, picked: dict | None = None) -> str:
-    """The card for the saved ``status``; ``picked``: the other provider
-    chosen (not saved yet) with its own status."""
+    """The card with ``status`` the default provider's (``default_provider``
+    in it: another default); ``picked``: the other provider's own status
+    (else the terminal login, nothing known)."""
     res = subprocess.run([_node(), "-e", PANEL, str(WEB / "app.js"), str(WEB / "i18n.js"), lang,
                           json.dumps(status), json.dumps(picked) if picked else ""],
                          text=True, encoding="utf-8", capture_output=True, timeout=60)
     assert res.returncode == 0, res.stderr[-3000:]
     return json.loads(res.stdout)["html"]
+
+
+def _section(html: str, provider: str) -> str:
+    """One provider's card of the panel."""
+    claude, codex = html.index('id="model-claude"'), html.index('id="model-codex"')
+    return html[claude:codex] if provider == "claude" else html[codex:]
 
 
 CLAUDE = {"provider": "claude", "model": "", "reasoning_effort": "", "auth": "terminal",
@@ -427,40 +516,51 @@ CLAUDE = {"provider": "claude", "model": "", "reasoning_effort": "", "auth": "te
     ("ro", ["Autentificarea din terminal", "conectat: claude.ai · max", "Gata"]),
 ])
 def test_the_panel_offers_only_the_ways_that_work(lang, words):
-    html = _panel(lang, CLAUDE)
+    html = _section(_panel(lang, CLAUDE), "claude")
     for w in words:
         assert w in html, w
     # (Only the ways the status offers: this one lists no account.)
     assert 'value="account"' not in html and 'value="api_key"' in html
-    assert 'id="model-key"' not in html                  # the key box: API key only
+    assert 'id="model-key-claude"' not in html           # the key box: API key only
     assert '<option value="opus">' in html and 'id="model-effort"' not in html
 
 
 def test_the_panel_shows_codex_refused_and_its_live_models():
     html = _panel("en", {**CLAUDE, "codex_refused": "Harvey's Codex provider supports macOS "
                                                     "and Linux only."})
-    assert 'value="codex" disabled' in html and "macOS and Linux only" in html
+    assert 'name="default-provider" value="codex" disabled' in html
+    assert "macOS and Linux only" in html and 'id="model-name-codex"' not in html
     codex = {**CLAUDE, "provider": "codex", "model": "gpt-6-luna", "auth": "account",
              "folder": "data/auth/codex", "linked": False, "linked_as": {},
              "problem": "Not linked yet: no login in data/auth/codex.",
              "models": [{"id": "gpt-6-luna", "name": "GPT-6 Luna", "efforts": ["low", "high"]}]}
-    html = _panel("en", codex)
+    html = _section(_panel("en", codex), "codex")
     assert '<option value="gpt-6-luna">GPT-6 Luna</option>' in html
     assert '<option value="low">' in html and '<option value="xhigh">' not in html
     assert 'value="account" checked' in html and "data/auth/codex" in html
     assert "not linked yet" in html and "gpt-5.5" not in html
 
 
-def test_switching_the_panel_to_claude_shows_claudes_models_and_status():
+def test_both_providers_have_their_own_card_and_the_default_is_marked():
     codex = {**CLAUDE, "provider": "codex", "model": "gpt-6-luna", "linked": True,
              "linked_as": {"method": "chatgpt", "plan": "plus"},
              "cli": {"ok": True, "version": "0.159.3", "problem": ""},
              "models": [{"id": "gpt-6-luna", "name": "GPT-6 Luna", "efforts": ["low"]}]}
     html = _panel("en", codex, picked=CLAUDE)
     # Claude's aliases and Claude's own status line, none of Codex's.
-    assert '<option value="opus">' in html and "gpt-6-luna" not in html
-    assert "CLI 2.1.318" in html and "chatgpt" not in html and "0.159.3" not in html
-    assert 'id="model-effort"' not in html
+    mine = _section(html, "claude")
+    assert '<option value="opus">' in mine and "gpt-6-luna" not in mine
+    assert "CLI 2.1.318" in mine and "chatgpt" not in mine and "0.159.3" not in mine
+    assert 'id="model-effort"' not in mine
+    theirs = _section(html, "codex")
+    assert "gpt-6-luna" in theirs and "0.159.3" in theirs and 'id="model-effort"' in theirs
+    # Codex is the default: its radio checked, its card marked.
+    assert 'name="default-provider" value="codex" checked' in html
+    assert ">default</span>" in theirs and ">default</span>" not in mine
+    # Codex with no model can't be made the default.
+    blank = _panel("en", CLAUDE, picked={**codex, "model": ""})
+    assert 'name="default-provider" value="codex" disabled' in blank
+    assert "save a Codex model first" in blank
 
 
 @pytest.mark.parametrize("lang, words", [
@@ -475,18 +575,18 @@ def test_the_panel_in_api_key_mode_has_the_key_box_caps_and_unlink(lang, words):
     status = {**CLAUDE, "auth": "api_key", "linked": True, "linked_as": {"method": "api_key"},
               "key_set": {"claude": True, "codex": False}, "spend": spend,
               "usd_per_day": 2.0, "usd_per_month": 20.0}
-    html = _panel(lang, status)
+    html = _section(_panel(lang, status), "claude")
     for w in words:
         assert w in html, w
     # The key box is a password field, empty: what was saved never comes back.
-    assert 'id="model-key" type="password"' in html and 'value=""' in html
-    assert 'id="model-unlink"' in html and 'id="model-price-in"' not in html
+    assert 'id="model-key-claude" type="password"' in html and 'value=""' in html
+    assert 'id="model-unlink-claude"' in html and 'id="model-price-in-claude"' not in html
     # Codex: its token prices too, and no Unlink with no key saved.
     codex = {**status, "provider": "codex", "model": "gpt-6-luna", "spend": None,
              "key_set": {"claude": True, "codex": False}, "linked": False, "linked_as": {}}
-    html = _panel(lang, codex)
-    assert 'id="model-price-in"' in html and 'id="model-price-out"' in html
-    assert 'id="model-unlink"' not in html
+    html = _section(_panel(lang, codex), "codex")
+    assert 'id="model-price-in-codex"' in html and 'id="model-price-out-codex"' in html
+    assert 'id="model-unlink-codex"' not in html
 
 
 # ── The agent's language ──

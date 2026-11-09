@@ -429,7 +429,7 @@ def _saved_auth(client):
 
 
 def test_the_panel_links_the_account_and_sets_the_brain_to_it(client, fake):
-    r = client.post("/api/brain", json={"auth": "account"})
+    r = client.post("/api/brain", json={"provider": "codex", "auth": "account"})
     assert r.status_code == 409 and "Link the ChatGPT account first" in r.json()["message"]
     fake.use("device_ok")
     started = client.post("/api/brain/codex/link").json()
@@ -469,15 +469,15 @@ def test_the_link_endpoints_need_the_token(client):
 
 def test_claude_offers_its_own_account_link_once_linked(client):
     from harvey.config import set_brain_settings
-    set_brain_settings({"provider": "claude", "model": ""}, client.dir / "harvey.yaml")
+    set_brain_settings({"provider": "claude"}, client.dir / "harvey.yaml")
     assert client.get("/api/brain").json()["offered"] == ["terminal", "account", "api_key"]
-    r = client.post("/api/brain", json={"auth": "account"})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "account"})
     assert r.status_code == 409 and "Link the Claude account first" in r.json()["message"]
 
 
 def test_today_says_link_again_when_the_renewal_failed(client, monkeypatch):
     from harvey.config import set_brain_settings
-    set_brain_settings({"auth": "account"}, client.dir / "harvey.yaml")
+    set_brain_settings({"auth": "account"}, client.dir / "harvey.yaml", provider="codex")
     monkeypatch.setattr(dash, "_active_brain",
                         lambda: BrainConfig(provider="codex", model="gpt-6-luna", auth="account"))
     _linked(refreshed_ago=9 * 86400)
@@ -521,7 +521,7 @@ def _codex_status(**account):
 def test_the_panel_offers_the_account_link_for_codex(lang, words):
     from tests.test_brain_auth import _panel
     html = _panel(lang, _codex_status(linked=False, expired=False))
-    assert 'value="account" checked' in html and 'id="model-link"' in html
+    assert 'value="account" checked' in html and 'id="model-link-codex"' in html
     for w in words:
         assert w in html, w
 
@@ -539,7 +539,7 @@ def test_a_pending_link_shows_the_page_and_the_code_to_type(lang, words):
     html = _panel(lang, _codex_status(linked=False, expired=False, link=link))
     assert '<code id="codex-link-code">WXYZ-12345</code>' in html
     assert 'href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer"' in html
-    assert 'id="model-link"' not in html                 # (one link at a time)
+    assert 'id="model-link-codex"' not in html           # (one link at a time)
     for w in words:
         assert w in html, w
 
@@ -549,7 +549,7 @@ def test_a_linked_account_shows_unlink_and_link_again_once_expired():
     html = _panel("en", _codex_status(linked=True, expired=False, renewed_at=1790000000,
                                       last_try={"at": 1790000000, "ok": True, "kind": ""}))
     assert "ChatGPT account linked in Harvey" in html and "renewed" in html
-    assert 'id="model-unlink-account"' in html and 'id="model-link"' not in html
+    assert 'id="model-unlink-account-codex"' in html and 'id="model-link-codex"' not in html
     html = _panel("en", _codex_status(linked=True, expired=True, renewed_at=1790000000,
                                       last_try={"at": 1790000000, "ok": False, "kind": "auth"}))
     assert "link the account again" in html and "the last renewal failed (auth)" in html
@@ -567,14 +567,16 @@ brain:
 """
 
 
-def test_a_switch_takes_the_account_linked_in_harvey_for_that_provider(monkeypatch):
+def test_a_new_default_takes_the_account_linked_in_harvey_when_it_never_named_one(monkeypatch):
     monkeypatch.setattr(codex_link, "is_linked", lambda: True)
-    assert brain_auth.carried_auth("terminal", "codex", "claude") == ("account", "")
-    # (No switch, or no provider it came from: the login chosen stays.)
-    assert brain_auth.carried_auth("terminal", "codex", "codex") == ("terminal", "")
-    assert brain_auth.carried_auth("terminal", "codex") == ("terminal", "")
+    # (Linked while Claude was the default, before each provider kept its
+    # own login: an older config names none for Codex.)
+    assert brain_auth.linked_auth(BrainConfig(provider="claude"), "codex") == "account"
+    # A login Codex's settings name stays its own.
+    named = BrainConfig(provider="claude", codex={"auth": "terminal"})
+    assert brain_auth.linked_auth(named, "codex") == ""
     monkeypatch.setattr(codex_link, "is_linked", lambda: False)
-    assert brain_auth.carried_auth("terminal", "codex", "claude") == ("terminal", "")
+    assert brain_auth.linked_auth(BrainConfig(provider="claude"), "codex") == ""
 
 
 def _link(client, fake):
@@ -604,8 +606,11 @@ def test_codex_linked_while_claude_is_chosen_shows_its_models_and_saves_with_it(
     monkeypatch.setattr(brain_auth, "codex_status", REAL_CODEX_STATUS)
     monkeypatch.setattr(hc, "check_cli_version", lambda *a, **k: "0.159.3")
     monkeypatch.setattr(hc.CodexClient, "describe", describe)
-    # The link never switches the provider: Claude stays, on its own login.
-    assert load_brain_config(str(client.dir / "harvey.yaml")).provider == "claude"
+    # The link never switches the provider: Claude stays the default, on its
+    # own login, and Codex's own login is the account linked.
+    linked = load_brain_config(str(client.dir / "harvey.local.yaml"))
+    assert (linked.provider, linked.auth) == ("claude", "terminal")
+    assert linked.codex.auth == "account"
     seen = client.get("/api/brain?provider=codex&full=1&refresh=1").json()
     assert seen["auth"] == "account"
     assert "No Codex login found" not in (seen.get("problem") or "")
@@ -614,9 +619,13 @@ def test_codex_linked_while_claude_is_chosen_shows_its_models_and_saves_with_it(
     # The login picked on the panel is the one asked about.
     terminal = client.get("/api/brain?provider=codex&auth=terminal").json()
     assert terminal["auth"] == "terminal"
-    # Saving the switch with no login named takes the linked account.
+    # Codex's own model saved (Claude still the default), then Codex made
+    # the default: on the account linked.
     model = seen["models"][0]["id"]
     r = client.post("/api/brain", json={"provider": "codex", "model": model})
     assert r.status_code == 200, r.text
+    assert load_brain_config(str(client.dir / "harvey.local.yaml")).provider == "claude"
+    assert client.post("/api/brain", json={"default": "codex"}).status_code == 200
     saved = load_brain_config(str(client.dir / "harvey.local.yaml"))
     assert (saved.provider, saved.auth, saved.model) == ("codex", "account", model)
+    assert saved.claude.auth == "terminal"

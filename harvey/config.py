@@ -634,26 +634,16 @@ BRAIN_AUTH_READY = ("terminal", "account", "api_key")
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
 
 
-class BrainConfig(BaseModel):
-    """Which subscription Harvey thinks with.
+class ProviderBrainConfig(BaseModel):
+    """One provider's own settings (brain.claude, brain.codex): its login
+    (``auth``, BRAIN_AUTH_MODES; absent: ``terminal``, the CLI's own login,
+    as before), its model, Codex's reasoning effort, and, billed per token,
+    its USD caps (``usd_per_day`` / ``usd_per_month``, UTC; None: no cap)
+    and Codex's prices (``codex_usd_per_mtok_in`` / ``_out``, USD per
+    million tokens: its CLI reports no cost, so with no price its calls
+    don't run). With no cap set no API-key call is made at all
+    (brain_spend.NO_CAP)."""
 
-    ``claude`` (default) runs Claude Code headless on your Claude plan.
-    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
-    fallback between them, and an explicit ``model`` only affects Harvey —
-    your own Claude Code / Codex settings are never read or changed.
-    ``auth`` says which login the CLI uses (BRAIN_AUTH_MODES; absent:
-    ``terminal``, the CLI's own login, as before).
-
-    With ``auth: api_key`` the calls are billed per token, and
-    ``usd_per_day`` / ``usd_per_month`` (UTC; None: no cap) hold what
-    Harvey's own calls may cost, checked before each one. Claude's CLI
-    reports each call's cost; Codex's doesn't, so its calls are priced
-    from ``codex_usd_per_mtok_in`` / ``_out`` (USD per million tokens),
-    and with no price they don't run. With no cap set no API-key call is
-    made at all (brain_spend.NO_CAP).
-    """
-
-    provider: str = "claude"
     model: str = ""  # empty = the provider's own default
     reasoning_effort: str = ""  # codex only; empty = model default
     auth: str = "terminal"  # BRAIN_AUTH_MODES
@@ -661,17 +651,6 @@ class BrainConfig(BaseModel):
     usd_per_month: float | None = None
     codex_usd_per_mtok_in: float | None = None
     codex_usd_per_mtok_out: float | None = None
-
-    @field_validator("provider", mode="before")
-    @classmethod
-    def _valid_provider(cls, v) -> str:
-        v = str(v or "claude").strip().lower()
-        if v not in BRAIN_PROVIDERS:
-            raise ValueError(
-                f"'{v}' is not a supported brain provider. "
-                f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
-            )
-        return v
 
     @field_validator("model", mode="before")
     @classmethod
@@ -719,6 +698,213 @@ class BrainConfig(BaseModel):
                 f"Use one of: {', '.join(CODEX_REASONING_EFFORTS)}."
             )
         return v
+
+
+# A provider's own keys (brain.<provider>.<key>); Codex's effort and token
+# prices are Codex's only.
+PROVIDER_KEYS = tuple(ProviderBrainConfig.model_fields)
+CODEX_ONLY_KEYS = ("reasoning_effort", "codex_usd_per_mtok_in", "codex_usd_per_mtok_out")
+
+
+def provider_keys(provider: str) -> tuple[str, ...]:
+    return PROVIDER_KEYS if provider == "codex" else tuple(
+        k for k in PROVIDER_KEYS if k not in CODEX_ONLY_KEYS)
+
+
+def _flat_brain_keys(data):
+    """A ``brain:`` mapping with the flat keys an older Harvey wrote moved
+    into their provider's block (they win over the block's own, so a
+    caller's ``BrainConfig(provider=p, model=m)`` is that provider's
+    model): Codex's effort and prices to Codex, the rest to the default
+    provider's. Anything else is returned as it is."""
+    if not isinstance(data, dict):
+        return data
+    flat = {k: data[k] for k in PROVIDER_KEYS if k in data}
+    if not flat:
+        return data
+    data = {k: v for k, v in data.items() if k not in PROVIDER_KEYS}
+    target = str(data.get("provider") or "claude").strip().lower()
+    for p in BRAIN_PROVIDERS:
+        mine = {k: v for k, v in flat.items()
+                if (p == "codex" and k in CODEX_ONLY_KEYS)
+                or (p == target and k not in CODEX_ONLY_KEYS)}
+        if not mine:
+            continue
+        block = data.get(p)
+        if isinstance(block, ProviderBrainConfig):
+            block = block.model_dump(exclude_unset=True)
+        data[p] = {**(block if isinstance(block, dict) else {}), **mine}
+    return data
+
+
+class BrainConfig(BaseModel):
+    """Which subscriptions Harvey thinks with: Claude (Claude Code headless,
+    on your Claude plan) and Codex (on your ChatGPT plan), each set up on
+    its own (``claude:``, ``codex:``: ProviderBrainConfig), side by side.
+
+    ``provider`` is the default: what runs on its own (the Writer, the
+    Handler, the Analyst, training) uses it, and a new chat starts on it; a
+    chat can be on the other one (agent_chat.provider). There is never an
+    automatic fallback between them, and an explicit ``model`` only affects
+    Harvey: your own Claude Code / Codex settings are never read or changed.
+
+    The settings an older Harvey wrote flat (``brain: {provider, model,
+    auth, ...}``) load as the default provider's block (Codex's effort and
+    prices as Codex's); the first save writes them in this shape
+    (set_brain_settings).
+
+    The flat attributes (``model``, ``auth``, ``usd_per_day``, ...) are the
+    view every caller reads: those of ``provider``'s block. ``for_provider``
+    gives the same view for the other provider.
+    """
+
+    provider: str = "claude"
+    claude: ProviderBrainConfig = ProviderBrainConfig()
+    codex: ProviderBrainConfig = ProviderBrainConfig()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flat_keys(cls, data):
+        return _flat_brain_keys(data)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _valid_provider(cls, v) -> str:
+        v = str(v or "claude").strip().lower()
+        if v not in BRAIN_PROVIDERS:
+            raise ValueError(
+                f"'{v}' is not a supported brain provider. "
+                f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _claude_has_no_codex_keys(self):
+        set_here = [k for k in CODEX_ONLY_KEYS
+                    if k in self.claude.model_fields_set and getattr(self.claude, k) not in ("", None)]
+        if set_here:
+            raise ValueError(f"brain.claude.{set_here[0]} is Codex's only: set it under brain.codex.")
+        return self
+
+    def block(self, provider: str | None = None) -> ProviderBrainConfig:
+        """A provider's own settings (``provider``: the default)."""
+        return self.codex if (provider or self.provider) == "codex" else self.claude
+
+    def for_provider(self, provider: str | None) -> "BrainConfig":
+        """The view of ``provider`` (None or "": the default): the same
+        settings, its block's read as the flat attributes."""
+        p = str(provider or self.provider).strip().lower()
+        if p not in BRAIN_PROVIDERS:
+            raise ValueError(f"'{p}' is not a supported brain provider.")
+        return self if p == self.provider else self.model_copy(update={"provider": p}, deep=True)
+
+    def model_copy(self, *, update=None, deep: bool = False):
+        """A copy; flat keys in ``update`` (``model``, ``auth``, ...) set the
+        copy's own provider's block (``provider`` first), as the flat view
+        reads them."""
+        flat = {k: v for k, v in (update or {}).items() if k in PROVIDER_KEYS}
+        if not flat:
+            return super().model_copy(update=update, deep=deep)
+        rest = {k: v for k, v in update.items() if k not in PROVIDER_KEYS}
+        out = super().model_copy(update=rest or None, deep=True)
+        for k, v in flat.items():
+            setattr(out, k, v)
+        return out
+
+    def chose_auth(self, provider: str) -> bool:
+        """Whether the settings name a login for ``provider`` (written in
+        the file, or set by a caller), rather than the default terminal."""
+        return "auth" in self.block(provider).model_fields_set
+
+    # The flat view: the provider's own block (Codex's effort and prices
+    # are Codex's). Setting one sets it in that block, after validation.
+    def _set(self, provider: str, key: str, value) -> None:
+        block = self.block(provider)
+        setattr(block, key, ProviderBrainConfig(**{key: value}).model_dump()[key])
+        block.model_fields_set.add(key)
+
+    @property
+    def model(self) -> str:
+        return self.block().model
+
+    @model.setter
+    def model(self, value) -> None:
+        self._set(self.provider, "model", value)
+
+    @property
+    def reasoning_effort(self) -> str:
+        return self.block().reasoning_effort if self.provider == "codex" else ""
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value) -> None:
+        self._set("codex", "reasoning_effort", value)
+
+    @property
+    def auth(self) -> str:
+        return self.block().auth
+
+    @auth.setter
+    def auth(self, value) -> None:
+        self._set(self.provider, "auth", value)
+
+    @property
+    def usd_per_day(self) -> float | None:
+        return self.block().usd_per_day
+
+    @usd_per_day.setter
+    def usd_per_day(self, value) -> None:
+        self._set(self.provider, "usd_per_day", value)
+
+    @property
+    def usd_per_month(self) -> float | None:
+        return self.block().usd_per_month
+
+    @usd_per_month.setter
+    def usd_per_month(self, value) -> None:
+        self._set(self.provider, "usd_per_month", value)
+
+    @property
+    def codex_usd_per_mtok_in(self) -> float | None:
+        return self.codex.codex_usd_per_mtok_in
+
+    @codex_usd_per_mtok_in.setter
+    def codex_usd_per_mtok_in(self, value) -> None:
+        self._set("codex", "codex_usd_per_mtok_in", value)
+
+    @property
+    def codex_usd_per_mtok_out(self) -> float | None:
+        return self.codex.codex_usd_per_mtok_out
+
+    @codex_usd_per_mtok_out.setter
+    def codex_usd_per_mtok_out(self, value) -> None:
+        self._set("codex", "codex_usd_per_mtok_out", value)
+
+    def flat(self) -> dict:
+        """The view as the flat keys (status lines, the action log)."""
+        return {k: getattr(self, k) for k in ("provider", *PROVIDER_KEYS)}
+
+
+def with_brain_provider(config, provider: str | None):
+    """``config`` (a HarveyConfig, or anything with a ``brain``) whose
+    brain is ``provider``'s view (BrainConfig.for_provider): what a chat,
+    its wakes and tasks run with. The same config when it already is."""
+    brain = getattr(config, "brain", None)
+    if config is None or brain is None:
+        import types
+        return types.SimpleNamespace(brain=BrainConfig().for_provider(provider))
+    if not hasattr(brain, "for_provider"):
+        if not provider or getattr(brain, "provider", "claude") == provider:
+            return config
+        brain = BrainConfig(provider=getattr(brain, "provider", "claude"))
+    view = brain.for_provider(provider)
+    if view is brain:
+        return config
+    if hasattr(config, "model_copy"):
+        return config.model_copy(update={"brain": view})
+    import copy
+    out = copy.copy(config)
+    out.brain = view
+    return out
 
 
 class WriterConfig(BaseModel):
@@ -1014,27 +1200,59 @@ def set_require_approval(value: bool, path=None) -> Path:
     return written
 
 
-BRAIN_KEYS = ("provider", "model", "reasoning_effort", "auth", "usd_per_day", "usd_per_month",
-              "codex_usd_per_mtok_in", "codex_usd_per_mtok_out")
+BRAIN_KEYS = ("provider", *PROVIDER_KEYS)
 
 
-def set_brain_settings(values: dict, path=None) -> Path:
-    """Write the ``brain:`` keys in ``values`` (BRAIN_KEYS) into
-    harvey.local.yaml (made from the config Harvey reads when there is none
-    yet, see save_config_change). Only those keys change, each line rewritten
-    in place, and the section must still be a valid BrainConfig, or nothing
-    is written and ConfigError says why. A key absent from the file and set
-    to its default stays absent (no ``auth: terminal`` written for an install
-    that never chose). Returns the file written."""
+def brain_section(brain: BrainConfig, keep: dict | None = None) -> dict:
+    """The ``brain:`` block to write for ``brain``: the default provider and
+    each provider's keys that differ from the defaults, or that ``keep``
+    (the section on file, in either shape) names for it, so a value written
+    on purpose stays written."""
+    keep = _flat_brain_keys(dict(keep)) if isinstance(keep, dict) else {}
+    defaults = ProviderBrainConfig().model_dump()
+    out: dict = {}
+    if brain.provider != "claude" or "provider" in keep:
+        out["provider"] = brain.provider
+    for p in BRAIN_PROVIDERS:
+        mine = keep.get(p) if isinstance(keep.get(p), dict) else {}
+        block = brain.block(p).model_dump()
+        values = {k: block[k] for k in provider_keys(p) if block[k] != defaults[k] or k in mine}
+        if values:
+            out[p] = values
+    return out
+
+
+def set_brain_settings(values: dict, path=None, *, provider: str | None = None) -> Path:
+    """Write brain settings into harvey.local.yaml (made from the config
+    Harvey reads when there is none yet, see save_config_change):
+    ``values["provider"]``, the default provider, and with ``provider``
+    that provider's own keys (provider_keys(provider)) in its block. Linking,
+    unlinking or saving a key for one provider never touches the other's.
+
+    Only those keys change, each line rewritten in place, and the section
+    must still be a valid BrainConfig, or nothing is written and ConfigError
+    says why. A key absent from the file and set to its default stays absent
+    (no ``auth: terminal`` written for an install that never chose). A
+    section an older Harvey wrote flat is rewritten whole in the new shape
+    (brain_section; the comments inside it go, the rest of the file's stay).
+    Returns the file written."""
     import copy
-    unknown = sorted(set(values) - set(BRAIN_KEYS))
+    if provider is not None:
+        provider = str(provider).strip().lower()
+        if provider not in BRAIN_PROVIDERS:
+            raise ConfigError(f"'{provider}' is not a supported brain provider.")
+    allowed = {"provider", *(provider_keys(provider) if provider else ())}
+    unknown = sorted(set(values) - allowed)
     if unknown:
-        raise ConfigError(f"Not a brain setting: {', '.join(unknown)}.")
+        raise ConfigError(f"Not a brain setting{' of ' + provider if provider else ''}: "
+                          f"{', '.join(unknown)}.")
+    own = {k: v for k, v in values.items() if k != "provider"}
     try:
-        wanted = BrainConfig(**values).model_dump(include=set(values))
+        default = BrainConfig(provider=values["provider"]).provider if "provider" in values \
+            else None
+        wanted = ProviderBrainConfig(**own).model_dump(include=set(own))
     except ValidationError as e:
         raise ConfigError(_format_validation_error(e))
-    defaults = BrainConfig().model_dump()
 
     def edit(data_bytes: bytes, name: str) -> bytes:
         bom = data_bytes.startswith(b"\xef\xbb\xbf")
@@ -1052,21 +1270,43 @@ def set_brain_settings(values: dict, path=None) -> Path:
         if section is not None and not isinstance(section, dict):
             raise ConfigError(f"'brain' in {name} must be a mapping.")
         section = section or {}
-        changes = [(("brain", k), v) for k, v in wanted.items()
-                   if section.get(k, defaults[k]) != v]
+        try:
+            current = BrainConfig(**section)
+        except ValidationError as e:
+            raise ConfigError(f"Invalid brain settings in {name}:\n{_format_validation_error(e)}")
+        changes = []
+        if default is not None and current.provider != default:
+            changes.append((("brain", "provider"), default))
+        if provider:
+            have = current.block(provider).model_dump()
+            changes += [(("brain", provider, k), v) for k, v in wanted.items() if have[k] != v]
         if not changes:
             return data_bytes
-        expected = copy.deepcopy(data)
-        if not isinstance(expected.get("brain"), dict):
-            expected["brain"] = {}
-        for (_, k), v in changes:
-            expected["brain"][k] = v
+        flat = any(k in section for k in PROVIDER_KEYS)
+        new_brain = _flat_brain_keys(copy.deepcopy(section))
+        for (_, *keys), v in changes:
+            node = new_brain
+            for k in keys[:-1]:
+                if not isinstance(node.get(k), dict):
+                    node[k] = {}
+                node = node[k]
+            node[keys[-1]] = v
         try:
-            BrainConfig(**expected["brain"])
+            result = BrainConfig(**new_brain)
         except ValidationError as e:
             raise ConfigError(f"Invalid brain settings:\n{_format_validation_error(e)}")
+        expected = copy.deepcopy(data)
+        if flat:
+            # (Written whole in the new shape: brain_section.)
+            expected["brain"] = brain_section(result, keep=new_brain)
+            edits = [(("brain",), expected["brain"])]
+        else:
+            # (A changed key differs from its default where the file never
+            # had it, so nothing is written that wasn't chosen.)
+            expected["brain"] = new_brain
+            edits = changes
         try:
-            new = set_yaml_values(raw, changes)
+            new = set_yaml_values(raw, edits)
             ok = yaml.safe_load(new) == expected
         except yaml.YAMLError:
             ok = False

@@ -2,11 +2,13 @@
 
 Runs on the operator's Claude subscription (Claude Code headless, the
 default) or, when ``brain.provider: codex`` is configured, their ChatGPT
-subscription through an isolated Codex runtime (see harvey/codex.py). The
-provider is fixed per Brain; a failing provider never falls back to the
-other one. With ``brain.auth: api_key`` the calls are billed per token
-instead, and the brain's USD caps hold them before each call
-(harvey/brain_spend.py).
+subscription through an isolated Codex runtime (see harvey/codex.py). Both
+can be set up side by side (brain.claude, brain.codex): a Brain is one
+provider's (its BrainConfig view, BrainConfig.for_provider), fixed, and a
+failing provider never falls back to the other one: its pause and its
+budget hold only the work that runs on it. With ``auth: api_key`` the
+calls are billed per token instead, and that provider's USD caps hold them
+before each call (harvey/brain_spend.py).
 """
 
 import asyncio
@@ -43,10 +45,17 @@ _NON_RETRYABLE_PATTERNS = (
 
 PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
 
-# Settings key holding the brain's last health transition, for `harvey
+# Settings key holding a provider's last health transition, for `harvey
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
-# "since", and for pauses "kind" (plus "until", epoch seconds, for usage limits)}.
+# "since", and for pauses "kind" (plus "until", epoch seconds, for usage
+# limits)}, one per provider (status_key): a pause of one never says
+# anything about the other. BRAIN_STATUS_KEY alone is what an older Harvey
+# wrote for its one provider, read while a provider has no key of its own.
 BRAIN_STATUS_KEY = "brain_status"
+
+
+def status_key(provider: str) -> str:
+    return f"{BRAIN_STATUS_KEY}:{provider}"
 
 # Codex failures that repeat on every call until the operator acts (login,
 # CLI version, model choice, an unsafe Codex config layer). After one, the
@@ -73,10 +82,25 @@ def parse_brain_status(raw: str) -> dict:
 
 
 def active_brain_status(raw: str, provider: str) -> dict:
-    """The stored status if it belongs to ``provider`` (the one configured
-    now), else {}: a pause recorded for Codex says nothing about Claude."""
+    """The stored status if it belongs to ``provider``, else {}: a pause
+    recorded for Codex says nothing about Claude."""
     status = parse_brain_status(raw)
     return status if status.get("provider") == provider else {}
+
+
+async def stored_status(state, provider: str, default: str | None = None) -> dict:
+    """``provider``'s last recorded health transition ({} if none): its own
+    key, else what an older Harvey recorded for it. That older record was
+    its one provider's, which it hid once the other one was chosen: with
+    ``default`` (the default provider now) it is read for the default only,
+    so a pause of a provider not in use then never shows as one now."""
+    try:
+        raw = await state.get_setting(status_key(provider))
+        if not raw and (default is None or provider == default):
+            raw = await state.get_setting(BRAIN_STATUS_KEY)
+    except Exception:
+        return {}
+    return active_brain_status(raw or "", provider)
 
 
 # The stream-json lines a run writes before its result.
@@ -204,10 +228,7 @@ class Brain:
                 f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
             # A pause recorded before a restart must not outlive the problem.
             self._status_synced = True
-            try:
-                stored = parse_brain_status(await self.state.get_setting(BRAIN_STATUS_KEY))
-            except Exception:
-                stored = {}
+            stored = await stored_status(self.state, self.provider)
             until = stored.get("until")
             if (stored.get("status") == "paused" and stored.get("kind") == "usage_limit"
                     and isinstance(until, (int, float)) and until > time.time()):
@@ -275,7 +296,7 @@ class Brain:
 
     async def _record_status(self, status: str, reason: str, **extra):
         try:
-            await self.state.set_setting(BRAIN_STATUS_KEY, json.dumps({
+            await self.state.set_setting(status_key(self.provider), json.dumps({
                 "provider": self.provider, "status": status, "reason": reason[:500],
                 "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 **extra,

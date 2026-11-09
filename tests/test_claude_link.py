@@ -488,7 +488,7 @@ def test_the_panel_links_the_account_and_sets_the_brain_to_it(client):
     got = client.get("/api/brain").json()
     assert got["offered"] == ["terminal", "account", "api_key"]
     assert got["claude_account"] == {"kind": "", "link": {"status": "idle"}}
-    r = client.post("/api/brain", json={"auth": "account"})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "account"})
     assert r.status_code == 409 and "Link the Claude account first" in r.json()["message"]
     assert client.post("/api/brain/claude/link", json={"account": "other"}).status_code == 400
     started = client.post("/api/brain/claude/link", json={"account": "subscription"}).json()
@@ -509,6 +509,25 @@ def test_the_panel_links_the_account_and_sets_the_brain_to_it(client):
     assert _saved(client).auth == "terminal" and not claude_link.has_account()
 
 
+def test_linking_claude_while_codex_is_the_default_leaves_codex_alone(client):
+    config = dash._resolve_config_file()
+    set_brain_settings({"model": "gpt-6-luna", "usd_per_day": "3"}, config, provider="codex")
+    set_brain_settings({"provider": "codex"}, dash._resolve_config_file())
+    client.post("/api/brain/claude/link", json={"account": "subscription"})
+    client.post("/api/brain/claude/link/code", json={"code": GOOD_CODE})
+    assert _poll(client, lambda s: s["status"] not in ("pending", "waiting_code"))[
+        "status"] == "linked"
+    saved = _saved(client)
+    # Claude's own login is the account; Codex stays the default, as it was.
+    assert saved.provider == "codex" and saved.claude.auth == "account"
+    assert (saved.codex.auth, saved.codex.model, saved.codex.usd_per_day) == (
+        "terminal", "gpt-6-luna", 3.0)
+    # Unlinking it puts Claude's login back, nothing of Codex's.
+    assert client.delete("/api/brain/claude/account").json()["auth"] == "terminal"
+    after = _saved(client)
+    assert after.claude.auth == "terminal" and after.codex.model_dump() == saved.codex.model_dump()
+
+
 def test_a_link_under_way_can_be_cancelled_from_the_panel(client):
     assert client.post("/api/brain/claude/link", json={}).json()["status"] == "waiting_code"
     assert client.delete("/api/brain/claude/link").json()["status"] == "cancelled"
@@ -519,10 +538,11 @@ def test_a_console_account_needs_a_cap_before_the_brain_uses_it(client):
     client.post("/api/brain/claude/link", json={"account": "console"})
     client.post("/api/brain/claude/link/code", json={"code": GOOD_CODE})
     assert _poll(client, lambda s: s["status"] == "linked")["account"] == "console"
-    set_brain_settings({"auth": "terminal"}, dash._resolve_config_file())
-    r = client.post("/api/brain", json={"auth": "account"})
+    set_brain_settings({"auth": "terminal"}, dash._resolve_config_file(), provider="claude")
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "account"})
     assert r.status_code == 400 and "USD cap" in r.json()["message"]
-    r = client.post("/api/brain", json={"auth": "account", "usd_per_day": "2"})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "account",
+                                        "usd_per_day": "2"})
     assert r.status_code == 200 and _saved(client).auth == "account"
     got = client.get("/api/brain").json()
     assert got["billed"] is True and got["spend"] is not None
@@ -538,7 +558,7 @@ def test_the_link_endpoints_need_the_token(client):
 
 
 def test_today_says_link_again_when_the_account_is_logged_out(client, monkeypatch):
-    set_brain_settings({"auth": "account"}, client.dir / "harvey.yaml")
+    set_brain_settings({"auth": "account"}, client.dir / "harvey.yaml", provider="claude")
     monkeypatch.setattr(dash, "_active_brain",
                         lambda: BrainConfig(provider="claude", auth="account"))
     claude_link._write_note("subscription")
@@ -571,11 +591,11 @@ def _claude_status(kind="", link=None, linked=None, billed=False):
     ("ro", ["Conectează contul", "Conectează un cont Console", "plătește pe token"]),
 ])
 def test_the_panel_offers_both_claude_account_links(lang, words):
-    from tests.test_brain_auth import _panel
-    html = _panel(lang, _claude_status(linked=False))
+    from tests.test_brain_auth import _panel, _section
+    html = _section(_panel(lang, _claude_status(linked=False)), "claude")
     assert 'value="account" checked' in html
-    assert 'id="model-link"' in html and 'id="model-link-console"' in html
-    assert 'id="model-unlink-account"' not in html
+    assert 'id="model-link-claude"' in html and 'id="model-link-console"' in html
+    assert 'id="model-unlink-account-claude"' not in html
     for w in words:
         assert w in html, w
 
@@ -592,7 +612,7 @@ def test_a_link_waiting_for_its_code_shows_the_page_and_a_code_box(lang, words):
             "url": "https://claude.com/cai/oauth/authorize?code=true&state=fictional"}
     html = _panel(lang, _claude_status(link=link))
     assert 'href="https://claude.com/cai/oauth/authorize?code=true&amp;state=fictional"' in html
-    assert 'id="claude-link-code"' in html and 'id="model-link"' not in html
+    assert 'id="claude-link-code"' in html and 'id="model-link-claude"' not in html
     for w in words:
         assert w in html, w
     again = _panel("en", _claude_status(link={**link, "problem": "invalid_code"}))
@@ -605,10 +625,10 @@ def test_a_linked_console_account_shows_its_caps_and_unlink():
     from tests.test_brain_auth import _panel
     html = _panel("en", _claude_status(kind="console", linked=True, billed=True))
     assert "Anthropic Console account linked in Harvey (billed per token)" in html
-    assert 'id="model-usd-day"' in html and 'id="model-key"' not in html
+    assert 'id="model-usd-day-claude"' in html and 'id="model-key-claude"' not in html
     assert "today $0.50 of $2.00" in html or "$0.50" in html
-    assert 'id="model-unlink-account"' in html and 'id="model-link"' not in html
+    assert 'id="model-unlink-account-claude"' in html and 'id="model-link-claude"' not in html
     ended = _panel("en", _claude_status(kind="subscription", linked=False))
     assert "link the account again" in ended and "Link the account again" in ended
     subscription = _panel("en", _claude_status(kind="subscription", linked=True))
-    assert 'id="model-usd-day"' not in subscription
+    assert 'id="model-usd-day-claude"' not in subscription

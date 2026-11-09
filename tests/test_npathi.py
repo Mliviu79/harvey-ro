@@ -337,14 +337,14 @@ def test_a_schema_39_file_steps_up_to_the_latest_once(tmp_path):
     con = sqlite3.connect(path, isolation_level=None)
     schema.create(con, version=39)
     con.execute("INSERT INTO outbox (id, to_email, status) VALUES ('o1', 'a@example.com', 'sent')")
-    assert schema.step_up(con) == schema.LATEST == 42
+    assert schema.step_up(con) == schema.LATEST
     assert schema.missing(con) == []
     assert con.execute("SELECT channel, to_phone, price_credits, provider_status "
                        "FROM outbox").fetchone() == ("email", "", None, "")
     names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
     assert set(schema.PHONE_SUPPRESSION_GUARD_NAMES) <= names
     assert set(schema.guard_names(con)) <= names
-    assert schema.step_up(con) == 42             # again: nothing to do
+    assert schema.step_up(con) == schema.LATEST  # again: nothing to do
     con.close()
 
 

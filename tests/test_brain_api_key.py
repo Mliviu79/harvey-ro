@@ -146,15 +146,15 @@ def test_the_claude_key_is_checked_saved_under_harveys_name_and_never_echoed(
     client.post("/api/settings/env", json={brain_auth.CLAUDE_KEY_ENV: "sk-ant-other"})
     assert brain_auth.claude_key() == FAKE_KEY
     # Now API-key mode can be chosen, with a cap: never without one.
-    r = client.post("/api/brain", json={"auth": "api_key", "usd_per_day": "",
-                                        "usd_per_month": ""})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "api_key",
+                                        "usd_per_day": "", "usd_per_month": ""})
     assert r.status_code == 400 and "Set a USD cap" in r.json()["message"]
     assert not (client.dir / "harvey.local.yaml").exists()
-    r = client.post("/api/brain", json={"auth": "api_key", "usd_per_day": "2.5",
-                                        "usd_per_month": ""})
+    r = client.post("/api/brain", json={"provider": "claude", "auth": "api_key",
+                                        "usd_per_day": "2.5", "usd_per_month": ""})
     assert r.status_code == 200, r.text
     # (Clearing the last cap later is refused the same way.)
-    r = client.post("/api/brain", json={"usd_per_day": ""})
+    r = client.post("/api/brain", json={"provider": "claude", "usd_per_day": ""})
     assert r.status_code == 400 and "Set a USD cap" in r.json()["message"]
     saved = load_brain_config(str(client.dir / "harvey.local.yaml"))
     assert (saved.auth, saved.usd_per_day, saved.usd_per_month) == ("api_key", 2.5, None)
@@ -479,7 +479,9 @@ async def test_codex_is_priced_from_its_tokens_or_refused_under_a_cap_with_no_pr
     cost = await brain._record_codex_usage(Result(), agent="writer", task="t", label="")
     # Every input token (cached too) at the input price: 1M x $1.25 + 0.1M x $10.
     assert cost == pytest.approx(2.25)
-    assert await brain_spend.spent(state, "day") == pytest.approx(2.25)
+    assert await brain_spend.spent(state, "day", priced) == pytest.approx(2.25)
+    # (Codex's own spend: Claude's caps count Claude's calls only.)
+    assert await brain_spend.spent(state, "day") == 0.0
     assert "USD cap for the day" in await brain_spend.refusal(state, priced)
 
 
@@ -646,7 +648,8 @@ def test_harvey_usage_prints_the_money_beside_the_caps(monkeypatch, tmp_path, ca
                         lambda *a: BrainConfig(auth="api_key", usd_per_day=2.0))
     cli.cmd_usage(type("A", (), {"days": 30})())
     out = capsys.readouterr().out
-    assert "API key, billed per token" in out and "$0.75 of $2.00 (brain.usd_per_day)" in out
+    assert "API key, billed per token" in out
+    assert "$0.75 of $2.00 (brain.claude.usd_per_day)" in out
     assert "(no cap)" in out and "Subscription plans aren't billed" not in out
 
 
@@ -771,27 +774,34 @@ def test_the_agents_codex_driver_writes_the_threads_tokens_for_the_meter():
 
 # ── A provider switch keeps what still applies ──
 
-def test_a_provider_switch_keeps_the_login_only_where_it_applies(monkeypatch, tmp_path):
+def test_setup_keeps_a_providers_own_key_login_only_with_a_key_saved(monkeypatch, tmp_path):
+    import harvey.setup as setup_mod
+
     env_file = tmp_path / ".env"
     monkeypatch.setattr(brain_auth, "ENV_FILE", env_file)
     monkeypatch.delenv(brain_auth.CLAUDE_KEY_ENV, raising=False)
     monkeypatch.setattr(brain_auth, "AUTH_DIR", tmp_path / "auth")
-    assert brain_auth.carried_auth("terminal", "codex") == ("terminal", "")
-    assert brain_auth.carried_auth("account", "claude") == ("account", "")
-    auth, why = brain_auth.carried_auth("api_key", "claude")
+    saved = BrainConfig(provider="claude", claude={"auth": "api_key", "usd_per_day": 1.0},
+                        codex={"auth": "account"})
+    monkeypatch.setattr(setup_mod, "_current_brain", lambda: saved)
+    monkeypatch.setattr(brain_auth, "linked_in_harvey", lambda p: False)
+    auth, why = setup_mod._auth_for("claude")
     assert auth == "terminal" and "No Claude API key is saved" in why
     env_file.write_text(f"{brain_auth.CLAUDE_KEY_ENV}={FAKE_KEY}\n", encoding="utf-8")
-    assert brain_auth.carried_auth("api_key", "claude") == ("api_key", "")
-    assert brain_auth.carried_auth("api_key", "codex")[0] == "terminal"
+    assert setup_mod._auth_for("claude") == ("api_key", "")
+    # Codex's own login, whatever Claude's is.
+    assert setup_mod._auth_for("codex") == ("account", "")
 
 
-def test_train_with_another_provider_keeps_the_key_mode_caps_and_prices(monkeypatch, capsys):
+def test_train_with_another_provider_takes_that_providers_own_settings(monkeypatch, capsys):
     from harvey import cli
     import harvey.config as config_mod
     import harvey.trainer as trainer_mod
 
-    saved = BrainConfig(provider="claude", model="sonnet", auth="api_key", usd_per_day=3.0,
-                        codex_usd_per_mtok_in=1.25, codex_usd_per_mtok_out=10.0)
+    saved = BrainConfig(provider="claude",
+                        claude={"model": "sonnet", "auth": "api_key", "usd_per_day": 3.0},
+                        codex={"auth": "api_key", "usd_per_day": 1.0,
+                               "codex_usd_per_mtok_in": 1.25, "codex_usd_per_mtok_out": 10.0})
     monkeypatch.setattr(config_mod, "load_brain_config", lambda *a: saved)
     used = []
 
@@ -804,17 +814,14 @@ def test_train_with_another_provider_keeps_the_key_mode_caps_and_prices(monkeypa
     monkeypatch.setattr(trainer_mod, "Trainer", FakeTrainer)
     args = type("A", (), {"url": "https://example.com", "max_pages": 5, "provider": "codex",
                           "model": "gpt-6-luna", "reasoning_effort": None})()
-    monkeypatch.setattr(brain_auth, "key_set", lambda p: p == "codex")
     cli.cmd_train(args)
     [cfg] = used
-    assert (cfg.provider, cfg.model, cfg.auth) == ("codex", "gpt-6-luna", "api_key")
-    assert (cfg.usd_per_day, cfg.codex_usd_per_mtok_in, cfg.codex_usd_per_mtok_out) == (
-        3.0, 1.25, 10.0)
-    # No key for the provider switched to: the terminal login, said.
-    monkeypatch.setattr(brain_auth, "key_set", lambda p: False)
-    cli.cmd_train(args)
-    assert used[-1].auth == "terminal" and used[-1].usd_per_day == 3.0
-    assert "No Codex API key is saved" in capsys.readouterr().out
+    # Codex's own login, cap and prices; Claude's untouched.
+    assert (cfg.provider, cfg.model, cfg.auth, cfg.usd_per_day) == (
+        "codex", "gpt-6-luna", "api_key", 1.0)
+    assert (cfg.codex_usd_per_mtok_in, cfg.codex_usd_per_mtok_out) == (1.25, 10.0)
+    assert cfg.claude.model_dump() == saved.claude.model_dump()
+    assert saved.provider == "claude" and saved.codex.model == ""     # (never edited in place)
 
 
 # ── The plan card and Today ──
@@ -837,8 +844,10 @@ def test_the_plan_card_and_today_say_a_free_plan_gets_no_runs_on_a_key(client, m
             ids.append(p["id"])
         return ids
     free, paid = run(go())
-    monkeypatch.setattr(dash, "_active_brain",
-                        lambda: BrainConfig(auth="api_key", usd_per_day=3.0))
+    from types import SimpleNamespace
+    billed = BrainConfig(auth="api_key", usd_per_day=3.0)
+    monkeypatch.setattr(dash, "_active_brain", lambda: billed)
+    monkeypatch.setattr(dash, "_load_config_quietly", lambda: SimpleNamespace(brain=billed))
     cards = {p["id"]: p for p in client.get("/api/agent/chats/c1/messages").json()["plans"]}
     assert cards[free]["billed"] and cards[free]["no_runs"] is True
     assert cards[paid]["no_runs"] is False and cards[paid]["agent_usd"] == 0
@@ -847,6 +856,7 @@ def test_the_plan_card_and_today_say_a_free_plan_gets_no_runs_on_a_key(client, m
     assert item["plans"] == [free] and today["stats"]["agent_free_plans"] == 1
     # On a subscription neither says anything.
     monkeypatch.setattr(dash, "_active_brain", lambda: BrainConfig())
+    monkeypatch.setattr(dash, "_load_config_quietly", lambda: SimpleNamespace(brain=BrainConfig()))
     cards = client.get("/api/agent/chats/c1/messages").json()["plans"]
     assert not any("no_runs" in p or "billed" in p for p in cards)
     assert not [i for i in client.get("/api/today").json()["items"]

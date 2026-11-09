@@ -21,8 +21,8 @@ it reads every due event not yet seen, marking them seen when it ends. At
 most WAKES_PER_DAY wakes a plan in 24 hours.
 
 A wake is one run of the agent's driver (driver.py: ``claude -p`` through
-claude_runtime.build_agent_command, or Codex's app-server when
-brain.provider is codex) with the same MCP server, ``--chat`` the plan's
+claude_runtime.build_agent_command, or Codex's app-server) on the plan's
+chat's provider (chat.config_for_chat) with the same MCP server, ``--chat`` the plan's
 chat, so its tool calls are recorded under the wake's turn. Its first
 message is prompts/agent.md, the memory snapshot (memory.py), the chat so
 far, then the wake's events as structured data: never a page or a reply's
@@ -31,16 +31,20 @@ the plan's chat as an answer marked with why it woke
 (agent_message.wake), counted as unread until the user opens the chat; an
 answer of SILENT writes nothing (its tool calls are still recorded).
 Before each wake: the plan's share (is_within_budget, of the Claude plan
-or the ChatGPT plan, or with an API key the brain's USD caps: over it, the
-lane rests and the wake waits), the driver usable (its CLI, its login),
+or the ChatGPT plan, or with an API key that provider's USD caps: over it,
+the wake waits), the driver usable (its CLI, its login),
 with an API key its worst case held of its plan's budget and the install's
 spend limits (brain_spend.hold_run: else it waits too; a run that reaches
 its hold as it streams is stopped there, its chat saying so with what it
 wrote: brain_spend.Meter), and the chat's
 lease: while a live chat process holds it (the user is in that chat), the
-wake waits and tries a little later, which is no failure. A logged-out CLI pauses the agent's
-lane until the user resumes it; a spent quota rests it, with the reason on
-the Queue page and Today.
+wake waits and tries a little later, which is no failure. What holds one
+provider (its share or quota used, its caps reached, its CLI logged out or
+unusable, no price for Codex) holds only the wakes and tasks on it: they
+wait (LOGIN_RETRY_SECONDS for a login, else as long as the reason lasts),
+the reason kept per provider for the Queue page and Today (held), while
+the chats on the other provider go on; what every run shares (the
+install's spend limits) rests the agent's lane.
 
 Quiet hours are the Email module's: wakes run at any hour, and no wake can
 send anything (no tool does).
@@ -79,6 +83,12 @@ BUSY_RETRY_SECONDS = 120
 BUDGET_RETRY_SECONDS = 900
 QUOTA_RETRY_SECONDS = 3600
 DAY_RETRY_SECONDS = 3600
+# A provider whose CLI is logged out or can't be used: its wakes and tasks
+# look again this often (the user logs in, or links the account again).
+LOGIN_RETRY_SECONDS = 1800
+# A chat moved to the other provider as its wake started: the wake starts
+# again this soon, on the new one.
+MOVED_RETRY_SECONDS = 5
 # After a wake failed, the plan's next one waits this long.
 FAILED_RETRY_SECONDS = 900
 # How often a running wake looks whether it was asked to stop (its plan
@@ -89,8 +99,13 @@ STOP_POLL_SECONDS = 2.0
 SWEEP_LOOKBACK_SECONDS = 3600
 # The owner of a wake's chat lease.
 OWNER_PREFIX = "wake-"
-# Why the agent's lane rests (the Queue page and Today read it).
+# Why the agent's lane rests (the Queue page and Today read it), and why
+# one provider's wakes and tasks wait (HOLD_KEY:<provider>).
 HOLD_KEY = "agent.wake_hold"
+
+
+def hold_key(provider: str | None = None) -> str:
+    return f"{HOLD_KEY}:{provider}" if provider else HOLD_KEY
 _QUOTA_PATTERNS = ("usage limit", "rate limit", "limit reached", "quota")
 # The plans whose day's wakes were said to be used, and the day (the sweep
 # asks every minute: it is logged once a day).
@@ -266,7 +281,7 @@ async def enqueue(state, plan_id) -> str | None:
     plan = await plans.get(state, plan_id)
     if plan is None or plan["status"] != plans.APPROVED:
         return None
-    if chat.refusal(chat._config()):
+    if chat.refusal((await chat.config_for_chat(state, plan["chat"]))[0]):
         return None
     cancelled = await _one(state, "overlay.agent.wake_cancelled_last",
                            (AGENT_LANE, dedupe(plan["id"])))
@@ -464,29 +479,51 @@ def silent(text: str) -> bool:
 
 # ── Running one ──
 
-async def hold(state, why: str, seconds: float) -> None:
+async def hold(state, why: str, seconds: float, provider: str | None = None) -> None:
     """The agent's lane rests ``seconds`` (its waiting wakes with it), the
-    reason kept for the Queue page and Today."""
+    reason kept for the Queue page and Today; with ``provider``, only that
+    provider's reason is kept, and the lane goes on (the run's own job
+    waits: LaneExhausted's retry_after)."""
     from harvey.modules import jobs
 
-    await jobs.rest_lane(state, AGENT_LANE, seconds)
-    await state.set_setting(HOLD_KEY, json.dumps({"why": why, "until": _now() + int(seconds)}))
+    if not provider:
+        await jobs.rest_lane(state, AGENT_LANE, seconds)
+    await state.set_setting(hold_key(provider),
+                            json.dumps({"why": why, "until": _now() + int(seconds)}))
+
+
+async def clear_hold(state, provider: str) -> None:
+    """A run on ``provider`` got its answer: neither its provider's reason
+    nor the lane's stands any more."""
+    await state.delete_setting(HOLD_KEY)
+    await state.delete_setting(hold_key(provider))
 
 
 async def held(state) -> dict | None:
-    """Why the agent's wakes wait now ({why, until}), or None."""
+    """Why the agent's wakes wait now ({why, until, paused, provider}), or
+    None: the lane paused or resting, else the providers held (their
+    reasons together, ``provider`` the one held, "" for both)."""
     from harvey.modules import jobs
 
     paused = await jobs.lane_paused(state, AGENT_LANE)
     if paused:
-        return {"why": paused, "until": None, "paused": True}
-    try:
-        h = json.loads(await state.get_setting(HOLD_KEY) or "{}")
-    except ValueError:
-        h = {}
-    if h.get("until") and h["until"] > _now():
-        return {"why": h.get("why") or "", "until": h["until"], "paused": False}
-    return None
+        return {"why": paused, "until": None, "paused": True, "provider": ""}
+    found = []
+    for p in (None, "claude", "codex"):
+        try:
+            h = json.loads(await state.get_setting(hold_key(p)) or "{}")
+        except ValueError:
+            h = {}
+        if h.get("until") and h["until"] > _now():
+            if p is None:
+                return {"why": h.get("why") or "", "until": h["until"], "paused": False,
+                        "provider": ""}
+            found.append((p, h))
+    if not found:
+        return None
+    return {"why": " · ".join(str(h.get("why") or "") for _, h in found),
+            "until": max(h["until"] for _, h in found), "paused": False,
+            "provider": found[0][0] if len(found) == 1 else ""}
 
 
 async def run(ctx) -> dict:
@@ -503,7 +540,8 @@ async def run(ctx) -> dict:
         return {"plan": plan_id, "skipped": f"the plan is {plan['status'] if plan else 'gone'}"}
     if await chat.chat_info(state, plan["chat"]) is None:
         return {"plan": plan_id, "skipped": "its chat is gone"}
-    config = chat._config()
+    # (Its chat's provider: what holds the other one doesn't hold it.)
+    config, provider = await chat.config_for_chat(state, plan["chat"])
     why = chat.refusal(config)
     if why:
         raise jobs.JobError("wakes can't run: " + why)
@@ -516,12 +554,12 @@ async def run(ctx) -> dict:
     brain = Brain(state, getattr(config, "brain", None))
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await brain.is_within_budget(max_percent=percent):
-        why = (f"{brain.budget_why}: the wakes wait" if brain.budget_why else
-               f"Harvey's share of your {brain.provider_label} plan is used for now "
-               "(usage.max_daily_claude_percent): the wakes wait")
-        await hold(state, why, BUDGET_RETRY_SECONDS)
+        why = (f"{brain.budget_why}: the {brain.provider_label} wakes wait" if brain.budget_why
+               else f"Harvey's share of your {brain.provider_label} plan is used for now "
+               "(usage.max_daily_claude_percent): the wakes on it wait")
+        await hold(state, why, BUDGET_RETRY_SECONDS, provider)
         raise jobs.LaneExhausted(why, retry_after=BUDGET_RETRY_SECONDS)
-    exe = await runner(config, "wakes")
+    exe = await held_runner(state, config, provider, "wakes")
     held_usd = await hold_cost(ctx, plan_id, brain, config, chat.MAX_TURNS, "wake")
     meter = await _meter(state, brain, held_usd)
     owner = OWNER_PREFIX + ctx.job.id
@@ -529,6 +567,13 @@ async def run(ctx) -> dict:
     if not await acquire_lease(state, owner, chat.LEASE_TTL_SECONDS, lease):
         raise jobs.LaneExhausted("the chat is in use: the wake waits for it",
                                  retry_after=BUSY_RETRY_SECONDS)
+    moved = ((await chat.chat_info(state, plan["chat"])) or {}).get("provider")
+    if moved and moved != provider:
+        # (Moved to the other provider since it was read: never answered on
+        # the old one; it starts again, on the new one.)
+        await release_lease(state, owner, lease)
+        raise jobs.LaneExhausted("the chat moved to another provider: the wake starts again "
+                                 "on it", retry_after=MOVED_RETRY_SECONDS)
     keeper = asyncio.ensure_future(_keep(state, owner, lease))
     turn = uuid.uuid4().hex[:12]
     started = time.monotonic()
@@ -581,7 +626,7 @@ async def run(ctx) -> dict:
     if not answered and ended != "budget":
         await no_answer(state, payload, response, err, ended, exit_code,
                         provider=_provider_of(exe))
-    await state.delete_setting(HOLD_KEY)
+    await clear_hold(state, provider)
     why_woke = label(events)
     quiet = answered and silent(response)
     if not quiet:
@@ -632,7 +677,8 @@ def budget_text(meter, plan_id: int, written: str = "") -> str:
     problem): why, then what it wrote before (masked where it is kept)."""
     if meter.why == "cap":
         why = (f"stopped at the brain's USD cap: ${meter.line:.2f} was left of it when the "
-               "run started (brain.usd_per_day / usd_per_month)")
+               f"run started (brain.{getattr(meter, 'provider', 'claude')}.usd_per_day / "
+               "usd_per_month)")
     else:
         why = (f"stopped at its budget: the run reached the ${meter.line:.2f} it held of "
                f"plan {int(plan_id)}'s budget")
@@ -649,18 +695,21 @@ async def no_answer(state, payload, response: str, err: str, ended: str, exit_co
                     what: str = "wake", timeout: int = TIMEOUT_SECONDS,
                     provider: str = "") -> None:
     """A run of the agent's lane (a wake, a task) that got no answer: a
-    logged-out CLI pauses the lane, a spent quota rests it, anything else
-    but the turn limit fails the job (its detail is Harvey's own words, a
-    tail of the CLI's for the Queue page). Returns at the turn limit."""
+    logged-out CLI or a spent quota holds its provider's runs (they wait;
+    the other provider's go on), anything else but the turn limit fails the
+    job (its detail is Harvey's own words, a tail of the CLI's for the
+    Queue page). Returns at the turn limit."""
     from harvey.agent import chat, driver
     from harvey.modules import jobs
 
     lowered = (response + " " + err).lower()
     kind = (payload or {}).get("error_kind")
     codex = (payload or {}).get("provider") == driver.CODEX or provider == driver.CODEX
+    which = driver.CODEX if codex else driver.CLAUDE
     if kind == "auth" or any(p in lowered for p in chat._LOGIN_PATTERNS):
-        raise jobs.LaneExhausted(driver.login_detail(driver.CODEX if codex else driver.CLAUDE)
-                                 + ", then resume the agent's lane on the Queue page")
+        why = driver.login_detail(which) + f": the {what}s on it wait"
+        await hold(state, why, LOGIN_RETRY_SECONDS, which)
+        raise jobs.LaneExhausted(why, retry_after=LOGIN_RETRY_SECONDS)
     if not codex and kind != "usage_limit":
         # (The CLI's own rate-limit event said the plan's limit is reached:
         # harvey/integrations/quota.py.)
@@ -670,8 +719,8 @@ async def no_answer(state, payload, response: str, err: str, ended: str, exit_co
             kind = "usage_limit"
     if kind == "usage_limit" or any(p in lowered for p in _QUOTA_PATTERNS):
         why = (f"your {'ChatGPT' if codex else 'Claude'} plan's limit is reached for now: "
-               f"the {what}s wait")
-        await hold(state, why, QUOTA_RETRY_SECONDS)
+               f"the {what}s on it wait")
+        await hold(state, why, QUOTA_RETRY_SECONDS, which)
         raise jobs.LaneExhausted(why, retry_after=QUOTA_RETRY_SECONDS)
     if not turn_limit(payload, ended):
         detail = (f"no answer after {timeout} s" if ended == "timeout"
@@ -717,11 +766,14 @@ async def _ask(state, exe: str, chat_id: str, content: str, model: str,
     max_turns = chat.MAX_TURNS if max_turns is None else int(max_turns)
     try:
         proc = await driver.start(exe, state.db_path, chat_id, task=task, model=model, auth=auth)
-    except driver.Unusable as e:
-        raise _unusable(e, "the agent") from None
-    except OSError as e:
-        raise jobs.LaneExhausted(f"{driver.label(_provider_of(exe))} couldn't be started: "
-                                 f"{e}") from None
+    except (driver.Unusable, OSError) as e:
+        # (Its provider's runs wait, the reason kept as that provider's;
+        # the other provider's go on: the lane isn't paused.)
+        err = _unusable(e, "the agent") if isinstance(e, driver.Unusable) else \
+            jobs.LaneExhausted(f"{driver.label(_provider_of(exe))} couldn't be started: {e}",
+                               retry_after=LOGIN_RETRY_SECONDS)
+        await hold(state, str(err), err.retry_after or LOGIN_RETRY_SECONDS, _provider_of(exe))
+        raise err from None
     calling["started"] = True
     turns, ids, usage, ended, result = 0, set(), None, "", None
     written, streaming = [], []
@@ -820,8 +872,10 @@ def _provider_of(exe) -> str:
 
 async def runner(config, what: str):
     """What runs the agent for a wake or a task (driver.check), or
-    LaneExhausted saying why it can't (the lane pauses until the user
-    resumes it; a spent ChatGPT quota rests it)."""
+    LaneExhausted saying why it can't: the run waits (a spent ChatGPT quota
+    QUOTA_RETRY_SECONDS, anything else LOGIN_RETRY_SECONDS) and the other
+    provider's runs go on (held_runner keeps the reason as its
+    provider's)."""
     from harvey.agent import driver
 
     try:
@@ -830,16 +884,29 @@ async def runner(config, what: str):
         raise _unusable(e, what) from None
 
 
+async def held_runner(state, config, provider: str, what: str):
+    """runner(), the reason it can't kept as ``provider``'s (held: the
+    Queue page and Today)."""
+    from harvey.modules import jobs
+
+    try:
+        return await runner(config, what)
+    except jobs.LaneExhausted as e:
+        await hold(state, str(e), e.retry_after or LOGIN_RETRY_SECONDS, provider)
+        raise
+
+
 def _unusable(e, what: str):
-    """driver.Unusable as the job error it is: a spent quota rests the lane
-    (QUOTA_RETRY_SECONDS), anything else pauses it."""
+    """driver.Unusable as the job error it is: the run waits, for as long
+    as a spent quota lasts (QUOTA_RETRY_SECONDS) or LOGIN_RETRY_SECONDS."""
     from harvey.agent import driver
     from harvey.modules import jobs
 
     if e.kind == "usage_limit":
         return jobs.LaneExhausted(f"your ChatGPT plan's limit is reached for now: {what} "
-                                  "waits", retry_after=QUOTA_RETRY_SECONDS)
-    return jobs.LaneExhausted(f"{driver.label(e.provider)} can't be used for {what}: {e}")
+                                  "on it wait", retry_after=QUOTA_RETRY_SECONDS)
+    return jobs.LaneExhausted(f"{driver.label(e.provider)} can't be used for {what}: {e}",
+                              retry_after=LOGIN_RETRY_SECONDS)
 
 
 async def _interrupted(proc) -> dict | None:
@@ -875,8 +942,9 @@ async def hold_cost(ctx, plan_id: int, brain, config, turns: int, what: str) -> 
     """With an API key, the run's worst case held of its plan's budget and
     the install's spend limits before it starts (brain_spend.hold_run);
     else the run waits, its job saying why. A reason every run shares (the
-    install's limits, no price entered) also rests the lane, and Today says
-    it; one plan's short budget holds only that plan's run. Nothing on a
+    install's limits) also rests the lane, and Today says it; one
+    provider's (no price entered for Codex) holds only the runs on it; one
+    plan's short budget holds only that plan's run. Nothing on a
     subscription."""
     from harvey.modules import jobs
 
@@ -885,7 +953,9 @@ async def hold_cost(ctx, plan_id: int, brain, config, turns: int, what: str) -> 
                                           getattr(config, "spend", None), turns, what,
                                           BUDGET_RETRY_SECONDS)
     except jobs.LaneExhausted as e:
-        if not getattr(e, "plan_only", False):
+        if getattr(e, "provider_only", False):
+            await hold(ctx.state, str(e), BUDGET_RETRY_SECONDS, brain.provider)
+        elif not getattr(e, "plan_only", False):
             await hold(ctx.state, str(e), BUDGET_RETRY_SECONDS)
         raise
 

@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 42).
+"""The overlay's tables (harvey.db schema 43).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 42
+LATEST = 43
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1301,12 +1301,29 @@ def _to_42(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_42)
 
 
+# ── Schema 43: the provider each chat runs on ──
+
+SCHEMA_43 = """
+-- The model provider a chat is answered by (harvey/agent/chat.py): 'claude'
+-- or 'codex', set when the chat is made (the default provider then) and
+-- changed by the user between messages; its plans' wakes and tasks run on
+-- it too. NULL (the chats made before): the default provider at the time.
+ALTER TABLE agent_chat ADD COLUMN provider TEXT;
+"""
+
+
+def _to_43(con: sqlite3.Connection) -> None:
+    """Schema 43: agent_chat.provider. The chats on file keep NULL: they
+    follow the default provider, as they did."""
+    _script(con, SCHEMA_43)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
          (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40), (41, _to_41),
-         (42, _to_42))
+         (42, _to_42), (43, _to_43))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

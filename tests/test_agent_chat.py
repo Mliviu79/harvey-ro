@@ -503,7 +503,10 @@ def test_chats_are_listed_searched_renamed_and_deleted(state, fake):
             await chat.chats(state)
     a, b, listed, found, literal, renamed, empty, missing, gone, after = _run(state, work)
     assert [c["id"] for c in listed] == [b, a]
-    assert set(listed[0]) == {"id", "title", "created_at", "last_at", "unread", "answering"}
+    assert set(listed[0]) == {"id", "title", "created_at", "last_at", "unread", "answering",
+                              "provider"}
+    # (Made on the default provider, which it keeps.)
+    assert listed[0]["provider"] == "claude"
     assert [c["id"] for c in found] == [a] and [c["id"] for c in literal] == [b]
     assert renamed["title"] == "Cluj, pe scurt"
     assert (empty.code, missing.code, gone.code) == ("empty", "missing", "missing")
@@ -1035,8 +1038,11 @@ def _events(body: str) -> list[dict]:
 
 
 def test_the_dashboard_keeps_chats_and_streams_an_answer_in_order(client, fake, monkeypatch):
-    assert client.get("/api/agent/chats").json() == {"chats": [], "refused": "",
-                                                     "provider": "claude", "model": ""}
+    listed = client.get("/api/agent/chats").json()
+    assert {k: listed[k] for k in ("chats", "refused", "provider", "model")} == {
+        "chats": [], "refused": "", "provider": "claude", "model": ""}
+    assert [(p["id"], p["default"], p["refused"]) for p in listed["providers"]] == [
+        ("claude", True, ""), ("codex", False, "")]
     r = client.post("/api/agent/chats", json={"text": "Câte contacte am?"})
     assert r.status_code == 200 and r.json()["success"] is True
     chat_id, turn = r.json()["chat"], r.json()["turn"]

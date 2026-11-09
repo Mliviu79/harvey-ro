@@ -131,33 +131,27 @@ def cmd_train(args):
         sys.exit(2)
 
     from pydantic import ValidationError
-    from harvey.config import BrainConfig, ConfigError, load_brain_config
+    from harvey.config import ConfigError, load_brain_config
 
     try:
         brain_config = load_brain_config()
-        overrides = {
-            k: v for k, v in (
-                ("provider", args.provider),
-                ("model", args.model),
-                ("reasoning_effort", args.reasoning_effort),
-            ) if v is not None
-        }
-        if overrides:
-            if "provider" in overrides and overrides["provider"] != brain_config.provider:
-                # A different provider never inherits the other one's model;
-                # its login stays when it still applies (an API key only
-                # with one saved for it), and so do the USD caps and Codex's
-                # prices (brain_auth.carried_auth, CARRIED_MONEY).
-                from harvey import brain_auth
+        if args.provider is not None and args.provider != brain_config.provider:
+            # The default becomes that provider, with its own settings (its
+            # login, model, caps and prices: the other provider's untouched);
+            # an account linked in Harvey for it is its login when it never
+            # named one (brain_auth.linked_auth).
+            from harvey import brain_auth
 
-                auth, why = brain_auth.carried_auth(brain_config.auth, overrides["provider"],
-                                                   brain_config.provider)
-                if why:
-                    print(f"  {why}")
-                money = {k: getattr(brain_config, k) for k in brain_auth.CARRIED_MONEY}
-                brain_config = BrainConfig(**overrides, auth=auth, **money)
-            else:
-                brain_config = BrainConfig(**{**brain_config.model_dump(), **overrides})
+            linked = brain_auth.linked_auth(brain_config, args.provider)
+            brain_config = brain_config.model_copy(update={"provider": args.provider}, deep=True)
+            if linked:
+                brain_config.auth = linked
+        else:
+            brain_config = brain_config.model_copy(deep=True)
+        if args.model is not None:
+            brain_config.model = args.model
+        if args.reasoning_effort is not None:
+            brain_config.reasoning_effort = args.reasoning_effort
     except (ConfigError, ValidationError) as e:
         print(f"  {e}")
         sys.exit(2)
@@ -173,7 +167,6 @@ def _codex_model_for_training(brain_config):
     can run (read live, no prompt sent), asked in a terminal; elsewhere the
     list is printed for --model."""
     from harvey import brain_auth, codex
-    from harvey.config import BrainConfig
 
     try:
         models = asyncio.run(brain_auth.codex_models(brain_config))
@@ -190,7 +183,9 @@ def _codex_model_for_training(brain_config):
     from harvey.setup import _ask_model
 
     chosen = _ask_model("codex", models, auth=brain_config.auth)
-    return BrainConfig(**{**brain_config.model_dump(), "model": chosen.model})
+    brain_config = brain_config.model_copy(deep=True)
+    brain_config.model = chosen.model
+    return brain_config
 
 
 def cmd_dashboard(args):
@@ -273,28 +268,35 @@ def cmd_status(args):
             print("  Postal address:       MISSING")
             print(textwrap.fill(address_notice, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
-        from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
+        from harvey.brain import Brain, stored_status
         from harvey.config import ConfigError, load_brain_config
         try:
             brain_config = load_brain_config()
         except ConfigError as e:
             brain_config, config_error = None, e
-        # Only the configured provider's health: an old Codex pause says
-        # nothing once harvey.yaml has switched to Claude.
-        brain_status = active_brain_status(
-            await state.get_setting(BRAIN_STATUS_KEY),
-            brain_config.provider if brain_config else "")
+        # Both providers when both are set up: the default (what runs on its
+        # own) first, then the other one (the chats on it). Each its own
+        # health: a Codex pause says nothing about Claude.
+        shown = []
+        if brain_config is not None:
+            shown = [brain_config.provider] + [
+                p for p in ("claude", "codex")
+                if p != brain_config.provider and brain_config.block(p).model_fields_set]
         healthy = True
-        if getattr(args, "check", False):
-            if brain_config is None:
-                print(f"  Brain:                config error: {config_error}")
-                healthy = False
-            else:
-                brain = Brain(state, brain_config)
+        if getattr(args, "check", False) and brain_config is None:
+            print(f"  Brain:                config error: {config_error}")
+            healthy = False
+        for p in shown:
+            view = brain_config.for_provider(p)
+            role = "" if len(shown) == 1 else (" (default)" if p == brain_config.provider
+                                               else " (chats)")
+            if getattr(args, "check", False):
+                brain = Brain(state, view)
                 problem = await brain.preflight()
-                label = brain.provider_label + (f" ({brain.model})" if brain.model else "")
+                label = brain.provider_label + (f" ({brain.model})" if brain.model else "") + role
                 if problem:
-                    healthy = False
+                    # (Only the default holds what runs on its own.)
+                    healthy = healthy and p != brain_config.provider
                     print(f"  Brain:                {label} NOT READY")
                     print(f"                        {problem}")
                 elif brain.provider == "codex":
@@ -303,10 +305,12 @@ def cmd_status(args):
                 else:
                     print(f"  Brain:                {label} CLI isolation flags present "
                           "(login not checked: Claude is checked by its first call)")
-        elif brain_status.get("status") == "paused":
-            label = {"claude": "Claude", "codex": "Codex"}.get(brain_status.get("provider"), "Brain")
-            print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
-            print(f"                        {brain_status.get('reason', '')}")
+                continue
+            brain_status = await stored_status(state, p, brain_config.provider)
+            if brain_status.get("status") == "paused":
+                label = {"claude": "Claude", "codex": "Codex"}.get(p, "Brain") + role
+                print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
+                print(f"                        {brain_status.get('reason', '')}")
         print()
         return healthy
 
@@ -330,8 +334,67 @@ def _quota_seen(windows: dict) -> str:
     return f"Last seen {ago} ({w['seen_at']})" + (f", {source}" if source else "") + "."
 
 
+async def _print_provider_usage(state, brain_config, provider, default: bool = False) -> bool:
+    """One provider's part of ``harvey usage``: its plan's gauge, or with an
+    API key its spend beside its caps. Whether it is billed per token."""
+    from harvey import brain_auth, brain_spend
+
+    windows = None
+    api = brain_config is not None and brain_spend.api_key(brain_config)
+    try:
+        if api:
+            pass  # (An API key has no plan to read: its money is shown instead.)
+        elif provider == "codex":
+            from harvey.codex import CodexClient, CodexQuotaClient
+            windows = await CodexQuotaClient(CodexClient(
+                model=brain_config.model,
+                native_home=brain_auth.codex_home(brain_config.auth))).get_utilization()
+        elif provider == "claude":
+            from harvey.integrations.quota import QuotaClient
+            windows = await QuotaClient(state, auth=brain_config.auth).get_utilization()
+    except Exception:
+        pass
+
+    label = {"claude": "Claude", "codex": "Codex"}.get(provider, "Brain")
+    print(f"\n  {label} Usage" + (" (default)" if default else "")
+          + (" (API key, billed per token)" if api else ""))
+    print("  " + "=" * 52)
+    if api:
+        money = await brain_spend.totals(state, brain_config)
+        for name, period in (("Today (UTC)", "day"), ("This month", "month")):
+            spent = money["today_usd" if period == "day" else "month_usd"]
+            cap = money[f"usd_per_{period}"]
+            of = (f" of ${cap:.2f} (brain.{provider}.usd_per_{period})" if cap is not None
+                  else " (no cap)")
+            print(f"  {name:<16} ${spent:.2f}{of}")
+        if not money["priced"]:
+            print("  No price entered for Codex's tokens (brain.codex.codex_usd_per_mtok_in / "
+                  "_out):")
+            print("  with a cap set, no call is made until there is one.")
+    elif windows:
+        labels = {"five_hour": "5-hour window", "seven_day": "Weekly",
+                  "limit_reached": "Usage limit"}
+        for key, w in windows.items():
+            resets = f"  (resets {w['resets_at']})" if w.get("resets_at") else ""
+            name = labels.get(key) or (f"Weekly, {key[len('seven_day_'):]}"
+                                       if key.startswith("seven_day_") else key)
+            print(f"  {name:<16} {w['utilization']:5.1f}% used{resets}")
+        seen = _quota_seen(windows)
+        if seen:
+            print(f"  {seen}")
+    elif provider == "codex":
+        print("  Quota gauge unavailable (check 'codex login', the Codex CLI "
+              "version, and network).")
+    elif provider == "claude":
+        print("  Quota gauge unavailable: no reading from the Claude CLI yet (it comes "
+              "with Harvey's next answer, or its /usage check; run 'claude login' "
+              "if it isn't logged in).")
+    return api
+
+
 def cmd_usage(args):
-    """Show brain usage: active provider's quota, totals, breakdowns."""
+    """Show brain usage: each provider's quota (or spend), totals,
+    breakdowns."""
     from harvey.state import StateManager
     from harvey.config import ConfigError, load_brain_config
 
@@ -345,60 +408,23 @@ def cmd_usage(args):
             print(f"  {e}")
             brain_config = None
 
-        # Live quota for the ACTIVE provider only (best-effort). Each
+        # Each provider set up (the default, and the other one when its
+        # settings name anything or Harvey used it lately): its own gauge,
+        # or with an API key its own spend beside its own caps. Each
         # subscription's gauge is read from its own source and labelled as
         # such; one is never shown as the other.
-        windows = None
-        provider = brain_config.provider if brain_config else None
         from harvey import brain_spend
-        api = brain_config is not None and brain_spend.api_key(brain_config)
-        try:
-            from harvey import brain_auth
-            if api:
-                pass  # (An API key has no plan to read: its money is shown instead.)
-            elif provider == "codex":
-                from harvey.codex import CodexClient, CodexQuotaClient
-                windows = await CodexQuotaClient(CodexClient(
-                    model=brain_config.model,
-                    native_home=brain_auth.codex_home(brain_config.auth))).get_utilization()
-            elif provider == "claude":
-                from harvey.integrations.quota import QuotaClient
-                windows = await QuotaClient(state, auth=brain_config.auth).get_utilization()
-        except Exception:
-            pass
-
-        label = {"claude": "Claude", "codex": "Codex"}.get(provider, "Brain")
-        print(f"\n  {label} Usage" + (" (API key, billed per token)" if api else ""))
-        print("  " + "=" * 52)
-        if api:
-            money = await brain_spend.totals(state, brain_config)
-            for name, period in (("Today (UTC)", "day"), ("This month", "month")):
-                spent = money["today_usd" if period == "day" else "month_usd"]
-                cap = money[f"usd_per_{period}"]
-                of = (f" of ${cap:.2f} (brain.usd_per_{period})" if cap is not None
-                      else " (no cap)")
-                print(f"  {name:<16} ${spent:.2f}{of}")
-            if not money["priced"]:
-                print("  No price entered for Codex's tokens (brain.codex_usd_per_mtok_in / _out):")
-                print("  with a cap set, no call is made until there is one.")
-        elif windows:
-            labels = {"five_hour": "5-hour window", "seven_day": "Weekly",
-                      "limit_reached": "Usage limit"}
-            for key, w in windows.items():
-                resets = f"  (resets {w['resets_at']})" if w.get("resets_at") else ""
-                label = labels.get(key) or (f"Weekly, {key[len('seven_day_'):]}"
-                                            if key.startswith("seven_day_") else key)
-                print(f"  {label:<16} {w['utilization']:5.1f}% used{resets}")
-            seen = _quota_seen(windows)
-            if seen:
-                print(f"  {seen}")
-        elif provider == "codex":
-            print("  Quota gauge unavailable (check 'codex login', the Codex CLI "
-                  "version, and network).")
-        elif provider == "claude":
-            print("  Quota gauge unavailable: no reading from the Claude CLI yet (it comes "
-                  "with Harvey's next answer, or its /usage check; run 'claude login' "
-                  "if it isn't logged in).")
+        used = {r["provider"] for r in await state.usage_by_provider(days=args.days)}
+        shown = [] if brain_config is None else [brain_config.provider] + [
+            p for p in ("claude", "codex") if p != brain_config.provider
+            and (brain_config.block(p).model_fields_set or p in used)]
+        any_api = False
+        for provider in shown or [None]:
+            view = brain_config.for_provider(provider) if provider else None
+            any_api = await _print_provider_usage(state, view, provider,
+                                                  default=len(shown) > 1 and provider == shown[0]) \
+                or any_api
+        api = any_api
 
         totals = await state.usage_totals()
         print()
@@ -2431,9 +2457,10 @@ def cmd_agent(args):
 
     async def _answer(h, chat_id, text):
         """Send ``text`` and print the answer as it comes: (the answer, or
-        None when refused; whether it ended with an answer)."""
+        None when refused; whether it ended with an answer). A new chat runs
+        on --provider (else the default provider)."""
         try:
-            answer = await h.ask(chat_id, text)
+            answer = await h.ask(chat_id, text, provider=args.provider or None)
         except chat.Refused as e:
             print(f"\n  {e}\n")
             return None, False
@@ -2454,8 +2481,18 @@ def cmd_agent(args):
             if info is None:
                 print(f"\n  No chat {chat_id}: harvey agent chats lists them.\n")
                 raise SystemExit(2)
+            if args.provider and args.provider != info.get("provider"):
+                # (Between messages: the next one starts a process of it,
+                # primed from the chat so far.)
+                try:
+                    info = await h.set_provider(chat_id, args.provider)
+                except chat.Refused as e:
+                    print(f"\n  {e}\n")
+                    raise SystemExit(1)
             print(f"\n  Chat {chat_id}: {info['title'] or '(untitled)'}"
-                  + (f" ({info['context']:,} tokens of context)" if info["context"] else ""))
+                  + (f" ({info['context']:,} tokens of context)" if info["context"] else "")
+                  + (f", on {'Codex' if info.get('provider') == 'codex' else 'Claude'}"
+                     if info.get("provider") else ""))
         print("\n  Chat with Harvey's agent. Enter sends; Ctrl-C stops an answer; "
               "Ctrl-D or 'exit' ends; 'new' starts a new chat.")
         while True:
@@ -2492,7 +2529,8 @@ def cmd_agent(args):
         for c in found:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last_at"] or 0))
             busy = "  [answering]" if c["answering"] else ""
-            print(f"  {c['id']}  {when}  {c['title'] or '(untitled)'}{busy}")
+            on = f"  [{c['provider']}]" if c.get("provider") else ""
+            print(f"  {c['id']}  {when}  {c['title'] or '(untitled)'}{on}{busy}")
         print()
 
     async def _rename():
@@ -4691,8 +4729,10 @@ def main():
         "agent", help="The chats with Harvey's agent, its plans, tasks and memory: chats, "
                       "chat, ask, rename, delete, log, plans, tasks, memory",
         description="Ask Harvey's agent about Harvey's data. It reads through Harvey's own "
-                    "tools and runs on your Claude plan, or your ChatGPT plan with "
-                    "brain.provider: codex (within usage.max_daily_claude_percent). To act it proposes a plan with a budget; "
+                    "tools and runs on your Claude plan or your ChatGPT plan: a new chat on the "
+                    "default provider (brain.provider) or the one --provider names, each chat "
+                    "on its own (within usage.max_daily_claude_percent). To act it proposes a "
+                    "plan with a budget; "
                     "only you approve it (here or on the Chat tab), and it queues runs only "
                     "under it, and Harvey wakes it when a run of the plan finishes or at a "
                     "time it scheduled (its answer lands in the plan's chat). Chats are kept "
@@ -4720,6 +4760,9 @@ def main():
     sub.add_argument("--chat", default="",
                      help="chat: go on with this chat; log, plans: only its")
     sub.add_argument("--plan", type=int, default=None, help="tasks: only this plan's")
+    sub.add_argument("--provider", choices=("claude", "codex"), default=None,
+                     help="chat, ask: the provider a new chat runs on (default: brain.provider); "
+                          "chat --chat ID: move that chat to it before the next message")
     sub.add_argument("--q", default="", help="chats: only those whose title holds these words")
     sub.add_argument("--yes", action="store_true",
                      help="delete, plans cancel: without asking first")

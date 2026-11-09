@@ -486,13 +486,15 @@ def test_a_fenced_answer_counts_and_a_failed_run_fails_the_task(state, fake, mon
     assert ("task_done", str(second["id"])) in _q(state, "SELECT kind, ref FROM agent_event")
 
 
-def test_a_logged_out_cli_pauses_the_lane_and_the_task_waits(state, fake, monkeypatch):
+def test_a_logged_out_cli_holds_its_provider_and_the_task_waits(state, fake, monkeypatch):
     plan_id = _plan(state)
     task = _assign(state, plan_id)
     monkeypatch.setenv("FAKE_TASK", "login")
     job = _work(state)
     assert job.status == "queued"
-    assert _run(jobs.lane_paused(state, "agent"))
+    # (Its provider's runs wait; the lane goes on for the other one's.)
+    assert not _run(jobs.lane_paused(state, "agent"))
+    assert _run(wakes.held(state))["provider"] == "claude"
     assert _task(state, task["id"])["status"] == "queued"
     assert _q(state, "SELECT COUNT(*) FROM agent_event") == [(0,)]
 

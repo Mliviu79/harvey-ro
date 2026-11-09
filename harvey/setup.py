@@ -168,7 +168,9 @@ def _ask_model(provider: str, codex_models: list | None = None,
     """Ask for the model. Codex: one of ``codex_models`` (the account's live
     list, brain_auth.codex_models: by number or id), else an id typed in;
     never blank, and nothing is suggested. Claude: blank for the CLI's
-    default."""
+    default. Returns the settings setup edits with ``provider`` the default,
+    that model and login ``auth`` its own, and the other provider's
+    untouched."""
     if provider == "codex":
         ids = [m["id"] for m in codex_models or []]
         if ids:
@@ -189,7 +191,10 @@ def _ask_model(provider: str, codex_models: list | None = None,
         else:
             model = _ask("Model (leave blank for the default)", required=False)
         try:
-            return BrainConfig(provider=provider, model=model, auth=auth, **_current_money())
+            brain = _current_brain().for_provider(provider).model_copy(deep=True)
+            brain.model = model
+            brain.auth = auth
+            return brain
         except ValidationError:
             print("    (that doesn't look like a model name — try again or leave blank)")
 
@@ -199,27 +204,32 @@ def _ask_brain_config(codex_models: list | None = None, auth: str = "terminal") 
     return _ask_model(_ask_provider(), codex_models, auth=auth)
 
 
-def _current_auth() -> str:
-    """brain.auth of the config setup edits (terminal when none is set or
-    it can't be read): re-running setup keeps the login it was linked with."""
-    from harvey.config import ConfigError, load_brain_config
-    try:
-        return load_brain_config(str(_config_file())).auth
-    except (ConfigError, OSError):
-        return "terminal"
-
-
-def _current_money() -> dict:
-    """The brain's USD caps and Codex's prices in the config setup edits
-    ({} when none): re-running setup never drops them."""
+def _current_brain() -> BrainConfig:
+    """The brain settings of the config setup edits (the defaults when
+    there are none or they can't be read): re-running setup keeps each
+    provider's own login, caps and prices."""
     from harvey.config import load_brain_config
     try:
-        brain = load_brain_config(str(_config_file()))
+        return load_brain_config(str(_config_file()))
     except Exception:
-        return {}
-    from harvey.brain_auth import CARRIED_MONEY
+        return BrainConfig()
 
-    return {k: getattr(brain, k, None) for k in CARRIED_MONEY if getattr(brain, k, None) is not None}
+
+def _auth_for(provider: str) -> tuple[str, str]:
+    """The login setup keeps for ``provider``: its own, or the account
+    linked in Harvey for it when it never named one (brain_auth.linked_auth),
+    and a line saying why not when it is an API key with none saved (then
+    the terminal login)."""
+    from harvey import brain_auth
+
+    current = _current_brain()
+    auth = brain_auth.linked_auth(current, provider) or current.block(provider).auth
+    if auth == brain_auth.API_KEY and not brain_auth.key_set(provider):
+        label = "Codex" if provider == "codex" else "Claude"
+        return brain_auth.TERMINAL, (f"No {label} API key is saved, so {label} uses the "
+                                     "terminal login: save a key in Settings → Model to bill "
+                                     "it instead.")
+    return auth, ""
 
 
 class SetupWizard:
@@ -288,9 +298,9 @@ class SetupWizard:
         from harvey import brain_auth
 
         provider = _ask_provider()
-        # (The login kept when it still applies to the provider chosen: an
-        # API key only with one saved for it.)
-        auth, why = brain_auth.carried_auth(_current_auth(), provider)
+        # (Its own login, kept when it still applies: an API key only with
+        # one saved for it.)
+        auth, why = _auth_for(provider)
         if why:
             _print_harvey(why)
         if provider == "codex":

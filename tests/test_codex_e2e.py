@@ -143,7 +143,7 @@ class Harness:
         return sum(1 for e in self.entries() if e.get(key) == value)
 
     async def status(self):
-        return brain_mod.parse_brain_status(await self.state.get_setting(brain_mod.BRAIN_STATUS_KEY))
+        return brain_mod.parse_brain_status(await self.state.get_setting(brain_mod.status_key("codex")))
 
     def fail_from_call(self, n, scenario="hooks"):
         """Switch the CLI to ``scenario`` at the n-th model call (preflight
@@ -594,7 +594,7 @@ async def test_usage_limit_pause_is_recorded_survives_restart_and_clears(harvey,
     # The pause runs out: recorded as recovered, and the reply is handled.
     stored = await harvey.status()
     stored["until"] = __import__("time").time() - 1
-    await harvey.state.set_setting(brain_mod.BRAIN_STATUS_KEY, json.dumps(stored))
+    await harvey.state.set_setting(brain_mod.status_key("codex"), json.dumps(stored))
     await harvey.run_cycles(1)
     assert (await harvey.status())["status"] == "ok"
     assert await harvey.state.is_reply_processed("in-1")

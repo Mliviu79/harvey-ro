@@ -263,13 +263,6 @@ def auth_of(brain) -> str:
     return getattr(brain, "auth", "") or TERMINAL
 
 
-# What a provider switch (harvey train --provider, harvey setup) carries
-# over besides the login: the brain's USD caps (the install's) and Codex's
-# token prices (read only by Codex, so kept for when it is the brain again).
-CARRIED_MONEY = ("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in",
-                 "codex_usd_per_mtok_out")
-
-
 def linked_in_harvey(provider: str) -> bool:
     """Whether an account is linked in Harvey for ``provider`` (Codex's
     login in data/auth/codex, Claude's note of the one it linked)."""
@@ -280,22 +273,18 @@ def linked_in_harvey(provider: str) -> bool:
     return claude_link.has_account()
 
 
-def carried_auth(auth: str, provider: str, from_provider: str = "") -> tuple[str, str]:
-    """The login a switch to ``provider`` keeps, and a line saying why it
-    didn't ("" when it did): an API key only when one is saved for that
-    provider, else the terminal login. Switching from ``from_provider``
-    (another one), the terminal login becomes the account linked in Harvey
-    for ``provider`` when there is one (linked while the other provider was
-    chosen). A linked account folder is kept
-    (it is the provider's own, and an empty one fails as not logged in)."""
-    auth = auth or TERMINAL
-    if auth == TERMINAL and from_provider and from_provider != provider             and ACCOUNT in offered(provider) and linked_in_harvey(provider):
-        return ACCOUNT, ""
-    if auth == API_KEY and not key_set(provider):
-        label = "Codex" if provider == "codex" else "Claude"
-        return TERMINAL, (f"No {label} API key is saved, so the brain uses the terminal login "
-                          f"for {label}: save a key in Settings → Model to bill it instead.")
-    return auth, ""
+def linked_auth(brain, provider: str) -> str:
+    """The login to record for ``provider`` as it becomes the default
+    (harvey train --provider, harvey setup, Settings → Model): the account
+    linked in Harvey for it when its settings never named a login (linked
+    while the other provider was the default, before each provider kept its
+    own), else "" (it keeps its own)."""
+    chose = getattr(brain, "chose_auth", None)
+    if brain is not None and callable(chose) and chose(provider):
+        return ""
+    if ACCOUNT in offered(provider) and linked_in_harvey(provider):
+        return ACCOUNT
+    return ""
 
 
 def _clean(value, limit: int = 40) -> str:
@@ -489,7 +478,8 @@ LINK_ENDED = ("The Claude login linked in Harvey has ended (signed out or revoke
 LINK_EXPIRED = ("The Codex login linked in Harvey has expired and couldn't be renewed: "
                 "link the account again.")
 
-async def status(brain, *, state=None, full: bool = False, force: bool = False) -> dict:
+async def status(brain, *, state=None, full: bool = False, force: bool = False,
+                 default: str | None = None) -> dict:
     """Settings → Model's status line (and setup-status's brain entry):
     {provider, model, reasoning_effort, auth, offered, folder, cli {ok,
     version, problem}, linked (True, False, None: unknown), linked_as
@@ -502,7 +492,9 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
     ``spend`` (brain_spend.totals), and for Codex ``codex_account`` (the
     account linked in Harvey: codex_link.renewal_status, with ``link``,
     a link under way)}. Kept KEEP_SECONDS (``full``: KEEP_FULL_SECONDS), a failed
-    one KEEP_FAILED_SECONDS; ``force`` asks again."""
+    one KEEP_FAILED_SECONDS; ``force`` asks again. ``default``: the default
+    provider, when known (an older Harvey's pause is the default's only:
+    brain.stored_status)."""
     from harvey.config import BrainConfig
 
     brain = brain or BrainConfig()
@@ -524,11 +516,9 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
         _kept[key] = (now + ttl, dict(found))
     raw = ""
     if state is not None:
-        from harvey.brain import BRAIN_STATUS_KEY
-        try:
-            raw = await state.get_setting(BRAIN_STATUS_KEY) or ""
-        except Exception:
-            raw = ""
+        from harvey.brain import stored_status
+        stored = await stored_status(state, provider, default)
+        raw = json.dumps(stored) if stored else ""
     codex_account = None
     if provider == "codex":
         # The account linked in Harvey: its renewal and a link under way.
@@ -564,6 +554,25 @@ async def status(brain, *, state=None, full: bool = False, force: bool = False) 
             "folder": _shown(account_dir(provider)) if auth == ACCOUNT else "",
             "codex_refused": codex_refusal(), "last_error": last_error(raw, provider),
             **found}
+
+
+async def statuses(brain, *, state=None, full: bool = False, force: bool = False) -> dict:
+    """Both providers side by side (Settings → Model, /api/brain):
+    {default, providers: {claude: status, codex: status}}, each provider's
+    under its own settings (BrainConfig.for_provider) and with ``default``
+    saying which one runs what runs on its own. ``full``: Codex's account
+    and models (Claude's status is the same either way)."""
+    from harvey.config import BRAIN_PROVIDERS, BrainConfig
+
+    brain = brain or BrainConfig()
+    out = {}
+    for p in BRAIN_PROVIDERS:
+        view = brain.for_provider(p) if hasattr(brain, "for_provider") else brain
+        found = await status(view, state=state, full=full and p == "codex", force=force,
+                             default=brain.provider)
+        found["default"] = p == brain.provider
+        out[p] = found
+    return {"default": brain.provider, "providers": out}
 
 
 def codex_refusal() -> str:

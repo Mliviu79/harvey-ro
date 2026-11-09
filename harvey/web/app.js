@@ -1215,6 +1215,8 @@ function todayItemText(it, stats) {
     case 'ack': return tr(t('today.item.ack', {n: s.cold_waiting || 0}), t('today.item.ack_detail'), t('today.item.ack_action'));
     case 'agent-wakes': return tr(t('today.item.agent_wakes'), it.detail, t('today.item.agent_wakes_action'));
     case 'codex-login': return tr(t('today.item.codex_login'), t('today.item.codex_login_detail'), t('today.item.codex_login_action'));
+    case 'brain-paused-other': return tr(t('today.item.brain_paused_other', {who: t('chat.provider.' + (it.provider === 'codex' ? 'codex' : 'claude'))}),
+      it.detail, t('today.item.codex_login_action'));
     case 'agent-free-plans': return tr(t('today.item.agent_free_plans', {n: s.agent_free_plans || 0}), t('today.item.agent_free_plans_detail'), t('today.item.agent_free_plans_action'));
     case 'site-check': return tr(t('today.item.site_check', {n: fmtN(s.sites_to_check || 0)}), t('today.item.site_check_detail'), t('today.item.site_check_action'));
     case 'campaign-checks': return tr(t('today.item.campaign_checks', {n: s.campaign_checks_waiting || 0}),
@@ -2265,11 +2267,13 @@ function quotaCardHtml(data) {
   return html;
 }
 
-// API-key mode: today's and this month's spend of Harvey's own calls, each
-// beside its cap (brain.usd_per_day / usd_per_month) as a bar.
-function moneyCardHtml(m) {
+// API-key mode: today's and this month's spend of Harvey's own calls on a
+// provider, each beside its cap (brain.<provider>.usd_per_day /
+// usd_per_month) as a bar; ``who`` names the provider when both are shown.
+function moneyCardHtml(m, who) {
   if (!m) return '';
-  let html = '<h2>' + escHtml(t('use.money_title')) + '</h2>';
+  let html = '<h2>' + escHtml(t('use.money_title')) +
+    (who ? ' · ' + escHtml(t('chat.provider.' + who)) : '') + '</h2>';
   for (const [label, spent, cap] of [[t('use.money_today'), m.today_usd, m.usd_per_day],
                                      [t('use.money_month'), m.month_usd, m.usd_per_month]]) {
     const x = fmtUsd(spent || 0, 2);
@@ -2299,7 +2303,14 @@ async function loadUsage() {
     billing.textContent = t(billed ? 'use.billing_api' : 'use.billing_sub');
   }
   const quotaEl = document.getElementById('usage-quota');
-  const qHtml = billed ? moneyCardHtml(data.money) : quotaCardHtml(data);
+  // (Each provider set up, the default first: its plan's gauge, or its
+  // spend beside its own caps.)
+  const provs = data.providers && Object.keys(data.providers).length ? data.providers : null;
+  const ids = provs ? Object.keys(provs).sort((a, b) => (provs[b].default ? 1 : 0) - (provs[a].default ? 1 : 0)) : [];
+  const qHtml = provs
+    ? ids.map(p => provs[p].billing === 'api_key' ? moneyCardHtml(provs[p].money, ids.length > 1 ? p : '')
+                                                  : quotaCardHtml({quota_provider: p, quota: provs[p].quota})).join('')
+    : billed ? moneyCardHtml(data.money) : quotaCardHtml(data);
   quotaEl.innerHTML = qHtml;
   quotaEl.style.display = qHtml ? 'block' : 'none';
 
@@ -5209,60 +5220,82 @@ function backgroundSearchLine(bg, noSite) {
     (rows.length ? rows.map(escHtml).join(' &middot; ') : escHtml(t('finder.bg_none'))) + '</p>';
 }
 
-// Settings → Model: which subscription Harvey thinks with (Claude or
-// Codex), the model, Codex's reasoning effort, how the CLI is logged in
-// (brain.auth: only the ways whose flow exists are offered) and its status.
-// Codex's models are its account's live list (/api/brain?full=1), read
-// when Codex is chosen. With an API key: the key box (checked with a free
-// call and saved by /api/brain/key, never shown again), the brain's USD
-// caps, Codex's token prices, and Unlink.
+// Settings → Model: Claude and Codex set up side by side, each with its own
+// card (its model, Codex's reasoning effort, how its CLI is logged in:
+// brain.<provider>.auth, only the ways whose flow exists are offered, its
+// status), and the default provider: what runs on its own, and a new
+// chat's. Codex's models are its account's live list under its own login
+// (/api/brain?provider=codex&full=1). With an API key: the key box
+// (checked with a free call and saved by /api/brain/key, never shown
+// again), that provider's USD caps, Codex's token prices, and Unlink.
+// Saving, linking or unlinking one provider never touches the other's.
 let _model = null, _modelFull = {}, _modelPick = null, _modelBusy = false;
 const MODEL_MONEY = ['usd_per_day', 'usd_per_month', 'codex_usd_per_mtok_in', 'codex_usd_per_mtok_out'];
+const MODEL_PROVIDERS = ['claude', 'codex'];
+
+// The page's state from GET /api/brain ({default, providers: {claude,
+// codex}}): each provider's pick starts as what is saved.
+function adoptModel(s) {
+  _model = s && !s.error && s.providers ? s : null;
+  _modelPick = null;
+  if (!_model) return;
+  _modelPick = {};
+  for (const p of MODEL_PROVIDERS) {
+    const x = _model.providers[p] || {provider: p, model: '', reasoning_effort: '', auth: 'terminal'};
+    _modelPick[p] = {model: x.model || '', reasoning_effort: x.reasoning_effort || '', auth: x.auth || 'terminal', key: ''};
+    for (const k of MODEL_MONEY) _modelPick[p][k] = x[k] == null ? '' : String(x[k]);
+  }
+}
+
+function modelSaved(p) {
+  return (_model && _model.providers && _model.providers[p]) || {provider: p, auth: 'terminal', offered: ['terminal']};
+}
 
 async function loadModelCard(refresh) {
   const el = document.getElementById('model-card');
   if (!el) return;
   const s = await api('/api/brain' + (refresh ? '?refresh=1' : ''));
-  _model = s && !s.error ? s : null;
-  _modelPick = _model ? {provider: _model.provider, model: _model.model,
-                         reasoning_effort: _model.reasoning_effort, auth: _model.auth, key: ''} : null;
-  if (_modelPick) for (const k of MODEL_MONEY) _modelPick[k] = _model[k] == null ? '' : String(_model[k]);
+  adoptModel(s);
   if (refresh) _modelFull = {};
-  adoptCodexLink(_model);
-  adoptClaudeLink(_model);
+  for (const p of MODEL_PROVIDERS) {
+    adoptCodexLink(modelSaved(p));
+    adoptClaudeLink(modelSaved(p));
+  }
   renderModelCard();
-  if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
+  // (Codex's models are its account's live list.)
+  if (_model) loadProviderStatus('codex', refresh);
 }
 
-// After a link: the card read again, the pick kept on the provider just
-// linked, with its linked account (linked while the other provider was the
-// saved one, the switch is the user's to save).
+// After a link: the card read again (the provider's own login is now the
+// account linked).
 async function keepLinkedPick(provider) {
   await loadModelCard(true);
-  if (!_modelPick || !_model) return;
-  if (provider !== _model.provider) pickModel('provider', provider);
-  _modelPick.auth = 'account';
   delete _modelFull[provider];
-  if (provider === 'codex' || provider !== _model.provider) loadProviderStatus(provider, false);
-  renderModelCard();
+  if (provider !== 'codex') loadProviderStatus(provider, false);
 }
 
-// The status (and models) of a provider: Codex's with its live list
-// (full=1); Claude's when it isn't the saved one (a switch not saved yet).
+// A provider's status read on its own: Codex's with its live list
+// (full=1), and either one under a login picked and not saved yet.
 async function loadProviderStatus(provider, refresh) {
   if (_modelFull[provider] && !refresh) { renderModelCard(); return; }
   _modelFull[provider] = {loading: true};
   renderModelCard();
-  // (Under the login picked; a switch's first look takes the one it would
-  // carry, the account linked in Harvey when there is one.)
-  const auth = _modelPick && _modelPick.provider === provider && _modelPick.auth ? _modelPick.auth : '';
+  const pick = _modelPick && _modelPick[provider];
+  const auth = pick && pick.auth && pick.auth !== modelSaved(provider).auth ? pick.auth : '';
   const s = await api('/api/brain?provider=' + provider + (provider === 'codex' ? '&full=1' : '') +
                       (auth ? '&auth=' + encodeURIComponent(auth) : '') + (refresh ? '&refresh=1' : ''));
   _modelFull[provider] = s && !s.error ? s : {failed: true};
-  if (s && !s.error && _modelPick && _modelPick.provider === provider && !_modelPick.auth) _modelPick.auth = s.auth;
   adoptCodexLink(_modelFull[provider]);
   adoptClaudeLink(_modelFull[provider]);
   renderModelCard();
+}
+
+// What a provider's card shows: its own read when there is one (Codex's
+// models, a login picked), else what GET /api/brain said.
+function modelShown(p) {
+  const full = _modelFull[p];
+  if (full && !full.loading && !full.failed) return full;
+  return modelSaved(p);
 }
 
 // An API key's line: set or not, and today's (this month's) spend beside
@@ -5304,91 +5337,127 @@ function modelStatusLine(s) {
     (s.problem ? '<p class="small muted">' + escHtml(s.problem) + '</p>' : '');
 }
 
+function modelRadio(name, value, label, on, disabled, note, handler) {
+  return '<label class="check-line"><input type="radio" name="' + name + '" value="' + escHtml(value) + '"' +
+    (on ? ' checked' : '') + (disabled ? ' disabled' : '') + ' onchange="' + handler + '"> <span>' +
+    escHtml(label) + '</span>' + (note ? ' <span class="muted small">' + escHtml(note) + '</span>' : '') + '</label>';
+}
+
 function renderModelCard() {
   const el = document.getElementById('model-card');
   if (!el) return;
   if (!_model) { el.innerHTML = '<p class="muted">' + escHtml(t('model.unreadable')) + '</p>'; return; }
-  const p = _modelPick;
-  const codex = p.provider === 'codex';
-  const keySet = !!((_model.key_set || {})[p.provider]);
-  // Codex's status is always its full one (its models); Claude's is the
-  // saved one's, or its own read when the switch isn't saved yet.
-  const full = codex || p.provider !== _model.provider ? _modelFull[p.provider] : null;
-  const shown = full ? (!full.loading && !full.failed ? full : null) : _model;
+  const codexSaved = modelSaved('codex');
+  const refused = codexSaved.codex_refused || _model.codex_refused || '';
+  // (Codex can be the default only with a model saved for it.)
+  const codexBlank = !codexSaved.model;
+  el.innerHTML =
+    '<div class="settings-row"><div><h3>' + escHtml(t('model.default')) + '</h3>' +
+      '<p class="desc">' + escHtml(t('model.default_desc')) + '</p></div><div class="fields">' +
+      modelRadio('default-provider', 'claude', t('model.claude'), _model.default !== 'codex', _modelBusy, '',
+                 'setDefaultProvider(this.value)') +
+      modelRadio('default-provider', 'codex', t('model.codex'), _model.default === 'codex',
+                 _modelBusy || !!refused || (codexBlank && _model.default !== 'codex'),
+                 refused ? t('model.codex_refused') : codexBlank && _model.default !== 'codex' ? t('model.codex_default_blank') : '',
+                 'setDefaultProvider(this.value)') +
+      (refused ? '<p class="small muted">' + escHtml(refused) + '</p>' : '') +
+    '</div></div>' +
+    MODEL_PROVIDERS.map(p => providerCard(p, refused)).join('');
+}
+
+// One provider's card: its model (Codex's from its account's live list),
+// Codex's effort, its login and status, Save, Recheck and Unlink.
+function providerCard(p, refused) {
+  const pick = _modelPick[p];
+  const codex = p === 'codex';
+  const saved = modelSaved(p);
+  const shown = modelShown(p);
+  const full = _modelFull[p];
+  const keySet = !!((saved.key_set || shown.key_set || {})[p]);
   const models = (shown && shown.models) || [];
-  const radio = (name, value, label, on, disabled, note) =>
-    '<label class="check-line"><input type="radio" name="' + name + '" value="' + escHtml(value) + '"' +
-      (on ? ' checked' : '') + (disabled ? ' disabled' : '') +
-      ' onchange="pickModel(' + jsq(name) + ', this.value)"> <span>' + escHtml(label) + '</span>' +
-      (note ? ' <span class="muted small">' + escHtml(note) + '</span>' : '') + '</label>';
-  // (The ways the picked provider offers: Codex can link an account.)
-  const ways = Array.from(new Set([...((shown && shown.offered) || _model.offered || ['terminal']),
-                                   ...(p.provider === _model.provider ? [_model.auth] : [])]));
-  const account = codex ? (((shown || (_model.provider === 'codex' ? _model : null)) || {}).codex_account || {}) : {};
-  // Claude's account linked in Harvey (its kind, a link under way), and
-  // whether the login picked is billed per token (held by the caps).
-  const claudeShown = !codex ? (shown || (_model.provider !== 'codex' ? _model : null)) : null;
-  const claudeAcc = (claudeShown && claudeShown.claude_account) || {};
-  const billed = p.auth === 'api_key' || (!codex && p.auth === 'account' && claudeAcc.kind === 'console');
-  const efforts = codex ? (((models.find(m => m.id === p.model) || {}).efforts || []).length
-    ? models.find(m => m.id === p.model).efforts : (_model.efforts || [])) : [];
-  let modelField = '<input class="form-input" id="model-name" list="model-options" autocomplete="off" value="' +
-      escHtml(p.model || '') + '" placeholder="' + escHtml(t(codex ? 'model.codex_ph' : 'model.claude_ph')) +
-      '" oninput="pickModel(\'model\', this.value)">' +
-    '<datalist id="model-options">' + models.map(m => '<option value="' + escHtml(m.id) + '">' +
-      escHtml(m.name && m.name !== m.id ? m.name : '') + '</option>').join('') + '</datalist>';
+  const ways = Array.from(new Set([...((shown && shown.offered) || saved.offered || ['terminal']), saved.auth || 'terminal']));
+  const account = codex ? (shown.codex_account || saved.codex_account || {}) : {};
+  const claudeAcc = !codex ? (shown.claude_account || saved.claude_account || {}) : {};
+  const billed = pick.auth === 'api_key' || (!codex && pick.auth === 'account' && claudeAcc.kind === 'console');
+  const efforts = codex ? (((models.find(m => m.id === pick.model) || {}).efforts || []).length
+    ? models.find(m => m.id === pick.model).efforts : (_model.efforts || [])) : [];
+  const on = (key, value) => 'pickModel(' + jsq(p) + ', ' + jsq(key) + ', ' + value + ')';
   let modelNote = '';
   if (codex) {
     if (full && full.loading) modelNote = t('model.codex_reading');
     else if (full && full.failed) modelNote = t('model.codex_unread');
-    else if (shown && !models.length) modelNote = (shown.problem || t('model.codex_none'));
-    else if (shown) modelNote = t('model.codex_list', {n: models.length});
+    else if (full && !models.length) modelNote = (shown.problem || t('model.codex_none'));
+    else if (full) modelNote = t('model.codex_list', {n: models.length});
   } else {
     modelNote = t('model.claude_list');
   }
-  el.innerHTML =
-    '<div class="settings-row"><div><h3>' + escHtml(t('model.provider')) + '</h3>' +
-      '<p class="desc">' + escHtml(t('model.desc')) + '</p></div><div class="fields">' +
-      radio('provider', 'claude', t('model.claude'), !codex, false, '') +
-      radio('provider', 'codex', t('model.codex'), codex, !!_model.codex_refused,
-            _model.codex_refused ? t('model.codex_refused') : '') +
-      (_model.codex_refused ? '<p class="small muted">' + escHtml(_model.codex_refused) + '</p>' : '') +
-    '</div></div>' +
+  const disabled = codex && !!refused;
+  const id = k => 'model-' + k + '-' + p;
+  return '<div class="model-provider" id="model-' + p + '">' +
+    '<h3 class="model-provider-head">' + escHtml(t(codex ? 'model.codex' : 'model.claude')) +
+      (_model.default === p ? ' <span class="badge t-active">' + escHtml(t('model.is_default')) + '</span>' : '') + '</h3>' +
+    (disabled ? '<p class="small muted">' + escHtml(t('model.codex_refused')) + '</p></div>' :
     '<div class="settings-row"><div><h3>' + escHtml(t('model.model')) + '</h3>' +
       '<p class="desc">' + escHtml(modelNote) + '</p></div><div class="fields">' +
-      '<div class="form-group"><label class="form-label" for="model-name">' + escHtml(t('model.model')) + '</label>' +
-        modelField + '</div>' +
+      '<div class="form-group"><label class="form-label" for="' + id('name') + '">' + escHtml(t('model.model')) + '</label>' +
+        '<input class="form-input" id="' + id('name') + '" list="' + id('options') + '" autocomplete="off" value="' +
+        escHtml(pick.model || '') + '" placeholder="' + escHtml(t(codex ? 'model.codex_ph' : 'model.claude_ph')) +
+        '" oninput="' + on('model', 'this.value') + '">' +
+        '<datalist id="' + id('options') + '">' + models.map(m => '<option value="' + escHtml(m.id) + '">' +
+          escHtml(m.name && m.name !== m.id ? m.name : '') + '</option>').join('') + '</datalist></div>' +
       (codex ? '<div class="form-group"><label class="form-label" for="model-effort">' + escHtml(t('model.effort')) +
-        '</label><select class="form-input" id="model-effort" onchange="pickModel(\'reasoning_effort\', this.value)">' +
+        '</label><select class="form-input" id="model-effort" onchange="' + on('reasoning_effort', 'this.value') + '">' +
         '<option value="">' + escHtml(t('model.effort_default')) + '</option>' +
-        efforts.map(e => '<option value="' + escHtml(e) + '"' + (p.reasoning_effort === e ? ' selected' : '') + '>' +
+        efforts.map(e => '<option value="' + escHtml(e) + '"' + (pick.reasoning_effort === e ? ' selected' : '') + '>' +
           escHtml(e) + '</option>').join('') + '</select></div>' : '') +
     '</div></div>' +
     '<div class="settings-row"><div><h3>' + escHtml(t('model.link')) + '</h3>' +
-      '<p class="desc">' + escHtml(t(p.auth === 'api_key' ? (codex ? 'model.api_codex' : 'model.api_claude')
-                                     : codex && p.auth === 'account' ? 'model.account_codex'
-                                     : p.auth === 'account' ? 'model.account_claude'
+      '<p class="desc">' + escHtml(t(pick.auth === 'api_key' ? (codex ? 'model.api_codex' : 'model.api_claude')
+                                     : codex && pick.auth === 'account' ? 'model.account_codex'
+                                     : pick.auth === 'account' ? 'model.account_claude'
                                      : codex ? 'model.terminal_codex' : 'model.terminal_claude')) + '</p></div>' +
       '<div class="fields">' +
-      ways.map(w => radio('auth', w, t('model.auth.' + w), p.auth === w, false,
-                          w === 'account' && _model.folder ? _model.folder : '')).join('') +
-      (p.auth === 'api_key' ? modelKeyFields(p, codex, keySet) : '') +
-      (codex && p.auth === 'account' ? codexAccountFields(account) : '') +
-      (!codex && p.auth === 'account' ? claudeAccountFields(claudeAcc, claudeShown || {}) : '') +
-      (billed && p.auth !== 'api_key' ? modelCapFields(p) : '') +
-      modelStatusLine(shown || (p.provider === _model.provider ? _model : null)) +
-      '<div class="btn-group"><button class="btn btn-primary btn-sm" id="model-save" onclick="saveModel()"' +
+      ways.map(w => modelRadio('auth-' + p, w, t('model.auth.' + w), pick.auth === w, false,
+                               w === 'account' && saved.folder ? saved.folder : '',
+                               on('auth', 'this.value'))).join('') +
+      (pick.auth === 'api_key' ? modelKeyFields(p, pick, codex, keySet) : '') +
+      (codex && pick.auth === 'account' ? codexAccountFields(account) : '') +
+      (!codex && pick.auth === 'account' ? claudeAccountFields(claudeAcc, shown) : '') +
+      (billed && pick.auth !== 'api_key' ? modelCapFields(p, pick) : '') +
+      modelStatusLine(pick.auth === saved.auth || (full && !full.loading && !full.failed) ? shown : null) +
+      '<div class="btn-group"><button class="btn btn-primary btn-sm" id="' + id('save') + '" onclick="saveModel(' + jsq(p) + ')"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.save')) + '</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="loadModelCard(true)">' + escHtml(t('model.recheck')) + '</button>' +
-      (p.auth === 'api_key' && keySet ? '<button class="btn btn-ghost btn-sm" id="model-unlink" onclick="unlinkModelKey()"' +
+      (pick.auth === 'api_key' && keySet ? '<button class="btn btn-ghost btn-sm" id="' + id('unlink') + '" onclick="unlinkModelKey(' + jsq(p) + ')"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink')) + '</button>' : '') +
-      (codex && p.auth === 'account' && account.linked && !_codexLinkPending() ?
-        '<button class="btn btn-ghost btn-sm" id="model-unlink-account" onclick="unlinkCodexAccount()"' +
+      (codex && pick.auth === 'account' && account.linked && !_codexLinkPending() ?
+        '<button class="btn btn-ghost btn-sm" id="model-unlink-account-codex" onclick="unlinkCodexAccount()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink_account')) + '</button>' : '') +
-      (!codex && p.auth === 'account' && claudeAcc.kind && !_claudeLinkActive() ?
-        '<button class="btn btn-ghost btn-sm" id="model-unlink-account" onclick="unlinkClaudeAccount()"' +
+      (!codex && pick.auth === 'account' && claudeAcc.kind && !_claudeLinkActive() ?
+        '<button class="btn btn-ghost btn-sm" id="model-unlink-account-claude" onclick="unlinkClaudeAccount()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.unlink_account')) + '</button>' : '') + '</div>' +
-    '</div></div>';
+    '</div></div></div>');
+}
+
+// The default provider: saved at once ({default: p}). Codex needs a model
+// saved first.
+async function setDefaultProvider(p) {
+  if (!_model || _modelBusy || p === _model.default) return;
+  _modelBusy = true;
+  try {
+    const res = await api('/api/brain', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({default: p}),
+    });
+    if (res && res.success) {
+      showToast(t('model.default_saved', {who: t(p === 'codex' ? 'chat.provider.codex' : 'chat.provider.claude')}) +
+                (res.loop_running ? ' ' + t('model.restart') : ''), 'success');
+    } else {
+      showToast(failMsg(res, t('model.failed')), 'error');
+    }
+  } finally {
+    _modelBusy = false;
+  }
+  loadModelCard(true);
 }
 
 // Codex's account linked in Harvey (brain.auth: account): a ChatGPT
@@ -5441,7 +5510,7 @@ function codexAccountFields(account) {
   }
   if (!account.linked || account.expired) {
     out += '<p class="small muted">' + escHtml(t('model.link_note')) + '</p>' +
-      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link" onclick="startCodexLink()"' +
+      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link-codex" onclick="startCodexLink()"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t(account.linked ? 'model.link_again' : 'model.link_start')) +
         '</button></div>';
   }
@@ -5563,7 +5632,7 @@ function claudeAccountFields(acc, s) {
   }
   if (!acc.kind || ended) {
     out += '<p class="small muted">' + escHtml(t('model.claude_link_how')) + '</p>' +
-      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link" onclick="startClaudeLink(\'subscription\')"' +
+      '<div class="btn-group"><button class="btn btn-secondary btn-sm" id="model-link-claude" onclick="startClaudeLink(\'subscription\')"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t(acc.kind ? 'model.link_again' : 'model.link_start')) + '</button>' +
       '<button class="btn btn-ghost btn-sm" id="model-link-console" onclick="startClaudeLink(\'console\')"' +
         (_modelBusy ? ' disabled' : '') + '>' + escHtml(t('model.claude_link_console')) + '</button></div>' +
@@ -5657,86 +5726,80 @@ async function unlinkClaudeAccount() {
   loadModelCard(true);
 }
 
-// The brain's USD caps alone (a Console account, billed per token).
-function modelCapFields(p) {
-  const field = (id, key, label, ph) =>
-    '<div class="form-group"><label class="form-label" for="' + id + '">' + escHtml(label) + '</label>' +
-    '<input class="form-input" id="' + id + '" type="number" min="0" step="any" inputmode="decimal" value="' +
-      escHtml(p[key] || '') + '" placeholder="' + escHtml(ph) + '" oninput="pickModel(' + jsq(key) + ', this.value)"></div>';
+// A provider's USD caps alone (a Console account, billed per token).
+function modelCapFields(p, pick) {
   return '<p class="small muted">' + escHtml(t('model.caps_console')) + ' ' + escHtml(t('model.caps_note')) + '</p>' +
-    field('model-usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
-    field('model-usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph'));
+    modelMoneyField(p, pick, 'usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
+    modelMoneyField(p, pick, 'usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph'));
 }
 
-// The API key's box (a password field: what was saved is never shown), the
-// brain's USD caps, and Codex's token prices (its CLI reports no cost).
-function modelKeyFields(p, codex, keySet) {
-  const field = (id, key, label, ph) =>
-    '<div class="form-group"><label class="form-label" for="' + id + '">' + escHtml(label) + '</label>' +
-    '<input class="form-input" id="' + id + '" type="number" min="0" step="any" inputmode="decimal" value="' +
-      escHtml(p[key] || '') + '" placeholder="' + escHtml(ph) + '" oninput="pickModel(' + jsq(key) + ', this.value)"></div>';
-  return '<div class="form-group"><label class="form-label" for="model-key">' + escHtml(t('model.key')) + '</label>' +
-      '<input class="form-input" id="model-key" type="password" autocomplete="off" spellcheck="false" value="' +
-        escHtml(p.key || '') + '" placeholder="' + escHtml(t(keySet ? 'model.key_ph_set' : 'model.key_ph')) +
-        '" oninput="pickModel(\'key\', this.value)"></div>' +
+function modelMoneyField(p, pick, id, key, label, ph) {
+  const el = 'model-' + id + '-' + p;
+  return '<div class="form-group"><label class="form-label" for="' + el + '">' + escHtml(label) + '</label>' +
+    '<input class="form-input" id="' + el + '" type="number" min="0" step="any" inputmode="decimal" value="' +
+      escHtml(pick[key] || '') + '" placeholder="' + escHtml(ph) + '" oninput="pickModel(' + jsq(p) + ', ' +
+      jsq(key) + ', this.value)"></div>';
+}
+
+// The API key's box (a password field: what was saved is never shown),
+// the provider's USD caps, and Codex's token prices (its CLI reports no
+// cost).
+function modelKeyFields(p, pick, codex, keySet) {
+  const box = 'model-key-' + p;
+  return '<div class="form-group"><label class="form-label" for="' + box + '">' + escHtml(t('model.key')) + '</label>' +
+      '<input class="form-input" id="' + box + '" type="password" autocomplete="off" spellcheck="false" value="' +
+        escHtml(pick.key || '') + '" placeholder="' + escHtml(t(keySet ? 'model.key_ph_set' : 'model.key_ph')) +
+        '" oninput="pickModel(' + jsq(p) + ', \'key\', this.value)"></div>' +
     '<p class="small muted">' + escHtml(t('model.caps_note')) + '</p>' +
-    field('model-usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
-    field('model-usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph')) +
+    modelMoneyField(p, pick, 'usd-day', 'usd_per_day', t('model.cap_day'), t('model.cap_ph')) +
+    modelMoneyField(p, pick, 'usd-month', 'usd_per_month', t('model.cap_month'), t('model.cap_ph')) +
     (codex ? '<p class="small muted">' + escHtml(t('model.price_note')) + '</p>' +
-      field('model-price-in', 'codex_usd_per_mtok_in', t('model.price_in'), t('model.price_ph')) +
-      field('model-price-out', 'codex_usd_per_mtok_out', t('model.price_out'), t('model.price_ph')) : '');
+      modelMoneyField(p, pick, 'price-in', 'codex_usd_per_mtok_in', t('model.price_in'), t('model.price_ph')) +
+      modelMoneyField(p, pick, 'price-out', 'codex_usd_per_mtok_out', t('model.price_out'), t('model.price_ph')) : '');
 }
 
-function pickModel(key, value) {
-  if (!_modelPick) return;
-  if (key === 'provider' && value !== _modelPick.provider) {
-    _modelPick.provider = value;
-    // A model is one provider's: switching back gives the saved one again.
-    _modelPick.model = value === _model.provider ? _model.model : '';
-    _modelPick.reasoning_effort = value === _model.provider ? _model.reasoning_effort : '';
-    // (The other provider's login is the one its status says the switch
-    // carries: set when that status comes back.)
-    _modelPick.auth = value === _model.provider ? _model.auth : '';
-    delete _modelFull[value];
-    if (value === 'codex' || value !== _model.provider) loadProviderStatus(value, false);
-    renderModelCard();
-    return;
-  }
-  _modelPick[key] = value;
+function pickModel(p, key, value) {
+  if (!_modelPick || !_modelPick[p]) return;
+  _modelPick[p][key] = value;
   if (key === 'auth') {
-    // (Codex's models are the login's own: ask again under the one picked.)
-    if (_modelPick.provider === 'codex' || _modelPick.provider !== _model.provider) {
-      delete _modelFull[_modelPick.provider];
-      loadProviderStatus(_modelPick.provider, false);
-    }
-    renderModelCard();
+    // (Its status, and Codex's models, are the login's own: read again
+    // under the one picked.)
+    delete _modelFull[p];
+    loadProviderStatus(p, false);
   }
 }
 
-async function saveModel() {
-  if (!_modelPick || _modelBusy) return;
-  const body = Object.assign({}, _modelPick);
+// Save one provider's card ({provider: p, ...}): the other's untouched.
+async function saveModel(p) {
+  if (!_modelPick || !_modelPick[p] || _modelBusy) return;
+  const body = Object.assign({provider: p}, _modelPick[p]);
   const key = String(body.key || '').trim();
   delete body.key;
-  if (body.provider === 'codex' && !String(body.model || '').trim()) {
+  if (p !== 'codex') {
+    delete body.reasoning_effort;
+    delete body.codex_usd_per_mtok_in;
+    delete body.codex_usd_per_mtok_out;
+  }
+  if (p === 'codex' && !String(body.model || '').trim()) {
     showToast(t('model.codex_blank'), 'error');
     return;
   }
-  if (body.provider === 'codex' && body.auth === 'account' && _codexLinkPending()) {
+  if (p === 'codex' && body.auth === 'account' && _codexLinkPending()) {
     showToast(t('model.link_first'), 'error');
     return;
   }
-  const claudeAcc = ((_model.provider !== 'codex' ? _model : (_modelFull.claude || {})).claude_account) || {};
-  if (body.provider !== 'codex' && body.auth === 'account' && (_claudeLinkActive() || !claudeAcc.kind)) {
+  const claudeAcc = (modelShown('claude').claude_account || modelSaved('claude').claude_account) || {};
+  if (p !== 'codex' && body.auth === 'account' && (_claudeLinkActive() || !claudeAcc.kind)) {
     showToast(t('model.claude_link_first'), 'error');
     return;
   }
-  const consoleBilled = body.provider !== 'codex' && body.auth === 'account' && claudeAcc.kind === 'console';
+  const consoleBilled = p !== 'codex' && body.auth === 'account' && claudeAcc.kind === 'console';
   if (consoleBilled && !String(body.usd_per_day ?? '').trim() && !String(body.usd_per_month ?? '').trim()) {
     showToast(t('model.cap_needed'), 'error');
     return;
   }
-  if (body.auth === 'api_key' && !key && !((_model.key_set || {})[body.provider])) {
+  const keySet = !!((modelSaved(p).key_set || {})[p]);
+  if (body.auth === 'api_key' && !key && !keySet) {
     showToast(t('model.key_needed'), 'error');
     return;
   }
@@ -5751,10 +5814,10 @@ async function saveModel() {
       // way, and the key never comes back from the server.)
       const saved = await api('/api/brain/key', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({provider: body.provider, key: key}),
+        body: JSON.stringify({provider: p, key: key}),
       });
-      _modelPick.key = '';
-      const box = document.getElementById('model-key');
+      _modelPick[p].key = '';
+      const box = document.getElementById('model-key-' + p);
       if (box) box.value = '';
       if (!saved || !saved.success) {
         showToast(failMsg(saved, t('model.failed')), 'error');
@@ -5777,12 +5840,12 @@ async function saveModel() {
 }
 
 // Unlink: the saved key removed (Claude's from .env, Codex's from its own
-// file), and a brain on it back to the terminal login.
-async function unlinkModelKey() {
+// file), and that provider back to the terminal login if it was on it.
+async function unlinkModelKey(p) {
   if (!_modelPick || _modelBusy) return;
   _modelBusy = true;
   try {
-    const res = await api('/api/brain/key?provider=' + encodeURIComponent(_modelPick.provider), {method: 'DELETE'});
+    const res = await api('/api/brain/key?provider=' + encodeURIComponent(p), {method: 'DELETE'});
     if (res && res.success) showToast(t('model.unlinked'), 'success');
     else showToast(failMsg(res, t('model.failed')), 'error');
   } finally {
@@ -8035,12 +8098,7 @@ async function loadChatList() {
   const el = document.getElementById('chat-chats');
   if (!data) { el.innerHTML = offlineLine(); return; }
   _chatList = data;
-  const note = document.getElementById('chat-note');
-  note.innerHTML = data.refused
-    ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>'
-    : data.provider === 'codex'
-      ? '<p class="muted small">' + escHtml(t('chat.on_codex', {model: data.model || t('chat.model_default')})) + '</p>'
-      : '';
+  paintChatNote();
   el.innerHTML = renderChatList(data.chats || [], _chatId, q);
   const side = document.getElementById('chat-plans');
   if (side) side.innerHTML = renderPlanList((plans && plans.plans) || [], data.chats || []);
@@ -8266,7 +8324,9 @@ function renderChatList(list, current, q) {
     '<button type="button" class="chat-open" onclick="openChat(this.parentNode.dataset.chat)"' + (c.id === current ? ' aria-current="true"' : '') + '>' +
     '<span class="chat-item-title">' + escHtml(c.title || t('chat.untitled')) + '</span>' +
     '<span class="chat-item-when">' + (c.answering ? '<span class="badge t-active">' + escHtml(t('chat.answering')) + '</span> ' : '') +
-      (c.unread && !c.answering ? '<span class="badge t-note">' + escHtml(t('chat.wake.unread')) + '</span> ' : '') + chatWhen(c.last_at) + '</span></button>' +
+      (c.unread && !c.answering ? '<span class="badge t-note">' + escHtml(t('chat.wake.unread')) + '</span> ' : '') +
+      (c.provider && c.provider !== ((_chatList && _chatList.provider) || 'claude')
+        ? '<span class="badge">' + escHtml(t('chat.provider.' + c.provider)) + '</span> ' : '') + chatWhen(c.last_at) + '</span></button>' +
     '<button type="button" class="icon-btn" onclick="renameChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.rename')) + '" aria-label="' + escHtml(t('chat.rename')) + '">' + icon('pen') + '</button>' +
     '<button type="button" class="icon-btn" onclick="deleteChat(this.parentNode.dataset.chat)" title="' + escHtml(t('chat.delete')) + '" aria-label="' + escHtml(t('chat.delete')) + '">' + icon('x') + '</button>' +
     '</div>').join('');
@@ -8302,8 +8362,11 @@ function paintChat(scroll) {
   el.scrollTop = scroll === 'older' ? el.scrollHeight - below
     : (scroll === 'follow' && !atEnd ? top : el.scrollHeight);
   const busy = !!(live && !live.end) || !!data.busy;
-  const refused = !!(_chatList && _chatList.refused);
+  const refused = !!(chatProvider(chatProviderId()) || {}).refused;
   document.getElementById('chat-send').disabled = refused || busy;
+  const picker = document.getElementById('chat-provider');
+  if (picker) picker.innerHTML = chatProviderPicker(busy || !!data.waking);
+  paintChatNote();
   document.getElementById('chat-stop').hidden = !busy;
   document.getElementById('chat-title').textContent = data.chat ? (data.chat.title || t('chat.untitled')) : t('chat.new');
   document.getElementById('chat-tokens').innerHTML = chatContext(data.chat, live);
@@ -8382,7 +8445,7 @@ function wakeLabel(w) {
 
 const CHAT_ERRORS = {login: 1, max_turns: 1, failed: 1, timeout: 1, stopped: 1, budget: 1};
 const CHAT_REFUSALS = {empty: 1, too_long: 1, codex: 1, budget: 1, busy: 1, elsewhere: 1, cli: 1,
-                       full: 1, missing: 1, retry: 1, waking: 1};
+                       full: 1, missing: 1, retry: 1, waking: 1, provider: 1};
 
 // Send the chat's newest message again (its answer failed or was stopped).
 function chatRetry(turn) {
@@ -8519,6 +8582,7 @@ function openChat(id) {
 }
 
 function newChat() {
+  _chatNewProvider = '';
   openChat('');
   const box = document.getElementById('chat-input');
   if (box) box.focus();
@@ -8584,8 +8648,11 @@ async function sendChat(ev) {
   if (!text || btn.disabled) return;
   btn.disabled = true;
   const path = _chatId ? '/api/agent/chats/' + encodeURIComponent(_chatId) + '/messages' : '/api/agent/chats';
+  // (A new chat runs on the provider picked for it, the default unless
+  // another one was picked.)
+  const body = _chatId ? {text: text} : {text: text, provider: chatProviderId()};
   const r = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                             body: JSON.stringify({text: text})});
+                             body: JSON.stringify(body)});
   if (!r || r.success === false) { btn.disabled = false; chatRefused(r); return; }
   box.value = '';
   await chatStarted(r);
@@ -8597,6 +8664,78 @@ async function retryChat(turn) {
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({turn: turn})});
   if (!r || r.success === false) { chatRefused(r); return; }
   await chatStarted(r);
+}
+
+// Which provider a chat runs on: the open chat's own (the default for one
+// made before chats had their own), or the one picked for a new chat (the
+// default, preselected).
+let _chatNewProvider = '';
+
+function chatProviderId() {
+  const list = (_chatList && _chatList.providers) || [];
+  const fallback = (list.find(p => p.default) || {}).id || (_chatList && _chatList.provider) || 'claude';
+  if (_chatId) {
+    const c = (_chatData && _chatData.chat) || ((_chatList && _chatList.chats) || []).find(x => x.id === _chatId);
+    return (c && c.provider) || (_chatData && _chatData.provider) || fallback;
+  }
+  return _chatNewProvider || fallback;
+}
+
+function chatProvider(id) {
+  return ((_chatList && _chatList.providers) || []).find(p => p.id === id) || null;
+}
+
+// The picker in the chat's head: both providers with their state (the
+// default marked; one that can't run here disabled; one paused says so).
+// Changed between messages only: while an answer or a wake is under way it
+// is disabled.
+function chatProviderPicker(busy) {
+  const list = (_chatList && _chatList.providers) || [];
+  if (!list.length) return '';
+  const on = chatProviderId();
+  return '<label class="small muted" for="chat-provider-pick">' + escHtml(t('chat.provider')) + '</label> ' +
+    '<select id="chat-provider-pick" class="form-input chat-provider-pick"' + (busy ? ' disabled' : '') +
+    ' onchange="pickChatProvider(this.value)">' + list.map(p => {
+      const bits = [t('chat.provider.' + p.id)];
+      if (p.default) bits.push(t('chat.provider_default'));
+      if (p.refused) bits.push(t('chat.provider_refused'));
+      else if (p.paused) bits.push(t('chat.provider_paused'));
+      return '<option value="' + escHtml(p.id) + '"' + (p.id === on ? ' selected' : '') +
+        (p.refused ? ' disabled' : '') + '>' + escHtml(bits.join(' · ')) + '</option>';
+    }).join('') + '</select>';
+}
+
+// Under the chats: why the provider picked can't run here, or who answers.
+function paintChatNote() {
+  const note = document.getElementById('chat-note');
+  if (!note || !_chatList) return;
+  const p = chatProvider(chatProviderId()) || {};
+  note.innerHTML = p.refused
+    ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.refused_codex')) + '</div></div>'
+    : p.paused
+      ? '<div class="banner wait">' + icon('alert') + '<div>' + escHtml(t('chat.provider_paused_why', {why: p.paused})) + '</div></div>'
+      : p.id === 'codex'
+        ? '<p class="muted small">' + escHtml(t('chat.on_codex', {model: p.model || t('chat.model_default')})) + '</p>'
+        : '';
+}
+
+// A provider picked: for a new chat, the one it will run on; for an open
+// chat, it moves there (its next message starts a process of it, primed
+// from the chat so far). Refused (an answer under way, a provider that
+// can't be started), the picker goes back.
+async function pickChatProvider(id) {
+  if (!_chatId) {
+    _chatNewProvider = id;
+    paintChat();
+    return;
+  }
+  const r = await api('/api/agent/chats/' + encodeURIComponent(_chatId), {method: 'PATCH',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({provider: id})});
+  if (!r || r.success === false) { chatRefused(r); paintChat(); return; }
+  if (_chatData) _chatData.chat = Object.assign({}, _chatData.chat || {}, r.chat);
+  showToast(t('chat.provider_moved', {who: t('chat.provider.' + id)}), 'success');
+  loadChatList();
+  paintChat();
 }
 
 // While the Chat tab is open (the page's 15 s refresh): the list again (a

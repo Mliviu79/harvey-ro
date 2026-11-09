@@ -26,7 +26,7 @@ Bounds: at most OPEN_MAX tasks of a plan queued or running, PER_DAY
 assigned in 24 hours, TASK_TURNS turns and TIMEOUT_SECONDS a run.
 Closing or cancelling the plan, or deleting its chat, cancels its tasks
 (a running one is stopped, like a wake). A task runs on the agent's
-driver (driver.py: Claude, or Codex when brain.provider says so). Its tokens go to usage_events (agent ``agent``, task
+driver (driver.py: Claude or Codex, the provider of its plan's chat). Its tokens go to usage_events (agent ``agent``, task
 ``task.<profile>``) and to the task's row, which the plan card counts.
 """
 
@@ -375,7 +375,7 @@ async def assign(state, plan_id, chat: str, parent_turn: str, profile: str, prom
         plans.usable(plan, plan_id, chat)
     except plans.Refused as e:
         raise Refused(str(e)) from None
-    why = chats.refusal(chats._config())
+    why = chats.refusal((await chats.config_for_chat(state, chat))[0])
     if why:
         raise Refused("tasks can't run: " + why)
     p = PROFILES.get(str(profile or ""))
@@ -593,7 +593,8 @@ async def run(ctx) -> dict:
     if plan is None or plan["status"] != plans.APPROVED:
         await _end(state, tid, CANCELLED, problem="its plan is closed")
         return {"task": tid, "skipped": f"the plan is {plan['status'] if plan else 'gone'}"}
-    config = chat._config()
+    # (Its chat's provider, as the plan's wakes.)
+    config, provider = await chat.config_for_chat(state, task["chat"])
     why = chat.refusal(config)
     if why:
         await _end(state, tid, FAILED, problem="tasks can't run with these settings")
@@ -601,12 +602,13 @@ async def run(ctx) -> dict:
     brain = Brain(state, getattr(config, "brain", None))
     percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
     if not await brain.is_within_budget(max_percent=percent):
-        why = (f"{brain.budget_why}: the agent's wakes and tasks wait" if brain.budget_why else
+        why = (f"{brain.budget_why}: the agent's {brain.provider_label} wakes and tasks wait"
+               if brain.budget_why else
                f"Harvey's share of your {brain.provider_label} plan is used for now "
-               "(usage.max_daily_claude_percent): the agent's wakes and tasks wait")
-        await wakes.hold(state, why, wakes.BUDGET_RETRY_SECONDS)
+               "(usage.max_daily_claude_percent): the agent's wakes and tasks on it wait")
+        await wakes.hold(state, why, wakes.BUDGET_RETRY_SECONDS, provider)
         raise jobs.LaneExhausted(why, retry_after=wakes.BUDGET_RETRY_SECONDS)
-    exe = await wakes.runner(config, "tasks")
+    exe = await wakes.held_runner(state, config, provider, "tasks")
     held_usd = await wakes.hold_cost(ctx, plan["id"], brain, config, TASK_TURNS, "task")
     meter = await wakes._meter(state, brain, held_usd)
     if not await _write(state, "overlay.agent.task_start", (_now(), tid)):
@@ -623,6 +625,10 @@ async def run(ctx) -> dict:
             getattr(getattr(config, "brain", None), "model", "") or "", calling, stop=stop,
             task=tid, max_turns=TASK_TURNS, timeout=TIMEOUT_SECONDS, auth=driver.auth(config),
             meter=meter)
+    except jobs.LaneExhausted:
+        # (Its provider couldn't be started: it waits, queued again.)
+        await _write(state, "overlay.agent.task_requeue", (tid,))
+        raise
     except asyncio.CancelledError:
         # (Cut off by the worker's shutdown: back to the queue; a call it
         # made counts all the same.)
@@ -674,7 +680,7 @@ async def run(ctx) -> dict:
         await _end(state, tid, FAILED, problem=f"no answer within {TASK_TURNS} turns")
         await ctx.say(f"  task {tid}: no answer within {TASK_TURNS} turns")
         return {"task": tid, "status": FAILED, "turns": turns, "tokens": tokens}
-    await state.delete_setting(wakes.HOLD_KEY)
+    await wakes.clear_hold(state, provider)
     value, wrong = check(task["profile"], response)
     if wrong:
         status = INVALID

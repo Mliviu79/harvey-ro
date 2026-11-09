@@ -321,19 +321,14 @@ class FallbackCrawler:
 
 
 def brain_section(brain_config: BrainConfig) -> dict:
-    """The ``brain:`` block to write back, so retraining keeps the choice."""
-    section = {"provider": brain_config.provider}
-    if brain_config.model:
-        section["model"] = brain_config.model
-    if brain_config.reasoning_effort:
-        section["reasoning_effort"] = brain_config.reasoning_effort
-    if brain_config.auth != "terminal":
-        section["auth"] = brain_config.auth
-    # (The API key's USD caps and Codex's prices: never dropped by a retrain.)
-    for key in ("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in", "codex_usd_per_mtok_out"):
-        if getattr(brain_config, key, None) is not None:
-            section[key] = getattr(brain_config, key)
-    return section
+    """The ``brain:`` block to write back, so retraining keeps the choice:
+    the default provider and each provider's own settings (its login, model,
+    caps and Codex's prices: config.brain_section)."""
+    from harvey.config import brain_section as section
+
+    out = section(brain_config)
+    return {"provider": brain_config.provider, **{k: v for k, v in out.items()
+                                                  if k != "provider"}}
 
 
 # What training learns from a website. Retraining replaces exactly these and

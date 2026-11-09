@@ -1,7 +1,16 @@
 """The chats with Harvey's agent: conversations the user keeps, each
 answered by a live process while it is in use: the Claude CLI's, or
-Codex's app-server when brain.provider is codex (driver.py, read as the
-same stream-json events; what follows says the CLI for either).
+Codex's app-server for a chat on Codex (driver.py, read as the same
+stream-json events; what follows says the CLI for either).
+
+Each chat has its own provider (agent_chat.provider, schema 43): picked
+when it is made (the default provider, brain.provider, unless the user
+picks the other one), changed between messages (set_provider: never while
+an answer or a wake is under way; its process closes, and the next message
+starts one of the new provider primed from the chat so far, like any
+restart). A chat made before keeps NULL: the default provider at the time.
+Its plans' wakes and tasks run on it too; a provider that can't be used
+holds only the chats (and wakes, tasks) on it.
 
 A chat (agent_chat, schema 32) is kept until the user deletes it: titled
 from its first message (TITLE_CHARS, no model call) or renamed, listed by
@@ -116,7 +125,10 @@ ERRORS = ("login", "max_turns", "failed", "timeout", "stopped", "budget")
 # Why a message (or a change to a chat) is refused before anything is
 # written.
 REFUSALS = ("empty", "too_long", "codex", "budget", "busy", "elsewhere", "cli", "full",
-            "missing", "retry", "waking")
+            "missing", "retry", "waking", "provider")
+
+# The providers a chat can run on (config.BRAIN_PROVIDERS).
+PROVIDERS = ("claude", "codex")
 
 _LOGIN_PATTERNS = ("not logged in", "please run `claude login`", "invalid api key",
                    "unauthorized", "run 'codex login'")
@@ -144,6 +156,37 @@ def refusal(config) -> str:
     from harvey.agent import driver
 
     return driver.refusal(config)
+
+
+def default_provider(config) -> str:
+    """The default provider (brain.provider): a new chat's, and a chat's
+    made before chats had their own."""
+    from harvey.agent import driver
+
+    return driver.provider(config)
+
+
+def provider_of(info: dict | None, config) -> str:
+    """The provider a chat runs on: its own, else the default."""
+    p = (info or {}).get("provider") or ""
+    return p if p in PROVIDERS else default_provider(config)
+
+
+def for_chat(config, provider: str):
+    """``config`` with its brain the view of ``provider``
+    (config.with_brain_provider): what a chat, its wakes and its tasks run
+    with."""
+    from harvey.config import with_brain_provider
+
+    return with_brain_provider(config, provider)
+
+
+async def config_for_chat(state, chat_id: str, config=None):
+    """(the config for a chat's provider, that provider): its wakes' and
+    tasks' too."""
+    config = config if config is not None else _config()
+    p = provider_of(await chat_info(state, chat_id), config)
+    return for_chat(config, p), p
 
 
 def _now() -> int:
@@ -178,7 +221,7 @@ def _row(r) -> dict:
 def _chat_row(r) -> dict | None:
     if r is None:
         return None
-    return dict(zip(("id", "title", "created_at", "last_at", "turn", "unread"), r))
+    return dict(zip(("id", "title", "created_at", "last_at", "turn", "unread", "provider"), r))
 
 
 async def _one(state, name: str, args=()):
@@ -223,8 +266,9 @@ def _held_refusal(holder: dict | None, verb: str = "") -> Refused:
 # ── The chats ──
 
 async def chat_info(state, chat_id: str) -> dict | None:
-    """One chat ({id, title, created_at, last_at, turn, unread, context,
-    hint}), or None. ``unread``: its wake answers the user hasn't opened."""
+    """One chat ({id, title, created_at, last_at, turn, unread, provider,
+    context, hint}), or None. ``unread``: its wake answers the user hasn't
+    opened; ``provider``: its own (None: the default's)."""
     info = _chat_row(await _one(state, "overlay.agent.chat", (chat_id,)))
     if info is None:
         return None
@@ -252,7 +296,8 @@ async def _waking(state) -> set[str]:
 
 async def chats(state, q: str = "", limit: int = 50) -> list[dict]:
     """The chats, newest activity first ({id, title, created_at, last_at,
-    unread, answering}), those whose title holds ``q`` when it is given.
+    unread, provider, answering}), those whose title holds ``q`` when it is
+    given (``provider``: its own, None for the default's).
     ``answering``: an answer is being made, here, in another Harvey
     process or by a wake; ``unread``: wake answers the user hasn't
     opened."""
@@ -636,8 +681,9 @@ def _budget_detail(answer: Answer) -> str:
     wrote before (kept, as the user saw it)."""
     meter = answer.meter
     left = meter.line if meter is not None else 0.0
+    which = getattr(meter, "provider", "") or "claude"
     why = (f"stopped at the brain's USD cap: ${left:.2f} was left of it when the answer "
-           "started (brain.usd_per_day / usd_per_month)")
+           f"started (brain.{which}.usd_per_day / usd_per_month)")
     written = "".join(e.get("text") or "" for e in answer.events if e.get("type") == "text")
     return why + ("\n\n" + written.strip() if written.strip() else "")
 
@@ -731,20 +777,22 @@ class Hub:
         self.owner = f"chat-{uuid.uuid4().hex[:12]}"
         self.chats: dict[str, Live] = {}
         self._room = asyncio.Lock()
-        self._brain = None
+        self._brains: dict = {}
 
     def brain(self, config):
-        """The Brain for these settings. On Codex it is kept while they stay
-        the same, so its quota reading is cached (reading it starts a
-        runtime); on Claude a new one each message, as before."""
+        """The Brain for these settings (a chat's provider's view). On Codex
+        it is kept while they stay the same, so its quota reading is cached
+        (reading it starts a runtime); on Claude a new one each message, as
+        before."""
         from harvey.brain import Brain
 
         settings = getattr(config, "brain", None)
         if getattr(settings, "provider", "claude") != "codex":
             return Brain(self.state, settings)
-        if self._brain is None or self._brain.config != settings:
-            self._brain = Brain(self.state, settings)
-        return self._brain
+        kept = self._brains.get("codex")
+        if kept is None or kept.config != settings:
+            kept = self._brains["codex"] = Brain(self.state, settings)
+        return kept
 
     def _live(self, chat_id: str) -> "Live":
         live = self.chats.get(chat_id)
@@ -764,18 +812,20 @@ class Hub:
     def answering(self) -> set[str]:
         return {cid for cid, live in self.chats.items() if live.answering}
 
-    async def ask(self, chat_id: str | None, text: str, config=None) -> Answer:
-        """Send a message to a chat (None: a new one, titled from it): the
-        Answer it starts (follow it for the events), or Refused before
-        anything is written."""
+    async def ask(self, chat_id: str | None, text: str, config=None,
+                  provider: str | None = None) -> Answer:
+        """Send a message to a chat (None: a new one, titled from it, on
+        ``provider``, else the default): the Answer it starts (follow it
+        for the events), or Refused before anything is written."""
         text, config = _checked(text, config)
         if chat_id and await chat_info(self.state, chat_id) is None:
             raise Refused("no such chat", "missing")
         if chat_id:
             return await self._live(chat_id).ask(text, config)
+        provider = _picked(provider, config)
         new = uuid.uuid4().hex[:12]
         try:
-            return await self._live(new).ask(text, config, new=True)
+            return await self._live(new).ask(text, config, new=True, provider=provider)
         except BaseException:
             self.chats.pop(new, None)
             raise
@@ -794,6 +844,43 @@ class Hub:
             raise Refused("only a message that failed or was stopped can be sent again", "retry")
         text, config = _checked(user["text"], config)
         return await self._live(chat_id).ask(text, config, retry_of=turn)
+
+    async def set_provider(self, chat_id: str, provider: str, config=None) -> dict:
+        """Move a chat to another provider, between messages: its process
+        closed, the next message starts one of ``provider`` primed from the
+        chat so far. Refused while an answer is being made (busy) or a wake
+        answers in it (waking), while another Harvey process has it open,
+        and for a provider that can't run here or now (codex, cli: why).
+        Returns the chat."""
+        from harvey.agent import driver
+
+        config = config if config is not None else _config()
+        provider = _picked(provider, config)
+        info = await chat_info(self.state, chat_id)
+        if info is None:
+            raise Refused("no such chat", "missing")
+        live = self._live(chat_id)
+        async with live.lock:
+            if live.answering:
+                raise Refused("an answer is still coming: wait for it, or stop it", "busy")
+            if chat_id in await _held_elsewhere(self.state):
+                from harvey.modules.worker import lease_holder
+
+                raise _held_refusal(await lease_holder(self.state, LEASE_TTL_SECONDS,
+                                                       _lease(chat_id)), " first")
+            view = for_chat(config, provider)
+            why = refusal(view)
+            if why:
+                raise Refused(why, "codex")
+            try:
+                await driver.check(view)
+            except driver.Unusable as e:
+                raise Refused(str(e), "cli") from None
+            if info.get("provider") != provider:
+                await _write(self.state, ("overlay.agent.chat_provider", (provider, chat_id)))
+            if live.proc is not None and live.provider != provider:
+                await live.close_process()
+        return await chat_info(self.state, chat_id)
 
     async def stop(self, chat_id: str) -> bool:
         """Stop the answer being made in a chat (True when there was one)."""
@@ -865,17 +952,23 @@ class Hub:
 
 
 def _checked(text: str, config):
-    """The message as it is sent and the settings, or Refused."""
+    """The message as it is sent and the settings, or Refused (the
+    provider's own refusal is the chat's: Live.ask)."""
     text = (text or "").strip()
     if not text:
         raise Refused("write a message first", "empty")
     if len(text) > MESSAGE_CHARS:
         raise Refused(f"a message is at most {MESSAGE_CHARS:,} characters", "too_long")
     config = config if config is not None else _config()
-    why = refusal(config)
-    if why:
-        raise Refused(why, "codex")
     return text, config
+
+
+def _picked(provider: str | None, config) -> str:
+    """A provider the user picked ("" or None: the default), or Refused."""
+    p = str(provider or "").strip().lower() or default_provider(config)
+    if p not in PROVIDERS:
+        raise Refused(f"'{p}' is not a provider: claude or codex", "provider")
+    return p
 
 
 class Live:
@@ -888,6 +981,8 @@ class Live:
         self.state = hub.state
         self.chat_id = chat_id
         self.proc: Process | None = None
+        # The provider its process runs on.
+        self.provider = ""
         self.turns_used = 0
         self.answer: Answer | None = None
         self.last_usage: dict = {}
@@ -933,6 +1028,7 @@ class Live:
                     runner, self.state.db_path, self.chat_id,
                     model=getattr(getattr(config, "brain", None), "model", "") or "",
                     auth=driver.auth(config))
+                self.provider = driver.provider(config)
             except driver.Unusable as e:
                 await self._release()
                 raise Refused(str(e), "cli") from None
@@ -996,12 +1092,26 @@ class Live:
 
     # Messages
 
-    async def ask(self, text: str, config, new: bool = False, retry_of: str = "") -> Answer:
+    async def ask(self, text: str, config, new: bool = False, retry_of: str = "",
+                  provider: str = "") -> Answer:
         """Send a checked message (Hub.ask, Hub.retry): ``new``, the chat's
-        first; ``retry_of``, the turn it sends again."""
+        first (on ``provider``); ``retry_of``, the turn it sends again. It
+        runs on the chat's provider (for_chat)."""
         async with self.lock:
             if self.answering:
                 raise Refused("an answer is still coming: wait for it, or stop it", "busy")
+            if new:
+                info = None
+                provider = provider or default_provider(config)
+            else:
+                info = await chat_info(self.state, self.chat_id)
+                if info is None:
+                    raise Refused("no such chat", "missing")
+                provider = provider_of(info, config)
+            config = for_chat(config, provider)
+            why = refusal(config)
+            if why:
+                raise Refused(why, "codex")
             brain = self.hub.brain(config)
             percent = getattr(getattr(config, "usage", None), "max_daily_claude_percent", None)
             if not await brain.is_within_budget(max_percent=percent):
@@ -1009,9 +1119,7 @@ class Live:
                 raise Refused(f"{brain.budget_why}: ask again later" if brain.budget_why else
                               f"Harvey's share of your {brain.provider_label} plan is used for "
                               "now (usage.max_daily_claude_percent): ask again later", "budget")
-            if not new and await chat_info(self.state, self.chat_id) is None:
-                raise Refused("no such chat", "missing")
-            fresh = (self.proc is None or not self.proc.alive
+            fresh = (self.proc is None or not self.proc.alive or self.provider != provider
                      or self.turns_used + MAX_TURNS > PROCESS_TURNS
                      or getattr(self.proc, "stale", False))
             if self._idle is not None:
@@ -1026,7 +1134,7 @@ class Live:
             if new:
                 # (Only once its process runs: a refused start leaves no chat.)
                 writes.append(("overlay.agent.new_chat",
-                               (self.chat_id, title_of(text), now, now)))
+                               (self.chat_id, title_of(text), now, now, provider)))
             if retry_of:
                 writes.append(("overlay.agent.set_status", (RETRIED, now, retry_of)))
             writes += [("overlay.agent.add", (turn, "user", text, RUNNING, self.chat_id,

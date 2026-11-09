@@ -770,9 +770,9 @@ statement("overlay.brain.spend_since",
           "COALESCE(SUM(CASE WHEN source = 'api_key_unpriced' THEN input_tokens "
           "+ cache_read_tokens + cache_creation_tokens END), 0), "
           "COALESCE(SUM(CASE WHEN source = 'api_key_unpriced' THEN output_tokens END), 0) "
-          "FROM usage_events WHERE created_at >= ? "
+          "FROM usage_events WHERE created_at >= ? AND provider = ? "
           "AND source IN ('api_key', 'api_key_estimate', 'api_key_unpriced')",
-          params=("2026-01-01 00:00:00",))
+          params=("2026-01-01 00:00:00", "claude"))
 # The most an agent's API-key turn cost since a time (a wake's or a task's
 # worst case).
 statement("overlay.brain.agent_turn_cost",
@@ -821,7 +821,7 @@ statement("overlay.agent.calls_after",
 # holds some words), one, a new one, its title, the message it answers
 # now, and its removal with its messages and their tool calls (its
 # usage_events rows stay: they are the plan's accounting).
-_CHAT = "SELECT id, title, created_at, last_at, turn, unread FROM agent_chat "
+_CHAT = "SELECT id, title, created_at, last_at, turn, unread, provider FROM agent_chat "
 statement("overlay.agent.chats",
           _CHAT + "INDEXED BY agent_chat_recent ORDER BY last_at DESC LIMIT ?", params=(50,))
 statement("overlay.agent.chats_like",
@@ -831,8 +831,11 @@ statement("overlay.agent.chats_like",
                                "conversation the user keeps"})
 statement("overlay.agent.chat", _CHAT + "WHERE id = ?", params=("c",))
 statement("overlay.agent.new_chat",
-          "INSERT INTO agent_chat (id, title, created_at, last_at) VALUES (?, ?, ?, ?)",
-          params=("c", "t", 1, 1))
+          "INSERT INTO agent_chat (id, title, created_at, last_at, provider) VALUES (?, ?, ?, ?, ?)",
+          params=("c", "t", 1, 1, "claude"))
+# The provider a chat is answered by (NULL: the default's).
+statement("overlay.agent.chat_provider", "UPDATE agent_chat SET provider = ? WHERE id = ?",
+          params=("codex", "c"))
 statement("overlay.agent.rename_chat", "UPDATE agent_chat SET title = ? WHERE id = ?",
           params=("t", "c"))
 statement("overlay.agent.chat_turn", "SELECT turn FROM agent_chat WHERE id = ?", params=("c",))

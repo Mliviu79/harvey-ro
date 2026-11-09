@@ -173,7 +173,7 @@ async def test_old_cli_fails_closed_without_sending_the_prompt(
     assert "No prompt was sent" in brain.paused_reason
     # The heartbeat's preflight reports the same, so nothing in the cycle runs.
     assert missing in await brain.preflight()
-    stored = await state.get_setting(brain_mod.BRAIN_STATUS_KEY)
+    stored = await state.get_setting(brain_mod.status_key("claude"))
     assert '"status": "paused"' in stored and '"provider": "claude"' in stored
 
 
@@ -208,7 +208,7 @@ async def test_updated_cli_resumes(state, monkeypatch):
     assert await brain.preflight() == ""
     assert brain.paused_reason == ""
     assert await brain.think("hi") == "ok" and "--safe-mode" in captured["cmd"]
-    stored = await state.get_setting(brain_mod.BRAIN_STATUS_KEY)
+    stored = await state.get_setting(brain_mod.status_key("claude"))
     assert '"status": "ok"' in stored
 
 

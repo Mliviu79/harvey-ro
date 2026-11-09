@@ -22,8 +22,9 @@ With an API key (a Console account alike):
   counted, and an unpriced Codex call (made before a cap was required)
   keeps its tokens (source SOURCE_UNPRICED), priced when the spend is read
   at the prices entered by then.
-- ``brain.usd_per_day`` / ``usd_per_month`` (UTC; None: no cap) are
-  checked before each call against what those rows already cost
+- ``brain.<provider>.usd_per_day`` / ``usd_per_month`` (UTC; None: no
+  cap) are checked before each call against what that provider's rows
+  already cost (Claude and Codex each have their own caps)
   (``refusal``): reached, the call isn't made. A cap of 0 is no calls.
   With a cap set and Codex unpriced the spend can't be counted, so no call
   is made either ("no price entered"). Brain's daily call counter stays as
@@ -223,13 +224,15 @@ async def _value(state, name: str, args):
 
 
 async def spent(state, period: str = "day", brain=None) -> float:
-    """What Harvey's own API-key calls cost today or this month (UTC): the
-    costs recorded, plus unpriced Codex calls' tokens at ``brain``'s prices
-    (none entered: they can't be counted, and refusal holds every call
-    under a cap)."""
+    """What Harvey's own API-key calls on ``brain``'s provider cost today or
+    this month (UTC): the costs recorded, plus unpriced Codex calls' tokens
+    at ``brain``'s prices (none entered: they can't be counted, and refusal
+    holds every call under a cap). Each provider's caps hold its own calls
+    only."""
+    provider = getattr(brain, "provider", "") or "claude"
     async with state._connect() as db:
         async with db.execute(queries.sql("overlay.brain.spend_since"),
-                              (since(period),)) as cur:
+                              (since(period), provider)) as cur:
             row = await cur.fetchone()
     cost, tokens_in, tokens_out = (row or (0, 0, 0))
     total = float(cost or 0.0)
@@ -244,13 +247,13 @@ def caps(brain) -> list[tuple[float, str]]:
         (getattr(brain, "usd_per_month", None), "month")) if cap is not None]
 
 
-NO_PRICE = ("no price entered for Codex's tokens (brain.codex_usd_per_mtok_in and "
+NO_PRICE = ("no price entered for Codex's tokens (brain.codex.codex_usd_per_mtok_in and "
             "codex_usd_per_mtok_out): with a USD cap set, Harvey can't count what a call "
             "costs, so none is made")
 
 
-NO_CAP = ("set a USD cap for the brain (brain.usd_per_day or usd_per_month, Settings → "
-          "Model): billed per token, Harvey makes no call without one")
+NO_CAP = ("set a USD cap for this provider (brain.<provider>.usd_per_day or usd_per_month, "
+          "Settings → Model): billed per token, Harvey makes no call without one")
 
 
 async def refusal(state, brain) -> str:
@@ -267,7 +270,8 @@ async def refusal(state, brain) -> str:
     for cap, period in held:
         used = await spent(state, period, brain)
         if used >= cap - EPSILON:
-            return (f"the brain's USD cap for the {period} (${cap:.2f}, brain.usd_per_{period}) "
+            return (f"the brain's USD cap for the {period} (${cap:.2f}, "
+                    f"brain.{getattr(brain, 'provider', 'claude')}.usd_per_{period}) "
                     f"is reached: ${used:.2f} spent")
     return ""
 
@@ -351,8 +355,9 @@ async def hold_run(ctx, plan_id: int, brain, spend, turns: int, what: str, retry
     (``spend``: config.spend) and of plan ``plan_id``'s budget; 0 in the
     subscription modes (nothing held). Raises jobs.LaneExhausted (retried
     after ``retry`` seconds, no try used) when it can't be held, marked
-    ``plan_only`` when it is the plan's budget that can't cover it (the
-    other reasons hold every agent run alike)."""
+    ``plan_only`` when it is the plan's budget that can't cover it, and
+    ``provider_only`` when it is Codex's missing price (the install's
+    limits hold every agent run alike)."""
     from harvey.agent import plans
     from harvey.modules import jobs
 
@@ -360,10 +365,13 @@ async def hold_run(ctx, plan_id: int, brain, spend, turns: int, what: str, retry
         return 0.0
     worst = await run_worst_usd(ctx.state, brain, turns)
     if worst is None:
-        raise jobs.LaneExhausted(
-            f"the agent's {what}s wait: no price entered for Codex's tokens "
-            "(brain.codex_usd_per_mtok_in and codex_usd_per_mtok_out), so what a "
+        err = jobs.LaneExhausted(
+            f"the agent's Codex {what}s wait: no price entered for Codex's tokens "
+            "(brain.codex.codex_usd_per_mtok_in and codex_usd_per_mtok_out), so what a "
             f"{what} may cost can't be held of its plan's budget", retry_after=retry)
+        # (Codex's alone: the runs on Claude go on.)
+        err.provider_only = True
+        raise err
     try:
         await ctx.reserve(worst, worst, per_day=getattr(spend, "per_day_usd", None),
                           per_month=getattr(spend, "per_month_usd", None))
@@ -410,14 +418,15 @@ def _codex_tokens(model_usage) -> dict:
 
 
 # Every metered run of this process (a weak set: one dropped without
-# close() is forgotten), and the money all of them counted, ever: a run's
-# ``room`` is checked against what every run in flight adds after it
-# starts, so chats, wakes, tasks and brain calls running side by side
-# share what was left of the caps instead of each spending all of it. Runs
-# of another Harvey process (``harvey run`` beside the dashboard) are seen
-# only once they are recorded.
+# close() is forgotten), and the money all of them counted, ever, per
+# provider: a run's ``room`` is checked against what every run in flight on
+# its provider adds after it starts, so chats, wakes, tasks and brain calls
+# running side by side share what was left of that provider's caps instead
+# of each spending all of it (the other provider's runs have caps of their
+# own). Runs of another Harvey process (``harvey run`` beside the
+# dashboard) are seen only once they are recorded.
 _LIVE: "weakref.WeakSet[Meter]" = weakref.WeakSet()
-_COUNTED = [0.0]
+_COUNTED: dict[str, float] = {}
 
 
 class Meter:
@@ -443,12 +452,13 @@ class Meter:
         self.limit = None if limit is None else max(0.0, float(limit))
         # (What was left of the caps less what the runs in flight have
         # counted and not yet recorded; then every run's growth from here.)
+        self.provider = getattr(brain, "provider", "claude") or "claude"
         self.room = None if room is None else max(
-            0.0, float(room) - sum(m.cost for m in list(_LIVE)))
-        self._start = _COUNTED[0]
+            0.0, float(room) - sum(m.cost for m in list(_LIVE) if m.provider == self.provider))
+        self._start = _COUNTED.get(self.provider, 0.0)
         self._added = 0.0
         self.why = ""
-        self.codex = getattr(brain, "provider", "claude") == "codex"
+        self.codex = self.provider == "codex"
         self._calls: dict[str, dict] = {}
         self._current = ""
         self._seq = 0
@@ -480,12 +490,12 @@ class Meter:
         # reaches a limit of 0.)
         cost = self.cost
         if cost > self._added:
-            _COUNTED[0] += cost - self._added
+            _COUNTED[self.provider] = _COUNTED.get(self.provider, 0.0) + cost - self._added
             self._added = cost
         if self.limit is not None and cost > 0 and cost >= self.limit - EPSILON:
             self.why = self.why or "hold"
             return True
-        grown = _COUNTED[0] - self._start
+        grown = _COUNTED.get(self.provider, 0.0) - self._start
         if self.room is not None and grown > 0 and grown >= self.room - EPSILON:
             self.why = self.why or "cap"
             return True
