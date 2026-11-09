@@ -540,6 +540,19 @@ function applyModules() {
     label.dataset.i18n = _modules.email ? 'nav.group.email' : 'nav.group.messages';
     label.textContent = t(label.dataset.i18n);
   }
+  // The Today and Outbox ledes speak of email only while the Email module
+  // is on; else of messages (SMS and WhatsApp), or of neither.
+  const lede = document.getElementById('today-lede');
+  if (lede) {
+    lede.dataset.i18n = _modules.email ? 'today.lede'
+      : _modules.messages ? 'today.lede_messages' : 'today.lede_plain';
+    lede.textContent = t(lede.dataset.i18n);
+  }
+  const obLede = document.getElementById('outbox-lede');
+  if (obLede) {
+    obLede.dataset.i18nHtml = _modules.email ? 'ob.lede' : 'ob.lede_messages';
+    obLede.innerHTML = t(obLede.dataset.i18nHtml);
+  }
   const sec = document.getElementById(currentTab);
   if (sec && sec.dataset.module && !_modules[sec.dataset.module]) showTab('overview');
 }
@@ -2668,7 +2681,7 @@ async function confirmAck() {
   try {
     const res = await api('/api/acknowledgement', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                                    body: JSON.stringify({typed: input.value.trim()})});
-    if (!res || !res.success) { showToast(t('cw.ack_failed'), 'error'); return; }
+    if (!res || !res.success) { showToast(res && res.off_module ? failMsg(res) : t('cw.ack_failed'), 'error'); return; }
     const done = _ackDone;
     closeAckDialog();
     if (_cp.setup) _cp.setup.acknowledged = true;
@@ -2737,7 +2750,8 @@ function renderDesk(items, i) {
     : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')"' +
         (cur.off_module ? ' disabled' : '') + '>' +
         escHtml(t('desk.approve')) + ' <kbd>A</kbd></button>' +
-      '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
+      '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')"' +
+        (cur.off_module && !msg ? ' disabled' : '') + '>' +
         escHtml(t('desk.edit')) + ' <kbd>E</kbd></button>' +
       '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
         escHtml(t('desk.reject')) + ' <kbd>R</kbd></button>';
@@ -2815,7 +2829,7 @@ async function deskSave(id) {
     showToast(t('desk.saved'), 'success');
     loadOutbox();
   } else {
-    showToast((data && data.message) || t('desk.save_failed'), 'error');
+    showToast(failMsg(data, t('desk.save_failed')), 'error');
   }
 }
 
@@ -4931,7 +4945,7 @@ async function saveAudienceFromContacts() {
   const res = await api('/api/audiences', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                           body: JSON.stringify({name: name.trim(), query: contactQuery()})});
   if (res && res.success) showToast(t('cl.audience_saved', {name: name.trim()}), 'success');
-  else showToast((res && res.message) || t('camp.save_failed'), 'error');
+  else showToast(failMsg(res, t('camp.save_failed')), 'error');
 }
 
 // Pick a campaign (one not finished, made on the Campaigns page) for the ticked addresses.
@@ -4956,7 +4970,7 @@ async function addSelectedToCampaign() {
   try {
     const res = await api('/api/campaigns/' + encodeURIComponent(sel.value) + '/members', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: selectedEmails()})});
-    if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+    if (!res || !res.success) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return; }
     showToast(t('cl.added', {n: res.counts.added, left: res.counts.total - res.counts.added + (res.counts.not_found || 0)}), 'success');
     [..._cv.sel.entries()].forEach(([id, x]) => { if (x.kind === 'email') _cv.sel.delete(id); });
     document.getElementById('cl-addbar').innerHTML = '';
@@ -7076,7 +7090,7 @@ async function markSent(ci, ri, sent) {
     res = await resp.json();
   } catch {}
   const ok = !!(res && res.success);
-  if (!ok) showToast((res && res.message) || t('camp.save_failed'), 'error');
+  if (!ok) showToast(failMsg(res, t('camp.save_failed')), 'error');
   else if (!sent && res.sent) showToast(t('camp.already_replied'));
   else showToast(sent ? t('camp.marked') : t('camp.unmarked'), 'success');
   loadCampaigns();
@@ -7242,7 +7256,7 @@ async function campaignAction(id, action) {
   try {
     const res = await api('/api/campaigns/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
     if (res && res.success) showToast(t('cp.done.' + action), 'success');
-    else showToast((res && res.message) || t('camp.save_failed'), 'error');
+    else showToast(failMsg(res, t('camp.save_failed')), 'error');
   } finally {
     _cp.busy = false;
   }
@@ -7366,7 +7380,7 @@ async function removeCampaignMember(i) {
   if (!m || !confirm(t('cp.remove_confirm', {email: m.email}))) return;
   const res = await api('/api/campaigns/' + encodeURIComponent(_cp.open) + '/members', {
     method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({emails: [m.email]})});
-  if (!res || !res.success) showToast((res && res.message) || t('camp.save_failed'), 'error');
+  if (!res || !res.success) showToast(failMsg(res, t('camp.save_failed')), 'error');
   loadCampaigns();
 }
 
@@ -7407,7 +7421,7 @@ async function loadAudiences() {
 
 async function previewAudience(id) {
   const res = await api('/api/audiences/' + id + '/preview');
-  if (!res || !res.counts) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  if (!res || !res.counts) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return; }
   _cp.previews[id] = res.counts;
   loadAudiences();
 }
@@ -7415,8 +7429,9 @@ async function previewAudience(id) {
 async function renameAudience(id, name) {
   const next = prompt(t('cp.rename_prompt'), name);
   if (!next || !next.trim()) return;
-  await api('/api/audiences/' + id, {method: 'PATCH', headers: {'Content-Type': 'application/json'},
-                                     body: JSON.stringify({name: next.trim()})});
+  const res = await api('/api/audiences/' + id, {method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                                                 body: JSON.stringify({name: next.trim()})});
+  if (!res || !res.success) showToast(failMsg(res, t('camp.save_failed')), 'error');
   loadAudiences();
 }
 
@@ -7580,7 +7595,7 @@ async function cwPreview() {
     ? await api('/api/audiences/preview', {method: 'POST', headers: {'Content-Type': 'application/json'},
                                            body: JSON.stringify({query: contactQuery() || 'kind=email', send_to_risky: !!w.risky})})
     : await api('/api/audiences/' + Number(w.audience) + '/preview?send_to_risky=' + (w.risky ? 'true' : 'false'));
-  if (!res || !res.counts) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  if (!res || !res.counts) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return; }
   w.counts = res.counts;
   renderCampaignWizard();
 }
@@ -7596,7 +7611,7 @@ async function cwSave(quiet) {
       ? await api('/api/campaigns/' + encodeURIComponent(w.id), {method: 'PATCH', headers: {'Content-Type': 'application/json'},
                                                                 body: JSON.stringify(body)})
       : await api('/api/campaigns', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return false; }
+    if (!res || !res.success) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return false; }
     if (!w.id) w.id = res.id;
     if (!quiet) { showToast(t('cw.saved'), 'success'); loadCampaigns(); }
     return true;
@@ -7610,7 +7625,7 @@ async function cwGenerate() {
   if (!w || !(await cwSave(true))) return;
   showToast(t('cw.generating'));
   const res = await api('/api/campaigns/' + encodeURIComponent(w.id) + '/templates', {method: 'POST'});
-  if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  if (!res || !res.success) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return; }
   w.steps = res.sequence;
   renderCampaignWizard();
 }
@@ -7624,7 +7639,7 @@ async function cwStart() {
     return;
   }
   const res = await api('/api/campaigns/' + encodeURIComponent(w.id) + '/start', {method: 'POST'});
-  if (!res || !res.success) { showToast((res && res.message) || t('camp.save_failed'), 'error'); return; }
+  if (!res || !res.success) { showToast(failMsg(res, t('camp.save_failed')), 'error'); return; }
   showToast(t('cw.started', {n: (res.counts || {}).added || 0}), 'success');
   _cp.open = w.id;
   _cp.wiz = null;

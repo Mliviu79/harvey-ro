@@ -448,6 +448,8 @@ const I18N = {
 
     'today.title': 'Astăzi',
     'today.lede': 'Ce așteaptă decizia ta și cum avansează campaniile de email.',
+    'today.lede_messages': 'Ce așteaptă decizia ta și cum avansează mesajele.',
+    'today.lede_plain': 'Ce așteaptă decizia ta și cum avansează lucrul.',
     'today.needs_you': 'Așteaptă decizia ta', 'today.pipeline_now': 'Unde e fiecare pas acum',
     'today.recent': 'Activitate recentă', 'today.by_stage': 'Contacte pe etape', 'today.runs': 'Rulări',
     'today.error_title': 'Nu s-a putut verifica ce așteaptă decizia ta',
@@ -821,6 +823,7 @@ const I18N = {
 
     'ob.title': 'Coadă de trimitere',
     'ob.lede': 'Emailurile care te așteaptă. Citești unul, hotărăști, treci mai departe: <kbd>A</kbd> aprobi, <kbd>R</kbd> respingi, <kbd>E</kbd> editezi, <kbd>J</kbd>/<kbd>K</kbd> te miști.',
+    'ob.lede_messages': 'Mesajele care te așteaptă (SMS, WhatsApp). Citești unul, hotărăști, treci mai departe: <kbd>A</kbd> aprobi, <kbd>R</kbd> respingi, <kbd>E</kbd> editezi, <kbd>J</kbd>/<kbd>K</kbd> te miști.',
     'ob.error': 'Coada nu s-a putut citi',
     'ob.approve_all_title': 'Emailurile reținute de Harvey le aprobi tu, pe rând',
     'ob.approve_all': 'Aprobă toate ({n})', 'ob.resume': 'Reia trimiterea', 'ob.pause': 'Oprește toată trimiterea',
@@ -1574,6 +1577,8 @@ const I18N = {
 
     'today.title': 'Today',
     'today.lede': 'What’s waiting on you, and how the email pipeline is moving.',
+    'today.lede_messages': 'What’s waiting on you, and how your messages are moving.',
+    'today.lede_plain': 'What’s waiting on you, and how the work is moving.',
     'today.needs_you': 'Needs you', 'today.pipeline_now': 'Pipeline right now',
     'today.recent': 'Recent activity', 'today.by_stage': 'Contacts by stage', 'today.runs': 'Collector runs',
     'today.error_title': 'Couldn’t check what needs you',
@@ -1947,6 +1952,7 @@ const I18N = {
 
     'ob.title': 'Outbox',
     'ob.lede': 'Emails waiting for you. Read one, decide, move on — <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>E</kbd> edit, <kbd>J</kbd>/<kbd>K</kbd> to move.',
+    'ob.lede_messages': 'Messages waiting for you (SMS, WhatsApp). Read one, decide, move on — <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>E</kbd> edit, <kbd>J</kbd>/<kbd>K</kbd> to move.',
     'ob.error': 'Couldn’t read the Outbox',
     'ob.approve_all_title': 'Emails Harvey held are left for you to approve one by one',
     'ob.approve_all': 'Approve all {n}', 'ob.resume': 'Resume sending', 'ob.pause': 'Pause all sending',

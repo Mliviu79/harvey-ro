@@ -143,6 +143,10 @@ class TestOnlyNpathi:
         r = client.post(f"/api/outbox/{item}/approve")
         assert r.status_code == 409 and r.json()["off_module"] == "email_outreach"
         assert "Email campaigns" in r.json()["message"]
+        # Nor rewritten: an email draft is the Email module's.
+        r = client.post(f"/api/outbox/{item}/edit", json={"subject": "Alt", "body": "Alt text."})
+        assert r.status_code == 409 and r.json()["off_module"] == "email_outreach"
+        assert asyncio.run(_row(_db(env), item))["body"] == "Un email de dinainte."
         r = client.post("/api/outbox/approve-all")
         assert r.status_code == 409 and r.json()["off_module"] == "email_outreach"
         assert asyncio.run(_row(_db(env), item))["status"] == "pending_review"
@@ -253,3 +257,250 @@ def test_the_cli_refuses_an_email_with_email_off(tmp_path, monkeypatch):
     assert code == 1
     code, out = _cli(monkeypatch, db, "outbox", "--reject", item)
     assert code == 0 and "Rejected" in out
+
+
+# ── What only the Email module does: refused while it is off ──
+
+
+def _email_on_for(fn):
+    """``fn()`` run as if the Email module were on too (a test's setup:
+    what it made stays when the module goes off again)."""
+    real = switches.resolve
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(switches, "resolve", lambda stored, mans=None: real(
+            {**stored, switches.KEY.format(switches.EMAIL_MODULE): switches.ON}, mans))
+        return fn()
+
+
+def test_email_problem_names_the_email_module():
+    assert switches.email_problem({"email_outreach"}, "A new campaign") is None
+    off = switches.email_problem({"npathi"}, "A new campaign")
+    assert isinstance(off, switches.ModuleOff) and off.module_id == "email_outreach"
+    assert str(off).startswith("A new campaign needs the Email campaigns module")
+
+
+def _off(r):
+    assert r.status_code == 409, r.json()
+    assert r.json()["off_module"] == "email_outreach" and r.json()["success"] is False
+    return r
+
+
+@pytest.mark.modules_on("npathi")
+def test_campaign_work_is_refused_with_email_off_and_its_history_stays_open(client, env,
+                                                                            monkeypatch):
+    import harvey.dashboard as dash
+    from tests.test_campaigns import NOTE, SEQUENCE, config
+    from tests.test_dashboard_campaigns import _seed
+
+    cfg = config()
+    monkeypatch.setattr(dash, "_load_config_quietly", lambda: cfg)
+    _seed(env["db"], "office@alfa.example.com", "office@beta.example.com")
+
+    def setup():
+        aid = client.post("/api/audiences", json={"name": "Alfa", "query": "q=alfa"}).json()["id"]
+        draft = client.post("/api/campaigns", json={"name": "Ciornă", "audience_id": aid,
+                                                    "li_note": NOTE, "sequence": SEQUENCE})
+        paused = client.post("/api/campaigns", json={"name": "Pornită", "audience_id": aid,
+                                                     "li_note": NOTE, "sequence": SEQUENCE})
+        pid = paused.json()["id"]
+        assert client.post(f"/api/campaigns/{pid}/start").json()["success"]
+        assert client.post(f"/api/campaigns/{pid}/pause").json()["success"]
+        return aid, draft.json()["id"], pid
+    aid, cid, pid = _email_on_for(setup)
+
+    def no_model(*a, **k):
+        raise AssertionError("the model was asked with the Email module off")
+    monkeypatch.setattr(dash, "_campaign_writer", no_model)
+
+    _off(client.post("/api/audiences", json={"name": "Beta", "query": "q=beta"}))
+    _off(client.post("/api/campaigns", json={"name": "Alta", "li_note": NOTE}))
+    _off(client.patch(f"/api/campaigns/{cid}", json={"name": "Redenumită"}))
+    _off(client.post(f"/api/campaigns/{cid}/templates"))
+    _off(client.put(f"/api/campaigns/{cid}/templates", json={"sequence": SEQUENCE}))
+    _off(client.post(f"/api/campaigns/{cid}/members", json={"emails": ["office@beta.example.com"]}))
+    _off(client.post(f"/api/campaigns/{cid}/start"))
+    _off(client.post(f"/api/campaigns/{pid}/resume"))
+    _off(client.post("/api/acknowledgement", json={"typed": "accept"}))
+    _off(client.post("/api/sending-mode", json={"mode": "autopilot", "confirm": "autopilot"}))
+    _off(client.post("/api/prospects/p-x/sent", json={"sent": True}))
+    _off(client.patch(f"/api/audiences/{aid}", json={"name": "Redenumit"}))
+
+    # Nothing changed, and what it did stays readable and exportable.
+    listed = {c["id"]: c for c in client.get("/api/campaigns").json()}
+    assert listed[cid]["status"] == "draft" and listed[cid]["name"] == "Ciornă"
+    assert listed[pid]["status"] == "paused"
+    assert [a["name"] for a in client.get("/api/audiences").json()["audiences"]] == ["Alfa"]
+    assert client.get(f"/api/campaigns/{pid}").status_code == 200
+    assert client.get(f"/api/campaigns/{pid}/record.csv").status_code == 200
+    assert client.get(f"/api/audiences/{aid}/preview").status_code == 200
+    # Stopping and archiving (the safe way) stay open.
+    assert client.post(f"/api/campaigns/{pid}/stop").json()["campaign"]["status"] == "finished"
+    assert client.post(f"/api/campaigns/{cid}/archive").json()["campaign"]["status"] == "archived"
+    assert client.patch(f"/api/audiences/{aid}", json={"archived": True}).json()["success"]
+    assert client.get("/api/audiences").json()["audiences"] == []
+
+
+@pytest.mark.modules_on("npathi")
+def test_the_cli_approves_a_text_only_when_the_gate_would_send_it(tmp_path, monkeypatch):
+    """``harvey outbox --approve`` checks an SMS answer's text as the
+    dashboard's Approve does: one the sender would block stays waiting."""
+    import harvey.config as config_mod
+    from tests.test_module_switches import _cli
+
+    db = tmp_path / "harvey.db"
+    monkeypatch.setattr(config_mod, "load_config", lambda *a, **k: SendCfg())
+
+    async def seed():
+        s = StateManager(db_path=str(db))
+        await s.init_db()
+        bad = await _answer(s, "c-1", "p-1", body="Salut {nume}", approved=False)
+        good = await _answer(s, "c-2", "p-2", approved=False)
+        return bad, good
+
+    bad, good = asyncio.run(seed())
+    code, out = _cli(monkeypatch, db, "outbox", "--approve", bad)
+    assert code == 1 and "would block this message" in out and "curly braces" in out
+    assert asyncio.run(_row(StateManager(db_path=str(db)), bad))["status"] == "pending_review"
+    code, out = _cli(monkeypatch, db, "outbox", "--approve", good)
+    assert code == 0 and "Approved." in out
+    assert asyncio.run(_row(StateManager(db_path=str(db)), good))["status"] == "approved"
+
+
+# ── The pages' words with the Email module off ──
+
+
+LEDES = r'''
+const fs = require('fs'), vm = require('vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+global.localStorage = {getItem: () => process.argv[3], setItem: () => {}};
+vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
+const els = {'today-lede': {dataset: {}}, 'outbox-lede': {dataset: {}}};
+global.document = {getElementById: id => els[id] || null, querySelectorAll: () => []};
+global.currentTab = 'today';
+const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
+vm.runInThisContext('let _modules;' + pick('function applyModules() {', 'async function loadModules()'));
+const out = {};
+for (const [name, mods] of Object.entries({email: {email: true, messages: true},
+                                            messages: {email: false, messages: true},
+                                            none: {email: false, messages: false}})) {
+  vm.runInThisContext('_modules = ' + JSON.stringify(mods));
+  applyModules();
+  out[name] = {today: els['today-lede'].textContent, outbox: els['outbox-lede'].innerHTML};
+}
+process.stdout.write(JSON.stringify(out));
+'''
+
+
+@pytest.mark.parametrize("lang", ["ro", "en"])
+def test_the_ledes_speak_of_messages_with_email_off(lang):
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    web = Path(__file__).resolve().parent.parent / "harvey" / "web"
+    res = subprocess.run([node, "-e", LEDES, str(web / "app.js"), str(web / "i18n.js"), lang],
+                         text=True, encoding="utf-8", capture_output=True, timeout=60)
+    assert res.returncode == 0, res.stderr[-3000:]
+    out = json.loads(res.stdout)
+    assert "email" in out["email"]["today"].lower() and "mail" in out["email"]["outbox"].lower()
+    for page in ("today", "outbox"):
+        assert "mail" not in out["messages"][page].lower(), out["messages"][page]
+    assert ("mesaje" if lang == "ro" else "messages") in out["messages"]["today"]
+    assert "SMS" in out["messages"]["outbox"]
+    assert "mail" not in out["none"]["today"].lower()
+
+
+@pytest.mark.modules_on("npathi")
+def test_the_cli_refuses_the_email_modules_work_with_it_off(tmp_path, monkeypatch, capsys):
+    """``harvey campaigns new|start|resume|add``, ``harvey audiences save``,
+    ``harvey ack`` and ``harvey sending accept-gap`` are refused with the
+    Email module off, as the dashboard refuses them (a start would check
+    addresses at a verifier); listing, pausing and the record stay open."""
+    import builtins
+    import sqlite3
+
+    import harvey.config as config_mod
+    from harvey.state import READ_GAP_KEY
+    from tests.test_campaigns import NOTE, SEQUENCE, config, contact
+    from tests.test_module_switches import _cli
+
+    db = tmp_path / "harvey.db"
+    cfg = config()
+    monkeypatch.setattr(config_mod, "load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "accept")
+    sequence = tmp_path / "sequence.json"
+    sequence.write_text(json.dumps(SEQUENCE), encoding="utf-8")
+
+    async def seed():
+        s = StateManager(db_path=str(db))
+        await s.init_db()
+        await contact(s, "office@alfa.example.com")
+        await s.set_setting(READ_GAP_KEY, json.dumps(
+            {"since": 1, "covered_from": 2, "reason": "a test gap",
+             "mailbox": "fake:h@x.example.com"}))
+    asyncio.run(seed())
+
+    def setup():
+        code, out = _cli(monkeypatch, db, "audiences", "save", "Alfa", "--q", "alfa")
+        assert code == 0, out
+        code, out = _cli(monkeypatch, db, "campaigns", "new", "--name", "Alfa", "--audience",
+                         "1", "--note", NOTE, "--sequence-file", str(sequence))
+        assert code == 0, out
+        return out.split("Draft campaign ")[1].split()[0]
+    cid = _email_on_for(setup)
+
+    def counts():
+        con = sqlite3.connect(db)
+        try:
+            return (con.execute("SELECT COUNT(*) FROM audience").fetchone()[0],
+                    con.execute("SELECT COUNT(*), MAX(status) FROM campaigns").fetchone(),
+                    con.execute("SELECT COUNT(*) FROM campaign_member").fetchone()[0],
+                    con.execute("SELECT COUNT(*) FROM settings WHERE key = ?",
+                                (READ_GAP_KEY,)).fetchone()[0])
+        finally:
+            con.close()
+    before = counts()
+    for argv in (("campaigns", "new", "--name", "Beta", "--audience", "1", "--note", NOTE),
+                 ("campaigns", "start", cid), ("campaigns", "resume", cid),
+                 ("campaigns", "add", cid, "office@alfa.example.com"),
+                 ("audiences", "save", "Beta", "--q", "beta"), ("ack",),
+                 ("sending", "accept-gap")):
+        code, out = _cli(monkeypatch, db, *argv)
+        assert code == 1 and "Email campaigns module (email_outreach), which is off" in out, argv
+    assert counts() == before
+    assert asyncio.run(StateManager(db_path=str(db)).acknowledgement_status())["given"] is False
+    code, out = _cli(monkeypatch, db, "campaigns", "list")
+    assert code == 0 and "Alfa" in out
+    code, out = _cli(monkeypatch, db, "audiences", "list")
+    assert code == 0 and "Alfa" in out
+    code, out = _cli(monkeypatch, db, "ack", "--status")
+    assert code == 0 and "Not confirmed yet" in out
+    code, out = _cli(monkeypatch, db, "campaigns", "export", cid, "--out",
+                     str(tmp_path / "record.json"))
+    assert code == 0 and (tmp_path / "record.json").exists()
+
+
+@pytest.mark.modules_on("npathi")
+def test_a_read_gap_is_not_accepted_on_the_dashboard_with_email_off(client, env):
+    from harvey.state import READ_GAP_KEY
+
+    asyncio.run(_db(env).set_setting(READ_GAP_KEY, json.dumps(
+        {"since": 1, "covered_from": 2, "reason": "a test gap",
+         "mailbox": "fake:h@x.example.com"})))
+    _off(client.post("/api/mail/read-gap/accept", json={"typed": "accept"}))
+    assert asyncio.run(_db(env).read_gap()) is not None
+
+
+def test_the_campaign_pages_say_a_module_refusal_in_the_viewers_language():
+    """The Campaigns and Contacts actions show a refusal through failMsg,
+    which words ``off_module`` in RO or EN, not the server's English."""
+    from pathlib import Path
+
+    app = (Path(__file__).resolve().parent.parent / "harvey" / "web" / "app.js").read_text(
+        encoding="utf-8")
+    assert "failMsg(res, t('camp.save_failed'))" in app
+    assert "(res && res.message) || t('camp.save_failed')" not in app
+    assert "res && res.off_module ? failMsg(res) : t('cw.ack_failed')" in app

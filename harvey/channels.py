@@ -92,6 +92,21 @@ NPATHI_CHANNEL = {sub: ch for ch, subs in npathi.CHANNELS.items() for sub in sub
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
+async def answer_problems(state, item: dict, body: str, config) -> list[str]:
+    """What the gate would refuse in an SMS or WhatsApp answer's text (an
+    Outbox row, ``item``), as it would send it now: a first answer to the
+    number needs the firm's name and the opt-out line. The dashboard's
+    Approve and Edit and ``harvey outbox --approve`` ask it before an
+    answer is approved, while it can still be fixed. [] when none."""
+    from harvey import gate
+
+    rules = SEND_RULES.get(item.get("channel") or "")
+    if rules is None:
+        return ["not a messaging channel"]
+    first = not await state.messages_sent_to_since(item["channel"], item.get("to_phone") or "", "")
+    return gate.message_problems(body, max_chars=rules.max_chars, config=config, first=first)
+
+
 def _json(raw) -> dict:
     try:
         out = json.loads(raw or "{}")

@@ -15,6 +15,9 @@ from harvey.state import StateManager
 from tests.test_campaigns import NOTE, SEQUENCE, config
 from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 
+# The Email module's own work: it runs with the module on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 def _seed(db, *emails):
     async def run():

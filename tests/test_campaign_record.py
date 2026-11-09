@@ -32,6 +32,9 @@ from tests.test_campaigns import (  # noqa: F401  (state is a fixture)
 from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 from tests.test_outbox_native import Cfg, FakeProvider, make_handler, seed_prospect
 
+# The Email module's own work: it runs with the module on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 ALFA, BETA = "office@alfa.example.com", "office@beta.example.com"
 
 

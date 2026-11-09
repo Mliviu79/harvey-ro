@@ -28,6 +28,9 @@ from tests.test_outbox_native import FakeProvider, StubBrain, make_handler
 ROOT = Path(__file__).resolve().parents[1]
 CHAT, TURN = "chat-c", "turn-1"
 NOTE_LONG = NOTE + " Trimitem cel mult o revenire."
+# Campaigns are the Email module's: these tests run with it on, except
+# where one says otherwise (the closest marker wins).
+pytestmark = pytest.mark.modules_on("email_outreach")
 REPLY_KEYS = {"event", "kind", "at", "conversation", "campaign", "intent", "stage", "status",
               "asked_to_stop", "needs_human", "answer_waiting"}
 
@@ -269,6 +272,31 @@ def test_pause_yes_and_no_tool_starts_or_resumes(db):
         assert not n.startswith(("start", "resume", "approve", "send", "undo", "unsuppress")), n
 
 
+@pytest.mark.modules_on()           # (the defaults: the Email module off)
+def test_campaign_writes_are_refused_with_email_off_and_the_counts_stay(db):
+    """With the Email module off the agent saves no audience and makes,
+    edits or asks to start no campaign; its counts and pause stay open."""
+    plan_id = _plan(db)
+    aud, cid = _email_on_for(lambda: _draft(db, plan_id))
+    for tool, args in (
+            ("save_audience", {"plan": plan_id, "name": "Beta", "filter": {"q": "beta"}}),
+            ("create_campaign", {"plan": plan_id, "name": "Alta", "audience": aud["audience"],
+                                 "offer": "x", "sequence": SEQUENCE, "note": NOTE_LONG}),
+            ("edit_campaign", {"plan": plan_id, "campaign": cid, "name": "Z"}),
+            ("request_start", {"plan": plan_id, "campaign": cid})):
+        error, why = _one(db, tool, args)
+        assert error and "Email campaigns module (email_outreach), which is off" in why, tool
+        assert "the user turns modules on" in why
+    assert _q(db, "SELECT name, status FROM campaigns") == [("Stomatologi", "draft")]
+    assert _q(db, "SELECT COUNT(*) FROM audience") == [(1,)]
+    assert _q(db, "SELECT start_requested_at FROM agent_campaign") == [(None,)]
+    assert _ok(db, "campaign_preview", {"campaign": cid})["preview"]["ready"] == 1
+    assert _ok(db, "campaign_status", {"campaign": cid})["status"] == "draft"
+    # Each refusal is an action on file, as any refusal is.
+    assert _q(db, "SELECT COUNT(*) FROM agent_action WHERE outcome = 'refused' "
+                  "AND why LIKE '%email_outreach%'") == [(4,)]
+
+
 def test_the_status_and_the_preview_are_counts(db):
     plan_id = _plan(db)
     _, cid = _draft(db, plan_id)
@@ -394,7 +422,7 @@ class _GuidedBrain(StubBrain):
         return True
 
 
-@pytest.mark.modules_on("npathi")
+@pytest.mark.modules_on("npathi", "email_outreach")
 def test_draft_reply_answers_a_message_that_came_by_sms_back_on_sms(db, monkeypatch):
     """An answer to a text goes back as a text, to the number it came from,
     held for the user like any answer the agent asked for; one with no
@@ -518,24 +546,41 @@ def test_draft_reply_is_staged_for_review_with_the_guidance(db, monkeypatch):
     assert _q(db, "SELECT COUNT(*) FROM suppression WHERE undone_at IS NULL") == [(1,)]
 
 
+def _email_on_for(fn):
+    """``fn()`` as if the Email module were on (a test's setup, in a test
+    that runs with it off)."""
+    from tests.test_messages_without_email import _email_on_for as on_for
+
+    return on_for(fn)
+
+
+@pytest.mark.modules_on()           # (the defaults: the Email module off)
 def test_draft_reply_is_refused_while_its_channels_module_is_off(db, monkeypatch):
     """With the Email module off no email answer is queued for the agent
     (the Outbox may be shown for nPathi's texts, and an email there could
-    only wait); the model isn't asked."""
+    only wait); the model isn't asked, and replies() says so first."""
     import harvey.agents.sender as sender_mod
     from harvey.agents.handler import Handler
     from tests.test_outbox_native import Cfg, Env
 
     monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: FakeProvider())
     plan_id = _plan(db)
-    _, cid = _draft(db, plan_id)
-    _start(db, cid)
     state = StateManager(str(db))
-    _run(_sent_first_email(state, cid, "office@alfa.example.com"))
-    _reply(state, "office@alfa.example.com", "Cât costă?")
+
+    def setup():
+        _, cid = _draft(db, plan_id)
+        _start(db, cid)
+        _run(_sent_first_email(state, cid, "office@alfa.example.com"))
+        _reply(state, "office@alfa.example.com", "Cât costă?")
+        return cid
+    _email_on_for(setup)
     [convo] = _q(db, "SELECT id FROM conversations")
     _run(state.update_outbox_item(_q(db, "SELECT id FROM outbox WHERE kind = 'reply'")[0][0],
                                   status="rejected"))
+    [c] = _ok(db, "replies", {"plan": plan_id})["conversations"]
+    assert c["answerable"] is False and c["why"] == "module_off"
+    assert _email_on_for(lambda: _ok(db, "replies", {"plan": plan_id}))[
+        "conversations"][0]["answerable"] is True
     brain = _GuidedBrain()
 
     def handler(state_, cfg):

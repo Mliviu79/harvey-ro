@@ -575,6 +575,23 @@ def cmd_outbox(args):
             if problem:
                 print(f"\n  {problem}\n")
                 sys.exit(1)
+            if item and item.get("status") == "pending_review" \
+                    and (item.get("channel") or "email") != "email":
+                # An SMS or WhatsApp answer the gate would refuse isn't
+                # approved, as on the dashboard: edit it there first.
+                from harvey import channels
+                from harvey.config import load_config
+
+                try:
+                    config = load_config()
+                except Exception:
+                    config = None
+                problems = await channels.answer_problems(state, item, item.get("body") or "",
+                                                          config)
+                if problems:
+                    print("\n  The sender would block this message: " + "; ".join(problems))
+                    print("  Edit it on the dashboard's Outbox, or reject it.\n")
+                    sys.exit(1)
             n = await state.approve_outbox(args.approve)
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
@@ -3806,6 +3823,17 @@ def cmd_channels(args):
     raise SystemExit(asyncio.run(_run()))
 
 
+async def _email_refused(state, what: str) -> None:
+    """Exits with why when ``what``, something only the Email module does,
+    is asked while it is off (as the dashboard refuses it)."""
+    from harvey.modules import switches
+
+    off = switches.email_problem(await switches.enabled_ids(state), what)
+    if off is not None:
+        print(f"\n  {off}\n")
+        sys.exit(1)
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -3823,6 +3851,7 @@ def cmd_sending(args):
         elif args.sending_action == "accept-gap":
             # Cold email waits for a mailbox read back to the last complete
             # one; a mailbox too big to read that far never gets there.
+            await _email_refused(state, "Accepting a mailbox read gap")
             gap = await state.read_gap()
             if gap is None:
                 print("\n  No read gap: cold email isn't waiting for one.\n")
@@ -3868,6 +3897,7 @@ def cmd_ack(args):
         if args.status:
             print("  Not confirmed yet: cold email waits until it is (harvey ack).\n")
             return
+        await _email_refused(state, "The cold-email acknowledgement")
         try:
             typed = input(f"  Type {acknowledgement.CONFIRM_WORD} to confirm: ").strip()
         except EOFError:
@@ -3969,6 +3999,7 @@ def cmd_audiences(args):
         action = args.audiences_action
         try:
             if action == "save":
+                await _email_refused(state, "Saving an audience")
                 query = args.query or _contacts_query(args)
                 aid = await state.campaigns_call(campaigns.save_audience, args.name, query)
                 print(f"\n  Saved audience {aid}: "
@@ -4024,6 +4055,12 @@ def cmd_campaigns(args):
         await state.init_db()
         action = args.campaigns_action
         config = load_config()
+        # (Reading, pausing, stopping, archiving, taking members out and the
+        # record stay open with the Email module off.)
+        what = {"new": "A new campaign", "start": "Starting a campaign",
+                "resume": "Resuming a campaign", "add": "Adding addresses to a campaign"}
+        if action in what:
+            await _email_refused(state, what[action])
         try:
             if action == "new":
                 note = args.note or ""

@@ -28,7 +28,7 @@ from harvey.state import COLLEAGUE_REPLIED, Prospect
 from tests.test_dashboard_live_status import client, env  # noqa: F401  (fixtures)
 from tests.test_outbox_native import Cfg, Env, StubBrain, state  # noqa: F401  (fixture)
 
-pytestmark = pytest.mark.modules_on("npathi", "email_outreach")
+pytestmark = pytest.mark.modules_on("npathi")
 
 KEY = "zk_test_fictional_key_7788"
 URL = "https://chat.example.com"

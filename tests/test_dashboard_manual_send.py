@@ -15,6 +15,9 @@ from fastapi.testclient import TestClient
 import harvey.dashboard as dash
 from harvey.state import StateManager
 
+# The Email module's own work: it runs with the module on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 ORIGIN = "http://127.0.0.1:5555"
 
 

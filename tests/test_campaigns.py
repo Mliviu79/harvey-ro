@@ -566,6 +566,7 @@ async def test_an_audience_keeps_the_page_filters_and_reads_them_like_the_page(s
 
 # ── The CLI ──
 
+@pytest.mark.modules_on("email_outreach")
 def test_harvey_audiences_and_campaigns(tmp_path, monkeypatch, capsys):
     import asyncio
 

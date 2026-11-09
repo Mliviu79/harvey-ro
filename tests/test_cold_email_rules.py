@@ -18,6 +18,9 @@ from harvey.models.prospect import Prospect
 from harvey.state import ACK_NEEDED, NOTE_ADDED, StateManager
 from tests.test_outbox_native import FakeProvider, make_sender, seed_campaign, seed_prospect
 
+# The Email module's own work: it runs with the module on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 def _now():
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()

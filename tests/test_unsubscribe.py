@@ -807,6 +807,7 @@ async def test_a_gap_can_be_accepted_and_cold_email_goes_again(state):
     assert (item["status"], item["error"]) == ("sent", "")
 
 
+@pytest.mark.modules_on("email_outreach")
 def test_harvey_sending_accept_gap_needs_the_word(tmp_path, monkeypatch, capsys):
     import asyncio
     import builtins

@@ -34,7 +34,7 @@ from tests.test_npathi import (  # noqa: F401  (fixtures)
 )
 from tests.test_outbox_native import FakeProvider
 
-pytestmark = pytest.mark.modules_on("npathi", "email_outreach")
+pytestmark = pytest.mark.modules_on("npathi")
 
 DESK = "+40268000101"          # a fixed line
 BOB = "+40730000104"           # another mobile

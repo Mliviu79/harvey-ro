@@ -22,6 +22,9 @@ from harvey.models.prospect import Prospect
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 
+# Email drafts are the Email module's: these run with it on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 @pytest.fixture
 def client(monkeypatch):
@@ -198,8 +201,6 @@ def test_every_open_role_shows_and_unlabelled_signals_keep_their_code(client):
     assert "Roofing estimator" in hiring[0] and "Crew foreman" in hiring[0]
 
 
-# (Approving email needs the Email module on.)
-@pytest.mark.modules_on("email_outreach")
 def test_an_approved_edit_is_what_gets_sent(client):
     from tests.test_outbox_native import FakeProvider, make_sender
     state, item_id = asyncio.run(_seed(client.db_path))

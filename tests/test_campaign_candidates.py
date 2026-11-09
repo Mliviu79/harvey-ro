@@ -345,6 +345,7 @@ async def test_send_to_risky_takes_only_true_or_false(state):
     assert (await _fresh(state, cid))["send_to_risky"] is False
 
 
+@pytest.mark.modules_on("email_outreach")
 def test_harvey_campaigns_new_send_to_risky(tmp_path, monkeypatch, capsys):
     import asyncio
     import json

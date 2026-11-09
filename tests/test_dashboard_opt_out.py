@@ -8,6 +8,8 @@ import asyncio
 import json
 import sqlite3
 
+import pytest
+
 from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 from harvey.state import StateManager
 
@@ -185,6 +187,7 @@ def test_the_contact_list_flags_an_undone_opt_out(client):
     assert flags == {"p1": True, "p2": False}
 
 
+@pytest.mark.modules_on("email_outreach")
 def test_a_read_gap_is_accepted_only_when_typed(client):
     from harvey.state import READ_GAP_KEY
 

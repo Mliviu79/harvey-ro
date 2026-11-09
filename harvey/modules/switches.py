@@ -168,6 +168,15 @@ def channel_problem(enabled: set[str], channel: str) -> ValueError | None:
     return None
 
 
+def email_problem(enabled: set[str], what: str) -> ModuleOff | None:
+    """Why ``what``, something only the Email module does (a campaign made,
+    edited, started or resumed, its sequence written, addresses added, an
+    audience saved, the cold-email acknowledgement, autopilot, a hand
+    send), is refused with these modules on, or None. Reading, pausing,
+    stopping and exporting what it did stay open with it off."""
+    return None if EMAIL_MODULE in enabled else ModuleOff(EMAIL_MODULE, what)
+
+
 # A module's own settings ([settings] in its manifest), per install.
 SETTING_KEY = "modules.{}.{}"
 

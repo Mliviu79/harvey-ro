@@ -377,6 +377,7 @@ def test_no_opt_out_line_is_warned_about_too():
     assert "opt_out_line" in compliance_notice(cfg)
 
 
+@pytest.mark.modules_on("email_outreach")          # (an email draft: the Email module's)
 def test_an_edit_the_footer_would_push_over_the_limit_is_refused(client, monkeypatch, env):
     import sqlite3
     import harvey.config

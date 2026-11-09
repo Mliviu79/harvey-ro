@@ -3321,6 +3321,19 @@ async def _with_context_overlay(items: list[dict]) -> list[dict]:
     return items
 
 
+async def _email_refusal(state, what: str):
+    """The 409 for something only the Email module does (a campaign made,
+    edited, started, an audience saved, the acknowledgement, autopilot, a
+    hand send) while it is off, or None. The page says it in the viewer's
+    language from ``off_module``."""
+    from harvey.modules import switches
+
+    problem = switches.email_problem(await switches.enabled_ids(state), what)
+    if problem is None:
+        return None
+    return JSONResponse(_error_body(problem, "message", success=False), status_code=409)
+
+
 async def _channel_refusal(state, channel: str):
     """The 409 for a row on ``channel`` whose module is off (an email while
     the Email module is off, an SMS while nPathi's is), or None: such a row
@@ -3425,12 +3438,16 @@ async def set_sending_mode(request: Request):
         return _refuse('expected {"mode": "approval"} or {"mode": "autopilot", "confirm": "autopilot"}', 400)
     if mode == "autopilot" and body.get("confirm") != "autopilot":
         return _refuse('Type "autopilot" to confirm: Harvey will send email without asking you.', 400)
+    state = _state()
+    await state.init_db()
+    # (Back to approval stays open with the Email module off: the safe way.)
+    refused = await _email_refusal(state, "Autopilot") if mode == "autopilot" else None
+    if refused:
+        return refused
     try:
         path = set_require_approval(mode == "approval", _resolve_config_file())
     except ConfigError as e:
         return _refuse(str(e), 409)
-    state = _state()
-    await state.init_db()
     requeued = await state.requeue_autopilot_approved() if mode == "approval" else 0
     await state.log_action("sending_mode", "dashboard", {"mode": mode, "file": path.name,
                                                          "requeued": requeued})
@@ -3458,16 +3475,10 @@ async def outbox_approve_all():
 
 async def _message_problems(state, item: dict, body: str) -> list[str]:
     """What the gate would refuse in an SMS or WhatsApp answer's text, as
-    it would send it now (a first answer to the number needs the firm's
-    name and the opt-out line)."""
-    from harvey import channels, gate
+    it would send it now (channels.answer_problems)."""
+    from harvey import channels
 
-    rules = channels.SEND_RULES.get(item.get("channel") or "")
-    if rules is None:
-        return ["not a messaging channel"]
-    first = not await state.messages_sent_to_since(item["channel"], item.get("to_phone") or "", "")
-    return gate.message_problems(body, max_chars=rules.max_chars,
-                                 config=_load_config_quietly(), first=first)
+    return await channels.answer_problems(state, item, body, _load_config_quietly())
 
 
 @app.post("/api/outbox/{item_id}/approve")
@@ -3511,6 +3522,12 @@ async def outbox_edit(item_id: str, request: Request):
             return JSONResponse({"success": False,
                                  "message": "Only drafts awaiting review can be edited."},
                                 status_code=409)
+        if (item.get("channel") or "email") == "email":
+            # (An email draft is the Email module's: with it off the row
+            # stays listed and rejectable, never rewritten.)
+            refused = await _channel_refusal(state, "email")
+            if refused:
+                return refused
         if (item.get("channel") or "email") != "email":
             # An SMS or WhatsApp answer: text only, checked as the messenger
             # will check it (its length, braces, links, the first answer's
@@ -3686,12 +3703,15 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
         if not isinstance(body, dict) or not isinstance(body.get("sent", True), bool):
             return _refuse('expected {"sent": true|false}', 400)
         sent = body.get("sent", True)
+        state = _state()
+        await state.init_db()
+        refused = await _email_refusal(state, "Marking an email sent by hand")
+        if refused:
+            return refused
         rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
         if not rows:
             return _refuse("unknown prospect", 404)
         current = rows[0].get("status") or "new"
-        state = _state()
-        await state.init_db()
         key = MANUAL_SEND_KEY + prospect_id
         marked = bool(await state.get_setting(key))
 
@@ -4361,6 +4381,9 @@ async def post_acknowledgement(request: Request):
         return _refuse(f'expected {{"typed": "{acknowledgement.CONFIRM_WORD}"}}', 400)
     state = _state()
     await state.init_db()
+    refused = await _email_refusal(state, "The cold-email acknowledgement")
+    if refused:
+        return refused
     await state.acknowledge("dashboard")
     return {"success": True, **await state.acknowledgement_status()}
 
@@ -4379,6 +4402,9 @@ async def accept_read_gap(request: Request):
         return _refuse('expected {"typed": "accept"}', 400)
     state = _state()
     await state.init_db()
+    refused = await _email_refusal(state, "Accepting a mailbox read gap")
+    if refused:
+        return refused
     if not await state.accept_read_gap("dashboard"):
         return _refuse("Cold email isn't waiting for a mailbox read.", 404)
     return {"success": True}
@@ -4507,6 +4533,9 @@ async def save_audience(request: Request):
 
     body = await _json_body(request)
     state = await _campaign_state()
+    refused = await _email_refusal(state, "Saving an audience")
+    if refused:
+        return refused
     try:
         audience_id = await launch.save_audience(state, str(body.get("name") or ""),
                                                  str(body.get("query") or ""))
@@ -4526,6 +4555,11 @@ async def edit_audience(audience_id: int, request: Request):
 
     body = await _json_body(request)
     state = await _campaign_state()
+    # (Archiving stays open with the Email module off; a rename doesn't.)
+    refused = await _email_refusal(state, "Renaming an audience") \
+        if body.get("name") is not None else None
+    if refused:
+        return refused
     try:
         changed = await state.campaigns_call(
             campaigns.update_audience, audience_id, name=body.get("name"),
@@ -4629,6 +4663,9 @@ async def create_campaign(request: Request):
     from harvey import campaigns, launch
 
     body = await _json_body(request)
+    refused = await _email_refusal(await _campaign_state(), "A new campaign")
+    if refused:
+        return refused
     try:
         config = _campaign_config()
         state = await _campaign_state()
@@ -4676,6 +4713,9 @@ async def edit_campaign(campaign_id: str, request: Request):
     allowed = ("name", "offer", "sequence", "li_note", "review", "rolling", "audience_id", "query",
                "send_to_risky")
     state = await _campaign_state()
+    refused = await _email_refusal(state, "Editing a campaign")
+    if refused:
+        return refused
     try:
         c = await state.campaigns_call(campaigns.update_campaign, campaign_id,
                                        **{k: body[k] for k in allowed if k in body})
@@ -4694,6 +4734,10 @@ async def generate_templates(campaign_id: str):
     from harvey.models.campaign import Campaign
 
     state = await _campaign_state()
+    # (It calls the model: not with the Email module off.)
+    refused = await _email_refusal(state, "Writing a campaign's sequence")
+    if refused:
+        return refused
     c = await state.campaign_record(campaign_id)
     if c is None:
         return _refuse("no such campaign", 404)
@@ -4720,6 +4764,9 @@ async def save_templates(campaign_id: str, request: Request):
 
     body = await _json_body(request)
     state = await _campaign_state()
+    refused = await _email_refusal(state, "Editing a campaign")
+    if refused:
+        return refused
     try:
         c = await state.campaigns_call(campaigns.update_campaign, campaign_id,
                                        sequence=body.get("sequence"))
@@ -4762,6 +4809,9 @@ async def add_campaign_members(campaign_id: str, request: Request):
             or any(not isinstance(e, str) for e in emails):
         return _refuse('expected {"emails": [...]} (at most 5000)', 400)
     state = await _campaign_state()
+    refused = await _email_refusal(state, "Adding addresses to a campaign")
+    if refused:
+        return refused
     try:
         counts = await campaigns.add_by_hand(state, _campaign_config(), campaign_id, emails)
     except (campaigns.Refused, ValueError) as e:
@@ -4811,6 +4861,12 @@ async def campaign_action(campaign_id: str, action: str):
     if action not in ("start", "pause", "resume", "stop", "archive"):
         return _refuse("unknown action", 404)
     state = await _campaign_state()
+    # (Pause, stop and archive stay open with the Email module off.)
+    refused = await _email_refusal(state, "Starting a campaign" if action == "start"
+                                   else "Resuming a campaign") \
+        if action in ("start", "resume") else None
+    if refused:
+        return refused
     try:
         if action == "start":
             counts = await campaigns.start(state, _campaign_config(), campaign_id)

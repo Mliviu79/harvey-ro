@@ -64,6 +64,10 @@ ANSWERABLE = ("interested", "objection", "question", "wrong_person")
 GUIDANCE_CHARS = 500
 CONVERSATIONS_LIMIT = 50
 REASON_CHARS = 200
+# Why a conversation isn't answerable, in the order draft_reply checks it:
+# an answer waits, an intent Harvey doesn't answer, closed, nothing new of
+# theirs, the module of its channel off.
+UNANSWERABLE = ("answer_waiting", "intent", "status", "answered", "module_off")
 
 
 class Refused(ValueError):
@@ -284,14 +288,28 @@ async def status(state, campaign_id) -> dict:
 
 
 async def conversations(state, campaign_id: str, limit: int = CONVERSATIONS_LIMIT) -> list[dict]:
-    """A campaign's newest conversations: ids and their enums, never text."""
-    return [{"conversation": cid, "campaign": campaign_id, "intent": _enum(i, INTENTS),
-             "stage": _enum(st, STAGES), "status": _enum(s, CONVERSATION_STATUSES),
-             "needs_human": s == "needs_human", "answer_waiting": bool(w),
-             "answerable": i in ANSWERABLE and s in ("open", "needs_human") and not w
-             and last == "prospect"}
-            for cid, i, st, s, _at, w, last, _channel in await _all(
-                state, "overlay.agent.campaign_conversations", (campaign_id, int(limit)))]
+    """A campaign's newest conversations: ids and their enums, never text.
+    ``answerable`` is whether draft_reply would take it; when not, ``why``
+    says which of its checks it fails first (UNANSWERABLE)."""
+    from harvey.modules import switches
+
+    on = await switches.enabled_ids(state)
+    out = []
+    for cid, i, st, s, _at, w, last, channel in await _all(
+            state, "overlay.agent.campaign_conversations", (campaign_id, int(limit))):
+        why = ("answer_waiting" if w else
+               "intent" if i not in ANSWERABLE else
+               "status" if s not in ("open", "needs_human") else
+               "answered" if last != "prospect" else
+               "module_off" if switches.channel_problem(on, channel or "email") else "")
+        row = {"conversation": cid, "campaign": campaign_id, "intent": _enum(i, INTENTS),
+               "stage": _enum(st, STAGES), "status": _enum(s, CONVERSATION_STATUSES),
+               "needs_human": s == "needs_human", "answer_waiting": bool(w),
+               "answerable": not why}
+        if why:
+            row["why"] = why
+        out.append(row)
+    return out
 
 
 # ── What the agent does: through the Campaigns page's own code ──
@@ -341,6 +359,17 @@ def _offer(offer) -> dict:
     return offer if isinstance(offer, dict) else {}
 
 
+async def _email_on(state, what: str) -> None:
+    """Refused while the Email module is off: what writes a campaign or an
+    audience, or asks the model, is the Email module's (its reads, counts
+    and pause stay open)."""
+    from harvey.modules import switches
+
+    off = switches.email_problem(await switches.enabled_ids(state), what)
+    if off is not None:
+        raise Refused(f"{off}; the user turns modules on, not the agent")
+
+
 async def _audience(state, audience) -> dict:
     from harvey import campaigns
 
@@ -360,6 +389,7 @@ async def save_audience(state, config, name, query: str) -> dict:
     address."""
     from harvey import campaigns, launch
 
+    await _email_on(state, "Saving an audience")
     try:
         # (The name as the page sends it: campaigns.save_audience strips it
         # and cuts it to campaigns.NAME_CHARS, for both.)
@@ -379,6 +409,7 @@ async def create(state, config, plan: int, chat: str, *, name, audience, offer, 
     the setting's unless given (never past it: campaigns.risky_allowed)."""
     from harvey import campaigns, launch
 
+    await _email_on(state, "A new campaign")
     a = await _audience(state, audience)
     body = {"name": str(name or ""), "audience_id": a["id"],
             "rolling": bool(rolling), "offer": _offer(offer),
@@ -404,6 +435,7 @@ async def edit(state, plan: int, chat: str, campaign_id, *, name=None, audience=
     """One of this plan's drafts edited the way the wizard's Save edits it."""
     from harvey import campaigns
 
+    await _email_on(state, "Editing a campaign")
     c = await _own(state, plan, chat, campaign_id, draft=True)
     fields: dict = {}
     if name is not None:
@@ -493,6 +525,7 @@ async def request_start(state, config, plan: int, chat: str, campaign_id) -> dic
     as a card (its audience counted now, its sequence, its note, the
     sending account) whose button opens it on the Campaigns page. Nothing
     starts here."""
+    await _email_on(state, "Asking to start a campaign")
     c = await _own(state, plan, chat, campaign_id, draft=True)
     counted = await preview(state, config, c["id"])
     need = await to_do(state, config, c)

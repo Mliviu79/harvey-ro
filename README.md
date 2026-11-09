@@ -1293,7 +1293,10 @@ is for: Harvey drafts the answer, you approve it in the Outbox, every time
    The Email module can stay off: the Outbox, Conversations and Today show
    while either is on, and with Email off they hold only SMS and WhatsApp
    (an email queued from before stays listed, to reject, and can't be
-   approved until the Email module is on again).
+   approved until the Email module is on again). Campaigns, audiences,
+   autopilot and the cold-email acknowledgement are the Email module's: with
+   it off they can be read, exported, paused and stopped, not made, edited
+   or started.
 2. **Connect it**: Settings → Channels (or `harvey channels connect`). Enter
    your install's address (`https://...`; Harvey refuses plain http and private
    addresses) and a workspace API key with `account.view`, `sms.read` /

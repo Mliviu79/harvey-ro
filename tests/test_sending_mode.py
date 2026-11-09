@@ -20,6 +20,9 @@ from harvey.paths import PROJECT_ROOT
 from harvey.state import StateManager
 from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 
+# The Email module's own work: it runs with the module on.
+pytestmark = pytest.mark.modules_on("email_outreach")
+
 
 @pytest.fixture
 def yaml_file(tmp_path):

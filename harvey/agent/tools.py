@@ -701,7 +701,8 @@ def build(db_path: str, chat: str = "", task: int | None = None):
           "objection, question, wrong_person, not_interested, ooo, unsubscribe, escalate), "
           "how many need a human, how many have an answer waiting, and the newest "
           f"{outreach.CONVERSATIONS_LIMIT} conversations' ids with those fields and whether "
-          "an answer can be drafted. Never their text, subject or address.")
+          "an answer can be drafted (when not, why: "
+          f"{', '.join(outreach.UNANSWERABLE)}). Never their text, subject or address.")
     async def replies(campaign: str = "", plan: int | None = None) -> str:
         return await t.call("replies", {"campaign": campaign, "plan": plan},
                             lambda: a.campaign_read("replies", campaign or None, plan))

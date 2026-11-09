@@ -1069,7 +1069,25 @@ minor versions can still change behaviour.
   box. Modules declare their channels in their manifest (`channels`), one
   module each. The kill switch still stops every channel. Harvey's agent
   can't draft an answer (`draft_reply`) while the module of the channel it
-  would go by is off.
+  would go by is off, and `replies()` marks such a conversation not
+  answerable, with why (`module_off`; or an answer waiting, an intent
+  Harvey doesn't answer, a closed conversation, or nothing new of theirs
+  to answer).
+- **With the Email module off, its work is refused, not only hidden.** A
+  campaign made, edited, its sequence written or saved, addresses added,
+  started or resumed, an audience saved or renamed, an email draft in the
+  Outbox edited, the cold-email acknowledgement,
+  autopilot, a hand send and accepting a mailbox read gap are refused by
+  the server, naming the module (in Romanian or English on the page, the
+  Campaigns and Contacts actions included); so are `harvey campaigns
+  new|start|resume|add`, `harvey audiences save`, `harvey ack` and
+  `harvey sending accept-gap`, and the agent's
+  `save_audience`, `create_campaign`, `edit_campaign` and `request_start`.
+  Reading campaigns and audiences, their previews and the record export,
+  pausing, stopping and archiving, rejecting an email in the Outbox, and
+  switching back to approval stay
+  open. Today's and the Outbox's introductions speak of messages, not
+  email, while the Email module is off.
 - **A rolling campaign's hourly roll no longer reads its whole audience.**
   It reads the contacts that changed since its last roll and its
   candidates that came due (see Added); a roll with one changed contact
@@ -1497,6 +1515,11 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **`harvey outbox --approve` checks an SMS or WhatsApp answer's text** as
+  the dashboard's Approve does: one the sender would block (curly braces,
+  too long, a link that isn't yours, a first answer without your firm's
+  name or the opt-out line) stays waiting, and the command says why and
+  exits 1.
 - **Numbers on the do-not-contact list stay out of exports**: `harvey
   export`, the companies export and the Contacts export leave them out.
 - **Undo opt-out lifts the person's number too** (a STOP by SMS), not only

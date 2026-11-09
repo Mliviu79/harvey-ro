@@ -582,6 +582,7 @@ def test_a_running_child_is_stopped_when_its_task_is_cancelled(state, fake, monk
 
 # ── A campaign_driver keeps to its campaign ──
 
+@pytest.mark.modules_on("email_outreach")
 def test_a_campaign_driver_works_on_its_own_campaign_only(tmp_path, monkeypatch):
     from tests.test_agent_campaigns import NOTE_LONG
     from tests.test_campaigns import SEQUENCE, config, contact
