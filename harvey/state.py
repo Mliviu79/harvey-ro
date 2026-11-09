@@ -200,6 +200,25 @@ _HELD_CAMPAIGN = ("o.campaign_id IN (SELECT id FROM campaigns "
                   "WHERE status IN ('paused', 'draft'))")
 
 
+def _prev_step(cond: str) -> str:
+    """SQL: a row of the step before follow-up ``o`` (same campaign and
+    person) where ``cond`` holds on it, as ``p``."""
+    return ("EXISTS (SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
+            "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
+            f"AND p.step = o.step - 1 AND {cond})")
+
+
+# SQL: the step before follow-up ``o`` is on file and nothing of it went (a
+# removed row beside one that went is only the record).
+_PREV_NOT_SENT = _prev_step("p.status != 'sent'") + " AND NOT " + _prev_step("p.status = 'sent'")
+# SQL: the step before follow-up ``o`` hasn't gone yet: it waits, or it was
+# removed and nothing of that step went or ended (the campaign cycle drafts
+# it again).
+_PREV_UNSENT = (_prev_step("p.status IN ('pending_review', 'approved', 'sending', 'removed')")
+                + " AND NOT " + _prev_step("p.status NOT IN ('pending_review', 'approved', "
+                                           "'sending', 'removed')"))
+
+
 def _company_answered(p: str) -> str:
     """SQL: someone at prospect ``p``'s company has replied."""
     return (f"EXISTS (SELECT 1 FROM prospects c, settings s "
@@ -252,6 +271,9 @@ RECHECK_PREFIX = "Precleared couldn't check this address; trying again after "
 # have reached them. Never retried, and counted as Harvey's mail, so the
 # dashboard never offers a second one by hand.
 MAYBE_SENT_PREFIX = "may have gone out: "
+# A row you removed before it went (status 'removed'): never sent, and its
+# campaign member stays in (state.remove_outbox_item).
+REMOVED_BY_YOU = "removed by you before it went"
 STALE_SENDING_ERROR = (
     MAYBE_SENT_PREFIX + "Harvey stopped in the middle of sending it; check "
     "your Sent folder before emailing them again"
@@ -1409,12 +1431,7 @@ class StateManager:
         if follow_ups_only:
             where.append("o.kind = 'sequence' AND o.step > 1")
         if skip_unready_follow_ups:
-            where.append(
-                "NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS ("
-                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
-                "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
-                "AND p.step = o.step - 1 "
-                "AND p.status IN ('pending_review', 'approved', 'sending')))")
+            where.append(f"NOT (o.kind = 'sequence' AND o.step > 1 AND {_PREV_UNSENT})")
         sql = "SELECT * FROM outbox o"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1482,11 +1499,7 @@ class StateManager:
             params += [len(moved_back_prefix), moved_back_prefix]
         sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
                f"AND o.kind = 'sequence' AND {due} AND NOT {_HELD_CAMPAIGN} "
-               "AND NOT (o.step > 1 AND EXISTS ("
-               "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
-               "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
-               "AND p.step = o.step - 1 "
-               "AND p.status IN ('pending_review', 'approved', 'sending')))")
+               f"AND NOT (o.step > 1 AND {_PREV_UNSENT})")
         if stored_verdicts:
             # A verdict is stored as JSON under prefix + the lower-cased
             # address, with the facts it was decided on and when.
@@ -1531,17 +1544,31 @@ class StateManager:
         "price_credits", "provider_status", "approved_by",
     })
 
-    async def update_outbox_item(self, item_id: str, **kwargs):
+    async def update_outbox_item(self, item_id: str, *, if_status: str | None = None,
+                                 if_updated: str | None = None, **kwargs) -> int:
+        """Write these columns of one row. ``if_status`` / ``if_updated``:
+        only while the row still has the status (or the updated_at) it was
+        read with, so a decision made on a stale read (a drain's hold) never
+        brings back a row you removed, rejected or edited since. Returns
+        rows changed."""
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
         if not fields:
-            return
+            return 0
         sets = ", ".join(f"{k} = ?" for k in fields)
+        where, params = "id = ?", [item_id]
+        if if_status is not None:
+            where += " AND status = ?"
+            params.append(if_status)
+        if if_updated is not None:
+            where += " AND updated_at = ?"
+            params.append(if_updated)
         async with self._connect() as db:
-            await db.execute(
-                f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ?",
-                (*fields.values(), _utcnow().isoformat(), item_id),
+            cursor = await db.execute(
+                f"UPDATE outbox SET {sets}, updated_at = ? WHERE {where}",
+                (*fields.values(), _utcnow().isoformat(), *params),
             )
             await db.commit()
+            return cursor.rowcount
 
     async def claim_outbox_item(self, item_id: str) -> bool:
         """Take an approved item for sending: approved → sending, atomically.
@@ -1686,6 +1713,70 @@ class StateManager:
 
         return await self._in_tx(run)
 
+    async def remove_outbox_item(self, item_id: str, *, by: str) -> int:
+        """Remove a message that hasn't gone (pending or approved, any
+        channel) and was never handed over: no provider message id, no send
+        attempt kept for it (an SMS or WhatsApp answer tried under its
+        Idempotency-Key may have gone). Kept as 'removed' for the record;
+        never sent, counted or listed as waiting. Unlike a rejection, a cold
+        email's member stays in its campaign (campaigns.redraft: the cycle
+        drafts that step again), and a conversation's answer no longer
+        holds the conversation. The action log names the row, never its text
+        or recipient. Returns rows changed (0/1)."""
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import campaigns, channels, queries
+
+        def run(con):
+            n = con.execute(queries.sql("overlay.outbox.remove"),
+                            (REMOVED_BY_YOU, _utcnow().isoformat(), item_id,
+                             channels.ATTEMPT_KEY + item_id)).rowcount
+            if not n:
+                return None
+            row = con.execute(queries.sql("overlay.outbox.removed_row"), (item_id,)).fetchone()
+            redrafted = False
+            if row[0] == "sequence" and row[1]:
+                redrafted = campaigns.redraft(con, row[1], row[2])
+            return {"outbox_id": item_id, "kind": row[0], "campaign_id": row[1] or "",
+                    "step": int(row[3] or 1), "channel": row[4] or "email",
+                    "conversation_id": row[5] or "", "drafted_again": redrafted}
+
+        details = await self._in_tx(run)
+        if details is None:
+            return 0
+        await self.log_action("outbox_removed", by, details)
+        return 1
+
+    async def outbox_tried(self, item_id: str) -> bool:
+        """Was this row ever handed over for sending (a provider message id,
+        or a send attempt kept for it)? Then it may have gone."""
+        from harvey import channels
+
+        rows = await self._named("overlay.outbox.tried", (channels.ATTEMPT_KEY + item_id, item_id))
+        return bool(rows and rows[0][0])
+
+    async def edit_outbox_item(self, item_id: str, subject: str, body: str, *, was: dict,
+                               status: str, approved_by: str, error: str) -> int:
+        """Rewrite a row that hasn't gone, as it stood when read (``was``:
+        its status and approved_by, so a row approved, sent or claimed since
+        is never changed) and never tried (outbox_tried), leaving it at
+        ``status`` / ``approved_by`` / ``error``. Returns rows changed."""
+        import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+        from harvey import channels, queries
+
+        async with self._connect() as db:
+            cursor = await db.execute(queries.sql("overlay.outbox.edit"), (
+                subject, body, status, approved_by, error[:300], _utcnow().isoformat(),
+                item_id, was.get("status") or "", was.get("approved_by") or "",
+                channels.ATTEMPT_KEY + item_id))
+            await db.commit()
+            return cursor.rowcount
+
+    async def first_email_on_file(self, campaign_id: str, prospect_id: str) -> bool:
+        """A campaign's first email to a person is in its slot (sent, waiting
+        or ended; a removed one isn't)."""
+        return bool(await self._named("overlay.outbox.first_on_file",
+                                      (campaign_id or "", prospect_id or "")))
+
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None.
 
@@ -1788,9 +1879,10 @@ class StateManager:
                 "AND COALESCE(o.error, '') = '' AND (o.send_at IS NULL OR o.send_at <= ?) "
                 "AND (c.id IS NULL OR (c.status = 'active' "
                 "AND COALESCE(c.review, 'inherit') != 'always')) "
-                "AND NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS (SELECT 1 FROM outbox p "
-                "WHERE p.prospect_id = o.prospect_id AND p.campaign_id = o.campaign_id "
-                "AND p.kind = 'sequence' AND p.step = o.step - 1 AND p.status != 'sent')) "
+                # (A follow-up only once the step before it went: not while
+                # it waits, nor while a step you removed is drafted again.)
+                "AND NOT (o.kind = 'sequence' AND o.step > 1 "
+                f"AND {_PREV_NOT_SENT}) "
                 "ORDER BY o.send_at, o.created_at LIMIT ?)",
                 (_utcnow().isoformat(), kind, due_before, int(limit)),
             )
@@ -1930,12 +2022,14 @@ class StateManager:
 
     async def get_previous_step(self, item: dict) -> dict | None:
         """The email a sequence follow-up follows (same campaign and person,
-        one step earlier), or None."""
+        one step earlier), or None. A removed one only when that step has
+        no other row (it waits to be drafted again)."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM outbox WHERE prospect_id = ? AND campaign_id = ? "
-                "AND kind = 'sequence' AND step = ? ORDER BY created_at DESC LIMIT 1",
+                "AND kind = 'sequence' AND step = ? "
+                "ORDER BY status = 'removed', created_at DESC LIMIT 1",
                 (item["prospect_id"], item.get("campaign_id") or "", int(item["step"]) - 1),
             ) as cursor:
                 row = await cursor.fetchone()

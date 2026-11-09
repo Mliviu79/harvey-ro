@@ -443,7 +443,10 @@ class Sender:
                 )
                 if item_id:
                     staged += 1
-            await self.state.set_campaign_member(campaign.id, email, "staged")
+            # (A member whose step you removed after an earlier one went is
+            # still in its sequence.)
+            await self.state.set_campaign_member(
+                campaign.id, email, "in_sequence" if member.get("last_step") else "staged")
             # Conditional: never overwrite a status set while staging
             # (marked sent by hand, a reply).
             await self.state.queue_prospect_if_unsent(prospect.id)
@@ -502,7 +505,9 @@ class Sender:
         prev = await self.state.get_previous_step(item)
         if prev is None:
             return None
-        if prev["status"] in ("pending_review", "approved", "sending"):
+        # (A step you removed is drafted again by the campaign cycle: what
+        # follows it waits for that one.)
+        if prev["status"] in ("pending_review", "approved", "sending", "removed"):
             return "wait"
         if prev["status"] != "sent":
             return "cancelled", f"step {prev['step']} wasn't sent ({prev['status']})"
@@ -635,9 +640,11 @@ class Sender:
                     # Staged before the address was known to be personal (or
                     # the line was edited out): it gets the line, and waits
                     # for you to approve it as it now is.
+                    # (Not over a text you edited since it was read: then
+                    # it only goes back to you, as it is.)
                     await self.state.update_outbox_item(
                         item["id"], body=email_rules.with_note(item["body"], note),
-                        source_note=note)
+                        source_note=note, if_updated=item.get("updated_at") or "")
                     return "pending_review", NOTE_ADDED
                 if personal and email_rules.privacy_crowded(
                         item["body"], compliance_of(self.config).privacy_url):
@@ -715,7 +722,12 @@ class Sender:
         also ends its member's place in the campaign, with the same reason
         (undoing a hand send finds it by that reason). A failed one is never
         retried, so its member would otherwise stay open for good."""
-        await self.state.update_outbox_item(item["id"], status=blocked[0], error=blocked[1])
+        # Only while it is as it was read: a row you removed or rejected in
+        # the meantime stays so (an approved hold would send it later).
+        if not await self.state.update_outbox_item(item["id"], status=blocked[0],
+                                                   error=blocked[1],
+                                                   if_status=item.get("status") or ""):
+            return
         if blocked[0] in ("cancelled", "failed") and item["kind"] == "sequence" \
                 and item.get("campaign_id"):
             member = await self.state.campaign_member(item["campaign_id"], item["to_email"])
@@ -872,7 +884,8 @@ class Sender:
             if order == "wait":
                 continue
             if order:
-                await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
+                await self.state.update_outbox_item(item["id"], status=order[0], error=order[1],
+                                                    if_status=item.get("status") or "")
                 continue
             # The recipient's country when Harvey is sure of it, and the
             # company's and person's names: they go with the compliance
@@ -951,6 +964,7 @@ class Sender:
                     await self.state.update_outbox_item(
                         item["id"], status="failed",
                         error=f"precleared: {clearance.verdict}: {clearance.reason}"[:300],
+                        if_status=item.get("status") or "",
                     )
                     logger.warning(
                         f"Sender: Precleared held back email to {item['to_email']}: "

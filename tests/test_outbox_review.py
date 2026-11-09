@@ -85,19 +85,48 @@ def test_editing_a_draft_changes_it_but_does_not_approve_it(client):
     state, item_id = asyncio.run(_seed(client.db_path))
     r = client.post(f"/api/outbox/{item_id}/edit", json={
         "subject": "your portal", "body": "Hello Brightline Portals team,\n\nSam"})
-    assert r.json() == {"success": True}
+    assert r.json() == {"success": True, "status": "pending_review"}
     item = asyncio.run(state.get_outbox_item(item_id))
     assert item["subject"] == "your portal"
     assert item["body"] == "Hello Brightline Portals team,\n\nSam"
     assert item["status"] == "pending_review"
 
 
-@pytest.mark.parametrize("status", ["approved", "sent", "rejected"])
-def test_only_drafts_awaiting_review_can_be_edited(client, status):
+@pytest.mark.parametrize("status", ["sending", "sent", "rejected", "removed"])
+def test_only_a_message_that_hasnt_gone_can_be_edited(client, status):
     state, item_id = asyncio.run(_seed(client.db_path, status=status))
     r = client.post(f"/api/outbox/{item_id}/edit", json={"subject": "x", "body": "y"})
-    assert r.status_code == 409
+    assert r.status_code == 409 and r.json()["code"] == "gone"
     assert asyncio.run(state.get_outbox_item(item_id))["subject"] == "your client portal"
+
+
+def test_an_approved_email_you_approved_stays_approved_when_edited(client):
+    state, item_id = asyncio.run(_seed(client.db_path))
+    assert client.post(f"/api/outbox/{item_id}/approve").json()["success"]
+    r = client.post(f"/api/outbox/{item_id}/edit", json={
+        "subject": "your portal", "body": "Hello Brightline Portals team,\n\nSam"})
+    assert r.json() == {"success": True, "status": "approved"}
+    item = asyncio.run(state.get_outbox_item(item_id))
+    assert (item["status"], item["approved_by"], item["subject"]) == (
+        "approved", "you", "your portal")
+
+
+def test_an_approved_email_nobody_approved_by_hand_goes_back_for_review_when_edited(client):
+    # (Approved by autopilot at the drain: an edit is yours to approve again.)
+    state, item_id = asyncio.run(_seed(client.db_path, status="approved"))
+    asyncio.run(state.update_outbox_item(item_id, approved_by="autopilot"))
+    r = client.post(f"/api/outbox/{item_id}/edit", json={"subject": "s", "body": "New text."})
+    assert r.json() == {"success": True, "status": "pending_review"}
+    item = asyncio.run(state.get_outbox_item(item_id))
+    assert (item["status"], item["approved_by"]) == ("pending_review", "")
+
+
+def test_an_email_with_a_message_id_on_file_is_never_edited(client):
+    state, item_id = asyncio.run(_seed(client.db_path, status="approved"))
+    asyncio.run(state.update_outbox_item(item_id, message_id="<m1@example.com>"))
+    r = client.post(f"/api/outbox/{item_id}/edit", json={"subject": "s", "body": "New text."})
+    assert r.status_code == 409 and r.json()["code"] == "tried"
+    assert asyncio.run(state.get_outbox_item(item_id))["body"] == "Hello welcome team,\n\nSam"
 
 
 def test_edit_needs_both_subject_and_body(client):
@@ -131,7 +160,7 @@ def test_a_reply_keeps_its_subject_so_it_stays_in_the_thread(client):
     state, item_id = asyncio.run(_seed(client.db_path, kind="reply"))
     r = client.post(f"/api/outbox/{item_id}/edit",
                     json={"subject": "something new", "body": "Thanks, Tuesday works."})
-    assert r.json() == {"success": True}
+    assert r.json() == {"success": True, "status": "pending_review"}
     item = asyncio.run(state.get_outbox_item(item_id))
     assert item["subject"] == "your client portal"
     assert item["body"] == "Thanks, Tuesday works."
@@ -149,7 +178,7 @@ def test_a_reply_with_a_folded_subject_can_still_have_its_body_edited(client):
     # The browser's <input> drops the newline; the server keeps the original.
     r = client.post(f"/api/outbox/{item_id}/edit",
                     json={"subject": "Re: your client portal", "body": "Tuesday works."})
-    assert r.json() == {"success": True}
+    assert r.json() == {"success": True, "status": "pending_review"}
     assert asyncio.run(state.get_outbox_item(item_id))["subject"] == "Re: your client\n portal"
 
 

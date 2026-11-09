@@ -290,7 +290,12 @@ class MessageSender:
     async def _hold(self, item: dict, blocked: tuple[str, str]) -> None:
         status, why = blocked
         if (item.get("status"), item.get("error") or "") != (status, why):
-            await self.state.update_outbox_item(item["id"], status=status, error=why[:300])
+            # Only while it is as it was read: an answer you removed or
+            # rejected in the meantime stays so (a wait would send it later).
+            if not await self.state.update_outbox_item(item["id"], status=status,
+                                                       error=why[:300],
+                                                       if_status=item.get("status") or ""):
+                return
         if status == "failed":
             await self.state.delete_setting(channels.ATTEMPT_KEY + item["id"])
             logger.warning(f"Messenger: an answer to {mask(item.get('to_phone') or '')} "

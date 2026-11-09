@@ -3370,6 +3370,14 @@ def _outbox_rows(rows: list[dict], enabled: set[str] | None = None) -> list[dict
     return rows
 
 
+async def _tried(state, row: dict) -> bool:
+    """Was this row's send ever tried (state.outbox_tried)? An email is
+    never tried twice, so only its message id says so."""
+    if (row.get("channel") or "email") == "email":
+        return bool(row.get("message_id"))
+    return await state.outbox_tried(row["id"])
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""
@@ -3382,19 +3390,24 @@ async def get_outbox_api():
         from harvey.modules import switches
 
         on = await switches.enabled_ids(state)
+        pending = await state.get_outbox(status="pending_review", limit=100)
+        # Mail going out right now leads the list.
+        approved = (await state.get_outbox(status="sending", limit=10)
+                    + await state.get_outbox(status="approved", limit=50))
+        for row in pending + approved:
+            # (A row whose send was tried may have gone: the page offers no
+            # Edit or Remove on it.)
+            row["tried"] = await _tried(state, row)
         return {
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
-            "pending": _outbox_rows(await _with_context(
-                await state.get_outbox(status="pending_review", limit=100)), on),
-            # Mail going out right now leads the list.
-            "approved": _outbox_rows(await state.get_outbox(status="sending", limit=10)
-                                     + await state.get_outbox(status="approved", limit=50), on),
+            "pending": _outbox_rows(await _with_context(pending), on),
+            "approved": _outbox_rows(approved, on),
             "sent": _outbox_rows(await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
             "failed": _outbox_rows(await query_db(
-                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
+                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled','removed') "
                 "ORDER BY updated_at DESC LIMIT 25")),
         }
     except Exception as e:
@@ -3503,9 +3516,32 @@ async def outbox_approve(item_id: str):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+# What the page and the API say about a row that can't be changed any more.
+NOT_WAITING = "Only a message that hasn't gone (waiting for review or approved) can be changed."
+TRIED = ("A send of this message was already tried, so it may have gone: it can't be "
+         "edited or removed (sending it again goes under the same key, with the first "
+         "text). Reject it to stop it being tried again.")
+
+
+def _unchangeable(item: dict | None, tried: bool) -> JSONResponse | None:
+    """Why a row can't be edited or removed now (``code`` gone or tried,
+    for the page), or None when it can."""
+    if not item or item.get("status") not in ("pending_review", "approved"):
+        return JSONResponse({"success": False, "code": "gone", "message": NOT_WAITING},
+                            status_code=409)
+    if tried:
+        return JSONResponse({"success": False, "code": "tried", "message": TRIED},
+                            status_code=409)
+    return None
+
+
 @app.post("/api/outbox/{item_id}/edit")
 async def outbox_edit(item_id: str, request: Request):
-    """Rewrite a draft awaiting review. Never approves it."""
+    """Rewrite a message that hasn't gone: waiting for review, or approved
+    and not sent yet (never one being sent, or one whose send was tried).
+    Never approves it: a draft stays waiting for review, and an approved
+    one stays approved only when you approved it (else it goes back for
+    review). ``code`` names a refusal for the page: gone, tried, text."""
     try:
         body = await request.json()
     except Exception:
@@ -3518,17 +3554,22 @@ async def outbox_edit(item_id: str, request: Request):
         state = _state()
         await state.init_db()
         item = await state.get_outbox_item(item_id)
-        if not item or item.get("status") != "pending_review":
-            return JSONResponse({"success": False,
-                                 "message": "Only drafts awaiting review can be edited."},
-                                status_code=409)
-        if (item.get("channel") or "email") == "email":
-            # (An email draft is the Email module's: with it off the row
-            # stays listed and rejectable, never rewritten.)
-            refused = await _channel_refusal(state, "email")
-            if refused:
-                return refused
-        if (item.get("channel") or "email") != "email":
+        refused = _unchangeable(item, bool(item) and await state.outbox_tried(item_id))
+        if refused:
+            return refused
+        channel = item.get("channel") or "email"
+        # (An email draft is the Email module's, an SMS or WhatsApp answer
+        # nPathi's: with it off the row stays listed and removable, never
+        # rewritten.)
+        refused = await _channel_refusal(state, channel)
+        if refused:
+            return refused
+        # Approved by you, it stays approved as you rewrite it; else it goes
+        # back to you for review.
+        mine = item["status"] == "approved" and item.get("approved_by") == "you"
+        status, by = ("approved", "you") if mine else ("pending_review", "")
+        error = item.get("error") or ""
+        if channel != "email":
             # An SMS or WhatsApp answer: text only, checked as the messenger
             # will check it (its length, braces, links, the first answer's
             # firm name and opt-out line).
@@ -3536,17 +3577,21 @@ async def outbox_edit(item_id: str, request: Request):
                 return _refuse("The message is empty.", 400)
             problems = await _message_problems(state, item, text)
             if problems:
-                return _refuse("The sender would block this message: " + "; ".join(problems),
-                               400)
-            if not await state.edit_outbox_draft(item_id, "", text):
-                return _refuse("Only drafts awaiting review can be edited.")
+                return JSONResponse({"success": False, "code": "text",
+                                     "detail": "; ".join(problems),
+                                     "message": "The sender would block this message: "
+                                                + "; ".join(problems)}, status_code=400)
             from harvey.state import HELD_FOR_REVIEW
 
-            if (item.get("error") or "").startswith(HELD_FOR_REVIEW):
-                await state.update_outbox_item(item_id, error="")   # (what held it is fixed)
+            if error.startswith(HELD_FOR_REVIEW):
+                error = ""                               # (what held it is fixed)
+            if not await state.edit_outbox_item(item_id, "", text, was=item, status=status,
+                                                approved_by=by, error=error):
+                return JSONResponse({"success": False, "code": "gone", "message": NOT_WAITING},
+                                    status_code=409)
             await state.log_action("outbox_edited", "dashboard", {
-                "outbox_id": item_id, "channel": item["channel"], "old_body": item.get("body", "")})
-            return {"success": True}
+                "outbox_id": item_id, "channel": channel, "old_body": item.get("body", "")})
+            return {"success": True, "status": status}
         if item.get("kind") == "reply":
             # Gmail threads a reply by its subject: a new one would land as a
             # fresh, unthreaded email to someone who wrote in. Only the body
@@ -3572,14 +3617,38 @@ async def outbox_edit(item_id: str, request: Request):
                                  "message": "The sender would have blocked this: "
                                             + "; ".join(gate.reasons)},
                                 status_code=400)
-        if not await state.edit_outbox_draft(item_id, subject, text):
-            return JSONResponse({"success": False,
-                                 "message": "Only drafts awaiting review can be edited."},
+        if not await state.edit_outbox_item(item_id, subject, text, was=item, status=status,
+                                            approved_by=by, error=error):
+            return JSONResponse({"success": False, "code": "gone", "message": NOT_WAITING},
                                 status_code=409)
         await state.log_action("outbox_edited", "dashboard", {
             "outbox_id": item_id, "to_email": item.get("to_email", ""),
             "old_subject": item.get("subject", ""), "old_body": item.get("body", ""),
         })
+        return {"success": True, "status": status}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/remove")
+async def outbox_remove(item_id: str):
+    """Remove a message that hasn't gone (any channel, waiting for review or
+    approved, never tried): kept as removed, never sent. Unlike Reject, a
+    cold email's person stays in the campaign, which drafts that step again;
+    a conversation's answer no longer holds the conversation. A row whose
+    channel's module is off can be removed too."""
+    try:
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if item is None:
+            return _refuse("No such message.", 404)
+        refused = _unchangeable(item, await state.outbox_tried(item_id))
+        if refused:
+            return refused
+        if not await state.remove_outbox_item(item_id, by="dashboard"):
+            return JSONResponse({"success": False, "code": "gone", "message": NOT_WAITING},
+                                status_code=409)
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -4906,7 +4975,8 @@ async def get_conversations():
     # held by the sending hours or a cap): shown with why it waits.
     from harvey.agents.messenger import wait_code
 
-    waiting = {c: {**w, "wait": wait_code(w["error"]) if w["status"] == "approved" else ""}
+    waiting = {c: {**w, "wait": wait_code(w["error"]) if w["status"] == "approved" else "",
+                   "tried": await _state().outbox_tried(w["id"])}
                for c, w in (await _state().messages_waiting(cids)).items()}
     # The number (or handle) an SMS or WhatsApp conversation came from,
     # masked as phones are everywhere else outside Contacts.
@@ -4995,13 +5065,15 @@ async def answer_conversation(convo_id: str, request: Request):
                              "code": refused.code,
                              "detail": refused[1].removeprefix("gate: ")},
                             status_code=400 if refused.code == "text" else 409)
-    if await state.messages_waiting([convo_id]):
+    if waits := await state.messages_waiting([convo_id]):
         # (One already approved and not sent: a second would be a second
         # message before they answered, refused at send time; a double
-        # click must not queue it.)
+        # click must not queue it. The waiting one can be edited or
+        # removed on the conversation.)
         return JSONResponse({"success": False, "code": "waiting",
                              "message": "An answer you approved here hasn't gone yet: "
-                                        "reject it in the Outbox to write another."},
+                                        "edit or remove it to write another.",
+                             "outbox_id": waits[convo_id]["id"]},
                             status_code=409)
     client = await npathi.client(state)
     hold = await sender.blocked(item, client)

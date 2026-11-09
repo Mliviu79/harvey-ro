@@ -513,7 +513,8 @@ function loadCurrentTab() {
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'outbox': loadOutbox(); break;
-    case 'conversations': loadConversations(); break;
+    // (Not while an answer is being edited there: what's typed would go.)
+    case 'conversations': if (!_cvEdit.id) loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'queue': loadQueue(); break;
     case 'chat': loadChat(); break;
@@ -2460,12 +2461,15 @@ async function loadOutbox() {
     return h + '</tbody></table></div>';
   };
 
-  list.innerHTML =
+  _obEdit.rows = data.approved || [];
+  if (_obEdit.id && !_obEdit.rows.some(r => r.id === _obEdit.id && r.status === 'approved')) _obEdit.id = null;
+  list.innerHTML = obEditor() +
     table(t('ob.approved'), data.approved, [
       [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
       [t('ob.sends'), r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
       // Why an approved SMS or WhatsApp answer waits (the sending hours, a cap...).
       [t('ob.waits'), r => isMessage(r) && r.error ? msgWhy(r.wait, r.error) : '', true],
+      [t('ob.change'), obRowActions, false, true],
     ]) +
     table(t('ob.sent'), data.sent, [
       [t('ob.to'), outboxTo], [t('ob.step'), r => r.step], [t('ob.subject'), outboxSubject],
@@ -2475,6 +2479,83 @@ async function loadOutbox() {
       [t('ob.to'), outboxTo], [t('ob.status'), r => badge(r.status), false, true],
       [t('ob.reason'), r => r.error, true], [t('ob.updated'), r => formatDate(r.updated_at), true],
     ]);
+}
+
+// An approved message that hasn't gone can still be edited (it stays
+// approved when you approved it) or removed; never one being sent, or one
+// whose send was tried (it may have gone).
+const _obEdit = {id: null, rows: []};
+
+function obRowActions(r) {
+  if (r.status !== 'approved' || r.tried) return '';
+  return '<button class="btn btn-secondary btn-sm" onclick="obEditOpen(' + jsq(r.id) + ')"' +
+      (r.off_module ? ' disabled' : '') + '>' + escHtml(t('desk.edit')) + '</button> ' +
+    '<button class="btn btn-secondary btn-sm" onclick="outboxRemove(' + jsq(r.id) + ')" title="' +
+      escHtml(t('desk.remove_title')) + '">' + escHtml(t('desk.remove')) + '</button>';
+}
+
+function obEditor() {
+  const r = _obEdit.rows.find(x => x.id === _obEdit.id);
+  if (!r) return '';
+  const msg = isMessage(r);
+  return '<div class="card"><div class="subhead">' + escHtml(t('ob.edit_approved', {to: outboxTo(r)})) + '</div>' +
+    (msg ? '' : '<input id="ob-edit-subject" class="desk-edit-subject" value="' + escHtml(r.subject || '') + '"' +
+      (r.kind === 'reply' ? ' readonly title="' + escHtml(t('desk.reply_subject')) + '"' : '') + '>') +
+    '<textarea id="ob-edit-body" class="desk-edit-body" rows="' + (msg ? 5 : 12) + '"' +
+      (msg ? ' maxlength="' + (MESSAGE_MAX[r.channel] || 300) + '"' : '') + '>' + escHtml(r.body || '') + '</textarea>' +
+    '<p class="muted small">' + escHtml(t('ob.edit_approved_note')) + '</p>' +
+    '<div class="desk-actions"><button class="btn btn-primary btn-sm" onclick="obEditSave(' + jsq(r.id) + ')">' + escHtml(t('common.save')) + '</button>' +
+    '<button class="btn btn-secondary btn-sm" onclick="obEditOpen(null)">' + escHtml(t('common.cancel')) + '</button></div></div>';
+}
+
+function obEditOpen(id) {
+  _obEdit.id = id;
+  loadOutbox();
+}
+
+async function obEditSave(id) {
+  const subj = document.getElementById('ob-edit-subject');
+  const body = String(document.getElementById('ob-edit-body').value || '').trim();
+  const data = await saveOutboxEdit(id, subj ? subj.value.trim() : '', body);
+  if (data && data.success) {
+    _obEdit.id = null;
+    showToast(data.status === 'approved' ? t('desk.saved_approved') : t('desk.saved'), 'success');
+    loadOutbox();
+  } else showToast(editWhy(data), 'error');
+}
+
+// One edit, from the desk, the approved list or a conversation.
+async function saveOutboxEdit(id, subject, body) {
+  try {
+    const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: subject, body: body}),
+    });
+    if (await lockIfRefused(r)) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// Why an edit or a removal was refused, in the viewer's language when the
+// server names it (gone, tried, the text's rules, a module off).
+function editWhy(data, fallback) {
+  if (data && data.off_module) return t('desk.module_off', {name: moduleName(data.off_module)});
+  if (data && data.code) {
+    const why = msgWhy(data.code, data.message, data.detail);
+    return why.charAt(0).toUpperCase() + why.slice(1);
+  }
+  return failMsg(data, fallback || t('desk.save_failed'));
+}
+
+async function outboxRemove(id, after) {
+  if ((!after && deskBusy()) || !confirm(t('desk.remove_confirm'))) return;
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/remove', {method: 'POST'});
+  if (data && data.success) {
+    if (_obEdit.id === id) _obEdit.id = null;
+    if (_cvEdit.id === id) _cvEdit.id = null;
+    showToast(t('desk.removed'), 'success');
+  } else showToast(editWhy(data, t('desk.action_failed')), 'error');
+  if (after) after(); else loadOutbox();
 }
 
 // Who a row goes to, and what it is: an email's address and subject, an
@@ -2751,10 +2832,14 @@ function renderDesk(items, i) {
         (cur.off_module ? ' disabled' : '') + '>' +
         escHtml(t('desk.approve')) + ' <kbd>A</kbd></button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')"' +
-        (cur.off_module && !msg ? ' disabled' : '') + '>' +
+        (cur.off_module || cur.tried ? ' disabled' : '') + '>' +
         escHtml(t('desk.edit')) + ' <kbd>E</kbd></button>' +
       '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
-        escHtml(t('desk.reject')) + ' <kbd>R</kbd></button>';
+        escHtml(t('desk.reject')) + ' <kbd>R</kbd></button>' +
+      // Remove deletes only this message (the person stays in the campaign);
+      // not offered once a send was tried (it may have gone).
+      (cur.tried ? '' : '<button class="btn btn-secondary" onclick="outboxRemove(' + jsq(cur.id) + ')" title="' +
+        escHtml(t('desk.remove_title')) + '">' + escHtml(t('desk.remove')) + '</button>');
 
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
@@ -2814,22 +2899,14 @@ async function deskSave(id) {
   if (cur && isMessage(cur)) {
     if (!body) { showToast(t('desk.need_body'), 'error'); return; }
   } else if (!subject || !body) { showToast(t('desk.need_both'), 'error'); return; }
-  let data = null;
-  try {
-    const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({subject: subject, body: body}),
-    });
-    if (await lockIfRefused(r)) return;
-    data = await r.json();
-  } catch {}
+  const data = await saveOutboxEdit(id, subject, body);
   if (data && data.success) {
     _desk.editing = null;
     _desk.unsaved = null;
     showToast(t('desk.saved'), 'success');
     loadOutbox();
   } else {
-    showToast(failMsg(data, t('desk.save_failed')), 'error');
+    showToast(editWhy(data), 'error');
   }
 }
 
@@ -7724,11 +7801,7 @@ function convoCard(c) {
   // An answer approved and not sent yet (held by the sending hours, a cap,
   // a pause): with why it waits.
   const w = c.waiting;
-  const waiting = w
-    ? '<div class="thread-draft"><div class="sender">' + icon('queue') + escHtml(t('cv.waiting')) + '</div>' +
-      '<div class="td-body">' + escHtml(w.body) + '</div>' +
-      (w.status === 'approved' && w.error ? '<p class="muted small">' + escHtml(t('cv.waiting_why', {why: msgWhy(w.wait, w.error)})) + '</p>' : '') + '</div>'
-    : '';
+  const waiting = w ? convoWaiting(c, w) : '';
   const h = c.handle;
   const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || (h && h.value) || t('cv.unknown');
   const stageKey = 'cv.stage.' + c.stage;
@@ -7743,6 +7816,54 @@ function convoCard(c) {
       stage + badge(c.status) + '</div></div>' +
     '<div class="thread">' + (thread || '<p class="muted small">' + escHtml(t('cv.no_messages')) + '</p>') +
     draft + waiting + '</div>' + convoAnswer(c) + convoActions(c) + '</div>';
+}
+
+// An answer you approved that hasn't gone: with why it waits, and, until it
+// is being sent (or a send of it was tried), Edit inline and Remove (then the
+// answer box comes back).
+const _cvEdit = {id: null};
+
+function convoWaiting(c, w) {
+  const open = w.status === 'approved' && !w.tried;
+  const editing = open && _cvEdit.id === w.id;
+  const why = w.status === 'approved' && w.error
+    ? '<p class="muted small">' + escHtml(t('cv.waiting_why', {why: msgWhy(w.wait, w.error)})) + '</p>' : '';
+  const body = editing
+    ? '<textarea class="form-input" id="cv-edit-' + escHtml(w.id) + '" rows="3" maxlength="' +
+        (MESSAGE_MAX[(c.handle || {}).channel] || 300) + '">' + escHtml(w.body) + '</textarea>' +
+      '<p class="small" style="color:var(--bad)" id="cv-edit-why-' + escHtml(w.id) + '" hidden></p>'
+    : '<div class="td-body">' + escHtml(w.body) + '</div>';
+  const actions = !open ? '' : editing
+    ? '<button class="btn btn-primary btn-sm" onclick="convoEditSave(' + jsq(w.id) + ')">' + escHtml(t('common.save')) + '</button> ' +
+      '<button class="btn btn-secondary btn-sm" onclick="convoEdit(null)">' + escHtml(t('common.cancel')) + '</button>'
+    : '<button class="btn btn-secondary btn-sm" onclick="convoEdit(' + jsq(w.id) + ')">' + escHtml(t('desk.edit')) + '</button> ' +
+      '<button class="btn btn-secondary btn-sm" onclick="outboxRemove(' + jsq(w.id) + ', loadConversations)" title="' +
+        escHtml(t('cv.remove_title')) + '">' + escHtml(t('desk.remove')) + '</button>';
+  return '<div class="thread-draft"><div class="sender">' + icon('queue') + escHtml(t('cv.waiting')) + '</div>' +
+    body + why + (actions ? '<div class="desk-actions">' + actions + '</div>' : '') + '</div>';
+}
+
+function convoEdit(id) {
+  _cvEdit.id = id;
+  loadConversations();
+}
+
+async function convoEditSave(id) {
+  const el = document.getElementById('cv-edit-' + id);
+  const body = String((el && el.value) || '').trim();
+  if (!body) { showToast(t('desk.need_body'), 'error'); return; }
+  const data = await saveOutboxEdit(id, '', body);
+  if (data && data.success) {
+    _cvEdit.id = null;
+    showToast(t('desk.saved_approved'), 'success');
+    loadConversations();
+    return;
+  }
+  // Refused: said under the text, which stays as you wrote it.
+  const why = editWhy(data);
+  const box = document.getElementById('cv-edit-why-' + id);
+  if (box) { box.textContent = why; box.hidden = false; }
+  showToast(why, 'error');
 }
 
 // Why an SMS or WhatsApp answer can't go (now, or ever), in the viewer's
@@ -8917,7 +9038,8 @@ setInterval(() => {
     // the outreach list, which the Email loop changes as it goes.
     case 'prospects': if (_cv.view === 'outreach' && !_optOut.id) loadOutreach(); break;
     case 'campaigns': loadCampaigns(); break;
-    case 'conversations': loadConversations(); break;
+    // (Not while an answer is being edited there: what's typed would go.)
+    case 'conversations': if (!_cvEdit.id) loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'controls': loadLogs(); loadControlSending(); break;

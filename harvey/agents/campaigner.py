@@ -175,6 +175,11 @@ class CampaignCycle:
             picked.append(prospect)
         if not picked:
             return 0
-        await self.writer.write_for_members(campaign, picked)
+        # A member back for a step you removed after its first email went (or
+        # while it still waits) needs no new first email: staging fills the
+        # free step from the template.
+        first = [p for p in picked if not await self.state.first_email_on_file(c["id"], p.id)]
+        if first:
+            await self.writer.write_for_members(campaign, first)
         await self.sender._stage_campaign_native(campaign, emails=[p.email for p in picked])
         return len(picked)

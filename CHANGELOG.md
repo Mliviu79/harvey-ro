@@ -9,6 +9,26 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Removing a message that hasn't gone, and editing every one.** Each
+  unsent row of the Outbox (waiting for review or approved, any channel)
+  has **Remove** beside Edit, Approve and Reject (`POST
+  /api/outbox/{id}/remove`, `harvey outbox --remove ID`): only that
+  message is deleted, kept as removed for the record, never sent or
+  counted. Unlike Reject, the person stays in the campaign, and the next
+  campaign cycle drafts that step again (a first email written anew, a
+  follow-up from the template); a follow-up waits while the step before it
+  is drafted again. An answer waiting on a conversation shows there with
+  **Edit** and **Remove**, and once removed the answer box comes back.
+  Approved messages can now be edited too: one you approved stays approved
+  with the new text, one autopilot approved goes back to you. A message
+  whose send was already tried (it may have gone, and sending it again
+  replays the first text under its key) can be neither edited nor
+  removed: Reject still stops it. Schema 42: the campaign step index
+  leaves out removed rows.
+  A drain that decided about a row before you removed, rejected or
+  edited it no longer writes its stale decision over yours, and autopilot
+  approves a follow-up once the step drafted again in place of a removed
+  one went.
 - **Answering SMS and WhatsApp messages people send in.** When the
   `npathi` module's **Send answers** is on for a channel (Settings →
   Channels, with the sender answers go from: one a reply can come back to),

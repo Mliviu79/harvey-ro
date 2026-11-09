@@ -1,4 +1,4 @@
-"""The overlay's tables (harvey.db schema 41).
+"""The overlay's tables (harvey.db schema 42).
 
 Integers for ids, times (unix seconds), enums and dictionary ids. A firm is
 Harvey's own integer id; register identifiers live in ``firm_ident`` under
@@ -25,7 +25,7 @@ import sqlite3
 # The schema the upgrade writes and verifies (frozen: PARTS), and the one
 # this release reads, reached from it by STEPS.
 UPGRADE_TARGET = 25
-LATEST = 41
+LATEST = 42
 VERSION = LATEST
 # The capability an observation is kept under when a search's hit gave it
 # and the row names no capability (schema 24's collector "discover"): so
@@ -1283,11 +1283,30 @@ def _to_41(con: sqlite3.Connection) -> None:
     _script(con, SCHEMA_41)
 
 
+# ── Schema 42: a message removed before it went frees its campaign step ──
+
+SCHEMA_42 = """
+-- An outbox row you removed before it went (status 'removed') is kept for
+-- the record but no longer holds its (campaign, person, step) slot: the
+-- campaign cycle may draft that step again.
+DROP INDEX uq_outbox_campaign_step;
+CREATE UNIQUE INDEX uq_outbox_campaign_step ON outbox(campaign_id, prospect_id, step)
+  WHERE campaign_id != '' AND kind = 'sequence' AND status != 'removed';
+"""
+
+
+def _to_42(con: sqlite3.Connection) -> None:
+    """Schema 42: the campaign step index leaves out removed rows. No row
+    on file is removed yet, so the index holds the same rows."""
+    _script(con, SCHEMA_42)
+
+
 # (target version, step), in order. Append only: a released step is never
 # edited, and PARTS stays schema 25.
 STEPS = ((26, _to_26), (27, _to_27), (28, _to_28), (29, _to_29), (30, _to_30), (31, _to_31),
          (32, _to_32), (33, _to_33), (34, _to_34), (35, _to_35), (36, _to_36),
-         (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40), (41, _to_41))
+         (37, _to_37), (38, _to_38), (39, _to_39), (40, _to_40), (41, _to_41),
+         (42, _to_42))
 
 
 def create(con: sqlite3.Connection, *, triggers: bool = True, version: int | None = None) -> None:

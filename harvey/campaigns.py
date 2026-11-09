@@ -579,6 +579,18 @@ def stop_after(con: sqlite3.Connection, campaign_id: str, email: str, step: int,
     return True
 
 
+def redraft(con: sqlite3.Connection, campaign_id: str, email: str) -> bool:
+    """One of a member's emails was removed before it went (you took it
+    out, unlike a rejection, which ends the member): its place stays open,
+    back to ready, so the campaign cycle drafts that step again (staging
+    fills only the steps whose slot is free: what was sent or still waits
+    keeps its own). True when it was moved back."""
+    m = member(con, campaign_id, email)
+    if m is None or m["status"] not in (M["staged"], M["in_sequence"]):
+        return False
+    return set_member(con, campaign_id, email, "ready")
+
+
 def end_memberships(con: sqlite3.Connection, email: str, status: str, reason: str) -> int:
     """Every open membership of an address ends (it replied, was suppressed
     or bounced): in every campaign, whatever its state."""

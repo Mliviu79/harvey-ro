@@ -595,6 +595,23 @@ def cmd_outbox(args):
             n = await state.approve_outbox(args.approve)
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
+        if args.remove:
+            # Removed, not rejected: the person stays in their campaign,
+            # which drafts that step again. (Its module may be off.)
+            item = await state.get_outbox_item(args.remove)
+            if item and item.get("status") in ("pending_review", "approved") \
+                    and await state.outbox_tried(args.remove):
+                print("\n  A send of it was already tried, so it may have gone: it can't be "
+                      "removed.\n  Reject it to stop it being tried again: "
+                      f"harvey outbox --reject {args.remove}\n")
+                sys.exit(1)
+            n = await state.remove_outbox_item(args.remove, by="cli")
+            if not n:
+                print("\n  Nothing waiting to send with that id (already sending or sent?).\n")
+                sys.exit(1)
+            print("\n  Removed: only this message. A campaign's person stays in it, and the"
+                  "\n  next campaign cycle drafts that step again.\n")
+            return
         if args.reject:
             n = await state.reject_outbox_item(args.reject)
             print(f"\n  {'Rejected.' if n else 'Nothing waiting to send with that id (already sending or sent?).'}\n")
@@ -631,7 +648,8 @@ def cmd_outbox(args):
                 print(f"    {line}")
         if pending:
             print("\n  Approve: harvey outbox --approve <id>   |   all: harvey outbox --approve-all")
-            print("  Reject:  harvey outbox --reject <id>\n")
+            print("  Reject:  harvey outbox --reject <id>   |   remove only this message "
+                  "(the person stays in the campaign): harvey outbox --remove <id>\n")
         else:
             print("  Nothing awaiting review.\n")
 
@@ -4252,6 +4270,9 @@ def main():
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.add_argument("--remove", metavar="ID", default="",
+                     help="Remove one item that hasn't gone (unlike --reject, the person "
+                          "stays in the campaign, which drafts that step again)")
     sub.set_defaults(func=cmd_outbox)
 
     # harvey sending pause|resume|status

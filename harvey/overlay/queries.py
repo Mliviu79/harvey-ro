@@ -1124,10 +1124,12 @@ statement("overlay.agent.campaigns_open_active",
 statement("overlay.agent.campaign_members",
           "SELECT status, COUNT(*) FROM campaign_member INDEXED BY campaign_member_status "
           "WHERE campaign = ? GROUP BY status", params=("c",))
+# (The campaign step index leaves out removed rows, schema 42: a statement
+# read through it says so in its own WHERE.)
 statement("overlay.agent.campaign_sequence",
           "SELECT status, COUNT(*) FROM outbox INDEXED BY uq_outbox_campaign_step "
-          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' GROUP BY status",
-          params=("c",))
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' AND status != 'removed' "
+          "GROUP BY status", params=("c",))
 statement("overlay.agent.campaign_replies",
           "SELECT intent, stage, status, COUNT(*) FROM conversations "
           "INDEXED BY idx_conversations_campaign_id WHERE campaign_id = ? "
@@ -1300,7 +1302,7 @@ statement("overlay.campaigns.member_counts",
                                     "Campaigns page: its (campaign, status) index read whole"})
 statement("overlay.campaigns.sent_counts",
           "SELECT campaign_id, COUNT(*) FROM outbox INDEXED BY uq_outbox_campaign_step "
-          "WHERE campaign_id != '' AND kind = 'sequence' AND status = 'sent' "
+          "WHERE campaign_id != '' AND kind = 'sequence' AND status != 'removed' AND status = 'sent' "
           "GROUP BY campaign_id",
           scans={"outbox": "every campaign's cold email sent, counted for the Campaigns "
                            "page: the campaigns' sequence index read whole"})
@@ -1329,16 +1331,16 @@ statement("overlay.campaigns.review",
 # The Outbox's note on a paused campaign's approved emails, and taking it off.
 statement("overlay.campaigns.note_paused",
           "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET error = ? "
-          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' "
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' AND status != 'removed' "
           "AND status = 'approved' AND COALESCE(error, '') = ''", params=("p", "c"))
 statement("overlay.campaigns.note_resumed",
           "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET error = '' "
-          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' "
+          "WHERE campaign_id = ? AND campaign_id != '' AND kind = 'sequence' AND status != 'removed' "
           "AND status = 'approved' AND error = ?", params=("c", "p"))
 statement("overlay.campaigns.cancel_queued",
           "UPDATE outbox INDEXED BY uq_outbox_campaign_step SET status = 'cancelled', "
           "error = ?, updated_at = ? WHERE campaign_id = ? AND campaign_id != '' "
-          "AND kind = 'sequence' AND status IN ('pending_review', 'approved')",
+          "AND kind = 'sequence' AND status != 'removed' AND status IN ('pending_review', 'approved')",
           params=("e", "2026-01-01", "c"))
 statement("overlay.campaigns.end_members",
           "UPDATE campaign_member SET status = ?, ended_at = ?, end_reason = ? "
@@ -1430,7 +1432,7 @@ statement("overlay.campaigns.acknowledgements",
 statement("overlay.campaigns.record_sends",
           "SELECT to_email, step, subject, sent_at, source_note, message_id, kind FROM outbox "
           "INDEXED BY uq_outbox_campaign_step WHERE campaign_id = ? AND campaign_id != '' "
-          "AND kind = 'sequence' AND status = 'sent' "
+          "AND kind = 'sequence' AND status != 'removed' AND status = 'sent' "
           "UNION ALL SELECT o.to_email, o.step, o.subject, o.sent_at, o.source_note, "
           "o.message_id, o.kind FROM conversations c INDEXED BY idx_conversations_campaign_id "
           "CROSS JOIN outbox o INDEXED BY idx_outbox_prospect WHERE c.campaign_id = ? "
@@ -1516,6 +1518,36 @@ statement("overlay.outbox.email_sent_since",
 statement("overlay.outbox.email_sent_since_kind",
           "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND channel = 'email' "
           "AND sent_at >= ? AND kind = ?", params=("2026-01-01", "sequence"))
+
+# Removing or editing a row that hasn't gone: only while it waits (pending
+# or approved) and nothing was ever handed over for it (no provider message
+# id, no send attempt kept under npathi:attempt:<id>: an SMS or WhatsApp
+# answer tried under its Idempotency-Key may have gone, and an edit would
+# be replayed as the first body).
+_UNTRIED = ("COALESCE(message_id, '') = '' AND NOT EXISTS "
+            "(SELECT 1 FROM settings s WHERE s.key = ?)")
+statement("overlay.outbox.remove",
+          "UPDATE outbox SET status = 'removed', error = ?, updated_at = ? WHERE id = ? "
+          f"AND status IN ('pending_review', 'approved') AND {_UNTRIED}",
+          params=("removed by you", "2026-01-01", "o", "npathi:attempt:o"))
+statement("overlay.outbox.edit",
+          "UPDATE outbox SET subject = ?, body = ?, status = ?, approved_by = ?, error = ?, "
+          "updated_at = ? WHERE id = ? AND status = ? AND COALESCE(approved_by, '') = ? "
+          f"AND {_UNTRIED}",
+          params=("s", "b", "pending_review", "", "", "2026-01-01", "o", "approved", "",
+                  "npathi:attempt:o"))
+statement("overlay.outbox.removed_row",
+          "SELECT kind, campaign_id, to_email, step, channel, conversation_id FROM outbox "
+          "WHERE id = ?", params=("o",))
+statement("overlay.outbox.tried",
+          f"SELECT NOT ({_UNTRIED}) FROM outbox WHERE id = ?",
+          params=("npathi:attempt:o", "o"))
+# Whether a campaign's first email to a person is on file in its slot (any
+# status but removed): the cycle drafts a first email only where it isn't.
+statement("overlay.outbox.first_on_file",
+          "SELECT 1 FROM outbox INDEXED BY uq_outbox_campaign_step WHERE campaign_id = ? "
+          "AND campaign_id != '' AND prospect_id = ? AND step = 1 AND kind = 'sequence' "
+          "AND status != 'removed' LIMIT 1", params=("c", "p"))
 
 # ── Messages people send in (harvey/agents/messages.py, schema 40) ──
 # The live firms a phone contact is linked to (a shared number: several).

@@ -48,7 +48,7 @@ def test_schema_38_on_a_new_file_and_stepped_from_37(tmp_path):
     old = sqlite3.connect(tmp_path / "old.db", isolation_level=None)
     schema.create(old, version=37)
     old.execute("INSERT INTO campaigns (id, name, status, rolling) VALUES ('c', 'n', 'active', 1)")
-    assert schema.step_up(old) == schema.LATEST == 41
+    assert schema.step_up(old) == schema.LATEST == 42
     for con in (new, old):
         assert schema.missing(con) == [] and triggers.missing(con) == []
         have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
