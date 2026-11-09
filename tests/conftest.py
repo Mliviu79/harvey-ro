@@ -163,7 +163,9 @@ def _no_login_status(monkeypatch, tmp_path_factory):
 
     monkeypatch.setattr(_brain_auth, "claude_status", unknown)
     monkeypatch.setattr(_brain_auth, "codex_status", unknown)
-    monkeypatch.setattr(_brain_auth, "AUTH_DIR", tmp_path_factory.mktemp("auth"))
+    auth_dir = tmp_path_factory.mktemp("auth")
+    monkeypatch.setattr(_brain_auth, "AUTH_DIR", auth_dir)
+    monkeypatch.setattr("harvey.linked_logins.AUTH_DIR", auth_dir)
     # (The brain's API key is read from .env: never the checkout's.)
     monkeypatch.setattr(_brain_auth, "ENV_FILE", tmp_path_factory.mktemp("env") / ".env")
     _brain_auth.forget()

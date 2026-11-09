@@ -841,7 +841,19 @@ class BrainConfig(BaseModel):
 
     @property
     def auth(self) -> str:
-        return self.block().auth
+        return self.auth_for(self.provider)
+
+    def auth_for(self, provider: str | None = None) -> str:
+        """The login ``provider``'s calls use: the one its settings name,
+        else the account linked in Harvey for it when there is one (linked
+        before each provider kept its own login), else the terminal login.
+        So the panel, the status and the calls follow what is linked."""
+        p = provider or self.provider
+        block = self.block(p)
+        if self.chose_auth(p):
+            return block.auth
+        from harvey import linked_logins
+        return "account" if linked_logins.has_account(p) else block.auth
 
     @auth.setter
     def auth(self, value) -> None:

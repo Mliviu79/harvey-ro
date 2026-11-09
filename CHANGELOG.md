@@ -1561,6 +1561,11 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A login linked before each provider kept its own.** A Codex account
+  linked while Claude was the default (the config naming no login for
+  Codex) showed and ran as the terminal login. A provider whose settings
+  name no login now uses the account linked in Harvey for it, else the
+  terminal login, in its card, its status and its calls.
 - **Loose ends of removing and answering.** A campaign email removed in
   the moment staging wrote it no longer leaves its person staged with
   nothing to send: the step is drafted again, once (and staging no

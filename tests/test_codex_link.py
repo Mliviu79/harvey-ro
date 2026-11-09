@@ -629,3 +629,41 @@ def test_codex_linked_while_claude_is_chosen_shows_its_models_and_saves_with_it(
     saved = load_brain_config(str(client.dir / "harvey.local.yaml"))
     assert (saved.provider, saved.auth, saved.model) == ("codex", "account", model)
     assert saved.claude.auth == "terminal"
+
+
+def test_a_provider_naming_no_login_uses_the_account_linked_in_harvey():
+    home = account_home()
+    login = _write_login(home)
+    # (Codex linked before each provider kept its own login: the file says
+    # only `provider: claude`.)
+    brain = BrainConfig(provider="claude")
+    assert brain.for_provider("codex").auth == "account"
+    assert brain.auth_for("codex") == "account"
+    assert brain.auth == "terminal"                          # Claude's own, untouched
+    named = BrainConfig(provider="claude", codex={"auth": "terminal"})
+    assert named.auth_for("codex") == "terminal"             # a login it names stays
+    login.unlink()
+    assert brain.auth_for("codex") == "terminal"
+
+
+def test_the_panel_shows_codex_on_the_account_linked_before_the_upgrade(client, fake, monkeypatch):
+    from tests.conftest import REAL_CODEX_STATUS
+
+    (client.dir / "harvey.yaml").write_text(CLAUDE_TEMPLATE, encoding="utf-8")
+    _link(client, fake)
+    # (As an older Harvey left it: the login linked, the config naming none.)
+    (client.dir / "harvey.local.yaml").unlink()
+    homes = []
+
+    async def describe(self, timeout=0):
+        homes.append(self.native_home)
+        return {"version": "0.159.3", "account": {"type": "chatgpt", "plan": "plus"},
+                "models": [{"id": "gpt-6-luna", "name": "gpt-6-luna", "efforts": []}]}
+    monkeypatch.setattr(brain_auth, "codex_status", REAL_CODEX_STATUS)
+    monkeypatch.setattr(hc, "check_cli_version", lambda *a, **k: "0.159.3")
+    monkeypatch.setattr(hc.CodexClient, "describe", describe)
+    seen = client.get("/api/brain?full=1&refresh=1").json()
+    codex = seen["providers"]["codex"]
+    assert codex["auth"] == "account" and codex["linked"] is True
+    assert seen["providers"]["claude"]["auth"] == "terminal"
+    assert homes and all(h == account_home() for h in homes)

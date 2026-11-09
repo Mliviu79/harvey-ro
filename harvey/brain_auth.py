@@ -54,10 +54,11 @@ import subprocess
 import time
 from pathlib import Path
 
+from harvey import linked_logins
 from harvey.paths import PROJECT_ROOT
 
 TERMINAL, ACCOUNT, API_KEY = "terminal", "account", "api_key"
-AUTH_DIR = PROJECT_ROOT / "data" / "auth"
+AUTH_DIR = linked_logins.AUTH_DIR
 # Harvey's .env, where the Claude key is kept (read afresh, so a key
 # removed from Settings stops being used without a restart).
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -274,11 +275,11 @@ def linked_in_harvey(provider: str) -> bool:
 
 
 def linked_auth(brain, provider: str) -> str:
-    """The login to record for ``provider`` as it becomes the default
-    (harvey train --provider, harvey setup, Settings → Model): the account
-    linked in Harvey for it when its settings never named a login (linked
-    while the other provider was the default, before each provider kept its
-    own), else "" (it keeps its own)."""
+    """The account linked in Harvey for ``provider`` when its settings never
+    named a login (linked while the other provider was the default, before
+    each provider kept its own), else "" (it keeps its own). What
+    BrainConfig.auth_for reads, and what train, setup and Settings → Model
+    record as a provider becomes the default."""
     chose = getattr(brain, "chose_auth", None)
     if brain is not None and callable(chose) and chose(provider):
         return ""
