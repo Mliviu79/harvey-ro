@@ -270,12 +270,27 @@ CARRIED_MONEY = ("usd_per_day", "usd_per_month", "codex_usd_per_mtok_in",
                  "codex_usd_per_mtok_out")
 
 
-def carried_auth(auth: str, provider: str) -> tuple[str, str]:
+def linked_in_harvey(provider: str) -> bool:
+    """Whether an account is linked in Harvey for ``provider`` (Codex's
+    login in data/auth/codex, Claude's note of the one it linked)."""
+    if provider == "codex":
+        from harvey import codex_link
+        return codex_link.is_linked()
+    from harvey import claude_link
+    return claude_link.has_account()
+
+
+def carried_auth(auth: str, provider: str, from_provider: str = "") -> tuple[str, str]:
     """The login a switch to ``provider`` keeps, and a line saying why it
     didn't ("" when it did): an API key only when one is saved for that
-    provider, else the terminal login. A linked account folder is kept
+    provider, else the terminal login. Switching from ``from_provider``
+    (another one), the terminal login becomes the account linked in Harvey
+    for ``provider`` when there is one (linked while the other provider was
+    chosen). A linked account folder is kept
     (it is the provider's own, and an empty one fails as not logged in)."""
     auth = auth or TERMINAL
+    if auth == TERMINAL and from_provider and from_provider != provider             and ACCOUNT in offered(provider) and linked_in_harvey(provider):
+        return ACCOUNT, ""
     if auth == API_KEY and not key_set(provider):
         label = "Codex" if provider == "codex" else "Claude"
         return TERMINAL, (f"No {label} API key is saved, so the brain uses the terminal login "

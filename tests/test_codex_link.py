@@ -554,3 +554,69 @@ def test_a_linked_account_shows_unlink_and_link_again_once_expired():
                                       last_try={"at": 1790000000, "ok": False, "kind": "auth"}))
     assert "link the account again" in html and "the last renewal failed (auth)" in html
     assert "Link the account again" in html
+
+
+# ── Linked while Claude was chosen ──
+
+CLAUDE_TEMPLATE = """# Harvey's settings (fictional)
+persona:
+  name: H
+  company: Acme Example
+brain:
+  provider: claude
+"""
+
+
+def test_a_switch_takes_the_account_linked_in_harvey_for_that_provider(monkeypatch):
+    monkeypatch.setattr(codex_link, "is_linked", lambda: True)
+    assert brain_auth.carried_auth("terminal", "codex", "claude") == ("account", "")
+    # (No switch, or no provider it came from: the login chosen stays.)
+    assert brain_auth.carried_auth("terminal", "codex", "codex") == ("terminal", "")
+    assert brain_auth.carried_auth("terminal", "codex") == ("terminal", "")
+    monkeypatch.setattr(codex_link, "is_linked", lambda: False)
+    assert brain_auth.carried_auth("terminal", "codex", "claude") == ("terminal", "")
+
+
+def _link(client, fake):
+    fake.use("device_ok")
+    assert client.post("/api/brain/codex/link").json()["status"] == "pending"
+    for _ in range(200):
+        got = client.get("/api/brain/codex/link").json()
+        if got["status"] != "pending":
+            break
+        time.sleep(0.05)
+    assert got["status"] == "linked"
+
+
+def test_codex_linked_while_claude_is_chosen_shows_its_models_and_saves_with_it(
+        client, fake, monkeypatch):
+    from tests.conftest import REAL_CODEX_STATUS
+
+    (client.dir / "harvey.yaml").write_text(CLAUDE_TEMPLATE, encoding="utf-8")
+    _link(client, fake)
+    homes = []
+
+    async def describe(self, timeout=0):
+        # (Codex's answer, read from the folder the client was given.)
+        homes.append(self.native_home)
+        return {"version": "0.159.3", "account": {"type": "chatgpt", "plan": "plus"},
+                "models": [{"id": "gpt-6-luna", "name": "gpt-6-luna", "efforts": []}]}
+    monkeypatch.setattr(brain_auth, "codex_status", REAL_CODEX_STATUS)
+    monkeypatch.setattr(hc, "check_cli_version", lambda *a, **k: "0.159.3")
+    monkeypatch.setattr(hc.CodexClient, "describe", describe)
+    # The link never switches the provider: Claude stays, on its own login.
+    assert load_brain_config(str(client.dir / "harvey.yaml")).provider == "claude"
+    seen = client.get("/api/brain?provider=codex&full=1&refresh=1").json()
+    assert seen["auth"] == "account"
+    assert "No Codex login found" not in (seen.get("problem") or "")
+    assert seen["linked"] is True and [m["id"] for m in seen["models"]] == ["gpt-6-luna"]
+    assert homes and all(h == account_home() for h in homes)
+    # The login picked on the panel is the one asked about.
+    terminal = client.get("/api/brain?provider=codex&auth=terminal").json()
+    assert terminal["auth"] == "terminal"
+    # Saving the switch with no login named takes the linked account.
+    model = seen["models"][0]["id"]
+    r = client.post("/api/brain", json={"provider": "codex", "model": model})
+    assert r.status_code == 200, r.text
+    saved = load_brain_config(str(client.dir / "harvey.local.yaml"))
+    assert (saved.provider, saved.auth, saved.model) == ("codex", "account", model)

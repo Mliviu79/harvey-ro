@@ -1711,13 +1711,16 @@ def _brain_config_or_error():
 
 
 @app.get("/api/brain")
-async def get_brain(full: bool = False, refresh: bool = False, provider: str = ""):
+async def get_brain(full: bool = False, refresh: bool = False, provider: str = "",
+                    auth: str = ""):
     """Settings → Model: the provider, model, reasoning effort and login
     (brain.auth) with its status (brain_auth.status: the CLI's version
     check, linked as what, the last error's class; ``full`` with Codex's
     account and its models, ``refresh`` asks the CLIs again). ``provider``
-    (claude, codex): that provider's status under the same login, for the
-    panel before a switch is saved."""
+    (claude, codex): that provider's status for the panel before a switch
+    is saved, under ``auth`` (the login picked there) when that provider
+    offers it, else the login the switch carries (brain_auth.carried_auth:
+    the account linked in Harvey for it, when there is one)."""
     from harvey import brain_auth
     from harvey.config import BRAIN_AUTH_READY, BRAIN_PROVIDERS, CODEX_REASONING_EFFORTS, BrainConfig
     brain, error = _brain_config_or_error()
@@ -1726,7 +1729,12 @@ async def get_brain(full: bool = False, refresh: bool = False, provider: str = "
     if provider and provider != brain.provider:
         if provider not in BRAIN_PROVIDERS:
             return JSONResponse({"error": f"'{provider}' is not a brain provider"}, status_code=400)
-        brain = BrainConfig(provider=provider, auth=brain.auth)
+        picked = auth.lower() if auth.lower() in brain_auth.offered(provider) else ""
+        brain = BrainConfig(provider=provider,
+                            auth=picked or brain_auth.carried_auth(brain.auth, provider, brain.provider)[0])
+    elif auth and auth.lower() != brain.auth and auth.lower() in brain_auth.offered(provider or brain.provider):
+        brain = BrainConfig(provider=brain.provider, model=brain.model,
+                            reasoning_effort=brain.reasoning_effort, auth=auth.lower())
     state = _state()
     await state.init_db()
     out = await brain_auth.status(brain, state=state, full=full, force=refresh)
@@ -1777,7 +1785,10 @@ async def set_brain(request: Request):
                            "would fail.", 400)
     else:
         values["reasoning_effort"] = ""
-    auth = (values.get("auth") or current.auth).lower()
+    auth = (values.get("auth") or (brain_auth.carried_auth(current.auth, provider, current.provider)[0]
+                                   if provider != current.provider else current.auth)).lower()
+    if not values.get("auth") and auth != current.auth:
+        values["auth"] = auth
     if auth not in brain_auth.offered(provider) and auth != current.auth:
         return _refuse(f"Linking with '{auth}' isn't available from the dashboard yet.", 409)
     if auth == brain_auth.ACCOUNT and provider == "codex" and auth != current.auth:

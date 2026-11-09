@@ -150,7 +150,8 @@ def cmd_train(args):
                 # prices (brain_auth.carried_auth, CARRIED_MONEY).
                 from harvey import brain_auth
 
-                auth, why = brain_auth.carried_auth(brain_config.auth, overrides["provider"])
+                auth, why = brain_auth.carried_auth(brain_config.auth, overrides["provider"],
+                                                   brain_config.provider)
                 if why:
                     print(f"  {why}")
                 money = {k: getattr(brain_config, k) for k in brain_auth.CARRIED_MONEY}

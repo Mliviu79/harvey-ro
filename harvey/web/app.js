@@ -5227,15 +5227,32 @@ async function loadModelCard(refresh) {
   if (_model && _model.provider === 'codex') loadProviderStatus('codex', refresh);
 }
 
+// After a link: the card read again, the pick kept on the provider just
+// linked, with its linked account (linked while the other provider was the
+// saved one, the switch is the user's to save).
+async function keepLinkedPick(provider) {
+  await loadModelCard(true);
+  if (!_modelPick || !_model) return;
+  if (provider !== _model.provider) pickModel('provider', provider);
+  _modelPick.auth = 'account';
+  delete _modelFull[provider];
+  if (provider === 'codex' || provider !== _model.provider) loadProviderStatus(provider, false);
+  renderModelCard();
+}
+
 // The status (and models) of a provider: Codex's with its live list
 // (full=1); Claude's when it isn't the saved one (a switch not saved yet).
 async function loadProviderStatus(provider, refresh) {
   if (_modelFull[provider] && !refresh) { renderModelCard(); return; }
   _modelFull[provider] = {loading: true};
   renderModelCard();
+  // (Under the login picked; a switch's first look takes the one it would
+  // carry, the account linked in Harvey when there is one.)
+  const auth = _modelPick && _modelPick.provider === provider && _modelPick.auth ? _modelPick.auth : '';
   const s = await api('/api/brain?provider=' + provider + (provider === 'codex' ? '&full=1' : '') +
-                      (refresh ? '&refresh=1' : ''));
+                      (auth ? '&auth=' + encodeURIComponent(auth) : '') + (refresh ? '&refresh=1' : ''));
   _modelFull[provider] = s && !s.error ? s : {failed: true};
+  if (s && !s.error && _modelPick && _modelPick.provider === provider && !_modelPick.auth) _modelPick.auth = s.auth;
   adoptCodexLink(_modelFull[provider]);
   adoptClaudeLink(_modelFull[provider]);
   renderModelCard();
@@ -5453,8 +5470,7 @@ function followCodexLink() {
     if (res.status === 'linked') {
       showToast(t('model.link_done'), 'success');
       _codexLink = null;
-      if (_modelPick) _modelPick.auth = 'account';
-      loadModelCard(true);
+      keepLinkedPick('codex');
       return;
     }
     if (res.status === 'cancelled' || res.status === 'idle') _codexLink = null;
@@ -5605,8 +5621,7 @@ function followClaudeLink() {
     if (res.status === 'linked') {
       showToast(t('model.claude_link_done'), 'success');
       _claudeLink = null;
-      if (_modelPick) _modelPick.auth = 'account';
-      loadModelCard(true);
+      keepLinkedPick('claude');
       return;
     }
     if (res.status === 'cancelled' || res.status === 'idle') _claudeLink = null;
@@ -5672,12 +5687,23 @@ function pickModel(key, value) {
     // A model is one provider's: switching back gives the saved one again.
     _modelPick.model = value === _model.provider ? _model.model : '';
     _modelPick.reasoning_effort = value === _model.provider ? _model.reasoning_effort : '';
+    // (The other provider's login is the one its status says the switch
+    // carries: set when that status comes back.)
+    _modelPick.auth = value === _model.provider ? _model.auth : '';
+    delete _modelFull[value];
     if (value === 'codex' || value !== _model.provider) loadProviderStatus(value, false);
     renderModelCard();
     return;
   }
   _modelPick[key] = value;
-  if (key === 'auth') renderModelCard();
+  if (key === 'auth') {
+    // (Codex's models are the login's own: ask again under the one picked.)
+    if (_modelPick.provider === 'codex' || _modelPick.provider !== _model.provider) {
+      delete _modelFull[_modelPick.provider];
+      loadProviderStatus(_modelPick.provider, false);
+    }
+    renderModelCard();
+  }
 }
 
 async function saveModel() {
