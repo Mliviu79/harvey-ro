@@ -8,9 +8,14 @@ every request passes, in order:
 1. Host: one Host header naming a loopback address (``localhost``,
    127.0.0.0/8, ``[::1]``) with an optional port. Anything else, including a
    rebinding name that resolves to 127.0.0.1, is refused before the token is
-   looked at.
+   looked at. The one exception is opt-in: with ``HARVEY_DASHBOARD_ORIGIN``
+   set to the https origin a reverse proxy on this machine serves the
+   dashboard at, that origin's host is answered too (see "Behind a reverse
+   proxy" below).
 2. Browser provenance: a request carrying ``Origin`` must come from exactly
-   this origin, and ``Sec-Fetch-Site`` must be ``same-origin`` or ``none``.
+   this origin (``http://`` + the loopback Host, or the configured https
+   origin for its host), and ``Sec-Fetch-Site`` must be ``same-origin`` or
+   ``none``.
    (A top-level navigation to ``/`` is the one exception: the shell carries
    no data.) No CORS headers are ever sent, so preflights fail.
 3. Public shell: only ``GET``/``HEAD`` of ``/`` and ``/static/*`` (HTML, CSS,
@@ -28,6 +33,21 @@ never seen half-written, never follows a symlink, and never replaces an
 existing file). An existing token is used only if it is a regular file owned
 by this user with no group/other permissions and a well-formed value;
 otherwise the API stays locked (fail closed) and the error says what to do.
+
+Behind a reverse proxy: the dashboard still binds to loopback only, and the
+proxy (which ends TLS and passes the Host header through unchanged) is what
+the outside reaches. ``HARVEY_DASHBOARD_ORIGIN`` names the one origin it is
+served at; it is read once at start, from the environment or ``.env``, must
+be ``https://`` + a DNS name, and a value that can't be used stops the
+dashboard from starting. The guard can't see TLS, so it trusts the proxy for
+that; what it checks is unchanged (Host, Origin, fetch metadata, token), and
+responses for the public host carry ``Strict-Transport-Security`` (unless the
+origin names a port: HSTS covers every port of a name). A proxy that replaces
+Host with the loopback address it forwards to is refused as before, and the
+refusal says so. The token
+is then the only thing between the internet and the dashboard, so the proxy
+should also limit who reaches it (an address allowlist, a VPN): its own
+basic auth can't, since ``Authorization`` carries the token.
 
 On Windows, POSIX permission bits mean nothing: the file gets whatever ACL
 the folder grants, and Harvey doesn't pretend otherwise (see README).
@@ -70,7 +90,14 @@ SECURITY_HEADERS = [
      b"form-action 'none'; frame-ancestors 'none'"),
 ]
 
+# Only for the public host: a loopback origin is plain http.
+HSTS_HEADER = (b"strict-transport-security", b"max-age=31536000")
+
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# The https origin a reverse proxy serves the dashboard at (opt-in).
+ORIGIN_ENV = "HARVEY_DASHBOARD_ORIGIN"
+_DNS_LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 
 class TokenError(Exception):
@@ -274,6 +301,57 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+class OriginError(Exception):
+    """HARVEY_DASHBOARD_ORIGIN can't be used; the dashboard doesn't start."""
+
+
+def parse_public_origin(value: str | None) -> str | None:
+    """The origin a reverse proxy serves the dashboard at, as browsers write
+    it (``https://harvey.example.com``, lower case, no default port), None
+    when unset. OriginError for anything that isn't https + a DNS name."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    problem = OriginError(
+        f"{ORIGIN_ENV}={value!r} isn't an origin Harvey can be served at. Use https and "
+        "the DNS name your reverse proxy answers to, nothing after it: "
+        "https://harvey.example.com")
+    scheme, _, authority = value.partition("://")
+    if scheme.lower() != "https":
+        raise problem
+    if authority.endswith("/"):
+        authority = authority[:-1]
+    host = parse_host(authority)
+    if host is None or len(host) > 253:
+        raise problem
+    labels = host.split(".")
+    if len(labels) < 2 or not all(_DNS_LABEL_RE.fullmatch(label) for label in labels):
+        raise problem
+    if not labels[-1][0].isalpha() or labels[-1] == "localhost":
+        # A last label that starts with a digit is an address to a browser
+        # (1.2.3.4, 1.2.3.0x4); localhost is a loopback name.
+        raise problem
+    port = int(authority[len(host) + 1:] or 443)
+    return f"https://{host}" + ("" if port == 443 else f":{port}")
+
+
+class PublicOrigin:
+    """The origin a reverse proxy serves this dashboard at, set once at
+    start. None (the default) is loopback only."""
+
+    def __init__(self):
+        self.origin: str | None = None
+
+    def configure(self, value: str | None):
+        self.origin = None  # a value that can't be used leaves loopback only
+        self.origin = parse_public_origin(value)
+
+    @property
+    def host(self) -> str | None:
+        """The Host header a request for that origin carries."""
+        return self.origin[len("https://"):] if self.origin else None
+
+
 def is_public_path(method: str, path: str) -> bool:
     if method not in ("GET", "HEAD"):
         return False
@@ -303,9 +381,10 @@ class DashboardGuard:
     """ASGI middleware applying the checks in the module docstring to every
     request, and the security headers to every response."""
 
-    def __init__(self, app, store: TokenStore):
+    def __init__(self, app, store: TokenStore, public_origin: PublicOrigin):
         self.app = app
         self.store = store
+        self.public_origin = public_origin
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -319,11 +398,13 @@ class DashboardGuard:
         for k, v in scope.get("headers") or []:
             headers.setdefault(k.decode("latin-1").lower(), []).append(v.decode("latin-1"))
 
+        secured = list(SECURITY_HEADERS)
+
         async def send_secured(message):
             if message["type"] == "http.response.start":
                 existing = [(k, v) for k, v in message.get("headers", [])
-                            if k.lower() not in {h for h, _ in SECURITY_HEADERS}]
-                message = {**message, "headers": existing + SECURITY_HEADERS}
+                            if k.lower() not in {h for h, _ in secured}]
+                message = {**message, "headers": existing + secured}
             await send(message)
 
         async def deny(status: int, code: str, message: str, extra=()):
@@ -340,10 +421,21 @@ class DashboardGuard:
         # 1. Host, before anything else.
         hosts = headers.get("host", [])
         host = parse_host(hosts[0]) if len(hosts) == 1 else None
-        if host is None or not is_loopback(host):
+        host_header = hosts[0].lower() if host is not None else ""
+        served_at = self.public_origin.origin
+        if host is not None and is_loopback(host):
+            origin = f"http://{host_header}"
+        elif host is not None and host_header == self.public_origin.host:
+            # The reverse proxy's name, exactly as configured (it ends TLS).
+            origin = served_at
+            if ":" not in host_header:
+                secured.append(HSTS_HEADER)  # every port of the name, so not with one
+        else:
             return await deny(400, "bad_host",
-                              "This dashboard only answers to localhost / 127.0.0.1.")
-        host_header = hosts[0].lower()
+                              "This dashboard only answers to localhost / 127.0.0.1."
+                              if not served_at else
+                              "This dashboard only answers to localhost / 127.0.0.1 and to "
+                              f"the address in {ORIGIN_ENV}.")
 
         # 2. Browser provenance.
         public = is_public_path(method, path)
@@ -351,8 +443,13 @@ class DashboardGuard:
                       and headers.get("sec-fetch-mode", [""])[0] == "navigate"
                       and headers.get("sec-fetch-dest", [""])[0] == "document")
         origins = headers.get("origin", [])
-        if origins and (len(origins) != 1 or origins[0].lower() != f"http://{host_header}"):
+        if origins and (len(origins) != 1 or origins[0].lower() != origin):
             if not navigation:
+                if served_at and origin != served_at and origins == [served_at]:
+                    # The page is the proxy's, the Host isn't: still refused.
+                    return await deny(403, "cross_origin", (
+                        "Cross-origin requests are refused. The reverse proxy replaced the "
+                        "Host header: make it pass Host through unchanged."))
                 return await deny(403, "cross_origin", "Cross-origin requests are refused.")
         site = headers.get("sec-fetch-site", [])
         if site and site[0].lower() not in ("same-origin", "none") and not navigation:

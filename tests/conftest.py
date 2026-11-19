@@ -107,6 +107,18 @@ def _no_dotenv(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _loopback_dashboard(monkeypatch):
+    """The dashboard answers to localhost only, whatever the developer's
+    environment or the checkout's .env say: set but empty, the setting is
+    never looked up in .env."""
+    import harvey.dashboard as dash
+    from harvey import dashboard_auth
+
+    monkeypatch.setenv(dashboard_auth.ORIGIN_ENV, "")
+    monkeypatch.setattr(dash.public_origin, "origin", None)
+
+
+@pytest.fixture(autouse=True)
 def _private_dashboard_token(tmp_path_factory):
     """Never create or read the checkout's real data/dashboard-token."""
     import harvey.dashboard as dash

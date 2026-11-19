@@ -174,7 +174,8 @@ Docker Compose runs the dashboard; start and stop the heartbeat from its
 Actions card. Host networking preserves the dashboard's loopback-only bind at
 `127.0.0.1:5555`. This Compose setup supports native Linux; use the pip install
 above on macOS or Windows. On a remote Linux host, reach the dashboard through
-an SSH tunnel rather than exposing its port to the network.
+an SSH tunnel rather than exposing its port to the network, or serve it through
+your own HTTPS reverse proxy (see [The dashboard](#the-dashboard)).
 
 ```bash
 git clone https://github.com/Mliviu79/harvey-ro.git
@@ -721,7 +722,26 @@ harvey dashboard     # prints the link to open, e.g. http://127.0.0.1:5555/#toke
 
 **Opening it.** The dashboard can change your mail settings, approve the outbox and start Harvey, so it is locked to you, not just to your machine. On first start it creates a random token in `data/dashboard-token` (readable only by you) and prints a link carrying it after the `#`. Open that link: the page keeps the token for that browser tab only and removes it from the address bar. A new tab, or a tab opened without the link, shows a locked screen; paste the token there, or run `harvey dashboard --url` to print the link again. Every API request needs the token as an `Authorization: Bearer` header — scripts and `curl` included — and the token is never accepted from a cookie or a query string. Delete `data/dashboard-token` and restart the dashboard to replace it.
 
-**It only listens on this machine.** `--host` accepts loopback addresses only (`127.0.0.1`, `::1`, `localhost`), and requests must name one of them in their `Host` header, which also stops a DNS name pointed at 127.0.0.1 from reaching it. Requests sent by other websites open in your browser are refused. To use it from another computer, tunnel instead of exposing it: `ssh -L 5555:127.0.0.1:5555 your-machine`, then open the printed link locally. The token protects against other users and other websites, not against programs already running as your own user account, which can read the token file just as they can read `.env` or the database.
+**It only listens on this machine.** `--host` accepts loopback addresses only (`127.0.0.1`, `::1`, `localhost`), and requests must name one of them in their `Host` header, which also stops a DNS name pointed at 127.0.0.1 from reaching it. Requests sent by other websites open in your browser are refused. To use it from another computer, tunnel instead of exposing it: `ssh -L 5555:127.0.0.1:5555 your-machine`, then open the printed link locally (or put it behind your own reverse proxy, below). The token protects against other users and other websites, not against programs already running as your own user account, which can read the token file just as they can read `.env` or the database.
+
+**Behind your own HTTPS reverse proxy (opt-in).** To open the dashboard at a name of your own, such as `https://harvey.example.com`, run a reverse proxy (Caddy, nginx) on the same machine and tell Harvey the one address it is served at, in `.env`:
+
+```
+HARVEY_DASHBOARD_ORIGIN=https://harvey.example.com
+```
+
+```
+# Caddyfile
+harvey.example.com {
+    reverse_proxy 127.0.0.1:5555
+}
+```
+
+Restart the dashboard (in Docker: `docker compose restart harvey`, then `docker compose logs harvey` for the link); `harvey dashboard` and `harvey dashboard --url` then print the link at that address. Harvey still listens on `127.0.0.1` only: the proxy ends TLS and must pass the `Host` header through unchanged, without rewriting `Origin`. Caddy does by default (remove any `header_up Host`); nginx doesn't, so add `proxy_set_header Host $http_host;`; in Apache, `ProxyPreserveHost On`. The value must be `https://` and a DNS name, with nothing after it (a port if the proxy uses one), and it is read when the dashboard starts: one that can't be used stops the start (in Docker the container then keeps restarting, and its log says why), and with none set the dashboard answers to `localhost` only, as before. Every check stays as it was (the token on every request, requests from other websites refused), and the local link and an SSH tunnel keep working beside it. Use a name that serves nothing else: browsers are told to use https for everything on it (`Strict-Transport-Security`).
+
+If the page opens but every action answers "Cross-origin requests are refused", the proxy is replacing `Host` with the address it forwards to: make it pass `Host` through as above. If the page doesn't open at all ("only answers to localhost"), the name in the browser isn't the one in `HARVEY_DASHBOARD_ORIGIN`, or the dashboard wasn't restarted after setting it. The one-time Gmail and Microsoft 365 sign-ins (`harvey gmail auth`, `harvey microsoft auth`) still finish on the server's own `localhost`: from another computer, run them over SSH with that port forwarded (`ssh -L 8765:localhost:8765` for Gmail, `8766` for Microsoft 365).
+
+Know what this changes: the dashboard is then reachable from the whole internet, and the link with its token is the only thing that unlocks it. Whoever gets the link (a forwarded message, a screenshot, a synced browser history) can approve the outbox and change your mail settings from anywhere, where a tunnel would also ask them for your SSH key. So limit who reaches it at the proxy: an address allowlist (Caddy's `remote_ip`), or a VPN. The proxy's own password prompt (basic auth) can't be used, since the `Authorization` header carries Harvey's token, and a sign-in page that sets a cookie can't either: the dashboard's requests send no cookies. If the link may have leaked, delete `data/dashboard-token` and restart the dashboard.
 
 **Windows:** the token file is protected by the permissions of the folder it lives in (your user profile normally restricts this to you); Harvey doesn't apply POSIX file modes there.
 

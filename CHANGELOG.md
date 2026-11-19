@@ -9,6 +9,26 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **The dashboard behind your own HTTPS reverse proxy.** The dashboard
+  answers to `localhost` only, so a proxy serving it at a name of your own
+  either showed nothing or, when it replaced `Host` with the address it
+  forwards to, showed the page and answered every action with "Cross-origin
+  requests are refused". With
+  `HARVEY_DASHBOARD_ORIGIN=https://harvey.example.com` in `.env` (opt-in,
+  read when the dashboard starts; https and a DNS name only, anything else
+  stops the start) it also answers to that one address, and
+  `harvey dashboard` prints the link there. Two things to change, then: set
+  it, and have the proxy pass `Host` through unchanged (Caddy's default;
+  nginx needs `proxy_set_header Host $http_host;`). A proxy that still
+  replaces `Host` is refused as before, and the refusal now says so. Harvey
+  still listens on 127.0.0.1 only and every check stays: the token on every
+  request, requests from other websites refused. Responses at that address
+  carry `Strict-Transport-Security`. The token is then all that stands
+  between the internet and the dashboard, so limit who can reach it at the
+  proxy (an address allowlist or a VPN; its basic auth can't be used, the
+  `Authorization` header carries the token). See "The dashboard" in the
+  README.
+
 - **Claude and Codex side by side.** Both providers can be set up at
   once, each with its own login, model, Codex's reasoning effort, USD caps
   and Codex's prices (`brain.claude`, `brain.codex`): linking, unlinking or

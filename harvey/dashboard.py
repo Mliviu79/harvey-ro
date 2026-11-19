@@ -1,6 +1,7 @@
 """Harvey Dashboard — local web UI to set up, control, and monitor Harvey."""
 
 import asyncio
+import io
 import ipaddress
 import json
 import logging
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import aiosqlite
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse,
@@ -132,6 +133,8 @@ async def _run_worker(stop: asyncio.Event):
 app = FastAPI(title="Harvey Dashboard", docs_url=None, redoc_url=None, openapi_url=None,
               lifespan=_lifespan)
 token_store = auth.TokenStore(TOKEN_FILE)
+# Loopback only until start_dashboard reads HARVEY_DASHBOARD_ORIGIN.
+public_origin = auth.PublicOrigin()
 
 
 class _UpgradeGate:
@@ -162,7 +165,7 @@ def _upgrade_needed() -> bool:
 
 # (The guard is outermost: a request without the token never learns more.)
 app.add_middleware(_UpgradeGate)
-app.add_middleware(auth.DashboardGuard, store=token_store)
+app.add_middleware(auth.DashboardGuard, store=token_store, public_origin=public_origin)
 
 # Harvey process tracking
 _harvey_process: subprocess.Popen | None = None
@@ -7515,8 +7518,9 @@ class DashboardSetupError(Exception):
 
 
 def _check_loopback_bind(host: str) -> str:
-    """The host to bind, which must be a loopback address. The dashboard has
-    no remote-access mode: from another machine, use an SSH tunnel."""
+    """The host to bind, which must be a loopback address: from another
+    machine it is an SSH tunnel, or a reverse proxy on this one
+    (HARVEY_DASHBOARD_ORIGIN)."""
     name = (host or "").strip().lower()
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
@@ -7528,11 +7532,31 @@ def _check_loopback_bind(host: str) -> str:
     return name
 
 
+def _public_origin_setting() -> str | None:
+    """HARVEY_DASHBOARD_ORIGIN as set: the environment first, then .env
+    (read, not loaded; one that can't be read counts as not set)."""
+    value = os.environ.get(auth.ORIGIN_ENV)
+    if value is None:
+        try:
+            text = read_user_text(ENV_FILE)
+        except OSError:
+            return None
+        value = dotenv_values(stream=io.StringIO(text)).get(auth.ORIGIN_ENV)
+    return value
+
+
 def dashboard_url(host: str = "127.0.0.1", port: int = 5555) -> str:
     """The unlock link. The token rides in the #fragment, which browsers
     never send to the server (so it stays out of logs and Referer); the
-    page moves it to sessionStorage and strips it from the address bar."""
+    page moves it to sessionStorage and strips it from the address bar.
+    Behind a reverse proxy (HARVEY_DASHBOARD_ORIGIN) the link is its origin's."""
     name = _check_loopback_bind(host)
+    try:
+        origin = auth.parse_public_origin(_public_origin_setting())
+    except auth.OriginError as e:
+        raise DashboardSetupError(str(e)) from e
+    if origin:
+        return f"{origin}/#token={token_store.get()}"
     try:
         if ipaddress.ip_address(name).version == 6:
             name = f"[{name}]"
@@ -7591,16 +7615,24 @@ async def _close_claude_link() -> None:
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
-    """Start the dashboard server (loopback only, token required)."""
+    """Start the dashboard server (loopback only, token required; a reverse
+    proxy on this machine may serve it at HARVEY_DASHBOARD_ORIGIN)."""
     import uvicorn
 
     try:
         bind = _check_loopback_bind(host)
         url = dashboard_url(host, port)
-    except (DashboardSetupError, auth.TokenError) as e:
+        # Taken here, once: nothing saved while it runs changes who may reach it.
+        public_origin.configure(_public_origin_setting())
+    except (DashboardSetupError, auth.TokenError, auth.OriginError) as e:
         raise DashboardSetupError(str(e)) from e
 
     print(f"\n  Harvey Dashboard running. Open this link to unlock it:\n\n    {url}\n")
+    if public_origin.origin:
+        print(f"  Served at {public_origin.origin} by your reverse proxy ({auth.ORIGIN_ENV});")
+        print(f"  Harvey itself listens only on {bind} port {port}. Anyone on the internet can")
+        print(f"  reach {public_origin.origin}: limit who can at the proxy, and keep the")
+        print("  link private.\n")
     print(f"  The token is stored in {token_store.path} (owner-only). Keep the link")
     print("  private; anyone with it can use the dashboard. Press Ctrl+C to stop.\n")
     if os.name == "nt":

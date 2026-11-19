@@ -5,8 +5,9 @@ PID/log files are all redirected into tmp_path, and starting Harvey is
 stubbed. Covers: every route needs the token (enumerated, so a new route
 can't slip through), the public shell carries no data, Host/Origin/fetch
 metadata checks, cross-site "simple" requests, token storage, .env
-persistence, loopback-only binding, a real server started as the CLI does,
-and the browser-side token handling under node.
+persistence, loopback-only binding, the opt-in origin a reverse proxy serves
+the dashboard at, a real server started as the CLI does, and the browser-side
+token handling under node.
 """
 
 import errno
@@ -36,6 +37,7 @@ pytestmark = pytest.mark.modules_on("email_outreach")
 
 POSIX = pytest.mark.skipif(os.name == "nt", reason="POSIX file modes (Windows uses ACLs)")
 ORIGIN = "http://127.0.0.1:5555"
+PUBLIC = "https://harvey.example.com"
 CROSS_SITE = {"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site",
               "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "empty"}
 
@@ -49,6 +51,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "PID_FILE", tmp_path / "data" / "harvey.pid")
     monkeypatch.setattr(dash, "LOG_FILE", tmp_path / "data" / "harvey.log")
     dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    # Not set at all here (conftest sets it empty), so this .env is looked at.
+    monkeypatch.delenv(auth.ORIGIN_ENV, raising=False)
     spawned = []
 
     class NoPopen:
@@ -303,6 +307,213 @@ def test_top_level_navigation_to_the_shell_is_allowed_from_anywhere(anon):
     assert anon.get("/static/app.js", headers={**CROSS_SITE,
                                                "Sec-Fetch-Dest": "script"}).status_code == 403
     assert anon.get("/api/companies", headers=nav).status_code == 403
+
+
+# ── Behind a reverse proxy: one https origin, opt-in ──
+
+
+@pytest.fixture
+def proxied(env):
+    """The dashboard as a reverse proxy serves it at PUBLIC."""
+    dash.public_origin.configure(PUBLIC)
+    with TestClient(dash.app, base_url=PUBLIC,
+                    headers={"Authorization": f"Bearer {env['token']}"}) as c:
+        yield c
+
+
+@pytest.mark.parametrize("value, origin", [
+    ("https://harvey.example.com", PUBLIC), ("https://Harvey.Example.COM/", PUBLIC),
+    ("  https://harvey.example.com:443 ", PUBLIC), ("HTTPS://harvey.example.com", PUBLIC),
+    ("https://harvey.example.com:8443", "https://harvey.example.com:8443"),
+    ("https://harvey.example.com:0443", PUBLIC),
+    ("https://harvey.example.com:08443", "https://harvey.example.com:8443"),
+    ("https://xn--harvey-9za.example", "https://xn--harvey-9za.example"),
+    ("", None), ("   ", None), (None, None),
+])
+def test_public_origin_is_written_as_browsers_send_it(value, origin):
+    assert auth.parse_public_origin(value) == origin
+
+
+@pytest.mark.parametrize("value", [
+    "http://harvey.example.com", "harvey.example.com", "//harvey.example.com",
+    "https://harvey.example.com/dashboard", "https://harvey.example.com//",
+    "https://harvey.example.com?x=1", "https://harvey.example.com#x",
+    "https://user@harvey.example.com", "https://harvey.example.com.",
+    "https://harvey", "https://localhost", "https://harvey.localhost", "https://127.0.0.1",
+    "https://192.0.2.10", "https://[::1]", "https://[2001:db8::1]", "https://2130706433.1",
+    "https://-harvey.example.com", "https://harvey_x.example.com", "https://*.example.com",
+    "https://harvey.example.com:0", "https://harvey.example.com:", "https://harvey.example.com:99999",
+    "https://harvey.example.com, https://other.example.com", "https://harvey.example.com other",
+    "https://" + "a" * 64 + ".example.com", "https://harvey..example.com", "null", "*",
+    "https://192.0.2.0x4", "https://harvey.0x7f", "https://harvey.example.1com", "https",
+    "https://" + ".".join(["a" * 60] * 4) + ".example.com",       # over 253 characters
+])
+def test_unusable_public_origins_are_refused(value):
+    with pytest.raises(auth.OriginError, match=auth.ORIGIN_ENV):
+        auth.parse_public_origin(value)
+
+
+def test_a_refused_value_leaves_loopback_only():
+    public = auth.PublicOrigin()
+    public.configure(PUBLIC)
+    assert public.origin == PUBLIC and public.host == "harvey.example.com"
+    with pytest.raises(auth.OriginError):
+        public.configure("http://harvey.example.com")
+    assert public.origin is None and public.host is None
+
+
+def test_public_host_is_refused_until_configured(env):
+    with TestClient(dash.app, base_url=PUBLIC,
+                    headers={"Authorization": f"Bearer {env['token']}"}) as c:
+        assert c.get("/").status_code == 400
+        r = c.get("/api/companies", headers={"Origin": PUBLIC, "Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 400 and r.json()["error"] == "bad_host"
+        assert auth.ORIGIN_ENV not in r.text
+
+
+def test_proxied_dashboard_works_from_its_own_origin(proxied, env):
+    headers = {"Origin": PUBLIC, "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"}
+    assert proxied.get("/api/companies", headers=headers).status_code == 200
+    r = proxied.post("/api/settings/env", json={"SMTP_HOST": "smtp.example.test"},
+                     headers=headers)
+    assert r.status_code == 200 and r.json()["success"]
+    assert "SMTP_HOST=smtp.example.test" in dash.ENV_FILE.read_text()
+    assert proxied.post("/api/sending/pause", headers=headers).status_code == 200
+    # No Origin at all (curl, or a same-origin GET) still needs only the token.
+    assert proxied.get("/api/companies").status_code == 200
+    # The unlock link, clicked on another site.
+    nav = {"Origin": "https://mail.example.net", "Sec-Fetch-Site": "cross-site",
+           "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
+    assert proxied.get("/", headers={**nav, "Authorization": ""}).status_code == 200
+    assert proxied.get("/api/companies", headers=nav).status_code == 403
+
+
+def test_proxied_dashboard_still_needs_the_token(proxied, env):
+    headers = {"Origin": PUBLIC, "Sec-Fetch-Site": "same-origin"}
+    for auth_header in ("", "Bearer " + "x" * 43, f"Basic {env['token']}"):
+        r = proxied.get("/api/companies", headers={**headers, "Authorization": auth_header})
+        assert r.status_code == 401, auth_header
+        r = proxied.post("/api/sending/pause", headers={**headers, "Authorization": auth_header})
+        assert r.status_code == 401, auth_header
+    r = proxied.get(f"/api/companies?token={env['token']}",
+                    headers={"Authorization": "", "Cookie": f"token={env['token']}"})
+    assert r.status_code == 401
+    shell = proxied.get("/", headers={"Authorization": ""})
+    assert shell.status_code == 200 and env["token"] not in shell.text
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://evil.example"},
+    {"Origin": "null"},
+    {"Origin": "http://harvey.example.com"},            # the same name over plain http
+    {"Origin": "https://harvey.example.com:8443"},
+    {"Origin": "https://harvey.example.com:443"},       # browsers never write the default port
+    {"Origin": "https://harvey.example.com."},
+    {"Origin": "https://sub.harvey.example.com"},
+    {"Origin": "https://harvey.example.com.evil.example"},
+    {"Origin": "https://example.com"},
+    {"Origin": ORIGIN},                                 # a loopback origin on the public host
+    {"Origin": "http://harvey.example.com:5555"},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Site": "same-site"},                    # a sibling subdomain's page
+    {"Origin": PUBLIC, "Sec-Fetch-Site": "same-site"},
+    {"Origin": PUBLIC, "Sec-Fetch-Site": "cross-site"},
+])
+def test_foreign_browser_contexts_are_refused_behind_the_proxy(proxied, headers):
+    assert proxied.get("/api/companies", headers=headers).status_code == 403
+    r = proxied.post("/api/sending/pause", headers=headers)
+    assert r.status_code == 403
+    assert r.json()["message"] in ("Cross-origin requests are refused.",
+                                   "Cross-site requests are refused.")
+    assert r.headers["strict-transport-security"] == "max-age=31536000"
+
+
+@pytest.mark.asyncio
+async def test_two_origin_headers_are_refused_behind_the_proxy(env):
+    dash.public_origin.configure(PUBLIC)
+    base = [("host", "harvey.example.com"), ("authorization", f"Bearer {env['token']}")]
+    assert await _raw(base + [("origin", PUBLIC)]) == 200
+    assert await _raw(base + [("origin", PUBLIC), ("origin", PUBLIC)]) == 403
+    assert await _raw(base + [("origin", PUBLIC), ("origin", "https://evil.example")]) == 403
+    assert await _raw(base + [("host", "127.0.0.1:5555")]) == 400
+
+
+@pytest.mark.parametrize("host", [
+    "harvey.example.com:443", "harvey.example.com:5555", "harvey.example.com:80",
+    "harvey.example.com.", "sub.harvey.example.com", "example.com", "evil.example",
+    "harvey.example.com.evil.example", "xharvey.example.com", "harvey.example.com@evil.example",
+    "evil.example@harvey.example.com", "https://harvey.example.com", "harvey.example.com/",
+])
+def test_only_the_configured_public_host_is_answered(proxied, env, host):
+    for path in ("/", "/api/companies"):
+        r = proxied.get(path, headers={"Host": host})
+        assert r.status_code == 400, (host, path, r.status_code)
+        assert env["token"] not in r.text
+        # Says where to look, without naming the address.
+        assert auth.ORIGIN_ENV in r.json()["message"] and "harvey.example" not in r.text
+
+
+def test_the_public_host_is_matched_whatever_its_case(proxied):
+    assert proxied.get("/api/companies", headers={"Host": "Harvey.Example.COM"}).status_code == 200
+
+
+def test_a_public_origin_with_a_port_names_that_port(env):
+    dash.public_origin.configure("https://harvey.example.com:8443")
+    token = {"Authorization": f"Bearer {env['token']}"}
+    with TestClient(dash.app, base_url="https://harvey.example.com:8443", headers=token) as c:
+        ok = {"Origin": "https://harvey.example.com:8443", "Sec-Fetch-Site": "same-origin"}
+        assert c.post("/api/sending/pause", headers=ok).status_code == 200
+        assert c.post("/api/sending/pause", headers={"Origin": PUBLIC}).status_code == 403
+        assert c.get("/api/companies", headers={"Host": "harvey.example.com"}).status_code == 400
+        # HSTS covers every port of a name, so none is sent for one port of it.
+        assert "strict-transport-security" not in c.get("/").headers
+
+
+def test_loopback_keeps_working_beside_the_public_origin(proxied, env):
+    """`harvey dashboard --url` on the machine itself, or an SSH tunnel."""
+    local = {"Host": "127.0.0.1:5555"}
+    assert proxied.get("/api/companies", headers=local).status_code == 200
+    same = {**local, "Origin": ORIGIN, "Sec-Fetch-Site": "same-origin"}
+    assert proxied.post("/api/sending/pause", headers=same).status_code == 200
+
+
+def test_a_proxy_that_replaces_host_is_refused_and_told_why(proxied, authed):
+    """The page is at the public address, but the proxy sent Harvey its own
+    loopback Host: refused as any other origin is, with the reason."""
+    rewritten = {"Host": "127.0.0.1:5555", "Origin": PUBLIC, "Sec-Fetch-Site": "same-origin"}
+    r = proxied.post("/api/sending/pause", headers=rewritten)
+    assert r.status_code == 403 and r.json()["error"] == "cross_origin"
+    assert "pass Host through" in r.json()["message"]
+    assert "strict-transport-security" not in r.headers
+    other = proxied.post("/api/sending/pause", headers={**rewritten, "Origin": "https://evil.example"})
+    assert other.json()["message"] == "Cross-origin requests are refused."
+    # With no public origin set, nothing hints at one.
+    dash.public_origin.configure(None)
+    r = authed.post("/api/sending/pause", headers={"Origin": PUBLIC})
+    assert r.status_code == 403 and r.json()["message"] == "Cross-origin requests are refused."
+
+
+def test_hsts_is_sent_for_the_public_host_only(proxied, env):
+    def hsts(response):
+        return response.headers.get("strict-transport-security")
+
+    assert hsts(proxied.get("/")) == "max-age=31536000"
+    assert hsts(proxied.get("/api/companies")) == "max-age=31536000"
+    assert hsts(proxied.get("/api/companies", headers={"Authorization": ""})) == "max-age=31536000"
+    assert hsts(proxied.get("/", headers={"Host": "127.0.0.1:5555"})) is None
+    assert hsts(proxied.get("/", headers={"Host": "evil.example"})) is None
+    for name, value in auth.SECURITY_HEADERS:
+        assert proxied.get("/").headers[name.decode()] == value.decode()
+
+
+def test_no_cors_preflight_is_approved_behind_the_proxy(proxied):
+    r = proxied.options("/api/companies", headers={
+        "Origin": "https://evil.example", "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization"})
+    assert r.status_code == 403
+    own = proxied.options("/api/companies", headers={
+        "Origin": PUBLIC, "Access-Control-Request-Method": "GET"})
+    assert not any(h.lower().startswith("access-control-") for h in own.headers)
 
 
 @pytest.mark.parametrize("content_type", [
@@ -700,6 +911,111 @@ def test_loopback_bind_prints_a_fragment_link(env, monkeypatch, capsys, host, sh
     assert "?token" not in out and "?t=" not in out
     assert calls[0].host == host.strip("[]") and calls[0].proxy_headers is False
     assert calls[0].log_level == "warning"
+
+
+def _serve_nothing(monkeypatch):
+    calls = []
+
+    class Server:
+        def __init__(self, config):
+            calls.append(config)
+
+        def run(self):
+            pass
+    monkeypatch.setattr(dash, "_server_class", lambda: Server)
+    return calls
+
+
+def test_public_origin_from_the_environment_gives_its_link(env, monkeypatch, capsys):
+    calls = _serve_nothing(monkeypatch)
+    monkeypatch.setenv(auth.ORIGIN_ENV, "https://Harvey.Example.com/")
+    dash.start_dashboard(port=5599)
+    out = capsys.readouterr().out
+    assert f"{PUBLIC}/#token={env['token']}" in out and "http://127.0.0.1" not in out
+    assert f"Served at {PUBLIC} by your reverse proxy" in out
+    assert "listens only on 127.0.0.1 port 5599" in out
+    assert f"reach {PUBLIC}: limit who can at the proxy" in " ".join(out.split())
+    assert "?token" not in out
+    # Still bound to loopback, still blind to forwarded headers.
+    assert calls[0].host == "127.0.0.1" and calls[0].proxy_headers is False
+    assert dash.public_origin.origin == PUBLIC and dash.public_origin.host == "harvey.example.com"
+
+
+def test_public_origin_is_read_from_the_env_file_and_the_environment_wins(env, monkeypatch):
+    dash.ENV_FILE.write_text(f"SMTP_HOST=smtp.example.test\n{auth.ORIGIN_ENV}={PUBLIC}\n")
+    assert dash.dashboard_url() == f"{PUBLIC}/#token={env['token']}"
+    assert auth.ORIGIN_ENV not in os.environ           # .env is read, not loaded
+    monkeypatch.setenv(auth.ORIGIN_ENV, "https://other.example.com")
+    assert dash.dashboard_url() == f"https://other.example.com/#token={env['token']}"
+    monkeypatch.setenv(auth.ORIGIN_ENV, "")            # set but empty: loopback only
+    assert dash.dashboard_url() == f"http://127.0.0.1:5555/#token={env['token']}"
+    assert dash.public_origin.origin is None           # a link asked for changes nothing
+
+
+@pytest.mark.parametrize("line", [
+    'export HARVEY_DASHBOARD_ORIGIN="https://harvey.example.com"  # behind the proxy',
+    "HARVEY_DASHBOARD_ORIGIN='https://harvey.example.com/'\r",
+    "\ufeffHARVEY_DASHBOARD_ORIGIN=https://harvey.example.com",
+])
+def test_public_origin_is_read_however_the_env_file_spells_it(env, line):
+    dash.ENV_FILE.write_text(line + "\n", encoding="utf-8", newline="")
+    assert dash.dashboard_url() == f"{PUBLIC}/#token={env['token']}"
+
+
+def test_an_env_file_that_cannot_be_read_as_utf8_still_starts(env, monkeypatch):
+    _serve_nothing(monkeypatch)
+    dash.ENV_FILE.write_bytes(b"# caf\xe9\nSMTP_HOST=smtp.example.test\n")
+    assert dash.dashboard_url() == f"http://127.0.0.1:5555/#token={env['token']}"
+    dash.start_dashboard()
+    assert dash.public_origin.origin is None
+    dash.ENV_FILE.unlink()
+    dash.ENV_FILE.mkdir()                              # can't be read at all
+    assert dash.dashboard_url() == f"http://127.0.0.1:5555/#token={env['token']}"
+
+
+def test_public_origin_is_taken_at_start_not_when_saved(authed, env):
+    """Saving .env from the dashboard never changes who may reach it."""
+    dash.ENV_FILE.write_text(f"{auth.ORIGIN_ENV}={PUBLIC}\n")
+    assert authed.post("/api/settings/env", json={"SMTP_HOST": "smtp.example.test"}).status_code == 200
+    assert os.environ[auth.ORIGIN_ENV] == PUBLIC       # the save loads .env; the guard doesn't look
+    assert dash.public_origin.origin is None
+    with TestClient(dash.app, base_url=PUBLIC,
+                    headers={"Authorization": f"Bearer {env['token']}"}) as c:
+        assert c.get("/api/companies").status_code == 400
+
+
+@pytest.mark.parametrize("value", ["http://harvey.example.com", "harvey.example.com",
+                                   "https://203.0.113.7", "https://harvey.example.com/x"])
+def test_an_unusable_public_origin_stops_the_start(env, monkeypatch, capsys, value):
+    import harvey.cli as cli
+    _never_serve(monkeypatch)
+    monkeypatch.setenv(auth.ORIGIN_ENV, value)
+    with pytest.raises(dash.DashboardSetupError, match=auth.ORIGIN_ENV):
+        dash.start_dashboard()
+    for url in (False, True):
+        args = type("A", (), {"host": "127.0.0.1", "port": 5555, "url": url})()
+        with pytest.raises(SystemExit) as e:
+            cli.cmd_dashboard(args)
+        assert e.value.code == 2
+        out = capsys.readouterr().out
+        assert "Dashboard not started" in out and env["token"] not in out
+    assert dash.public_origin.origin is None
+
+
+def test_public_origin_never_widens_the_bind(env, monkeypatch):
+    _never_serve(monkeypatch)
+    monkeypatch.setenv(auth.ORIGIN_ENV, PUBLIC)
+    for host in ("0.0.0.0", "harvey.example.com", "::"):
+        with pytest.raises(dash.DashboardSetupError, match="only listens on this machine"):
+            dash.start_dashboard(host=host)
+
+
+def test_cli_url_prints_the_public_link(env, monkeypatch, capsys):
+    import harvey.cli as cli
+    _never_serve(monkeypatch)
+    monkeypatch.setenv(auth.ORIGIN_ENV, PUBLIC)
+    cli.cmd_dashboard(type("A", (), {"host": "127.0.0.1", "port": 5555, "url": True})())
+    assert capsys.readouterr().out.strip() == f"{PUBLIC}/#token={env['token']}"
 
 
 def test_startup_fails_closed_without_a_usable_token(env, monkeypatch):
