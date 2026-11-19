@@ -1581,6 +1581,13 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A value saved on Settings can't add a line to `.env`.** Line breaks in
+  a saved key were replaced, but not the other characters the file is split
+  on when it is read back (a form feed, U+2028 and the like), so on the next
+  save the rest of such a value became a line of its own: any setting,
+  written by whoever held the dashboard's token. A value holding one is now
+  refused.
+
 - **A login linked before each provider kept its own.** A Codex account
   linked while Claude was the default (the config naming no login for
   Codex) showed and ran as the terminal login. A provider whose settings

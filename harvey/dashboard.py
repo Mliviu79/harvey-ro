@@ -640,6 +640,11 @@ async def save_env_settings(request: Request):
                                         status_code=400)
                 # Strip newlines so a crafted value can't inject extra .env entries
                 updates[key] = value.replace("\n", " ").replace("\r", " ").strip()
+                # (the file is read back with splitlines(), which also splits
+                # on form feeds, U+2028 and the like)
+                if len(updates[key].splitlines()) > 1:
+                    return JSONResponse({"success": False, "message": f"{key} is invalid."},
+                                        status_code=400)
         if updates:
             try:
                 _write_env_file(updates)

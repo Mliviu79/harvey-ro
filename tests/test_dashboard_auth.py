@@ -973,6 +973,19 @@ def test_an_env_file_that_cannot_be_read_as_utf8_still_starts(env, monkeypatch):
     assert dash.dashboard_url() == f"http://127.0.0.1:5555/#token={env['token']}"
 
 
+@pytest.mark.parametrize("separator", ["\x0c", "\x0b", "\x1c", "\x85", "\u2028", "\u2029"])
+def test_a_saved_value_cannot_add_a_line_to_the_env_file(authed, env, separator):
+    """The file is read back with splitlines(), so any character it splits
+    on would turn the rest of a value into a line of its own on the next
+    save: the address the dashboard is served at, for one."""
+    planted = f"smtp.example.test{separator}{auth.ORIGIN_ENV}=https://other.example.com"
+    r = authed.post("/api/settings/env", json={"SMTP_HOST": planted})
+    assert r.status_code == 400 and not r.json()["success"]
+    assert authed.post("/api/settings/env", json={"SMTP_PORT": "587"}).status_code == 200
+    assert auth.ORIGIN_ENV not in dash.ENV_FILE.read_text()
+    assert dash.dashboard_url() == f"http://127.0.0.1:5555/#token={env['token']}"
+
+
 def test_public_origin_is_taken_at_start_not_when_saved(authed, env):
     """Saving .env from the dashboard never changes who may reach it."""
     dash.ENV_FILE.write_text(f"{auth.ORIGIN_ENV}={PUBLIC}\n")
