@@ -615,15 +615,29 @@ async def _first(*events: asyncio.Event) -> None:
             w.cancel()
 
 
+async def _check_ended(state, job: jobs.Job) -> None:
+    """A check a Find-contacts run's search waited for failed: the search is
+    queued anyway (job_kinds.check_ended; a cancelled one queues nothing)."""
+    try:
+        from harvey.modules.job_kinds import check_ended
+
+        await check_ended(state, job)
+    except Exception as e:
+        logger.warning("worker: the searches after check %s: %s", job.id, e)
+
+
 async def _after_job(state, job: jobs.Job) -> None:
-    """A job ended: when it finished its run, the plans that run is of get
-    their event (harvey/agent/wakes.py); a wake that finished lets the
-    plan's next one be queued for what came meanwhile; a task whose job
-    ended without ending it (harvey/agent/tasks.py) ends with it."""
+    """A job ended: a check whose run's searches waited for it and that
+    didn't queue them gets them queued (_check_ended); when it finished
+    its run, the plans that run is of get their event (harvey/agent/
+    wakes.py); a wake that finished lets the plan's next one be queued for
+    what came meanwhile; a task whose job ended without ending it
+    (harvey/agent/tasks.py) ends with it."""
     try:
         now = await jobs.get(state, job.id)
         if now is None or now.status not in jobs.FINISHED:
             return
+        await _check_ended(state, now)
         from harvey.agent import tasks, wakes
 
         if job.batch_id:

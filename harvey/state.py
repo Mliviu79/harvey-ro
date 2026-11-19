@@ -522,8 +522,9 @@ class StateManager:
         self._schema: int | None = None
 
     async def _on_overlay(self, method: str, *args, **kwargs):
-        """overlay.store's ``method`` in a write transaction of its own, in
-        a worker thread."""
+        """overlay.store's ``method`` in a write transaction of its own (a
+        method in store.OWN_TRANSACTIONS opens its own), in a worker
+        thread."""
         from harvey.overlay import store
 
         return await asyncio.to_thread(store.call, self.db_path, method, *args, **kwargs)
@@ -758,6 +759,34 @@ class StateManager:
         """A register pull's records marked as Harvey's in one bulk write
         (overlay.store.Store.pull)."""
         return await self._on_overlay("pull", records, **kwargs)
+
+    async def ensure_registry_records(self, *, regs=None, query=None, limit=None,
+                                      **kwargs) -> dict:
+        """A record for every firm of a registry selection (registration
+        numbers, or a resolved registry query) that has none
+        (overlay.store.Store.ensure_registry_records): the selection read
+        once with no write lock, then one short write transaction.
+        ``limit`` 0 or ``dry_run`` only counts and takes no write lock (an
+        estimate). Counts: {"selected", "existing", "created", "left",
+        "cui_added", "cui_left", "cui_conflicts", "unkeyable", "excluded"};
+        with ``held`` the selection's firms that have a record ("ids") and
+        the ones made ("new"), from the same read."""
+        if limit is not None:
+            kwargs["limit"] = limit
+        return await self._on_overlay("ensure_registry_records", regs=regs, query=query,
+                                      **kwargs)
+
+    async def registry_entry(self, company_id: str) -> dict | None:
+        """What the registry declares for a firm that is to take its
+        registry entry, {"website", "domain"}, else None
+        (overlay.store.Store.registry_entry). A read."""
+        return await self._on_overlay("registry_entry", company_id)
+
+    async def take_from_registry(self, company_id: str, run_id: str = "") -> dict:
+        """What a registry pull gave a firm, for a record made for a
+        registry selection that holds nothing of its own (overlay.store.
+        Store.take_from_registry)."""
+        return await self._on_overlay("take_from_registry", company_id, run_id)
 
     async def match_records(self, records) -> tuple[int, list]:
         """A register pull's records matched in a read transaction, before

@@ -318,6 +318,9 @@ def overlay_con(files):
     adapters = registers.adapters(files)
     loaded = registers.attach_all(con, adapters)
     assert all(loaded.values()), loaded
+    # The temporary tables named statements fill and read.
+    for ddl in harvey.overlay.queries.TEMP_TABLES.values():
+        con.execute(ddl)
     yield con
     con.close()
 
@@ -500,12 +503,29 @@ def test_register_values_reach_firms_only_through_keys(files):
     for st in _all_registered(files):
         if st.module == "onrc":
             assert not re.search(r"\bf\.cui\s*=(?!\s*'')", st.sql), st.name
+            # The one read that wants every registration of a CUI (alias
+            # ``o``: whether a record holds any of a firm's numbers) goes
+            # through that index, so it names its condition.
+            if re.search(r"\bo\.cui\s*=", st.sql):
+                assert "o.cui != ''" in st.sql and ".records." in st.name, st.name
     names = {st.name for st in queries.named()}
     for m in registers.declared():
         # (A register written in WAL mode marks its saves itself: anaf.)
         assert f"{m.id}.marks" in names, m.id
         for r in m.register["reads"]:
             assert f"{m.id}.read.{r['code']}" in names, (m.id, r["code"])
+
+
+def test_a_firms_other_registrations_are_probed_by_index(files, overlay_con):
+    """Whether a record in Harvey holds any registration number of a firm's
+    CUI (the records statements): per firm, one search of the registry's
+    firms by CUI through its partial index, then the identifiers by key."""
+    _all_registered(files)
+    for name in ("onrc.records.select.keys", "onrc.records.select.match",
+                 "onrc.records.recheck"):
+        plan = explain(overlay_con, queries.sql(name, "reg"), queries.get(name).params)
+        at = plan.index("SEARCH o USING INDEX firms_cui (cui=?)")
+        assert plan[at + 1] == "SEARCH i USING PRIMARY KEY (scheme=? AND key=?)", (name, plan)
 
 
 def test_the_plan_checker_catches_what_it_should(overlay_con):

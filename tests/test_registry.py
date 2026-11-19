@@ -397,7 +397,9 @@ def test_cli_import_onrc_counts_the_whole_country(monkeypatch, capsys, raw, db_p
     monkeypatch.setattr(onrc, "latest_dataset", latest)
     monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
     out = run_cli(monkeypatch, capsys, "import-onrc", *narrowing, "--registry", str(db_path))
-    assert "every activity in all of Romania" in out and " match" in out
+    assert "11 operating firms in all of Romania" in out and "nothing was saved" in out
+    # Counted in the registry where it is: no pull is queued, no database made.
+    assert not (tmp_path / "harvey.db").exists()
 
 
 def test_counting_stops_at_the_cap(con, monkeypatch):

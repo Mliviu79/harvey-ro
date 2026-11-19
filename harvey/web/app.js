@@ -509,7 +509,7 @@ function loadCurrentTab() {
     case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': loadCompanies(); break;
-    case 'registry': loadRegistry(); break;
+    case 'registry': registryOn('registry'); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'outbox': loadOutbox(); break;
@@ -1028,7 +1028,10 @@ async function loadOverview() {
 
   renderOverviewSending(ov.sending);
   renderRunsTable(document.getElementById('overview-runs'), runs, 6);
-  renderOverviewSetup(setup, ov);
+  // (With no company on file the check leads to where companies come
+  // from: Companies' All firms while a registry is loaded, else Discover.)
+  const reg = ov.companies ? null : await api('/api/registry?limit=1');
+  renderOverviewSetup(setup, ov, !!(reg && !reg.off && (reg.loaded || {}).registry));
 }
 
 function renderOverviewHints() {
@@ -1044,12 +1047,22 @@ function overviewSearch(event) {
   overviewSearchFor(document.getElementById('overview-q').value);
 }
 
-function overviewSearchFor(q) {
-  _co.q = String(q || '').trim();
-  _co.offset = 0;
-  _co.selected.clear();
-  const box = document.getElementById('company-search');
-  if (box) box.value = _co.q;
+// The search lands on the Companies page's open scope: the registry's
+// list (All firms) or the companies in Harvey.
+async function overviewSearchFor(q) {
+  const words = String(q || '').trim();
+  if (await companyScope() === 'all') {
+    _rg.q = words;
+    registryFilterChanged();
+    const box = document.getElementById('registry-search');
+    if (box) box.value = words;
+  } else {
+    _co.q = words;
+    _co.offset = 0;
+    _co.selected.clear();
+    const box = document.getElementById('company-search');
+    if (box) box.value = words;
+  }
   goTab('companies');
 }
 
@@ -1083,13 +1096,14 @@ function runName(r) {
 
 // Setup checks that matter for finding contacts (scope "finding"), plus
 // whether any company is on file.
-function renderOverviewSetup(setup, ov) {
+function renderOverviewSetup(setup, ov, registry) {
   const el = document.getElementById('overview-setup');
   if (!el) return;
   const checks = ((setup && setup.checks) || []).filter(c => c.scope === 'finding');
   const rows = checks.map(c => ({done: c.done, label: checkLabel(c), help: checkHelp(c), optional: !c.required}));
   rows.push({done: (ov.companies || 0) > 0, label: t('ov.check.companies'),
-             help: t('ov.check.companies_help'), tab: 'discover'});
+             help: t(registry ? 'ov.check.companies_help' : 'ov.check.companies_help_discover'),
+             tab: registry ? 'companies' : 'discover'});
   const needed = rows.filter(r => !r.optional);
   const done = needed.filter(r => r.done).length;
   el.innerHTML = '<div class="setup-head"><span class="setup-pct">' +
@@ -3174,15 +3188,21 @@ function stamp() {
 
 // ── Companies: phone and email first ──
 //
-// One server-side page of /api/companies: sorted, filtered (the Contacts
-// page's company filters, plus activity, contact and source), with the
-// total and page numbers. The search box, the filters and the selection
-// live outside the rows, so a refresh re-renders the rows without losing
-// any of them. A page cut from a kept ordering (a filter, or a sort by a
-// figure) isn't refetched every 15 seconds: the ordering is the costly part.
+// Two scopes, switched at the top. "All firms" is the trade registry's own
+// list, read where it is (the Registry page's list, drawn here): a firm
+// gets a record in Harvey when Find contacts starts work for it. "In
+// Harvey" is the companies Harvey has worked on: one server-side page of
+// /api/companies, sorted, filtered (the Contacts page's company filters,
+// plus activity, contact and source), with the total and page numbers. The
+// search box, the filters and the selection live outside the rows, so a
+// refresh re-renders the rows without losing any of them. A page cut from
+// a kept ordering (a filter, or a sort by a figure) isn't refetched every
+// 15 seconds: the ordering is the costly part.
 
 let _co = { q: '', f: {}, sort: '', dir: '', offset: 0, limit: loadPageSize(), total: 0, selected: new Set(),
-            timer: null, gen: 0, pagedBy: '', sources: [], financials: false, error: '', ms: 0 };
+            timer: null, gen: 0, pagedBy: '', sources: [], financials: false, error: '', ms: 0, scope: '' };
+const COMPANY_SCOPES = ['all', 'harvey'];
+const COMPANY_SCOPE_KEY = 'harvey-companies-scope';
 // [sort key, label key]: what the Sort menu offers (relevance only with a search).
 const COMPANY_SORTS = [['created', 'co.sort.created'], ['name', 'co.sort.name'], ['place', 'co.sort.place'],
                        ['turnover', 'co.sort.turnover'], ['employees', 'co.sort.employees'],
@@ -3221,7 +3241,59 @@ async function apiRead(path) {
   }
 }
 
+// The scope this browser chose last: In Harvey until it chooses.
+function savedCompanyScope() {
+  try { const s = localStorage.getItem(COMPANY_SCOPE_KEY); return COMPANY_SCOPES.includes(s) ? s : 'harvey'; }
+  catch { return 'harvey'; }
+}
+
+// The scope the page shows. Decided once, when it first opens: All firms
+// when a registry is loaded and Harvey holds no firm yet (the only list
+// with anything in it), else the one chosen last. A read that failed
+// decides nothing: the next load asks again.
+async function companyScope() {
+  if (_co.scope) return _co.scope;
+  if (savedCompanyScope() === 'all') return (_co.scope = 'all');
+  const own = await api('/api/companies?limit=1');
+  if (!own) return 'harvey';
+  if (!own.total) {
+    const reg = await api('/api/registry?limit=1');
+    if (!reg) return 'harvey';
+    if (!reg.off && (reg.loaded || {}).registry) return (_co.scope = _co.scope || 'all');
+  }
+  return (_co.scope = _co.scope || 'harvey');
+}
+
+function setCompanyScope(scope) {
+  if (!COMPANY_SCOPES.includes(scope) || scope === _co.scope) return;
+  _co.scope = scope;
+  try { localStorage.setItem(COMPANY_SCOPE_KEY, scope); } catch { /* private mode */ }
+  loadCompanies();
+}
+
+// The switch, the lede and which of the two lists is shown.
+function renderCompanyScopes(scope) {
+  const el = document.getElementById('co-scopes');
+  if (el) {
+    el.innerHTML = COMPANY_SCOPES.map(s =>
+      '<button class="' + (s === scope ? 'on' : '') + '" aria-pressed="' + (s === scope) + '" onclick="setCompanyScope(\'' + s + '\')">' +
+        escHtml(t('co.scope.' + s)) + '</button>').join('');
+  }
+  const lede = document.getElementById('companies-lede');
+  if (lede) {
+    lede.dataset.i18n = scope === 'all' ? 'co.lede_all' : 'co.lede';
+    lede.textContent = t(lede.dataset.i18n);
+  }
+  const own = document.getElementById('companies-list'), all = document.getElementById('companies-registry');
+  if (own) own.hidden = scope === 'all';
+  if (all) all.hidden = scope !== 'all';
+}
+
 async function loadCompanies() {
+  const scope = await companyScope();
+  renderCompanyScopes(scope);
+  // (Not under the Registry page, opened while the scope was being read.)
+  if (scope === 'all') return currentTab === 'registry' ? undefined : registryOn('companies');
   const el = document.getElementById('companies-list');
   if (!document.getElementById('company-rows')) {
     el.innerHTML = '<div class="toolbar">' +
@@ -3283,7 +3355,9 @@ async function loadCompanies() {
     const filtered = q || Object.keys(_co.f).length;
     rowsEl.innerHTML = '<div class="table-card">' + (filtered
       ? emptyState(icon('discover'), escHtml(t('co.no_match')), escHtml(t(q ? 'co.no_match_copy' : 'cl.no_match_copy')))
-      : emptyState(icon('companies'), escHtml(t('co.empty')), t('co.empty_copy'))) + '</div>';
+      : emptyState(icon('companies'), escHtml(t('co.empty')), t('co.empty_copy'), false,
+          '<button type="button" class="btn btn-secondary btn-sm" onclick="setCompanyScope(\'all\')">' +
+            escHtml(t('co.scope.all')) + '</button>')) + '</div>';
     return;
   }
   const allOn = data.every(c => _co.selected.has(c.id));
@@ -3455,13 +3529,20 @@ function clearCompanyFilters() {
 // or registration date, with the exact total and page numbers. Each firm
 // says whether it is already in Harvey (by CUI); its panel shows every
 // financial year side by side, the registry's record, the taxpayer file
-// and ANAF's answer. Pulling the list or the ticked firms is a registry
-// pull, counted first like on Descoperă (free).
+// and ANAF's answer.
+//
+// The same list is drawn in two places, with one state (filters, sort,
+// page, ticks): on the Registry page, where the ticked firms or the list
+// are pulled (a registry pull, counted first like on Descoperă, free), and
+// as the Companies page's All firms, where they are sent to Find contacts
+// (a firm gets its record when that run takes it).
 
 const REGISTRY_SOURCE = 'onrc.registry_search';
+// Where the list is drawn: the section's id, and the element it fills.
+const REGISTRY_HOSTS = {registry: 'registry-list', companies: 'companies-registry'};
 let _rg = { q: '', f: {}, sort: '', dir: '', offset: 0, limit: loadPageSize(), total: 0, rows: [],
             selected: new Map(), timer: null, gen: 0, source: null, loaded: {}, pagedBy: '', ms: 0,
-            shownSort: '', shownDir: '' };
+            shownSort: '', shownDir: '', host: 'registry' };
 const REGISTRY_SORTS = [['name', 'rg.sort.name'], ['turnover', 'rg.sort.turnover'], ['employees', 'rg.sort.employees'],
                         ['profit', 'rg.sort.profit'], ['registered', 'rg.sort.registered']];
 
@@ -3488,8 +3569,23 @@ function registryParams() {
   return p.toString();
 }
 
+// Draw the list on the page named. Its elements have one id each, so the
+// copy on the other page goes (with any card open on it).
+function registryOn(host) {
+  if (host !== _rg.host) {
+    closeRegistryPull();
+    closeRegistryFinder();
+    const report = document.getElementById('registry-finder');
+    if (report) { delete report.dataset.pending; delete report.dataset.run; }   // a run's report stops being followed
+    const old = document.getElementById(REGISTRY_HOSTS[_rg.host]);
+    if (old) old.innerHTML = '';
+    _rg.host = host;
+  }
+  return loadRegistry();
+}
+
 async function loadRegistry() {
-  const el = document.getElementById('registry-list');
+  const el = document.getElementById(REGISTRY_HOSTS[_rg.host]);
   if (!el) return;
   if (!document.getElementById('registry-rows')) {
     el.innerHTML = '<div class="toolbar">' +
@@ -3500,12 +3596,12 @@ async function loadRegistry() {
         'oninput="registrySearchInput(this.value)"></label>' +
       '<div id="registry-sort"></div><div id="registry-actions"></div>' +
       '</div><details class="more-fields" id="rg-more"><summary id="rg-more-sum"></summary><div id="rg-filters"></div></details>' +
-      '<div id="registry-pull"></div><div id="registry-selbar"></div><div id="registry-rows"></div>';
+      '<div id="registry-pull"></div><div id="registry-finder"></div><div id="registry-selbar"></div><div id="registry-rows"></div>';
     document.getElementById('registry-search').value = _rg.q;
   }
   const rowsEl = document.getElementById('registry-rows');
   const gen = ++_rg.gen;
-  if (!_rg.rows.length) rowsEl.innerHTML = '<div class="table-card"><div class="skeleton"></div><div class="skeleton"></div></div>';
+  if (!_rg.rows.length || !rowsEl.innerHTML) rowsEl.innerHTML = '<div class="table-card"><div class="skeleton"></div><div class="skeleton"></div></div>';
   const got = await apiRead('/api/registry?' + registryParams());
   if (gen !== _rg.gen) return;
   if (!got || !document.getElementById('registry-rows')) { rowsEl.innerHTML = offlineState(); return; }
@@ -3610,11 +3706,12 @@ function renderRegistryFilters() {
   if (active && document.getElementById(active)) document.getElementById(active).focus();
 }
 
-// A filter change starts over: page one, no pull card, and no ticks (a
-// ticked firm the new filter leaves out would be pulled unseen).
+// A filter change starts over: page one, no pull card or estimate, and no
+// ticks (a ticked firm the new filter leaves out would be taken unseen).
 function registryFilterChanged() {
   _rg.offset = 0;
   closeRegistryPull();
+  closeRegistryFinder();
   if (_rg.selected.size) { _rg.selected.clear(); renderRegistrySelbar(); renderRegistryActions(); }
 }
 
@@ -3695,7 +3792,7 @@ function pageRegistry(how, value) {
   pageMove(_rg, how, value);
   if (_rg.total && _rg.offset >= _rg.total) _rg.offset = Math.floor((_rg.total - 1) / _rg.limit) * _rg.limit;
   loadRegistry().then(() => {
-    const top = document.getElementById('registry');
+    const top = document.getElementById(_rg.host);
     if (top && how !== 'size') top.scrollIntoView({block: 'start'});
   });
 }
@@ -3731,6 +3828,7 @@ function registrySelectionOnly() {
   const allOn = _rg.rows.length > 0 && _rg.rows.every(r => _rg.selected.has(r.reg));
   document.querySelectorAll('#registry-rows thead th.sel input, #registry-rows .sel-page-mobile input').forEach(b => { b.checked = allOn; });
   closeRegistryPull();
+  closeRegistryFinder();
   renderRegistryActions();
   renderRegistrySelbar();
 }
@@ -3740,7 +3838,9 @@ function renderRegistrySelbar() {
   if (!el) return;
   const n = _rg.selected.size;
   el.innerHTML = n ? '<div class="selbar"><b>' + escHtml(t('sel.count', {n: n})) + '</b>' +
-    '<button class="btn btn-primary btn-sm" onclick="pullRegistry(true)">' + escHtml(t('rg.pull_selected', {n: fmtN(n)})) + '</button>' +
+    (_rg.host === 'companies'
+      ? '<button class="btn btn-primary btn-sm" onclick="findForRegistry(true)">' + escHtml(t('rg.find_selected', {n: fmtN(n)})) + '</button>'
+      : '<button class="btn btn-primary btn-sm" onclick="pullRegistry(true)">' + escHtml(t('rg.pull_selected', {n: fmtN(n)})) + '</button>') +
     '<button class="btn btn-ghost btn-sm" onclick="clearRegistrySelection()">' + escHtml(t('sel.clear')) + '</button></div>' : '';
 }
 
@@ -3753,13 +3853,46 @@ function renderRegistryActions() {
   const el = document.getElementById('registry-actions');
   if (!el) return;
   const n = _rg.selected.size;
+  // All firms sends them to Find contacts; the Registry page pulls them.
+  const find = _rg.host === 'companies';
+  const label = find ? t('actions.find') : t('rg.pull'), ico = find ? '' : 'arrow';
+  const run = find ? 'findForRegistry' : 'pullRegistry';
   el.innerHTML = menuHtml('registry-menu', [
     {sep: true, label: t('actions.selection', {n: n})},
-    {label: t('rg.pull'), icon: 'arrow', action: 'pullRegistry(true)', disabled: !n},
+    {label: label, icon: ico, action: run + '(true)', disabled: !n},
     {sep: true, label: t('actions.all_results', {n: _rg.total})},
-    {label: t('rg.pull'), icon: 'arrow', action: 'pullRegistry(false)', disabled: !_rg.total || !registryNarrowed(),
+    {label: label, icon: ico, action: run + '(false)', disabled: !_rg.total || !registryNarrowed(),
      note: registryNarrowed() ? '' : t('rg.pull_needs_filter')},
   ]);
+}
+
+// The contact finder for the ticked firms or the filter's whole list,
+// straight from the registry: priced first (the estimate says how many of
+// them are in Harvey already, how many enter it with the run and how many
+// a later run takes), then run under a cap. Ticked firms are searched
+// again when they were before, as a selection is on In Harvey.
+async function findForRegistry(selection) {
+  if (!selection) await registryReloadNow();
+  closeRegistryPull();
+  openFinder('registry-finder', selection ? {registry: {regs: [..._rg.selected.keys()]}, force: true}
+                                          : {registry: registryFilter()});
+}
+
+// An estimate shown for the list as it was: gone when the filter or the
+// ticks change. A run's report stays until it is closed.
+function closeRegistryFinder() {
+  const el = document.getElementById('registry-finder');
+  if (!el || el.dataset.run) return;
+  delete el.dataset.pending;
+  delete el.dataset.open;
+  el.innerHTML = '';
+  if (_finder && _finder.target === 'registry-finder') _finder = null;
+}
+
+// A run that started from the registry gave firms a record: the rows on
+// show say so.
+function registryFinderRan() {
+  if (document.getElementById('registry-rows')) loadRegistry();
 }
 
 // Pull the ticked firms or the whole list into Harvey: counted first
@@ -3851,12 +3984,22 @@ function renderFirmDrawer() {
   const record = {cuis: d.cui ? [{cui: d.cui, sources: ['registry:onrc']}] : [], registry: d.registry,
                   financials: d.financials, anaf: d.anaf, taxpayer: d.taxpayer};
   const parts = recordSections({record: record, address: firm.address}, section, none, {yearsAcross: true});
+  // A firm not in Harvey yet: Find contacts on All firms (its record is
+  // made by that run), a pull on the Registry page.
   const actions = '<div class="btn-row">' + (d.company_id
     ? '<button class="btn btn-primary btn-sm" onclick="openCompany(' + jsq(d.company_id) + ')">' + escHtml(t('rg.open_in_harvey')) + '</button>'
-    : '<button class="btn btn-primary btn-sm" onclick="pullOneFirm(' + jsq(d.reg) + ')">' + escHtml(t('rg.pull_one')) + '</button>') + '</div>';
+    : _rg.host === 'companies'
+    ? '<button class="btn btn-primary btn-sm" onclick="findForFirm(' + jsq(d.reg) + ')">' + escHtml(t('cl.find')) + '</button>'
+    : '<button class="btn btn-primary btn-sm" onclick="pullOneFirm(' + jsq(d.reg) + ')">' + escHtml(t('rg.pull_one')) + '</button>') +
+    '</div><div id="drawer-finder"></div>';
   el.innerHTML = head(escHtml(firm.name || d.reg), escHtml([d.cui ? 'CUI ' + d.cui : '', d.reg].filter(Boolean).join(' · ')) +
       (d.company_id ? ' · <span class="tag t-good">' + escHtml(t('rg.in_harvey')) + '</span>' : '')) +
     '<div class="drawer-scroll">' + actions + parts.identity + parts.rest + '</div>';
+}
+
+// Find contacts for the open registry firm: priced first, like any run.
+function findForFirm(reg) {
+  openFinder('drawer-finder', {registry: {regs: [reg]}, force: true});
 }
 
 // One firm, counted first like any pull (the firm may be gone from a
@@ -6778,27 +6921,45 @@ function siteBasisText(b) {
 }
 
 let _finder = null;
+let _finderSeq = 0;
 
+// The Find-contacts card: what a run over ``body`` would do, priced, with
+// its caps. A selection of the trade registry ({registry: ...}) also says
+// how many firms it holds, how many are in Harvey already, how many enter
+// it with this run and how many are left for a later one; the figures
+// under it are for the ones already in Harvey.
 async function openFinder(target, body) {
   const el = document.getElementById(target);
   if (!el) return;
   el.dataset.open = '1';
   delete el.dataset.run;
+  // (An estimate still being priced when the list it was asked for changes
+  // draws nothing: the change dropped its token, or a newer one took it.)
+  const token = String(++_finderSeq);
+  el.dataset.pending = token;
   el.innerHTML = '<div class="card"><p class="muted small">' + escHtml(t('disc.pricing')) + '</p></div>';
   const est = await api('/api/contacts/find/estimate', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
+  if (el.dataset.pending !== token) return;
+  delete el.dataset.pending;
   if (!est || est.error) {
-    el.innerHTML = '<div class="test-result error">' + escHtml(failMsg(est, t('cl.find_failed'))) + '</div>';
+    const why = est && est.code && hasKey('en', 'finder.why.' + est.code) ? t('finder.why.' + est.code) : '';
+    el.innerHTML = '<div class="test-result error">' + escHtml(why || failMsg(est, t('cl.find_failed'))) + '</div>';
     return;
   }
   _finder = {target: target, body: body, est: est};
   const paid = est.to_look_up > 0;
   const cap = paid ? Math.min(1, Math.max(0.01, Math.ceil(est.estimated_cost * 100) / 100)) : 0;
+  const rg = est.registry;
+  const taken = est.companies + (rg ? rg.to_create || 0 : 0);
   el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t('finder.title')) + '</h2>' +
-    '<p>' + escHtml(t('finder.summary', {n: fmtN(est.companies), site: fmtN(est.with_site),
+    (rg ? finderRegistryLines(rg) : '') +
+    (rg && !est.companies ? '' :
+    '<p>' + escHtml(t(rg ? 'finder.rg_summary' : 'finder.summary', {n: fmtN(est.companies), site: fmtN(est.with_site),
                                          look: fmtN(est.to_look_up)})) +
-      (est.more ? ' ' + escHtml(t('finder.more')) : '') + '</p>' +
+      (est.more ? ' ' + escHtml(t('finder.more')) : '') + '</p>') +
+    (rg && rg.to_create ? '<p class="muted small">' + escHtml(t('finder.rg_note')) + '</p>' : '') +
     (paid ? (est.searchers.length
       ? '<p class="muted small">' + escHtml(t('finder.cost', {cost: fmtUsd(est.estimated_cost, 4),
                                                             most: fmtUsd(est.most, 4)})) + '</p>'
@@ -6807,9 +6968,48 @@ async function openFinder(target, body) {
       escHtml(t('finder.cap')) + '</label><input class="form-input" id="finder-cap" type="number" min="0" step="0.01" value="' + cap + '" oninput="finderCapChanged()">' +
       '<div class="muted small">' + escHtml(t('finder.cap_help')) + '</div></div>' + finderClassifyField(est.classifier) + '</div>' +
     '<div id="finder-checks-wrap">' + finderChecksLine(est.checks, cap) + '</div>' + finderClassifyLine(est.classifier) +
-    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runFinder(this)"' + (est.companies ? '' : ' disabled') + '>' +
-      escHtml(t('finder.run', {n: fmtN(est.companies)})) + '</button>' +
+    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runFinder(this)"' + (taken ? '' : ' disabled') + '>' +
+      escHtml(t('finder.run', {n: fmtN(taken)})) + '</button>' +
     '<button class="btn btn-ghost btn-sm" onclick="closeFinder()">' + escHtml(t('common.cancel')) + '</button></div></div>';
+}
+
+// A registry selection, counted: the firms in it, those in Harvey already,
+// those that enter it with this run and those a later run takes, then the
+// firms it leaves out (a declared website on the do-not-contact list, a
+// CUI Harvey can't key by), each only when there are any. (What the new
+// ones need, a declared website to read or a paid lookup, is read from the
+// registry as each one's search starts: the card says the estimate leaves
+// them out.)
+function finderRegistryLines(rg) {
+  const parts = [t('finder.rg_existing', {n: rg.existing || 0}), t('finder.rg_to_create', {n: rg.to_create || 0})]
+    .concat(rg.left ? [t('finder.rg_left', {n: rg.left})] : []);
+  return '<p>' + escHtml(t('finder.rg_selected', {n: rg.selected || 0})) + ' ' + escHtml(parts.join(' · ')) + '</p>' +
+    finderRegistryLeftOut(rg) +
+    (rg.left ? '<p class="muted small">' + escHtml(t('finder.rg_left_help')) + '</p>' : '');
+}
+
+function finderRegistryLeftOut(rg) {
+  const out = [['excluded', 'finder.rg_excluded'], ['unkeyable', 'finder.rg_unkeyable']]
+    .filter(([k]) => rg[k]).map(([k, key]) => t(key, {n: rg[k]}));
+  return out.length ? '<p class="muted small">' + escHtml(out.join(' · ')) + '</p>' : '';
+}
+
+// What a run from the registry did as it started: the firms that entered
+// Harvey, those checked at ANAF before their search, those whose search
+// was already waiting (an earlier run's search or ANAF check), those left
+// out and those left for a later run; a figure of 0 isn't said. '' for any
+// other run.
+function finderRegistryRan(data) {
+  const rg = data.registry;
+  if (!rg) return '';
+  const first = (data.checks_first || {}).companies || 0;
+  const waiting = data.already_waiting || 0;
+  return [t('finder.rg_created', {n: rg.created || 0})]
+    .concat(first ? [t('finder.rg_checks_first', {n: first})] : [])
+    .concat(waiting ? [t('finder.rg_waiting', {n: waiting})] : [])
+    .concat([['excluded', 'finder.rg_excluded_after'], ['unkeyable', 'finder.rg_unkeyable_after']]
+      .filter(([k]) => rg[k]).map(([k, key]) => t(key, {n: rg[k]})))
+    .concat(rg.left ? [t('finder.rg_left_after', {n: rg.left})] : []).join(' ');
 }
 
 // The classifier's part of a Find-contacts run: how many questions it may
@@ -6874,10 +7074,17 @@ async function runFinder(btn) {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
   });
   if (data && data.success) {
-    showToast(t(data.force ? 'cl.find_queued_force' : 'cl.find_queued') + ' ' +
-              t('finder.queued', {n: fmtN(data.queued || 0)}), 'success');
-    if (data.batch_id) watchRun(_finder.target, data.batch_id);
+    // (From the registry, the new firms' searches are queued by their ANAF
+    // check: the run says what it took, not what is queued this moment.
+    // What it did as it started stays above its report; with no report,
+    // the toast says it.)
+    const ran = finderRegistryRan(data);
+    showToast(ran ? t('finder.rg_started', {n: data.companies || 0}) + (data.batch_id ? '' : ' ' + ran)
+              : t(data.force ? 'cl.find_queued_force' : 'cl.find_queued') + ' ' +
+                t('finder.queued', {n: fmtN(data.queued || 0)}), 'success');
+    if (data.batch_id) watchRun(_finder.target, data.batch_id, ran);
     else closeFinder();
+    if (ran) registryFinderRan();
   } else {
     btn.disabled = false;
     showToast(failMsg(data, t('cl.find_failed')), 'error');
@@ -6913,8 +7120,9 @@ function runActive(r) {
 }
 
 // A run just started, followed where it was started: its report every few
-// seconds while its jobs run, then what it took and cost.
-async function watchRun(target, batchId) {
+// seconds while its jobs run, then what it took and cost. ``lead``: a line
+// kept above the report (what a run from the registry did as it started).
+async function watchRun(target, batchId, lead) {
   const el = document.getElementById(target);
   if (!el) return;
   el.dataset.open = '1';
@@ -6924,7 +7132,8 @@ async function watchRun(target, batchId) {
     if (el.dataset.run !== batchId) return;
     if (!r || !r.statuses) { closeFinder(); return; }
     const active = runActive(r);
-    el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t(active ? 'run.running' : 'run.finished')) + '</h2>' + runReportHtml(r) +
+    el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t(active ? 'run.running' : 'run.finished')) + '</h2>' +
+      (lead ? '<p class="small">' + escHtml(lead) + '</p>' : '') + runReportHtml(r) +
       '<div class="btn-row"><button class="btn btn-secondary btn-sm" onclick="openQueue(' + jsq(batchId) + ')">' + escHtml(t('disc.see_jobs')) + '</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="closeFinder()">' + escHtml(t('common.close')) + '</button></div></div>';
     if (!active) return;
@@ -9204,8 +9413,10 @@ setInterval(() => {
   switch (currentTab) {
     case 'overview': loadOverview(); break;
     case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadJobRuns(); loadTodayActivity(); break;
-    // A page cut from a kept ordering isn't refetched: the ordering is the costly part.
-    case 'companies': if (_co.pagedBy !== 'snapshot') loadCompanies(); break;
+    // A page cut from a kept ordering isn't refetched: the ordering is the
+    // costly part. Nor is the registry's list (All firms): it only changes
+    // with a load.
+    case 'companies': if (_co.scope !== 'all' && _co.pagedBy !== 'snapshot') loadCompanies(); break;
     // The contacts list isn't refetched (its count is a big query): only
     // the outreach list, which the Email loop changes as it goes.
     case 'prospects': if (_cv.view === 'outreach' && !_optOut.id) loadOutreach(); break;

@@ -653,7 +653,8 @@ def test_harvey_contacts_status_and_find_in_the_background(tmp_path, monkeypatch
     monkeypatch.setattr(state_mod, "DB_PATH", db)
     monkeypatch.setattr("harvey.config.load_env", lambda *a, **k: EnvConfig(serper_api_key="k"))
     args = SimpleNamespace(action="status", county="", locality="", website="", q="", require="",
-                           exclude="", limit=200, max_spend=0.0, force=False, background=True)
+                           exclude="", limit=200, max_spend=0.0, force=False, background=True,
+                           words=[], from_registry=False, dry_run=False)
     cli.cmd_contacts(args)
     out = capsys.readouterr().out
     assert "Companies with no contact:    2" in out and "with a website to read:     1" in out

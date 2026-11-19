@@ -2519,16 +2519,25 @@ def _block_listed(rows: list[dict], people: bool, suppressed: set | None = None)
 from harvey.launch import FIND_MAX  # noqa: E402  (the queueing paths, shared with the agent)
 
 
-async def _find_selection(body: dict):
+async def _find_selection(body: dict, create: bool = False):
     """(state, the companies a Find-contacts request selects, its filter's
     error or "") from {"filter": {the Contacts page's filters}, "company_ids",
-    "force", "limit"} (launch.find_selection)."""
+    "force", "limit"}, or {"registry": the Registry page's filters or
+    {"regs": [...]}} (launch.find_selection). ``create``: a run, which
+    makes the registry selection's records."""
     from harvey import launch
 
     state = _state()
     await state.init_db()
-    selected, error = await launch.find_selection(state, body)
+    selected, error = await launch.find_selection(state, body, create=create)
     return state, selected, error
+
+
+def _registry_counts(body: dict) -> dict:
+    """{"registry": the counts of a request's registry selection} for its
+    answer (launch.registry_selection's, without the ids), or {}."""
+    chosen = body.get("_registry")
+    return {"registry": {k: v for k, v in chosen.items() if k != "new"}} if chosen else {}
 
 
 async def _json_body(request: Request) -> dict:
@@ -2548,14 +2557,30 @@ async def estimate_find_contacts(request: Request):
     ``checks``: the address checks it may make and what they may cost past
     the verifiers' free allowances (finder.checks_estimate); ``classifier``:
     its calls and their cost as a range (finder.classify_estimate). Both
-    are estimates: the run's caps are what is enforced, step by step."""
+    are estimates: the run's caps are what is enforced, step by step.
+
+    With {"registry": the Registry page's filters, or {"regs": [...]}} in
+    place of the company ids, the selection is the registry's and nothing
+    is written: ``registry`` says how many firms it holds (``selected``),
+    how many have a record (``existing``), how many would get one at Run
+    (``to_create``) and how many would be left for a later run (``left``);
+    the figures beside it are for the firms that have a record already (one
+    whose registry entry declares a website it hasn't taken yet counted
+    with a website), ``excluded`` and ``unkeyable`` the firms left out, and
+    ``registry.note`` says what isn't known of the others until then."""
     from harvey import launch
 
     body = await _json_body(request)
     state, selected, error = await _find_selection(body)
     if error:
-        return JSONResponse({"error": error}, status_code=400)
-    return await launch.find_estimate(state, selected, bool(body.get("force")))
+        # (The registry refusals a filter on the page can reach, as codes it
+        # says in the reader's language.)
+        code = ("registry_only_excludes" if "only excludes" in error
+                else "registry_every_status" if "isn't taken yet" in error else None)
+        return JSONResponse({"error": error, **({"code": code} if code else {})},
+                            status_code=400)
+    return {**await launch.find_estimate(state, selected, bool(body.get("force"))),
+            **_registry_counts(body)}
 
 
 @app.post("/api/contacts/find")
@@ -2568,7 +2593,26 @@ async def find_contacts(request: Request):
     or null: no cap of the run's own; 0: none, a site no register fact
     settles waits unlinked). A company already searched by a module's
     capability is skipped by it, unless ``force`` (searched again, once in
-    this run). The run's report: GET /api/jobs/batches/{batch_id}/report."""
+    this run). The run's report: GET /api/jobs/batches/{batch_id}/report.
+
+    {"registry": the Registry page's filters, or {"regs": [...]}} in place
+    of the company ids starts from the trade registry: the selection's
+    firms with no record get one now (``limit`` at most; ``registry`` in
+    the answer: ``selected``, ``existing``, ``created``, and ``left`` for
+    a later run), and the run goes on over the selection's firms. The new
+    ones are checked at ANAF first when that module is on (``checks_first``:
+    ``jobs`` queued, ``companies`` whose search each check queues when it
+    is done); ``queued`` counts the searches queued at once. ``registry``
+    also counts the firms left out: ``excluded`` (their declared website is
+    on the do-not-contact list: no record) and ``unkeyable`` (a CUI Harvey
+    can't key by).
+
+    The records are made and committed before the run is queued, in a
+    write of their own. Stopped between the two (an error, a restart),
+    records are left with no work queued; the same request again recovers
+    them: they are the selection's firms with a record and no contact, the
+    newest first, so the next run takes them (and searches them at once,
+    as it does any firm whose search no check is waiting for)."""
     from harvey.modules import jobs
     from harvey.modules.job_kinds import enqueue_contact_search
 
@@ -2585,21 +2629,25 @@ async def find_contacts(request: Request):
         return JSONResponse({"success": False, "message": "classify_max_spend must be a "
                              "number of dollars, 0 or more", "code": "bad_cap"},
                             status_code=400)
-    state, selected, error = await _find_selection(body)
+    state, selected, error = await _find_selection(body, create=True)
     if error:
         return JSONResponse({"success": False, "message": error}, status_code=400)
     if not selected:
-        return {"success": True, "queued": 0, "companies": 0, "force": bool(body.get("force"))}
+        return {"success": True, "queued": 0, "companies": 0, "force": bool(body.get("force")),
+                **_registry_counts(body)}
+    checks: dict = {}
     try:
         batch_id, ids, dupes = await enqueue_contact_search(
             state, [c["id"] for c in selected], max_spend=max_spend,
-            force=bool(body.get("force")), classify_max_spend=classify_cap)
+            force=bool(body.get("force")), classify_max_spend=classify_cap,
+            check_first=(body.get("_registry") or {}).get("new") or (), checks=checks)
     except jobs.Duplicate as e:
-        return JSONResponse(_duplicate_body(e), status_code=409)
+        return JSONResponse({**_duplicate_body(e), **_registry_counts(body)}, status_code=409)
     return {"success": True, "batch_id": batch_id, "queued": len(ids),
             "already_waiting": len(dupes), "companies": len(selected),
             "max_spend": max_spend, "classify_max_spend": classify_cap,
-            "force": bool(body.get("force"))}
+            "force": bool(body.get("force")), "checks_first": checks,
+            **_registry_counts(body)}
 
 
 @app.get("/api/contacts/finder")

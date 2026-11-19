@@ -373,10 +373,12 @@ def decide(ids, holders: dict[tuple[str, str], set[str]],
 # the Match are firm ids as text, like every company id the callers pass.
 
 def match_firm(con, company, extra_ids=(), declared_domain: bool = False, *, schemes,
-               registers=()) -> Match:
+               registers=(), ignore=frozenset()) -> Match:
     """match() on an overlay connection. Reads only. ``schemes``: the
     database's Schemes; ``registers``: register adapters attached to
-    ``con`` (their name index answers the name in its town)."""
+    ``con`` (their name index answers the name in its town). ``ignore``:
+    records (firm ids) left out as holders, as if they weren't on file: a
+    firm's own records, when the firm is matched against the others."""
     import harvey.overlay.queries  # noqa: F401  (registers the statements read below)
 
     ids = identifiers(company, extra_ids)
@@ -384,7 +386,7 @@ def match_firm(con, company, extra_ids=(), declared_domain: bool = False, *, sch
         return Match()
     record_holders: dict[tuple[str, str], set[int]] = {}
     for kind, value in ids:
-        found = _overlay_holders(con, schemes, kind, value, company, registers)
+        found = _overlay_holders(con, schemes, kind, value, company, registers) - set(ignore)
         if found:
             record_holders[(kind, value)] = found
     records = {r for found in record_holders.values() for r in found}

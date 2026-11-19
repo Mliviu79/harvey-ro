@@ -680,13 +680,20 @@ def test_registrations_in_area(files):
     assert onrc.registrations_in_area(files["firms"], None, "Cristian") == {"J2025000200088"}
 
 
-def test_cli_every_firm_in_the_country_takes_a_flag(monkeypatch, capsys):
+def test_cli_every_firm_in_the_country_is_never_imported(monkeypatch, capsys, tmp_path):
     import sys
 
+    import harvey.state as state_mod
     from harvey import cli
 
-    monkeypatch.setattr(sys, "argv", ["harvey", "import-onrc", "--administrators", "none"])
-    with pytest.raises(SystemExit) as exit_:
-        cli.main()
-    assert exit_.value.code == 2
-    assert "--whole-country" in capsys.readouterr().out
+    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
+    for flags in ([], ["--whole-country"]):
+        monkeypatch.setattr(sys, "argv", ["harvey", "import-onrc", "--administrators", "none",
+                                          *flags])
+        with pytest.raises(SystemExit) as exit_:
+            cli.main()
+        assert exit_.value.code == 2
+        # The registry is read where it is: the Companies page lists it, and
+        # contacts are found from a selection of it.
+        out = capsys.readouterr().out
+        assert "Companies page" in out and "harvey contacts find --registry" in out

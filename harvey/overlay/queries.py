@@ -1690,3 +1690,142 @@ statement("overlay.messages.in_flight",
           "WHERE status = 'sent' AND channel != 'email' AND message_id != '' "
           "AND provider_status NOT IN ('delivered', 'read', 'failed', 'canceled') "
           "AND sent_at >= ? ORDER BY sent_at LIMIT ?", params=("2026-01-01", 50), bounded=True)
+
+# ── Records for a selection of a register's firms (overlay/store.py,
+#    Store.ensure_registry_records) ──
+# Temporary tables named statements fill and read, by name: created on the
+# connection by whoever runs them (and by the plan test before it explains
+# them). Writing them takes no lock on the database itself.
+# ``registering`` is a selection of a register's firms as it was read: one
+# row per firm by its row in the register (``firm_row``; the register's own
+# statements fill it from its file), with the two identifiers a record of
+# it holds (``cui``, NULL for a firm with none; ``reg``) and the record in
+# Harvey that holds each already (``by_cui``; ``by_reg``, by any of the
+# firm's registration numbers), NULL for none. ``left_out``: a row the
+# register's statement read but the selection leaves out, by why (the
+# register's code: a registration no key reaches, a firm on the
+# do-not-contact list), counted and dropped before anything else reads it.
+# ``recording`` is the part of it a write gives records to, numbered from 1
+# in the register's order (``n``: the new record's id is the highest id
+# given so far plus it); ``keying`` the records known by a registration
+# number only that gain their firm's CUI.
+TEMP_TABLES = {
+    "registering": "CREATE TEMP TABLE IF NOT EXISTS registering ("
+                   "firm_row INTEGER PRIMARY KEY, cui INTEGER, reg TEXT NOT NULL, "
+                   "by_cui INTEGER, by_reg INTEGER, left_out INTEGER)",
+    "recording": "CREATE TEMP TABLE IF NOT EXISTS recording ("
+                 "n INTEGER PRIMARY KEY, firm_row INTEGER NOT NULL UNIQUE, cui INTEGER, "
+                 "reg TEXT NOT NULL)",
+    "keying": "CREATE TEMP TABLE IF NOT EXISTS keying ("
+              "record INTEGER PRIMARY KEY, cui INTEGER NOT NULL)",
+}
+for _table in TEMP_TABLES:
+    statement(f"overlay.records.clear.{_table}", f"DELETE FROM temp.{_table}")
+
+# The live firm a record belongs to, and whether that firm (its survivor
+# and every record merged into it) holds a key of a scheme: what
+# Store._add_keys asks before a record gains a legal identifier.
+_LIVE = "(SELECT CASE live WHEN 0 THEN id ELSE live END FROM firm WHERE id = {record})"
+
+
+def _firm_holds(record: str, scheme: str) -> str:
+    live = _LIVE.format(record=record)
+    return (f"(EXISTS (SELECT 1 FROM firm_ident x WHERE x.firm = {live} AND x.scheme = {scheme}) "
+            f"OR EXISTS (SELECT 1 FROM firm m CROSS JOIN firm_ident x WHERE m.live = {live} "
+            f"AND m.live != 0 AND x.firm = m.id AND x.scheme = {scheme}))")
+
+
+# The selection counted (param: the CUI scheme's id): its firms; those with
+# a record; of those, the records known by a registration number only that
+# can gain their firm's CUI (no record holds it, and the record's firm holds
+# no other); and the ones left as they are: the record's firm holds another
+# CUI, or the CUI and the registration number are on records of two firms.
+statement("overlay.records.counts",
+          "SELECT COUNT(*), COALESCE(SUM(n.by_cui IS NOT NULL OR n.by_reg IS NOT NULL), 0), "
+          "COALESCE(SUM(CASE WHEN n.cui IS NULL OR n.by_reg IS NULL OR n.by_cui IS NOT NULL "
+          f"THEN 0 ELSE NOT {_firm_holds('n.by_reg', '?1')} END), 0), "
+          "COALESCE(SUM(CASE WHEN n.cui IS NULL OR n.by_reg IS NULL THEN 0 "
+          f"WHEN n.by_cui IS NULL THEN {_firm_holds('n.by_reg', '?1')} "
+          "WHEN n.by_cui = n.by_reg THEN 0 "
+          f"ELSE {_LIVE.format(record='n.by_cui')} IS NOT {_LIVE.format(record='n.by_reg')} "
+          "END), 0) FROM temp.registering n",
+          params=(1,))
+# The rows the selection left out (a registration no key reaches; a firm
+# whose declared website is on the do-not-contact list), counted, then
+# dropped.
+statement("overlay.records.left_out",
+          "SELECT COALESCE(SUM(left_out = 1), 0), COALESCE(SUM(left_out = 2), 0) "
+          "FROM temp.registering WHERE left_out IS NOT NULL")
+statement("overlay.records.drop_left_out",
+          "DELETE FROM temp.registering WHERE left_out IS NOT NULL")
+# The records a write just made, as the selection's own (param: the highest
+# id given before it): each firm of temp.recording that still has a row
+# there (overlay.records.made_ids reads the same) is held by the record
+# with its number, so the selection's held firms are read by one statement.
+statement("overlay.records.made",
+          "UPDATE temp.registering SET by_reg = ?1 + (SELECT r.n FROM temp.recording r "
+          "WHERE r.firm_row = registering.firm_row) "
+          "WHERE firm_row IN (SELECT firm_row FROM temp.recording)",
+          params=(0,))
+statement("overlay.records.made_ids",
+          "SELECT ?1 + r.n FROM temp.recording r ORDER BY r.n", params=(0,), drives="r")
+# The selection's firms that have a record, as the live firm each record
+# belongs to, once, the newest records first, up to a cap (params: 1 for
+# every one or 0 for those no contact reaches, the cap): the companies a
+# Find-contacts run over the selection goes on with.
+statement("overlay.records.held",
+          "SELECT DISTINCT v.id FROM temp.registering n CROSS JOIN firm f CROSS JOIN firm v "
+          "WHERE f.id = COALESCE(n.by_cui, n.by_reg) "
+          "AND v.id = CASE f.live WHEN 0 THEN f.id ELSE f.live END "
+          "AND (?1 OR v.n_contacts = 0) ORDER BY v.id DESC LIMIT ?2",
+          params=(0, 50_000), bounded=True, drives="n")
+# The first firms with no record, in the register's order, up to a cap
+# (param), numbered from 1.
+statement("overlay.records.pick",
+          "INSERT INTO temp.recording (n, firm_row, cui, reg) "
+          "SELECT ROW_NUMBER() OVER (ORDER BY s.firm_row), s.firm_row, s.cui, s.reg FROM ("
+          "SELECT firm_row, cui, reg FROM temp.registering "
+          "WHERE by_cui IS NULL AND by_reg IS NULL ORDER BY firm_row LIMIT ?) s",
+          params=(50_000,), bounded=True)
+# The first records that can gain their firm's CUI (params: the CUI
+# scheme's id, a cap): a record two firms of the selection name once.
+statement("overlay.records.pick.keys",
+          "INSERT OR IGNORE INTO temp.keying (record, cui) SELECT n.by_reg, n.cui "
+          "FROM temp.registering n WHERE n.cui IS NOT NULL AND n.by_cui IS NULL "
+          f"AND n.by_reg IS NOT NULL AND NOT {_firm_holds('n.by_reg', '?1')} "
+          "ORDER BY n.firm_row LIMIT ?2",
+          params=(1, 5_000), bounded=True)
+# The highest id firm ever gave out (sqlite_sequence, which has no row for
+# firm before its first insert; the table's own highest id beside it,
+# should the two ever disagree). New records take the numbers after it,
+# and SQLite moves the sequence with the INSERT that writes them.
+statement("overlay.records.base",
+          "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'firm'), 0), "
+          "COALESCE((SELECT MAX(id) FROM firm), 0))")
+# A new record's identifiers (params: the scheme's id, the highest id
+# given before, the time).
+statement("overlay.records.ident.cui",
+          "INSERT INTO firm_ident (scheme, key, firm, since) SELECT ?1, n.cui, ?2 + n.n, ?3 "
+          "FROM temp.recording n WHERE n.cui IS NOT NULL",
+          params=(1, 0, 1_700_000_000))
+statement("overlay.records.ident.reg",
+          "INSERT INTO firm_ident (scheme, key, firm, since) SELECT ?1, n.reg, ?2 + n.n, ?3 "
+          "FROM temp.recording n",
+          params=(2, 0, 1_700_000_000))
+# The CUI a record known by a registration number only gains (params: the
+# CUI scheme's id, the time), under the rules of Store._add_keys, asked
+# again inside the write: the record is still on file, no record holds the
+# CUI, and the record's firm holds no key of the scheme (guard_ident_legal
+# would refuse a second on the record itself).
+statement("overlay.records.key",
+          "INSERT INTO firm_ident (scheme, key, firm, since) SELECT ?1, k.cui, k.record, ?2 "
+          "FROM temp.keying k WHERE EXISTS (SELECT 1 FROM firm r WHERE r.id = k.record) "
+          "AND NOT EXISTS (SELECT 1 FROM firm_ident h WHERE h.scheme = ?1 AND h.key = +k.cui) "
+          f"AND NOT {_firm_holds('k.record', '?1')}",
+          params=(1, 1_700_000_000))
+# The records that gained it (param: the CUI scheme's id): the ones to place
+# again in the name and place orders.
+statement("overlay.records.keyed",
+          "SELECT k.record FROM temp.keying k CROSS JOIN firm_ident i "
+          "WHERE i.scheme = ? AND i.key = +k.cui AND i.firm = k.record",
+          params=(1,), drives="k")

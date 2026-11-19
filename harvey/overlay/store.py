@@ -7,7 +7,10 @@ signals, merges and their undo, and removing a firm from Harvey. They run
 on one connection inside the caller's transaction (``call`` opens one per
 call; ``Batch`` keeps one for many), so a row-at-a-time write keeps every
 count through the triggers, and a bulk one (a registry pull, a merge, a
-removal) recounts what it touched (triggers.bulk).
+removal) recounts what it touched (triggers.bulk). The methods in
+``OWN_TRANSACTIONS`` open their own instead (a long read with no write
+lock, then a short write): ``call`` runs them with none open, and a
+``Batch`` can't.
 
 Ids. A firm is Harvey's own integer id; every caller passes and gets back
 company ids as text, so a firm id travels as its digits. An old text id
@@ -51,6 +54,12 @@ LOCAL_COLUMNS = ("name", "industry", "address")
 # the finder's and the pages' writes wait seconds, not minutes. A pull cut
 # short keeps the chunks already committed.
 PULL_CHUNK = 5_000
+# Records one ensure_registry_records call creates at most, all in its one
+# write transaction, which holds the write lock for the inserts only (the
+# selection is read before it, with none): 50,000 held it for 0.7 to 1.4 s
+# on an invented registry of 300,000 firms and a database of up to 300,000,
+# with every trigger on (a real install's bigger files will be slower).
+RECORDS_MAX = 50_000
 
 
 class RemoveRefused(ValueError):
@@ -147,20 +156,30 @@ def connect(path, *, data_dir=None) -> tuple[sqlite3.Connection, list]:
 # Store methods that only read: run without taking the write lock.
 READS = frozenset({"match_company", "companies_with_id", "held",
                    "keeper_order", "observed", "module_readings", "module_readings_of",
-                   "dictionaries_stale", "match_records", "scan_candidates", "unknown_pairs"})
+                   "dictionaries_stale", "match_records", "scan_candidates", "unknown_pairs",
+                   "registry_entry"})
+
+
+# Store methods that open their own transactions (the selection read with
+# no write lock, then one short write): run with none open.
+OWN_TRANSACTIONS = frozenset({"ensure_registry_records"})
 
 
 def call(path, method: str, *args, **kwargs):
     """``Store(...).method(*args, **kwargs)`` in one transaction of its own
     (a write transaction unless it only reads; committed, or rolled back
-    when it raises)."""
+    when it raises). A method in OWN_TRANSACTIONS is run with none open:
+    it opens and commits its own."""
     con, attached = connect(path)
     try:
         store = Store(con, registers=attached)
-        con.execute("BEGIN" if method in READS else "BEGIN IMMEDIATE")
+        own = method in OWN_TRANSACTIONS
+        if not own:
+            con.execute("BEGIN" if method in READS else "BEGIN IMMEDIATE")
         try:
             out = getattr(store, method)(*args, **kwargs)
-            con.execute("COMMIT")
+            if not own:
+                con.execute("COMMIT")
         except BaseException:
             if con.in_transaction:
                 con.execute("ROLLBACK")
@@ -1470,6 +1489,304 @@ class Store:
                                 result.origin, batch=run_id)
         return result.company_id, result.created, False, shared
 
+    def ensure_registry_records(self, *, regs=None, query=None,
+                                limit: int = RECORDS_MAX, dry_run: bool = False,
+                                held: int = 0, with_contact: bool = True,
+                                barred=()) -> dict:
+        """A record for every firm of a selection of the trade registry
+        that has none, written by SQL over the attached registry: no row of
+        the selection is read into Python. The selection is the firms of the
+        registration numbers ``regs``, or the firms a resolved ``query``
+        (registry.Query) matches: how many numbers and which queries are
+        taken is the registry adapter's to say (onrc.queries.Adapter.
+        select_firms; ValueError for what it refuses). A CUI on several
+        registrations is one firm, its canonical row, whichever of them
+        the selection holds. ``barred``: the do-not-contact list's domains;
+        a firm whose declared website is one of them (or under one) is left
+        out, as a pull leaves it out, and counted as ``excluded``; a
+        registration no key reaches (its CUI isn't one the core can key by)
+        is left out too, counted as ``unkeyable``.
+
+        It opens its own transactions, so it is called with none open
+        (``call`` does; RuntimeError inside one). The selection is read
+        once, with no write lock, into temporary tables, and everything
+        below is answered from them; one write transaction then holds the
+        lock for the inserts only. With ``limit`` 0 or ``dry_run`` nothing
+        is written and no write lock is taken at all: the counts alone, as
+        an estimate (``dry_run`` says ``to_create``: how many ``limit``
+        would make).
+
+        A firm has a record when a record holds its CUI or one of its
+        registration numbers (the canonical row's, or another registration
+        of its CUI). Such a firm is left as it is, but for one gap: a
+        record known by a registration number only gains the firm's CUI
+        (Store._add_keys' rules: no record holds that CUI, and the record's
+        firm holds no other), and is placed again in the name and place
+        orders (overlay/orders.py takes those records' ids); at most
+        ``limit`` and PULL_CHUNK of them a call. Where the CUI is on another
+        firm's record, or the record's firm holds another CUI, both are
+        left alone and counted.
+
+        Of the firms with no record the first ``limit`` (in the registry's
+        name order; at most RECORDS_MAX) get a firm row at their place in
+        the name and place orders and the identifiers a pull writes (CUI
+        and registration number, or the number alone), nothing else: no
+        source, website, contact or local description. Ids go up in that
+        order. The rest wait for the next call, which skips the ones made
+        here. When identifiers changed while the selection was read, the
+        firms about to get a record are asked for again inside the write,
+        and one another writer made a record for meanwhile counts as
+        existing (so fewer than ``limit`` may be created). The kept counts
+        and the identity revision follow through the triggers.
+
+        Returns {"selected": firms in the selection, "existing": those with
+        a record, "created", "left": those still without one, "cui_added":
+        records that gained their CUI, "cui_left": records that can gain
+        theirs at a later call, "cui_conflicts": firms left alone as above,
+        "unkeyable", "excluded"}; with ``dry_run`` "to_create" too. What
+        the write didn't touch is counted as it was read.
+
+        ``held`` above 0 adds the selection's firms that have a record, as
+        company ids, the newest records first (so the ones made here before
+        any other), those no contact reaches unless ``with_contact``:
+        "ids", up to ``held`` (less ``to_create`` with ``dry_run``), what a
+        run goes on with; "new", the ones this call made (read from its own
+        temporary table); with ``dry_run`` "declares_site", those of "ids"
+        that haven't taken their registry entry yet and whose registry row
+        declares a website (their search reads it when it starts)."""
+        from harvey.queries import sql
+
+        if (regs is None) == (query is None):
+            raise ValueError("a selection is registration numbers or a registry query, one of "
+                             "the two")
+        if isinstance(limit, bool):
+            raise ValueError("limit is a number of records, not a yes or no")
+        limit = int(limit)
+        if not 0 <= limit <= RECORDS_MAX:
+            raise ValueError(f"at most {RECORDS_MAX:,} records are created at a time")
+        if regs is not None:
+            regs = list(regs)
+            if not all(isinstance(r, str) and r for r in regs):
+                raise ValueError("regs must be registration numbers")
+        if self.con.in_transaction:
+            raise RuntimeError("ensure_registry_records opens its own transactions: call it "
+                               "with none open (overlay.store.call does)")
+        registry, cui, reg = self._selecting()
+
+        def clear():
+            for table in _statements.TEMP_TABLES:
+                self.x(sql(f"overlay.records.clear.{table}"))
+
+        for ddl in _statements.TEMP_TABLES.values():
+            self.x(ddl)
+        clear()
+        try:
+            # Each statement its own read: a transaction kept open over them
+            # couldn't take the write lock once another writer committed.
+            seen = self.identity()
+            registry.select_firms(self.con, (cui, reg), regs=regs, query=query,
+                                  barred=barred)
+            unkeyable, excluded = self.x(sql("overlay.records.left_out")).fetchone()
+            self.x(sql("overlay.records.drop_left_out"))
+            selected, existing, keyable, conflicts = self.x(sql("overlay.records.counts"),
+                                                            (cui,)).fetchone()
+            created = keyed = 0
+            new: list[str] = []
+            write = limit and not dry_run
+            if write and selected > existing:
+                self.x(sql("overlay.records.pick"), (limit,))
+            if write and keyable:
+                self.x(sql("overlay.records.pick.keys"), (cui, min(limit, PULL_CHUNK)))
+            if write and (selected > existing or keyable):
+                created, keyed, found, base = self._write_registry_records(registry, cui, reg,
+                                                                           seen)
+                existing += found
+                if created and held > 0:
+                    # (The firms just made are the selection's, held by
+                    # their new records: one read gives every held firm.)
+                    self.x(sql("overlay.records.made"), (base,))
+                    new = [str(r[0]) for r in self.x(sql("overlay.records.made_ids"), (base,))]
+            out = {"selected": selected, "existing": existing, "created": created,
+                   "left": selected - existing - created, "cui_added": keyed,
+                   "cui_left": keyable - keyed, "cui_conflicts": conflicts,
+                   "unkeyable": unkeyable, "excluded": excluded}
+            to_create = min(selected - existing, limit)
+            if dry_run:
+                out["to_create"] = to_create
+            if held > 0:
+                room = held - to_create if dry_run else held
+                ids = [str(r[0]) for r in self.x(sql("overlay.records.held"),
+                                                 (int(bool(with_contact)), room))] \
+                    if room > 0 else []
+                out["ids"] = ids
+                if dry_run:
+                    declared = {str(r[0]) for r in self.x(registry.declared_sql(), (
+                        int(bool(with_contact)), room))} if ids else set()
+                    out["declares_site"] = [i for i in ids if i in declared]
+                else:
+                    out["new"] = new
+        finally:
+            if self.con.in_transaction:
+                self.x("ROLLBACK")
+            clear()
+        return out
+
+    def _selecting(self):
+        """(the registry's adapter, the id of its CUI scheme, the id of its
+        registration number scheme): what a selection of its firms is read
+        with. FileNotFoundError with no registry loaded."""
+        registry = next((a for a in self.registers if hasattr(a, "select_firms")), None)
+        if registry is None:
+            raise FileNotFoundError("no registry loaded: run harvey registry load")
+        schemes = [self.schemes.named(name) for name in registry.record_schemes()]
+        if None in schemes:
+            raise RuntimeError("the registry's identifier schemes aren't in the database yet")
+        return (registry, *(s.id for s in schemes))
+
+    def _registry_due(self, live: int):
+        """(the registry adapter, the firm's record the registry knows it
+        by, that record as a pull reads it) for a live firm that is to take
+        its registry entry: one the registry describes, not sourced to it,
+        that holds nothing of its own. A record made for a selection
+        (ensure_registry_records) is such a firm until its entry is taken,
+        whatever a register gave it meanwhile (ANAF's phone, by its check).
+        A firm another source found, one the user took off the registry's
+        pulls while Harvey's own work keeps it (remove_company), or one
+        Harvey searched or worked on is not: None for those, and for a firm
+        no registry describes."""
+        registry = next((a for a in self.registers if hasattr(a, "pull_record")), None)
+        if registry is None:
+            return None
+        group = self._group(live)
+        registers = self._register_sources()
+        if any(self._harvey_work(member, registers, skips=False) for member in group):
+            return None
+        marks = ",".join("?" * len(group))
+        held: dict[str, tuple[int, object]] = {}
+        for fid, scheme, key in self.x(f"SELECT firm, scheme, key FROM firm_ident "
+                                       f"WHERE firm IN ({marks})", group):
+            s = self.schemes.by_id.get(scheme)
+            if s is not None:
+                held.setdefault(s.name, (fid, key))
+        for name in registry.record_schemes():        # by its CUI first
+            if name in held:
+                own, key = held[name]
+                record = registry.pull_record(self.con, key, name)
+                if record is not None:
+                    break
+        else:
+            return None
+        # Looked up, never inserted: this is also a read (registry_entry). No
+        # source row yet means no firm is sourced to the registry.
+        src = self.one("SELECT id FROM source WHERE name = ?", (record.source,))
+        if src is not None and self.one(
+                f"SELECT 1 FROM firm_source WHERE firm IN ({marks}) AND source = ? LIMIT 1",
+                (*group, src)):
+            return None
+        return registry, own, record
+
+    def registry_entry(self, company_id) -> dict | None:
+        """What the registry declares for a firm that is to take its
+        registry entry (_registry_due), as {"website", "domain"}; None for
+        any other firm. A read: the contact finder checks the declared
+        domain against the do-not-contact list before the entry is taken."""
+        live = self.live(company_id)
+        due = self._registry_due(live) if live is not None else None
+        if due is None:
+            return None
+        record = due[2]
+        return {"website": record.website or "", "domain": record.domain or ""}
+
+    def take_from_registry(self, company_id, run_id: str = "") -> dict:
+        """What a registry pull gave a firm it saved, for a firm that is to
+        take its registry entry (_registry_due: a record made for a
+        selection, ensure_registry_records, that holds nothing of its own),
+        when Harvey starts work for it. Through the pull's own save of one
+        record (_pulled): its declared website and domain only where the
+        firm has none (the website sourced to the registry), the domain
+        left off when another firm holds it; the identifiers it lacks; the
+        registry as one of its sources. Then, as a pull saving a new firm
+        does (save_company), the record is matched once more with the
+        firm's own records left out: a firm another source brought that it
+        surely is takes it in (an automatic merge), one it may be is put up
+        for review. Then the phones the loaded registers hold for it
+        (_register_phones). Nothing the firm holds is replaced.
+
+        {} and nothing written for any other firm, and for one whose
+        registry keys sit on another firm's record as well (the review
+        list's to settle). Else {"website", "domain": the firm's now,
+        "shared_domain": the declared domain is another firm's, "phones":
+        register phones on file, "merged_into": the firm it was merged
+        into, or ""}."""
+        from harvey.collectors.phones import phone_region
+        from harvey.modules import ingest
+
+        live = self.live(company_id)
+        due = self._registry_due(live) if live is not None else None
+        if due is None:
+            return {}
+        _registry, own, record = due
+        company = ingest.company_from(record)
+        match = self.match_company(company, declared_domain=record.declared_domain)
+        if not (match.attach and match.same_record and self.live(match.company_id) == live):
+            return {}
+        group = frozenset(self._group(live))
+        other = resolver.match_firm(self.con, company, (), record.declared_domain,
+                                    schemes=self.schemes, registers=self.registers,
+                                    ignore=group)
+        had_site = self.one("SELECT website FROM firm WHERE id = ?", (live,)) is not None
+        shared = self._pulled(record, run_id, match)[3]
+        if not had_site and record.website:
+            # The declared website it took is the registry's, as on a pulled firm.
+            self.x("UPDATE firm SET website_source = ? WHERE id = ? AND website IS NOT NULL "
+                   "AND website_source IS NULL", (self.source(record.source), live))
+        merged_into = ""
+        if other.attach:
+            try:
+                merges.merge(self.con, int(other.company_id), live, score=other.score,
+                             reasons=json.dumps(other.reasons), decided_by="auto")
+                merged_into = str(other.company_id)
+            except merges.MergeRefused:
+                self._candidate(int(other.company_id), live, other.score, other.reasons)
+        elif other.review:
+            self._candidate(int(other.company_id), live, other.score, other.reasons)
+        for cid, score, reasons in other.others:
+            self._candidate(int(cid), live, score, reasons)
+        phones = self._register_phones(
+            {own: phone_region(record.location or "", None, record.domain or "")})
+        now = self.live(live)
+        website, domain = self.x("SELECT website, domain FROM firm WHERE id = ?",
+                                 (now,)).fetchone()
+        return {"website": website or "", "domain": domain or "", "shared_domain": shared,
+                "phones": phones, "merged_into": merged_into}
+
+    def _write_registry_records(self, registry, cui: int, reg: int,
+                                seen: int) -> tuple[int, int, int, int]:
+        """ensure_registry_records' one write transaction, over what it
+        picked into temp.recording and temp.keying. ``seen``: the identity
+        revision before the selection was read. Returns (records created,
+        records that gained their CUI, firms that had a record by now, the
+        highest id given before: a new record's id is it plus its number)."""
+        from harvey.queries import sql
+
+        self.x("BEGIN IMMEDIATE")
+        # No identifier written since: the firms picked still have no record.
+        found = 0 if self.identity() == seen else \
+            self.x(registry.recheck_sql(), (cui, reg)).rowcount
+        now = int(time.time())
+        base = self.one(sql("overlay.records.base"))
+        created = self.x(registry.record_firms_sql(), (base, now)).rowcount
+        if created:
+            self.x(sql("overlay.records.ident.cui"), (cui, base, now))
+            self.x(sql("overlay.records.ident.reg"), (reg, base, now))
+        keyed = self.x(sql("overlay.records.key"), (cui, now)).rowcount
+        if keyed:
+            # (Their ids: orders.refresh places firms by id.)
+            self._reorder(*(r[0] for r in self.x(sql("overlay.records.keyed"),
+                                                 (cui,)).fetchall()))
+        self.x("COMMIT")
+        return created, keyed, found, base
+
     def _register_phones(self, regions: dict[int, str | None]) -> int:
         """The phones every loaded register knows for these firms (by the
         key it reads them by), as contacts with the register as source."""
@@ -1932,18 +2249,21 @@ class Store:
         return [r[0] for r in self.x(f"SELECT id FROM source WHERE name IN "
                                      f"({','.join('?' * len(names))})", names)]
 
-    def _harvey_work(self, fid: int, registers: list[int]) -> str:
+    def _harvey_work(self, fid: int, registers: list[int], *, skips: bool = True) -> str:
         """What Harvey holds of its own on a firm (beyond what a register
-        pull wrote), as the first such thing found, or ""."""
-        marks = ",".join(str(i) for i in registers) or "NULL"
+        pull wrote), as the first such thing found, or "". ``skips`` False
+        leaves out the searches left out on purpose (outcome "skipped")."""
+        # (No register source on file yet: every source is Harvey's own.)
+        marks = ",".join(str(i) for i in registers)
+        skipped = "" if skips else f" AND outcome != {schema.OUTCOME['skipped']}"
         checks = (
             ("found by a search of Harvey's", f"SELECT 1 FROM firm_source WHERE firm = ? "
                                               f"AND source NOT IN ({marks})"),
             ("contacts Harvey found", f"SELECT 1 FROM link_evidence WHERE firm = ? "
                                       f"AND source NOT IN ({marks})"),
             ("people Harvey found", "SELECT 1 FROM person WHERE firm = ?"),
-            ("searches", "SELECT 1 FROM search WHERE is_person = 0 AND target = ?1 UNION ALL "
-                         "SELECT 1 FROM search WHERE origin = ?1"),
+            ("searches", f"SELECT 1 FROM search WHERE is_person = 0 AND target = ?1{skipped} "
+                         f"UNION ALL SELECT 1 FROM search WHERE origin = ?1{skipped}"),
             ("web signals", "SELECT 1 FROM obs WHERE firm = ?"),
             ("keys Harvey found", "SELECT 1 FROM firm_key WHERE firm = ?"),
             ("places", "SELECT 1 FROM locations WHERE firm = ?"),

@@ -9,6 +9,45 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Companies lists the whole trade registry, and Find contacts starts
+  from it.** The Companies page has two lists, switched at the top. **All
+  firms** is the registry's own list (the Registry page's, with its filters,
+  sorts and panel), read where the registry is: nothing is copied into
+  Harvey to show it. **In Harvey** is the list Companies had: the companies
+  Harvey has worked on. The page opens on All firms while a registry is
+  loaded and Harvey holds no company yet, else on the list you chose last
+  (In Harvey until you choose, so an existing install looks the same until
+  you switch); with no registry loaded, All firms says so and how to load
+  it. On All firms, tick firms (up to 10,000) or filter, then **Find
+  contacts**: the run is priced first as before, and the estimate also
+  says how many firms the selection holds, how many are already in Harvey,
+  how many enter it with this run and how many are left for a later one (a
+  run takes up to 50,000). A firm gets its record in Harvey when the run
+  takes it, and not before; the run then says how many were left. What the
+  new firms need isn't in the estimate: each one's search first reads its
+  registry entry (the website it declares, read free; the registers'
+  phones), so how many need a paid lookup isn't known before the run, and
+  the cap you type is what holds the spend. While the ANAF module is on
+  they are checked there first, and each check starts their search. The
+  filter's whole list needs something narrowing it; with nothing it would
+  be every firm in Romania, and the action says to pick a filter first. A
+  firm's panel on All firms offers Find contacts for that firm. In a
+  terminal: `harvey contacts find dentist --registry --county BV` (words,
+  `--q`, `--county` and `--locality` select registry firms; `--limit` caps
+  how many get a record; `--dry-run` counts and estimates, writing
+  nothing). `POST /api/contacts/find` and its estimate take
+  `{"registry": {...}}` (the Registry page's filters, or `{"regs": [...]}`)
+  in place of the company ids and answer with `registry` (`selected`,
+  `existing`, `to_create` or `created`, `left`, and the firms left out:
+  `excluded`, whose declared website is on the do-not-contact list and
+  which get no record, and `unkeyable`, whose CUI Harvey can't key by;
+  the card and the terminal say them when there are any). A filter that
+  only excludes (words with a leading `-` and nothing else) is refused,
+  and so are `--registry` with `--limit` below 1 and words given to
+  `harvey contacts find` without `--registry`. The Overview's registry
+  tip, the Companies empty state and Help's "Getting started" now point
+  there.
+  The Registry page and its **Pull into Harvey** are as they were.
 - **The dashboard behind your own HTTPS reverse proxy.** The dashboard
   answers to `localhost` only, so a proxy serving it at a name of your own
   either showed nothing or, when it replaced `Host` with the address it
@@ -1122,6 +1161,17 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **`harvey import-onrc` no longer imports the whole country.** With no
+  activity, area or filter it is refused, with or without
+  `--whole-country`: importing everything was the way to have every firm
+  on the Companies page and ready for work, a copy in Harvey of some 1.8
+  million operating firms the registry already holds. The registry is now
+  listed on Companies → All firms as it is, and a firm gets its record
+  when Find contacts takes it (`harvey contacts find --registry` in a
+  terminal), so that copy has no use. `harvey import-onrc --dry-run` with
+  nothing narrowing it still counts: the loaded registry's operating firms
+  (every status with `--include-inactive`), read where they are. An import
+  with an activity, a county, a town or a filter works as before.
 - **The Outbox and Conversations no longer need the Email module.** They
   (and Today) are shown while any module that writes or answers messages
   is on: the Email module, or nPathi Chat for SMS and WhatsApp, which no

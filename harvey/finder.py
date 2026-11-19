@@ -34,6 +34,17 @@ search, whichever source brought it in. For one company at a time (the
    site publishes as the person's own is linked to them as it is, with no
    check, cap or not.
 
+A record made when a Find-contacts run chose a firm from the trade
+registry, that holds nothing of its own yet, takes its registry entry
+first, in its own job: the website it declares (the domain left off
+when another company holds it), the phones the loaded registers hold for
+it, the registry as its source (Store.take_from_registry, the pull's own
+save of one firm). Until then it holds nothing to search by, so no lookup
+is paid for a firm that declares a website. One whose declared website is
+on the do-not-contact list is left alone, as a pull left it out (each
+search that could look it up records it as skipped, so the background
+doesn't offer it again).
+
 A website found by searching is the company's only on evidence. Code
 decides what a register fact settles (site_match.hard): the firm's CUI or
 registration number on the pages (no other firm's beside it), an official
@@ -309,10 +320,12 @@ def site_of(company: dict) -> tuple[str, str]:
 # the site it holds or a search found waits for a check or the classifier,
 # or wasn't taken as the firm's; it has no website and none was found, or
 # no search could look (none set up, no money for it, every search failed);
-# it was skipped (read already, a contact on file).
+# it was skipped (read already, a contact on file, the website its
+# registry entry declares on the do-not-contact list).
 WHY = ("unreachable", "blocked", "site_error", "no_contacts", "waiting_check",
        "waiting_classifier", "not_linked", "no_website_found", "no_search", "no_budget",
-       "search_error", "already_read", "has_contact", "gone", "nothing_found")
+       "search_error", "already_read", "has_contact", "do_not_contact", "gone",
+       "nothing_found")
 
 
 @dataclass
@@ -385,13 +398,25 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
     from harvey.modules import switches
 
     out = Found(company_id)
+    env = env if env is not None else _env()
+    enabled = await switches.enabled_ids(state)
+    # (Before anything is decided for it: the entry gives it its website.)
+    if await _registry_entry(state, company_id, config, run_id) == "do_not_contact":
+        skip = "the website its registry entry declares is on the do-not-contact list"
+        out.skipped.append(skip)
+        out.why = "do_not_contact"
+        # Each search that could look it up records the skip, as one that
+        # found nothing would: the background's walk doesn't offer it again.
+        for s in searchers(enabled, env):
+            await state.record_search("company", company_id, s.module, s.capability,
+                                      looked_for="website", outcome="skipped",
+                                      batch_id=batch_id, detail=skip)
+        return out
     company = await company_row(state, company_id)
     if company is None:
         out.skipped.append("merged into another company, or gone")
         out.why = "gone"
         return out
-    env = env if env is not None else _env()
-    enabled = await switches.enabled_ids(state)
     wanted = await state.collected_signal_codes()
     domain, floor = site_of(company)
     site_done = bool(domain) and await company_searched(state, company_id, *SITE, since,
@@ -454,6 +479,27 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
             found=out.contacts, cost=out.cost, batch_id=batch_id,
             detail="; ".join(out.steps + out.skipped))
     return out
+
+
+async def _registry_entry(state, company_id: str, config, run_id: str = "") -> str:
+    """Give a record made for a registry selection, that holds nothing of
+    its own yet (Store.registry_entry), what a pull gave the firms it saved
+    (Store.take_from_registry), unless the website it declares is on the
+    do-not-contact list (ingest.excluded, as a pull checks it): then
+    nothing is written and "do_not_contact" is returned. "taken" when it
+    was, "" for any other firm."""
+    declared = await state.registry_entry(company_id)
+    if declared is None:
+        return ""
+    barred = []
+    if config is not None:
+        from harvey.config import live_do_not_contact
+
+        barred = live_do_not_contact(config)
+    if ingest.excluded(api.Record(domain=declared["domain"]), barred):
+        return "do_not_contact"
+    await state.take_from_registry(company_id, run_id=run_id)
+    return "taken"
 
 
 async def _reread_found(state, company: dict, domain: str, read, out: Found, *,

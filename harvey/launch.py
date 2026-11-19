@@ -9,13 +9,18 @@ tools (harvey/agent/actions.py) both go through these, then through the
 same enqueue functions (harvey/modules/job_kinds.py), so a run the agent
 queues is the run the same request on the page would queue: the same
 selection, the same caps, the same module switches. Nothing here spends,
-queues or starts anything.
+queues or starts anything. One thing is written before a run is queued: a
+Find-contacts run that starts from the trade registry gives the firms it
+takes a record (registry_selection), since a registry firm has none until
+Harvey starts work for it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
+import sqlite3
+from pathlib import Path
 
 # A Find-contacts run takes at most this many companies (the newest first);
 # a wider filter is taken in more runs.
@@ -363,10 +368,25 @@ async def discovery_estimate(state, config, plan: list[dict], notes: list[str],
 
 # ── Find contacts ──
 
-async def find_selection(state, body: dict) -> tuple[list[dict], str]:
+# What a Find-contacts estimate over a registry selection can't say.
+REGISTRY_NOTE = ("the firms that would get a record aren't in the figures for the companies "
+                 "on file: whether each declares a website (read free) or a loaded register "
+                 "holds a phone for it is read from the registry when its search starts, so "
+                 "how many need a paid lookup isn't known before the run; a firm with a "
+                 "record whose search hasn't started yet is counted with a website when its "
+                 "registry entry declares one (its search reads that website, free); the "
+                 "run's cap is what is enforced")
+
+
+async def find_selection(state, body: dict, *, create: bool = False) -> tuple[list[dict], str]:
     """(the companies a Find-contacts request selects, its filter's error
     or "") from {"filter": {the Contacts page's filters}, "company_ids",
-    "force", "limit"}."""
+    "force", "limit"}, or {"registry": {...}} in place of the ids: a
+    selection of the trade registry (registry_selection), kept on the
+    request as ``_registry``. ``create`` (a run, never an estimate): the
+    registry selection's firms with no record get one. In an estimate, a
+    record whose registry entry declares a website it hasn't taken yet is
+    selected with a website (``site``): its search reads that one."""
     from harvey import finder
     from harvey.contact_query import filter_from_query
 
@@ -381,9 +401,137 @@ async def find_selection(state, body: dict) -> tuple[list[dict], str]:
     except (TypeError, ValueError):
         return [], "limit must be a number"
     ids = body.get("company_ids") if isinstance(body.get("company_ids"), list) else None
+    declares: set[str] = set()
+    if body.get("registry") is not None:
+        if ids is not None:
+            return [], "a registry selection or company_ids, one of the two"
+        if any(str(v).strip() for v in raw.values() if v is not None):
+            # (They read what Harvey holds of a company; a firm that gets
+            # its record here holds nothing yet, and would be left out.)
+            return [], ("a registry selection is narrowed by the registry's own filters, "
+                        "not the Contacts page's")
+        try:
+            chosen = await registry_selection(state, body["registry"], limit=limit,
+                                              force=bool(body.get("force")), create=create)
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            return [], str(e)
+        except sqlite3.OperationalError as e:
+            # (The write waited its 30 s for another writer and gave up.)
+            return [], f"the registry selection couldn't be read or its records made ({e})"
+        ids = chosen.pop("ids")
+        declares = set(chosen.pop("declares_site", ()))
+        body["_registry"] = chosen
     selected = await finder.select(state, f, ids=ids, force=bool(body.get("force")),
                                    limit=limit, attach_figures=attach)
+    for c in selected:
+        if c["id"] in declares:
+            c["site"] = True
     return selected, ""
+
+
+def _positive(params: dict) -> bool:
+    """Whether a registry pull's parameters (job_kinds.registry_params)
+    name something firms are taken by: chosen firms, an area, a financial
+    or taxpayer condition, or a word that isn't an exclusion."""
+    from harvey import registry
+
+    if (params["regs"] or params["counties"] or params["localities"] or params["fin"]
+            or params["tax"]):
+        return True
+    return registry.says_anything(" ".join(w for w in (params["words"] or "").split()
+                                           if not w.startswith("-")))
+
+
+def _barred_domains() -> list[str]:
+    """The do-not-contact list's domain entries as the config file says it
+    is now, normalised as gate.do_not_contact_domain_match reads them (an
+    address entry bars a mailbox, not a firm)."""
+    from harvey.config import live_do_not_contact
+    from harvey.gate import do_not_contact_entry
+    from harvey.modules.job_kinds import _config
+
+    config = _config()
+    if config is None:
+        return []
+    out = []
+    for raw in live_do_not_contact(config):
+        entry = do_not_contact_entry(raw)
+        if entry and "@" not in entry and entry not in out:
+            out.append(entry)
+    return out
+
+
+async def registry_selection(state, chosen, *, limit: int = FIND_MAX, force: bool = False,
+                             create: bool = False) -> dict:
+    """A Find-contacts request's selection of the trade registry: the
+    Registry page's own filters as it sends them (words, county, locality,
+    status, the turnover and headcount bounds, unknown, employer, vat,
+    micro) or the rows ticked there ({"regs": [registration numbers]}),
+    read by job_kinds.registry_plan as a pull's are, and once more only
+    when it names something to take firms by (not only exclusions). Nothing
+    is copied from the registry: a firm gets a record only here, when a run
+    takes it. A firm whose declared website is on the do-not-contact list
+    gets none and isn't taken (``excluded``), as a pull leaves it out; a
+    registration no key reaches is counted (``unkeyable``).
+
+    The selection is read once (StateManager.ensure_registry_records).
+    ``create`` False (an estimate) counts and writes nothing, with no write
+    lock: {"selected": firms in the selection, "existing": those with a
+    record, "to_create": those that would get one now (the run's ``limit``
+    at most, and overlay.store.RECORDS_MAX), "left": those left without
+    one for a later run, "excluded", "unkeyable", "note"}, with
+    "declares_site": the records of "ids" whose search will read the
+    website their registry entry declares. ``create`` True makes those
+    records by SQL over the registry in the same call and says "created"
+    in place of "to_create", with "new": the companies it made.
+
+    Both carry "ids": the selection's firms that have a record now, the
+    newest records first (so a run's new ones before any other), those no
+    contact reaches unless ``force``, up to ``limit`` less the records
+    still to make: what the run, or the estimate, goes on with.
+
+    ValueError for filters that say nothing (registry_plan), only
+    exclude, or the registry can't select by; switches.ModuleOff with the
+    registry's module off, FileNotFoundError with no registry (or a
+    filter's file) loaded."""
+    from harvey import registry, registry_view
+    from harvey.modules import switches
+    from harvey.modules.job_kinds import discover_sources, registry_plan
+    from harvey.overlay.store import RECORDS_MAX
+
+    source = next((s for s in discover_sources(await switches.enabled_ids(state))
+                   if s["job"] == "registry_pull"), None)
+    if source is None:
+        raise ValueError("no module gives a registry to select from")
+    if not source["enabled"]:
+        raise switches.ModuleOff(source["module"], "Finding contacts from the registry")
+    if not isinstance(chosen, dict):
+        raise ValueError("registry is the Registry page's filters, or {\"regs\": [...]}")
+    params = registry_plan(chosen)
+    if not _positive(params):
+        raise ValueError("the registry selection only excludes: name an activity, an area, a "
+                         "word or a financial or taxpayer condition the firms are taken by")
+
+    def resolved():
+        con = registry.connect(Path(params["path"]))
+        try:
+            return registry_view.resolve(con, params)
+        finally:
+            con.close()
+
+    by = {"regs": params["regs"]} if params["regs"] else \
+        {"query": await asyncio.to_thread(resolved)}
+    cap = min(int(limit), RECORDS_MAX)
+    got = await state.ensure_registry_records(**by, limit=cap, dry_run=not create,
+                                              held=int(limit), with_contact=force,
+                                              barred=_barred_domains())
+    out = {"selected": got["selected"], "existing": got["existing"], "left": got["left"],
+           "excluded": got["excluded"], "unkeyable": got["unkeyable"], "ids": got["ids"]}
+    if not create:
+        return {**out, "to_create": got["to_create"],
+                "left": got["left"] - got["to_create"], "note": REGISTRY_NOTE,
+                "declares_site": got["declares_site"]}
+    return {**out, "created": got["created"], "new": got["new"]}
 
 
 async def find_estimate(state, selected: list[dict], force: bool) -> dict:

@@ -4,7 +4,9 @@ A firm is reached by its CUI through ``firm_by_cui`` (the canonical row,
 built by the load: derived.py), or by its registration number (``reg``,
 the scheme ro.onrc_reg) when it has no CUI. Never through ``firms.cui``
 directly: that index is partial (``cui != ''``) and a CUI can be on several
-registrations.
+registrations. The one read that wants every registration of a CUI (whether
+a record in Harvey holds any of a firm's numbers: the records statements)
+goes through that index, and says ``cui != ''``.
 
 Activities are read and ranged over the current revisions of the
 nomenclature only (2 and 3: the classes the registry's search index tags),
@@ -18,8 +20,9 @@ import sqlite3
 from functools import lru_cache
 
 from harvey import queries
+from harvey.modules.ro.onrc.derived import CUI_OK
 from harvey.registers import Adapter as Base
-from harvey.registers import Read, chunks
+from harvey.registers import Read, Stale, chunks
 
 MODULE = "onrc"
 DATASET_DATE = "(SELECT value FROM {alias}.meta WHERE key = 'date')"
@@ -240,6 +243,152 @@ queries.statement(
     "SELECT n.firm_id FROM {derived}.name_key n WHERE n.key = ? AND n.locality = ?",
     params=("exemplu", "brasov"), module=MODULE)
 
+# ── Records for a selection of firms (overlay.store.Store.
+#    ensure_registry_records) ──
+# Registration numbers one selection may name (a selection on the Registry
+# page, a pull of chosen firms, the keys statement's one JSON list).
+REGS_MAX = 10_000
+# A selection goes into temp.registering (overlay/queries.py) as its firms'
+# canonical rows (derived firm_key: a CUI's one row, or the row of a firm
+# with no CUI), each once, with its CUI, its registration number and the
+# record in Harvey that holds each already. A matched or chosen registration
+# that isn't its CUI's canonical one stands for the firm: its canonical row
+# is taken (through firm_by_cui), once however many of its registrations
+# the selection holds. Params: the selection, the CUI scheme's id, the
+# registration number scheme's, then the do-not-contact list's domains (a
+# JSON list, normalised as gate.do_not_contact_domain_match reads them).
+# A row the selection holds but leaves out is written with ``left_out`` set,
+# for the caller to count and drop: 1, a registration no key reaches (its
+# CUI isn't one the core can key by: derived.CUI_OK; written by its own row
+# id, negated, so it never meets a firm's); 2, a firm whose declared
+# website is on the do-not-contact list (that domain, or one under it: the
+# label boundary of gate.do_not_contact_domain_match), as a pull leaves it
+# out (ingest.excluded).
+# The probes in firm_ident are by (scheme, key), compared with no affinity
+# (``+``) so the probe keeps the key. A firm's number is its canonical
+# row's, else any other registration of its CUI (read through the index on
+# firms.cui, which needs ``cui != ''``): a record holding only an old
+# number of the firm is the firm's record.
+_BY_CUI = "(SELECT i.firm FROM firm_ident i WHERE i.scheme = ?2 AND i.key = +k.cui)"
+_BY_REG = ("COALESCE((SELECT i.firm FROM firm_ident i WHERE i.scheme = ?3 AND i.key = +f.reg), "
+           "(SELECT i.firm FROM {alias}.firms o CROSS JOIN firm_ident i "
+           "WHERE k.cui IS NOT NULL AND o.cui = f.cui AND o.cui != '' "
+           "AND i.scheme = ?3 AND i.key = +o.reg LIMIT 1))")
+_LEFT_OUT = ("CASE WHEN k.firm_id IS NULL THEN 1 WHEN f.domain != '' AND EXISTS ("
+             "SELECT 1 FROM json_each(?4) d WHERE f.domain = d.value "
+             "OR substr(f.domain, -length(d.value) - 1) = '.' || d.value) THEN 2 END")
+_SELECTED = ("INSERT OR IGNORE INTO temp.registering "
+             "(firm_row, cui, reg, by_cui, by_reg, left_out) "
+             f"SELECT COALESCE(k.firm_id, -g.id), k.cui, COALESCE(f.reg, g.reg), {_BY_CUI}, "
+             f"{_BY_REG}, {_LEFT_OUT} ")
+# From a registration ``g`` to its firm: the canonical row ``k``, read as
+# ``f`` (both NULL for a registration no key reaches).
+_CANONICAL = ("CROSS JOIN {alias}.firms g LEFT JOIN {derived}.firm_by_cui b "
+              f"ON b.cui = CAST(g.cui AS INTEGER) AND g.cui != '' "
+              f"AND {CUI_OK.replace('f.cui', 'g.cui')} "
+              "LEFT JOIN {derived}.firm_key k ON k.firm_id = COALESCE(b.firm_id, g.id) "
+              "LEFT JOIN {alias}.firms f ON f.id = k.firm_id")
+# Firms chosen by registration number (a JSON list).
+queries.statement(
+    "onrc.records.select.keys",
+    f"{_SELECTED}FROM json_each(?1) j {_CANONICAL} WHERE g.reg = j.value",
+    params=('["J08/1/2015"]', 1, 2, '["exemplu.example.ro"]'), module=MODULE, drives="j")
+
+
+def _fin_bounds(at: int) -> str:
+    """mf_financials.store.Filter.sql("f.cui") with every bound a parameter
+    that may be NULL, so one statement serves every combination. Params
+    from ``at``: whether a firm with no figure is kept (1 or 0), the least
+    and most turnover, the least and most employees."""
+    unknown, *bounds = (f"?{at + i}" for i in range(5))
+
+    def column(name, low, high):
+        return (f"CASE WHEN {low} IS NULL AND {high} IS NULL THEN 1 "
+                f"WHEN l.{name} IS NULL THEN {unknown} "
+                f"ELSE ({low} IS NULL OR l.{name} >= {low}) "
+                f"AND ({high} IS NULL OR l.{name} <= {high}) END")
+
+    return (f"(({unknown} AND NOT EXISTS (SELECT 1 FROM fin.latest l WHERE l.cui = f.cui)) "
+            f"OR EXISTS (SELECT 1 FROM fin.latest l WHERE l.cui = f.cui "
+            f"AND {column('turnover', *bounds[:2])} AND {column('employees', *bounds[2:])}))")
+
+
+def _tax_flags(at: int) -> str:
+    """mf_taxpayers.store.Filter.sql("f.cui") the same way. Params from
+    ``at``: employer, VAT payer, micro-enterprise tax, each 1, 0 or NULL
+    (not asked)."""
+    return ("EXISTS (SELECT 1 FROM tax.taxpayers x WHERE x.cui = f.cui AND "
+            + " AND ".join(f"(?{at + i} IS NULL OR x.{column} = ?{at + i})"
+                           for i, column in enumerate(("employer", "vat", "micro_tax"))) + ")")
+
+
+# Firms a resolved registry query matches (registry.Query.match, a
+# full-text expression), with its financial bounds and its taxpayer
+# conditions when it has them (the financials and the taxpayer file
+# attached beside the registry, as registry._where reads them; a firm's
+# registrations carry the one CUI, so they hold for the canonical row as
+# for the matched one).
+for _name, _conds, _args in (
+        ("", (), ()),
+        ("+fin", (_fin_bounds(5),), (0, 1, None, None, None)),
+        ("+tax", (_tax_flags(5),), (1, None, None)),
+        ("+fin+tax", (_fin_bounds(5), _tax_flags(10)), (0, 1, None, None, None, 1, None, None))):
+    queries.statement(
+        f"onrc.records.select.match{_name}",
+        f"{_SELECTED}FROM {{alias}}.firm_fts t {_CANONICAL} "
+        f"WHERE t.firm_fts MATCH ?1 AND g.id = t.rowid"
+        + "".join(f" AND {c}" for c in _conds),
+        params=("tags : activ", 1, 2, '["exemplu.example.ro"]', *_args), module=MODULE,
+        drives="t")
+# Inside the write, when identifiers changed since the selection was read:
+# the firms about to get a record that have one now (another writer made
+# it meanwhile) are taken off, by the same three probes. Params: the CUI
+# scheme's id, the registration number scheme's.
+queries.statement(
+    "onrc.records.recheck",
+    "DELETE FROM temp.recording WHERE "
+    "EXISTS (SELECT 1 FROM firm_ident i WHERE i.scheme = ?1 AND i.key = +recording.cui) "
+    "OR EXISTS (SELECT 1 FROM firm_ident i WHERE i.scheme = ?2 AND i.key = +recording.reg) "
+    "OR EXISTS (SELECT 1 FROM {alias}.firms o CROSS JOIN firm_ident i "
+    "WHERE recording.cui IS NOT NULL AND o.cui = CAST(recording.cui AS TEXT) AND o.cui != '' "
+    "AND i.scheme = ?2 AND i.key = +o.reg)",
+    params=(1, 2), module=MODULE)
+# The new records themselves: each firm of temp.recording at the id after
+# the highest given so far, at its place in the registry's orders
+# (overlay/orders.py: its row's id follows the names, its place line's rank
+# the places). Params: the highest id given so far, the time.
+queries.statement(
+    "onrc.records.firms",
+    "INSERT INTO firm (id, created, name_order, place_order) "
+    "SELECT ?1 + n.n, ?2, n.firm_row, p.rank FROM temp.recording n "
+    f"CROSS JOIN {{alias}}.firms f {_PLACE} WHERE f.id = n.firm_row",
+    params=(0, 1_700_000_000), module=MODULE, drives="n")
+# The selection's firms that have a record and haven't taken their registry
+# entry yet (no source on the record or its live firm, no website on file),
+# whose registry row declares a website: the newest records first, up to a
+# cap (params: 1 for every one or 0 for those no contact reaches, the cap).
+# Their search reads that website when it starts, so an estimate counts
+# them as firms with a website, never as lookups.
+queries.statement(
+    "onrc.records.declared",
+    "SELECT DISTINCT v.id FROM temp.registering n CROSS JOIN firm f CROSS JOIN firm v "
+    "CROSS JOIN {alias}.firms r WHERE f.id = COALESCE(n.by_cui, n.by_reg) "
+    "AND v.id = CASE f.live WHEN 0 THEN f.id ELSE f.live END AND r.id = n.firm_row "
+    "AND r.website != '' AND v.website IS NULL AND (?1 OR v.n_contacts = 0) "
+    "AND NOT EXISTS (SELECT 1 FROM firm_source s WHERE s.firm = f.id) "
+    "AND NOT EXISTS (SELECT 1 FROM firm_source s WHERE s.firm = v.id) "
+    "ORDER BY v.id DESC LIMIT ?2",
+    params=(0, 50_000), bounded=True, module=MODULE, drives="n")
+queries.statement(
+    "onrc.records.ready",
+    "SELECT COUNT(*) FROM {derived}.sqlite_master WHERE type = 'table' "
+    "AND name IN ('firm_by_cui', 'firm_key', 'place_rank')", module=MODULE)
+# The dataset the registry was loaded from (its name and date): what a
+# firm read from it is sourced to (Adapter.pull_record).
+queries.statement(
+    "onrc.dataset",
+    "SELECT key, value FROM {alias}.meta WHERE key IN ('dataset', 'date')", module=MODULE)
+
 
 @lru_cache(maxsize=20_000)
 def place(locality, county) -> str:
@@ -417,6 +566,116 @@ class Adapter(Base):
         if row is None:
             return (con.execute(self.sql("order.place_last")).fetchone()[0] or 0) + 0.5
         return float(row[0]) if row[1] == line else row[0] - 0.5
+
+    # Records for a selection of its firms (overlay.store.Store.
+    # ensure_registry_records)
+
+    def record_schemes(self) -> tuple[str, str]:
+        """The schemes a record of a registry firm holds its identifiers
+        under: its CUI's, its registration number's."""
+        return ("ro.cui", REG)
+
+    def select_firms(self, con, schemes: tuple[int, int], *, regs=None, query=None,
+                     barred=()) -> None:
+        """Put a selection of firms into temp.registering (see the
+        statements): the firms of the registration numbers ``regs`` (at
+        most REGS_MAX), or those a resolved ``query`` (registry.Query)
+        matches. ``schemes``: the ids of record_schemes() in the database
+        on ``con``. ``barred``: the do-not-contact list's domains; a firm
+        whose declared website is one of them, or under one, is written
+        left out (as is a registration no key reaches), for the caller to
+        count. It reads the registry and the identifiers in Harvey and
+        writes the temporary table only: no lock on the database.
+
+        A query is taken when its match is a full-text expression, however
+        many firms that is ("-word" over operating firms is nearly all of
+        them), with or without financial bounds and taxpayer conditions
+        (read from the financials and the taxpayer file attached to
+        ``con``, not from the query's own paths). Refused (ValueError): a
+        query whose match is empty (it names nothing), one whose match is
+        every firm (registry.EVERY: only exclusions or conditions over
+        every status, so no full-text expression to read it by), and one
+        made from registration numbers (pass ``regs``).
+        FileNotFoundError when a condition's file isn't loaded; Stale when
+        the registry's key tables predate this code."""
+        from harvey import registry
+
+        if regs is not None:
+            regs = list(regs)
+            if len(regs) > REGS_MAX:
+                raise ValueError(f"at most {REGS_MAX:,} firms can be chosen one by one")
+        else:
+            if query.firm_ids is not None:
+                raise ValueError("a registry query made from registration numbers isn't taken "
+                                 "here: pass the numbers themselves")
+            if not query.match:
+                raise ValueError("the registry query names no activity, area or filter: "
+                                 "nothing to select by")
+            if query.match == registry.EVERY:
+                raise ValueError("a registry query with nothing for the search index to match "
+                                 "(only exclusions, financial or taxpayer conditions, over "
+                                 "every status) isn't taken yet: name an activity, an area or "
+                                 "a word, or keep to operating firms")
+        if con.execute(self.sql("records.ready")).fetchone()[0] != 3:
+            raise Stale("the registry's key tables (firm_by_cui, firm_key, place_rank) aren't "
+                        "all built: run harvey registry load --force")
+        domains = json.dumps(list(barred or ()))
+        if regs is not None:
+            con.execute(self.sql("records.select.keys"), (json.dumps(regs), *schemes, domains))
+            return
+        attached = {r[1] for r in con.execute("PRAGMA database_list")}
+        name, params = "records.select.match", [query.match, *schemes, domains]
+        fin = query.fin if query.fin is not None and query.fin.active() else None
+        if fin is not None:
+            if "fin" not in attached:
+                raise FileNotFoundError("no financial statements loaded: harvey financials load")
+            name += "+fin"
+            params += [int(fin.unknown == "include"), fin.min_turnover, fin.max_turnover,
+                       fin.min_employees, fin.max_employees]
+        tax = query.tax if query.tax is not None and query.tax.active() else None
+        if tax is not None:
+            if "tax" not in attached:
+                raise FileNotFoundError("no taxpayer file loaded: harvey taxpayers load")
+            name += "+tax"
+            params += [None if wanted is None else int(bool(wanted))
+                       for wanted in (tax.employer, tax.vat, tax.micro)]
+        con.execute(self.sql(name), params)
+
+    def recheck_sql(self) -> str:
+        """The DELETE that takes off temp.recording the firms a record
+        holds now (params: the ids of record_schemes())."""
+        return self.sql("records.recheck")
+
+    def declared_sql(self) -> str:
+        """The SELECT of the selection's records that haven't taken their
+        registry entry and whose registry row declares a website (params:
+        1 for every one or 0 for those no contact reaches, a cap)."""
+        return self.sql("records.declared")
+
+    def record_firms_sql(self) -> str:
+        """The INSERT that writes the firms of temp.recording as records,
+        each at its place in the registry's orders (params: the highest
+        firm id given so far, the time they are created)."""
+        return self.sql("records.firms")
+
+    def pull_record(self, con, key, scheme: str = "ro.cui"):
+        """One firm as the record a pull reads it as (collectors.onrc.
+        firms_draft: its identifiers, place, declared website and domain,
+        its source), by CUI or registration number; None when the registry
+        has no such firm. Its administrators are left in the registry: the
+        contact finder names them when it works on the firm."""
+        from harvey.collectors import onrc
+
+        firm = self.describe(con, [key], scheme).get(key)
+        if firm is None:
+            return None
+        meta = dict(con.execute(self.sql("dataset")).fetchall())
+        entry = onrc.Firm(**{f: firm.get(f) or "" for f in onrc.Firm.__dataclass_fields__})
+        draft = onrc.firms_draft([entry], onrc.Dataset(meta.get("dataset", ""),
+                                                       meta.get("date", ""), {}),
+                                 codes={entry.reg: firm["activities"]},
+                                 with_administrators=False)
+        return draft.records[0]
 
     def name_of_id(self, con, registry_id: int) -> str:
         row = con.execute(self.sql("name_of_id"), (registry_id,)).fetchone()

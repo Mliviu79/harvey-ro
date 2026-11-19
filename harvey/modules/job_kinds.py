@@ -29,6 +29,9 @@ from pathlib import Path
 
 from harvey.modules import jobs
 from harvey.modules.jobs import JobError, LaneExhausted, SpendLimit, Transient
+# Firms a pull may name one by one (a selection on the Registry page): the
+# registry adapter's bound, also read from here.
+from harvey.modules.ro.onrc.queries import REGS_MAX
 
 logger = logging.getLogger("harvey.jobs")
 
@@ -814,15 +817,25 @@ async def enqueue_finder_follow_ups(state, company_ids, *, batch_id: str = "",
     with no website are looked up too, drawing paid searches from the
     run's websites amount only. Anything else (an address check for what
     it saved) is a Find-contacts run of its own, with its own estimate and
-    cap. Returns how many were queued."""
+    cap. In a Find-contacts run's batch (the firms it checked first:
+    enqueue_contact_search's ``check_first``) it is that run's search of
+    every one of them. Returns how many were queued."""
     from harvey import finder
 
     if not company_ids:
         return 0
+    batch = await jobs.get_batch(state, batch_id) if batch_id else None
+    if batch and batch.get("kind") == "find_contacts":
+        # A Find-contacts run's new firms, checked first: the run's own
+        # search of each (under its cap, forced when the run is), whether
+        # or not it has a website on file yet (its job reads the registry's).
+        ids, _ = await enqueue_find_contacts(
+            state, company_ids, batch_id=batch_id, parent_id=parent_id,
+            force_since=(batch.get("params") or {}).get("since") or "")
+        return len(ids)
     chosen = await finder.select(state, ids=company_ids, force=True, limit=len(company_ids))
     ids, _ = await enqueue_find_contacts(state, [c["id"] for c in chosen if c["site"]],
                                          batch_id=batch_id, parent_id=parent_id, free_only=True)
-    batch = await jobs.get_batch(state, batch_id) if batch_id else None
     if batch and (batch.get("params") or {}).get("find_websites"):
         wanted = [c["id"] for c in chosen if not c["site"]]
         room = max(0, await website_lookups_limit(state, batch)
@@ -949,32 +962,103 @@ async def metered(ctx, config):
 
 async def enqueue_contact_search(state, selected: list[str], *, max_spend: float = 0.0,
                                  force: bool = False, label: str = "",
-                                 classify_max_spend: float | None = None
+                                 classify_max_spend: float | None = None,
+                                 check_first=(), checks: dict | None = None
                                  ) -> tuple[str, list, list]:
     """A Find-contacts run over chosen companies: one batch (capped at
     ``max_spend``; 0 reads websites only), one job per company. ``force``
     searches again what was searched before this run started.
     ``classify_max_spend``: what the run's classifier calls may cost in
     all (None: no cap of the run's own; 0: none is made, a site no
-    register fact settles waits unlinked). Returns (batch id, new job
-    ids, jobs already waiting); Duplicate when every one is already
-    waiting."""
+    register fact settles waits unlinked).
+
+    ``check_first``: the companies among ``selected`` this run made a
+    record for (a registry selection's new firms). They get the checks a
+    source's new companies get first (enqueue_follow_up_checks: ANAF's,
+    free, which puts their phones on file before any search is paid for),
+    and each check queues their search in this batch when it is done; one
+    no check takes (no identifier it asks by, its module off) is searched
+    at once. The register signals are counted again over the firms in
+    Harvey (enqueue_register_counts), as after a pull that saved firms.
+    ``checks`` (a dict) is filled with {"jobs": checks queued,
+    "companies": the companies whose search waits for one}.
+
+    A company whose search already waits behind a check of an earlier
+    Find-contacts run (its records' first run) isn't searched here: it is
+    one of the jobs already waiting (that check), and searched when the
+    check is done.
+
+    Returns (batch id, new search job ids, jobs already waiting);
+    Duplicate when every one is already waiting."""
     from harvey import contacts
 
     since = contacts.now() if force else ""
+    first = set(check_first or ()) & set(selected)
+    behind = await _checked_first(state)
     params = {"companies": len(selected), "force": force}
     if classify_max_spend is not None:
         params["classify_max_spend"] = float(classify_max_spend)
+    if first and since:
+        # (What the searches the checks queue later are forced since.)
+        params["since"] = since
     batch_id = await jobs.new_batch(
         state, "find_contacts", label or ("Find contacts (search again)" if force
                                           else "Find contacts"),
         params=params, max_spend=max_spend)
-    ids, dupes = await enqueue_find_contacts(state, selected, batch_id=batch_id,
-                                             force_since=since)
-    if not ids and dupes:
+    waiting: set[str] = set()
+    queued = 0
+    if first:
+        queued = await enqueue_follow_up_checks(state, [i for i in selected if i in first],
+                                                batch_id=batch_id, then_find=True)
+        waiting = set(await _checked_first(state, batch_id)) & first if queued else set()
+        await enqueue_register_counts(state, batch_id=batch_id)
+    if checks is not None:
+        checks.update(jobs=queued, companies=len(waiting))
+    held = {i: behind[i] for i in selected if i in behind and i not in first}
+    ids, dupes = await enqueue_find_contacts(
+        state, [i for i in selected if i not in waiting and i not in held],
+        batch_id=batch_id, force_since=since)
+    if held:
+        found = {j: await jobs.get(state, j) for j in set(held.values())}
+        dupes = [*dupes, *(found[j] for j in held.values() if found[j] is not None)]
+    if not ids and not queued and dupes:
         await jobs.drop_batch(state, batch_id)
         raise jobs.Duplicate(dupes[0])
     return batch_id, ids, dupes
+
+
+async def _checked_first(state, batch_id: str | None = None) -> dict[str, str]:
+    """The companies whose search a check queues when it is done (its
+    id_check job's ``then_find``), as {company id: that check's job id}:
+    the checks of a run's batch, or with no batch those still to finish
+    (queued, running or paused) of every Find-contacts run."""
+    where = "jobs.batch_id = ?" if batch_id is not None else (
+        "jobs.status IN ('queued', 'running', 'paused') AND jobs.batch_id IN "
+        "(SELECT id FROM job_batches WHERE kind = 'find_contacts')")
+    async with state._connect() as db:
+        async with db.execute(
+                "SELECT j.value, jobs.id FROM jobs, json_each(jobs.params_json, '$.company_ids') j "
+                f"WHERE {where} AND jobs.kind = 'id_check' "
+                "AND json_extract(jobs.params_json, '$.then_find')",
+                (batch_id,) if batch_id is not None else ()) as cur:
+            return {str(r[0]): r[1] for r in await cur.fetchall()}
+
+
+async def check_ended(state, job) -> int:
+    """A check that would have queued its companies' search in a
+    Find-contacts run (``then_find``) failed: their searches are queued
+    anyway, in the run's batch (they don't depend on its answer; the records
+    it was made for have no other work queued). A check the user cancelled
+    queues nothing, running or waiting: that is the run being stopped. How
+    many were queued."""
+    if (job.kind != "id_check" or not job.params.get("then_find") or not job.batch_id
+            or job.status != jobs.FAILED):
+        return 0
+    batch = await jobs.get_batch(state, job.batch_id)
+    if not batch or batch.get("kind") != "find_contacts":
+        return 0
+    return await enqueue_finder_follow_ups(state, job.params.get("company_ids") or [],
+                                           batch_id=job.batch_id, parent_id=job.id)
 
 
 # ── Checking the websites a search found before (harvey/site_check.py) ──
@@ -1288,6 +1372,11 @@ async def enqueue_backlog(state) -> int:
                      if free[s.module] or (paid and (s.estimate > 0 or free[s.module] is None))]
         ids += [i for i in await finder.next_paid(state, BACKLOG_QUEUED, available)
                 if i not in waiting and i not in ids][:room - len(ids)]
+    if ids:
+        # (A Find-contacts run's new firm whose check is still to finish:
+        # the check queues the run's search of it, after ANAF's phone.)
+        behind = await _checked_first(state)
+        ids = [i for i in ids if i not in behind]
     if not ids and not waiting:
         _backlog_idle[key] = time.monotonic() + BACKLOG_IDLE_SECONDS
     new, _ = await enqueue_find_contacts(state, ids, background=True)
@@ -1323,10 +1412,6 @@ def _number(value):
         return None
     number = float(value)
     return int(number) if number.is_integer() else number
-
-
-# Firms a pull may name one by one (a selection on the Registry page).
-REGS_MAX = 10_000
 
 
 def registry_plan(filters: dict) -> dict:
@@ -1380,7 +1465,7 @@ def registry_params(filters: dict) -> dict:
         regs = list(dict.fromkeys(r.strip() for r in regs if r.strip()))
         if len(regs) > REGS_MAX:
             raise ValueError(f"at most {REGS_MAX:,} firms can be chosen one by one; "
-                             "pull the filter instead")
+                             "use the filter instead")
     all_statuses = str(f.get("status") or "") == "all"
     where = ", ".join(localities + counties) or "Romania"
     base = {"path": str(REGISTRY_PATH), "data_dir": str(PROJECT_ROOT / "data" / "onrc"),

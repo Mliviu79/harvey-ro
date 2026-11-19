@@ -175,10 +175,10 @@
       <div class="subhead"><span data-i18n="ov.runs">Importuri și căutări recente</span>
         <span class="hint"><a href="#" onclick="goTab('activity');return false" data-i18n="common.see_all">Vezi tot</a></span></div>
       <div class="card flush" id="overview-runs"><p class="pad muted" data-i18n="common.loading">Se încarcă…</p></div>
-      <div class="subhead" data-i18n="ov.import_title">Import din registru (ONRC)</div>
+      <div class="subhead" data-i18n="ov.import_title">Firmele din registru (ONRC)</div>
       <div class="card tip" id="overview-import">
         <p data-i18n-html="ov.import_body"></p>
-        <pre class="cmd">harvey import-onrc stomatologie <span class="nb">--county BV</span></pre>
+        <pre class="cmd">harvey contacts find stomatologie <span class="nb">--registry --county BV</span></pre>
         <p class="muted" data-i18n-html="ov.import_more"></p>
       </div>
     </div>
@@ -312,8 +312,10 @@
 <!-- Companies -->
 <div id="companies" class="section">
   <div class="section-head">
-    <div><h2 data-i18n="co.title">Firme</h2><p data-i18n="co.lede">Telefon și email întâi. Apasă pe un rând ca să vezi tot ce știm despre firmă.</p></div>
+    <div><h2 data-i18n="co.title">Firme</h2><p id="companies-lede" data-i18n="co.lede">Telefon și email întâi. Apasă pe un rând ca să vezi tot ce știm despre firmă.</p></div>
   </div>
+  <div class="toolbar"><div class="segmented" id="co-scopes" role="group" data-i18n-aria="co.scope_label" aria-label="Ce firme arată lista"></div></div>
+  <div id="companies-registry" hidden></div>
   <div id="companies-list"></div>
 </div>
 

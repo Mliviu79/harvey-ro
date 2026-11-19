@@ -963,6 +963,44 @@ async def _classifier(state, args) -> None:
     print()
 
 
+async def _registry_selection(state, args, *, create: bool) -> tuple[list[dict], dict]:
+    """`harvey contacts find --registry`: the firms the words, --q, --county
+    and --locality select in the trade registry (launch.find_selection, as
+    the dashboard's Find contacts reads a registry selection). With
+    ``create`` False nothing is written (the estimate, and --dry-run); with
+    it the firms with no record get one, and what the selection holds is
+    printed. Returns (the companies the run takes, the selection's counts:
+    launch.registry_selection's); exits when the selection is refused."""
+    from harvey import launch
+
+    if args.website or args.require or args.exclude:
+        print("\n  --website, --require and --exclude read what Harvey holds of a company; "
+              "a registry selection takes words, --q, --county and --locality.\n")
+        raise SystemExit(2)
+    body = {"registry": {"words": " ".join([*args.words, args.q]).strip(),
+                         "county": args.county, "locality": args.locality},
+            "force": args.force, "limit": 200 if args.limit is None else args.limit}
+    selected, error = await launch.find_selection(state, body, create=create)
+    if error:
+        print(f"\n  {error}\n")
+        raise SystemExit(2)
+    got = body["_registry"]
+    if create or args.dry_run:
+        making = got.get("created", got.get("to_create", 0))
+        print(f"\n  Registry: {got['selected']:,} firm{'' if got['selected'] == 1 else 's'} "
+              f"match, {got['existing']:,} with a record in Harvey; {making:,} "
+              + ("got one now" if create else "would get one now")
+              + (f", {got['left']:,} left for a later run (--limit)" if got["left"] else ""))
+        left_out = [f"{got[k]:,} {what}" for k, what in (
+            ("excluded", "on the do-not-contact list"),
+            ("unkeyable", "with a CUI Harvey can't key by")) if got.get(k)]
+        if left_out:
+            print(f"  Left out: {', '.join(left_out)}")
+    if args.dry_run and got.get("to_create"):
+        print(f"  Note: {launch.REGISTRY_NOTE}.")
+    return selected, got
+
+
 def cmd_contacts(args):
     """The contact finder: every company with no contact is a record to
     search (harvey/finder.py). Writes and sends nothing but contacts."""
@@ -999,9 +1037,29 @@ def cmd_contacts(args):
         exclude = [c.strip().upper() for c in args.exclude.split(",") if c.strip()]
         if require or exclude:
             f.signals = (tuple(require), tuple(exclude))
-        selected = await finder.select(state, f, force=args.force,
-                                       limit=200 if args.limit is None else args.limit)
-        if not selected:
+        new: list[str] = []
+        from_registry = args.from_registry
+        only_counts = from_registry and args.dry_run
+        making = 0
+        if args.words and not from_registry:
+            print("\n  Words select firms in the trade registry: add --registry, or use --q to "
+                  "search the companies on file.\n")
+            raise SystemExit(2)
+        if from_registry:
+            if args.limit is not None and args.limit < 1:
+                print("\n  --limit must be 1 or more.\n")
+                raise SystemExit(2)
+            # Every estimate first, with nothing written: the records are
+            # made just before the run is queued.
+            selected, got = await _registry_selection(state, args, create=False)
+            making = got["to_create"]
+        else:
+            selected = await finder.select(state, f, force=args.force,
+                                           limit=200 if args.limit is None else args.limit)
+        if not selected and not making:
+            if only_counts:
+                print("  Dry run: nothing was written or queued.\n")
+                return
             print("\n  Nothing to search: every company that matches has a contact "
                   "already (--force searches them again).\n")
             return
@@ -1038,13 +1096,31 @@ def cmd_contacts(args):
                   + (f" (cap: ${cap:.2f})" if cap is not None else
                      " (no cap of the run's own: --classify-max-spend)"))
             print(f"  {ce['note']}")
+        if only_counts:
+            print("  Dry run: nothing was written or queued.\n")
+            return
+        if from_registry:
+            selected, got = await _registry_selection(state, args, create=True)
+            new = got.get("new") or []
+            if not selected:
+                print("\n  Nothing to search: every firm of the selection that has a record "
+                      "has a contact already (--force searches them again).\n")
+                return
+        if new:
+            print(f"  {len(new):,} more are new from the registry and aren't in the figures "
+                  "above: each reads its declared website, when it has one, as its search "
+                  "starts.")
+        checks: dict = {}
         try:
             batch_id, ids, dupes = await enqueue_contact_search(
                 state, [c["id"] for c in selected], max_spend=args.max_spend, force=args.force,
-                classify_max_spend=cap)
+                classify_max_spend=cap, check_first=new, checks=checks)
         except jobs.Duplicate as e:
             print(f"\n  {e}\n")
             raise SystemExit(2)
+        if checks.get("jobs"):
+            print(f"  {checks['companies']:,} new firms are checked at ANAF first (free); "
+                  "each check queues their search when it is done")
         if dupes:
             print(f"  {len(dupes):,} already waiting, not queued twice")
         if args.background:
@@ -1549,6 +1625,31 @@ def cmd_registry(args):
         asyncio.run(_pull())
 
 
+def _count_whole_registry(path: Path, every_status: bool) -> None:
+    """`harvey import-onrc --dry-run` with nothing narrowing it: how many
+    firms the loaded registry holds (operating ones, or every status),
+    counted where it is. Nothing is loaded, queued or saved."""
+    from harvey import registry
+
+    try:
+        con = registry.connect(path)
+    except FileNotFoundError:
+        print(f"\n  No registry loaded at {path}. harvey registry load\n")
+        raise SystemExit(2)
+    try:
+        q = registry.Query(match=registry.EVERY, all_statuses=True) if every_status else \
+            registry.Query(match=f"tags : {registry.OPERATING_TAG}")
+        n = registry.count(con, q)
+        meta = registry.status(path) or {}
+    finally:
+        con.close()
+    print(f"\n  ONRC open data: {meta.get('dataset')} (registry as of {meta.get('date')})")
+    print(f"  {n:,} {'firms of every status' if every_status else 'operating firms'} in "
+          "all of Romania")
+    print("  Dry run: nothing was saved. They are browsable on the dashboard's Companies "
+          "page as they are.\n")
+
+
 def cmd_import_onrc(args):
     """Companies (and their administrators) from Romania's trade registry,
     by area and activity: a shortcut for harvey registry load (when the
@@ -1570,14 +1671,18 @@ def cmd_import_onrc(args):
                   "or give --codes 8623.\n")
             raise SystemExit(2)
         localities = onrc._localities(args.locality)
-        # Nothing narrowing it at all is every operating firm in Romania
-        # (about 1.8 million): fine on purpose, not by a forgotten flag.
+        # Nothing narrowing it at all is every firm in Romania: never copied
+        # (the registry is read where it is); --dry-run counts them there.
         narrowed = classes or names or localities or fin or tax
-        if not (narrowed or args.dry_run or args.whole_country):
-            print("\n  With no activity, area or filter this is every operating "
-                  "company in Romania (about 1.8 million, roughly an hour to "
-                  "import). Add --dry-run to count, or --whole-country to import "
-                  "them all.\n")
+        if not narrowed and args.dry_run:
+            _count_whole_registry(_registry_path(args), args.include_inactive)
+            return
+        if not narrowed:
+            print("\n  The whole registry isn't imported: it is already browsable on the "
+                  "dashboard's Companies page, and contacts are found from a selection "
+                  "there, or with harvey contacts find --registry. Give an activity, an "
+                  "area or a filter to import those firms, or --dry-run to count them "
+                  "all.\n")
             raise SystemExit(2)
         with_admins = args.administrators == "all"
 
@@ -4374,7 +4479,10 @@ def main():
                     "that match the filters and have no contact: their own website "
                     "first (free), then, within --max-spend, a search by name and town "
                     "for those with no website and one checked address per person "
-                    "named there. 'status' shows the backlog.")
+                    "named there. With --registry the filters select firms in the trade "
+                    "registry (harvey contacts find dentist --registry --county BV): "
+                    "nothing is copied up front, a firm gets its record when the run "
+                    "takes it. 'status' shows the backlog.")
     sub.add_argument("action", nargs="?", default="find",
                      choices=["find", "status", "rejudge", "judge-test", "verify",
                               "classifier"],
@@ -4383,7 +4491,16 @@ def main():
                           "classifier over a labelled set), verify (ask the classifier "
                           "about contacts: yes, no or unsure) or classifier (its profiles; "
                           "classifier use TASK PROFILE)")
-    sub.add_argument("words", nargs="*", help=argparse.SUPPRESS)
+    sub.add_argument("words", nargs="*",
+                     help="find --registry: what the firms do or are called, as harvey "
+                          "registry search reads it (dentist, 8623), right after find; "
+                          "classifier use: TASK PROFILE")
+    sub.add_argument("--registry", dest="from_registry", action="store_true",
+                     help="find: start from the trade registry instead of the companies on "
+                          "file. The words, --q, --county and --locality select registry "
+                          "firms (at least one is needed); those with no record in Harvey "
+                          "get one now, --limit at most, and are searched with the rest of "
+                          "the selection. --dry-run counts and writes nothing")
     sub.add_argument("--county", default="", help="Only companies in this county")
     sub.add_argument("--locality", default="", help="Only companies in this town")
     sub.add_argument("--website", default="", choices=["", "yes", "no"],
@@ -4414,7 +4531,8 @@ def main():
                      help="Search again companies already searched (each search is "
                           "kept; the company drawer shows where and when)")
     sub.add_argument("--dry-run", action="store_true",
-                     help="rejudge: count only (the default); verify: count and price only")
+                     help="rejudge: count only (the default); verify: count and price only; "
+                          "find --registry: count and estimate only")
     sub.add_argument("--run", action="store_true",
                      help="rejudge: check them (one firm per job on a lane of its own)")
     sub.add_argument("--undo", default="", metavar="BATCH",
@@ -4627,10 +4745,12 @@ def main():
                      help="Also companies that aren't operating (struck off, insolvent...)")
     sub.add_argument("--dry-run", action="store_true",
                      help="Count what would be imported (the registry is still "
-                          "loaded); save nothing")
+                          "loaded); save nothing. With no activity, area or filter: count "
+                          "the loaded registry's firms where it is")
     sub.add_argument("--whole-country", action="store_true",
-                     help="Import every operating company in Romania when no "
-                          "activity, area or filter is given")
+                     help="Refused: the whole registry is never imported (it is browsable "
+                          "on the Companies page as it is; harvey contacts find --registry "
+                          "finds contacts from a selection)")
     sub.add_argument("--data-dir", default="",
                      help="Where the dataset files are kept (default: data/onrc)")
     sub.add_argument("--administrators", choices=("all", "none"), default="all",

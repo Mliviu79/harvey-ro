@@ -213,7 +213,11 @@ def _country(text: str) -> bool:
 
 # ── Searches: where a record was already searched ──
 
-SEARCH_OUTCOMES = ("found", "nothing", "error")
+# "skipped": a search left out on purpose (the contact finder's, for a firm
+# whose declared website is on the do-not-contact list): it counts as done,
+# so the background doesn't offer the firm again, but isn't Harvey's work
+# on the firm (overlay.store.Store._registry_due).
+SEARCH_OUTCOMES = ("found", "nothing", "error", "skipped")
 
 
 def _utc(moment: datetime) -> str:
