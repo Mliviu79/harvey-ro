@@ -109,7 +109,6 @@
     <div class="nav-group">
       <button class="active" data-tab="overview" onclick="showTab('overview', this)"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg><span class="label" data-i18n="nav.overview">Prezentare</span></button>
       <button data-tab="companies" onclick="showTab('companies', this)"><svg class="icon" aria-hidden="true"><use href="#i-companies"/></svg><span class="label" data-i18n="nav.companies">Firme</span><span class="nav-count soft" id="nav-companies"></span></button>
-      <button data-tab="registry" onclick="showTab('registry', this)"><svg class="icon" aria-hidden="true"><use href="#i-registry"/></svg><span class="label" data-i18n="nav.registry">Registru</span></button>
       <button data-tab="prospects" onclick="showTab('prospects', this)"><svg class="icon" aria-hidden="true"><use href="#i-contacts"/></svg><span class="label" data-i18n="nav.contacts">Contacte</span></button>
       <button data-tab="discover" onclick="showTab('discover', this)"><svg class="icon" aria-hidden="true"><use href="#i-discover"/></svg><span class="label" data-i18n="nav.discover">Descoperă</span></button>
       <button data-tab="modules" onclick="showTab('modules', this)"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg><span class="label" data-i18n="nav.modules">Surse</span></button>
@@ -258,7 +257,6 @@
 
   <div class="subhead" data-i18n="disc.sources">Surse</div>
   <div id="discover-providers"></div>
-  <div id="discover-filters"></div>
 
   <div class="subhead needs-data" data-i18n="disc.run">Căutare</div>
   <div class="card needs-data">
@@ -317,14 +315,6 @@
   <div class="toolbar"><div class="segmented" id="co-scopes" role="group" data-i18n-aria="co.scope_label" aria-label="Ce firme arată lista"></div></div>
   <div id="companies-registry" hidden></div>
   <div id="companies-list"></div>
-</div>
-
-<!-- The trade registry, with its financials -->
-<div id="registry" class="section">
-  <div class="section-head">
-    <div><h2 data-i18n="rg.title">Registrul comerțului</h2><p data-i18n="rg.lede">Toate firmele din registrul ONRC, cu ultimele situații financiare. Bifează firme sau filtrează și adu-le în Harvey.</p></div>
-  </div>
-  <div id="registry-list"></div>
 </div>
 
 <!-- Contacts -->

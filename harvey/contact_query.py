@@ -119,8 +119,8 @@ def search_arg(raw: str) -> tuple[str, str, bool]:
 
 
 def county_arg(raw: str) -> str:
-    """The county as the registry spells it, from any spelling the pull
-    takes ("BV", "brasov", "județul Brașov"); "" for none. ValueError for
+    """The county as the registry spells it, from any spelling a
+    selection takes ("BV", "brasov", "județul Brașov"); "" for none. ValueError for
     an unknown one: dropped, it would match the whole country."""
     if not raw:
         return ""

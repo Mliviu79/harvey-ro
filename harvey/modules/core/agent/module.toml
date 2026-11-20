@@ -2,7 +2,7 @@
 # (harvey/agent/: an MCP server) and answers in the dashboard's chat. It
 # runs on your Claude plan, inside Harvey's share of it
 # (usage.max_daily_claude_percent): one live Claude process per chat. It
-# queues runs (Discover, a registry pull, Find contacts, Verify contacts)
+# queues runs (Discover, Find contacts, from the registry too, Verify contacts)
 # only under a plan the user approved, within its budget, through the
 # pages' own code; Harvey wakes it under that plan (a job on this module's
 # lane) when a run finishes, at a time it scheduled, or when one of the

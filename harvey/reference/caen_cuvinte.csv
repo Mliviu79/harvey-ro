@@ -1,7 +1,7 @@
 # Cuvinte uzuale pentru clasele CAEN: ce scrie lumea când caută o firmă
 # ("brutărie", "service auto", "avocat") acolo unde denumirea oficială spune
 # altfel. Everyday Romanian words per CAEN class, read by harvey/caen.py for
-# the company search, `harvey caen` and import-onrc. version: 2 = CAEN Rev.2,
+# the company search, `harvey caen` and the registry search. version: 2 = CAEN Rev.2,
 # 3 = CAEN Rev.3. Words are separated by ";". Add words freely: each one
 # should make someone who types it expect companies of that class.
 code,version,cuvinte

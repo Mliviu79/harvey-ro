@@ -291,7 +291,7 @@ class Actions:
         """(the ids an action takes, how many were followed to the firm they
         were merged into, how many were skipped): a firm id to its live
         firm (each once), a contact id while it is on file, a registration
-        number as kept (the registry pull resolves it). In pieces of
+        number as kept (the registry selection resolves it). In pieces of
         SET_CHUNK, each one JSON array."""
         if of == "registry":
             return list(members), 0, 0
@@ -331,9 +331,9 @@ class Actions:
             return {"filter": args}
         s = await self._set(set_id)
         if s["kind"] == "filter" and takes == "registry":
-            raise readonly.Refused("a registry pull takes the registry's filters or a "
-                                   "set of registration numbers (of='registry'), not a "
-                                   "Contacts filter")
+            raise readonly.Refused("a registry selection is the registry's own filters "
+                                   "(registry=...) or a set of registration numbers "
+                                   "(of='registry'), not a Contacts filter")
         if s["of"] != takes:
             hint = (" (save_set with the filter and of='contacts' keeps the contacts it "
                     "selects)" if s["kind"] == "filter" else "")
@@ -382,19 +382,25 @@ class Actions:
             except plans.Refused as e:
                 raise readonly.Refused(str(e)) from None
             try:
-                batch_id, ids, dupes = await queue(state)
+                batch_id, ids, dupes, *more = await queue(state)
             except jobs.Duplicate as e:
                 why = (f"the same work is already waiting (job {e.job.id}, {e.job.status}): "
                        "follow it with plan_status or jobs()")
                 await plans.settle(state, action, plans.REFUSED, why=why)
                 raise readonly.Refused(why) from None
+            except readonly.Refused as e:
+                await plans.settle(state, action, plans.REFUSED, why=str(e))
+                raise
             except Exception as e:
                 await plans.settle(state, action, plans.ERROR, why=type(e).__name__)
                 raise
-            await plans.settle(state, action, plans.OK if ids else plans.NOTHING, batch=batch_id)
+            # (A run can hold work besides the jobs it counts: a registry
+            # selection's ANAF checks, which queue its searches later.)
+            ran = bool(ids) or bool(more and more[0])
+            await plans.settle(state, action, plans.OK if ran else plans.NOTHING, batch=batch_id)
             # (The user may have cancelled the plan while this run was being
             # queued: the cancel couldn't see its batch yet, so it goes now.)
-            if ids and (await plans.get(state, plan))["status"] == plans.CANCELLED:
+            if ran and (await plans.get(state, plan))["status"] == plans.CANCELLED:
                 await plans.cancel_run(state, batch_id)
                 raise readonly.Refused(f"plan {plan} was cancelled meanwhile: its run is "
                                        "cancelled too")
@@ -438,48 +444,10 @@ class Actions:
                 raise readonly.Refused("name the sources (estimate's discover lists them)")
             for k in keys:
                 if k not in PROVIDERS:
-                    raise readonly.Refused(f"{k} isn't a search source: the registry is "
-                                           "registry_pull")
+                    raise readonly.Refused(f"{k} isn't a search source: firms are taken "
+                                           "from the registry by find_contacts(registry=...)")
             return await self._discovery(state, body)
         return await self._act(turn, "discover", arguments, plan, prepare)
-
-    async def registry_pull(self, turn: str, plan, filters=None, set=None,
-                            websites_max_spend=0.0, classify_max_spend=0.0) -> dict:
-        """A registry pull, as the Registry page and the Discover tab queue
-        it: by the registry source's filters, or a set of registration
-        numbers (a SELECT set of='registry')."""
-        from harvey.modules.job_kinds import REGS_MAX, discover_sources
-
-        arguments = {"filters": filters or {}, "set": set,
-                     "websites_max_spend": websites_max_spend,
-                     "classify_max_spend": classify_max_spend}
-        taken: dict = {}
-
-        async def prepare(state):
-            source = next((s["key"] for s in discover_sources() if s["job"] == "registry_pull"),
-                          None)
-            if source is None:
-                raise readonly.Refused("no registry source is installed")
-            if set not in (None, ""):
-                if filters:
-                    raise readonly.Refused("give the registry's filters or a set, not both")
-                chosen = await self._resolve(set, None, "registry", REGS_MAX)
-                taken.update(chosen["set"])
-                f = {"regs": [str(r) for r in chosen["ids"]]}
-                if not f["regs"]:
-                    return {"plan": int(plan), "queued": 0, "set": chosen["set"],
-                            "note": "the set holds no registration number"}
-            elif isinstance(filters, dict) and filters:
-                f = dict(filters)
-                f.pop("regs", None)
-            else:
-                raise readonly.Refused("give the registry's filters (words, county, "
-                                       "locality, ...) or a set of registration numbers")
-            body = {"providers": [source], "filters": {source: f}, "max_spend": 0,
-                    "find_websites": True, "websites_max_spend": websites_max_spend,
-                    "classify_max_spend": classify_max_spend}
-            return await self._discovery(state, body)
-        return _with_set(await self._act(turn, "registry_pull", arguments, plan, prepare), taken)
 
     async def _discovery(self, state, body: dict):
         """The Discover run's request read as /api/discover/run reads it
@@ -528,41 +496,100 @@ class Actions:
         return (max_spend + (websites or 0.0), classify_cap), estimate, queue
 
     async def find_contacts(self, turn: str, plan, set=None, filter=None, max_spend=0.0,
-                            classify_max_spend=0.0, force: bool = False, limit=None) -> dict:
-        """A Find-contacts run, as POST /api/contacts/find queues it."""
+                            classify_max_spend=0.0, force: bool = False, limit=None,
+                            registry=None) -> dict:
+        """A Find-contacts run, as POST /api/contacts/find queues it: over a
+        filter or a set of firms, or from the trade registry (``registry``:
+        the registry's own filters, or a set of='registry'), whose firms
+        with no record get one when the run is queued and are checked at
+        ANAF first, as the button's run does (launch.find_selection,
+        enqueue_contact_search's ``check_first``)."""
         from harvey import launch
-        from harvey.modules.job_kinds import enqueue_contact_search
+        from harvey.modules.job_kinds import REGS_MAX, enqueue_contact_search
 
         arguments = {"set": set, "filter": filter or {}, "max_spend": max_spend,
                      "classify_max_spend": classify_max_spend, "force": bool(force),
-                     "limit": limit}
+                     "limit": limit, "registry": registry or {}}
         taken: dict = {}
+        extra: dict = {}
+
+        async def registry_by():
+            """The registry selection asked for: {"regs": [...]} from a set
+            of='registry', the registry's filters, or None (firms on file)."""
+            if registry not in (None, "", {}):
+                if set not in (None, ""):
+                    raise readonly.Refused("give the registry's filters or a set, not both")
+                if filter:
+                    raise readonly.Refused("give the registry's filters or a Contacts filter, "
+                                           "not both: a firm that gets its record from the "
+                                           "registry holds nothing a Contacts filter reads")
+                if not isinstance(registry, dict):
+                    raise readonly.Refused("registry is the registry's filters (words, county, "
+                                           "locality, ...), as an object")
+                # (Chosen firms come as a set of='registry', never as a list.)
+                return {k: v for k, v in registry.items() if k != "regs"}
+            if set not in (None, "") and (await self._set(set))["of"] == "registry":
+                if filter:
+                    raise readonly.Refused("give a set or a filter, not both")
+                chosen = await self._resolve(set, None, "registry", REGS_MAX)
+                taken.update(chosen["set"])
+                return {"regs": [str(r) for r in chosen["ids"]]}
+            return None
 
         async def prepare(state):
             cap = _cap("max_spend", max_spend)
             classify_cap = _cap("classify_max_spend", classify_max_spend)
-            chosen = await self._resolve(set, filter, "firms", launch.FIND_MAX)
+            by = await registry_by()
             body = {"force": bool(force), "limit": limit}
-            if "ids" in chosen:
-                taken.update(chosen["set"])
-                body.update(filter={}, company_ids=[str(i) for i in chosen["ids"]])
+            if by is not None:
+                if "regs" in by and not by["regs"]:
+                    return {"plan": int(plan), "queued": 0, "set": dict(taken),
+                            "note": "the set holds no registration number"}
+                body["registry"] = by
             else:
-                body["filter"] = chosen["filter"]
+                chosen = await self._resolve(set, filter, "firms", launch.FIND_MAX)
+                if "ids" in chosen:
+                    taken.update(chosen["set"])
+                    body.update(filter={}, company_ids=[str(i) for i in chosen["ids"]])
+                else:
+                    body["filter"] = chosen["filter"]
+            # (An estimate: a registry selection's records are made only once
+            # the plan holds the run's caps, in queue.)
             selected, error = await launch.find_selection(state, body)
             if error:
                 raise readonly.Refused(error)
-            if not selected:
-                return {"plan": int(plan), "queued": 0, "companies": 0,
+            counts = _registry_counts(body)
+            if not selected and not (counts.get("registry") or {}).get("to_create"):
+                return {"plan": int(plan), "queued": 0, "companies": 0, **counts,
                         "note": "no company to search: each has a contact already (force "
                                 "searches them again)"}
             estimate = await launch.find_estimate(state, selected, bool(force))
 
             async def queue(state):
-                return await enqueue_contact_search(
-                    state, [c["id"] for c in selected], max_spend=cap, force=bool(force),
-                    classify_max_spend=classify_cap)
-            return (cap, classify_cap), _find_summary(estimate), queue
-        return _with_set(await self._act(turn, "find_contacts", arguments, plan, prepare), taken)
+                if by is None:
+                    batch_id, ids, dupes = await enqueue_contact_search(
+                        state, [c["id"] for c in selected], max_spend=cap,
+                        force=bool(force), classify_max_spend=classify_cap)
+                    return batch_id, ids, dupes
+                # (The selection read again, now making its records: the
+                # button's run, POST /api/contacts/find.)
+                again = {"force": bool(force), "limit": limit, "registry": by}
+                run, error = await launch.find_selection(state, again, create=True)
+                if error:
+                    raise readonly.Refused(error)
+                extra.update(_registry_counts(again))
+                if not run:
+                    return "", [], []
+                checks: dict = {}
+                batch_id, ids, dupes = await enqueue_contact_search(
+                    state, [c["id"] for c in run], max_spend=cap, force=bool(force),
+                    classify_max_spend=classify_cap,
+                    check_first=again["_registry"].get("new") or (), checks=checks)
+                extra["checks_first"] = checks
+                return batch_id, ids, dupes, checks.get("jobs")
+            return (cap, classify_cap), {**_find_summary(estimate), **counts}, queue
+        out = await self._act(turn, "find_contacts", arguments, plan, prepare)
+        return _with_set({**out, **extra} if "run" in out else out, taken)
 
     async def verify_contacts(self, turn: str, plan, set=None, filter=None, max_spend=0.0,
                               limit=None) -> dict:
@@ -883,6 +910,14 @@ def _with_set(out: dict, taken: dict) -> dict:
     if taken and "set" not in out:
         out = {**out, "set": dict(taken)}
     return out
+
+
+def _registry_counts(body: dict) -> dict:
+    """{"registry": the counts of a request's registry selection} (what
+    launch.find_selection kept on it, without the companies it made), or
+    {}: as the dashboard answers them."""
+    chosen = body.get("_registry")
+    return {"registry": {k: v for k, v in chosen.items() if k != "new"}} if chosen else {}
 
 
 def _filter_args(raw) -> dict:

@@ -44,6 +44,24 @@ attach = "reg"
 file = "registry.db"
 keyed_by = "ro.cui"
 adapter = "harvey.modules.ro.onrc.queries"
+# What a selection from it is made by: the registry's list (Companies →
+# All firms), Find contacts over it and the agent read these, each
+# filter's module (when it names one) on for it to be offered.
+label = "ONRC trade registry"
+filters = [
+    { key = "words", type = "text", label = "Activity or CAEN code (words, or 8623)" },
+    { key = "county", type = "text", label = "County (BV, Brașov; B is Bucharest)" },
+    { key = "locality", type = "text", label = "Town" },
+    { key = "status", type = "choice", options = ["operating", "all"], label = "Status (operating firms, or every registration)" },
+    { key = "min_turnover", type = "number", label = "Turnover from (lei)", module = "mf_financials" },
+    { key = "max_turnover", type = "number", label = "Turnover up to (lei)", module = "mf_financials" },
+    { key = "min_employees", type = "number", label = "Employees from", module = "mf_financials" },
+    { key = "max_employees", type = "number", label = "Employees up to", module = "mf_financials" },
+    { key = "unknown", type = "choice", options = ["exclude", "include"], label = "Firms with no figures on file", module = "mf_financials" },
+    { key = "employer", type = "yesno", label = "Employer (pays wage tax)", module = "mf_taxpayers" },
+    { key = "vat", type = "yesno", label = "VAT registered", module = "mf_taxpayers" },
+    { key = "micro", type = "yesno", label = "Micro-enterprise tax", module = "mf_taxpayers" },
+]
 
 [[register.reads]]
 code = "ACTIVITY_CODE"
@@ -75,38 +93,3 @@ op = "sync"
 inputs = []
 outputs = { records = "registry", values = ["registry"] }
 cost = { usd = 0.0, per = "dataset" }
-
-[[capabilities]]
-id = "registry_search"
-op = "query"
-inputs = [["query", "area"], ["query"], ["area"]]
-# A Discover source: ticked on the Descoperă page it queues this job in the
-# run's batch, with the filters below as its panel. The estimate is the
-# free count of the firms that match.
-discover = "registry_pull"
-label = "ONRC trade registry"
-filters = [
-    { key = "words", type = "text", label = "Activity or CAEN code (words, or 8623)" },
-    { key = "county", type = "text", label = "County (BV, Brașov; B is Bucharest)" },
-    { key = "locality", type = "text", label = "Town" },
-    { key = "status", type = "choice", options = ["operating", "all"], label = "Status (operating firms, or every registration)" },
-    { key = "min_turnover", type = "number", label = "Turnover from (lei)", module = "mf_financials" },
-    { key = "max_turnover", type = "number", label = "Turnover up to (lei)", module = "mf_financials" },
-    { key = "min_employees", type = "number", label = "Employees from", module = "mf_financials" },
-    { key = "max_employees", type = "number", label = "Employees up to", module = "mf_financials" },
-    { key = "unknown", type = "choice", options = ["exclude", "include"], label = "Firms with no figures on file", module = "mf_financials" },
-    { key = "employer", type = "yesno", label = "Employer (pays wage tax)", module = "mf_taxpayers" },
-    { key = "vat", type = "yesno", label = "VAT registered", module = "mf_taxpayers" },
-    { key = "micro", type = "yesno", label = "Micro-enterprise tax", module = "mf_taxpayers" },
-]
-outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"], values = ["dataset", "report", "codes", "collector", "run_params"] }
-cost = { usd = 0.0, per = "query" }
-
-# The same firms read straight from the downloaded files, without the
-# local registry database.
-[[capabilities]]
-id = "registry_import"
-op = "query"
-inputs = [["area"], ["query", "area"]]
-outputs = { records = "companies", ids = ["cui", "reg", "domain"], facts = ["ACTIVITY_CODE", "CONTACT_FOUND", "DECISION_MAKER_TITLE"], values = ["dataset", "report", "codes", "collector", "run_params"] }
-cost = { usd = 0.0, per = "query" }

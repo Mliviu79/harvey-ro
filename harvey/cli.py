@@ -963,10 +963,35 @@ async def _classifier(state, args) -> None:
     print()
 
 
+def _registry_filters(args) -> dict:
+    """The registry's own filters a command was given, as the All firms
+    list sends them (job_kinds.registry_params' keys): refused, before
+    anything is read, while the module a filter reads is off. Called
+    outside the event loop (_require_module runs one)."""
+    out: dict = {}
+    if getattr(args, "all_statuses", False):
+        out["status"] = "all"
+    fin = _fin_filter(args)
+    if fin is not None:
+        out.update({k: v for k, v in (("min_turnover", fin.min_turnover),
+                                      ("max_turnover", fin.max_turnover),
+                                      ("min_employees", fin.min_employees),
+                                      ("max_employees", fin.max_employees))
+                    if v is not None}, unknown=fin.unknown)
+    tax = _tax_filter(args)
+    if tax is not None:
+        out.update({k: "yes" if v else "no" for k, v in (
+            ("employer", tax.employer), ("vat", tax.vat), ("micro", tax.micro))
+            if v is not None})
+    return out
+
+
 async def _registry_selection(state, args, *, create: bool) -> tuple[list[dict], dict]:
-    """`harvey contacts find --registry`: the firms the words, --q, --county
-    and --locality select in the trade registry (launch.find_selection, as
-    the dashboard's Find contacts reads a registry selection). With
+    """`harvey contacts find --registry`: the firms the words, --q, --county,
+    --locality and the registry's own filters (--all-statuses, the
+    turnover and headcount bounds, --unknown, --employer, --vat, --micro)
+    select in the trade registry (launch.find_selection, as the dashboard's
+    Find contacts reads a registry selection). With
     ``create`` False nothing is written (the estimate, and --dry-run); with
     it the firms with no record get one, and what the selection holds is
     printed. Returns (the companies the run takes, the selection's counts:
@@ -978,7 +1003,8 @@ async def _registry_selection(state, args, *, create: bool) -> tuple[list[dict],
               "a registry selection takes words, --q, --county and --locality.\n")
         raise SystemExit(2)
     body = {"registry": {"words": " ".join([*args.words, args.q]).strip(),
-                         "county": args.county, "locality": args.locality},
+                         "county": args.county, "locality": args.locality,
+                         **getattr(args, "registry_filters", {})},
             "force": args.force, "limit": 200 if args.limit is None else args.limit}
     selected, error = await launch.find_selection(state, body, create=create)
     if error:
@@ -1044,6 +1070,20 @@ def cmd_contacts(args):
         if args.words and not from_registry:
             print("\n  Words select firms in the trade registry: add --registry, or use --q to "
                   "search the companies on file.\n")
+            raise SystemExit(2)
+        flag = lambda name: getattr(args, name, None)     # noqa: E731
+        registry_only = [shown for shown, given in (
+            ("--all-statuses", flag("all_statuses")),
+            ("--min-turnover", flag("min_turnover") is not None),
+            ("--max-turnover", flag("max_turnover") is not None),
+            ("--min-employees", flag("min_employees") is not None),
+            ("--max-employees", flag("max_employees") is not None),
+            ("--unknown", (flag("unknown_figures") or "exclude") != "exclude"),
+            ("--employer", flag("employer") is not None), ("--vat", flag("vat") is not None),
+            ("--micro", flag("micro") is not None)) if given]
+        if registry_only and not from_registry:
+            print(f"\n  {', '.join(registry_only)} select firms in the trade registry: add "
+                  "--registry.\n")
             raise SystemExit(2)
         if from_registry:
             if args.limit is not None and args.limit < 1:
@@ -1136,6 +1176,9 @@ def cmd_contacts(args):
         _job_failures(found)
         print("  See them: the dashboard's Contacts page, or harvey export --all\n")
 
+    # (Before the run: a filter whose module is off is refused here.)
+    args.registry_filters = _registry_filters(args) \
+        if getattr(args, "from_registry", False) else {}
     asyncio.run(_contacts())
 
 
@@ -1295,27 +1338,6 @@ def _print_registry_rows(total: int, rows: list[dict], words: str, offset: int,
         print()
 
 
-def _print_pull_report(report, where: str = ""):
-    if report.shared_domain:
-        print(f"  {report.shared_domain} list a website another business on file already "
-              "has: kept as separate records, possible matches to review")
-    if report.catch_all_only:
-        print(f"  {report.catch_all_only} only on the old catch-all code 8690 Rev.2, so "
-              "may be other health activities")
-    if report.excluded:
-        print(f"  {report.excluded} skipped — on your do-not-contact list")
-    verb = "would be" if report.dry_run else "are"
-    print(f"  {report.new_companies} {verb} new, {report.known_companies} already on file"
-          + ("" if report.dry_run else f" ({report.updated_companies} filled in)"))
-    print(f"  {report.administrators} administrators named")
-    if not report.dry_run:
-        print(f"  {report.activities} activities (CAEN classes) recorded, "
-              "searchable with harvey search")
-        print(f"  {report.observations} observations recorded")
-    for err in report.errors[:5]:
-        print(f"    ! {err}")
-
-
 def _amount(raw: str) -> float:
     """A number as typed: 1000000, 1.5M, 500k, 2,5M (lei or people)."""
     text = (raw or "").strip().lower().replace(" ", "").replace("_", "")
@@ -1419,85 +1441,11 @@ def _figures_line(fin: dict | None) -> str:
     return f"{fin.get('year')} ({fin.get('form')}): " + ", ".join(parts) if parts else ""
 
 
-# registry pull copies at most this many firms unless --limit says how many.
-PULL_WITHOUT_LIMIT = 10_000
-
-
-def _pull_progress(dry_run: bool):
-    verb = "checked" if dry_run else "saved"
-    return lambda done, total: print(f"  {verb} {done:,} of {total:,}...", flush=True)
-
-
-def _filter_params(flt) -> dict | None:
-    from dataclasses import asdict
-
-    return asdict(flt) if flt is not None else None
-
-
-async def _run_pull(state, args, params: dict, label: str = ""):
-    """Queue a registry pull, then wait for it (and the checks it queues
-    for the firms it saved). None when it was only queued; SystemExit when
-    it failed before saving anything."""
-    from harvey.modules import jobs
-
-    batch_id = await jobs.new_batch(state, "registry_pull", label or "Registry pull")
-    try:
-        await jobs.enqueue(state, "registry_pull", "onrc", params, module="onrc",
-                           capability="registry_search", label=label or "Registry pull",
-                           batch_id=batch_id)
-    except jobs.Duplicate as e:
-        print(f"\n  {e}\n")
-        raise SystemExit(2)
-    if getattr(args, "background", False):
-        await _queued_note(state, batch_id, 1)
-        return None
-    found = await _wait_for(state, batch_id)
-    pull = next((j for j in found if j.kind == "registry_pull"), None)
-    if pull is None or pull.status != jobs.DONE:
-        code = _job_failures(found)
-        print()
-        raise SystemExit(code or 1)
-    return found
-
-
-def _pull_report(found):
-    """The pull's report (an onrc.ImportReport) from its job's result."""
-    from harvey.collectors.onrc import ImportReport
-
-    pull = next(j for j in found if j.kind == "registry_pull")
-    data = pull.result.get("report") or {}
-    return ImportReport(**{k: v for k, v in data.items()
-                           if k in ImportReport.__dataclass_fields__})
-
-
-def _print_follow_ups(found) -> None:
-    """The checks a pull queued for the firms it saved (ANAF's), added up."""
-    from harvey.modules import jobs
-    from harvey.modules.runs import _new_check_report
-
-    checks = [j for j in found if j.kind == "id_check"]
-    for module in dict.fromkeys(j.module for j in checks):
-        total = _new_check_report(module)
-        for j in checks:
-            if j.module != module:
-                continue
-            if j.status == jobs.FAILED:
-                total["errors"].append(j.error)
-                continue
-            for key, value in j.result.items():
-                if isinstance(value, int) and not isinstance(value, bool) and key in total:
-                    total[key] += value
-            total["stopped"] = j.result.get("stopped") or total["stopped"]
-        waiting = sum(1 for j in checks if j.module == module and j.status not in jobs.FINISHED)
-        _print_check_report(total)
-        if waiting:
-            print(f"    {waiting} batch{'' if waiting == 1 else 'es'} still waiting: the worker "
-                  f"finishes {'it' if waiting == 1 else 'them'} (harvey jobs list)")
-
-
 def cmd_registry(args):
     """The whole trade registry in data/registry.db: load it once per
-    dataset, search it, pull chosen firms into Harvey. No Claude."""
+    dataset, and search it where it is. Nothing is copied into Harvey: a
+    firm gets its record when a Find-contacts run takes it (harvey
+    contacts find --registry). No Claude."""
     import json as _json
 
     from harvey import registry
@@ -1572,158 +1520,6 @@ def cmd_registry(args):
         else:
             _print_registry_rows(found["total"], found["rows"], words, args.offset,
                                  found["more"])
-        return
-
-    if action == "pull":
-        from harvey.state import StateManager
-
-        q = registry.resolve(con, words, all_statuses=args.all_statuses, fin=fin, tax=tax)
-        if not q.match:
-            print("\n  Say what to pull: words, a CAEN code, a county (BV) or a town.\n")
-            raise SystemExit(2)
-        try:
-            registry.count(con, q, 1)
-        except FileNotFoundError as e:
-            print(f"\n  {e} (the filter needs it).\n")
-            raise SystemExit(2)
-        if args.limit is None and not args.dry_run:
-            n = registry.count(con, q, PULL_WITHOUT_LIMIT + 1)
-            if n > PULL_WITHOUT_LIMIT:
-                print(f"\n  More than {PULL_WITHOUT_LIMIT:,} firms match \"{words}\". "
-                      "Narrow the words, or say how many with --limit N.\n")
-                raise SystemExit(2)
-
-        async def _pull():
-            state = StateManager()
-            await state.init_db()
-            meta = registry.status(path) or {}
-            with_admins = args.administrators == "all"
-            if with_admins and meta.get("with_administrators") != "1":
-                print("  (this registry was loaded without administrators: "
-                      "harvey registry load --force)")
-            found = await _run_pull(state, args, {
-                "path": str(path), "words": words, "all_statuses": args.all_statuses,
-                "fin": _filter_params(fin), "tax": _filter_params(tax),
-                "limit": args.limit, "with_administrators": with_admins,
-                "dry_run": args.dry_run}, label=words)
-            if found is None:
-                return
-            report = _pull_report(found)
-            print(f"\n  {report.in_area:,} firm{'' if report.in_area == 1 else 's'} "
-                  f"matching \"{words}\" from {meta.get('dataset')}"
-                  + (f" (first {args.limit:,})" if args.limit else ""))
-            _print_pull_report(report)
-            _print_follow_ups(found)
-            print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
-            if report.dry_run:
-                print("  Dry run: nothing was saved.\n")
-            elif report.errors:
-                raise SystemExit(1)
-            else:
-                print("  Next: harvey search, or harvey contacts (reads their sites)\n")
-
-        asyncio.run(_pull())
-
-
-def _count_whole_registry(path: Path, every_status: bool) -> None:
-    """`harvey import-onrc --dry-run` with nothing narrowing it: how many
-    firms the loaded registry holds (operating ones, or every status),
-    counted where it is. Nothing is loaded, queued or saved."""
-    from harvey import registry
-
-    try:
-        con = registry.connect(path)
-    except FileNotFoundError:
-        print(f"\n  No registry loaded at {path}. harvey registry load\n")
-        raise SystemExit(2)
-    try:
-        q = registry.Query(match=registry.EVERY, all_statuses=True) if every_status else \
-            registry.Query(match=f"tags : {registry.OPERATING_TAG}")
-        n = registry.count(con, q)
-        meta = registry.status(path) or {}
-    finally:
-        con.close()
-    print(f"\n  ONRC open data: {meta.get('dataset')} (registry as of {meta.get('date')})")
-    print(f"  {n:,} {'firms of every status' if every_status else 'operating firms'} in "
-          "all of Romania")
-    print("  Dry run: nothing was saved. They are browsable on the dashboard's Companies "
-          "page as they are.\n")
-
-
-def cmd_import_onrc(args):
-    """Companies (and their administrators) from Romania's trade registry,
-    by area and activity: a shortcut for harvey registry load (when the
-    latest dataset isn't loaded yet) and harvey registry pull."""
-    from harvey import registry
-    from harvey.collectors import onrc
-    from harvey.state import StateManager
-
-    async def _import():
-        try:
-            names = onrc.counties(args.county)
-        except ValueError as e:
-            print(f"\n  {e} (Brașov, Brasov, BV; Bucharest is B).\n")
-            raise SystemExit(2)
-        county = ", ".join(names) if names else "all of Romania"
-        classes = onrc.parse_classes(args.activity or [], args.codes)
-        if (args.activity or args.codes.strip()) and not classes:
-            print("\n  No CAEN class matches that activity. Try harvey caen <words>, "
-                  "or give --codes 8623.\n")
-            raise SystemExit(2)
-        localities = onrc._localities(args.locality)
-        # Nothing narrowing it at all is every firm in Romania: never copied
-        # (the registry is read where it is); --dry-run counts them there.
-        narrowed = classes or names or localities or fin or tax
-        if not narrowed and args.dry_run:
-            _count_whole_registry(_registry_path(args), args.include_inactive)
-            return
-        if not narrowed:
-            print("\n  The whole registry isn't imported: it is already browsable on the "
-                  "dashboard's Companies page, and contacts are found from a selection "
-                  "there, or with harvey contacts find --registry. Give an activity, an "
-                  "area or a filter to import those firms, or --dry-run to count them "
-                  "all.\n")
-            raise SystemExit(2)
-        with_admins = args.administrators == "all"
-
-        path = _registry_path(args)
-        state = StateManager()
-        await state.init_db()
-        where = f"{args.locality}, {county}" if args.locality else county
-        what = ", ".join(onrc.class_labels(classes)) if classes else "every activity"
-        print(f"\n  Looking for {what} in {where}"
-              f"{'' if args.include_inactive else ' (operating companies only)'}...")
-        found = await _run_pull(state, args, {
-            "path": str(path), "data_dir": str(_onrc_dir(args)), "ensure_latest": True,
-            "words": "", "classes": [list(c) for c in classes or []],
-            "counties": names or [], "localities": localities,
-            "all_statuses": args.include_inactive, "fin": _filter_params(fin),
-            "tax": _filter_params(tax), "with_administrators": with_admins,
-            "dry_run": args.dry_run, "area": where}, label=f"{what} in {where}")
-        if found is None:
-            return
-        pull = next((j for j in found if j.kind == "registry_pull"), None)
-        meta = (pull.result.get("meta") if pull else None) or registry.status(path) or {}
-        print(f"\n  ONRC open data: {meta.get('dataset')} (registry as of {meta.get('date')})")
-        if with_admins and meta.get("with_administrators") != "1":
-            print("  (this registry was loaded without administrators: "
-                  "harvey registry load --force)")
-        report = _pull_report(found)
-        print(f"  {report.in_area:,} match\n")
-        _print_pull_report(report)
-        _print_follow_ups(found)
-        print("\n  Source: ONRC open data, data.gov.ro (CC-BY 4.0)")
-        if report.dry_run:
-            print("  Dry run: nothing was saved. Re-run without --dry-run to import.\n")
-        elif report.errors:
-            raise SystemExit(1)
-        else:
-            print("  Next: harvey contacts (reads the sites of those with one)\n")
-
-    _require_module("onrc", "harvey import-onrc")
-    fin = _fin_filter(args)
-    tax = _tax_filter(args)
-    asyncio.run(_import())
 
 
 FIN_MODULE = "mf_financials"
@@ -1828,10 +1624,8 @@ def cmd_financials(args):
         checked_at, _ = source.load_catalog()
         _print_financials_status(values.get("financials") or store.status(), [], checked_at,
                                  settings)
-        print(f"  {result.get('companies', 0):,} companies on file got figures, "
-              f"{result.get('observations', 0):,} observations recorded")
-        for err in (result.get("errors") or [])[:3]:
-            print(f"    ! {err}")
+        print("  Read in place: the firms in Harvey show it now (nothing is copied into "
+              "harvey.db).")
         print()
 
     asyncio.run(_load())
@@ -2009,10 +1803,8 @@ def cmd_taxpayers(args):
         checked_at, _ = source.load_catalog()
         _print_taxpayers_status(values.get("taxpayers") or store.status(), None, checked_at,
                                 settings)
-        print(f"  {result.get('companies', 0):,} companies on file got readings, "
-              f"{result.get('observations', 0):,} observations recorded")
-        for err in (result.get("errors") or [])[:3]:
-            print(f"    ! {err}")
+        print("  Read in place: the firms in Harvey show it now (nothing is copied into "
+              "harvey.db).")
         print()
 
     asyncio.run(_load())
@@ -2037,13 +1829,13 @@ def _print_check_report(r: dict) -> None:
     from harvey.modules.runs import NOTHING_WANTED
 
     name = _module_name(r["module"])
-    print(f"  {name}: {r['companies']:,} compan{'y' if r['companies'] == 1 else 'ies'} "
-          f"with a CUI; {r['checked']:,} asked in {r['requests']:,} request"
+    print(f"  {name}: {r['cuis']:,} CUI{'' if r['cuis'] == 1 else 's'}; "
+          f"{r['checked']:,} asked in {r['requests']:,} request"
           f"{'' if r['requests'] == 1 else 's'}, {r['cached']:,} from answers kept, "
-          f"{r['not_found']:,} unknown to it" + (f", {r['invalid']:,} with an invalid CUI"
+          f"{r['not_found']:,} unknown to it" + (f", {r['invalid']:,} invalid"
                                                   if r["invalid"] else ""))
-    print(f"  {r['observations']:,} observations recorded on {r['updated']:,} companies"
-          + (f"; {r['phones_set']:,} got a phone" if r["phones_set"] else ""))
+    print("  The answers are kept in anaf.db and read from there; a firm's phone becomes "
+          "its contact when Harvey starts work for it.")
     if r["stopped"] == NOTHING_WANTED:
         print("    nothing asked: none of its signals is collected (their modules are off)")
     elif r["stopped"] == "busy":
@@ -2056,10 +1848,10 @@ def _print_check_report(r: dict) -> None:
 
 
 def cmd_anaf(args):
-    """ANAF's public web service for the companies on file: VAT and
-    e-Factura registration, fiscal inactivity, status, legal form, address
-    and phone. One request a second, 100 companies a request; answers are
-    kept for the module's cache_days. No Claude."""
+    """ANAF's public web service by CUI: VAT and e-Factura registration,
+    fiscal inactivity, status, legal form, address and phone. One request a
+    second, 100 CUIs a request; answers are kept in anaf.db for the
+    module's cache_days. No Claude."""
     from harvey.modules.ro.anaf import service
     from harvey.state import StateManager
 
@@ -2067,13 +1859,21 @@ def cmd_anaf(args):
         kept = service.status()
         print(f"\n  ANAF answers kept: {kept['answers']:,} ({kept['found']:,} known to ANAF)"
               + (f", newest {kept['latest']}" if kept["latest"] else ""))
-        print("  Check companies: harvey anaf check --missing | --all-on-file | --cui N\n")
+        print("  Check CUIs: harvey anaf check --missing | --all-on-file | --cui N\n")
         return
     _require_module(ANAF_MODULE, "harvey anaf check")
     cuis = [c for raw in args.cui or [] for c in raw.replace(",", " ").split()]
     if not cuis and not args.all_on_file and not args.missing:
-        print("\n  Say which companies: --cui N (one or more), --missing (never checked) "
-              "or --all-on-file.\n")
+        print("\n  Say which CUIs: --cui N (one or more), --missing (firms on file never "
+              "checked) or --all-on-file.\n")
+        raise SystemExit(2)
+    good = [service.clean_cui(c) for c in cuis]
+    for raw, clean in zip(cuis, good):
+        if not clean:
+            print(f"  {raw}: not a valid CUI")
+    good = [c for c in good if c]
+    if cuis and not good:
+        print()
         raise SystemExit(2)
 
     async def _check():
@@ -2083,45 +1883,47 @@ def cmd_anaf(args):
 
         state = StateManager()
         await state.init_db()
-        ids = None
         if cuis:
-            wanted = {service.clean_cui(c) or c for c in cuis}
-            rows = await state.companies_with_id("cui")
-            ids = [r["id"] for r in rows if r["value"] in wanted]
-            on_file = {r["value"] for r in rows if r["value"] in wanted}
-            for c in sorted(wanted - on_file):
-                print(f"  {c}: no company on file has this CUI (import it first)")
-            if not ids:
-                print()
-                raise SystemExit(2)
+            # By CUI: one with no record in Harvey is asked about too (its
+            # answer is kept in anaf.db, read when a record takes it).
+            selection = {"keys": sorted({int(c) for c in good})}
+        elif args.missing:
+            selection = {"missing": True}
+        else:
+            selection = {"all": True}
         batch_id = await jobs.new_batch(state, "id_check", "ANAF",
                                         params={"missing": args.missing})
-        queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", ids,
+        queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", selection,
                                                 missing_only=args.missing, batch_id=batch_id)
+        if not queued:
+            await jobs.drop_batch(state, batch_id)
         if dupes:
-            print(f"  {len(dupes)} batch{'' if len(dupes) == 1 else 'es'} of these companies "
+            print(f"  {len(dupes)} batch{'' if len(dupes) == 1 else 'es'} of these CUIs "
                   f"already queued (job {dupes[0].id}): not asked again")
+        if not queued:
+            print("  Nothing new to ask.\n" if not dupes else "")
+            return
         if args.background:
             await _queued_note(state, batch_id, len(queued))
             return
-        print("\n  Asking ANAF (one request a second, up to 100 companies each)...", flush=True)
-        found = await _wait_for(state, batch_id) if queued else []
+        print("\n  Asking ANAF (one request a second, up to 100 CUIs each)...", flush=True)
+        found = await _wait_for(state, batch_id)
         report = _new_check_report(ANAF_MODULE)
-        report["companies"] = sum(len(j.params.get("company_ids") or []) for j in found)
         for job in found:
+            report["cuis"] += len(job.params.get("cuis") or job.params.get("company_ids") or [])
             if job.status == jobs.FAILED:
                 report["errors"].append(job.error)
                 continue
             for key, value in job.result.items():
                 if isinstance(value, int) and not isinstance(value, bool) and key in report \
-                        and key != "companies":
+                        and key != "cuis":
                     report[key] += value
             report["stopped"] = job.result.get("stopped") or report["stopped"]
             if job.status == jobs.QUEUED and job.error:
                 report["stopped"] = report["stopped"] or "busy"
         _print_check_report(report)
         print(f"  Source: {_attribution(ANAF_MODULE)}\n")
-        if report["errors"] and not report["updated"] and not report["cached"]:
+        if report["errors"] and not report["checked"] and not report["cached"]:
             raise SystemExit(1)
 
     asyncio.run(_check())
@@ -3575,7 +3377,7 @@ def cmd_remove(args):
                 continue
             if not done["removed"]:
                 print(f"  {company_id}: kept, it holds {done['kept']}; "
-                      f"{done['pull_rows_removed']} register pull(s) taken off it.")
+                      f"{done['register_rows_removed']} register source(s) taken off it.")
                 continue
             extra = (f" and {done['contacts_removed']} contact(s) nothing else reaches"
                      if done["contacts_removed"] else "")
@@ -4498,9 +4300,12 @@ def main():
     sub.add_argument("--registry", dest="from_registry", action="store_true",
                      help="find: start from the trade registry instead of the companies on "
                           "file. The words, --q, --county and --locality select registry "
-                          "firms (at least one is needed); those with no record in Harvey "
-                          "get one now, --limit at most, and are searched with the rest of "
-                          "the selection. --dry-run counts and writes nothing")
+                          "firms (at least one is needed), with the registry's own filters "
+                          "below; those with no record in Harvey get one now, --limit at "
+                          "most, and are searched with the rest of the selection. --dry-run "
+                          "counts and writes nothing")
+    sub.add_argument("--all-statuses", action="store_true",
+                     help="find --registry: also firms that aren't operating")
     sub.add_argument("--county", default="", help="Only companies in this county")
     sub.add_argument("--locality", default="", help="Only companies in this town")
     sub.add_argument("--website", default="", choices=["", "yes", "no"],
@@ -4547,6 +4352,8 @@ def main():
                      help="judge-test: which task to test (default: site)")
     sub.add_argument("--checks", dest="limit_checks", type=int, default=0, metavar="N",
                      help="rejudge / judge-test: the first N only")
+    _fin_filter_args(sub)
+    _tax_filter_args(sub)
     _background_arg(sub)
     sub.set_defaults(func=cmd_contacts)
 
@@ -4576,11 +4383,13 @@ def main():
     sub = subparsers.add_parser(
         "registry",
         help="Romania's whole trade registry (ONRC open data), loaded once per dataset "
-             "into data/registry.db: load, status, search, pull",
+             "into data/registry.db: load, status, search",
         description="Loads every firm in ONRC's open data (all statuses, every "
                     "authorised CAEN class, administrators' names and roles) into a "
-                    "local database once per dataset, searches it in words, and pulls "
-                    "the firms you choose into Harvey. Free; no Claude calls.")
+                    "local database once per dataset, and searches it in words where it "
+                    "is. Nothing is copied into Harvey: harvey contacts find WORDS "
+                    "--registry finds contacts from a selection, and gives each firm it "
+                    "takes its record. Free; no Claude calls.")
     registry_sub = sub.add_subparsers(dest="registry_action", required=True)
 
     def _registry_common(p):
@@ -4614,21 +4423,6 @@ def main():
     _fin_filter_args(r)
     _tax_filter_args(r)
     _registry_common(r)
-    r = registry_sub.add_parser(
-        "pull", help="Copy the firms a search matches into Harvey (what import-onrc and Find use)")
-    r.add_argument("words", nargs="+", help="The same words as registry search")
-    r.add_argument("--limit", type=int, default=None,
-                   help="Only the first N matches (default: all, up to 10,000)")
-    r.add_argument("--administrators", choices=("all", "none"), default="all",
-                   help="all: name each firm's administrators (when CONTACT_FOUND is "
-                        "confirmed); none: leave them out")
-    r.add_argument("--all-statuses", action="store_true",
-                   help="Also firms that aren't operating")
-    r.add_argument("--dry-run", action="store_true", help="Count; save nothing")
-    _fin_filter_args(r)
-    _tax_filter_args(r)
-    _registry_common(r)
-    _background_arg(r)
     sub.set_defaults(func=cmd_registry)
 
     sub = subparsers.add_parser(
@@ -4639,9 +4433,9 @@ def main():
                     "data.gov.ro (only what is missing; kept in data/mf_financials/) "
                     "and loads the latest years into a local database: turnover, "
                     "employees, profit, equity and debts per company (CUI). Companies "
-                    "on file get the figures as signals, and registry search, pull and "
-                    "import-onrc can filter on turnover and employees before pulling "
-                    "anything. Free; no Claude calls.")
+                    "on file get the figures as signals, and registry search and "
+                    "contacts find --registry can filter on turnover and employees. "
+                    "Free; no Claude calls.")
     fin_sub = sub.add_subparsers(dest="financials_action", required=True)
     r = fin_sub.add_parser("load", help="Download what is missing and load the latest years")
     r.add_argument("--years", default="",
@@ -4697,72 +4491,26 @@ def main():
 
     sub = subparsers.add_parser(
         "anaf",
-        help="Check companies on file at ANAF's public web service (VAT, e-Factura, "
-             "inactive, status, legal form, address, phone): check, status",
-        description="Asks ANAF's free public web service about the companies on file by "
-                    "CUI: up to 100 a request, one request a second, answers kept for "
-                    "30 days (the module's cache_days). Firms a registry pull brings in "
-                    "are checked on their own while the module is on. No Claude calls.")
+        help="Check CUIs at ANAF's public web service (VAT, e-Factura, inactive, status, "
+             "legal form, address, phone): check, status",
+        description="Asks ANAF's free public web service about CUIs: up to 100 a request, "
+                    "one request a second. The answers are kept in data/anaf.db for 30 "
+                    "days (the module's cache_days) and read from there; nothing is "
+                    "copied into harvey.db, and a firm's phone becomes its contact when "
+                    "Harvey starts work for it. A Find-contacts run checks the firms it "
+                    "makes a record for first, while the module is on. No Claude calls.")
     anaf_sub = sub.add_subparsers(dest="anaf_action", required=True)
-    r = anaf_sub.add_parser("check", help="Check companies on file")
+    r = anaf_sub.add_parser("check", help="Check CUIs")
     r.add_argument("--cui", action="append", default=[],
-                   help="A company's CUI (repeat, or comma-separated); it must be on file")
+                   help="A CUI (repeat, or comma-separated); no record in Harvey needed")
     r.add_argument("--all-on-file", action="store_true",
-                   help="Every company on file with a CUI (kept answers younger than "
+                   help="Every CUI the firms in Harvey hold (kept answers younger than "
                         "cache_days are reused)")
     r.add_argument("--missing", action="store_true",
-                   help="Only companies ANAF was never asked about")
+                   help="Only the firms' CUIs ANAF was never asked about")
     _background_arg(r)
     anaf_sub.add_parser("status", help="How many ANAF answers are kept")
     sub.set_defaults(func=cmd_anaf)
-
-    sub = subparsers.add_parser(
-        "import-onrc",
-        help="Import Romanian companies by county (and optionally activity) from "
-             "the trade registry's open data (free; loads data/registry.db once per dataset)",
-        description="Finds operating companies in a county, authorised for an "
-                    "activity (CAEN class) or for any, in the local copy of ONRC's "
-                    "open data (harvey registry; loaded first when the latest dataset "
-                    "isn't), with every class each is authorised for (search "
-                    "them with harvey search) and their administrators when "
-                    "CONTACT_FOUND is confirmed. "
-                    "A company already on file keeps what it has, with its gaps "
-                    "filled, except the registered address, which the registry's "
-                    "replaces. No Claude calls, and nothing is sent.")
-    sub.add_argument("activity", nargs="*",
-                     help="What the business does, in English or Romanian, one per "
-                          "argument (dentist farmacie); quote a phrase: \"medic de familie\". "
-                          "Omit for every activity in the --county/--locality")
-    sub.add_argument("--county", default="",
-                     help="County names or codes, comma-separated: Brașov, Brasov or BV "
-                          "(Bucharest is B). Omit for the whole country")
-    sub.add_argument("--locality", default="",
-                     help="Only these towns or villages, comma-separated "
-                          "(Brașov, Săcele); works with or without --county")
-    sub.add_argument("--codes", default="",
-                     help="CAEN codes instead of (or as well as) words, e.g. 8623,8622")
-    sub.add_argument("--include-inactive", action="store_true",
-                     help="Also companies that aren't operating (struck off, insolvent...)")
-    sub.add_argument("--dry-run", action="store_true",
-                     help="Count what would be imported (the registry is still "
-                          "loaded); save nothing. With no activity, area or filter: count "
-                          "the loaded registry's firms where it is")
-    sub.add_argument("--whole-country", action="store_true",
-                     help="Refused: the whole registry is never imported (it is browsable "
-                          "on the Companies page as it is; harvey contacts find --registry "
-                          "finds contacts from a selection)")
-    sub.add_argument("--data-dir", default="",
-                     help="Where the dataset files are kept (default: data/onrc)")
-    sub.add_argument("--administrators", choices=("all", "none"), default="all",
-                     help="all: name each company's administrators (when CONTACT_FOUND "
-                          "is confirmed; the default); none: leave them out")
-    sub.add_argument("--keep-download", action="store_true",
-                     help=argparse.SUPPRESS)     # downloads are always kept now
-    sub.add_argument("--registry", default="", help=argparse.SUPPRESS)
-    _fin_filter_args(sub)
-    _tax_filter_args(sub)
-    _background_arg(sub)
-    sub.set_defaults(func=cmd_import_onrc)
 
     sub = subparsers.add_parser(
         "signals", help="The facts Harvey collects about companies, with costs and counts")
@@ -4808,10 +4556,10 @@ def main():
     sub.set_defaults(func=cmd_duplicates)
 
     sub = subparsers.add_parser(
-        "remove", help="Remove companies a register pull brought from Harvey (the register "
-                       "keeps them; a pull adds them again). One Harvey worked on stays, with "
-                       "only its pulls taken off. Refused for one in a merge or named by "
-                       "outreach")
+        "remove", help="Remove companies a register brought from Harvey (the register "
+                       "keeps them; a Find-contacts run that takes one makes its record "
+                       "again). One Harvey worked on stays, with only its register sources "
+                       "taken off. Refused for one in a merge or named by outreach")
     sub.add_argument("company_ids", nargs="+", metavar="ID", help="The companies to remove")
     sub.set_defaults(func=cmd_remove)
 

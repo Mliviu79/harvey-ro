@@ -340,50 +340,6 @@ async def test_geocode_cache(state, monkeypatch):
     check("geocode", got)
 
 
-# ── ONRC: the registry pull and the streaming import ──
-
-@pytest.mark.asyncio
-async def test_registry_pull(state, tmp_path):
-    from harvey import registry
-    from tests.test_registry import EXTRA_CAEN, EXTRA_FIRMS, EXTRA_STATUS
-    from tests.test_onrc import CAEN, DATASET, FIRMS, PEOPLE, STATUS, write
-    from harvey.collectors import onrc
-
-    folder = tmp_path / "raw"
-    folder.mkdir()
-    raw = {"caen": write(folder / onrc.FILES["caen"], CAEN + EXTRA_CAEN),
-           "status": write(folder / onrc.FILES["status"], STATUS + EXTRA_STATUS),
-           "firms": write(folder / onrc.FILES["firms"], FIRMS + EXTRA_FIRMS),
-           "people": write(folder / onrc.FILES["people"], PEOPLE)}
-    registry.build(raw, DATASET, tmp_path / "registry.db")
-    con = registry.connect(tmp_path / "registry.db")
-    pull = entry("harvey.modules.runs.registry_pull", lambda: registry.pull)
-    # On file already: one by CUI (filled), one holding a declared domain.
-    await state.add_company(Company(name="Clinica Zâmbet", cui="90000017", source="discover:osm"))
-    await state.add_company(Company(name="Alt Zâmbet", domain="zambet-exemplu.example.ro"))
-    await pull(state, con, registry.resolve(con, "dentist BV"))
-    await pull(state, con, registry.resolve(con, "8623 BV"))
-    await pull(state, con, registry.resolve(con, "8690"), with_administrators=False)
-    con.close()
-    check("registry_pull", dump(state.db_path))
-
-
-@pytest.mark.asyncio
-async def test_registry_import(state, tmp_path):
-    from harvey.collectors import onrc
-    from tests.test_onrc import CAEN, DATASET, FIRMS, PEOPLE, STATUS, write
-
-    files = {"caen": write(tmp_path / onrc.FILES["caen"], CAEN),
-             "status": write(tmp_path / onrc.FILES["status"], STATUS),
-             "firms": write(tmp_path / onrc.FILES["firms"], FIRMS),
-             "people": write(tmp_path / onrc.FILES["people"], PEOPLE)}
-    imp = entry("harvey.modules.runs.import_registry", lambda: onrc.import_registry)
-    await imp(state, files, DATASET, county="BV", classes=onrc.parse_classes("dentist"))
-    await imp(state, files, DATASET, county="BV", classes=onrc.parse_classes("fizioterapie"),
-              do_not_contact=["zambet-exemplu.example.ro"])
-    check("registry_import", dump(state.db_path))
-
-
 # ── The website reader and what reads its pages ──
 
 HOME = """<html><head><title>Brightpath Dental | Denver Dentist</title>

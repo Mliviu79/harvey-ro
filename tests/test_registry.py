@@ -1,4 +1,4 @@
-"""The whole registry in its own database (harvey/registry.py): load, search, pull.
+"""The whole registry in its own database (harvey/registry.py): load and search, in place.
 
 Built from the same tiny invented files as tests/test_onrc.py, plus a few
 rows of its own. Every company, person and number here is invented.
@@ -6,18 +6,14 @@ rows of its own. Every company, person and number here is invented.
 
 import sqlite3
 import sys
-import time
 
 import pytest
 import pytest_asyncio
 
 from harvey import registry
 from harvey.collectors import onrc
-from harvey.models import Company
-from harvey.modules import runs
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
-from tests import slim
 from tests.test_onrc import BIRTH, CAEN, CNP, DATASET, FIRMS, PEOPLE, STATUS, firm, write
 
 # A firm whose name says dentist but which isn't authorised for dentistry,
@@ -163,7 +159,7 @@ def test_the_same_with_county_names_codes_and_accents(con):
 
 def test_a_county_filter_takes_every_spelling_and_refuses_an_unknown_one(con):
     """As a filter (the Contacts and Companies pages, the registry view, the
-    agent), a county in any spelling the pull takes; an unknown one is
+    agent), a county in any spelling a selection takes; an unknown one is
     refused, never dropped (which would search the whole country)."""
     def found(counties):
         q = registry.resolve(con, classes=onrc.parse_classes("dentist"), counties=counties)
@@ -228,7 +224,7 @@ def test_rows_carry_activities_in_words_matched_first(con):
     assert CNP not in str(pfa)
 
 
-def test_explicit_filters_as_import_onrc_gives_them(con):
+def test_explicit_filters_by_class_county_and_town(con):
     q = registry.resolve(con, classes=onrc.parse_classes("kinetoterapeut"),
                          counties=["Brașov"])
     rows = registry.firm_rows(con, registry.matching_ids(con, q), q)
@@ -238,92 +234,6 @@ def test_explicit_filters_as_import_onrc_gives_them(con):
         == ["90000025"]
     q = registry.resolve(con, counties=["Cluj"])
     assert len(registry.matching_ids(con, q)) == 1
-
-
-# ── Pulling into the working database ──
-
-@pytest.mark.asyncio
-async def test_pull_saves_like_import_onrc(state, con):
-    q = registry.resolve(con, "dentist BV")
-    report = await runs.registry_pull(state, con, q)
-    assert not report.errors
-    assert (report.new_companies, report.known_companies) == (4, 0)
-    a = await state.get_company_by_cui("90000017")
-    assert a.external_id == "onrc:J08/100/2010" and a.source == "registry:onrc"
-    assert a.location == "Brașov, Romania"
-    assert a.address == "Str. Exemplului 12, 500123"
-    # What it does and who runs it are read from the registry: every class
-    # on file (the firm matched by its name alone has its own), and the
-    # administrators.
-    assert a.industry == "Specialist medical practice"
-    assert await slim.register_values(state, "ACTIVITY_CODE") == [
-        "4778/2", "8622/2", "8623/2", "8623/2", "8623/3"]
-    assert await slim.register_values(state, "CONTACT_FOUND") == [
-        "Andrei-Mihai Doi — Administrator", "Maria Testescu — Administrator"]
-    total, rows = await state.search_companies("8622")
-    assert [r["cui"] for r in rows] == ["90000017"]
-
-    again = await runs.registry_pull(state, con, q)
-    assert (again.new_companies, again.known_companies) == (0, 4)
-    assert again.observations == 0 and slim.one(state, "SELECT COUNT(*) FROM obs") == 0
-
-
-@pytest.mark.asyncio
-async def test_pull_merges_on_legal_identity_only(state, con):
-    known = await state.add_company(Company(name="Clinica Zâmbet", cui="90000017",
-                                            source="discover:osm"))
-    other = await state.add_company(Company(name="Alt Zâmbet",
-                                            domain="zambet-exemplu.example.ro"))
-    report = await runs.registry_pull(state, con, registry.resolve(con, "8623 BV"))
-    assert report.known_companies == 1 and report.new_companies == 2
-    merged = await state.get_company_by_cui("90000017")
-    # The same record, described by the registry now.
-    assert merged.id == known and merged.name == "ZÂMBET EXEMPLU SRL"
-    assert merged.domain == ""                       # another business holds it
-    assert report.shared_domain == 1
-    assert (await state.get_company_by_domain("zambet-exemplu.example.ro")).id == other
-
-
-@pytest.mark.asyncio
-async def test_pull_limit_dry_run_and_gate(state, con):
-    q = registry.resolve(con, "dentist BV")
-    dry = await runs.registry_pull(state, con, q, dry_run=True)
-    assert dry.new_companies == 4
-    with sqlite3.connect(state.db_path) as db:
-        assert db.execute("SELECT COUNT(*) FROM firm").fetchone()[0] == 0
-    report = await runs.registry_pull(state, con, q, limit=2, with_administrators=False)
-    assert report.new_companies == 2 and report.observations == 0
-
-
-@pytest.mark.asyncio
-async def test_catch_all_through_the_registry(state, con):
-    q = registry.resolve(con, classes=onrc.parse_classes("kinetoterapeut"),
-                         counties=["Brașov"])
-    report = await runs.registry_pull(state, con, q)
-    assert report.catch_all_only == 1
-    assert (await state.get_company_by_cui("90000104")).industry == "Physiotherapy"
-
-
-@pytest.mark.asyncio
-async def test_pull_is_quick_per_company(state, tmp_path):
-    # 600 invented firms: one batch-sized transaction each SAVE_BATCH, not a
-    # connection and a commit per write.
-    rows = [CAEN[0]] + [(f"J08/{i}/2020", "8623", "3") for i in range(600)]
-    status = [STATUS[0]] + [(f"J08/{i}/2020", "1048", "") for i in range(600)]
-    firms = [FIRMS[0]] + [firm(f"EXEMPLU {i} SRL", str(91000000 + i), f"J08/{i}/2020",
-                               "SRL", "Braşov", "Municipiul Braşov") for i in range(600)]
-    folder = tmp_path / "many"
-    folder.mkdir()
-    raw = {"caen": write(folder / "c.csv", rows), "status": write(folder / "s.csv", status),
-           "firms": write(folder / "f.csv", firms)}
-    path = tmp_path / "many.db"
-    registry.build(raw, DATASET, path)
-    con = registry.connect(path)
-    started = time.monotonic()
-    report = await runs.registry_pull(state, con, registry.resolve(con, "8623"))
-    per_company = (time.monotonic() - started) / 600
-    assert report.new_companies == 600
-    assert per_company < 0.010, per_company
 
 
 # ── The command line ──
@@ -373,33 +283,6 @@ def test_cli_load_uses_files_already_downloaded(monkeypatch, capsys, raw, tmp_pa
     assert "14 registrations" in out
     # Every downloaded file is still there.
     assert len(list(folder.iterdir())) == 4
-
-
-def test_cli_import_onrc_is_a_shortcut(monkeypatch, capsys, raw, db_path, tmp_path):
-    import harvey.state as state_mod
-
-    async def latest(client):
-        return DATASET
-    monkeypatch.setattr(onrc, "latest_dataset", latest)
-    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
-    out = run_cli(monkeypatch, capsys, "import-onrc", "dentist", "--county", "BV",
-                  "--dry-run", "--registry", str(db_path))
-    assert "3 match" in out and "3 would be new" in out
-
-
-@pytest.mark.parametrize("narrowing", [["--dry-run"], ["--whole-country", "--dry-run"]])
-def test_cli_import_onrc_counts_the_whole_country(monkeypatch, capsys, raw, db_path,
-                                                  tmp_path, narrowing):
-    import harvey.state as state_mod
-
-    async def latest(client):
-        return DATASET
-    monkeypatch.setattr(onrc, "latest_dataset", latest)
-    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
-    out = run_cli(monkeypatch, capsys, "import-onrc", *narrowing, "--registry", str(db_path))
-    assert "11 operating firms in all of Romania" in out and "nothing was saved" in out
-    # Counted in the registry where it is: no pull is queued, no database made.
-    assert not (tmp_path / "harvey.db").exists()
 
 
 def test_counting_stops_at_the_cap(con, monkeypatch):
@@ -488,59 +371,3 @@ def test_one_load_at_a_time(raw, db_path):
     assert registry.status(db_path)["dataset"] == newer.name
 
 
-@pytest.mark.asyncio
-async def test_a_failed_batch_takes_its_counts_with_it(state, con, monkeypatch):
-    from harvey.overlay.store import Store
-
-    def broken(self, *a, **k):
-        raise sqlite3.OperationalError("disk I/O error")
-    monkeypatch.setattr(Store, "pull", broken)
-    report = await runs.registry_pull(state, con, registry.resolve(con, "dentist BV"))
-    assert report.errors
-    assert (report.new_companies, report.administrators, report.observations) == (0, 0, 0)
-    assert slim.one(state, "SELECT COUNT(*) FROM firm") == 0
-
-
-def test_cli_pull_asks_for_a_limit_on_big_matches(monkeypatch, capsys, db_path, tmp_path):
-    import harvey.state as state_mod
-    from harvey import cli
-
-    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
-    monkeypatch.setattr(cli, "PULL_WITHOUT_LIMIT", 2)
-    with pytest.raises(SystemExit) as exit_:
-        run_cli(monkeypatch, capsys, "registry", "pull", "8623", "--registry", str(db_path))
-    assert exit_.value.code == 2
-    assert "--limit" in capsys.readouterr().out
-    out = run_cli(monkeypatch, capsys, "registry", "pull", "8623", "--dry-run",
-                  "--registry", str(db_path))
-    assert "4 would be new" in out and "saved 4" not in out
-    out = run_cli(monkeypatch, capsys, "registry", "pull", "8623", "--limit", "2",
-                  "--registry", str(db_path))
-    assert "2 are new" in out
-
-
-def test_cli_offline_uses_the_newest_download(monkeypatch, capsys, raw, tmp_path):
-    import httpx
-
-    import harvey.state as state_mod
-
-    async def offline(client):
-        raise httpx.ConnectError("no network")
-    monkeypatch.setattr(onrc, "latest_dataset", offline)
-    monkeypatch.setattr(onrc, "MIN_BYTES", {})
-    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
-    folder = tmp_path / "onrc" / DATASET.date
-    folder.mkdir(parents=True)
-    for role, path in raw.items():
-        (folder / onrc.FILES[role]).write_bytes(path.read_bytes())
-    out = run_cli(monkeypatch, capsys, "import-onrc", "dentist", "--county", "BV",
-                  "--dry-run", "--data-dir", str(tmp_path / "onrc"),
-                  "--registry", str(tmp_path / "offline.db"))
-    assert f"using {DATASET.name}, already downloaded" in out and "3 match" in out
-    # Nothing downloaded at all: a plain message, not a network traceback.
-    with pytest.raises(SystemExit) as exit_:
-        run_cli(monkeypatch, capsys, "import-onrc", "dentist", "--county", "BV",
-                "--data-dir", str(tmp_path / "empty"),
-                "--registry", str(tmp_path / "none.db"))
-    assert exit_.value.code == 2
-    assert "no complete dataset is downloaded" in capsys.readouterr().out

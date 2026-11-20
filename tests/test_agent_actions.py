@@ -395,7 +395,7 @@ def test_no_tool_can_approve_a_plan(db):
     calls = [(name, {"plan": plan_id}) for name in ("plan_status", "close_plan")]
     calls += [("find_contacts", {"plan": plan_id, "filter": {"county": "Brașov"}}),
               ("discover", {"plan": plan_id, "sources": ["osm"]}),
-              ("registry_pull", {"plan": plan_id, "filters": {"county": "BV"}}),
+              ("find_contacts", {"plan": plan_id, "registry": {"county": "BV"}}),
               ("verify_contacts", {"plan": plan_id, "filter": {"county": "Brașov"}}),
               ("cancel_run", {"plan": plan_id, "run": "x"}),
               ("query", {"sql": f"UPDATE agent_plan SET status = 'approved' WHERE id = {plan_id}"}),
@@ -444,8 +444,9 @@ def test_a_filter_set_and_a_select_set_are_resolved_server_side_and_never_return
                       ({"name": "x", "sql": "SELECT name FROM local_firm"}, "firm ids")):
         error, text = _one(db, "save_set", args)
         assert error and why in text, (args, text)
-    error, text = _one(db, "registry_pull", {"plan": plan_id, "set": s["set"]})
-    assert error and "set of registry" in text
+    error, text = _one(db, "find_contacts", {"plan": plan_id, "set": s["set"],
+                                             "registry": {"county": "BV"}})
+    assert error and "not both" in text
 
 
 def _seed_firm(db, name, place="Brașov, Brașov, Romania") -> str:
@@ -724,19 +725,6 @@ def test_an_action_queues_what_the_dashboards_endpoint_queues(db, client):
     assert _jobs_of(db, out["run"]) == _jobs_of(db, page)
     assert _batch(db, out["run"]) == _batch(db, page)
     assert out["caps"] == {"max_spend": 0.1, "classify_max_spend": 0.0}
-    # A registry pull, as the Registry page sends it.
-    filters = {"words": "stomatologie", "county": "BV"}
-    r = client.post("/api/discover/run", json={
-        "providers": ["onrc.registry_search"], "filters": {"onrc.registry_search": filters},
-        "max_spend": 0, "find_websites": True, "websites_max_spend": 0,
-        "classify_max_spend": 0})
-    assert r.status_code == 200, r.text
-    page = r.json()["batch_id"]
-    _cancel_all(db)
-    error, out = _one(db, "registry_pull", {"plan": plan_id, "filters": filters})
-    assert not error, out
-    assert _jobs_of(db, out["run"]) == _jobs_of(db, page)
-    assert _batch(db, out["run"]) == _batch(db, page)
 
 
 def test_a_module_off_or_a_bad_filter_is_refused_and_recorded(db, monkeypatch):
@@ -747,7 +735,7 @@ def test_a_module_off_or_a_bad_filter_is_refused_and_recorded(db, monkeypatch):
     error, text = _one(db, "find_contacts", {"plan": plan_id, "filter": {"county": "Atlantis"}})
     assert error
     error, text = _one(db, "discover", {"plan": plan_id, "sources": ["onrc.registry_search"]})
-    assert error and "registry_pull" in text
+    assert error and "find_contacts(registry=" in text
 
     async def off(state):
         return set()
@@ -815,7 +803,7 @@ def test_actions_write_only_plans_sets_actions_and_the_runs_they_queue(db):
     _call(db, [("save_set", {"name": "Brașov", "filter": {"county": "Brașov"}}),
                ("find_contacts", {"plan": plan_id, "set": 1, "max_spend": 0.1}),
                ("discover", {"plan": plan_id, "sources": ["osm"], "phrases": ["dentist"]}),
-               ("registry_pull", {"plan": plan_id, "filters": {"county": "BV"}}),
+               ("find_contacts", {"plan": plan_id, "registry": {"county": "BV"}}),
                ("query", {"sql": "SELECT COUNT(*) FROM firm"})])
     after = _counts(db)
     changed = {t for t in after if after[t] != before.get(t)}

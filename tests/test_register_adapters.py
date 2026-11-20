@@ -71,6 +71,53 @@ def test_bad_register_declarations_are_refused(tmp_path, bad, said):
     assert said in str(e.value)
 
 
+_FILTERED = '[register]\nattach = "x"\nfile = "x.db"\nkeyed_by = "example.id"\n' \
+    'adapter = "harvey.x"\nlabel = "Example register"\n'
+
+
+def test_a_register_declares_the_filters_firms_are_selected_by(tmp_path):
+    m = _manifest(tmp_path, "example_filters", REGISTER.replace(
+        'adapter = "harvey.modules.ro.mf_financials.queries"\n',
+        'adapter = "harvey.modules.ro.mf_financials.queries"\nlabel = "Example register"\n'
+        'filters = [{ key = "words", type = "text", label = "Words" },\n'
+        '  { key = "status", type = "choice", options = ["open", "all"], label = "Status" },\n'
+        '  { key = "big", type = "yesno", label = "Big", module = "example_other" }]\n'))
+    assert m.register["label"] == "Example register"
+    assert [f["key"] for f in m.register["filters"]] == ["words", "status", "big"]
+    assert m.register["filters"][2]["module"] == "example_other"
+    # One with no filters declares none.
+    assert _manifest(tmp_path, "example_plain", REGISTER).register["filters"] == ()
+
+
+@pytest.mark.parametrize("filters, said", [
+    ('filters = "words"\n', "filters must be an array of tables"),
+    ('filters = [{ type = "text" }]\n', "needs a key"),
+    ('filters = [{ key = "a", type = "date" }]\n', "type must be one of"),
+    ('filters = [{ key = "a", type = "choice" }]\n', "needs its options"),
+    ('filters = [{ key = "a", type = "text" }, { key = "a", type = "text" }]\n',
+     "declared twice"),
+    ('filters = [{ key = "a", type = "text", module = "Not An Id" }]\n', "module must be"),
+    ('filters = [{ key = "a", type = "text", where = "x" }]\n', "unknown keys: where"),
+])
+def test_bad_register_filters_are_refused(tmp_path, filters, said):
+    with pytest.raises(ManifestError) as e:
+        _manifest(tmp_path, "example_bad", _FILTERED + filters)
+    assert said in str(e.value)
+
+
+def test_the_registry_source_is_read_from_the_onrc_register():
+    from harvey.modules.job_kinds import registry_source
+
+    every = registry_source()
+    assert every["key"] == "onrc.registry" and every["module"] == "onrc" and every["enabled"]
+    keys = [f["key"] for f in every["filters"]]
+    assert keys[:4] == ["words", "county", "locality", "status"] and "micro" in keys
+    # A filter reading another module's data is offered only while it is on.
+    bare = registry_source({"onrc"})
+    assert [f["key"] for f in bare["filters"]] == keys[:4]
+    assert registry_source({"mf_financials"})["enabled"] is False
+
+
 def test_cross_check_wants_declared_schemes_signals_and_one_alias(tmp_path):
     a = _manifest(tmp_path, "example_a", REGISTER)
     b = _manifest(tmp_path, "example_b", REGISTER.replace("[[signals]]\ncode = \"EXAMPLE_SIGNAL\"\n"

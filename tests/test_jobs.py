@@ -1098,40 +1098,44 @@ async def test_a_worker_that_lost_its_job_writes_nothing(state, kinds):
 
 
 @pytest.mark.asyncio
-async def test_a_registry_pull_job_doesnt_freeze_the_event_loop(state, tmp_path):
-    from harvey import registry
-    from tests.test_onrc import CAEN, DATASET, FIRMS, STATUS, firm, write
+async def test_a_retired_kind_of_job_is_cancelled_with_its_code_and_never_run(state, kinds):
+    """A registry_pull row an earlier release left: cancelled with the code
+    'retired' when a full worker starts (queued or paused), never failed;
+    retry and resume refuse it; the lane goes on with its other jobs."""
+    queued = await jobs.enqueue(state, "registry_pull", "onrc", {"words": "8623"})
+    paused = await jobs.enqueue(state, "registry_pull", "onrc", {"words": "8690"})
+    await jobs.pause(state, paused)
+    ran = []
 
-    n = 20000
-    caen = [CAEN[0]] + [(f"J08/{i}/2020", "8623", "3") for i in range(n)]
-    status = [STATUS[0]] + [(f"J08/{i}/2020", "1048", "") for i in range(n)]
-    firms = [FIRMS[0]] + [firm(f"EXEMPLU {i} SRL", str(91000000 + i), f"J08/{i}/2020",
-                               "SRL", "Braşov", "Municipiul Braşov") for i in range(n)]
-    folder = tmp_path / "many"
-    folder.mkdir()
-    raw = {"caen": write(folder / "c.csv", caen), "status": write(folder / "s.csv", status),
-           "firms": write(folder / "f.csv", firms)}
-    path = tmp_path / "many.db"
-    registry.build(raw, DATASET, path)
-    await jobs.enqueue(state, "registry_pull", "onrc", {
-        "path": str(path), "words": "8623", "with_administrators": False, "dry_run": True})
-    gaps: list[float] = []
+    async def other(ctx):
+        ran.append(ctx.id)
+        return {}
 
-    async def ticker(stop):
-        last = time.monotonic()
-        while not stop.is_set():
-            await asyncio.sleep(0.05)
-            now = time.monotonic()
-            gaps.append(now - last)
-            last = now
+    kinds("other_onrc", other)
+    after = await jobs.enqueue(state, "other_onrc", "onrc")
+    await run_until_idle(state)
+    assert ran == [after]
+    assert rows(state, "SELECT id, status, error FROM jobs WHERE kind = 'registry_pull' "
+                       "ORDER BY id") == sorted([(queued, "cancelled", "retired"),
+                                                 (paused, "cancelled", "retired")])
+    for act in (jobs.retry, jobs.resume):
+        with pytest.raises(jobs.Refused) as refused:
+            await act(state, queued)
+        assert refused.value.code == "retired"
+    assert rows(state, "SELECT status FROM jobs WHERE id = ?", queued) == [("cancelled",)]
 
-    stop = asyncio.Event()
-    tick = asyncio.create_task(ticker(stop))
-    await run_until_idle(state, timeout=300)
-    stop.set()
-    await tick
-    assert rows(state, "SELECT status FROM jobs") == [("done",)]
-    assert max(gaps) < 0.5, f"the event loop stalled {max(gaps):.2f}s"
+
+@pytest.mark.asyncio
+async def test_a_retired_job_claimed_after_the_worker_started_ends_cancelled(state):
+    """One queued after the worker's start (or swept back from running): the
+    worker finishes it cancelled with its code before looking for code to
+    run it, and doesn't crash."""
+    job_id = await jobs.enqueue(state, "registry_pull", "onrc", {"words": "8623"})
+    job = await jobs.claim(state, "onrc", "w")
+    assert job is not None and job.id == job_id
+    await Worker(state, name="w", poll=0.05).run_job(job)
+    assert rows(state, "SELECT status, error FROM jobs WHERE id = ?", job_id) == [
+        ("cancelled", "retired")]
 
 
 @pytest.mark.asyncio
@@ -1177,19 +1181,19 @@ async def test_a_commands_worker_doesnt_hold_back_other_lanes(state, kinds):
     ran: list[str] = []
     release = asyncio.Event()
 
-    async def long_pull(ctx):
+    async def long_load(ctx):
         await release.wait()
-        ran.append("pull")
+        ran.append("load")
         return {}
 
     async def site(ctx):
         ran.append("site")
         return {}
 
-    kinds("long_pull", long_pull)
+    kinds("long_load", long_load)
     kinds("site", site)
-    batch = await jobs.new_batch(state, "registry_pull")
-    await jobs.enqueue(state, "long_pull", "onrc", batch_id=batch)
+    batch = await jobs.new_batch(state, "source_sync")
+    await jobs.enqueue(state, "long_load", "onrc", batch_id=batch)
     await jobs.enqueue(state, "site", "website")          # queued from the dashboard
     cli = Worker(state, name="cli", batch_ids={batch}, wait_for_lease=False, poll=0.05)
     dash = Worker(state, name="dashboard", poll=0.05)
@@ -1201,16 +1205,16 @@ async def test_a_commands_worker_doesnt_hold_back_other_lanes(state, kinds):
         await asyncio.sleep(0.05)
         if "site" in ran:
             break
-    assert ran == ["site"], "the website lane waited for an unrelated registry pull"
+    assert ran == ["site"], "the website lane waited for an unrelated registry load"
     release.set()
     for _ in range(60):
         await asyncio.sleep(0.05)
-        if "pull" in ran:
+        if "load" in ran:
             break
     s1.set()
     s2.set()
     await asyncio.wait_for(asyncio.gather(t1, t2), 15)
-    assert ran == ["site", "pull"]
+    assert ran == ["site", "load"]
     assert rows(state, "SELECT status, worker FROM jobs") == [("done", ""), ("done", "")]
 
 
@@ -1425,7 +1429,10 @@ def test_the_queue_page_under_node():
              {"lane": "osm", "name": "OpenStreetMap", "paused": "", "counts": {},
               "running": [{"id": "j2", "kind": "discover", "status": "running",
                            "stoppable": True, "progress": {}, "label": "dentist"}],
-              "waiting": [], "paused_jobs": [], "done": [], "failed": []}]
+              "waiting": [], "paused_jobs": [], "done": [],
+              # (A kind of job an earlier release ran, cancelled as retired.)
+              "failed": [{"id": "j3", "kind": "registry_pull", "status": "cancelled",
+                          "error": "retired", "progress": {}, "label": "8623"}]}]
     script = (
         f"require('vm').runInThisContext(require('fs').readFileSync({json.dumps(str(web / 'i18n.js'))}, 'utf8'));"
         f"require('vm').runInThisContext({json.dumps(tone + chr(10) + chr(10).join(parts))});"
@@ -1448,6 +1455,8 @@ def test_the_queue_page_under_node():
     assert "Cititorul de site" in website and "jobAction(" not in website
     assert "jobAction(&quot;j2&quot;,&quot;cancel&quot;)" in osm
     assert "jobAction(&quot;j2&quot;,&quot;pause&quot;)" in osm
+    assert "retrasă: firmele se iau din registru cu Găsește contacte" in osm
+    assert "jobAction(&quot;j3&quot;" not in osm               # never retried
     assert out["head"] == "TYPED"                       # left alone while edited
     assert 'id="queue-cap"' in out["head2"]               # refreshed once it isn't
     assert out["dup"].startswith("Aceeași lucrare așteaptă deja") and "dentist" in out["dup"]
@@ -1490,6 +1499,8 @@ def test_every_job_kind_and_run_stage_is_named_in_both_languages():
     for path in (root / "harvey").rglob("*.py"):
         src = path.read_text(encoding="utf-8")
         stages |= set(re.findall(r"(?:start_run|lane_run)\(\s*\"([a-z_]+)\"", src))
-    assert {"discover", "profile", "contacts", "lookup"} <= stages
+    assert {"discover", "profile", "contacts"} <= stages
+    # (Lookups by identifier no longer log a run; older runs still show it.)
+    stages.add("lookup")
     for key in [f"q.kind.{k}" for k in jobs.KINDS] + [f"runs.stage.{s}" for s in stages]:
         assert text.count(f"'{key}':") == 2, key

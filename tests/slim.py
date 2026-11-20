@@ -124,25 +124,64 @@ def firm(name, cui, town="Brașov", address="", website="", domain="", county=""
                      domain=domain, registered="2010-01-01")
 
 
-async def pull(state, *firms, dataset, codes=None, people=(), saved=None):
-    """A registry pull of ``firms`` as the onrc module saves one, with the
-    registry beside the database holding every firm pulled so far (where
-    the pulled firms' names and places are read)."""
-    from harvey.collectors import onrc
-    from harvey.modules import runs
+class Seeded(dict):
+    """What seed() did: {"created", "existing": the firms that had a record
+    already, "taken": firms that took their registry entry now,
+    "shared_domain": of those, how many declare a domain another firm
+    holds, "merged": how many were merged into a firm another source
+    brought, "ids": {registration number: the live company id}}."""
 
-    held = getattr(state, "_registry_firms", {})
-    held.update({f.reg: f for f in firms})
-    state._registry_firms = held
-    state._registry_people = list(getattr(state, "_registry_people", [])) + list(people)
-    registry_of(state, list(held.values()), dataset, codes=codes, people=state._registry_people)
-    report = onrc.ImportReport(dataset=dataset.name)
-    draft = onrc.firms_draft(list(firms), dataset, codes={f.reg: [("8623", 3)] for f in firms},
-                             classes=[("8623", None)]).stamp("onrc", "registry_search")
-    draft.values.update(codes=("ACTIVITY_CODE",), collector=onrc.COLLECTOR)
-    await runs.save_source_draft(state, draft, report, module="onrc", saved_ids=saved)
-    assert not report.errors, report.errors
-    return report
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+async def seed(state, *firms, dataset=None, codes=None, people=(), run_id="seed"):
+    """Registry firms brought into Harvey the way work starts on them: the
+    registry beside the database describes ``firms`` (every firm described
+    so far kept, as describe() does), then start() makes their records and
+    has them take their entries."""
+    describe(state, *firms, dataset=dataset, people=people, codes=codes)
+    return await start(state, *firms, run_id=run_id)
+
+
+async def start(state, *firms, run_id="seed"):
+    """Work starting on firms the loaded registry describes (collectors.onrc.
+    Firm, or anything with ``reg`` and ``cui``): each gets a record by SQL
+    over the attached registry (StateManager.ensure_registry_records) and
+    then takes its registry entry (StateManager.take_from_registry: its
+    declared website, its source, the registers' phones; a firm another
+    source brought that it surely is merges, one it may be goes for
+    review), in the order given. A firm that had a record already, or took
+    its entry before, is left as it is."""
+    made = await state.ensure_registry_records(regs=[f.reg for f in firms])
+    out = Seeded(created=made["created"], existing=made["existing"], taken=0,
+                 shared_domain=0, merged=0, ids={})
+    for f in firms:
+        cid = firm_of(state, f)
+        if cid is None:
+            continue
+        took = await state.take_from_registry(str(cid), run_id=run_id)
+        if took:
+            out["taken"] += 1
+            out["shared_domain"] += bool(took.get("shared_domain"))
+            out["merged"] += bool(took.get("merged_into"))
+        out["ids"][f.reg] = str(one(state, "SELECT CASE live WHEN 0 THEN id ELSE live END "
+                                           "FROM firm WHERE id = ?", cid))
+    return out
+
+
+def firm_of(state, f) -> int | None:
+    """The record holding a registry firm's CUI, else its registration
+    number."""
+    if f.cui:
+        held = firm_of_cui(state, f.cui)
+        if held is not None:
+            return held
+    return one(state, "SELECT fi.firm FROM firm_ident fi JOIN ident_scheme s ON s.id = fi.scheme "
+                      "WHERE s.name = 'ro.onrc_reg' AND fi.key = ?", f.reg)
 
 
 SNAPSHOT = {

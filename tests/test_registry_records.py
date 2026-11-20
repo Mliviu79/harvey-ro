@@ -16,7 +16,7 @@ from harvey import queries as named
 from harvey import registry
 from harvey.collectors import onrc
 from harvey.models import Company
-from harvey.modules import job_kinds, runs
+from harvey.modules import job_kinds
 from harvey.modules.ro.mf_financials.store import Filter as FinFilter
 from harvey.modules.ro.mf_taxpayers.store import Filter as TaxFilter
 from harvey.modules.ro.onrc import queries as onrc_queries
@@ -26,7 +26,7 @@ from harvey.registers import Stale
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 from tests import slim
-from tests.test_onrc import CAEN, DATASET, FIRMS, PEOPLE, STATUS, firm, write
+from tests.test_onrc import CAEN, FIRMS, PEOPLE, STATUS, firm, write
 from tests.test_registry import (  # noqa: F401  (con, db_path and state are fixtures)
     EXTRA_CAEN, EXTRA_FIRMS, EXTRA_STATUS, con, db_path, state)
 
@@ -162,7 +162,7 @@ async def test_records_for_firms_chosen_by_registration_number(state, db_path):
     for table in ("firm_source", "contact", "link", "link_evidence", "local_firm", "firm_key",
                   "person", "obs"):
         assert slim.one(state, f"SELECT COUNT(*) FROM {table}") == 0, table
-    # Read like any firm a pull saved: described by the registry.
+    # Read like any firm the registry describes.
     found = await state.get_company_by_cui("90000017")
     assert found.name == "ZÂMBET EXEMPLU SRL" and found.location == "Brașov, Romania"
     assert set(await state.held_ids("ro.onrc_reg", ["F08/800/2018"])) == {"F08/800/2018"}
@@ -193,10 +193,10 @@ async def test_a_second_run_creates_nothing(state, con):
 
 @pytest.mark.asyncio
 async def test_a_firm_with_a_record_gets_no_second_one(state, con):
-    # One record holds the CUI alone, a pull saved another, and a third firm
-    # was merged into a listing.
+    # One record holds the CUI alone, an earlier selection made another, and
+    # a third firm was merged into a listing.
     by_cui = await state.add_company(Company(name="Clinica Zâmbet", cui="90000017"))
-    await runs.registry_pull(state, con, registry.resolve(con, "8623/3"))
+    await state.ensure_registry_records(query=registry.resolve(con, "8623/3"))
     listing = await state.add_company(Company(name="Farmacia Exemplu",
                                               domain="farma-exemplu.example.ro"))
     await state.ensure_registry_records(regs=["J08/600/2015"])
@@ -579,32 +579,17 @@ async def test_a_broken_full_text_expression_raises_and_writes_nothing(state, co
     assert await state.ensure_registry_records(regs=["J08/100/2010"]) == counted(1, created=1)
 
 
-# ── The same as a pull leaves ──
+# ── What a record holds ──
 
 @pytest.mark.asyncio
-async def test_identifiers_are_the_ones_a_pull_writes(state, con, raw, tmp_path):
-    # The same firms pulled into a second database, the registry beside it.
-    other = tmp_path / "pulled"
-    other.mkdir()
-    registry.build(raw, DATASET, other / "registry.db")
-    pulled = StateManager(str(other / "test.db"))
-    await pulled.init_db()
-    await sync_vocabulary(pulled)
-    there = registry.connect(other / "registry.db")
-    try:
-        report = await runs.registry_pull(pulled, there, registry.resolve(there, "dentist BV"))
-    finally:
-        there.close()
-    assert report.new_companies == 5 and not report.errors
-
+async def test_a_record_holds_its_identifiers_and_nothing_else(state, con):
     await state.ensure_registry_records(query=registry.resolve(con, "dentist BV"))
-    assert held(state) == held(pulled) and len(held(state)) == 5
-    # The identity revision moved as much (a firm and each identifier), and
-    # as many firms are counted. A pull also counts what it copied up
-    # front: a declared website, the administrators as people.
-    assert identity(state) == identity(pulled) == 5 + 9
+    assert len(held(state)) == 5
+    # The identity revision moved for each firm and each identifier, and
+    # the firms are counted: nothing else is copied up front (no declared
+    # website, no administrators as people).
+    assert identity(state) == 5 + 9
     assert tally(state) == {"firms": 5}
-    assert tally(pulled) == {"firms": 5, "firms_with_site": 1, "people": 2}
 
 
 @pytest.mark.asyncio
@@ -623,10 +608,10 @@ async def test_new_records_take_their_places_in_the_name_and_place_orders(state,
 
 @pytest.mark.asyncio
 async def test_places_agree_with_the_ones_kept_for_the_current_load(state, con):
-    # The kept places are current (a registry load's follow-up): a pulled
-    # firm is placed as it is saved, new records in the same write.
+    # The kept places are current (a registry load's follow-up): new
+    # records are placed in the same write that makes them.
     assert await state.refresh_orders() == 0
-    await runs.registry_pull(state, con, registry.resolve(con, "8623/3"))
+    await state.ensure_registry_records(query=registry.resolve(con, "8623/3"))
     await state.ensure_registry_records(query=registry.resolve(con, "dentist"))
     made = positions(state)
     assert len(made) == 6 and all(p[0] is not None and p[2] is not None for p in made.values())

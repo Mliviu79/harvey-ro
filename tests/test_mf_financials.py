@@ -13,7 +13,7 @@ import pytest_asyncio
 
 from harvey import registry
 from harvey.collectors import onrc
-from harvey.modules import api, runs, switches
+from harvey.modules import api, switches
 from harvey.modules.loader import KEYED_BY, load_manifests
 from harvey.modules.ro.mf_financials import capabilities as caps
 from harvey.modules.ro.mf_financials import source, store
@@ -423,13 +423,7 @@ async def _values(state, code):
 async def test_the_statements_are_read_in_place_never_copied(state):
     await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
     await _company(state, "CLUJ EXEMPLU SRL", "90000041")
-    nothing = await runs.lookup_by_id(state)
-    assert nothing["observations"] == 0
-
-    # A lookup asks the statements nothing (they bring no contact) and
-    # writes nothing: every figure is read from their file.
-    first = await runs.lookup_by_id(state)
-    assert first["observations"] == 0 and first["companies"] == 0
+    # Nothing is written: every figure is read from their file.
     assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
     assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'lookup'") == 0
     # The newest year each firm filed, as the statements give it.
@@ -442,7 +436,6 @@ async def test_a_range_compares_the_latest_year_or_the_year_named(state):
     dormant = await _company(state, "DINTE TEST SRL", "90000025")
     old = await _company(state, "CLUJ EXEMPLU SRL", "90000041")
     unseen = await _company(state, "FARA CIFRE SRL", "90000163")
-    await runs.lookup_by_id(state)
 
     def verdicts(ranges):
         async def go():
@@ -460,7 +453,7 @@ async def test_a_range_compares_the_latest_year_or_the_year_named(state):
     assert zero[dormant] == "match"                 # 0 is a figure, not "not found"
 
 
-# ── Filtering the registry before anything is pulled ──
+# ── Filtering the registry before any work starts ──
 
 PFA_WITH_CUI = firm("POPESCU EXEMPLU PFA", "90000155", "F08/810/2019", "PFA", "Braşov",
                     "Municipiul Braşov", "Str. Exemplului", "4")
@@ -518,26 +511,29 @@ def test_bounds_without_loaded_statements_are_refused(reg, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_pull_with_bounds_saves_only_the_matches_with_their_figures(reg, reg_path, state,
-                                                                           monkeypatch):
+async def test_a_selection_with_bounds_makes_records_only_for_the_matches(reg, reg_path, state,
+                                                                         monkeypatch):
     monkeypatch.setattr(registry, "REGISTRY_PATH", reg_path)
     q = registry.resolve(reg, "dentist BV", fin=store.Filter(min_turnover=1_000_000),
                          fin_path=store.FINANCIALS_PATH)
-    report = await runs.registry_pull(state, reg, q, with_administrators=False)
-    assert report.new_companies == 1
+    made = await state.ensure_registry_records(query=q)
+    assert (made["selected"], made["created"]) == (1, 1)
     company = await state.get_company_by_cui("90000017")
     assert company is not None
-    # Figures attached straight away, so a filter on them is decided now.
+    # Its figures are read in place by its CUI, so a filter on them is
+    # decided now, with nothing copied.
     assert ("2025", 1_500_000.0) in await _values(state, "TURNOVER")
 
 
 @pytest.mark.asyncio
 async def test_a_sole_traders_missing_statement_is_never_a_no(reg, reg_path, state, monkeypatch):
     monkeypatch.setattr(registry, "REGISTRY_PATH", reg_path)
-    await runs.registry_pull(state, reg, registry.resolve(reg, "dentist BV"),
-                             with_administrators=False)
+    await state.ensure_registry_records(query=registry.resolve(reg, "dentist BV"))
     sole = await state.get_company_by_cui("90000155")
     srl = await state.get_company_by_cui("90000025")
+    for firm_id in (sole.id, srl.id):           # their work starts
+        await state.take_from_registry(firm_id)
+    sole = await state.get_company_by_cui("90000155")
 
     async def filed(cid):
         return [r["value_num"]
@@ -590,16 +586,6 @@ async def test_nothing_is_downloaded_unless_auto_update_is_on(state, monkeypatch
     assert await job_kinds.enqueue_due_sources(state) == ["mf_financials"]
     assert await job_kinds.enqueue_due_sources(state) == []   # not due again for check_days
     assert len(called) == 1 and called[0][:2] == ("source_sync", "mf_financials") and called[0][3]
-
-
-@pytest.mark.asyncio
-async def test_a_lookup_with_nothing_loaded_is_skipped_quietly(state, monkeypatch, tmp_path):
-    monkeypatch.setattr(store, "FINANCIALS_PATH", tmp_path / "missing.db")
-    await _company(state, "ZÂMBET EXEMPLU SRL", "90000017")
-    got = await runs.lookup_by_id(state)
-    # The statements are read in place: a lookup asks them nothing, loaded or not.
-    assert got["errors"] == [] and got["observations"] == 0
-    assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'lookup'") == 0
 
 
 # ── The dashboard and the CLI ──

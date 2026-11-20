@@ -305,19 +305,16 @@ async def test_the_registry_returns_only_what_it_declares(manifests, tmp_path):
         api.Input(extra={"files": files, "dataset": DATASET, "path": tmp_path / "r.db"}),
         api.Context())
     assert loaded.values["registry"]["dataset"] == DATASET.name
+    # Its one capability is the load: the registry is read in place.
+    assert {c["id"] for c in manifests["onrc"].capabilities} == {"registry_sync"}
     con = registry.connect(tmp_path / "r.db")
     try:
-        draft = await api.capability("onrc", "registry_search", manifests)(
-            api.Input(query=registry.resolve(con, "dentist BV"), extra={"con": con}),
-            api.Context())
+        sole = con.execute("SELECT cui, address FROM firms WHERE form = 'PFA'").fetchall()
     finally:
         con.close()
-    assert draft.records and draft.counts["matched"] == len(draft.records)
     # A sole trader keeps its registered office; a CNP is never its CUI.
-    sole = [r for r in draft.records if r.legal_form == "PFA"]
-    assert sole and all(r.address and not r.ids.get("cui") for r in sole)
-    for name, cap in ((loaded, "registry_sync"), (draft, "registry_search")):
-        assert _declared(name, manifests, "onrc", cap) == []
+    assert sole and all(address and not cui for cui, address in sole)
+    assert _declared(loaded, manifests, "onrc", "registry_sync") == []
 
 
 # ── What a module's files may not do ──

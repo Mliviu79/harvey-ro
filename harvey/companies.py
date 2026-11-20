@@ -1,6 +1,6 @@
 """The Companies page's shared pieces: its sorts and their default
 directions, kept orderings (``Snapshots`` of ``Ordered`` lists, which the
-overlay's page reads and the Registry page cut pages from), and one
+overlay's page reads and the All firms list cut pages from), and one
 company's record from the side databases.
 
 The record reads the side databases (the registry, the financial

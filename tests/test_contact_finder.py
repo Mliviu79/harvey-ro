@@ -395,7 +395,7 @@ def test_a_discover_batch_feeds_the_finder_what_it_saved(tmp_path):
     assert json.loads(params)["free_only"] is True
 
 
-def test_a_registry_pull_hands_the_finder_to_its_checks(tmp_path, monkeypatch):
+def test_a_new_records_check_hands_the_finder_on(tmp_path, monkeypatch):
     db = tmp_path / "harvey.db"
 
     async def go():
@@ -504,37 +504,26 @@ def test_a_preset_one_source_cant_run_leaves_it_out_with_a_note(client, monkeypa
     assert client.post("/api/discover/estimate", json={"provider": "osm"}).status_code == 400
 
 
-def test_the_registry_is_a_discover_source_with_its_own_filters(client, monkeypatch, tmp_path):
+def test_the_registry_is_not_a_discover_source(client, monkeypatch, tmp_path):
+    """Firms are taken from the registry by Find contacts (Companies → All
+    firms), never copied in by Discover: its menu lists no registry, and a
+    registry key sent to it is an unknown source."""
     from harvey import registry
+    from harvey.modules.job_kinds import registry_source
 
     monkeypatch.setattr(registry, "REGISTRY_PATH", tmp_path / "none.db")
     monkeypatch.setattr("harvey.config.load_config", lambda *a, **k: None)
     _seed(client.db_path)
     menu = client.get("/api/discover/providers").json()
-    (src,) = [s for s in menu["sources"] if s["key"] == "onrc.registry_search"]
-    keys = [f["key"] for f in src["filters"]]
+    assert not menu.get("sources")
+    keys = [f["key"] for f in registry_source()["filters"]]
     assert keys[:3] == ["words", "county", "locality"] and "min_turnover" in keys
-    body = {"providers": ["onrc.registry_search"],
-            "filters": {"onrc.registry_search": {"words": "8623", "county": "BV"}}}
-    est = client.post("/api/discover/estimate", json=body).json()
-    assert est["estimated_cost"] == 0 and est["free"] is True
-    assert "no registry loaded" in est["errors"][0]
-    # Nothing narrowing it is every firm in Romania: refused.
-    bare = client.post("/api/discover/estimate", json={"providers": ["onrc.registry_search"]})
-    assert bare.status_code == 400
-    r = client.post("/api/discover/run", json={**body, "max_spend": 0.25})
-    assert r.status_code == 200, r.text
-    ((kind, lane, params, batch),) = _rows(client.db_path,
-                                           "SELECT kind, lane, params_json, batch_id FROM jobs")
-    p = json.loads(params)
-    assert (kind, lane) == ("registry_pull", "onrc")
-    assert p["words"] == "8623" and len(p["counties"]) == 1 and p["with_administrators"]
-    summary = client.get("/api/discover/providers").json()
-    assert summary["active_runs"][0]["batch_id"] == batch
-    assert summary["active_runs"][0]["sources"][0]["key"] == "onrc.registry_search"
-    stop = client.post("/api/discover/stop", json={"batch_id": batch,
-                                                   "provider": "onrc.registry_search"})
-    assert stop.json()["cancelled"] == 1
+    for key in ("onrc.registry_search", registry_source()["key"]):
+        body = {"providers": [key], "filters": {key: {"words": "8623", "county": "BV"}}}
+        assert client.post("/api/discover/estimate", json=body).status_code == 400
+        assert client.post("/api/discover/run", json={**body, "max_spend": 0.25}).status_code \
+            == 400
+    assert _rows(client.db_path, "SELECT kind FROM jobs") == []
 
 
 def test_several_sources_share_one_batch_and_one_cap(tmp_path):
@@ -558,7 +547,7 @@ def test_several_sources_share_one_batch_and_one_cap(tmp_path):
 # ── The Discover page under node ──
 
 
-def test_discover_page_ticks_sources_shows_the_registry_filters_and_each_run():
+def test_discover_page_ticks_sources_and_shows_each_run():
     import shutil
     import subprocess
     from pathlib import Path
@@ -572,7 +561,7 @@ const fs = require('fs'), vm = require('vm');
 const app = fs.readFileSync(process.argv[1], 'utf8');
 vm.runInThisContext(fs.readFileSync(process.argv[2], 'utf8'));
 const els = {};
-const ids = ['discover-providers', 'discover-filters', 'discover-runs', 'disc-run', 'discover-estimate',
+const ids = ['discover-providers', 'discover-runs', 'disc-run', 'discover-estimate',
              'disc-cities', 'disc-depth', 'disc-limit', 'disc-cap'];
 ids.forEach(id => els[id] = {innerHTML: '', value: '', textContent: '', disabled: false, style: {}});
 els['disc-cap'].value = '2';
@@ -595,26 +584,22 @@ global.setInterval = () => 1; global.clearInterval = () => {};
 const calls = [];
 global.api = async (path, opts) => { calls.push([path, opts && opts.body]);
   return {providers: [{key: 'serper', label: 'Serper', configured: true, enabled: true, env_keys: [],
-                       blurb: 'Google search', cost_note: '$1/1k', free_tier: '2,500'}],
-          sources: [{key: 'onrc.registry_search', label: 'ONRC trade registry', configured: true,
-                     enabled: true, blurb: 'Every firm', filters: [
-                       {key: 'words', type: 'text', label: 'Activity'},
-                       {key: 'vat', type: 'yesno', label: 'VAT registered'}]}],
-          presets: {}, default: 'osm', selected_all: ['serper', 'onrc.registry_search'], running: true,
+                       blurb: 'Google search', cost_note: '$1/1k', free_tier: '2,500'},
+                      {key: 'osm', label: 'OpenStreetMap', configured: true, enabled: true, env_keys: [],
+                       blurb: 'Map data', cost_note: 'free', free_tier: 'unlimited'}],
+          presets: {}, default: 'osm', selected_all: ['serper', 'onrc.registry'], running: true,
           active_runs: [{batch_id: 'b1', label: 'Serper + dentist in BV', jobs: {running: 1, queued: 2},
                          max_spend: 2, spent: 0.004, searches_active: 1, contacts_found: 5, finder_waiting: 3,
                          sources: [{key: 'serper', jobs: {done: 1, running: 1}, new_companies: 4,
                                     known_companies: 1, actual_cost: 0.004, active: 1},
-                                   {key: 'onrc.registry_search', jobs: {queued: 1}, new_companies: 0,
+                                   {key: 'osm', jobs: {queued: 1}, new_companies: 0,
                                     known_companies: 0, actual_cost: 0, active: 1}]}]}; };
 const pick = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
 vm.runInThisContext(pick('// ── Discover: tick sources', '// Companies found but not looked at'));
 (async () => {
   await loadDiscoverProviders();
-  setSourceFilter('onrc.registry_search', 'words', '8623');
-  setSourceFilter('onrc.registry_search', 'vat', 'yes');
   console.log(JSON.stringify({cards: els['discover-providers'].innerHTML,
-    filters: els['discover-filters'].innerHTML, runs: els['discover-runs'].innerHTML,
+    runs: els['discover-runs'].innerHTML,
     body: discoverBody(), stop: t('disc.stop_source'), shared: t('disc.cap_shared', {cap: '$2.00'}),
     caps: [discoverCap('0'), discoverCap(''), discoverCap('2.5')]}));
 })().catch(e => {console.error(e); process.exit(1);});
@@ -622,17 +607,18 @@ vm.runInThisContext(pick('// ── Discover: tick sources', '// Companies found
     out = subprocess.run([node, "-e", script, str(web / "app.js"), str(web / "i18n.js")], text=True,
                          encoding="utf-8", capture_output=True, check=True, timeout=30)
     data = json.loads(out.stdout)
-    # Checkboxes, both ticked from the last run.
-    assert data["cards"].count('type="checkbox" checked') == 2
-    assert "ONRC trade registry" in data["filters"] and 'id="sf-onrc-registry_search-vat"' in data["filters"]
-    assert data["body"]["providers"] == ["serper", "onrc.registry_search"]
-    assert data["body"]["filters"] == {"onrc.registry_search": {"words": "8623", "vat": "yes"}}
+    # Checkboxes, the last run's ticked; the registry, which isn't a
+    # Discover source any more, dropped from what it remembers.
+    assert data["cards"].count('type="checkbox"') == 2
+    assert data["cards"].count('type="checkbox" checked') == 1
+    assert "registry" not in data["cards"]
+    assert data["body"]["providers"] == ["serper"] and "filters" not in data["body"]
     assert data["body"]["max_spend"] == 2
     # 0 is a cap of nothing; blank is the $1 default.
     assert data["caps"] == [0, 1, 2.5]
     # Each source's progress in the run, a Stop for the run and for each source.
     assert data["runs"].count(data["stop"]) == 2
-    assert "stopDiscovery(\"b1\",\"onrc.registry_search\")" in data["runs"]
+    assert "stopDiscovery(\"b1\",\"osm\")" in data["runs"]
     assert "stopDiscovery(\"b1\")" in data["runs"]
 
 
@@ -933,13 +919,15 @@ def test_a_discover_cap_of_0_is_0_and_blank_is_the_default(client, monkeypatch):
         (0.0,), (1.0,)]
 
 
-def test_discover_runs_only_the_registrys_job_from_its_filters(client, monkeypatch):
+def test_discover_refuses_the_registry_as_a_source(client, monkeypatch):
+    """The registry's firms are taken by Find contacts (Companies → All
+    firms), never by a Discover run."""
     monkeypatch.setattr("harvey.config.load_config", lambda *a, **k: None)
-    monkeypatch.setattr(job_kinds, "discover_sources", lambda enabled=None: [
-        {"key": "onrc.other_lookup", "module": "onrc", "job": "other_pull", "label": "Other"}])
-    r = client.post("/api/discover/run", json={"providers": ["onrc.other_lookup"],
-                                               "filters": {"onrc.other_lookup": {"words": "x"}}})
-    assert r.status_code == 400 and "can't be run from Discover" in r.json()["message"]
+    for path in ("/api/discover/run", "/api/discover/estimate"):
+        r = client.post(path, json={"providers": ["onrc.registry"],
+                                    "filters": {"onrc.registry": {"words": "8623"}}})
+        assert r.status_code == 400 and "unknown provider" in r.text, r.text
+    assert _rows(client.db_path, "SELECT COUNT(*) FROM jobs") == [(0,)]
 
 
 def test_the_background_walk_goes_on_where_it_stopped_with_todays_results(tmp_path,

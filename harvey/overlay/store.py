@@ -1,13 +1,14 @@
 """Harvey's writes on the overlay (schema 25).
 
 The writes the StateManager and its Batch make, by the same names (ingest,
-the contact finder and the runs call them): a firm found or pulled, the gaps of one on file, its
+the contact finder and the runs call them): a firm found or taken from a
+register, the gaps of one on file, its
 contacts and the evidence for each, people, searches, sources, places, web
 signals, merges and their undo, and removing a firm from Harvey. They run
 on one connection inside the caller's transaction (``call`` opens one per
 call; ``Batch`` keeps one for many), so a row-at-a-time write keeps every
-count through the triggers, and a bulk one (a registry pull, a merge, a
-removal) recounts what it touched (triggers.bulk). The methods in
+count through the triggers, and a bulk one (a merge, a removal)
+recounts what it touched (triggers.bulk). The methods in
 ``OWN_TRANSACTIONS`` open their own instead (a long read with no write
 lock, then a short write): ``call`` runs them with none open, and a
 ``Batch`` can't.
@@ -37,6 +38,7 @@ from urllib.parse import quote
 from harvey import contacts, resolver
 from harvey.overlay import bitmaps, merges, schema, triggers
 from harvey.overlay import queries as _statements  # noqa: F401  (registers the named ones it runs)
+from harvey.overlay.queries import register_functions
 from harvey.overlay.idents import Schemes
 from harvey.overlay.schema import CONTACT_STATUS, EMAIL, FIRM_KEY, LINE_TYPE, PHONE, TRUST
 
@@ -48,11 +50,9 @@ FILL_COLUMNS = frozenset({"name", "domain", "website", "industry", "location", "
 # Of those, the ones only a firm no register describes keeps (a register is
 # the authority on its own firms' name, place and activity).
 LOCAL_COLUMNS = ("name", "industry", "address")
-# Registry pull: records per bulk write. The records are matched first, in
-# a read transaction (matching is most of a pull's time), so the write
-# lock is held only for a chunk's writes and its recount; small enough that
-# the finder's and the pages' writes wait seconds, not minutes. A pull cut
-# short keeps the chunks already committed.
+# The records one ensure_registry_records call gives their CUI at most
+# (a record known by its registration number only): a bounded part of its
+# write, so the finder's and the pages' writes wait seconds, not minutes.
 PULL_CHUNK = 5_000
 # Records one ensure_registry_records call creates at most, all in its one
 # write transaction, which holds the write lock for the inserts only (the
@@ -154,9 +154,9 @@ def connect(path, *, data_dir=None) -> tuple[sqlite3.Connection, list]:
 
 
 # Store methods that only read: run without taking the write lock.
-READS = frozenset({"match_company", "companies_with_id", "held",
+READS = frozenset({"match_company", "id_keys_of", "held",
                    "keeper_order", "observed", "module_readings", "module_readings_of",
-                   "dictionaries_stale", "match_records", "scan_candidates", "unknown_pairs",
+                   "dictionaries_stale", "scan_candidates", "unknown_pairs",
                    "registry_entry"})
 
 
@@ -187,6 +187,23 @@ def call(path, method: str, *args, **kwargs):
         return out
     finally:
         con.close()
+
+
+def _register_numbers(value, region: str | None) -> list[str]:
+    """Every number in a register's phone reading: a list of E.164 numbers
+    with spaces between them (ANAF's), or a field as the register writes
+    it, which can hold several ("0268 000 000 / 0722 000 000")."""
+    from harvey.collectors.phones import field_phones
+
+    text = str(value or "").strip()
+    tokens = text.split()
+    pieces = tokens if tokens and all(t.startswith("+") for t in tokens) else [text]
+    out: list[str] = []
+    for piece in pieces:
+        for hit in field_phones(piece, region):
+            if hit.number not in out:
+                out.append(hit.number)
+    return out
 
 
 class Batch:
@@ -1387,82 +1404,17 @@ class Store:
     def module_readings(self, company_id, module: str):
         return self.module_readings_of([company_id], module)[company_id]
 
-    # ── A registry pull ──
+    # ── The registry's firms, as work starts on them ──
 
     def identity(self) -> int:
         """Revision ``identity``: moves whenever which firm holds which
         identifier changes."""
         return self.one("SELECT n FROM revision WHERE name = 'identity'") or 0
 
-    def match_records(self, records) -> tuple[int, list]:
-        """A pull's records matched (a read: no write lock), with the
-        identity revision they were matched at, for pull()."""
-        from harvey.modules import ingest
-
-        return self.identity(), [self.match_company(ingest.company_from(r),
-                                                    declared_domain=r.declared_domain)
-                                 for r in records]
-
-    def pull(self, records, *, facts_of=None, wanted=frozenset(), run_id: str = "",
-             dry_run: bool = False, matches=None, matched_at: int | None = None
-             ) -> list[tuple[str, bool, bool, bool]]:
-        """Mark the firms a register pull read as Harvey's, in bulk (the
-        kept-value triggers off, the touched rows recounted at the end):
-        each record matched (a firm on file gains what it lacked: its
-        declared website, its keys), new ones created with their declared
-        website (trust unset: never above likely) and identifiers, every
-        one sourced to this pull, and the phones the loaded registers know
-        for them kept as contacts. A fact is stored only where its module
-        stores the signal (a register's are read, not copied). Returns
-        (company id, created, updated, shared domain) per record; with
-        ``dry_run`` only matches ("" for an id, created for a new one).
-
-        ``matches``: match_records' for these records, made at identity
-        revision ``matched_at``. They are used when no firm or identifier
-        changed since; else every record is matched again here. A record
-        sharing a key with one before it in the chunk is matched again
-        too (it may be the firm that one just created). What a row-at-a-
-        time writer changed meanwhile beyond identities (a domain filled,
-        a phone linked) is read live for domains; a phone or a name found
-        meanwhile can be missed, which the duplicate scan finds later."""
-        from dataclasses import replace
-
-        from harvey.collectors.phones import phone_region
-        from harvey.modules import ingest
-
-        if dry_run:
-            return [("", not self.match_company(ingest.company_from(r),
-                                                declared_domain=r.declared_domain).attach,
-                     False, False) for r in records]
-        if matches is None or len(matches) != len(records) or matched_at != self.identity():
-            matches = [None] * len(records)
-        out = []
-        regions: dict[int, str | None] = {}
-        keys_seen: set = set()
-        with triggers.bulk(self.con):
-            for record, match in zip(records, matches):
-                keys = resolver.identifiers(ingest.company_from(record))
-                if match is not None and keys_seen.intersection(keys):
-                    match = None
-                keys_seen.update(keys)
-                saved = self._pulled(record, run_id, match)
-                out.append(saved)
-                fid = self.firm(saved[0])
-                if fid is None:
-                    continue
-                regions[fid] = phone_region(record.location or "", None, record.domain or "")
-                found = (facts_of or {}).get(record.key) or []
-                if found:
-                    self.add_observations(ingest.rows(
-                        [replace(f, record="") for f in found], company_id=saved[0],
-                        origin=saved[0], run_id=run_id, wanted=set(wanted)), run_id)
-            self._register_phones(regions)
-            self._reorder(*regions)
-        return out
-
     def _pulled(self, record, run_id: str, match=None) -> tuple[str, bool, bool, bool]:
-        """ingest.source_record on the overlay (``match``: the record's,
-        made before; None matches it here)."""
+        """ingest.source_record on the overlay for one register record
+        (take_from_registry: a firm's registry entry as its work starts;
+        ``match``: the record's, made before; None matches it here)."""
         from harvey.modules import ingest
 
         company = ingest.company_from(record)
@@ -1503,7 +1455,7 @@ class Store:
         registrations is one firm, its canonical row, whichever of them
         the selection holds. ``barred``: the do-not-contact list's domains;
         a firm whose declared website is one of them (or under one) is left
-        out, as a pull leaves it out, and counted as ``excluded``; a
+        out, and counted as ``excluded``; a
         registration no key reaches (its CUI isn't one the core can key by)
         is left out too, counted as ``unkeyable``.
 
@@ -1529,8 +1481,8 @@ class Store:
 
         Of the firms with no record the first ``limit`` (in the registry's
         name order; at most RECORDS_MAX) get a firm row at their place in
-        the name and place orders and the identifiers a pull writes (CUI
-        and registration number, or the number alone), nothing else: no
+        the name and place orders and their identifiers (CUI and
+        registration number, or the number alone), nothing else: no
         source, website, contact or local description. Ids go up in that
         order. The rest wait for the next call, which skips the ones made
         here. When identifiers changed while the selection was read, the
@@ -1645,13 +1597,13 @@ class Store:
 
     def _registry_due(self, live: int):
         """(the registry adapter, the firm's record the registry knows it
-        by, that record as a pull reads it) for a live firm that is to take
+        by, that record as the adapter reads it) for a live firm that is to take
         its registry entry: one the registry describes, not sourced to it,
         that holds nothing of its own. A record made for a selection
-        (ensure_registry_records) is such a firm until its entry is taken,
-        whatever a register gave it meanwhile (ANAF's phone, by its check).
+        (ensure_registry_records) is such a firm until its entry is taken
+        (a check at ANAF meanwhile writes nothing to it).
         A firm another source found, one the user took off the registry's
-        pulls while Harvey's own work keeps it (remove_company), or one
+        sources while Harvey's own work keeps it (remove_company), or one
         Harvey searched or worked on is not: None for those, and for a firm
         no registry describes."""
         registry = next((a for a in self.registers if hasattr(a, "pull_record")), None)
@@ -1698,15 +1650,15 @@ class Store:
         return {"website": record.website or "", "domain": record.domain or ""}
 
     def take_from_registry(self, company_id, run_id: str = "") -> dict:
-        """What a registry pull gave a firm it saved, for a firm that is to
-        take its registry entry (_registry_due: a record made for a
-        selection, ensure_registry_records, that holds nothing of its own),
-        when Harvey starts work for it. Through the pull's own save of one
+        """A firm's registry entry, for a firm that is to take it
+        (_registry_due: a record made for a selection,
+        ensure_registry_records, that holds nothing of its own), when
+        Harvey starts work for it. Through the register's save of one
         record (_pulled): its declared website and domain only where the
         firm has none (the website sourced to the registry), the domain
         left off when another firm holds it; the identifiers it lacks; the
-        registry as one of its sources. Then, as a pull saving a new firm
-        does (save_company), the record is matched once more with the
+        registry as one of its sources. Then, as saving a new firm does
+        (save_company), the record is matched once more with the
         firm's own records left out: a firm another source brought that it
         surely is takes it in (an automatic merge), one it may be is put up
         for review. Then the phones the loaded registers hold for it
@@ -1737,7 +1689,7 @@ class Store:
         had_site = self.one("SELECT website FROM firm WHERE id = ?", (live,)) is not None
         shared = self._pulled(record, run_id, match)[3]
         if not had_site and record.website:
-            # The declared website it took is the registry's, as on a pulled firm.
+            # The declared website it took is the registry's.
             self.x("UPDATE firm SET website_source = ? WHERE id = ? AND website IS NOT NULL "
                    "AND website_source IS NULL", (self.source(record.source), live))
         merged_into = ""
@@ -1789,7 +1741,11 @@ class Store:
 
     def _register_phones(self, regions: dict[int, str | None]) -> int:
         """The phones every loaded register knows for these firms (by the
-        key it reads them by), as contacts with the register as source."""
+        key it reads them by), as contacts with the register as source. A
+        national number is read in the firm's region, else in the one
+        market the register's module serves."""
+        from harvey.modules import switches
+
         kept = 0
         attached = {r[1] for r in self.x("PRAGMA database_list")}
         for adapter in self.registers:
@@ -1798,6 +1754,8 @@ class Store:
             scheme = self.schemes.named(adapter.keyed_by)
             if scheme is None:
                 continue
+            markets = getattr(switches.by_id().get(adapter.module), "markets", ()) or ()
+            market = markets[0] if len(markets) == 1 else None
             keys: dict = {}
             for fid in regions:
                 for (key,) in self.x("SELECT key FROM firm_ident WHERE firm = ? AND scheme = ?",
@@ -1812,43 +1770,107 @@ class Store:
                 continue
             for key, values in found.items():
                 fid = keys.get(key)
+                region = regions.get(fid) or market
                 for value, _ in values:
-                    kept += self._contact(fid, contacts.Found(
-                        "phone", str(value), source=adapter.module, trust="confirmed",
-                        region=regions.get(fid))) is not None
+                    for number in _register_numbers(value, region):
+                        kept += self._contact(fid, contacts.Found(
+                            "phone", number, source=adapter.module, trust="confirmed",
+                            region=region)) is not None
         return kept
 
-    def companies_with_id(self, kind: str, company_ids=None) -> list[dict]:
-        """StateManager.companies_with_id on the overlay: live firms holding
-        an identifier that arrives as ``kind`` ("cui"), one row per key,
-        {"id", "name", "value"}, in id order as text (the order callers
-        resume a check in)."""
-        schemes = [s.id for s in self.schemes.by_id.values() if s.kind == kind and not s.prefix]
-        if not schemes:
-            return []
-        marks = ",".join(str(i) for i in schemes)
-        sql = (f"SELECT CASE f.live WHEN 0 THEN f.id ELSE f.live END AS l, fi.key "
-               f"FROM firm_ident fi JOIN firm f ON f.id = fi.firm WHERE fi.scheme IN ({marks})")
-        rows = []
-        if company_ids is None:
-            rows = self.x(sql).fetchall()
+    def take_register_phones(self, company_id) -> int:
+        """The phones the loaded registers hold for a live firm (its every
+        record's keys), as contacts with the register as source, when
+        Harvey starts work for it: the registers' phones become contacts
+        then, never in bulk. One already on file is not added twice. How
+        many are on file now."""
+        from harvey.collectors.phones import phone_region
+
+        live = self.live(company_id)
+        if live is None:
+            return 0
+        domain = self.one("SELECT domain FROM firm WHERE id = ?", (live,)) or ""
+        region = phone_region("", None, domain)
+        # Each record keeps its own identifiers after a merge: read every
+        # record's, each phone linked through the record its key is on.
+        return self._register_phones({fid: region for fid in self._group(live)})
+
+    def _id_schemes(self, kind: str) -> list[int]:
+        """The ids of the schemes whose keys arrive as ``kind`` ("cui")."""
+        return [s.id for s in self.schemes.by_id.values() if s.kind == kind and not s.prefix]
+
+    def queue_id_checks(self, selection: dict, *, kind: str, module: str, capability: str,
+                        lane: str, size: int, label: str, missing_only: bool = False,
+                        then_find: bool = False, batch_id: str = "",
+                        parent_id: str = "") -> tuple[list[str], list[str]]:
+        """Queue checks of identifiers at an outside service (id_check jobs
+        of ``size`` keys each, in key order), all by SQL in this one write:
+        nothing of the selection is read into Python. ``selection``:
+
+        - {"keys": [...]}: these keys (whole numbers), on file or not;
+        - {"all": true}: every key of the ``kind`` Harvey holds;
+        - {"missing": true}: the same, less those the module's register
+          (its kept answers, attached) has an answer for; with no register
+          attached, every key (``missing_only`` still makes the check skip
+          the kept ones);
+        - {"firms": [ids]}: the keys these firms hold (a merged record's
+          followed to its survivor, every record of it giving its keys).
+
+        ``then_find``: each job also names the firms its keys were picked
+        for (``company_ids``, live ids), whose search it queues when it is
+        done; only with {"firms"}. A job's dedupe key is its exact keys and
+        ``missing_only``: a part an open job already asks the same is not
+        queued again. Returns (the new jobs' ids, the open jobs that were
+        duplicates)."""
+        from harvey.queries import sql
+
+        schemes = self._id_schemes(kind)
+        if then_find and "firms" not in selection:
+            raise ValueError("a check a run's search waits on is made for firms")
+        register_functions(self.con)
+        for ddl in _statements.ID_CHECK_TABLES.values():
+            self.x(ddl)
+        for table in _statements.ID_CHECK_TABLES:
+            self.x(sql(f"overlay.id_checks.clear.{table}"))
+        if "keys" in selection:
+            self.x(sql("overlay.id_checks.pick.keys"),
+                   (json.dumps([int(k) for k in selection["keys"]]),))
+        elif "firms" in selection:
+            firms = json.dumps([int(f) for f in selection["firms"]])
+            for scheme in schemes:
+                self.x(sql("overlay.id_checks.pick.firms"), (firms, scheme))
+        elif selection.get("missing") or selection.get("all"):
+            adapter = next((a for a in self.registers if a.module == module), None)
+            attached = {r[1] for r in self.x("PRAGMA database_list")}
+            unanswered = (getattr(adapter, "unanswered_sql", None)
+                          if selection.get("missing") and adapter is not None
+                          and adapter.alias in attached else None)
+            for scheme in schemes:
+                self.x(unanswered() if unanswered else sql("overlay.id_checks.pick.all"),
+                       (scheme,))
         else:
-            for cid in dict.fromkeys(company_ids):
-                live = self.live(cid)
-                if live is None:
-                    continue
-                group = self._group(live)
-                rows += self.x(sql + f" AND fi.firm IN ({','.join('?' * len(group))})",
-                               group).fetchall()
-        names = {}
-        out = []
-        for live, key in sorted(set(rows), key=lambda r: (str(r[0]), str(r[1]))):
-            if live not in names:
-                names[live] = self.one("SELECT COALESCE(f.display_name, l.name, '') FROM firm f "
-                                       "LEFT JOIN local_firm l ON l.firm = f.id WHERE f.id = ?",
-                                       (live,)) or ""
-            out.append({"id": str(live), "name": names[live], "value": str(key)})
-        return out
+            raise ValueError("a check is of keys, firms, every key, or those never answered")
+        self.x(sql("overlay.id_checks.parts"),
+               (max(1, int(size)), int(bool(missing_only)), f"id_check:{module}:{capability}:"))
+        new = [r[0] for r in self.x(sql("overlay.id_checks.queue"), (
+            lane, module, capability, label, int(bool(missing_only)), int(bool(then_find)),
+            batch_id or "", parent_id or "")).fetchall()]
+        dupes = [r[0] for r in self.x(sql("overlay.id_checks.dupes"), (json.dumps(new),))]
+        for table in _statements.ID_CHECK_TABLES:
+            self.x(sql(f"overlay.id_checks.clear.{table}"))
+        return new, dupes
+
+    def id_keys_of(self, kind: str, company_ids) -> list[int]:
+        """The keys arriving as ``kind`` these firms hold (each followed to
+        its live firm, every record of it), in key order: what an older
+        check, queued with its companies' ids, asks about."""
+        from harvey.queries import sql
+
+        ids = json.dumps([int(i) for i in company_ids or ()])
+        keys: set = set()
+        for scheme in self._id_schemes(kind):
+            keys.update(r[0] for r in self.x(sql("overlay.id_checks.keys_of"), (ids, scheme)))
+        return sorted(keys)
 
     def held(self, scheme: str, keys) -> dict:
         """{key: the live firm (as text) holding it} for the keys of a
@@ -2242,7 +2264,8 @@ class Store:
 
     def _register_sources(self) -> list[int]:
         """The source ids a register writes under: its module's name (its
-        phones) and ``registry:<module>`` (its pulls)."""
+        phones) and ``registry:<module>`` (its entries, taken when work
+        starts on a firm, and the records earlier releases copied)."""
         names = [n for m in self.manifests if m.register for n in (m.id, f"registry:{m.id}")]
         if not names:
             return []
@@ -2251,7 +2274,7 @@ class Store:
 
     def _harvey_work(self, fid: int, registers: list[int], *, skips: bool = True) -> str:
         """What Harvey holds of its own on a firm (beyond what a register
-        pull wrote), as the first such thing found, or "". ``skips`` False
+        wrote: its entry, its phones), as the first such thing found, or "". ``skips`` False
         leaves out the searches left out on purpose (outcome "skipped")."""
         # (No register source on file yet: every source is Harvey's own.)
         marks = ",".join(str(i) for i in registers)
@@ -2279,18 +2302,19 @@ class Store:
         return ""
 
     def remove_company(self, company_id) -> dict:
-        """Remove a firm from Harvey: a firm a register pull brought and
-        that holds nothing of Harvey's own goes, with what the pull wrote
+        """Remove a firm from Harvey: a firm a register brought and that
+        holds nothing of Harvey's own goes, with what the register wrote
         (identifiers, sources, the register's phones, review pairs). The
-        register still has it; a pull adds it again. A firm Harvey worked
-        on (searches, contacts or people it found, web signals, its own
-        sources, a found website...) stays, and only its register pulls'
-        source rows go: what was paid for or checked is never thrown away.
+        register still has it; a Find-contacts run that takes it makes the
+        record again. A firm Harvey worked on (searches, contacts or people
+        it found, web signals, its own sources, a found website...) stays,
+        and only its register source rows go: what was paid for or checked
+        is never thrown away.
         Refused for a firm in a merge (in force or undone: the merge's
         history names it) and for one outreach names. A contact no firm
         links any more goes too, unless it is marked do-not-contact.
         Returns {"removed": its id, or "" when it stays, "kept": why it
-        stays, or "", "pull_rows_removed", "contacts_removed"}."""
+        stays, or "", "register_rows_removed", "contacts_removed"}."""
         fid = self.firm(company_id)
         if fid is None:
             raise RemoveRefused("not_found")
@@ -2308,7 +2332,7 @@ class Store:
         if kept:
             pulled = self.x(f"DELETE FROM firm_source WHERE firm = ? AND source IN ({marks})",
                             (fid,)).rowcount
-            return {"removed": "", "kept": kept, "pull_rows_removed": pulled,
+            return {"removed": "", "kept": kept, "register_rows_removed": pulled,
                     "contacts_removed": 0}
         pulled = self.one(f"SELECT COUNT(*) FROM firm_source WHERE firm = ? "
                           f"AND source IN ({marks})", (fid,))
@@ -2337,5 +2361,5 @@ class Store:
             gone += self.x("DELETE FROM contact WHERE id = ? AND do_not_contact = 0 AND NOT EXISTS "
                            "(SELECT 1 FROM link WHERE contact = ?)",
                            (contact, contact)).rowcount
-        return {"removed": str(fid), "kept": "", "pull_rows_removed": pulled,
+        return {"removed": str(fid), "kept": "", "register_rows_removed": pulled,
                 "contacts_removed": gone}

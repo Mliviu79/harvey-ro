@@ -486,6 +486,12 @@ async function copyText(text, btn) {
 // ── Tabs and modules ──
 
 function showTab(id, btn) {
+  // (The trade registry's own page is now Companies → All firms.)
+  if (id === 'registry') {
+    id = 'companies';
+    _co.scope = 'all';
+    try { localStorage.setItem(COMPANY_SCOPE_KEY, 'all'); } catch { /* private mode */ }
+  }
   if (!document.getElementById(id)) id = 'overview';
   const section = document.getElementById(id);
   if (section.dataset.module && !_modules[section.dataset.module]) id = 'overview';
@@ -509,7 +515,6 @@ function loadCurrentTab() {
     case 'modules': loadModulesPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': loadCompanies(); break;
-    case 'registry': registryOn('registry'); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'outbox': loadOutbox(); break;
@@ -762,7 +767,7 @@ function taxpayersBody(tax) {
     '<div class="module-terms">' + escHtml(t('pd.source', {attribution: tax.attribution || ''})) + '</div>';
 }
 
-// ANAF's public web service: asked per company, one request a second.
+// ANAF's public web service: asked by CUI, one request a second.
 function anafBody(anaf) {
   if (!anaf.on) return '<p class="desc">' + escHtml(t('pd.anaf_off')) + '</p>';
   const kept = anaf.kept || {};
@@ -787,16 +792,15 @@ function anafBody(anaf) {
 }
 
 function anafSummary(rep) {
-  const done = t('pd.anaf_done', {companies: fmtN(rep.companies || 0), asked: fmtN(rep.checked || 0),
-                                  cached: fmtN(rep.cached || 0), updated: fmtN(rep.updated || 0),
-                                  missing: fmtN(rep.not_found || 0)});
+  const done = t('pd.anaf_done', {cuis: fmtN(rep.cuis || 0), asked: fmtN(rep.checked || 0),
+                                  cached: fmtN(rep.cached || 0), missing: fmtN(rep.not_found || 0)});
   return rep.stopped === 'busy' ? done + ' ' + t('pd.anaf_busy') : done;
 }
 
 let _anafWatch = null;
 
-// Start an ANAF check ({ids}, {q}, {missing: true} or {} for every company
-// with a CUI) and say when it is done.
+// Start an ANAF check of the CUIs some companies hold ({ids}, {q},
+// {missing: true} or {} for every CUI on file) and say when it is done.
 async function anafCheck(body) {
   const res = await api('/api/anaf/check', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
@@ -815,7 +819,7 @@ async function watchAnaf() {
   if (anaf.running) { _anafWatch = setTimeout(watchAnaf, 2000); return; }
   const rep = anaf.job && anaf.job.report;
   if (rep) {
-    if ((rep.errors || []).length && !rep.updated && !rep.cached) showToast(t('pd.anaf_failed', {error: rep.errors[0]}), 'error');
+    if ((rep.errors || []).length && !rep.checked && !rep.cached) showToast(t('pd.anaf_failed', {error: rep.errors[0]}), 'error');
     else showToast(anafSummary(rep), 'success');
   }
   if (document.getElementById('public-data')) renderPublicData(data);
@@ -1567,16 +1571,13 @@ function tServer(key, english) {
 
 // ── Discover: tick sources, price them, then run them as one batch ──
 
-// The sources ticked (search providers' keys and "<module>.<capability>"
-// for a source run as a job, the registry), and each one's filters.
+// The sources ticked (search providers' keys).
 let _sources = null;
-let _sourceFilters = {};
 let _discoverPoll = null;
 let _discData = null;
 
-function sourceCard(p, kind) {
-  const pv = (field) => kind === 'job' ? tServer('src.' + p.key + '.' + field, p[field] || '')
-                                       : tServer('prov.' + p.key + '.' + field, p[field]);
+function sourceCard(p) {
+  const pv = (field) => tServer('prov.' + p.key + '.' + field, p[field]);
   const on = _sources.has(p.key);
   const ready = p.configured
     ? '<span class="badge t-good">' + escHtml(t('disc.ready')) + '</span>'
@@ -1586,18 +1587,15 @@ function sourceCard(p, kind) {
       ' onchange="toggleSource(' + jsq(p.key) + ', this.checked)" aria-label="' + escHtml(pv('label')) + '">' +
       '<h3>' + escHtml(pv('label')) + '</h3>' + ready + '</div>' +
     '<div class="blurb">' + escHtml(pv('blurb')) + '</div>' +
-    (kind === 'job'
-      ? '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' + escHtml(t('disc.free_count')) + '</span></div>' +
-        (p.attribution ? '<div class="caveat">' + escHtml(p.attribution) + '</div>' : '')
-      : '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' + escHtml(pv('cost_note')) + '</span></div>' +
-        '<div class="row"><span class="k">' + escHtml(t('disc.free')) + '</span><span class="v">' + escHtml(pv('free_tier')) + '</span></div>' +
-        (p.needs_key
-          ? '<div class="row"><span class="k">' + escHtml(t('disc.setup')) + '</span><span class="v">' +
-            escHtml(t('disc.env_keys', {keys: p.env_keys.join(', ')})) + ' &middot; ' +
-            '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
-            escHtml(t('disc.get_key')) + '</a></span></div>'
-          : '') +
-        (p.caveat ? '<div class="caveat">' + escHtml(pv('caveat')) + '</div>' : '')) +
+    '<div class="row"><span class="k">' + escHtml(t('disc.cost')) + '</span><span class="v">' + escHtml(pv('cost_note')) + '</span></div>' +
+    '<div class="row"><span class="k">' + escHtml(t('disc.free')) + '</span><span class="v">' + escHtml(pv('free_tier')) + '</span></div>' +
+    (p.needs_key
+      ? '<div class="row"><span class="k">' + escHtml(t('disc.setup')) + '</span><span class="v">' +
+        escHtml(t('disc.env_keys', {keys: p.env_keys.join(', ')})) + ' &middot; ' +
+        '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
+        escHtml(t('disc.get_key')) + '</a></span></div>'
+      : '') +
+    (p.caveat ? '<div class="caveat">' + escHtml(pv('caveat')) + '</div>' : '') +
   '</label>';
 }
 
@@ -1614,8 +1612,7 @@ async function loadDiscoverProviders() {
   // source here, only one of the searches "find websites" goes through.
   const providers = data.providers.filter(p => p.enabled !== false && !p.lookup_only);
   renderWebsiteFinders(data.providers.filter(p => p.enabled !== false && p.website_lookup));
-  const jobbed = (data.sources || []).filter(s => s.enabled !== false);
-  const known = new Set(providers.map(p => p.key).concat(jobbed.map(s => s.key)));
+  const known = new Set(providers.map(p => p.key));
   if (_sources === null) {
     const last = (data.selected_all || []).filter(k => known.has(k));
     _sources = new Set(last.length ? last : [data.default].filter(k => known.has(k)));
@@ -1628,13 +1625,11 @@ async function loadDiscoverProviders() {
     });
     if (presetSel.value && data.presets[presetSel.value] === false) presetSel.value = '';
   }
-  el.innerHTML = (providers.length || jobbed.length ? '' : emptyState(icon('layers'), escHtml(t('disc.none_on')),
+  el.innerHTML = (providers.length ? '' : emptyState(icon('layers'), escHtml(t('disc.none_on')),
       escHtml(t('disc.none_on_copy')), true,
       '<button type="button" class="btn btn-secondary btn-sm" onclick="goTab(\'modules\')">' +
         escHtml(t('disc.open_modules')) + '</button>')) +
-    '<div class="prov-grid">' + jobbed.map(s => sourceCard(s, 'job')).join('') +
-      providers.map(p => sourceCard(p, 'provider')).join('') + '</div>';
-  renderSourceFilters(jobbed);
+    '<div class="prov-grid">' + providers.map(p => sourceCard(p)).join('') + '</div>';
 
   const running = data.running;
   renderProfileCard(data.unprofiled || 0, running);
@@ -1679,24 +1674,8 @@ function toggleSource(key, on) {
   loadDiscoverProviders();
 }
 
-// The filters a ticked source declares in its manifest (the registry's
-// activity, county, town, turnover...), one panel per source.
-function renderSourceFilters(jobbed) {
-  const el = document.getElementById('discover-filters');
-  if (!el) return;
-  const ticked = (jobbed || []).filter(s => _sources.has(s.key) && (s.filters || []).length);
-  el.innerHTML = ticked.map(s => {
-    const f = _sourceFilters[s.key] = _sourceFilters[s.key] || {};
-    const field = (x) => sourceFilterField(s.key, x, f[x.key], 'sf-',
-      'setSourceFilter(' + jsq(s.key) + ',' + jsq(x.key) + ',this.value)');
-    return '<div class="card source-filters"><h3>' + escHtml(tServer('src.' + s.key + '.label', s.label)) + '</h3>' +
-      '<div class="form-row">' + s.filters.map(field).join('') + '</div></div>';
-  }).join('');
-}
-
-// One filter a source declares in its manifest, as a form field (the
-// Discover panel's and the Registry page's): yes/no and choices as a
-// select, numbers and text as inputs.
+// One filter the registry declares in its manifest, as a form field (All
+// firms'): yes/no and choices as a select, numbers and text as inputs.
 function sourceFilterField(sourceKey, x, value, prefix, onchange) {
   const id = prefix + sourceKey.replace(/\W/g, '-') + '-' + x.key;
   const label = tServer('src.' + sourceKey + '.filter.' + x.key, x.label || x.key);
@@ -1714,13 +1693,6 @@ function sourceFilterField(sourceKey, x, value, prefix, onchange) {
   return '<div class="form-group"><label class="form-label" for="' + id + '">' + escHtml(label) + '</label>' + input + '</div>';
 }
 
-function setSourceFilter(source, key, value) {
-  const f = _sourceFilters[source] = _sourceFilters[source] || {};
-  if (value === '' || value === null) delete f[key]; else f[key] = value;
-  document.getElementById('disc-run').disabled = true;
-  document.getElementById('disc-run').textContent = t('disc.estimate_first');
-}
-
 function discoverCap(raw) {
   const text = String(raw == null ? '' : raw).trim();
   const cap = Number(text);
@@ -1729,12 +1701,8 @@ function discoverCap(raw) {
 
 function discoverBody() {
   const raw = document.getElementById('disc-cities').value.trim();
-  const providers = [..._sources];
-  const filters = {};
-  providers.forEach(k => { if (_sourceFilters[k]) filters[k] = _sourceFilters[k]; });
   return {
-    providers: providers,
-    filters: filters,
+    providers: [..._sources],
     // Semicolons or newlines, never commas: "Denver, CO" is one city.
     cities: raw ? raw.split(/[;\n]/).map(c => c.trim()).filter(Boolean) : [],
     // Blank: every result the source has; the cap is what stops a run.
@@ -1862,8 +1830,6 @@ async function stopDiscovery(batchId, source) {
 
 function sourceName(key) {
   const d = _discData || {};
-  const job = (d.sources || []).find(s => s.key === key);
-  if (job) return tServer('src.' + key + '.label', job.label);
   const p = (d.providers || []).find(x => x.key === key);
   return p ? tServer('prov.' + key + '.label', p.label) : key;
 }
@@ -3189,7 +3155,7 @@ function stamp() {
 // ── Companies: phone and email first ──
 //
 // Two scopes, switched at the top. "All firms" is the trade registry's own
-// list, read where it is (the Registry page's list, drawn here): a firm
+// list, read where it is (registryOn's list, drawn here): a firm
 // gets a record in Harvey when Find contacts starts work for it. "In
 // Harvey" is the companies Harvey has worked on: one server-side page of
 // /api/companies, sorted, filtered (the Contacts page's company filters,
@@ -3292,8 +3258,7 @@ function renderCompanyScopes(scope) {
 async function loadCompanies() {
   const scope = await companyScope();
   renderCompanyScopes(scope);
-  // (Not under the Registry page, opened while the scope was being read.)
-  if (scope === 'all') return currentTab === 'registry' ? undefined : registryOn('companies');
+  if (scope === 'all') return loadRegistry();
   const el = document.getElementById('companies-list');
   if (!document.getElementById('company-rows')) {
     el.innerHTML = '<div class="toolbar">' +
@@ -3524,25 +3489,23 @@ function clearCompanyFilters() {
 
 // ── Registry: every firm in the trade registry, with its financials ──
 //
-// One server-side page of /api/registry: the registry source's own filters
-// (the manifest's, as on Descoperă), sorted by name, a latest-year figure
+// One server-side page of /api/registry: the registry's own filters (its
+// manifest's [register] filters), sorted by name, a latest-year figure
 // or registration date, with the exact total and page numbers. Each firm
 // says whether it is already in Harvey (by CUI); its panel shows every
 // financial year side by side, the registry's record, the taxpayer file
 // and ANAF's answer.
 //
-// The same list is drawn in two places, with one state (filters, sort,
-// page, ticks): on the Registry page, where the ticked firms or the list
-// are pulled (a registry pull, counted first like on Descoperă, free), and
-// as the Companies page's All firms, where they are sent to Find contacts
-// (a firm gets its record when that run takes it).
+// It is drawn as the Companies page's All firms: the ticked firms or the
+// list are sent to Find contacts (a firm gets its record when that run
+// takes it).
 
-const REGISTRY_SOURCE = 'onrc.registry_search';
-// Where the list is drawn: the section's id, and the element it fills.
-const REGISTRY_HOSTS = {registry: 'registry-list', companies: 'companies-registry'};
+const REGISTRY_SOURCE = 'onrc.registry';
+// The element the list fills.
+const REGISTRY_HOST = 'companies-registry';
 let _rg = { q: '', f: {}, sort: '', dir: '', offset: 0, limit: loadPageSize(), total: 0, rows: [],
             selected: new Map(), timer: null, gen: 0, source: null, loaded: {}, pagedBy: '', ms: 0,
-            shownSort: '', shownDir: '', host: 'registry' };
+            shownSort: '', shownDir: '' };
 const REGISTRY_SORTS = [['name', 'rg.sort.name'], ['turnover', 'rg.sort.turnover'], ['employees', 'rg.sort.employees'],
                         ['profit', 'rg.sort.profit'], ['registered', 'rg.sort.registered']];
 
@@ -3553,7 +3516,7 @@ function registryFilter() {
 }
 
 // Whether the filter narrows the registry (status alone doesn't: with
-// nothing else a pull would be every firm in Romania, and is refused).
+// nothing else it would be every firm in Romania, and is refused).
 function registryNarrowed() {
   return Object.keys(registryFilter()).some(k => k !== 'status' && k !== 'unknown');
 }
@@ -3569,23 +3532,8 @@ function registryParams() {
   return p.toString();
 }
 
-// Draw the list on the page named. Its elements have one id each, so the
-// copy on the other page goes (with any card open on it).
-function registryOn(host) {
-  if (host !== _rg.host) {
-    closeRegistryPull();
-    closeRegistryFinder();
-    const report = document.getElementById('registry-finder');
-    if (report) { delete report.dataset.pending; delete report.dataset.run; }   // a run's report stops being followed
-    const old = document.getElementById(REGISTRY_HOSTS[_rg.host]);
-    if (old) old.innerHTML = '';
-    _rg.host = host;
-  }
-  return loadRegistry();
-}
-
 async function loadRegistry() {
-  const el = document.getElementById(REGISTRY_HOSTS[_rg.host]);
+  const el = document.getElementById(REGISTRY_HOST);
   if (!el) return;
   if (!document.getElementById('registry-rows')) {
     el.innerHTML = '<div class="toolbar">' +
@@ -3596,7 +3544,7 @@ async function loadRegistry() {
         'oninput="registrySearchInput(this.value)"></label>' +
       '<div id="registry-sort"></div><div id="registry-actions"></div>' +
       '</div><details class="more-fields" id="rg-more"><summary id="rg-more-sum"></summary><div id="rg-filters"></div></details>' +
-      '<div id="registry-pull"></div><div id="registry-finder"></div><div id="registry-selbar"></div><div id="registry-rows"></div>';
+      '<div id="registry-finder"></div><div id="registry-selbar"></div><div id="registry-rows"></div>';
     document.getElementById('registry-search').value = _rg.q;
   }
   const rowsEl = document.getElementById('registry-rows');
@@ -3706,16 +3654,15 @@ function renderRegistryFilters() {
   if (active && document.getElementById(active)) document.getElementById(active).focus();
 }
 
-// A filter change starts over: page one, no pull card or estimate, and no
-// ticks (a ticked firm the new filter leaves out would be taken unseen).
+// A filter change starts over: page one, no estimate, and no ticks (a
+// ticked firm the new filter leaves out would be taken unseen).
 function registryFilterChanged() {
   _rg.offset = 0;
-  closeRegistryPull();
   closeRegistryFinder();
   if (_rg.selected.size) { _rg.selected.clear(); renderRegistrySelbar(); renderRegistryActions(); }
 }
 
-// The list follows typing after a short pause; a pull asked for in that
+// The list follows typing after a short pause; a run asked for in that
 // pause reloads first (registryReloadNow), so it counts what is shown.
 function registryReloadSoon() {
   clearTimeout(_rg.timer);
@@ -3792,7 +3739,7 @@ function pageRegistry(how, value) {
   pageMove(_rg, how, value);
   if (_rg.total && _rg.offset >= _rg.total) _rg.offset = Math.floor((_rg.total - 1) / _rg.limit) * _rg.limit;
   loadRegistry().then(() => {
-    const top = document.getElementById(_rg.host);
+    const top = document.getElementById('companies');
     if (top && how !== 'size') top.scrollIntoView({block: 'start'});
   });
 }
@@ -3827,7 +3774,6 @@ function registrySelectionOnly() {
   });
   const allOn = _rg.rows.length > 0 && _rg.rows.every(r => _rg.selected.has(r.reg));
   document.querySelectorAll('#registry-rows thead th.sel input, #registry-rows .sel-page-mobile input').forEach(b => { b.checked = allOn; });
-  closeRegistryPull();
   closeRegistryFinder();
   renderRegistryActions();
   renderRegistrySelbar();
@@ -3838,9 +3784,7 @@ function renderRegistrySelbar() {
   if (!el) return;
   const n = _rg.selected.size;
   el.innerHTML = n ? '<div class="selbar"><b>' + escHtml(t('sel.count', {n: n})) + '</b>' +
-    (_rg.host === 'companies'
-      ? '<button class="btn btn-primary btn-sm" onclick="findForRegistry(true)">' + escHtml(t('rg.find_selected', {n: fmtN(n)})) + '</button>'
-      : '<button class="btn btn-primary btn-sm" onclick="pullRegistry(true)">' + escHtml(t('rg.pull_selected', {n: fmtN(n)})) + '</button>') +
+    '<button class="btn btn-primary btn-sm" onclick="findForRegistry(true)">' + escHtml(t('rg.find_selected', {n: fmtN(n)})) + '</button>' +
     '<button class="btn btn-ghost btn-sm" onclick="clearRegistrySelection()">' + escHtml(t('sel.clear')) + '</button></div>' : '';
 }
 
@@ -3853,16 +3797,14 @@ function renderRegistryActions() {
   const el = document.getElementById('registry-actions');
   if (!el) return;
   const n = _rg.selected.size;
-  // All firms sends them to Find contacts; the Registry page pulls them.
-  const find = _rg.host === 'companies';
-  const label = find ? t('actions.find') : t('rg.pull'), ico = find ? '' : 'arrow';
-  const run = find ? 'findForRegistry' : 'pullRegistry';
+  // The ticked firms, or the filter's whole list, go to Find contacts.
   el.innerHTML = menuHtml('registry-menu', [
     {sep: true, label: t('actions.selection', {n: n})},
-    {label: label, icon: ico, action: run + '(true)', disabled: !n},
+    {label: t('actions.find'), icon: '', action: 'findForRegistry(true)', disabled: !n},
     {sep: true, label: t('actions.all_results', {n: _rg.total})},
-    {label: label, icon: ico, action: run + '(false)', disabled: !_rg.total || !registryNarrowed(),
-     note: registryNarrowed() ? '' : t('rg.pull_needs_filter')},
+    {label: t('actions.find'), icon: '', action: 'findForRegistry(false)',
+     disabled: !_rg.total || !registryNarrowed(),
+     note: registryNarrowed() ? '' : t('rg.needs_filter')},
   ]);
 }
 
@@ -3873,7 +3815,6 @@ function renderRegistryActions() {
 // again when they were before, as a selection is on In Harvey.
 async function findForRegistry(selection) {
   if (!selection) await registryReloadNow();
-  closeRegistryPull();
   openFinder('registry-finder', selection ? {registry: {regs: [..._rg.selected.keys()]}, force: true}
                                           : {registry: registryFilter()});
 }
@@ -3893,63 +3834,6 @@ function closeRegistryFinder() {
 // show say so.
 function registryFinderRan() {
   if (document.getElementById('registry-rows')) loadRegistry();
-}
-
-// Pull the ticked firms or the whole list into Harvey: counted first
-// (Discover's estimate of a registry pull: free, read locally), then queued
-// as a registry pull on the registry's lane.
-let _rgPull = null;
-
-function registryPullBody(selection) {
-  const filters = selection ? {regs: [..._rg.selected.keys()]} : registryFilter();
-  return {providers: [REGISTRY_SOURCE], filters: {[REGISTRY_SOURCE]: filters}, max_spend: 0,
-          find_websites: true, websites_max_spend: 0};
-}
-
-async function pullRegistry(selection) {
-  if (!selection) await registryReloadNow();
-  const el = document.getElementById('registry-pull');
-  if (!el) return;
-  const body = registryPullBody(selection);
-  _rgPull = {body: body};
-  el.innerHTML = '<div class="card"><p class="muted small">' + escHtml(t('rg.counting')) + '</p></div>';
-  const est = await api('/api/discover/estimate', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
-  });
-  if (!_rgPull || _rgPull.body !== body) return;
-  if (!est || est.error) {
-    el.innerHTML = '<div class="test-result error">' + escHtml(failMsg(est && {off_module: est.off_module, error: est.error}, t('disc.estimate_failed'))) + '</div>';
-    return;
-  }
-  const n = est.available;
-  el.innerHTML = '<div class="card finder-card"><h2>' + escHtml(t('rg.pull_title')) + '</h2>' +
-    '<p>' + escHtml(n === null || n === undefined ? t('rg.pull_unknown') : t('rg.pull_summary', {n: fmtN(n)})) + '</p>' +
-    '<p class="muted small">' + escHtml(t('rg.pull_free')) + '</p>' +
-    ((est.errors || []).length ? '<p class="muted small">' + escHtml(est.errors.join('; ')) + '</p>' : '') +
-    '<div class="btn-row"><button class="btn btn-primary btn-sm" onclick="runRegistryPull(this)"' + (n === 0 ? ' disabled' : '') + '>' +
-      escHtml(n === null || n === undefined ? t('rg.pull') : t('rg.pull_run', {n: fmtN(n)})) + '</button>' +
-    '<button class="btn btn-ghost btn-sm" onclick="closeRegistryPull()">' + escHtml(t('common.cancel')) + '</button></div></div>';
-}
-
-function closeRegistryPull() {
-  _rgPull = null;
-  const el = document.getElementById('registry-pull');
-  if (el) el.innerHTML = '';
-}
-
-async function runRegistryPull(btn) {
-  if (!_rgPull) return;
-  btn.disabled = true;
-  const data = await api('/api/discover/run', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(_rgPull.body),
-  });
-  if (data && data.success) {
-    showToast(t('rg.pull_queued'), 'success');
-    closeRegistryPull();
-  } else {
-    btn.disabled = false;
-    showToast(failMsg(data, t('rg.pull_failed')), 'error');
-  }
 }
 
 // ── A registry firm's panel ──
@@ -3984,13 +3868,10 @@ function renderFirmDrawer() {
   const record = {cuis: d.cui ? [{cui: d.cui, sources: ['registry:onrc']}] : [], registry: d.registry,
                   financials: d.financials, anaf: d.anaf, taxpayer: d.taxpayer};
   const parts = recordSections({record: record, address: firm.address}, section, none, {yearsAcross: true});
-  // A firm not in Harvey yet: Find contacts on All firms (its record is
-  // made by that run), a pull on the Registry page.
+  // A firm not in Harvey yet: Find contacts (its record is made by that run).
   const actions = '<div class="btn-row">' + (d.company_id
     ? '<button class="btn btn-primary btn-sm" onclick="openCompany(' + jsq(d.company_id) + ')">' + escHtml(t('rg.open_in_harvey')) + '</button>'
-    : _rg.host === 'companies'
-    ? '<button class="btn btn-primary btn-sm" onclick="findForFirm(' + jsq(d.reg) + ')">' + escHtml(t('cl.find')) + '</button>'
-    : '<button class="btn btn-primary btn-sm" onclick="pullOneFirm(' + jsq(d.reg) + ')">' + escHtml(t('rg.pull_one')) + '</button>') +
+    : '<button class="btn btn-primary btn-sm" onclick="findForFirm(' + jsq(d.reg) + ')">' + escHtml(t('cl.find')) + '</button>') +
     '</div><div id="drawer-finder"></div>';
   el.innerHTML = head(escHtml(firm.name || d.reg), escHtml([d.cui ? 'CUI ' + d.cui : '', d.reg].filter(Boolean).join(' · ')) +
       (d.company_id ? ' · <span class="tag t-good">' + escHtml(t('rg.in_harvey')) + '</span>' : '')) +
@@ -4000,25 +3881,6 @@ function renderFirmDrawer() {
 // Find contacts for the open registry firm: priced first, like any run.
 function findForFirm(reg) {
   openFinder('drawer-finder', {registry: {regs: [reg]}, force: true});
-}
-
-// One firm, counted first like any pull (the firm may be gone from a
-// registry loaded since the panel opened).
-async function pullOneFirm(reg) {
-  const body = {providers: [REGISTRY_SOURCE], filters: {[REGISTRY_SOURCE]: {regs: [reg]}}, max_spend: 0,
-                find_websites: true, websites_max_spend: 0};
-  const est = await api('/api/discover/estimate', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
-  });
-  if (!est || est.error || est.available === 0) {
-    showToast(failMsg(est && est.error ? {off_module: est.off_module, error: est.error} : null, t('rg.pull_failed')), 'error');
-    return;
-  }
-  const data = await api('/api/discover/run', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
-  });
-  if (data && data.success) showToast(t('rg.pull_queued'), 'success');
-  else showToast(failMsg(data, t('rg.pull_failed')), 'error');
 }
 
 // ── Possible duplicates ──
@@ -9094,6 +8956,8 @@ function jobRow(j, buttons) {
     ? t('q.why.spend') : j.paused_reason === 'paused' ? t('q.why.hand') : (j.paused_reason || j.error || '')}));
   if (j.status === 'queued' && j.error) bits.push(t('q.retry_at', {why: j.error}));
   if (j.status === 'failed' && j.error) bits.push(j.error);
+  // (A kind of job no code runs any more, from an earlier release.)
+  if (j.status === 'cancelled' && j.error === 'retired') bits.push(t('q.retired'));
   if (j.status === 'running' && j.last_line) bits.push(j.last_line.trim());
   const act = (buttons || []).map(([action, label]) =>
     '<button type="button" class="btn btn-secondary btn-sm" onclick="jobAction(' + jsq(j.id) + ',' +
@@ -9129,7 +8993,7 @@ function laneCard(l) {
     block('q.running', l.running, j => j.stoppable ? [['cancel', 'q.cancel'], ['pause', 'q.pause']] : []) +
     block('q.waiting', l.waiting, [['cancel', 'q.cancel']], l.waiting_more) +
     block('q.paused', l.paused_jobs, [['resume', 'q.resume'], ['cancel', 'q.cancel']]) +
-    block('q.failed', l.failed, [['retry', 'q.retry']]) +
+    block('q.failed', l.failed, j => j.error === 'retired' ? [] : [['retry', 'q.retry']]) +
     block('q.done', l.done, []) +
     (!l.running.length && !l.waiting.length && !l.paused_jobs.length && !l.failed.length && !l.done.length
       ? '<p class="muted small">' + escHtml(t('q.lane_empty')) + '</p>' : '') +

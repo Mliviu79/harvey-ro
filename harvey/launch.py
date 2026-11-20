@@ -68,15 +68,9 @@ async def discovery_refusal(state, body: dict):
     """Why a source or the preset asked for can't run (a ModuleOff: its
     module is off), or None."""
     from harvey.modules import switches
-    from harvey.modules.job_kinds import discover_sources
 
     enabled = await switches.enabled_ids(state)
-    jobbed = {s["key"]: s["module"] for s in discover_sources()}
     for key in source_keys(body) or [""]:
-        if key in jobbed:
-            if jobbed[key] not in enabled:
-                return switches.ModuleOff(jobbed[key], f"The {key} discovery source")
-            continue
         problem = switches.discovery_problem(enabled, key, str(body.get("preset") or ""))
         if problem:
             return problem
@@ -222,21 +216,18 @@ async def place_queries(state, plan: list[dict], *, network: bool = True) -> Non
 
 
 def discovery_plan(body: dict, config, queries=None) -> tuple[list[dict], list[str]]:
-    """One part per source the request ticked: a search source's queries,
-    or a registry pull's parameters from its filters. A source that can't
-    take this run (a preset it can't search with, filters that say
-    nothing) is skipped with a note, unless it is the only one: then the
+    """One part per source the request ticked: a search source's queries.
+    A source that can't take this run (a preset it can't search with) is
+    skipped with a note, unless it is the only one: then the
     run is refused (ValueError). Unknown sources are refused (LookupError).
     ``queries``: what makes a source's searches (discovery_queries)."""
     from harvey.collectors.discover import PROVIDERS, is_discovery_source
-    from harvey.modules.job_kinds import discover_sources, lookup_only_message, registry_plan
+    from harvey.modules.job_kinds import lookup_only_message
 
     queries = queries or discovery_queries
     keys = source_keys(body)
     if not keys:
         raise ValueError("pick at least one source")
-    jobbed = {s["key"]: s for s in discover_sources()}
-    filters = body.get("filters") if isinstance(body.get("filters"), dict) else {}
     plan, notes = [], []
     for key in keys:
         try:
@@ -245,15 +236,6 @@ def discovery_plan(body: dict, config, queries=None) -> tuple[list[dict], list[s
             if key in PROVIDERS:
                 plan.append({"provider": key, "label": PROVIDERS[key].label,
                              "queries": queries(body, config, key)})
-            elif key in jobbed:
-                src = jobbed[key]
-                if src["job"] != "registry_pull":
-                    # Only the registry's filters are read here: another
-                    # source run as a job needs its own planner first.
-                    raise ValueError(f"{key} can't be run from Discover yet")
-                params = registry_plan(filters.get(key) or {})
-                plan.append({"source": key, "job": src["job"], "label": params.pop("label"),
-                             "params": params, "name": src["label"]})
             else:
                 raise LookupError(f"unknown provider {key!r}")
         except LookupError:
@@ -307,48 +289,32 @@ async def discovery_estimate(state, config, plan: list[dict], notes: list[str],
     count (DataForSEO Business Listings) is asked how many results each
     search has first, a small paid request each, so the price is exact;
     the answer says what counting cost. Without it nothing is asked of a
-    source (the agent's estimate). The registry's part is its free count
-    of the firms that match."""
+    source (the agent's estimate)."""
     from harvey.collectors.discover import PROVIDERS, area_cells, area_shape, estimate_cost
-    from harvey.modules.job_kinds import registry_count
     from harvey.modules.runs import run_discovery
 
     await place_queries(state, plan, network=count)
     parts = []
     for part in plan:
-        if part.get("provider"):
-            key, queries = part["provider"], part["queries"]
-            shape, most = area_shape(key)
-            areas = {"shape": shape, "max_results": most,
-                     "areas": len({q.location for q in queries if q.area}),
-                     "cells": sum(area_cells(key, q) for q in queries),
-                     "radius_km": sorted({q.area["radius_km"] for q in queries
-                                          if q.area.get("radius_km")})[:10]}
-            counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
-            if count and PROVIDERS[key].can_count:
-                report = await run_discovery(state, config, key, queries,
-                                             dry_run=True, count=True)
-                counted = {"counted": report.counted, "available": report.available,
-                           "count_cost": round(report.count_cost, 4),
-                           "errors": report.errors}
-            parts.append({"key": key, "label": part["label"],
-                          "queries": [q.keyword() for q in queries],
-                          "query_count": len(queries),
-                          "estimated_cost": round(estimate_cost(key, queries), 4),
-                          "free": PROVIDERS[key].estimate(queries) == 0, **areas, **counted})
-        else:
-            try:
-                n = await asyncio.to_thread(registry_count, part["params"])
-                errors = []
-            except FileNotFoundError as e:
-                n, errors = None, [f"{e} (the filter needs it)"]
-            parts.append({"key": part["source"], "label": part["label"],
-                          "queries": [part["label"]], "query_count": 1,
-                          "estimated_cost": 0.0, "free": True, "counted": n is not None,
-                          "available": n, "count_cost": 0.0,
-                          "errors": errors or ([] if n is not None else [
-                              "no registry loaded yet: the run loads it first (about "
-                              "1.5 GB, once per dataset)"])})
+        key, queries = part["provider"], part["queries"]
+        shape, most = area_shape(key)
+        areas = {"shape": shape, "max_results": most,
+                 "areas": len({q.location for q in queries if q.area}),
+                 "cells": sum(area_cells(key, q) for q in queries),
+                 "radius_km": sorted({q.area["radius_km"] for q in queries
+                                      if q.area.get("radius_km")})[:10]}
+        counted = {"counted": False, "available": None, "count_cost": 0.0, "errors": []}
+        if count and PROVIDERS[key].can_count:
+            report = await run_discovery(state, config, key, queries,
+                                         dry_run=True, count=True)
+            counted = {"counted": report.counted, "available": report.available,
+                       "count_cost": round(report.count_cost, 4),
+                       "errors": report.errors}
+        parts.append({"key": key, "label": part["label"],
+                      "queries": [q.keyword() for q in queries],
+                      "query_count": len(queries),
+                      "estimated_cost": round(estimate_cost(key, queries), 4),
+                      "free": PROVIDERS[key].estimate(queries) == 0, **areas, **counted})
     queries = [q for p_ in parts for q in p_["queries"]]
     counted_all = all(p_["counted"] for p_ in parts)
     return {
@@ -434,7 +400,7 @@ async def find_selection(state, body: dict, *, create: bool = False) -> tuple[li
 
 
 def _positive(params: dict) -> bool:
-    """Whether a registry pull's parameters (job_kinds.registry_params)
+    """Whether a registry selection's parameters (job_kinds.registry_params)
     name something firms are taken by: chosen firms, an area, a financial
     or taxpayer condition, or a word that isn't an exclusion."""
     from harvey import registry
@@ -468,14 +434,14 @@ def _barred_domains() -> list[str]:
 async def registry_selection(state, chosen, *, limit: int = FIND_MAX, force: bool = False,
                              create: bool = False) -> dict:
     """A Find-contacts request's selection of the trade registry: the
-    Registry page's own filters as it sends them (words, county, locality,
+    All firms list's own filters as it sends them (words, county, locality,
     status, the turnover and headcount bounds, unknown, employer, vat,
     micro) or the rows ticked there ({"regs": [registration numbers]}),
-    read by job_kinds.registry_plan as a pull's are, and once more only
+    read by job_kinds.registry_plan, and once more only
     when it names something to take firms by (not only exclusions). Nothing
     is copied from the registry: a firm gets a record only here, when a run
     takes it. A firm whose declared website is on the do-not-contact list
-    gets none and isn't taken (``excluded``), as a pull leaves it out; a
+    gets none and isn't taken (``excluded``); a
     registration no key reaches is counted (``unkeyable``).
 
     The selection is read once (StateManager.ensure_registry_records).
@@ -500,17 +466,16 @@ async def registry_selection(state, chosen, *, limit: int = FIND_MAX, force: boo
     filter's file) loaded."""
     from harvey import registry, registry_view
     from harvey.modules import switches
-    from harvey.modules.job_kinds import discover_sources, registry_plan
+    from harvey.modules.job_kinds import registry_plan, registry_source
     from harvey.overlay.store import RECORDS_MAX
 
-    source = next((s for s in discover_sources(await switches.enabled_ids(state))
-                   if s["job"] == "registry_pull"), None)
+    source = registry_source(await switches.enabled_ids(state))
     if source is None:
         raise ValueError("no module gives a registry to select from")
     if not source["enabled"]:
         raise switches.ModuleOff(source["module"], "Finding contacts from the registry")
     if not isinstance(chosen, dict):
-        raise ValueError("registry is the Registry page's filters, or {\"regs\": [...]}")
+        raise ValueError("registry is the All firms list's filters, or {\"regs\": [...]}")
     params = registry_plan(chosen)
     if not _positive(params):
         raise registers.Refused("the registry selection only excludes: name an activity, an "

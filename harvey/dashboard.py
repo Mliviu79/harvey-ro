@@ -1112,9 +1112,11 @@ async def get_company_contacts(company_id: str):
 
 @app.post("/api/companies/{company_id}/remove")
 async def remove_company(company_id: str):
-    """Remove a company a register pull brought from Harvey (the register
-    still has it, and a pull adds it again). One Harvey worked on stays,
-    with only its pulls taken off ("removed" is "", "kept" says why).
+    """Remove a company a register brought from Harvey (the register still
+    has it, and a Find-contacts run that takes it makes the record again).
+    One Harvey worked on stays, with only its register sources taken off
+    ("removed" is "", "kept" says why; ``register_rows_removed`` counts
+    them).
     Refused (409) for a company in a merge, undone or not, or one outreach
     names; 404 for none."""
     from harvey.overlay.store import RemoveRefused
@@ -1177,19 +1179,17 @@ def _official_modules() -> set[str]:
     return {m.id for m in switches.manifests() if m.official}
 
 
-# ── The Registry page: the whole trade registry, with its financials ──
+# ── The trade registry, with its financials (Companies → All firms) ──
 #
 # harvey/registry_view.py lists and orders the firms; the filters are the
-# registry source's own (its manifest, read by job_kinds.registry_params),
-# so the page shows what a pull of the same filters saves. Pulling goes
-# through Discover's estimate and run, with the same filters or the
-# registration numbers ticked.
+# registry's own (its manifest's [register] filters, job_kinds.registry_source,
+# read by job_kinds.registry_params), the same Find contacts selects by.
 
 
 def _registry_source(enabled=None) -> dict | None:
-    from harvey.modules.job_kinds import discover_sources
+    from harvey.modules.job_kinds import registry_source
 
-    return next((s for s in discover_sources(enabled) if s["job"] == "registry_pull"), None)
+    return registry_source(enabled)
 
 
 async def _in_harvey(cuis: list[str], regs: list[str] = ()) -> dict[str, str]:
@@ -2522,7 +2522,7 @@ from harvey.launch import FIND_MAX  # noqa: E402  (the queueing paths, shared wi
 async def _find_selection(body: dict, create: bool = False):
     """(state, the companies a Find-contacts request selects, its filter's
     error or "") from {"filter": {the Contacts page's filters}, "company_ids",
-    "force", "limit"}, or {"registry": the Registry page's filters or
+    "force", "limit"}, or {"registry": the All firms list's filters or
     {"regs": [...]}} (launch.find_selection). ``create``: a run, which
     makes the registry selection's records."""
     from harvey import launch
@@ -2559,7 +2559,7 @@ async def estimate_find_contacts(request: Request):
     its calls and their cost as a range (finder.classify_estimate). Both
     are estimates: the run's caps are what is enforced, step by step.
 
-    With {"registry": the Registry page's filters, or {"regs": [...]}} in
+    With {"registry": the All firms list's filters, or {"regs": [...]}} in
     place of the company ids, the selection is the registry's and nothing
     is written: ``registry`` says how many firms it holds (``selected``),
     how many have a record (``existing``), how many would get one at Run
@@ -2594,7 +2594,7 @@ async def find_contacts(request: Request):
     capability is skipped by it, unless ``force`` (searched again, once in
     this run). The run's report: GET /api/jobs/batches/{batch_id}/report.
 
-    {"registry": the Registry page's filters, or {"regs": [...]}} in place
+    {"registry": the All firms list's filters, or {"regs": [...]}} in place
     of the company ids starts from the trade registry: the selection's
     firms with no record get one now (``limit`` at most; ``registry`` in
     the answer: ``selected``, ``existing``, ``created``, and ``left`` for
@@ -5329,8 +5329,8 @@ async def get_activity():
 
 async def _batch_summary(state, batch_id: str) -> dict | None:
     """What a Descoperă run (one batch of jobs) did so far: its searches'
-    reports merged, each source's own progress, the registry pulls, the
-    sites read and contacts found, and how many of its jobs are where."""
+    reports merged, each source's own progress, the sites read and
+    contacts found, and how many of its jobs are where."""
     from harvey.modules import jobs
     from harvey.modules.job_kinds import merge_reports
 
@@ -5339,7 +5339,6 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
         return None
     found = await jobs.list_jobs(state, batch_id=batch_id, limit=100000)
     searches = [j for j in found if j.kind == "discover"]
-    pulls = [j for j in found if j.kind == "registry_pull"]
     sites = [j for j in found if j.kind == "site_read"]
     finder = [j for j in found if j.kind == "find_contacts"]
     report = merge_reports([j.progress.get("report") or j.result for j in searches])
@@ -5352,21 +5351,17 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
     active = (jobs.QUEUED, jobs.RUNNING)
     # Each source of the run on its own: its jobs' states and what they found.
     sources: dict[str, dict] = {}
-    for j in searches + pulls:
-        key = j.params.get("provider") or j.params.get("source") or j.kind
+    for j in searches:
+        key = j.params.get("provider") or j.kind
         s = sources.setdefault(key, {"key": key, "jobs": {}, "found": 0, "new_companies": 0,
                                      "known_companies": 0, "actual_cost": 0.0, "active": 0})
         s["jobs"][j.status] = s["jobs"].get(j.status, 0) + 1
         s["active"] += j.status in active
         s["actual_cost"] = round(s["actual_cost"] + float(j.actual_cost or 0.0), 4)
-        r = ((j.result or {}).get("report") or {}) if j.kind == "registry_pull" else (
-            j.progress.get("report") or j.result or {})
-        s["found"] += int(r.get("in_area" if j.kind == "registry_pull" else "found") or 0)
+        r = j.progress.get("report") or j.result or {}
+        s["found"] += int(r.get("found") or 0)
         for k in ("new_companies", "known_companies"):
             s[k] += int(r.get(k) or 0)
-            if j.kind == "registry_pull":
-                # (A search's are in the merged report already.)
-                report[k] += int(r.get(k) or 0)
     pools = (batch.get("params") or {}).get("pools") or {}
     looking = [j for j in finder if j.params.get("pool") == "websites"]
     websites = None
@@ -5401,7 +5396,7 @@ async def _batch_summary(state, batch_id: str) -> dict | None:
         "spend_limited": sum(1 for j in paused if j.paused_reason == jobs.SPEND_LIMIT),
         "running": any(j.status in active for j in found),
         # Searches of this run still to finish: what its Stop stops.
-        "searches_active": sum(1 for j in searches + pulls if j.status in active),
+        "searches_active": sum(1 for j in searches if j.status in active),
     }
 
 
@@ -5450,14 +5445,13 @@ def _discovery_plan(body: dict, config) -> tuple[list[dict], list[str]]:
 @app.get("/api/discover/providers")
 async def get_discovery_providers():
     """What each source does, what it costs, and whether it's ready to use:
-    the search modules' providers and every source Discover runs as a job
-    (the registry, with the filters its manifest declares); the runs still
-    working, and the newest one."""
+    the search modules' providers; the runs still working, and the newest
+    one. (The trade registry isn't a Discover source: its firms are taken
+    by Find contacts, from Companies → All firms.)"""
     try:
         from harvey.collectors.discover import DEFAULT_PROVIDER, PRESETS, provider_menu
         from harvey.config import load_env
         from harvey.modules import switches
-        from harvey.modules.job_kinds import discover_sources
 
         state = _state()
         await state.init_db()
@@ -5472,13 +5466,12 @@ async def get_discovery_providers():
             "ORDER BY b.rowid DESC LIMIT 10")
         runs = [s for s in [await _batch_summary(state, r["id"]) for r in working] if s]
         active = await query_db(
-            "SELECT kind, COUNT(*) AS n FROM jobs WHERE kind IN ('discover', 'site_read', "
-            "'registry_pull') AND status IN ('queued', 'running') GROUP BY kind")
+            "SELECT kind, COUNT(*) AS n FROM jobs WHERE kind IN ('discover', 'site_read') "
+            "AND status IN ('queued', 'running') GROUP BY kind")
         kinds = {r["kind"]: r["n"] for r in active}
         selected = await state.get_setting("discovery_provider") or DEFAULT_PROVIDER
         return {
             "providers": provider_menu(load_env().model_dump(), enabled),
-            "sources": discover_sources(enabled),
             # Presets whose module is off are hidden from the picker.
             "presets": {key: switches.capability_owner("preset", key) in enabled
                         for key in PRESETS},
@@ -5487,9 +5480,8 @@ async def get_discovery_providers():
             "selected_all": [k for k in selected.split(",") if k],
             "paused": await state.get_setting("discovery_paused"),
             "running": bool(kinds),
-            "running_kind": "discover" if kinds.get("discover") or kinds.get("registry_pull")
-                            else "profile",
-            "searches_waiting": kinds.get("discover", 0) + kinds.get("registry_pull", 0),
+            "running_kind": "discover" if kinds.get("discover") else "profile",
+            "searches_waiting": kinds.get("discover", 0),
             "sites_waiting": kinds.get("site_read", 0),
             "unprofiled": await state.count_companies_needing_profile(),
             "last_report": last,
@@ -5507,8 +5499,7 @@ async def estimate_discovery(request: Request):
     one): the sum, and each source's own. A source that can count
     (DataForSEO Business Listings) is asked how many results each search
     has first, a small paid request each, so the price is exact; the
-    answer says what counting cost. The registry's estimate is its free
-    count of the firms that match."""
+    answer says what counting cost."""
     try:
         from harvey import launch
         from harvey.config import load_config
@@ -5571,8 +5562,8 @@ def _money(value, default: float | None = None) -> float:
 @app.post("/api/discover/run")
 async def start_discovery(request: Request):
     """Queue the run and hand back at once: every source ticked in one
-    batch under one spend cap, a job per search on the source's own lane
-    and a registry pull on the registry's. Another run, of these sources or
+    batch under one spend cap, a job per search on the source's own lane.
+    Another run, of these sources or
     any other, queues behind or beside it; the same search asked again
     while it still waits is refused, naming the job already there. What
     every source saves feeds the contact finder."""
@@ -5621,7 +5612,7 @@ async def start_discovery(request: Request):
         state = _state()
         await state.init_db()
         await state.set_setting("discovery_provider",
-                                ",".join(p_.get("provider") or p_["source"] for p_ in plan))
+                                ",".join(p_["provider"] for p_ in plan))
         await state.set_setting("discovery_paused", "")
         try:
             batch_id, ids, dupes = await enqueue_sources(
@@ -5664,13 +5655,13 @@ async def start_profile():
 async def stop_discovery(request: Request):
     """Cancel what is still to finish of one run ({"batch_id"}), of one
     source within it ({"batch_id", "provider"}), or of one source in every
-    run ({"provider"}): its searches and registry pulls. A running search
+    run ({"provider"}): its searches. A running search
     stops after its page, keeping what it found; sites and contacts already
     queued are still looked at. Other runs (another source's, a command's)
     and searches paused at a spend limit or by hand are left alone."""
     try:
         from harvey.modules import jobs
-        from harvey.modules.job_kinds import discover_sources, discovery_lane
+        from harvey.modules.job_kinds import discovery_lane
 
         try:
             body = await request.json()
@@ -5682,24 +5673,20 @@ async def stop_discovery(request: Request):
         if not batch_id and not provider:
             return JSONResponse({"success": False, "message": "say which run to stop "
                                  "(batch_id) or which source (provider)"}, status_code=400)
-        jobbed = {s["key"]: s["module"] for s in discover_sources()}
         lane = None
         if not batch_id:
-            if provider in jobbed:
-                lane = jobbed[provider]
-            else:
-                try:
-                    lane = discovery_lane(provider)[0]
-                except ValueError as e:
-                    return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+            try:
+                lane = discovery_lane(provider)[0]
+            except ValueError as e:
+                return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         state = _state()
         await state.init_db()
         stopped = 0
         for job in await jobs.list_jobs(state, statuses=(jobs.QUEUED, jobs.RUNNING),
                                         batch_id=batch_id or None, lane=lane, limit=100000):
-            if job.kind not in ("discover", "registry_pull"):
+            if job.kind != "discover":
                 continue
-            key = job.params.get("provider") or job.params.get("source") or ""
+            key = job.params.get("provider") or ""
             if provider and key != provider:
                 continue
             try:
@@ -7291,9 +7278,10 @@ async def _anaf_status(state, on: set[str]) -> dict:
 
 async def _anaf_batch(state) -> tuple[bool, dict | None]:
     """Whether checks at ANAF are queued or running, and the latest
-    check's progress ({done, total, report, started_at}: companies, its
-    jobs' reports added up)."""
-    from harvey.modules import jobs
+    check's progress ({done, total, report, started_at}: CUIs, its jobs'
+    reports added up in SQL)."""
+    import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+    from harvey import queries
     from harvey.modules.runs import _new_check_report
 
     active = await query_db("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'id_check' AND "
@@ -7302,29 +7290,20 @@ async def _anaf_batch(state) -> tuple[bool, dict | None]:
                           "ORDER BY rowid DESC LIMIT 1", (ANAF_MODULE,))
     if not last:
         return bool(active and active[0]["n"]), None
-    found = [j for j in await jobs.list_jobs(state, batch_id=last[0]["batch_id"], limit=100000)
-             if j.kind == "id_check" and j.module == ANAF_MODULE]
+    batch = last[0]["batch_id"]
+    async with state._connect() as db:
+        async with db.execute(queries.sql("overlay.id_checks.progress"),
+                              (batch, ANAF_MODULE)) as cur:
+            (_jobs, total, done, checked, cached, not_found, invalid, requests, stopped,
+             started) = await cur.fetchone()
+        async with db.execute(queries.sql("overlay.id_checks.errors"),
+                              (batch, ANAF_MODULE)) as cur:
+            errors = [r[0] for r in await cur.fetchall()]
     report = _new_check_report(ANAF_MODULE)
-    done = total = 0
-    for j in found:
-        n = len(j.params.get("company_ids") or [])
-        total += n
-        if j.status == jobs.DONE:
-            done += n
-            for key, value in j.result.items():
-                if isinstance(value, int) and not isinstance(value, bool) and key in report:
-                    report[key] += value
-            report["stopped"] = j.result.get("stopped") or report["stopped"]
-        elif j.status == jobs.FAILED:
-            done += n
-            report["errors"].append(j.error)
-        else:
-            # A job part way (ten requests each): the companies it has saved.
-            done += min(n, int((j.progress or {}).get("done") or 0))
-    report["errors"] = report["errors"][:3]
-    started = min((j.created_at or "" for j in found), default="")
+    report.update(cuis=total, checked=checked, cached=cached, not_found=not_found,
+                  invalid=invalid, requests=requests, stopped=stopped or "", errors=errors)
     return bool(active and active[0]["n"]), {"done": done, "total": total, "report": report,
-                                             "started_at": started}
+                                             "started_at": started or ""}
 
 
 async def _module_refused(module_id: str, what: str) -> JSONResponse | None:
@@ -7388,11 +7367,13 @@ async def set_taxpayers_settings(request: Request):
 
 @app.post("/api/anaf/check")
 async def check_at_anaf(request: Request):
-    """Queue checks of companies at ANAF: {"ids": [...]} (a selection, or
-    one company), {"q": "..."} (every match of a search), {"missing": true}
-    (every company never checked) or {} (every company with a CUI, kept
-    answers reused). A hundred companies a job on ANAF's lane, one request
-    a second; the progress is in /api/public-data's ``anaf.job``."""
+    """Queue checks at ANAF of the CUIs some companies hold: {"ids": [...]}
+    (a selection, or one company), {"filter": ...} (the Companies page's
+    list), {"q": "..."} (every match of a search), {"missing": true} (every
+    CUI on file never checked) or {} (every CUI on file, kept answers
+    reused). A thousand CUIs a job on ANAF's lane, one request a second;
+    the answers are kept in anaf.db. The progress is in /api/public-data's
+    ``anaf.job``."""
     from harvey.modules import jobs
     from harvey.modules.job_kinds import enqueue_id_checks
 
@@ -7412,8 +7393,12 @@ async def check_at_anaf(request: Request):
     await state.init_db()
     if ids is None and q.strip():
         ids, request.state.matched = await _search_all_ids(state, q)
+    if ids is not None:
+        selection = {"firms": [i for i in ids if str(i).isdigit()]}
+    else:
+        selection = {"missing": True} if missing else {"all": True}
     batch_id = await jobs.new_batch(state, "id_check", "ANAF", params={"missing": missing})
-    queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", ids,
+    queued, dupes = await enqueue_id_checks(state, ANAF_MODULE, "company_check", selection,
                                             missing_only=missing, batch_id=batch_id)
     if not queued:
         # Nothing new queued: no empty run left behind.

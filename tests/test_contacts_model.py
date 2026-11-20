@@ -609,7 +609,7 @@ def test_registry_administrators_are_people_to_search_whatever_is_confirmed(tmp_
 
     async def go():
         s = await _state(db)
-        await slim.pull(s, firm, dataset=dataset,
+        await slim.seed(s, firm, dataset=dataset,
                         people=[(firm.reg, "POPESCU ION", "administrator")])
         return s, await s.read("people_page", contacts.ContactFilter(), "first_seen", "desc",
                                50, 0)

@@ -273,8 +273,8 @@ statement("overlay.read.kind_firms",
                             "filters read the firm's own counts)"})
 statement("overlay.read.source_firms",
           "SELECT firm FROM firm_source WHERE source = ?", params=(1,),
-          scans={"firm_source": "the firms one source found: its index range (every pulled "
-                                "firm for a register's pull)"})
+          scans={"firm_source": "the firms one source found: its index range (every "
+                                "firm that took a register's entry, for a register)"})
 # The distinct values of an index, one seek each (a DISTINCT would walk it).
 statement("overlay.read.firm_source_names",
           "WITH RECURSIVE s(v) AS (SELECT MIN(source) FROM firm_source UNION ALL "
@@ -1009,6 +1009,14 @@ statement("overlay.jobs.release_held",
           "WHERE batch_id = ? AND status = 'queued' AND started_at IS NULL", params=("b",))
 statement("overlay.jobs.drop_held",
           "DELETE FROM jobs WHERE batch_id = ? AND started_at IS NULL", params=("b",))
+# The rows of a kind of job no code runs any more (jobs.RETIRED: kind ->
+# the code they end with), cancelled when a worker starts.
+statement("overlay.jobs.cancel_retired",
+          "UPDATE jobs SET status = 'cancelled', "
+          "error = (SELECT r.value FROM json_each(?1) r WHERE r.key = jobs.kind), "
+          "paused_reason = '', finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+          "WHERE status IN ('queued', 'paused') AND kind IN (SELECT key FROM json_each(?1))",
+          params=('{"registry_pull": "retired"}',))
 # The plans a run belongs to, and whether all its jobs have finished.
 statement("overlay.agent.batch_plans",
           "SELECT DISTINCT plan FROM agent_action INDEXED BY agent_action_batch "
@@ -1829,3 +1837,143 @@ statement("overlay.records.keyed",
           "SELECT k.record FROM temp.keying k CROSS JOIN firm_ident i "
           "WHERE i.scheme = ? AND i.key = +k.cui AND i.firm = k.record",
           params=(1,), drives="k")
+
+
+# ── Checks by legal identifier at an outside service (ANAF), queued by
+#    Store.queue_id_checks ──
+#
+# The identifiers a check asks about are picked into ``id_pick`` (one row
+# per key, with the live firm it was picked for when a Find-contacts run
+# waits on the check), then cut into jobs of ``size`` keys in key order
+# (``id_part``: each job's keys and firms as JSON arrays, and its dedupe
+# key), and the jobs written from there in one INSERT. Nothing of the
+# selection is read into Python.
+ID_CHECK_TABLES = {
+    "id_pick": "CREATE TEMP TABLE IF NOT EXISTS id_pick (cui INTEGER PRIMARY KEY, firm INTEGER)",
+    "id_part": "CREATE TEMP TABLE IF NOT EXISTS id_part ("
+               "part INTEGER PRIMARY KEY, cuis TEXT NOT NULL, firms TEXT NOT NULL, "
+               "dedupe TEXT NOT NULL)",
+}
+for _table in ID_CHECK_TABLES:
+    statement(f"overlay.id_checks.clear.{_table}", f"DELETE FROM temp.{_table}")
+
+
+def _cui_key(cuis: str, missing_only: int) -> str:
+    """A check's dedupe identity: its exact keys (the JSON array, in key
+    order) and whether it asks only about keys never answered."""
+    import hashlib
+
+    raw = f"{cuis}|{int(bool(missing_only))}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:20]
+
+
+def register_functions(con) -> None:
+    """The SQL functions the id-check statements call, on ``con``."""
+    con.create_function("cui_key", 2, _cui_key, deterministic=True)
+
+
+# The keys given (param: a JSON array of whole numbers; anything else in it
+# is left out).
+statement("overlay.id_checks.pick.keys",
+          "INSERT OR IGNORE INTO temp.id_pick (cui) SELECT value FROM json_each(?) "
+          "WHERE type = 'integer' AND value > 0",
+          params=("[1, 2]",))
+# Every key of a scheme Harvey holds (param: the scheme's id).
+statement("overlay.id_checks.pick.all",
+          "INSERT OR IGNORE INTO temp.id_pick (cui) SELECT key FROM firm_ident WHERE scheme = ?",
+          params=(1,),
+          scans={"firm_ident": "every key of one scheme, read once by the primary key's range "
+                               "to queue a check of them all (the user's own request)"})
+# The keys of a scheme the firms given hold (params: a JSON array of firm
+# ids, the scheme's id), each with the live firm it stands for: a merged
+# record's id is followed to its survivor, and every record of that firm
+# gives its keys.
+statement("overlay.id_checks.pick.firms",
+          "WITH g(live) AS (SELECT DISTINCT CASE f.live WHEN 0 THEN f.id ELSE f.live END "
+          "FROM json_each(?1) j CROSS JOIN firm f WHERE f.id = j.value), "
+          "r(id, live) AS (SELECT live, live FROM g UNION ALL "
+          "SELECT m.id, g.live FROM g CROSS JOIN firm m WHERE m.live = g.live AND m.live != 0) "
+          "INSERT OR IGNORE INTO temp.id_pick (cui, firm) SELECT fi.key, r.live "
+          "FROM r CROSS JOIN firm_ident fi WHERE fi.firm = r.id AND fi.scheme = ?2",
+          params=("[1, 2]", 1))
+# The picked keys cut into jobs of ``size`` in key order (params: size,
+# whether only keys never answered are asked, the job's dedupe prefix).
+# Each part's keys and firms are read in key order from the picked table,
+# so the same keys give the same array, and the same dedupe key.
+statement("overlay.id_checks.parts",
+          "INSERT INTO temp.id_part (part, cuis, firms, dedupe) "
+          "SELECT p.part, p.cuis, p.firms, ?3 || cui_key(p.cuis, ?2) FROM ("
+          "SELECT b.part, "
+          "(SELECT json_group_array(x.cui) FROM (SELECT cui FROM temp.id_pick "
+          "WHERE cui BETWEEN b.lo AND b.hi ORDER BY cui) x) AS cuis, "
+          "(SELECT json_group_array(y.firm) FROM (SELECT DISTINCT CAST(firm AS TEXT) AS firm "
+          "FROM temp.id_pick WHERE cui BETWEEN b.lo AND b.hi AND firm IS NOT NULL "
+          "ORDER BY 1) y) AS firms "
+          "FROM (SELECT (n - 1) / ?1 AS part, MIN(cui) AS lo, MAX(cui) AS hi FROM ("
+          "SELECT cui, row_number() OVER (ORDER BY cui) AS n FROM temp.id_pick) GROUP BY part"
+          ") b) p",
+          params=(1000, 0, "id_check:anaf:company_check:"))
+# One job per part (params: lane, module, capability, label prefix, whether
+# only keys never answered are asked, whether the run's search waits on it,
+# batch, parent). A part an open job already asks the same is skipped
+# (the open-dedupe index); the new jobs' ids come back.
+statement("overlay.id_checks.queue",
+          "INSERT OR IGNORE INTO jobs (id, kind, lane, module, capability, label, params_json, "
+          "dedupe_key, batch_id, parent_id) "
+          "SELECT lower(hex(randomblob(6))), 'id_check', ?1, ?2, ?3, "
+          "?4 || ': ' || json_array_length(p.cuis) "
+          "|| CASE json_array_length(p.cuis) WHEN 1 THEN ' CUI' ELSE ' CUIs' END, "
+          "CASE WHEN ?6 THEN json_set(json_object('module', ?2, 'capability', ?3, "
+          "'cuis', json(p.cuis), 'missing_only', json(CASE WHEN ?5 THEN 'true' ELSE 'false' END)), "
+          "'$.then_find', json('true'), '$.company_ids', json(p.firms)) "
+          "ELSE json_object('module', ?2, 'capability', ?3, 'cuis', json(p.cuis), "
+          "'missing_only', json(CASE WHEN ?5 THEN 'true' ELSE 'false' END)) END, "
+          "p.dedupe, ?7, ?8 FROM temp.id_part p ORDER BY p.part RETURNING id",
+          params=("anaf", "anaf", "company_check", "ANAF", 0, 0, "", ""))
+# The open jobs that already ask what a part would (param: the new jobs'
+# ids, as a JSON array): the duplicates.
+statement("overlay.id_checks.dupes",
+          "SELECT j.id FROM temp.id_part p CROSS JOIN jobs j "
+          "WHERE j.dedupe_key = p.dedupe AND j.status IN ('queued', 'running', 'paused') "
+          "AND j.id NOT IN (SELECT value FROM json_each(?)) ORDER BY p.part",
+          params=("[]",), drives="p", bounded=True)
+# An older check's keys, from the companies it named (params: a JSON array
+# of firm ids, the scheme's id): what such a job asks about when it runs.
+statement("overlay.id_checks.keys_of",
+          "SELECT DISTINCT fi.key FROM json_each(?1) j CROSS JOIN firm f "
+          "CROSS JOIN firm r CROSS JOIN firm_ident fi "
+          "WHERE f.id = j.value AND r.id = CASE f.live WHEN 0 THEN f.id ELSE f.live END "
+          "AND fi.firm = r.id AND fi.scheme = ?2 "
+          "UNION SELECT fi.key FROM json_each(?1) j CROSS JOIN firm f CROSS JOIN firm m "
+          "CROSS JOIN firm_ident fi WHERE f.id = j.value "
+          "AND m.live = CASE f.live WHEN 0 THEN f.id ELSE f.live END AND m.live != 0 "
+          "AND fi.firm = m.id AND fi.scheme = ?2 ORDER BY 1",
+          params=("[1, 2]", 1), bounded=True)
+# A check run's progress, its jobs added up (param: the batch): their
+# keys (an older job's companies), how far each got, and what the finished
+# ones counted.
+statement("overlay.id_checks.progress",
+          "SELECT COUNT(*), COALESCE(SUM(n), 0), "
+          "COALESCE(SUM(CASE WHEN status IN ('done', 'failed') THEN n ELSE MIN(n, done) END), 0), "
+          "COALESCE(SUM(CASE status WHEN 'done' THEN checked END), 0), "
+          "COALESCE(SUM(CASE status WHEN 'done' THEN cached END), 0), "
+          "COALESCE(SUM(CASE status WHEN 'done' THEN not_found END), 0), "
+          "COALESCE(SUM(CASE status WHEN 'done' THEN invalid END), 0), "
+          "COALESCE(SUM(CASE status WHEN 'done' THEN requests END), 0), "
+          "MAX(CASE status WHEN 'done' THEN stopped END), MIN(created_at) FROM ("
+          "SELECT status, created_at, "
+          "COALESCE(json_array_length(params_json, '$.cuis'), "
+          "json_array_length(params_json, '$.company_ids'), 0) AS n, "
+          "COALESCE(json_extract(progress_json, '$.done'), 0) AS done, "
+          "COALESCE(json_extract(result_json, '$.checked'), 0) AS checked, "
+          "COALESCE(json_extract(result_json, '$.cached'), 0) AS cached, "
+          "COALESCE(json_extract(result_json, '$.not_found'), 0) AS not_found, "
+          "COALESCE(json_extract(result_json, '$.invalid'), 0) AS invalid, "
+          "COALESCE(json_extract(result_json, '$.requests'), 0) AS requests, "
+          "NULLIF(json_extract(result_json, '$.stopped'), '') AS stopped "
+          "FROM jobs WHERE batch_id = ? AND kind = 'id_check' AND module = ?)",
+          params=("b1", "anaf"))
+statement("overlay.id_checks.errors",
+          "SELECT error FROM jobs WHERE batch_id = ? AND kind = 'id_check' AND module = ? "
+          "AND status = 'failed' LIMIT 3",
+          params=("b1", "anaf"))

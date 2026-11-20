@@ -2,7 +2,7 @@
 
 An entry names what must never be emailed, keyed on what it names and never
 on a contact, prospect or firm row, so it survives merges, their undo, a
-contact deleted and found again, and a firm removed and pulled again:
+contact deleted and found again, and a firm removed and given a new record:
 
 - an address (normalised: lowercase, an international domain in its ASCII
   form); a plus-tagged variant of it is covered too;
@@ -11,10 +11,10 @@ contact deleted and found again, and a firm removed and pulled again:
 - a domain, with its subdomains (a free-mail domain is refused: it would
   bar every address there);
 - a firm: "<legal scheme>:<key>" when its records hold a legal identifier
-  (a tax code outlives every merge and re-pull), else "firm:<live id>",
+  (a tax code outlives every merge and new record), else "firm:<live id>",
   matched through firm.live (a record merged into it later is covered),
   with a domain entry for its own domain beside it (unless free mail), so
-  it outlives the firm's removal and a pull again too.
+  it outlives the firm's removal and a new record too.
 
 ``check()`` is the one reader: the send gate, the audience, the Writer, the
 exports and the Handler all ask it. The operator's tracked
@@ -230,7 +230,7 @@ def add(con: sqlite3.Connection, scope: str, value, reason, *, by: str, campaign
          (note or "")[:NOTE_MAX], int(time.time()), by or ""))
     made = cur.lastrowid if cur.rowcount else None
     if scope == "firm" and key.startswith("firm:"):
-        # No tax code to outlive the firm's removal and a pull again: its
+        # No tax code to outlive the firm's removal and a new record: its
         # own domain (never a free-mail one) is barred too, which does.
         row = con.execute("SELECT domain FROM firm WHERE id = ?", (int(key[5:]),)).fetchone()
         domain = normalize_domain(row[0] if row else "")

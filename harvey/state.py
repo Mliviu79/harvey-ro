@@ -621,8 +621,8 @@ class StateManager:
             raise UpgradeNeeded(version)
         await asyncio.to_thread(_check_shape, self.db_path, overlay_schema)
         # Only what modules declare is brought in (looked at first: most
-        # starts have nothing to write, and a page must not wait on a
-        # registry pull's write lock).
+        # starts have nothing to write, and a page must not wait on
+        # another writer's lock).
         if await asyncio.to_thread(store.call, self.db_path, "dictionaries_stale"):
             await self._on_overlay("sync_dictionaries")
 
@@ -755,11 +755,6 @@ class StateManager:
         outreach."""
         return await self._on_overlay("remove_company", company_id)
 
-    async def pull_records(self, records, **kwargs) -> list[tuple[str, bool, bool, bool]]:
-        """A register pull's records marked as Harvey's in one bulk write
-        (overlay.store.Store.pull)."""
-        return await self._on_overlay("pull", records, **kwargs)
-
     async def ensure_registry_records(self, *, regs=None, query=None, limit=None,
                                       **kwargs) -> dict:
         """A record for every firm of a registry selection (registration
@@ -783,17 +778,10 @@ class StateManager:
         return await self._on_overlay("registry_entry", company_id)
 
     async def take_from_registry(self, company_id: str, run_id: str = "") -> dict:
-        """What a registry pull gave a firm, for a record made for a
-        registry selection that holds nothing of its own (overlay.store.
-        Store.take_from_registry)."""
+        """A firm's registry entry, taken when work starts on a record made
+        for a registry selection that holds nothing of its own
+        (overlay.store.Store.take_from_registry)."""
         return await self._on_overlay("take_from_registry", company_id, run_id)
-
-    async def match_records(self, records) -> tuple[int, list]:
-        """A register pull's records matched in a read transaction, before
-        pull_records writes them (overlay.store.Store.match_records)."""
-        from harvey.overlay import store
-
-        return await asyncio.to_thread(store.call, self.db_path, "match_records", records)
 
     async def held_ids(self, scheme: str, keys) -> dict:
         """{key: the company holding it} for keys of an identifier scheme
@@ -2335,12 +2323,22 @@ class StateManager:
             min_confidence=min_confidence)
         return [r["id"] for r in rows]
 
-    async def companies_with_id(self, kind: str, company_ids=None) -> list[dict]:
-        """Companies on file (not merged away) holding an identifier of
-        ``kind`` (a CUI): ``{"id", "name", "value"}``, one row per
-        identifier, in company id order (then value), a company's rows
-        together. Only ``company_ids`` when given."""
-        return await self._on_overlay("companies_with_id", kind, company_ids)
+    async def queue_id_checks(self, selection: dict, **kwargs) -> tuple[list[str], list[str]]:
+        """Queue id_check jobs over a selection of identifiers, by SQL in
+        one write (overlay.store.Store.queue_id_checks). Returns (new job
+        ids, the ids of open jobs that were duplicates)."""
+        return await self._on_overlay("queue_id_checks", selection, **kwargs)
+
+    async def id_keys_of(self, kind: str, company_ids) -> list[int]:
+        """The identifiers of ``kind`` (a CUI) these companies hold, in key
+        order (overlay.store.Store.id_keys_of)."""
+        return await self._on_overlay("id_keys_of", kind, company_ids)
+
+    async def take_register_phones(self, company_id) -> int:
+        """The phones the loaded registers hold for a company, as its
+        contacts, when work starts for it (overlay.store.Store.
+        take_register_phones). How many are on file."""
+        return await self._on_overlay("take_register_phones", company_id)
 
     async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
         """Companies currently ranked (or in the pack) for this search phrase."""

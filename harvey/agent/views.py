@@ -495,11 +495,12 @@ def _job(job, lanes: dict | None = None) -> dict:
 
 # ── estimate() ──
 
-async def estimate(state, action: str, params: dict | None) -> dict:
+async def estimate(state, action: str, params: dict | None, writer=None) -> dict:
     """The estimate the dashboard shows before a run: ``discover``
     (provider, cities, terms, preset, depth, limit), ``registry`` (the
     registry's filters: words, county, locality, status, turnover and
-    headcount bounds, employer, vat, micro), ``find_contacts`` (a Contacts
+    headcount bounds, employer, vat, micro; the firms a Find-contacts run
+    from the registry would take, with ``writer``), ``find_contacts`` (a Contacts
     filter: county, locality, caen, website, kind, ...; force, limit) or
     ``verify`` (contact_ids, or a Contacts filter and limit). Nothing is
     queued, spent or asked of a source."""
@@ -508,7 +509,7 @@ async def estimate(state, action: str, params: dict | None) -> dict:
     if action == "discover":
         return _discover_estimate(state, p)
     if action == "registry":
-        return await _registry_estimate(p)
+        return await _registry_estimate(writer, p)
     if action == "find_contacts":
         return await _find_estimate(state, p)
     if action == "verify":
@@ -553,21 +554,30 @@ def _discover_estimate(state, p: dict) -> dict:
                     "Not counted at the source (that is a paid request)."}
 
 
-async def _registry_estimate(p: dict) -> dict:
-    from harvey.modules.job_kinds import registry_count, registry_plan
+async def _registry_estimate(writer, p: dict) -> dict:
+    """What a Find-contacts run from the trade registry would take, counted
+    as its estimate counts it (launch.registry_selection with nothing
+    made): the firms the registry's filters select, those with a record
+    in Harvey, those that would get one, those left for a later run, and
+    those left out. ``writer``: the actions' StateManager, whose overlay
+    has the registry attached (nothing is written: no write lock)."""
+    from harvey import launch
+    from harvey.modules import switches
 
+    if writer is None:
+        raise readonly.Refused("the registry can't be counted here")
+    if "regs" in p:
+        raise readonly.Refused("chosen firms are a set of='registry' (find_contacts takes it); "
+                               "estimate the registry's filters here")
     try:
-        params = registry_plan(p)
-    except ValueError as e:
-        raise readonly.Refused(str(e))
-    label = params.pop("label")
-    try:
-        n = await asyncio.to_thread(registry_count, params)
+        got = await launch.registry_selection(writer, p, create=False)
+    except (ValueError, RuntimeError, switches.ModuleOff) as e:
+        raise readonly.Refused(str(e).strip("'\"")) from None
     except FileNotFoundError as e:
-        return {"label": label, "firms": None, "note": f"{e} (the filter needs it)"}
-    return {"label": label, "firms": n, "cost_usd": 0.0,
-            "note": "free: counted in the registry on file" if n is not None
-                    else "no registry loaded yet"}
+        return {"selected": None, "note": f"{e} (the selection needs it)"}
+    return {**{k: got[k] for k in ("selected", "existing", "to_create", "left", "excluded",
+                                   "unkeyable")},
+            "cost_usd": 0.0, "note": got["note"]}
 
 
 async def _contact_filter(state, p: dict):

@@ -1,11 +1,12 @@
-"""The Registry page: the whole trade registry (data/registry.db) browsed
-with each firm's latest financial statements beside it, filtered the way a
-registry pull is, sorted, and paged like the Companies page.
+"""Companies → All firms: the whole trade registry (data/registry.db)
+browsed in place with each firm's latest financial statements beside it,
+filtered the way a Find-contacts run from the registry selects, sorted,
+and paged like the Companies page.
 
-The filters are the registry source's own (the onrc module's manifest,
-read by job_kinds.registry_params), resolved by the registry's own search
-(registry.resolve): the page lists exactly the firms a pull of the same
-filters would save, and can pull them.
+The filters are the registry's own (the onrc module's manifest
+[register], read by job_kinds.registry_params), resolved by the
+registry's own search (registry.resolve): the page lists exactly the
+firms a Find-contacts run with the same filters would take.
 
 Paging. The first request for a filter and sort orders every matching
 firm once, as an array of registry ids, and keeps it for a few minutes
@@ -156,7 +157,7 @@ def connect() -> sqlite3.Connection:
 
 
 def resolve(con, params: dict) -> registry.Query:
-    """A registry pull's parameters (job_kinds.registry_params) as the
+    """A registry selection's parameters (job_kinds.registry_params) as the
     registry's resolved query."""
     from harvey.modules.job_kinds import _filters
 

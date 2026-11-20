@@ -91,7 +91,7 @@ queries.statement(
     "SELECT f.reg FROM {alias}.firm_fts t CROSS JOIN {alias}.firms f "
     "WHERE t.firm_fts MATCH ? AND f.id = t.rowid AND f.cui = ''",
     params=("tags : c8623r3",), module=MODULE, drives="t")
-# The Registry page's list by name with nothing but words, area and status
+# The All firms list by name with nothing but words, area and status
 # (registry_view._index_page, on the registry's own connection: alias
 # ``main``): the full-text index counted, then a page of it in its rowid
 # order, which is the name order (the load numbers firms by name, as
@@ -245,8 +245,8 @@ queries.statement(
 
 # ── Records for a selection of firms (overlay.store.Store.
 #    ensure_registry_records) ──
-# Registration numbers one selection may name (a selection on the Registry
-# page, a pull of chosen firms, the keys statement's one JSON list).
+# Registration numbers one selection may name (rows ticked on All firms, a
+# set of the agent's, the keys statement's one JSON list).
 REGS_MAX = 10_000
 # A selection goes into temp.registering (overlay/queries.py) as its firms'
 # canonical rows (derived firm_key: a CUI's one row, or the row of a firm
@@ -262,8 +262,8 @@ REGS_MAX = 10_000
 # CUI isn't one the core can key by: derived.CUI_OK; written by its own row
 # id, negated, so it never meets a firm's); 2, a firm whose declared
 # website is on the do-not-contact list (that domain, or one under it: the
-# label boundary of gate.do_not_contact_domain_match), as a pull leaves it
-# out (ingest.excluded).
+# label boundary of gate.do_not_contact_domain_match), as ingest.excluded
+# leaves it out.
 # The probes in firm_ident are by (scheme, key), compared with no affinity
 # (``+``) so the probe keeps the key. A firm's number is its canonical
 # row's, else any other registration of its CUI (read through the index on
@@ -392,7 +392,7 @@ queries.statement(
 
 @lru_cache(maxsize=20_000)
 def place(locality, county) -> str:
-    """The place line a pull gives a firm ("Town, County, Romania")."""
+    """The place line a firm's registry entry gives it ("Town, County, Romania")."""
     from types import SimpleNamespace
 
     from harvey.collectors.onrc import _location
@@ -659,7 +659,7 @@ class Adapter(Base):
         return self.sql("records.firms")
 
     def pull_record(self, con, key, scheme: str = "ro.cui"):
-        """One firm as the record a pull reads it as (collectors.onrc.
+        """One firm as the record its registry entry is read as (collectors.onrc.
         firms_draft: its identifiers, place, declared website and domain,
         its source), by CUI or registration number; None when the registry
         has no such firm. Its administrators are left in the registry: the
@@ -755,7 +755,7 @@ class Adapter(Base):
         return [r[0] for r in con.execute(self.sql("name_key.holders"), (key, town))]
 
     def resolve_ids(self, filters: dict) -> list[int]:
-        """The registry ids the Registry page's search finds for these
+        """The registry ids the All firms search finds for these
         filters (words, county, locality, status "all"), in its order: read
         on its own connection to the registry file."""
         from harvey import registry
@@ -791,7 +791,7 @@ class Adapter(Base):
         return out
 
     def resolve(self, filters: dict) -> list[tuple[str, object]]:
-        """The keys the Registry page's search finds for these filters, in
+        """The keys the All firms search finds for these filters, in
         its order (resolve_ids' rows as the core's keys)."""
         ids = self.resolve_ids(filters)
         mapper = sqlite3.connect(":memory:", uri=True)

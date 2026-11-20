@@ -17,7 +17,7 @@ SQLite database, data/registry.db, beside the working one (harvey.db):
     caen_fts         full-text index over class names and everyday words
     meta             which dataset this is, when it was loaded, counts
 
-The same rules as the streaming import apply when loading: no personal
+When loading, no personal
 numeric code (CNP) where a CUI goes, no birth data or home locality of a
 representative (those columns are never read). A new dataset is built in
 a temporary file and renamed over the old one, so a reader never sees a
@@ -26,10 +26,11 @@ half-loaded registry.
 ``search()`` answers words the way harvey search does (every word must
 match, accent-insensitive, prefixes, a 4-digit code exact, -word excludes),
 with activity words resolved to CAEN classes first: "dentist" finds firms
-authorised for dental practice, whatever they are called. ``search_draft()``
-reads the firms a query matches as the onrc module's draft; core copies
-them into the working database (harvey/modules/runs.py, registry_pull),
-under the same identity, fill-gaps and confirmation rules as any source.
+authorised for dental practice, whatever they are called. Nothing here
+copies a firm into the working database: a firm gets its record in
+harvey.db only when work starts on it (overlay.store.Store.
+ensure_registry_records, then take_from_registry), and is read here in
+place.
 """
 
 from __future__ import annotations
@@ -536,7 +537,7 @@ class Query:
     places: list[str] = field(default_factory=list)
     # Bounds on the latest filed year's turnover and headcount (a
     # mf_financials store.Filter), checked in data/financials.db before
-    # anything is read or pulled; and where that database is.
+    # any firm is read or given a record; and where that database is.
     fin: object = None
     fin_path: Path | None = None
     # Yes/no conditions from the taxpayer file (a mf_taxpayers
@@ -545,8 +546,8 @@ class Query:
     tax: object = None
     tax_path: Path | None = None
     all_statuses: bool = False
-    # Registry ids of firms chosen one by one (a selection on the Registry
-    # page): the query is exactly these, whatever else it says.
+    # Registry ids of firms chosen one by one (rows ticked on Companies ->
+    # All firms): the query is exactly these, whatever else it says.
     firm_ids: list[int] | None = None
     # With match EVERY: the firms to leave out, as a full-text expression
     # ("-auto" with every status).
@@ -554,8 +555,7 @@ class Query:
 
     @property
     def classes(self) -> list[tuple[str, int | None]]:
-        """The classes the request named, in rank order: what pull records
-        as ACTIVITY_CODE and picks the industry from."""
+        """The classes the request named, in rank order."""
         return list(dict.fromkeys(self.explicit_classes + self.keyword_classes
                                   + self.name_classes))
 
@@ -619,7 +619,7 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
     "86.23", "8623/2" for Rev.2 only); "-word" must not; single letters
     are dropped, except a county code ("B" is București, "BV" Brașov).
     ``classes`` (code, version or None), ``counties`` (registry spelling)
-    and ``localities`` are filters on top, as import-onrc gives them;
+    and ``localities`` are filters on top;
     ``fin`` bounds turnover and headcount (financials.db at ``fin_path``),
     ``tax`` asks for employers, VAT payers or micro-enterprises (taxpayers.db
     at ``tax_path``). Operating firms only, unless ``all_statuses``.
@@ -696,7 +696,7 @@ def resolve(con, words: str = "", *, classes=None, counties=None, localities=Non
         for code, version in q.explicit_classes:
             expanded += [(code, v) for v in ((version,) if version is not None else CURRENT)]
         parts.append(_tags(expanded))
-    # A county filter in any spelling the pull takes ("Brașov", "BV",
+    # A county filter in any spelling a selection takes ("Brașov", "BV",
     # "județul Brașov"); an unknown one is refused, never dropped (which
     # would search the whole country).
     given = []
@@ -1015,53 +1015,3 @@ def _status_names() -> dict[str, str]:
     if _STATUS_NAMES is None:
         _STATUS_NAMES = onrc.status_names()
     return _STATUS_NAMES
-
-
-# ── Reading chosen firms for the working database ──
-
-def firms_for_pull(con, ids: list[int], with_administrators: bool = True):
-    """(Firms, reg -> classes, reg -> administrators) for these ids, in the
-    shapes onrc.firms_draft takes."""
-    firms, codes, people = [], {}, {}
-    for start in range(0, len(ids), 900):
-        chunk = ids[start:start + 900]
-        marks = ",".join("?" * len(chunk))
-        regs = {}
-        for r in con.execute(f"SELECT * FROM firms WHERE id IN ({marks})", chunk):
-            regs[r["id"]] = r["reg"]
-            firms.append((r["id"], onrc.Firm(
-                reg=r["reg"], name=r["name"], cui=r["cui"], form=r["form"],
-                county=r["county"], locality=r["locality"], address=r["address"],
-                website=r["website"], domain=r["domain"], registered=r["registered"])))
-        for r in con.execute(f"SELECT firm_id, code, version FROM firm_caen "
-                             f"WHERE firm_id IN ({marks}) ORDER BY firm_id, code, version",
-                             chunk):
-            codes.setdefault(regs[r[0]], []).append((f"{r[1]:04d}", r[2]))
-        if with_administrators:
-            for r in con.execute(f"SELECT firm_id, first_name, last_name, role "
-                                 f"FROM administrators WHERE firm_id IN ({marks}) "
-                                 f"ORDER BY rowid", chunk):
-                people.setdefault(regs[r[0]], []).append((r[1], r[2], r[3]))
-    order = {i: n for n, i in enumerate(ids)}
-    firms.sort(key=lambda pair: order[pair[0]])
-    return [f for _, f in firms], codes, people
-
-
-def dataset_of(con) -> onrc.Dataset:
-    meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
-    return onrc.Dataset(meta.get("dataset", ""), meta.get("date", ""), {})
-
-
-def search_draft(con, q: Query, *, limit: int | None = None,
-                 with_administrators: bool = True):
-    """The firms a resolved query matches (the first ``limit``, best first)
-    as a Draft (onrc.firms_draft): ``counts["matched"]`` how many,
-    ``values["dataset"]`` the registry's dataset."""
-    ids = matching_ids(con, q, limit) if q.match or q.firm_ids is not None else []
-    firms, codes, people = firms_for_pull(con, ids, with_administrators)
-    dataset = dataset_of(con)
-    draft = onrc.firms_draft(firms, dataset, codes=codes, people=people, classes=q.classes,
-                             with_administrators=with_administrators)
-    draft.counts["matched"] = len(ids)
-    draft.values["dataset"] = dataset
-    return draft

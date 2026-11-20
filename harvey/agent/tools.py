@@ -12,8 +12,8 @@ rows as a sample) and masked (readonly.mask_result: no email address or
 phone number in full).
 
 The action tools (actions.py) propose a plan, save a set, and queue the
-runs a user's button queues (discover, registry_pull, find_contacts,
-verify_contacts), only under a plan of this chat the user approved and
+runs a user's button queues (discover, find_contacts, verify_contacts),
+only under a plan of this chat the user approved and
 within its budget, through the same code the dashboard's endpoints run;
 cancel_run and plan_status follow them; schedule_wake asks Harvey to wake
 the agent later under the plan (wakes.py). remember, forget and notes keep
@@ -65,10 +65,10 @@ INSTRUCTIONS = (
     "tables and their join rules, query() for one SELECT (rows come back as a sample with "
     "their total), estimate() for what a run would cost; areas(), plan_cells(), terms() and "
     "phrase_yield() for where and what to search. To act: propose_plan() with a "
-    "budget, wait for the user to approve it, then discover(), registry_pull(), "
-    "find_contacts() or verify_contacts() under it, on a filter or a saved set "
-    "(save_set()), and follow the runs with plan_status(); schedule_wake() to look again "
-    "later. Campaigns: save_audience(), create_campaign() (a draft), campaign_preview(), "
+    "budget, wait for the user to approve it, then discover(), find_contacts() (also "
+    "from the trade registry: registry=its filters, or a set of='registry') or "
+    "verify_contacts() under it, on a filter or a saved set (save_set()), and follow the "
+    "runs with plan_status(); schedule_wake() to look again later. Campaigns: save_audience(), create_campaign() (a draft), campaign_preview(), "
     "request_start() (the user starts it), campaign_status(), replies(), draft_reply() "
     "(queued for the user's review), suppress(). "
     "remember() and save_playbook() keep what worked for later conversations. "
@@ -384,12 +384,20 @@ def build(db_path: str, chat: str = "", task: int | None = None):
     @tool("What a run would do and cost, before anything runs (nothing is queued or spent). "
           "action: discover (params: provider, cities, terms, preset, depth, limit), "
           "registry (words, county, locality, status, min/max_turnover, min/max_employees, "
-          "employer, vat, micro), find_contacts (a Contacts filter: county, locality, caen, "
-          "website, kind, ...; force, limit) or verify (contact_ids, or a Contacts filter "
-          "and limit).")
+          "unknown, employer, vat, micro: what find_contacts(registry=...) would take, counted: "
+          "the firms selected, those with a record in Harvey, those that would get one, those "
+          "left for a later run, those left out), find_contacts (a Contacts filter: county, "
+          "locality, caen, website, kind, ...; force, limit) or verify (contact_ids, or a "
+          "Contacts filter and limit).")
     async def estimate(action: str, params: dict | None = None) -> str:
         return await t.call("estimate", {"action": action, "params": params or {}},
-                            lambda: views.estimate(t.state, action, params or {}))
+                            lambda: estimating(action, params or {}))
+
+    async def estimating(action: str, params: dict):
+        # (The registry is counted on the actions' overlay, which has it
+        # attached: nothing is written.)
+        writer = await a.state() if (action or "").strip().lower() == "registry" else None
+        return await views.estimate(t.state, action, params, writer=writer)
 
     @tool("The job queue, read only. action: list (lane, status: queued, running, paused, "
           "done, failed, cancelled; limit: 10 by default, 50 at most), get (id: a job id or "
@@ -545,36 +553,31 @@ def build(db_path: str, chat: str = "", task: int | None = None):
             websites_max_spend, find_websites, classify_max_spend, areas))
 
     from harvey.modules.job_kinds import REGS_MAX
-
-    @tool("Queue a registry pull under an approved plan, as the Registry page does: filters "
-          "(the registry's: words, county, locality, status, min/max_turnover, "
-          "min/max_employees, unknown, employer, vat, micro) or set (a SELECT set of "
-          f"'registry' registration numbers, {REGS_MAX:,} at most). Free; websites_max_spend "
-          "for paid website lookups of the firms it saves, classify_max_spend for the "
-          "classifier, both from the plan's budget.", queues)
-    async def registry_pull(plan: int, filters: dict | None = None, set: int | None = None,
-                            websites_max_spend: float = 0.0,
-                            classify_max_spend: float = 0.0) -> str:
-        args = {"plan": plan, "filters": filters or {}, "set": set,
-                "websites_max_spend": websites_max_spend,
-                "classify_max_spend": classify_max_spend}
-        return await acting("registry_pull", args, lambda turn: a.registry_pull(
-            turn, plan, filters, set, websites_max_spend, classify_max_spend))
+    from harvey.overlay.store import RECORDS_MAX
 
     @tool("Queue the contact finder under an approved plan, as Contacts → Find contacts "
-          "does: set (a set of firms: its frozen ids) or filter; max_spend (website searches "
-          "and address checks, USD; 0: websites read only, free), classify_max_spend (its "
-          "classifier calls; 0: none, a site no register fact settles waits), force (search "
-          "again what was searched), limit. Firms with a contact already are skipped unless "
-          f"force; at most {launch.FIND_MAX:,} companies a run (the newest first). Returns the "
-          "run's id, the caps, the estimate and what remains.", queues)
+          "does: set (a set of firms: its frozen ids) or filter; or from the trade registry, "
+          "as Companies → All firms does: registry (the registry's filters: words, county, "
+          "locality, status, min/max_turnover, min/max_employees, unknown, employer, vat, "
+          "micro) or set (a SELECT set of 'registry' registration numbers, "
+          f"{REGS_MAX:,} at most). A registry firm with no record in Harvey gets one when the "
+          f"run is queued (limit at most, {RECORDS_MAX:,} at most a run; the rest are left "
+          "for a later run) and is checked at ANAF first when that module is on (free), "
+          "which queues its search. max_spend (website searches and address checks, USD; 0: "
+          "websites read only, free), classify_max_spend (its classifier calls; 0: none, a "
+          "site no register fact settles waits), force (search again what was searched), "
+          "limit. Firms with a contact already are skipped unless force; at most "
+          f"{launch.FIND_MAX:,} companies a run (the newest first). Returns the run's id, the "
+          "caps, the estimate (with the registry's counts) and what remains.", queues)
     async def find_contacts(plan: int, set: int | None = None, filter: dict | None = None,
                             max_spend: float = 0.0, classify_max_spend: float = 0.0,
-                            force: bool = False, limit: int | None = None) -> str:
+                            force: bool = False, limit: int | None = None,
+                            registry: dict | None = None) -> str:
         args = {"plan": plan, "set": set, "filter": filter or {}, "max_spend": max_spend,
-                "classify_max_spend": classify_max_spend, "force": force, "limit": limit}
+                "classify_max_spend": classify_max_spend, "force": force, "limit": limit,
+                "registry": registry or {}}
         return await acting("find_contacts", args, lambda turn: a.find_contacts(
-            turn, plan, set, filter, max_spend, classify_max_spend, force, limit))
+            turn, plan, set, filter, max_spend, classify_max_spend, force, limit, registry))
 
     @tool("Queue a verification of contacts by the classifier under an approved plan, as "
           "Contacts → Verify does: set (a set of contacts: its frozen ids; all of them, or "

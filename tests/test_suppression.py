@@ -3,8 +3,8 @@
 Schema 26 is reached in place from the schema 25 the upgrade writes, once,
 in one transaction; a file a newer Harvey made is refused by name. An entry
 is keyed on what it names, so an address stays barred through a merge, its
-undo, the contact deleted and found again, and its firm removed and pulled
-again; contact.do_not_contact mirrors the address entries, and nothing may
+undo, the contact deleted and found again, and its firm removed and brought
+in again; contact.do_not_contact mirrors the address entries, and nothing may
 clear the flag while one stands. All data is fictional."""
 
 import asyncio
@@ -16,7 +16,7 @@ from harvey import contacts, resolver, suppression
 from harvey.overlay import schema
 from harvey.state import NewerBuild, StateManager, UpgradeNeeded
 from tests.test_overlay_writes import (  # noqa: F401  (state is a fixture)
-    _clean, _con, _firm, _hit, _listing, _one, _pull, state,
+    _clean, _con, _firm, _hit, _listing, _one, _seed, state,
 )
 
 ADDR = "ana.popescu@exemplu-unu.example.com"
@@ -183,7 +183,7 @@ async def test_an_entry_flags_the_contact_and_nothing_else_may_clear_it(state):
     assert _clean(state) == {}
 
 
-# ── Surviving merges, undo, re-finds, removal and re-pull ──
+# ── Surviving merges, undo, re-finds, removal and a new record ──
 
 @pytest.mark.asyncio
 async def test_a_suppressed_address_survives_merge_undo_delete_and_refind(state):
@@ -215,8 +215,8 @@ async def test_a_suppressed_address_survives_merge_undo_delete_and_refind(state)
 
 
 @pytest.mark.asyncio
-async def test_a_firm_entry_survives_removal_and_a_pull_again_by_its_tax_code(state):
-    _, saved = await _pull(state, _firm(71, domain="exemplu-sapte.example.com"))
+async def test_a_firm_entry_survives_removal_and_a_new_record_by_its_tax_code(state):
+    _, saved = await _seed(state, _firm(71, domain="exemplu-sapte.example.com"))
     a = saved[0]
     entry = await state.suppress("firm", a, "by_hand", by="you")
     assert _one(state, "SELECT value FROM suppression WHERE id = ?", entry) == "ro.cui:90000071"
@@ -224,14 +224,14 @@ async def test_a_firm_entry_survives_removal_and_a_pull_again_by_its_tax_code(st
     await state.suppress("address", ADDR, "objection", by="reply")
     done = await state.remove_company(a)
     assert done["removed"] == a
-    _, again = await _pull(state, _firm(71))
+    _, again = await _seed(state, _firm(71))
     assert again[0] != a
     con = _con(state)
     try:
         assert suppression.Index(con).firm_hit(again[0]).value == "ro.cui:90000071"
     finally:
         con.close()
-    # Found on the firm pulled again: the address comes back flagged, and
+    # Found on the firm's new record: the address comes back flagged, and
     # any other address of the firm is barred through it.
     other = "office@exemplu-sapte.example.com"
     await state.add_contacts(again[0], [contacts.Found("email", ADDR, source="website"),

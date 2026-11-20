@@ -1,6 +1,6 @@
-"""The Registry page (harvey/registry_view.py, /api/registry): the trade
-registry browsed with its financials, filtered as a pull is, sorted, paged
-from a kept list, and pulled by filter or by the firms ticked.
+"""Companies → All firms (harvey/registry_view.py, /api/registry): the trade
+registry browsed with its financials, filtered as Find contacts selects, sorted, paged
+from a kept list.
 
 A small invented registry is built here directly (every name, number and
 person is fictional), with statements over three years, a taxpayer file and
@@ -23,7 +23,6 @@ from harvey.modules.ro.mf_financials import store as fin_store
 from harvey.modules.ro.mf_taxpayers import store as tax_store
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
-from tests import slim
 
 N = 400
 CODES = ["BV", "CJ", "B", "IS", "TM"]
@@ -148,33 +147,33 @@ FILTERS = [
 ]
 
 
-def pull_ids(con, params):
-    """The firms a pull of these parameters saves (the registry's own search)."""
+def selected_ids(con, params):
+    """The firms a selection of these parameters takes (the registry's own search)."""
     q = registry_view.resolve(con, params)
     return sorted(registry.matching_ids(con, q))
 
 
 @pytest.mark.parametrize("filters", FILTERS, ids=lambda f: json.dumps(f, sort_keys=True))
 @pytest.mark.parametrize("probe_max", [0, 10_000])
-def test_the_page_lists_exactly_what_a_pull_saves(world, monkeypatch, filters, probe_max):
+def test_the_page_lists_exactly_what_a_selection_takes(world, monkeypatch, filters, probe_max):
     # Both ways of checking figures and taxpayer conditions: firm by firm
     # (a narrow list) and from the statements' side (a broad one).
     monkeypatch.setattr(registry_view, "PROBE_MAX", probe_max)
     params = registry_params(filters)
     try:
         registry_plan(filters)
-        pullable = True
+        selectable = True
     except ValueError:
-        pullable = False
+        selectable = False
     con = registry_view.connect()
     try:
         listed = list(registry_view.matching(con, registry_view.resolve(con, params)))
-        if pullable:
-            assert listed == pull_ids(con, params)
+        if selectable:
+            assert listed == selected_ids(con, params)
             assert registry.count(con, registry_view.resolve(con, params)) == len(listed)
         else:
             # No filter: every operating firm (or every firm), which a
-            # pull refuses (registry_plan) and the page lists.
+            # selection refuses (registry_plan) and the page lists.
             want = con.execute("SELECT id FROM firms" + (
                 "" if filters.get("status") == "all" else " WHERE operating") + " ORDER BY id")
             assert listed == [r[0] for r in want]
@@ -185,7 +184,7 @@ def test_the_page_lists_exactly_what_a_pull_saves(world, monkeypatch, filters, p
 
 
 def test_only_excluded_words_leave_those_firms_out(world):
-    # "-dentist" listed every firm, dentists too, while a pull counted 0.
+    # "-dentist" listed every firm, dentists too, while a selection counted 0.
     con = registry_view.connect()
     try:
         dentists = {r[0] for r in con.execute(
@@ -246,14 +245,14 @@ def test_warming_up_adds_the_index_then_computes_every_ranking(world, monkeypatc
     con.close()
 
 
-def test_financial_conditions_alone_are_a_filter_a_pull_can_take(world):
+def test_financial_conditions_alone_are_a_filter_a_selection_can_take(world):
     # Before, a turnover bound with no words or area resolved to nothing.
     con = registry_view.connect()
     try:
         params = registry_plan({"min_turnover": "30000"})
-        assert len(pull_ids(con, params)) > 10
+        assert len(selected_ids(con, params)) > 10
         every = registry_plan({"min_turnover": "30000", "status": "all"})
-        assert len(pull_ids(con, every)) > len(pull_ids(con, params))
+        assert len(selected_ids(con, every)) > len(selected_ids(con, params))
     finally:
         con.close()
 
@@ -436,23 +435,6 @@ async def state(world):
     yield sm
 
 
-@pytest.mark.asyncio
-async def test_a_pull_of_chosen_firms_saves_exactly_them(world, state):
-    from harvey.modules.runs import registry_pull
-
-    con = registry_view.connect()
-    try:
-        regs = [r[0] for r in con.execute("SELECT reg FROM firms ORDER BY id DESC LIMIT 4")]
-        q = registry_view.resolve(con, registry_plan({"regs": regs}))
-        report = await registry_pull(state, con, q)
-    finally:
-        con.close()
-    assert report.new_companies == 4 and not report.errors
-    saved = [r[0] for r in slim.q(state, "SELECT fi.key FROM firm_ident fi JOIN ident_scheme s "
-                                         "ON s.id = fi.scheme WHERE s.name = 'ro.onrc_reg'")]
-    assert sorted(saved) == sorted(regs)
-
-
 @pytest.fixture
 def client(world, monkeypatch):
     from fastapi.testclient import TestClient
@@ -510,29 +492,3 @@ def test_the_api_pages_marks_firms_on_file_and_shows_one(world, client):
     assert client.get("/api/registry/firm", params={"reg": "J99/0/1999"}).status_code == 404
     bad = client.get("/api/registry", params={"county": "Atlantis"})
     assert bad.status_code == 400 and bad.json()["error"]
-
-
-def test_the_api_counts_and_queues_a_pull_of_the_ticked_firms(world, client):
-    from harvey.modules import jobs
-
-    con = registry_view.connect()
-    regs = [r[0] for r in con.execute("SELECT reg FROM firms LIMIT 5")]
-    con.close()
-    body = {"providers": ["onrc.registry_search"], "max_spend": 0,
-            "filters": {"onrc.registry_search": {"regs": regs}}}
-    est = client.post("/api/discover/estimate", json=body).json()
-    assert est["available"] == 5 and est["free"] is True
-    run = client.post("/api/discover/run", json=body).json()
-    assert run["success"] and run["queries"] == 1
-    with sqlite3.connect(world / "harvey.db") as db:
-        (params,) = db.execute(
-            "SELECT params_json FROM jobs WHERE kind = 'registry_pull'").fetchone()
-    assert sorted(json.loads(params)["regs"]) == sorted(regs)
-    by_filter = dict(body, filters={"onrc.registry_search": {"words": "dentist", "status": "all"}})
-    est = client.post("/api/discover/estimate", json=by_filter).json()
-    con = registry_view.connect()
-    try:
-        assert est["available"] == len(pull_ids(con, registry_params(
-            {"words": "dentist", "status": "all"})))
-    finally:
-        con.close()

@@ -20,7 +20,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.models import Company
-from harvey.modules import api, ingest, job_kinds, lanes, runs, switches
+from harvey.modules import api, job_kinds, lanes, runs, switches
 from harvey.modules.ro.anaf import capabilities as caps
 from harvey.modules.ro.anaf import service
 from harvey.signals import sync_vocabulary
@@ -399,6 +399,21 @@ def history(cui_) -> list[bool]:
             for found, d, body in rows if found]
 
 
+def on_file_cuis(state) -> list[int]:
+    """Every CUI the firms in Harvey hold, in order."""
+    return [r[0] for r in slim.q(state, "SELECT fi.key FROM firm_ident fi JOIN ident_scheme s "
+                                        "ON s.id = fi.scheme WHERE s.name = 'ro.cui' "
+                                        "ORDER BY fi.key")]
+
+
+def harvey_rows(state) -> dict:
+    """How many rows each of harvey.db's own tables holds (the jobs aside)."""
+    tables = [r[0] for r in slim.q(state, "SELECT name FROM sqlite_master WHERE type = 'table' "
+                                          "AND name NOT LIKE 'sqlite_%'")]
+    return {t: slim.one(state, f"SELECT COUNT(*) FROM \"{t}\"") for t in tables
+            if t not in ("jobs", "job_batches", "settings", "worker_lease")}
+
+
 @pytest.mark.asyncio
 async def test_a_check_keeps_each_answer_once_and_reads_it_in_place(state, monkeypatch):
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
@@ -406,24 +421,23 @@ async def test_a_check_keeps_each_answer_once_and_reads_it_in_place(state, monke
                                         location="Brașov, Romania", source="registry:onrc"))
     asked = []
     stub_anaf(monkeypatch, {A: answer(A), B: answer(B, phone="0722 000 210")}, asked)
+    before = harvey_rows(state)
 
-    first = await runs.check_by_id(state, "anaf", "company_check")
+    first = await runs.check_cuis(state, "anaf", "company_check", on_file_cuis(state))
     assert [sorted(b) for b in asked] == [[A, B]]             # one batch, one request
-    assert first["companies"] == 2 and first["updated"] == 2
-    # ANAF's answers are read from its own file, never copied into harvey.db.
+    assert first["cuis"] == 2 and first["checked"] == 2 and not first["errors"]
+    # ANAF's answers are read from its own file, never copied into harvey.db:
+    # a check writes nothing there, not even a phone.
+    assert harvey_rows(state) == before
     assert sorted(await readings(state, "FISCALLY_INACTIVE")) == sorted(
         [(a, 0, None, "anaf"), (b, 0, None, "anaf")])
-    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
-    # A phone fills only a company that has none.
-    assert (await state.get_company(a)).phone == "+40 268 000 210"
-    assert (await state.get_company(b)).phone == "+40 268 000 990"       # its own
-    assert first["phones_set"] == 1
+    assert not (await state.get_company(a)).phone
     assert {r[2] for r in await readings(state, "PHONE_NUMBER")} == {
         "+40268000210", "+40722000210"}
 
-    # Asked again with nothing changed: nothing new is written.
-    again = await runs.check_by_id(state, "anaf", "company_check", [a])
-    assert again["observations"] == 0 and again["cached"] == 1
+    # Asked again: the kept answer is used.
+    again = await runs.check_cuis(state, "anaf", "company_check", [int(A)])
+    assert again["cached"] == 1 and again["checked"] == 0
 
     # It turns inactive, then active again: each answer replaced by a
     # different one is kept (the active one, then the inactive one); asked
@@ -432,9 +446,27 @@ async def test_a_check_keeps_each_answer_once_and_reads_it_in_place(state, monke
         service.keep(service.CACHE_PATH, {A: answer(A, inactive=inactive)}, set(),
                      "2020-01-01T00:00:00+00:00")
         stub_anaf(monkeypatch, {A: answer(A, inactive=inactive)})
-        await runs.check_by_id(state, "anaf", "company_check", [a])
+        await runs.check_cuis(state, "anaf", "company_check", [int(A)])
     assert [r[1] for r in await readings(state, "FISCALLY_INACTIVE") if r[0] == a] == [0]
     assert history(A) == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_a_cui_with_no_record_is_asked_about_and_kept(state, monkeypatch):
+    asked = []
+    stub_anaf(monkeypatch, {A: answer(A)}, asked)
+    before = harvey_rows(state)
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                  {"keys": [int(A)]})
+    assert len(queued) == 1
+    from harvey.modules import jobs
+
+    job = await jobs.get(state, queued[0])
+    assert job.params["cuis"] == [int(A)] and "company_ids" not in job.params
+    result = await job_kinds.run_id_check(_JobCtx(state, job.params))
+    assert asked == [[A]] and result["cuis"] == 1 and result["checked"] == 1
+    assert harvey_rows(state) == before
+    assert service.kept(service.CACHE_PATH, [A])[A][1]["date_generale"]["cui"] == int(A)
 
 
 @pytest.mark.asyncio
@@ -444,29 +476,87 @@ async def test_missing_only_asks_about_companies_never_answered(state, monkeypat
     service.keep(service.CACHE_PATH, {A: answer(A)}, set(), "2020-01-01T00:00:00+00:00")
     asked = []
     stub_anaf(monkeypatch, {B: answer(B)}, asked)
-    report = await runs.check_by_id(state, "anaf", "company_check", missing_only=True)
+    report = await runs.check_cuis(state, "anaf", "company_check", on_file_cuis(state),
+                                   missing_only=True)
     assert asked == [[B]] and report["cached"] == 1
-    assert report["companies"] == 2 and a
+    assert report["cuis"] == 2 and a
+
+
+@pytest.mark.asyncio
+async def test_the_missing_selection_leaves_out_cuis_anaf_answered(state, monkeypatch):
+    from harvey.modules import jobs
+
+    for c in (A, B, C):
+        await state.add_company(Company(name=f"EXEMPLU {c} SRL", cui=c, source="registry:onrc"))
+    service.keep(service.CACHE_PATH, {A: answer(A)}, {B}, "2020-01-01T00:00:00+00:00")
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                  {"missing": True}, missing_only=True)
+    (job,) = [await jobs.get(state, j) for j in queued]
+    # A known and B unknown to ANAF are both answered: only C is left.
+    assert job.params["cuis"] == [int(C)] and job.params["missing_only"] is True
+    every, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", {"all": True})
+    assert (await jobs.get(state, every[0])).params["cuis"] == sorted(int(c) for c in (A, B, C))
+
+
+@pytest.mark.asyncio
+async def test_with_no_answers_file_attached_the_missing_selection_is_every_cui(
+        state, monkeypatch, tmp_path):
+    from harvey.modules import jobs
+
+    for c in (A, B):
+        await state.add_company(Company(name=f"EXEMPLU {c} SRL", cui=c, source="registry:onrc"))
+    # No answer kept anywhere: the file isn't there to attach.
+    assert not service.CACHE_PATH.exists()
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                  {"missing": True}, missing_only=True)
+    (job,) = [await jobs.get(state, j) for j in queued]
+    assert job.params["cuis"] == sorted(int(c) for c in (A, B))
+    assert job.params["missing_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_firms_are_followed_to_their_cuis_through_merges(state):
+    from harvey.modules import jobs
+
+    a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
+    b = await state.add_company(Company(name="EXEMPLU A BRASOV", source="osm"))
+    plain = await state.add_company(Company(name="EXEMPLU FARA CUI SRL", source="osm"))
+    # b's record merged into a: b stands for a, and gives a's CUI.
+    from harvey.overlay import merges
+
+    with sqlite3.connect(state.db_path) as con:
+        merges.merge(con, int(a), int(b), score=1.0, reasons="[]", decided_by="user")
+        con.commit()
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                  {"firms": [b, plain]}, then_find=True)
+    (job,) = [await jobs.get(state, j) for j in queued]
+    assert job.params["cuis"] == [int(A)]
+    assert job.params["company_ids"] == [a] and job.params["then_find"] is True
+    # The same keys again: an open job already asks them.
+    again, dupes = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                     {"firms": [a]})
+    assert again == [] and [d.id for d in dupes] == queued
 
 
 @pytest.mark.asyncio
 async def test_a_check_asks_with_nothing_confirmed(state, monkeypatch):
     """No signal to confirm first: an install whose older release left the
-    ANAF signals "proposed" is asked about at once, and after a pull."""
+    ANAF signals "proposed" is asked about at once, and for a run's new
+    records too."""
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
     with sqlite3.connect(state.db_path) as db:
         db.execute("UPDATE signal SET status = 'proposed'")
     asked = []
     stub_anaf(monkeypatch, {A: answer(A)}, asked)
-    report = await runs.check_by_id(state, "anaf", "company_check")
+    report = await runs.check_cuis(state, "anaf", "company_check", [int(A)])
     assert asked == [[A]] and report["requests"] == 1 and not report["stopped"]
-    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 1   # after a pull too
+    assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 1
 
 
 @pytest.mark.asyncio
 async def test_nothing_is_asked_when_none_of_its_signals_is_collected(state, monkeypatch):
     """The lookup is made only for a signal it can record: none collected
-    (their modules off), no request, no phone, no run."""
+    (their modules off), no request, no run."""
     a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
     asked = []
     stub_anaf(monkeypatch, {A: answer(A)}, asked)
@@ -474,11 +564,10 @@ async def test_nothing_is_asked_when_none_of_its_signals_is_collected(state, mon
     async def nothing():
         return set()
     monkeypatch.setattr(state, "collected_signal_codes", nothing)
-    report = await runs.check_by_id(state, "anaf", "company_check")
+    report = await runs.check_cuis(state, "anaf", "company_check", [int(A)])
     assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
-    assert asked == [] and report["requests"] == 0 and report["phones_set"] == 0
+    assert asked == [] and report["requests"] == 0
     assert report["stopped"] == runs.NOTHING_WANTED
-    assert not (await state.get_company(a)).phone
     with sqlite3.connect(state.db_path) as db:
         assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
 
@@ -488,13 +577,18 @@ async def _companies(state, n):
                                             source="registry:onrc")) for i in range(n)]
 
 
+async def _cuis(state, n) -> list[int]:
+    await _companies(state, n)
+    return on_file_cuis(state)
+
+
 @pytest.mark.asyncio
 @pytest.mark.live_anaf_client
 async def test_a_busy_anaf_stops_the_run_instead_of_moving_on(state, real_ask):
-    await _companies(state, 250)                          # three batches
+    cuis = await _cuis(state, 250)                        # three batches
     anaf = Anaf(fail=[503] * 1000)
     async with anaf.client() as http:
-        report = await runs.check_by_id(state, "anaf", "company_check", http=http)
+        report = await runs.check_cuis(state, "anaf", "company_check", cuis, http=http)
     assert len(anaf.bodies) == 4                          # one batch, its retries, then stop
     assert report["stopped"] == "busy" and len(report["errors"]) == 1
 
@@ -502,10 +596,10 @@ async def test_a_busy_anaf_stops_the_run_instead_of_moving_on(state, real_ask):
 @pytest.mark.asyncio
 @pytest.mark.live_anaf_client
 async def test_two_refused_batches_in_a_row_stop_the_run(state, real_ask):
-    await _companies(state, 350)                          # four batches
+    cuis = await _cuis(state, 350)                        # four batches
     anaf = Anaf(fail=[400] * 1000)
     async with anaf.client() as http:
-        report = await runs.check_by_id(state, "anaf", "company_check", http=http)
+        report = await runs.check_cuis(state, "anaf", "company_check", cuis, http=http)
     assert len(anaf.bodies) == 2 and report["stopped"] == "failed"
 
 
@@ -513,17 +607,17 @@ async def test_two_refused_batches_in_a_row_stop_the_run(state, real_ask):
 async def test_a_check_is_refused_while_the_module_is_off(state):
     await switches.set_enabled(state, "anaf", False)
     with pytest.raises(switches.ModuleOff, match="anaf"):
-        await runs.check_by_id(state, "anaf", "company_check")
+        await runs.check_cuis(state, "anaf", "company_check", [int(A)])
 
 
 @pytest.mark.asyncio
-async def test_firms_a_source_brings_in_are_queued_for_a_check(state):
+async def test_firms_a_run_makes_are_queued_for_a_check(state):
     ids = [await state.add_company(Company(name=f"EXEMPLU {c} SRL", cui=c,
                                            source="registry:onrc")) for c in (A, B, C)]
     assert await job_kinds.enqueue_follow_up_checks(state, ids) == 1
     with sqlite3.connect(state.db_path) as db:
-        queued = db.execute("SELECT kind, module, capability FROM jobs").fetchall()
-    assert queued == [("id_check", "anaf", "company_check")]
+        queued = db.execute("SELECT kind, module, capability, label FROM jobs").fetchall()
+    assert queued == [("id_check", "anaf", "company_check", "ANAF – date firmă: 3 CUIs")]
 
 
 @pytest.mark.asyncio
@@ -533,28 +627,7 @@ async def test_no_follow_up_while_the_module_is_off(state):
     assert await job_kinds.enqueue_follow_up_checks(state, [a]) == 0
 
 
-@pytest.mark.asyncio
-async def test_a_registry_pull_hands_each_saved_batch_to_the_follow_up(state, monkeypatch):
-    from harvey.collectors.onrc import ImportReport
-
-    draft = api.Draft(records=[api.Record(key=str(i), name=f"EXEMPLU {i} SRL",
-                                          ids={"cui": c}, source="registry:onrc",
-                                          module="onrc", capability="registry_search")
-                               for i, c in enumerate((A, B, C))],
-                      values={"codes": (), "collector": "registry"})
-
-    from harvey.overlay import store
-
-    handed = []
-    monkeypatch.setattr(store, "PULL_CHUNK", 2)
-    saved = []
-    await runs.save_source_draft(state, draft, ImportReport(), module="onrc", saved_ids=saved,
-                                 on_saved=lambda ids: handed.append(list(ids)))
-    assert [len(h) for h in handed] == [2, 1] and sum(handed, []) == saved
-
-
-# ── Saving a batch at a time, the next request going out meanwhile ──
-
+# ── The next request going out while a batch is handed on ──
 
 
 def _paced_anaf(monkeypatch, known, log):
@@ -570,67 +643,58 @@ def _paced_anaf(monkeypatch, known, log):
     monkeypatch.setattr(service, "ask", ask)
 
 
-def _slow_save(monkeypatch, log, seconds=0.25):
-    real = ingest.checked
-
-    async def checked(batch, module, found, **kw):
-        log.append(("save", time.monotonic(), len(found)))
-        await asyncio.sleep(seconds)
-        out = await real(batch, module, found, **kw)
-        log.append(("saved", time.monotonic(), len(found)))
-        return out
-    monkeypatch.setattr(ingest, "checked", checked)
-
-
 @pytest.mark.asyncio
-async def test_the_next_request_goes_out_while_a_batch_is_saved_never_faster_than_the_lane(
+async def test_the_next_request_goes_out_while_a_batch_is_handed_on_never_faster_than_the_lane(
         state, monkeypatch):
-    ids = await _companies(state, 550)                    # six batches
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
+    cuis = await _cuis(state, 550)                        # six batches
+    known = {str(c): answer(str(c)) for c in cuis}
     monkeypatch.setattr(lanes, "interval", lambda lane: 0.1)
     log = []
     _paced_anaf(monkeypatch, known, log)
-    _slow_save(monkeypatch, log)
-    report = await runs.check_by_id(state, "anaf", "company_check", ids)
-    assert report["requests"] == 6 and report["updated"] == 550 and not report["errors"]
+
+    async def saved(batch, report):
+        log.append(("save", time.monotonic(), len(batch)))
+        await asyncio.sleep(0.25)
+        log.append(("saved", time.monotonic(), len(batch)))
+
+    report = await runs.check_cuis(state, "anaf", "company_check", cuis, saved=saved)
+    assert report["requests"] == 6 and report["checked"] == 550 and not report["errors"]
     asks = [t for kind, t, _ in log if kind == "ask"]
     assert all(b - a >= 0.099 for a, b in zip(asks, asks[1:]))        # the lane's pace
-    in_flight = saving = most_requests = most_ahead = asked = saved = 0
+    in_flight = most_requests = most_ahead = asked = done = 0
     for kind, _, _ in log:
         in_flight += {"ask": 1, "answered": -1}.get(kind, 0)
         asked += kind == "ask"
-        saved += kind == "saved"
+        done += kind == "saved"
         most_requests = max(most_requests, in_flight)
-        most_ahead = max(most_ahead, asked - saved)
+        most_ahead = max(most_ahead, asked - done)
     assert most_requests == 1                  # one request at a time
-    assert most_ahead == 2                     # this batch saving, the next asked: no more
-    # Each request after the first went out before the batch before it was
-    # saved (as its save began: the batch's connection opening is part of it).
+    assert most_ahead == 2                     # this batch handed on, the next asked: no more
     answered = [t for kind, t, _ in log if kind == "answered"]
-    saved = [t for kind, t, _ in log if kind == "saved"]
-    assert all(answered[i - 1] < asks[i] < saved[i - 1] for i in range(1, len(asks)))
+    handed = [t for kind, t, _ in log if kind == "saved"]
+    assert all(answered[i - 1] < asks[i] < handed[i - 1] for i in range(1, len(asks)))
     assert len(asks) == 6
 
 
 @pytest.mark.asyncio
 async def test_a_stop_ends_it_after_the_batch_already_asked_for_and_loses_nothing(
         state, monkeypatch):
-    ids = await _companies(state, 550)
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
+    cuis = await _cuis(state, 550)
+    known = {str(c): answer(str(c)) for c in cuis}
     log = []
     _paced_anaf(monkeypatch, known, log)
-    saved_batches = []
+    handed = []
 
-    async def saved(batch_ids, report):
-        saved_batches.append(list(batch_ids))
+    async def saved(batch, report):
+        handed.append(list(batch))
 
-    report = await runs.check_by_id(state, "anaf", "company_check", ids, saved=saved,
-                                    stop=lambda: len(saved_batches) >= 1)
+    report = await runs.check_cuis(state, "anaf", "company_check", cuis, saved=saved,
+                                   stop=lambda: len(handed) >= 1)
     asked = [n for kind, _, n in log if kind == "ask"]
     assert report["stopped"] == "stopped" and asked == [100, 100]
-    # Every batch asked about was saved: none answered and dropped.
-    assert [len(b) for b in saved_batches] == [100, 100]
-    assert len(await readings(state, "VAT_REGISTERED")) == 200 == report["updated"]
+    # Every batch asked about was handed on: none answered and dropped.
+    assert [len(b) for b in handed] == [100, 100]
+    assert len(await readings(state, "VAT_REGISTERED")) == 200 == report["checked"]
 
 
 class _JobCtx:
@@ -659,37 +723,55 @@ class _JobCtx:
         return ""
 
 
+def _params(cuis):
+    return {"module": "anaf", "capability": "company_check", "cuis": cuis}
+
+
 @pytest.mark.asyncio
 async def test_a_paused_check_job_goes_on_from_where_it_got(state, monkeypatch):
-    from harvey.modules import job_kinds
-
-    ids = await _companies(state, 350)
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
+    cuis = await _cuis(state, 350)
+    known = {str(c): answer(str(c)) for c in cuis}
     asked = []
     stub_anaf(monkeypatch, known, asked)
-    params = {"module": "anaf", "capability": "company_check", "company_ids": ids}
-    first = _JobCtx(state, params, stop_after=1)
+    first = _JobCtx(state, _params(cuis), stop_after=1)
     await job_kinds.run_id_check(first)
     assert first.outcome == "paused" and first.progress["done"] == 200   # one more was asked
-    assert first.progress["after"] == sorted(ids)[199]
-    second = _JobCtx(state, params, progress=first.progress)
+    assert first.progress["after"] == cuis[199]
+    second = _JobCtx(state, _params(cuis), progress=first.progress)
     result = await job_kinds.run_id_check(second)
     every = [c for batch in asked for c in batch]
     assert sorted(every) == sorted(known) and len(every) == len(set(every))   # each once
-    assert result["updated"] == 350 and result["requests"] == 4 and result["companies"] == 350
+    assert result["checked"] == 350 and result["requests"] == 4 and result["cuis"] == 350
     assert second.progress["done"] == 350
     assert len(await readings(state, "VAT_REGISTERED")) == 350
 
 
 @pytest.mark.asyncio
+async def test_an_older_check_naming_its_companies_still_runs(state, monkeypatch):
+    """A job queued before checks went by CUI names its companies: their
+    CUIs are read when it starts, and its search still follows."""
+    a = await state.add_company(Company(name="EXEMPLU A SRL", cui=A, source="registry:onrc"))
+    b = await state.add_company(Company(name="EXEMPLU B SRL", cui=B, source="registry:onrc"))
+    asked = []
+    stub_anaf(monkeypatch, {A: answer(A), B: answer(B)}, asked)
+    params = {"module": "anaf", "capability": "company_check", "company_ids": [a, b],
+              "missing_only": False}
+    # (Its progress counted companies: it starts over.)
+    ctx = _JobCtx(state, params, progress={"after": a, "done": 1})
+    result = await job_kinds.run_id_check(ctx)
+    assert sorted(asked[0]) == [A, B] and result["cuis"] == 2 and result["checked"] == 2
+    assert ctx.progress["done"] == 2
+
+
+@pytest.mark.asyncio
 async def test_a_busy_anaf_hands_the_job_back_and_rests_the_lane(state, monkeypatch):
-    from harvey.modules import job_kinds, jobs
+    from harvey.modules import jobs
     from harvey.modules.jobs import LaneExhausted
 
-    ids = await _companies(state, 2250)
-    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", ids)
+    await _companies(state, 2250)
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", {"all": True})
     first = await jobs.get(state, queued[0])
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
+    known = {str(c): answer(str(c)) for c in on_file_cuis(state)}
     calls = []
 
     async def ask(client, cuis, **kw):
@@ -719,94 +801,50 @@ async def test_a_busy_anaf_hands_the_job_back_and_rests_the_lane(state, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_save_that_fails_part_way_never_ends_the_job_done(state, monkeypatch):
-    from harvey.modules import job_kinds
-    from harvey.modules.jobs import LaneExhausted, Transient
-
-    ids = await _companies(state, 350)
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
-    stub_anaf(monkeypatch, known, [])
-    real = ingest.checked
-    fail_on = {2}
-    calls = [0]
-
-    async def checked(batch, module, found, **kw):
-        calls[0] += 1
-        if calls[0] in fail_on:
-            raise sqlite3.OperationalError("database is locked")
-        return await real(batch, module, found, **kw)
-
-    monkeypatch.setattr(ingest, "checked", checked)
-    params = {"module": "anaf", "capability": "company_check", "company_ids": ids}
-    ctx = _JobCtx(state, params)
-    with pytest.raises(LaneExhausted):                    # some saved: goes on later
-        await job_kinds.run_id_check(ctx)
-    # (ANAF's answers are kept in its own file as they come: what harvey.db
-    # failed to save is a contact, never an answer lost.)
-    assert ctx.progress["done"] == 100
-    # The first save fails: nothing went through, so a try is used.
-    calls[0], fail_on = 0, {1}
-    with pytest.raises(Transient):
-        await job_kinds.run_id_check(_JobCtx(state, params, progress=ctx.progress))
-    calls[0], fail_on = 0, set()
-    done = _JobCtx(state, params, progress=ctx.progress)
-    result = await job_kinds.run_id_check(done)
-    assert done.outcome == "" and result["errors"] == [] and done.progress["done"] == 350
-    assert len(await readings(state, "VAT_REGISTERED")) == 350
-
-
-@pytest.mark.asyncio
 async def test_a_failed_batch_then_a_good_one_is_asked_again_not_skipped(state, monkeypatch):
-    from harvey.modules import job_kinds
     from harvey.modules.jobs import LaneExhausted
 
-    ids = await _companies(state, 350)
-    known = {r["value"]: answer(r["value"]) for r in await state.companies_with_id("cui")}
+    cuis = await _cuis(state, 350)
+    known = {str(c): answer(str(c)) for c in cuis}
     calls = []
 
-    async def ask(client, cuis, **kw):
-        calls.append(list(cuis))
+    async def ask(client, batch, **kw):
+        calls.append(list(batch))
         if len(calls) == 2:
             raise service.AnafError("ANAF refused the request (HTTP 400)")
-        return {c: known[c] for c in cuis}, set(), 1
+        return {c: known[c] for c in batch}, set(), 1
 
     monkeypatch.setattr(service, "ask", ask)
-    params = {"module": "anaf", "capability": "company_check", "company_ids": ids}
-    ctx = _JobCtx(state, params)
+    ctx = _JobCtx(state, _params(cuis))
     with pytest.raises(LaneExhausted):
         await job_kinds.run_id_check(ctx)
-    # Batches 3 and 4 were saved, but progress stays in front of batch 2.
+    # Batches 3 and 4 were answered, but progress stays in front of batch 2.
     assert len(calls) == 4 and ctx.progress["done"] == 100
-    assert ctx.progress["after"] == sorted(ids)[99]
-    done = _JobCtx(state, params, progress=ctx.progress)
+    assert ctx.progress["after"] == cuis[99]
+    done = _JobCtx(state, _params(cuis), progress=ctx.progress)
     result = await job_kinds.run_id_check(done)
     assert result["errors"] == [] and done.progress["done"] == 350
     assert calls[4] == calls[1]                           # the failed batch, asked again
-    # Every company read once: the ones asked twice said nothing new.
     assert len(await readings(state, "VAT_REGISTERED")) == 350
 
 
-
 @pytest.mark.asyncio
-async def test_companies_with_an_id_come_in_id_order_whatever_order_they_are_asked_in(state):
-    # More than one read of 900, asked for in reverse: the reads used to
-    # follow the order asked, each sorted on its own, so where a company
-    # fell (and which job of 1,000 it went in) depended on its random id.
-    ids = await _companies(state, 1000)
-    rows = await state.companies_with_id("cui", sorted(ids, reverse=True))
-    assert [r["id"] for r in rows] == sorted(ids)
+async def test_check_jobs_take_ten_requests_each_in_one_write(state):
+    from harvey.modules import jobs
 
-
-
-@pytest.mark.asyncio
-async def test_check_jobs_take_ten_requests_each(state):
-    from harvey.modules import job_kinds, jobs
-
-    ids = await _companies(state, 2050)
-    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check", ids)
+    keys = sorted(int(cui(str(9300000 + i))) for i in range(2050))
+    queued, _ = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                  {"keys": list(reversed(keys))})
     found = [await jobs.get(state, j) for j in queued]
-    assert [len(j.params["company_ids"]) for j in found] == [1000, 1000, 50]
+    assert [len(j.params["cuis"]) for j in found] == [1000, 1000, 50]
+    # In CUI order, each job's own run of them, none on file needed.
+    assert sum((j.params["cuis"] for j in found), []) == keys
+    assert slim.one(state, "SELECT COUNT(*) FROM firm") == 0
     assert jobs.stoppable("id_check")
+    # The same selection again: every part is already waiting.
+    again, dupes = await job_kinds.enqueue_id_checks(state, "anaf", "company_check",
+                                                     {"keys": keys})
+    assert again == [] and sorted(d.id for d in dupes) == sorted(queued)
 
 
 # ── The dashboard ──
@@ -903,7 +941,8 @@ def test_the_dashboard_checks_a_selection_at_anaf(client, monkeypatch, tmp_path)
             break
         time.sleep(0.1)
     job = data["anaf"]["job"]
-    assert job["report"]["updated"] == 1 and job["done"] == job["total"] == 1
+    assert job["report"]["checked"] == 1 and job["done"] == job["total"] == 1
+    assert job["report"]["cuis"] == 1
     assert data["anaf"]["on"] and data["anaf"]["kept"]["answers"] == 1
     assert data["taxpayers"]["on"] and data["taxpayers"]["loaded"] is None
     assert client.post("/api/anaf/check", json={"ids": "x"}).status_code == 400
@@ -914,7 +953,7 @@ def test_the_dashboard_checks_a_selection_at_anaf(client, monkeypatch, tmp_path)
 
 # ── The command line ──
 
-def test_cli_check_needs_to_be_told_which_companies(tmp_path, monkeypatch, capsys):
+def test_cli_check_needs_to_be_told_which_cuis(tmp_path, monkeypatch, capsys):
     import sys
 
     import harvey.state
@@ -925,10 +964,16 @@ def test_cli_check_needs_to_be_told_which_companies(tmp_path, monkeypatch, capsy
     with pytest.raises(SystemExit) as stop:
         main()
     assert stop.value.code == 2 and "--missing" in capsys.readouterr().out
-    monkeypatch.setattr(sys, "argv", ["harvey", "anaf", "check", "--cui", A])
-    with pytest.raises(SystemExit):
+    monkeypatch.setattr(sys, "argv", ["harvey", "anaf", "check", "--cui", "1234567"])
+    with pytest.raises(SystemExit) as stop:
         main()
-    assert "no company on file has this CUI" in capsys.readouterr().out
+    assert stop.value.code == 2 and "not a valid CUI" in capsys.readouterr().out
+    # A valid CUI needs no record in Harvey: one job is queued for it.
+    monkeypatch.setattr(sys, "argv", ["harvey", "anaf", "check", "--cui", A, "--background"])
+    main()
+    assert "Queued: 1 job" in capsys.readouterr().out
+    assert slim.q(tmp_path / "harvey.db", "SELECT json_extract(params_json, '$.cuis') "
+                                          "FROM jobs") == [(f"[{int(A)}]",)]
     monkeypatch.setattr(sys, "argv", ["harvey", "anaf", "status"])
     main()
     assert "ANAF answers kept: 0" in capsys.readouterr().out

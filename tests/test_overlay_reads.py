@@ -15,10 +15,11 @@ from harvey import contacts
 from harvey.collectors import discover as D
 from harvey.collectors import onrc
 from harvey.contacts import ContactFilter
-from harvey.modules import ingest, runs, switches
+from harvey.modules import ingest, switches
 from harvey.overlay import reads, recount, schema
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
+from tests import slim
 from tests import test_query_plans as plans
 
 DATASET = onrc.Dataset("firme-01-01-2026", "2026-01-01", {})
@@ -26,23 +27,29 @@ QUERY = D.DiscoveryQuery(term="dentist", location="Brașov")
 ALFA, BETA = 1000004, 1000012
 
 
-def _firm(n, name, cui, website="", domain=""):
-    # The registry fixture's three firms (plans.build_registry), as a pull
-    # reads them.
+def _firm(n, name, cui):
+    # A firm of the registry fixture (plans.build_registry) by its
+    # registration number and CUI.
     return onrc.Firm(reg=f"J08/{n}/2015", name=name, cui=cui, form="SRL", county="Brașov",
-                     locality="Brașov", address=f"Str. Exemplului nr. {n}", website=website,
-                     domain=domain, registered="2015-02-01")
+                     locality="Brașov", address=f"Str. Exemplului nr. {n}", website="",
+                     domain="", registered="2015-02-01")
 
 
-async def _pull(state, *firms):
-    report = onrc.ImportReport(dataset=DATASET.name)
-    draft = onrc.firms_draft(list(firms), DATASET, codes={f.reg: [("8623", 3)] for f in firms},
-                             classes=[("8623", None)]).stamp("onrc", "registry_search")
-    draft.values.update(codes=("ACTIVITY_CODE",), collector=onrc.COLLECTOR)
-    saved: list[str] = []
-    await runs.save_source_draft(state, draft, report, module="onrc", saved_ids=saved)
-    assert not report.errors, report.errors
-    return saved
+async def _seed(state, *firms):
+    """The registry fixture's firms as work starts on them (slim.start):
+    their live company ids, in order."""
+    done = await slim.start(state, *firms)
+    return [done.ids[f.reg] for f in firms]
+
+
+async def _delta(state) -> str:
+    """A firm with a CUI the registry fixture doesn't describe, as another
+    source brings one (its figures and verdicts read by that CUI)."""
+    from harvey.models import Company
+
+    return (await state.save_company(Company(name="EXEMPLU DELTA SRL", cui="1000020",
+                                             location="Brașov, Romania",
+                                             source="website"))).company_id
 
 
 @pytest_asyncio.fixture
@@ -60,10 +67,12 @@ async def state(tmp_path):
     await sync_vocabulary(sm)
     # Web signals' module (off as shipped).
     await switches.set_enabled(sm, "web_marketing", True)
-    alfa, beta, gama = await _pull(
-        sm, _firm(1, "EXEMPLU ALFA SRL", str(ALFA), "https://alfa.example.com",
-                  "alfa.example.com"),
-        _firm(2, "EXEMPLU BETA SRL", str(BETA)), _firm(3, "EXEMPLU GAMA SRL", ""))
+    alfa, beta, gama = await _seed(
+        sm, _firm(1, "EXEMPLU ALFA SRL", str(ALFA)), _firm(2, "EXEMPLU BETA SRL", str(BETA)),
+        _firm(3, "EXEMPLU GAMA SRL", ""))
+    # Alfa's website, as a search found it.
+    await sm.fill_company_fields(alfa, website="https://alfa.example.com",
+                                 domain="alfa.example.com")
     saved = await ingest.listing(sm, D.business_record(D.Business(
         name="Cabinet Exemplu", phone="+40 268 000 101", location="Brașov, Romania",
         external_id="dataforseo:cid:1", provider="dataforseo_maps", has_website=False), QUERY))
@@ -232,7 +241,8 @@ async def test_rows_describe_firms_from_the_register_and_locally(state):
     assert alfa["external_id"] == "onrc:J08/1/2015" and alfa["domain"] == "alfa.example.com"
     # Every class on its registration (an old revision's too).
     assert {a["code"] for a in alfa["activities"]} == {"8623", "4321", "7112"}
-    # Its email and mobile, and the taxpayer file's phone (kept by the pull).
+    # Its email and mobile, and the taxpayer file's phone (taken as its work
+    # started).
     assert alfa["figures"]["turnover"] == 250000 and alfa["contacts"] == 3
     assert alfa["_inputs"]["people"][0]["name"] == "Ana Exemplu"
     assert rows[i["gama"]]["external_id"] == "onrc:J08/3/2015" and rows[i["gama"]]["cui"] == ""
@@ -544,11 +554,11 @@ async def test_register_filters_follow_firms_added_merged_and_removed(state):
     unknown = ContactFilter(bounds={"min_turnover": 1e6, "unknown": "include"})
     assert _page(state, over)[1] == [i["beta"]]
     assert set(_page(state, unknown)[1]) == {i["beta"], i["gama"], i["listing"]}
-    # Gama (pulled, nothing of Harvey's on it) leaves Harvey.
+    # Gama (a registry record, nothing of Harvey's on it) leaves Harvey.
     assert (await state.remove_company(str(i["gama"])))["removed"]
     assert set(_page(state, unknown)[1]) == {i["beta"], i["listing"]}
-    # A firm pulled now has no figure on file: unknown.
-    (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    # A firm added now has no figure on file: unknown.
+    delta = await _delta(state)
     assert int(delta) in _page(state, unknown)[1]
     # Beta merged into the listing: the listing (its survivor) is listed.
     await state.merge_companies(str(i["listing"]), str(i["beta"]))
@@ -746,8 +756,8 @@ async def test_register_conditions_read_the_kept_sets_and_follow_changes(state, 
     with monkeypatch.context() as m:
         _no_walks(m)
         assert _verdicts(state) == walked
-        # A firm pulled after the job: read from the register by its key.
-        (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+        # A firm added after the job: read from the register by its key.
+        delta = await _delta(state)
         counts, rows = (await state.cohort_verdicts([], [], [{"code": "TURNOVER", "min": 1e6}]))
         assert counts["match"] == 2 and {int(x["id"]) for x in rows} == {i["beta"], int(delta)}
         # A merge: the record's values count on its survivor.
@@ -875,8 +885,8 @@ async def test_a_registry_reload_moves_the_statements_filed_answers(state, tmp_p
         "website, domain, registered, statuses, operating) VALUES ('J08/4/2015', "
         "'EXEMPLU DELTA SRL', '1000020', 'SRL', 'Brașov', 'BV', 'Brașov', "
         "'Str. Exemplului nr. 4', '', '', '01/02/2015', '1048', 1)")["filed_no"] == 1
-    (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
-    time.sleep(2.1)                     # pulled before the walk starts (not read again)
+    (delta,) = await _seed(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    time.sleep(2.1)                     # made before the walk starts (not read again)
     await state.recount_register_tally()
     assert not await state.read("register_tally_stale")
     assert verdict(int(delta)) == "no_match"
@@ -893,7 +903,7 @@ async def test_a_registry_reload_moves_the_statements_filed_answers(state, tmp_p
 async def test_many_identifiers_given_since_the_kept_sets_queue_the_job(state, monkeypatch):
     # Every first visit would read each of them again from the registers.
     assert await state.recount_register_tally() > 0
-    await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    await _delta(state)
     assert not await state.read("register_tally_stale")
     monkeypatch.setattr(reads, "PATCH_MAX", 0)
     assert await state.read("register_tally_stale")
@@ -904,7 +914,7 @@ async def test_an_export_credits_a_register_for_any_signal_it_has(state, tmp_pat
     # A statement with no turnover (the register's first signal) but a
     # headcount still came from the statements.
     _add_statement(tmp_path, 1000020, None, 3)
-    (delta,) = await _pull(state, _firm(4, "EXEMPLU DELTA SRL", "1000020"))
+    delta = await _delta(state)
     con, r = _reader(state)
     try:
         assert "mf_financials" in r.modules_of([delta])

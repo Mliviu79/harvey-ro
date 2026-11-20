@@ -864,7 +864,7 @@ def test_the_tools_schedule_a_wake_and_keep_memory(state):
                                ("schedule_wake", {"plan": plan_id, "in_hours": 0}),
                                ("remember", {"text": "Telefonul +40722000102 nu răspunde"}),
                                ("notes", {}), ("save_playbook", {"name": "Dentiști",
-                                                                 "body": "1. registry_pull"}),
+                                                                 "body": "1. find_contacts"}),
                                ("playbooks", {}), ("read_playbook", {"name": "Dentiști"}),
                                ("forget", {"id": 1}), ("forget", {"id": 1}),
                                ("plan_status", {"plan": plan_id})):
@@ -880,7 +880,7 @@ def test_the_tools_schedule_a_wake_and_keep_memory(state):
     got = {n: t for n, e, t in answers if not e}
     assert json.loads(got["notes"])["notes"][0]["text"] == "Telefonul +4072**** nu răspunde"
     assert json.loads(got["playbooks"])["playbooks"][0]["name"] == "Dentiști"
-    assert json.loads(got["read_playbook"])["body"] == "1. registry_pull"
+    assert json.loads(got["read_playbook"])["body"] == "1. find_contacts"
     status = json.loads(got["plan_status"])
     assert len(status["wakes"]["scheduled"]) == 1 and status["wakes"]["unseen"] == {}
     assert _q(state, "SELECT tool, outcome FROM agent_action ORDER BY id") == [
@@ -950,11 +950,11 @@ def test_notes_are_bounded_masked_and_given_to_every_new_process(state):
     # An edit within the room left by the note itself.
     edited = _run(memory.edit_note(state, n["id"], "Brașov: OSM a dat 12 firme noi"))
     assert edited["author"] == "dashboard"
-    _run(memory.save_playbook(state, "Dentiști pe județ", "1. registry_pull pe CAEN 8623\n2. ..."))
+    _run(memory.save_playbook(state, "Dentiști pe județ", "1. find_contacts pe CAEN 8623\n2. ..."))
     primed = _run(chat.prime(state, CHAT, "t1", "Salut"))
     assert f"- [{n['id']}] (the user's) Brașov: OSM a dat 12 firme noi" in primed
     assert "Your playbooks (read_playbook(name) reads one): Dentiști pe județ" in primed
-    assert "registry_pull pe CAEN 8623" not in primed
+    assert "find_contacts pe CAEN 8623" not in primed
     assert primed.index("## Your memory") < primed.index("## The user's new message")
     _run(memory.forget(state, n["id"]))
     with pytest.raises(memory.Refused):
@@ -1126,11 +1126,11 @@ def test_the_cli_shows_and_edits_the_memory_and_labels_a_wakes_answer(state, mon
     run("memory")
     out = capsys.readouterr().out
     assert "Note 1 kept." in out and "Brașov: OSM a dat 12 firme" in out and "of 2,200" in out
-    _run(memory.save_playbook(state, "Dentiști", "1. registry_pull"))
+    _run(memory.save_playbook(state, "Dentiști", "1. find_contacts"))
     run("memory", "playbooks")
     run("memory", "playbook", "Dentiști")
     out = capsys.readouterr().out
-    assert "Dentiști" in out and "1. registry_pull" in out
+    assert "Dentiști" in out and "1. find_contacts" in out
     run("memory", "forget", "1")
     run("memory", "delete-playbook", "Dentiști")
     assert "Forgotten." in capsys.readouterr().out

@@ -857,7 +857,7 @@ def test_a_hyphenated_given_name_is_checked_whole_then_its_first_part(tmp_path, 
 
 
 def test_a_discover_run_queues_only_so_many_website_lookups(tmp_path, monkeypatch):
-    """A county-wide registry pull mustn't fill the contacts lane for
+    """A county-wide Discover run mustn't fill the contacts lane for
     days: what the amount pays for plus a free run's worth, the rest left
     to the background's walk."""
     db = tmp_path / "harvey.db"

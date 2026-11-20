@@ -110,7 +110,7 @@ async def test_a_paid_rank_is_recorded_only_inside_a_capped_run(state, claim_pro
                         "email_outreach")
 def test_what_runs_with_no_cap_never_returns_a_paid_fact():
     """The work that runs with no cap of its own (a site read, the checks a
-    source's companies get, the local lookups by identifier) is free, and
+    source's companies get) is free, and
     none of it returns a paid fact: removing the confirmation can't make it
     collect one."""
     every = frozenset(m.id for m in switches.manifests())
@@ -118,7 +118,7 @@ def test_what_runs_with_no_cap_never_returns_a_paid_fact():
     def facts(cap):
         return set((cap.get("outputs") or {}).get("facts") or ())
 
-    free_lookups = R.id_enrichers(every) + R.id_lookups(every)
+    free_lookups = R.id_enrichers(every)
     assert free_lookups
     for m, cap, _ in free_lookups:
         assert float((cap.get("cost") or {}).get("usd", 0) or 0) == 0, (m.id, cap["id"])

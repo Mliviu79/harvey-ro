@@ -4,7 +4,7 @@ A module's manifest names the pace a service allows (``[[lanes]]`` with
 ``min_interval_seconds``, or ``max_per_second``), and its capability calls
 ``await wait(lane)`` right before each request. Every caller in the process
 takes its turn on one lock per lane, so two runs at once (a check from the
-dashboard and a registry pull's follow-up) never add up to more than the
+dashboard and a Find-contacts run's checks) never add up to more than the
 service allows.
 
 Between processes on one machine (the dashboard and a CLI command) the time

@@ -571,7 +571,7 @@ CREATE INDEX idx_outbox_message_id ON outbox(message_id) WHERE message_id != '';
 
 # contact.do_not_contact mirrors the live address entries; nothing else
 # may clear it while one stands. Rules, not kept values: never dropped,
-# bulk writes included (a contact a registry pull finds again comes back
+# bulk writes included (a contact a register gives again comes back
 # flagged).
 SUPPRESSION_GUARDS = f"""
 CREATE TRIGGER follow_suppression_ins AFTER INSERT ON suppression

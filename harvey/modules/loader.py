@@ -288,8 +288,64 @@ def _check_register(raw, where: str, problems: list[str]) -> dict:
             problems.append(f"{where}: register read {code} precedence must be a whole number")
             precedence = 0
         out_reads.append({"code": code, "absent": absent, "precedence": precedence})
+    label = raw.get("label", "")
+    if not isinstance(label, str):
+        problems.append(f"{where}: [register] label must be a string")
+        label = ""
     return {"attach": attach, "file": file, "keyed_by": keyed_by, "adapter": adapter,
-            "reads": tuple(out_reads)}
+            "reads": tuple(out_reads), "label": label,
+            "filters": _check_register_filters(raw.get("filters"), where, problems)}
+
+
+REGISTER_FILTER_TYPES = ("text", "choice", "number", "yesno")
+
+
+def _check_register_filters(raw, where: str, problems: list[str]) -> tuple[dict, ...]:
+    """A register's selection filters ([register] filters): what the
+    registry's list, Find contacts over it and the agent select firms
+    by. Each a table with a key, a type, a label, options for a choice,
+    and the module whose data it reads when that isn't the register's."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(f, dict) for f in raw):
+        problems.append(f"{where}: [register] filters must be an array of tables")
+        return ()
+    out, seen = [], set()
+    for f in raw:
+        key = f.get("key")
+        if not isinstance(key, str) or not _ID.match(key):
+            problems.append(f"{where}: a register filter needs a key in lower case letters, "
+                            f"digits and _, got {key!r}")
+            continue
+        if key in seen:
+            problems.append(f"{where}: register filter {key} is declared twice")
+            continue
+        seen.add(key)
+        if f.get("type") not in REGISTER_FILTER_TYPES:
+            problems.append(f"{where}: register filter {key} type must be one of "
+                            f"{', '.join(REGISTER_FILTER_TYPES)}, got {f.get('type')!r}")
+            continue
+        if not isinstance(f.get("label", ""), str):
+            problems.append(f"{where}: register filter {key} label must be a string")
+            continue
+        options = f.get("options")
+        if f["type"] == "choice" and (not isinstance(options, list) or not options
+                                      or not all(isinstance(o, str) for o in options)):
+            problems.append(f"{where}: register filter {key} is a choice and needs its "
+                            "options as a list of strings")
+            continue
+        module = f.get("module")
+        if module is not None and (not isinstance(module, str) or not _ID.match(module)):
+            problems.append(f"{where}: register filter {key} module must be a module id, "
+                            f"got {module!r}")
+            continue
+        unknown = set(f) - {"key", "type", "label", "options", "module"}
+        if unknown:
+            problems.append(f"{where}: register filter {key} has unknown keys: "
+                            f"{', '.join(sorted(unknown))}")
+            continue
+        out.append(dict(f))
+    return tuple(out)
 
 
 def _check_contact_kinds(raw, where: str, problems: list[str]) -> tuple[dict, ...]:

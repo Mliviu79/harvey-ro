@@ -248,7 +248,7 @@ def test_profiles_hold_real_tools_and_none_a_child_may_never_have():
     for p in tasks.PROFILES.values():
         assert p.tools <= every and not p.tools & tasks.FORBIDDEN, p.name
     for name in ("assign_task", "schedule_wake", "propose_plan", "close_plan", "discover",
-                 "registry_pull", "find_contacts", "verify_contacts", "cancel_run",
+                 "find_contacts", "verify_contacts", "cancel_run",
                  "create_campaign", "request_start", "pause_campaign", "suppress", "draft_reply",
                  "remember", "forget", "save_playbook"):
         assert name in tasks.FORBIDDEN

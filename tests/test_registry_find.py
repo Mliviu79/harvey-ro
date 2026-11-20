@@ -28,7 +28,7 @@ from harvey import finder, launch, registry
 from harvey.collectors import onrc
 from harvey.config import ComplianceConfig, EnvConfig
 from harvey.models import Company
-from harvey.modules import job_kinds, runs, switches
+from harvey.modules import job_kinds, switches
 from harvey.modules.ro.anaf import service as anaf
 from harvey.modules.worker import wait_for_batch
 from harvey.signals import sync_vocabulary
@@ -191,12 +191,14 @@ def test_ticked_rows_get_records_and_jobs_and_nothing_is_copied(client):
     assert got["checks_first"] == {"jobs": 1, "companies": 2} and got["queued"] == 1
     (check,) = [p for kind, p in queued(client.db) if kind == "id_check"]
     assert check["then_find"] is True and sorted(check["company_ids"]) == checked
+    # Asked by CUI: the run's new records' own, in order.
+    assert check["cuis"] == sorted([ZAMBET_CUI, int(TELEFON_CUI)])
     assert [p for kind, p in queued(client.db) if kind == "find_contacts"] == [
         {"company_id": record_of(client.db, SOLE_TRADER)}]
     assert slim.q(client.db, "SELECT kind, max_spend FROM job_batches") == [
         ("find_contacts", 0.5)]
     # The register signals are counted again over the firms in Harvey, as
-    # after a pull that saved firms.
+    # after any write that added firms.
     assert [kind for kind, _ in queued(client.db)] == [
         "id_check", "register_counts", "find_contacts"]
 
@@ -425,7 +427,7 @@ def test_the_cap_leaves_the_rest_for_a_later_run(client):
     ({"words": "-dentist -frizerie si"}, "only excludes"),
     ({"county": "Atlantis"}, "Atlantis"),
     ({"regs": "J08/100/2010"}, "list of registration numbers"),
-    ("dentist", "Registry page's filters"),
+    ("dentist", "All firms list's filters"),
 ])
 def test_a_selection_that_says_nothing_is_refused(client, chosen, says):
     for path in ("/api/contacts/find/estimate", "/api/contacts/find"):
@@ -486,30 +488,16 @@ async def _switch(folder, module: str, on: bool) -> None:
 
 # ── A firm's own job takes its registry entry ──
 
-async def _pulled(folder, source, regs) -> StateManager:
-    """Another install beside a copy of the same registers, the firms
-    brought by a registry pull: what the new records are compared with."""
+async def _beside(folder, source, regs) -> StateManager:
+    """Another install beside a copy of the same registers, with records
+    made for ``regs`` (nothing of theirs taken yet)."""
     folder.mkdir()
     for name in ("registry.db", "taxpayers.db"):
         if (source / name).exists():
             shutil.copy(source / name, folder / name)
     other = await opened(folder)
-    con = registry.connect(folder / "registry.db")
-    try:
-        await runs.registry_pull(other, con, registry.resolve(con, regs=regs))
-    finally:
-        con.close()
+    await other.ensure_registry_records(regs=regs)
     return other
-
-
-def _footing(sm, reg: str) -> dict:
-    """What the finder left on a firm, as far as a pull's firm can be
-    compared with a new record's."""
-    cid = record_of(sm.db_path, reg)
-    return {"site": site_columns(sm.db_path, reg), "sources": sources(sm.db_path, reg),
-            "links": slim.links(sm, cid), "phones": phone_sources(sm.db_path),
-            "people": sorted(slim.q(sm, "SELECT name, role FROM person")),
-            "searches": [s[:5] for s in slim.searches(sm)]}
 
 
 @pytest.mark.asyncio
@@ -530,23 +518,12 @@ async def test_the_finder_takes_the_registry_entry_then_reads_the_declared_site(
     assert site_columns(state.db_path, ZAMBET) == (f"https://{ZAMBET_SITE}", ZAMBET_SITE, None)
     assert sources(state.db_path, ZAMBET) == [("registry:onrc", f"onrc:{ZAMBET}")]
     assert phone_sources(state.db_path) == [("+40268000103", "mf_taxpayers")]
-    # The website it took is the registry's, as a pulled firm's is.
+    # The website it took is the registry's.
     assert website_source(state.db_path, ZAMBET) == "registry:onrc"
     # Its administrators are the registry's, named when the finder works on it.
     assert sorted(slim.q(state, "SELECT name FROM person")) == [
         ("Andrei-Mihai Doi",), ("Maria Testescu",)]
 
-    # From here on it is a pulled firm: the same as one a pull brought,
-    # searched the same way.
-    other = await _pulled(world / "pulled", world, [ZAMBET])
-    theirs = await finder.find(other, record_of(other.db_path, ZAMBET), spend=_spend(cap=True),
-                               env=ENV)
-    assert _footing(state, ZAMBET) == _footing(other, ZAMBET)
-    assert website_source(other.db_path, ZAMBET) == "registry:onrc"
-    mine, pulled = found.as_dict(), theirs.as_dict()
-    for d in (mine, pulled):
-        d.pop("ms"), d.pop("company_id")
-    assert mine == pulled
     # A second search takes nothing from the registry again.
     await finder.find(state, cid, spend=_spend(cap=True), env=ENV)
     assert sources(state.db_path, ZAMBET) == [("registry:onrc", f"onrc:{ZAMBET}")]
@@ -587,7 +564,7 @@ async def test_a_record_taking_its_entry_meets_the_firms_other_sources_brought(
         state, world, monkeypatch, listing, expected):
     """A firm a listing brought first, then a record made for the same
     registry firm: taking its entry, the record is matched with the firms
-    on file as a pull's new firm is, a review pair or a merge."""
+    on file as any new firm is, a review pair or a merge."""
     Fakes().install(monkeypatch)
     await state.add_company(Company(source="discover:osm", **listing))
     await state.ensure_registry_records(regs=[ZAMBET])
@@ -596,27 +573,16 @@ async def test_a_record_taking_its_entry_meets_the_firms_other_sources_brought(
     assert took["merged_into"] == ("" if len(expected[0]) == 2 else
                                    str(slim.one(state.db_path, "SELECT id FROM firm "
                                                                "WHERE live = 0")))
-    # As a pull of the same firm leaves the two.
-    folder = world / "pulled"
-    folder.mkdir()
-    shutil.copy(world / "registry.db", folder / "registry.db")
-    other = await opened(folder)
-    await other.add_company(Company(source="discover:osm", **listing))
-    con = registry.connect(folder / "registry.db")
-    try:
-        await runs.registry_pull(other, con, registry.resolve(con, regs=[ZAMBET]))
-    finally:
-        con.close()
-    assert _pairs(other) == expected
 
 
 @pytest.mark.asyncio
 async def test_only_a_record_that_holds_nothing_of_its_own_takes_its_entry(state, world,
                                                                           monkeypatch):
     """A firm another source found, holding the registry firm's CUI, and a
-    pulled firm the user took off the registry's pulls while Harvey's own
-    work keeps it, are searched as before: no registry source, website or
-    register phone is given them."""
+    registry firm the user took off the registry's sources while Harvey's
+    own work keeps it, are searched as before: no registry source or website
+    is given them. The registers' phones are, as to every firm work
+    starts for."""
     slim.taxpayers_beside(state, TAXPAYERS)
     site = _site(f"https://{ZAMBET_SITE}/", "<p>Zâmbet</p>",
                  _contact("email", f"office@{ZAMBET_SITE}", url=f"https://{ZAMBET_SITE}/"))
@@ -629,17 +595,20 @@ async def test_only_a_record_that_holds_nothing_of_its_own_takes_its_entry(state
     assert sorted(slim.q(state.db_path, "SELECT s.name FROM firm_source fs JOIN source s "
                                         "ON s.id = fs.source")) == [("discover:osm",)]
     assert slim.q(state.db_path, "SELECT website, domain FROM firm") == [(None, None)]
-    assert phone_sources(state.db_path) == [] and fakes.read == []
+    assert phone_sources(state.db_path) == [("+40268000103", "mf_taxpayers")]
+    assert fakes.read == []
     assert found.as_dict()["why"] != "do_not_contact"
     assert await state.take_from_registry(cid) == {}
 
-    # Pulled, worked on, then taken off the registry's pulls (harvey remove).
-    other = await _pulled(world / "pulled", world, [ZAMBET])
-    pulled = record_of(other.db_path, ZAMBET)
-    await finder.find(other, pulled, spend=_spend(cap=True), env=ENV)
-    removed = await other.remove_company(pulled)
-    assert removed["kept"] and sources(other.db_path, ZAMBET) == []
-    await finder.find(other, pulled, spend=_spend(cap=True), env=ENV)
+    # Taken from the registry, worked on, then taken off its sources (harvey remove).
+    other = await _beside(world / "other", world, [ZAMBET])
+    taken = record_of(other.db_path, ZAMBET)
+    await finder.find(other, taken, spend=_spend(cap=True), env=ENV)
+    assert sources(other.db_path, ZAMBET) == [("registry:onrc", f"onrc:{ZAMBET}")]
+    removed = await other.remove_company(taken)
+    assert removed["kept"] and removed["register_rows_removed"] == 1
+    assert sources(other.db_path, ZAMBET) == []
+    await finder.find(other, taken, spend=_spend(cap=True), env=ENV)
     assert sources(other.db_path, ZAMBET) == []
 
 
@@ -673,15 +642,10 @@ async def test_a_declared_domain_another_firm_holds_is_left_off(state, world, mo
     assert site_columns(state.db_path, unu) == (f"https://{SHARED}", None, None)
     assert fakes.read == [(SHARED, True), (SHARED, True)] and fakes.looked == []
     assert (first.trust, second.trust) == ("confirmed", "likely")
-    # As a pull leaves the two (it saves them in the same order, by name).
-    other = await _pulled(world / "pulled", world, [doi, unu])
-    for reg in (doi, unu):
-        assert site_columns(other.db_path, reg) == site_columns(state.db_path, reg)
 
 
 @pytest.mark.asyncio
-async def test_a_declared_site_listed_after_its_record_was_made_is_skipped(state, con_free,
-                                                                          monkeypatch):
+async def test_a_declared_site_listed_after_its_record_was_made_is_skipped(state, monkeypatch):
     """A record made before its declared website went on the do-not-contact
     list: its job takes nothing from the registry and reads nothing. The
     skip is recorded by each search that could look it up, so the
@@ -706,23 +670,12 @@ async def test_a_declared_site_listed_after_its_record_was_made_is_skipped(state
     # The background's walk doesn't offer it again.
     job_kinds._backlog_idle.clear()
     assert await job_kinds.enqueue_backlog(state) == 0
-    # A pull left the same firm out.
-    report = await runs.registry_pull(state, con_free, registry.resolve(
-        con_free, regs=[barred_reg]), do_not_contact=[BARRED], dry_run=True)
-    assert report.excluded == 1
     # Off the list, its job takes the entry as any other firm's (the skip
     # is no work of Harvey's on it).
     await finder.find(state, cid, spend=_spend(cap=True), env=ENV,
                       config=SimpleNamespace(compliance=ComplianceConfig()))
     assert fakes.read == [(BARRED, True)]
     assert site_columns(state.db_path, barred_reg)[1] == BARRED
-
-
-@pytest.fixture
-def con_free(world):
-    c = registry.connect(world / "registry.db")
-    yield c
-    c.close()
 
 
 # ── The background ──
@@ -824,6 +777,28 @@ async def test_a_run_checks_its_new_firms_then_searches_them(state, world, monke
         assert sources(state.db_path, reg) == [("registry:onrc", f"onrc:{reg}")], reg
 
 
+@pytest.mark.asyncio
+async def test_a_firm_harvey_already_had_takes_anafs_phone_when_its_search_starts(
+        state, world, monkeypatch):
+    """A check writes nothing to harvey.db: the phone ANAF answered with
+    becomes the firm's contact when work starts for it, whichever source
+    brought it; taken again, nothing is added twice."""
+    monkeypatch.setattr(anaf, "CACHE_PATH", world / "anaf.db")
+    other = cui("9100099")
+    cid = await state.add_company(Company(name="ALT EXEMPLU SRL", cui=other,
+                                          location="Brașov, Romania", source="osm"))
+    anaf.keep(anaf.CACHE_PATH, {other: answer(other, phone="0268 000 199")}, set())
+    assert phone_sources(state.db_path) == []
+    fakes = Fakes().install(monkeypatch)
+    found = await finder.find(state, cid, spend=_spend(cap=True), env=ENV)
+    assert ("+40268000199", "anaf") in phone_sources(state.db_path)
+    # Its phone on file before anything was decided: no search paid for.
+    assert found.as_dict()["why"] == "has_contact" and fakes.looked == []
+    links = slim.one(state.db_path, "SELECT COUNT(*) FROM link_evidence")
+    await finder.find(state, cid, spend=_spend(cap=True), env=ENV)
+    assert slim.one(state.db_path, "SELECT COUNT(*) FROM link_evidence") == links
+
+
 @pytest.mark.parametrize("ended", ["failed", "cancelled"])
 def test_a_check_that_ends_without_queueing_its_searches_still_gets_them_queued(client, ended):
     from harvey.modules import jobs, worker
@@ -849,6 +824,59 @@ def test_a_check_that_ends_without_queueing_its_searches_still_gets_them_queued(
         return
     assert sorted(searches) == sorted((record_of(client.db, reg), got["batch_id"])
                                       for reg in (ZAMBET, TELEFON))
+
+
+# ── The agent ──
+
+def test_the_agents_find_contacts_starts_from_the_registry_as_the_page_does(client):
+    """find_contacts(registry=the registry's filters) under an approved
+    plan: counted first by estimate('registry'), then the button's own
+    run, records made only once the plan holds the run, checked at ANAF
+    first; a set of registration numbers is the ticked rows."""
+    from tests.test_agent_actions import _actions, _approve, _chat, _one, _propose
+
+    db = client.db
+    run(opened(db.parent))
+    _chat(db)
+    plan_id = _propose(db, budget=0)
+    _approve(db, plan_id)
+    error, est = _one(db, "estimate", {"action": "registry", "params": SALON_FILTER})
+    assert not error, est
+    assert est == {**counted(5, 0, to_create=5, left=0), "cost_usd": 0.0,
+                   "note": launch.REGISTRY_NOTE}
+    assert firms(db) == 0
+
+    error, out = _one(db, "find_contacts", {"plan": plan_id, "registry": SALON_FILTER})
+    assert not error, out
+    assert out["estimate"]["registry"]["to_create"] == 5
+    assert out["registry"] == counted(5, 0, created=5, left=0)
+    assert out["checks_first"] == {"jobs": 1, "companies": 5} and out["queued"] == 0
+    assert firms(db) == 5 and nothing_copied(db)
+    assert [kind for kind, _ in queued(db)] == ["id_check", "register_counts"]
+    (check,) = [p for kind, p in queued(db) if kind == "id_check"]
+    assert check["then_find"] is True and len(check["company_ids"]) == 5
+    # The run is the plan's, though no search is queued until the check is done.
+    assert _actions(db)[-1][3:5] == ("find_contacts", out["run"])
+    assert _actions(db)[-1][7] == "ok"
+    # The page's run over the same filter finds that work waiting.
+    again = client.post("/api/contacts/find", json={"registry": SALON_FILTER})
+    assert again.status_code == 409 and again.json()["job"]["kind"] == "id_check"
+
+    # A set of registration numbers is taken as ticked rows.
+    error, s = _one(db, "save_set", {"name": "Zâmbet", "of": "registry",
+                                     "sql": f"SELECT reg FROM reg.firms WHERE reg = '{ZAMBET}'"})
+    assert not error and s["count"] == 1, s
+    error, out = _one(db, "find_contacts", {"plan": plan_id, "set": s["set"]})
+    assert not error, out
+    assert out["registry"] == counted(1, 0, created=1, left=0)
+    assert out["set"]["taken"] == 1 and firms(db) == 6
+    # Chosen firms come as a set, never as a list, and never with a filter.
+    for args, why in (({"registry": {"regs": [SIMPLU]}}, "needs an activity"),
+                      ({"registry": SALON_FILTER, "filter": {"county": "Brașov"}}, "not both"),
+                      ({"registry": SALON_FILTER, "set": s["set"]}, "not both")):
+        error, text = _one(db, "find_contacts", {"plan": plan_id, **args})
+        assert error and why in text, (args, text)
+    assert firms(db) == 6
 
 
 # ── The commands ──
@@ -913,18 +941,28 @@ def test_harvey_contacts_find_estimates_before_it_makes_records(world, monkeypat
     assert firms(world / "harvey.db") == 0 and queued(world / "harvey.db") == []
 
 
-def test_import_onrc_refuses_the_whole_country_and_counts_it_in_place(world, monkeypatch,
-                                                                      capsys):
-    for argv in (["--whole-country"], []):
-        with pytest.raises(SystemExit) as exit_:
-            _cli(monkeypatch, "import-onrc", *argv)
-        assert exit_.value.code == 2
-        out = capsys.readouterr().out
-        assert "Companies page" in out and "harvey contacts find --registry" in out
-    _cli(monkeypatch, "import-onrc", "--dry-run")
-    out = capsys.readouterr().out
-    assert "16 operating firms in all of Romania" in out and DATASET.name in out
-    _cli(monkeypatch, "import-onrc", "--dry-run", "--include-inactive", "--whole-country")
-    assert "19 firms of every status" in capsys.readouterr().out
-    # Counted where the registry is: no database, no job, nothing saved.
-    assert not (world / "harvey.db").exists()
+
+
+def test_harvey_contacts_find_takes_the_registrys_own_filters(world, monkeypatch, capsys):
+    from harvey.modules.ro.mf_taxpayers import store as tax_store
+
+    slim.taxpayers_beside(run(opened(world)), TAXPAYERS)
+    monkeypatch.setattr(tax_store, "TAXPAYERS_PATH", world / "taxpayers.db")
+    _cli(monkeypatch, "contacts", "find", "9602", "--registry", "--county", "BV",
+         "--employer", "yes", "--dry-run")
+    assert "Registry: 1 firm match, 0 with a record in Harvey" in capsys.readouterr().out
+    # Read from the registry only: without --registry it is refused.
+    with pytest.raises(SystemExit) as exit_:
+        _cli(monkeypatch, "contacts", "find", "--county", "BV", "--employer", "yes")
+    assert exit_.value.code == 2
+    assert "--employer select firms in the trade registry: add --registry" in \
+        capsys.readouterr().out
+    assert firms(world / "harvey.db") == 0 and queued(world / "harvey.db") == []
+
+
+@pytest.mark.parametrize("argv", [["import-onrc", "dentist"], ["registry", "pull", "dentist"]])
+def test_nothing_copies_registry_firms_up_front_any_more(world, monkeypatch, capsys, argv):
+    with pytest.raises(SystemExit) as exit_:
+        _cli(monkeypatch, *argv)
+    assert exit_.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

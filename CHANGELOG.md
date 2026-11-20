@@ -11,8 +11,8 @@ minor versions can still change behaviour.
 
 - **Companies lists the whole trade registry, and Find contacts starts
   from it.** The Companies page has two lists, switched at the top. **All
-  firms** is the registry's own list (the Registry page's, with its filters,
-  sorts and panel), read where the registry is: nothing is copied into
+  firms** is the registry's own list, with its filters, sorts and panel,
+  read where the registry is: nothing is copied into
   Harvey to show it. **In Harvey** is the list Companies had: the companies
   Harvey has worked on. The page opens on All firms while a registry is
   loaded and Harvey holds no company yet, else on the list you chose last
@@ -36,7 +36,7 @@ minor versions can still change behaviour.
   `--q`, `--county` and `--locality` select registry firms; `--limit` caps
   how many get a record; `--dry-run` counts and estimates, writing
   nothing). `POST /api/contacts/find` and its estimate take
-  `{"registry": {...}}` (the Registry page's filters, or `{"regs": [...]}`)
+  `{"registry": {...}}` (the All firms list's filters, or `{"regs": [...]}`)
   in place of the company ids and answer with `registry` (`selected`,
   `existing`, `to_create` or `created`, `left`, and the firms left out:
   `excluded`, whose declared website is on the do-not-contact list and
@@ -49,7 +49,6 @@ minor versions can still change behaviour.
   `harvey contacts find` without `--registry`. The Overview's registry
   tip, the Companies empty state and Help's "Getting started" now point
   there.
-  The Registry page and its **Pull into Harvey** are as they were.
 - **The dashboard behind your own HTTPS reverse proxy.** The dashboard
   answers to `localhost` only, so a proxy serving it at a name of your own
   either showed nothing or, when it replaced `Host` with the address it
@@ -1163,6 +1162,42 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **ANAF checks go by CUI, and write only their own file.** A check asks
+  ANAF about CUIs and keeps the answers in `data/anaf.db`, as before, but
+  no longer writes anything into `harvey.db` (no observation, no run row,
+  no phone). `harvey anaf check --cui N` works for any valid CUI, with no
+  record in Harvey needed; `--missing` is the CUIs on file ANAF never
+  answered, `--all-on-file` every CUI on file. Checks are queued in one
+  write as jobs of 1,000 CUIs each (they were 100 companies a job), and a
+  check queued again while the same one waits is not queued twice. The
+  progress and the report speak of CUIs. A check an earlier release queued
+  (by company) still runs, from the start.
+- **Register phones become contacts when work starts on a firm.** The
+  phone ANAF gives and the taxpayer file's phones are a firm's contacts
+  once its search starts (the contact finder takes them, for a firm just
+  given a record and for one Harvey worked on before alike), never in
+  bulk: a taxpayer-file load no longer adds phones to every firm on file,
+  and an ANAF check adds none. The ones already on file stay. A register
+  phone field holding two numbers ("0722 … / 0268 …", or ANAF's
+  space-separated list) now gives both.
+- **The registry's filters are the registry module's own.** They are
+  declared in its manifest's `[register]` table and read by Companies →
+  All firms, Find contacts and the agent alike; Discover no longer lists
+  the registry as a source.
+- **`harvey contacts find --registry` takes the registry's own filters**:
+  `--all-statuses`, `--min-turnover`, `--max-turnover`, `--min-employees`,
+  `--max-employees`, `--unknown`, `--employer`, `--vat` and `--micro`
+  (refused without `--registry`).
+- **The agent finds contacts from the registry** with `find_contacts`
+  (`registry`: the All firms list's filters, or a set saved `of='registry'`),
+  through the same path as the button: its new firms checked at ANAF
+  first, the run's caps out of the plan's budget, the records made only
+  once the plan has reserved them. `estimate('registry')` gives the same
+  counts as the button's estimate.
+- **`harvey remove`** says how many register rows it took off
+  (`register_rows_removed`): a registry firm a Find-contacts run takes
+  again gets a new record.
+
 - **`harvey import-onrc` no longer imports the whole country.** With no
   activity, area or filter it is refused, with or without
   `--whole-country`: importing everything was the way to have every firm
@@ -2022,6 +2057,20 @@ minor versions can still change behaviour.
   installation in Docker. Thanks to @EICCIO-Advisors for the private report.
 
 ### Removed
+
+- **The registry pull.** `harvey import-onrc`, `harvey registry pull`, the
+  Registry tab with its **Pull into Harvey**, Discover's ONRC source and
+  the agent's `registry_pull` are gone, with the code that copied registry
+  firms into Harvey in bulk. The registry is read where it is (Companies →
+  All firms, `harvey registry search`), and a firm gets its record when a
+  Find-contacts run takes it (All firms → Find contacts, or
+  `harvey contacts find WORDS --registry`). A saved Registry tab opens
+  Companies on All firms. A registry pull job an earlier release left
+  queued or paused is cancelled when the worker starts, marked "retired"
+  on the Queue (Coadă), and can't be retried or resumed; finished ones stay
+  as history. Firms an earlier pull brought in stay as they are. This
+  supersedes what the entries above say about registry pulls and
+  `import-onrc`.
 
 - **Confirming signals, and the Signals tab.** Every signal a module that
   is on declares is collected; the module's switch (Surse, `harvey modules

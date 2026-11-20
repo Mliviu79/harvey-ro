@@ -319,8 +319,10 @@ def overlay_con(files):
     loaded = registers.attach_all(con, adapters)
     assert all(loaded.values()), loaded
     # The temporary tables named statements fill and read.
-    for ddl in harvey.overlay.queries.TEMP_TABLES.values():
+    for ddl in (*harvey.overlay.queries.TEMP_TABLES.values(),
+                *harvey.overlay.queries.ID_CHECK_TABLES.values()):
         con.execute(ddl)
+    harvey.overlay.queries.register_functions(con)
     yield con
     con.close()
 

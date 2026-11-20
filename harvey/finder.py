@@ -38,10 +38,10 @@ A record made when a Find-contacts run chose a firm from the trade
 registry, that holds nothing of its own yet, takes its registry entry
 first, in its own job: the website it declares (the domain left off
 when another company holds it), the phones the loaded registers hold for
-it, the registry as its source (Store.take_from_registry, the pull's own
+it, the registry as its source (Store.take_from_registry, the register's
 save of one firm). Until then it holds nothing to search by, so no lookup
 is paid for a firm that declares a website. One whose declared website is
-on the do-not-contact list is left alone, as a pull left it out (each
+on the do-not-contact list is left alone (each
 search that could look it up records it as skipped, so the background
 doesn't offer it again).
 
@@ -483,13 +483,17 @@ async def _find(state, company_id: str, *, spend: Spend, since, batch_id, config
 
 async def _registry_entry(state, company_id: str, config, run_id: str = "") -> str:
     """Give a record made for a registry selection, that holds nothing of
-    its own yet (Store.registry_entry), what a pull gave the firms it saved
-    (Store.take_from_registry), unless the website it declares is on the
-    do-not-contact list (ingest.excluded, as a pull checks it): then
-    nothing is written and "do_not_contact" is returned. "taken" when it
-    was, "" for any other firm."""
+    its own yet (Store.registry_entry), its registry entry
+    (Store.take_from_registry: its declared website, its sources and the
+    registers' phones), unless the website it declares is on the
+    do-not-contact list (ingest.excluded): then nothing is written and
+    "do_not_contact" is returned. "taken" when it was. Any other firm takes
+    the phones the loaded registers hold for it (ANAF's answer, the
+    taxpayer file: Store.take_register_phones), which become its contacts
+    only now that work starts for it; "" for it."""
     declared = await state.registry_entry(company_id)
     if declared is None:
+        await state.take_register_phones(company_id)
         return ""
     barred = []
     if config is not None:

@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.models import Company
-from harvey.modules import api, runs, switches
+from harvey.modules import api, switches
 from harvey.modules.ro.mf_taxpayers import capabilities as caps
 from harvey.modules.ro.mf_taxpayers import source, store
 from harvey.signals import sync_vocabulary
@@ -288,13 +288,15 @@ async def state(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_companies_on_file_get_their_phone_and_read_the_rest_in_place(state):
+async def test_a_firm_takes_its_phones_when_work_starts_and_reads_the_rest_in_place(state):
     a = await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
                                         source="registry:onrc"))
     pfa = await state.add_company(Company(name="POPESCU EXEMPLU PFA", cui="90000022",
                                           source="registry:onrc"))
-    first = await runs.lookup_by_id(state)
-    assert first["companies"] == 2
+    # Loaded, the file's phones are no one's contacts yet.
+    assert not (await state.get_company(a)).phone
+    assert await state.take_register_phones(a) == 1
+    assert await state.take_register_phones(pfa) == 2
     assert (await state.get_company(a)).phone == "+40 268 000 210"
     assert (await state.get_company(pfa)).phone == "+40 722 000 210"
     # The rest is read from the file, dated as it was published.
@@ -309,8 +311,52 @@ async def test_companies_on_file_get_their_phone_and_read_the_rest_in_place(stat
         state, "SELECT c.value FROM link_evidence e JOIN contact c ON c.id = e.contact "
                "WHERE e.firm = ? AND c.kind = 2", int(pfa))) == ["+40268000310", "+40722000210"]
     assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
-    again = await runs.lookup_by_id(state)
-    assert again["observations"] == 0                                # same file: nothing new
+    # Taken again: nothing added twice.
+    links = slim.one(state, "SELECT COUNT(*) FROM link_evidence")
+    await state.take_register_phones(pfa)
+    assert slim.one(state, "SELECT COUNT(*) FROM link_evidence") == links
+
+
+@pytest.mark.asyncio
+async def test_a_firm_takes_the_phones_of_a_record_merged_into_it(state):
+    """The CUI stays on the record merged in, not on the survivor: work on
+    the survivor still takes the phone that CUI reaches."""
+    import sqlite3
+
+    from harvey.overlay import merges
+
+    listing = await state.add_company(Company(name="EXEMPLU ALFA", source="osm"))
+    record = await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
+                                             source="registry:onrc"))
+    with sqlite3.connect(state.db_path) as con:
+        merges.merge(con, int(listing), int(record), score=1.0, reasons="[]",
+                     decided_by="user")
+        con.commit()
+    assert await state.take_register_phones(listing) == 1
+    assert (await state.get_company(listing)).phone == "+40 268 000 210"
+
+
+@pytest.mark.asyncio
+async def test_a_load_copies_no_phone_onto_the_firms_on_file(state, monkeypatch):
+    """After a load, the firms on file read it in place; their phones from
+    it become contacts only when work starts for them."""
+    from types import SimpleNamespace
+
+    from harvey.modules import job_kinds, runs
+
+    await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014",
+                                    source="registry:onrc"))
+
+    async def loaded(state_, module, capability, extra=None):
+        return api.Draft(values={"taxpayers": {}})
+    monkeypatch.setattr(runs, "sync_source", loaded)
+    ctx = SimpleNamespace(state=state, id="job1", say_soon=lambda line: None,
+                          params={"module": "mf_taxpayers", "capability": "taxpayers_sync"},
+                          job=SimpleNamespace(id="job1", batch_id=""))
+    out = await job_kinds.run_source_sync(ctx)
+    assert "companies" not in out and "observations" not in out
+    assert slim.one(state, "SELECT COUNT(*) FROM contact") == 0
+    assert [k for (k,) in slim.q(state, "SELECT kind FROM jobs")] == ["register_counts"]
 
 
 @pytest.mark.asyncio
@@ -329,11 +375,12 @@ async def test_anaf_s_newer_reading_stays_current(state, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nothing_loaded_is_skipped_quietly(state, monkeypatch, tmp_path):
-    monkeypatch.setattr(store, "TAXPAYERS_PATH", tmp_path / "none.db")
-    await state.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014"))
-    found = await runs.lookup_by_id(state)
-    assert any("harvey taxpayers load" in s for s in found["skipped"])
+async def test_with_nothing_loaded_no_phone_is_taken(tmp_path):
+    # (Registers are read from the database's folder: none is beside it.)
+    bare = StateManager(str(tmp_path / "bare.db"))
+    await bare.init_db()
+    a = await bare.add_company(Company(name="EXEMPLU ALFA SRL", cui="90000014"))
+    assert await bare.take_register_phones(a) == 0
 
 
 def test_the_manifest():
@@ -359,7 +406,7 @@ def test_cli_status_says_nothing_is_loaded(tmp_path, monkeypatch, capsys):
     assert "No taxpayer file loaded" in capsys.readouterr().out
 
 
-# ── Filtering the registry before anything is pulled ──
+# ── Filtering the registry before any work starts ──
 
 from tests.test_mf_financials import reg  # noqa: E402,F401  (the registry fixture)
 

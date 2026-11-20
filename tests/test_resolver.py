@@ -41,8 +41,9 @@ def _firm(n=1, name="EXEMPLU SRL", locality="Brașov", cui=None, website="", dom
                      website=website, domain=domain, registered="2010-01-01")
 
 
-async def _pull(state, *firms):
-    return await slim.pull(state, *firms, dataset=DATASET)
+async def _seed(state, *firms):
+    """Registry firms brought in as work starts on them (slim.seed)."""
+    return await slim.seed(state, *firms, dataset=DATASET)
 
 
 async def _upsert(state, biz, query):
@@ -152,7 +153,7 @@ async def test_a_domain_two_companies_hold_says_nothing(state):
 
 @pytest.mark.asyncio
 async def test_map_hit_with_same_name_and_town_goes_to_review(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
 
     company_id, is_new = await _upsert(state, _maps_hit(), QUERY)
@@ -167,7 +168,7 @@ async def test_map_hit_with_same_name_and_town_goes_to_review(state):
 
 @pytest.mark.asyncio
 async def test_map_hit_with_same_name_town_and_phone_merges(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
     # The registry carries no phone; the firm's own site gave one.
     await state.add_observation(company_id=firm.id, signal_code="PHONE_NUMBER",
@@ -244,7 +245,7 @@ async def test_aggregator_domains_never_match(state):
 
 @pytest.mark.asyncio
 async def test_two_cuis_with_the_same_name_town_and_phone_stay_two(state):
-    await _pull(state, _firm(1), _firm(2))
+    await _seed(state, _firm(1), _firm(2))
     one = await state.get_company_by_cui("90000001")
     two = await state.get_company_by_cui("90000002")
     assert one.id != two.id
@@ -261,22 +262,29 @@ async def test_two_cuis_with_the_same_name_town_and_phone_stay_two(state):
 
 
 @pytest.mark.asyncio
-async def test_registry_still_matches_on_cui_and_fills_gaps(state):
-    await _pull(state, _firm())
-    report = await _pull(state, _firm(website="https://exemplu.example.com",
-                                      domain="exemplu.example.com"))
-    assert (report.known_companies, report.new_companies) == (1, 0)
+async def test_registry_still_matches_on_cui_and_takes_its_entry_once(state):
+    first = await _seed(state, _firm(website="https://exemplu.example.com",
+                                     domain="exemplu.example.com"))
+    assert (first.created, first.existing, first.taken) == (1, 0, 1)
     firm = await state.get_company_by_cui("90000001")
     assert firm.domain == "exemplu.example.com"
+    # The same CUI again is the same record, and the entry it took when
+    # its work started isn't taken twice: the registry's later rows are
+    # read in place, never copied over what the firm holds.
+    again = await _seed(state, _firm(website="https://altceva.example.com",
+                                     domain="altceva.example.com"))
+    assert (again.created, again.existing, again.taken) == (0, 1, 0)
+    assert (await state.get_company_by_cui("90000001")).domain == "exemplu.example.com"
+    assert _rows(state.db_path, "SELECT COUNT(*) FROM firm") == [(1,)]
 
 
 @pytest.mark.asyncio
 async def test_a_declared_website_alone_is_only_a_question(state):
     site = await state.save_company(Company(name="Zâmbet Exemplu", domain="zambet.example.com",
                                             location="Cluj"))
-    report = await _pull(state, _firm(name="ALTCEVA SRL", website="https://zambet.example.com",
+    report = await _seed(state, _firm(name="ALTCEVA SRL", website="https://zambet.example.com",
                                       domain="zambet.example.com"))
-    assert report.new_companies == 1 and report.shared_domain == 1
+    assert report.created == 1 and report.shared_domain == 1
     [pair] = await state.duplicates()
     assert pair["company_a"] == site.company_id
     assert pair["reasons"] == [{"code": "declared_domain", "value": "zambet.example.com"}]
@@ -287,7 +295,7 @@ async def test_a_declared_website_alone_is_only_a_question(state):
 
 @pytest.mark.asyncio
 async def test_undo_restores_exactly(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
     other = (await state.save_company(Company(
         name="Exemplu", phone="+40700000006", location="Brașov", source="discover:osm",
@@ -326,7 +334,7 @@ async def test_undo_restores_exactly(state):
 
 @pytest.mark.asyncio
 async def test_an_automatic_merge_can_be_undone(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
     await state.add_observation(company_id=firm.id, signal_code="PHONE_NUMBER",
                                 value_text="+40700000007")
@@ -342,7 +350,7 @@ async def test_an_automatic_merge_can_be_undone(state):
 
 @pytest.mark.asyncio
 async def test_undo_takes_back_what_the_listing_brought_after_the_merge(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
     await state.add_observation(company_id=firm.id, signal_code="PHONE_NUMBER",
                                 value_text="+40700000007")
@@ -428,7 +436,7 @@ async def test_undo_waits_for_a_later_merge_of_the_survivor(state):
 async def test_merge_pair_keeps_the_registry_record(state):
     site = (await state.save_company(Company(name="Exemplu", location="Brașov",
                                              source="discover:osm"))).company_id
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     firm = await state.get_company_by_cui("90000001")
     [pair] = await state.duplicates()
     done = await state.merge_pair(pair["company_a"], pair["company_b"])
@@ -437,7 +445,7 @@ async def test_merge_pair_keeps_the_registry_record(state):
 
 @pytest.mark.asyncio
 async def test_separate_takes_the_pair_off_the_list(state):
-    await _pull(state, _firm())
+    await _seed(state, _firm())
     await _upsert(state, _maps_hit(), QUERY)
     [pair] = await state.duplicates()
     await state.separate_companies(pair["company_a"], pair["company_b"])
@@ -505,7 +513,7 @@ def client(monkeypatch, tmp_path):
 async def _seed_pair(path):
     sm = StateManager(str(path))
     await sm.init_db()
-    await _pull(sm, _firm())
+    await _seed(sm, _firm())
     site = (await sm.save_company(Company(name="Exemplu", location="Brașov",
                                           phone="+40700000010", source="discover:osm"))).company_id
     return sm, (await sm.get_company_by_cui("90000001")).id, site
@@ -544,7 +552,7 @@ def test_the_api_refuses_two_cuis(client):
     async def seed():
         sm = StateManager(str(client.db_path))
         await sm.init_db()
-        await _pull(sm, _firm(1), _firm(2))
+        await _seed(sm, _firm(1), _firm(2))
         return [(await sm.get_company_by_cui(c)).id for c in ("90000001", "90000002")]
     one, two = asyncio.run(seed())
     r = client.post("/api/duplicates/merge", json={"a": one, "b": two})

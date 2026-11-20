@@ -14,7 +14,7 @@ merges with undo, sources, web signals and outreach.
 - queries.py: the overlay's named page statements.
 - idents.py: identifier schemes, and how a record's ids reach them.
 - store.py: Harvey's writes (the StateManager's, by the same names): firms
-  found or pulled, contacts and evidence, people, searches, web signals,
+  found or taken from a register as work starts, contacts and evidence, people, searches, web signals,
   merges and undo, removing a firm.
 - reads.py: Harvey's reads (the pages', the CLI's, the agents').
 - migrate.py, verify.py: the upgrade from schema 24 (harvey/upgrade.py runs

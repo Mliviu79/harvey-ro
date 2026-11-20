@@ -12,17 +12,8 @@ dataset of '^'-separated, BOM-prefixed UTF-8 files:
 Together they answer "every operating dental practice in Brașov, and who
 runs it" for free, without a single search. The files are big (the firms
 file alone is ~700 MB), so nothing here loads one into memory: each is
-streamed, in the order that keeps the working set smallest. With an
-activity filter: activity first (the classes you asked for, nationwide),
-then status (only for those), then firms (only those, in your county).
-Without one (every activity in a county or town): the firms file for the
-area's registration numbers, status for those, the firms file again for
-the ones kept. Then the activity file again for every class the kept
-firms are authorised for (saved as company_activities, so they can be
-searched by code or in words), then representatives (only for the firms
-kept, and only when wanted). harvey/registry.py loads the same files once
-per dataset into a local database instead, with every firm in it, and
-searches that; this module's streaming import still works on its own.
+streamed (read_rows). harvey/registry.py loads them once per dataset into
+a local database with every firm in it, and searches that in place.
 
 What is kept is deliberately narrow. The representatives file also carries
 birth dates and places and home localities; only a natural person's name
@@ -34,12 +25,10 @@ The downloaded files themselves are kept as published (data/onrc/<date>/):
 prune_downloads() deletes the representatives file and older datasets, but
 only when called.
 
-Every fact lands as an observation with the dataset it came from, as
-discovery's do: companies (and what they are authorised to do, which
-describes them like their industry) are saved because you asked for them
-by activity and place, and the ACTIVITY_CODE, CONTACT_FOUND and
-DECISION_MAKER_TITLE rows with them while the modules that declare those
-signals are on.
+A firm gets its record in Harvey only when work starts on it; what the
+registry says of it then (its activities, its administrators) is read as
+a draft (firms_draft) through the module's adapter, while the modules
+that declare those signals are on.
 """
 
 import csv
@@ -47,7 +36,7 @@ import io
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from importlib import resources
 from pathlib import Path
@@ -218,13 +207,6 @@ def clean_locality(text: str) -> str:
     first = _comma_below((text or "").split(",")[0]).strip()
     return re.sub(r"^(municipiul|oraș|orașul|comuna|sat|satul|loc\.?)\s+", "",
                   first, flags=re.IGNORECASE).strip()
-
-
-def _locality_matches(wanted: str, locality: str) -> bool:
-    want = _fold(wanted).split()
-    have = _fold(locality).split()
-    return bool(want) and any(have[i:i + len(want)] == want
-                              for i in range(len(have) - len(want) + 1))
 
 
 def valid_cui(raw: str) -> str:
@@ -496,57 +478,6 @@ def _version(raw: str) -> int | None:
     return int(raw) if raw.isdigit() else None
 
 
-def matching_registrations(path: Path, classes: set[tuple[str, int | None]]
-                           ) -> dict[str, list[tuple[str, int]]]:
-    """Registration number -> the wanted classes it is authorised for.
-    A class with version None matches the code in Rev.2 and Rev.3 alike;
-    the pre-2008 nomenclatures never match (their numbers mean other
-    things)."""
-    wanted = {(c, v) for c, v in classes if v is not None}
-    any_current = {c for c, v in classes if v is None}
-    out: dict[str, list[tuple[str, int]]] = {}
-    for reg, code, ver in read_rows(path, ("COD_INMATRICULARE", "COD_CAEN_AUTORIZAT",
-                                           "VER_CAEN_AUTORIZAT")):
-        code, version = code.strip().zfill(4), _version(ver)
-        if (code, version) in wanted or (code in any_current and version in (2, 3)):
-            hits = out.setdefault(reg.strip(), [])
-            if (code, version) not in hits:
-                hits.append((code, version))
-    return out
-
-
-def authorised_codes(path: Path, regs) -> dict[str, list[tuple[str, int]]]:
-    """Registration number -> every class it is authorised for, any
-    revision (the pre-2008 ones too: they describe old registrations), in
-    file order. Only for ``regs``: the national file is streamed, and only
-    the codes of these registrations are held."""
-    out: dict[str, list[tuple[str, int]]] = {}
-    for reg, code, ver in read_rows(path, ("COD_INMATRICULARE", "COD_CAEN_AUTORIZAT",
-                                           "VER_CAEN_AUTORIZAT")):
-        reg = reg.strip()
-        if reg not in regs:
-            continue
-        code, version = code.strip().zfill(4), _version(ver)
-        if version is None or not code.isdigit():
-            continue
-        have = out.setdefault(reg, [])
-        if (code, version) not in have:
-            have.append((code, version))
-    return out
-
-
-def active_registrations(path: Path, regs) -> set[str]:
-    """Which of these registrations are operating: status 1048 and none of
-    the closing statuses. One with no status row at all isn't counted."""
-    codes: dict[str, set[str]] = {}
-    for reg, code in read_rows(path, ("COD_INMATRICULARE", "COD")):
-        reg = reg.strip()
-        if reg in regs:
-            codes.setdefault(reg, set()).add(code.strip())
-    return {reg for reg, have in codes.items()
-            if ACTIVE_STATUS in have and not have & CLOSED_STATUSES}
-
-
 @dataclass
 class Firm:
     reg: str
@@ -585,30 +516,6 @@ def _localities(spec: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,;]", spec or "") if p.strip()]
 
 
-def _in_area(county: list[str] | str | None, locality: list[str] | str):
-    """A test for (county, locality) as the firms file spells them."""
-    wanted = [county] if isinstance(county, str) else list(county or [])
-    want_counties = {_fold(c) for c in wanted if c}
-    places = _localities(locality) if isinstance(locality, str) else list(locality)
-
-    def test(row_county: str, row_locality: str) -> bool:
-        if want_counties and _fold(row_county) not in want_counties:
-            return False
-        return not places or any(_locality_matches(p, row_locality) for p in places)
-    return test
-
-
-def registrations_in_area(path: Path, county: list[str] | str | None = None,
-                          locality: list[str] | str = "") -> set[str]:
-    """Every registration number whose registered office is in the area,
-    whatever it does: the first pass of an import with no activity filter.
-    Only the numbers are held; the firms are read again for those kept."""
-    inside = _in_area(county, locality)
-    return {reg.strip() for reg, row_county, row_locality in read_rows(
-        path, ("COD_INMATRICULARE", "ADR_JUDET", "ADR_LOCALITATE"))
-        if inside(row_county, row_locality)}
-
-
 def parse_firm(rec: dict) -> Firm:
     """One row of the firms file (column name -> raw value) as a Firm:
     names with Romanian's comma-below letters, a real CUI or none (never a
@@ -629,23 +536,6 @@ def parse_firm(rec: dict) -> Firm:
     )
 
 
-def matching_firms(path: Path, regs, county: list[str] | str | None = None,
-                   locality: list[str] | str = "") -> list[Firm]:
-    """The firms among these registrations whose registered office is in one
-    of the counties (all of Romania when none) and, when given, one of the
-    localities."""
-    inside = _in_area(county, locality)
-    out = []
-    for row in read_rows(path, _FIRM_COLUMNS):
-        rec = dict(zip(_FIRM_COLUMNS, row))
-        if rec["COD_INMATRICULARE"].strip() not in regs:
-            continue
-        if not inside(rec["ADR_JUDET"], rec["ADR_LOCALITATE"]):
-            continue
-        out.append(parse_firm(rec))
-    return out
-
-
 PEOPLE_COLUMNS = ("COD_INMATRICULARE", "PERSOANA_IMPUTERNICITA", "CALITATE")
 
 
@@ -660,60 +550,11 @@ def parse_person(name: str, role: str) -> tuple[str, str, str] | None:
     return (first, last, title) if first else None
 
 
-def administrators(path: Path, regs) -> dict[str, list[tuple[str, str, str]]]:
-    """Registration number -> [(first, last, role)] for the people who run
-    the company. Only the name and role columns are read; companies acting
-    as representatives, insolvency practitioners and any name holding
-    digits (an id where a name should be) are left out."""
-    out: dict[str, list[tuple[str, str, str]]] = {}
-    for reg, name, role in read_rows(path, PEOPLE_COLUMNS):
-        reg = reg.strip()
-        if reg not in regs:
-            continue
-        person = parse_person(name, role)
-        if not person:
-            continue
-        people = out.setdefault(reg, [])
-        if all(person[:2] != (f, l) for f, l, _ in people):
-            people.append(person)
-    return out
-
-
-# ── The import ──
-
-
-@dataclass
-class ImportReport:
-    dataset: str = ""
-    classes: list[str] = field(default_factory=list)
-    # With an activity filter: registrations authorised for a wanted class,
-    # of which operating, of which in the county/locality. Without one:
-    # registrations in the area, of which operating, and in_area == active.
-    authorised: int = 0
-    active: int = 0
-    in_area: int = 0
-    catch_all_only: int = 0      # ... matched only on Rev.2's catch-all 8690
-    shared_domain: int = 0       # website domain already held by another business
-    excluded: int = 0            # on the do-not-contact list
-    new_companies: int = 0
-    known_companies: int = 0
-    updated_companies: int = 0
-    administrators: int = 0
-    activities: int = 0          # company activities (CAEN classes) added
-    observations: int = 0
-    run_id: str = ""
-    dry_run: bool = False
-    errors: list[str] = field(default_factory=list)
-
-    def as_dict(self) -> dict:
-        return dict(self.__dict__)
-
-
 # Rev.2's "other human health activities": Rev.3 split it into labs (8691),
 # psychologists (8693), physiotherapy (8695) and more. A search for one of
 # those also asks for 8690 Rev.2, since older registrations still carry it,
 # but such a company may be any of the others: its ACTIVITY_CODE is
-# recorded at CATCH_ALL_CONFIDENCE and counted apart in the report.
+# recorded at CATCH_ALL_CONFIDENCE.
 CATCH_ALL = ("8690", 2)
 CATCH_ALL_CONFIDENCE = 0.5
 
@@ -847,64 +688,6 @@ def firms_draft(
                              source_url=evidence, record=key, collector=COLLECTOR)
                         for (code_, text), confidence in rows.items()]
     return draft
-
-
-def read_import(
-    files: dict[str, Path],
-    dataset: Dataset,
-    *,
-    county: str = "",
-    classes: list[tuple[str, int | None]] | None = None,
-    locality: str = "",
-    active_only: bool = True,
-    with_people: bool = True,
-) -> tuple[list[Firm], dict, dict, ImportReport]:
-    """Read the registry files for what an import asks for: (firms, every
-    class each is authorised for, their administrators, the report so far).
-
-    ``county`` and ``locality`` take comma-separated lists; no county is the
-    whole country. ``classes`` are (code, version) pairs, version None for
-    "Rev.2 or Rev.3". No classes reads every activity in the area, which
-    then needs a county or a locality (the whole country would be millions
-    of rows). ``with_people`` False leaves the representatives file unread.
-    """
-    classes = list(classes or [])
-    report = ImportReport(dataset=dataset.name)
-    report.classes = class_labels(classes)
-    names = counties(county)
-    if not classes and not names and not _localities(locality):
-        raise ValueError("every activity needs an area: give a county or a locality "
-                         "(or words or CAEN codes to search the whole country)")
-
-    # Streamed in the order that keeps the working set smallest. With an
-    # activity filter: the wanted classes nationwide, their status, the
-    # firms in the area. Without one: the area's registrations (numbers
-    # only), their status, the firms kept. Then every class of the kept
-    # firms, and their representatives.
-    if classes:
-        authorised = matching_registrations(files["caen"], set(classes))
-        report.authorised = len(authorised)
-        candidates = set(authorised)
-    else:
-        candidates = registrations_in_area(files["firms"], names, locality)
-        report.authorised = len(candidates)
-    keep = active_registrations(files["status"], candidates) if active_only \
-        else candidates
-    report.active = len(keep)
-    firms = matching_firms(files["firms"], keep, names, locality)
-    report.in_area = len(firms)
-    kept_regs = {f.reg for f in firms}
-    all_codes = authorised_codes(files["caen"], kept_regs)
-    if classes:
-        # A class asked for that the full read skipped (no version) still
-        # counts, as it did when it was matched.
-        for reg, hits in authorised.items():
-            if reg in kept_regs:
-                have = all_codes.setdefault(reg, [])
-                have += [pair for pair in hits if pair not in have]
-    people = administrators(files["people"], kept_regs) \
-        if with_people and "people" in files else {}
-    return firms, all_codes, people, report
 
 
 def parse_classes(words: str | list[str] = "", codes: str = "") -> list[tuple[str, int | None]]:

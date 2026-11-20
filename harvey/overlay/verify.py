@@ -632,7 +632,7 @@ def filters(con, adapters, *, county: str = "", county_name: str = "", words: st
                                                            f"{code}/{version}",
                                                            scheme="ro.onrc_reg")]
         compare(f"activity {code}", act_old, firms_of_keys(keys),
-                "old: every class the pull saved; new: the canonical row's current revisions")
+                "old: every class the old import saved; new: the canonical row's current revisions")
     if county_old is not None and county_new is not None:
         mob = ("SELECT l.contact_id, l.company_id FROM old.company_contacts l "
                "JOIN old.contacts k ON k.id = l.contact_id WHERE k.kind = 'phone' "

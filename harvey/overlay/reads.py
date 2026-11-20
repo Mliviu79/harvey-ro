@@ -78,7 +78,7 @@ PAID_TOP = (2**62, 2**62)
 PAID_BOTTOM = (-2**62, -2**62)
 PAID_WALK_SECONDS = 86400
 # Past this many identifiers given since the counts job kept the register
-# sets (a big pull), every first visit would read them all again from the
+# sets (a big Find-contacts run from the registry), every first visit would read them all again from the
 # registers: the worker runs the job again instead (bitmaps.py).
 PATCH_MAX = 10_000
 
@@ -2382,7 +2382,7 @@ class Reader:
         # register's administrators a batch of firms at a time, newest
         # first, until the page (or the count) is filled. In time order, as
         # schema 24 listed people: an administrator dates from its firm's
-        # pull, a person from when it was found.
+        # record, a person from when it was found.
         merged = self._merged()
         own_firms = {merged.get(r[0], r[0]) for r in self.x("overlay.read.person_firms")}
         if firms is not None:

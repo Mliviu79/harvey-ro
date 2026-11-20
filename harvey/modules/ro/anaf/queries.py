@@ -48,6 +48,18 @@ for _code, _col in FLAGS.items():
         scans={"parsed": "the answers that read yes: the flag's partial index, never the table"})
 
 
+# The keys of a scheme Harvey holds that ANAF was never asked about (param:
+# the scheme's id), picked for a check of the firms never checked
+# (Store.queue_id_checks): each key probed in the answers by primary key.
+queries.statement(
+    "anaf.unanswered",
+    "INSERT OR IGNORE INTO temp.id_pick (cui) SELECT fi.key FROM firm_ident fi "
+    "WHERE fi.scheme = ? AND NOT EXISTS (SELECT 1 FROM {alias}.answers a WHERE a.cui = fi.key)",
+    params=(1,), module=MODULE,
+    scans={"firm_ident": "every key of one scheme, read once by the primary key's range to "
+                         "queue a check of those never asked (the user's own request)"})
+
+
 def _read(signal: str, column: str) -> Read:
     return Read(signal, TABLE, "cui", f"c.{column}", date=FETCHED)
 
@@ -84,6 +96,10 @@ class Adapter(Base):
         except sqlite3.OperationalError:
             row = None
         return f"saved {row[0]}" if row else self.file_mark()
+
+    def unanswered_sql(self) -> str:
+        """The statement that picks the keys never asked about (anaf.unanswered)."""
+        return self.sql("unanswered")
 
     def held_yes_sql(self, signal: str, scheme: str = "") -> str | None:
         if signal in FLAGS and not scheme:

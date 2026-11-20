@@ -9,15 +9,17 @@ worker, or, when there is none, runs just its own jobs.
 
 Inside, one loop per lane: each lane runs its jobs in order, and lanes run
 side by side. Each lane has a lease of its own, taken by whoever runs it
-now: a command running its own registry pull holds the registry's lane
-only, and a dashboard started meanwhile runs every other lane. The leases
+now: a command running its own jobs holds those jobs' lanes only, and a
+dashboard started meanwhile runs every other lane. The leases
 are renewed from a thread, so a job that holds up the event loop never
 lets a second worker take over work that is still running; and a job's
 writes are fenced to the worker running it. Jobs left "running" on a lane
 nobody holds go back to the queue, and a search among them resumes from
 the page it reached.
 
-A job ends done, failed (with the message), cancelled, or paused. A
+A job ends done, failed (with the message), cancelled, or paused. A job
+of a kind that is retired (jobs.RETIRED) is cancelled with that kind's
+code when a full worker starts, or when it is claimed, never run. A
 passing problem (the network, a 5xx, a 429) is tried again later, waiting
 longer each time; a source out of credit pauses its whole lane.
 
@@ -392,6 +394,7 @@ class Worker:
             self._renewer.start()
             logger.info("worker %s: running jobs", self.name)
             if self.full:
+                await jobs.cancel_retired(self.state)
                 await _enqueue_stale_counts(self.state)
             next_sweep = 0.0
             while not stop.is_set():
@@ -529,6 +532,11 @@ class Worker:
         state = self.state
         if self._renewer is None:
             self._renewer = _Renewer(state.db_path, self.name, self.lease_ttl)
+        if job.kind in jobs.RETIRED:
+            # (A row from an earlier release, queued again or claimed by a
+            # worker that didn't cancel it at its start: it ends readable.)
+            await self._finish(job, jobs.CANCELLED, error=jobs.RETIRED[job.kind])
+            return
         kind = jobs.handler(job.kind)
         if kind is None:
             await self._finish(job, jobs.FAILED, error=f"no code runs jobs of kind {job.kind!r}")

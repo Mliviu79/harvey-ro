@@ -24,7 +24,7 @@ import harvey.dashboard as dash
 import harvey.state as state_module
 from harvey.collectors import discover as D
 from harvey.models import Company
-from harvey.modules import api, runs, switches
+from harvey.modules import runs, switches
 from harvey.signals import SIGNAL_CATALOG, sync_vocabulary
 from harvey.state import StateManager
 
@@ -264,19 +264,6 @@ def test_provider_menu_says_which_module_and_whether_on():
 
 
 # ── ONRC ──
-
-
-@pytest.mark.asyncio
-async def test_saving_registry_firms_needs_the_onrc_module(state):
-    from harvey.collectors import onrc
-
-    await switches.set_enabled(state, "onrc", False)
-    with pytest.raises(switches.ModuleOff, match="onrc"):
-        await runs.save_source_draft(state, api.Draft(), onrc.ImportReport(dataset="x"),
-                                     module="onrc")
-    # Nor is the registry read at all.
-    with pytest.raises(switches.ModuleOff, match="onrc"):
-        await runs.import_registry(state, {}, None, county="BV")
 
 
 # ── CLI ──
@@ -733,7 +720,7 @@ def test_the_modules_page_names_what_a_module_needs(client):
 
 
 @pytest.mark.parametrize("argv", [
-    ("registry", "load"), ("registry", "search", "dentist"), ("import-onrc", "--county", "BV"),
+    ("registry", "load"), ("registry", "search", "dentist"),
 ])
 def test_onrc_commands_are_refused_before_any_download(tmp_path, monkeypatch, argv):
     import harvey.cli as cli

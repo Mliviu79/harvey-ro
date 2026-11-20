@@ -1,4 +1,5 @@
-"""ONRC registry import — filtering, identity, what is (and isn't) stored.
+"""The ONRC trade registry: its files, the load, and selecting firms from
+it (filtering, identity, what is and isn't stored when work starts on them).
 
 The registry files are national and huge, so these tests build tiny ones in
 the same shape: '^'-separated, UTF-8 with a BOM, a header row. Every
@@ -13,7 +14,7 @@ import pytest_asyncio
 
 from harvey.collectors import onrc
 from harvey.models import Company
-from harvey.modules import runs
+from harvey import launch, registry
 from harvey.signals import sync_vocabulary
 from harvey.state import StateManager
 from tests import slim
@@ -124,21 +125,44 @@ def files(tmp_path):
 
 
 @pytest_asyncio.fixture
-async def state(tmp_path):
+async def state(tmp_path, monkeypatch):
+    # The registry the selection reads: beside the database, where the
+    # state attaches it.
+    monkeypatch.setattr(registry, "REGISTRY_PATH", tmp_path / "registry.db")
     sm = StateManager(str(tmp_path / "test.db"))
     await sm.init_db()
     await sync_vocabulary(sm)
     yield sm
 
 
-async def run(state, files, **kw):
-    """An import from the files, with the registry loaded from the same
-    files beside the database: the firms it saves are read from there (as
-    `harvey import-onrc` loads the dataset before it saves)."""
-    kw.setdefault("county", "BV")
-    kw.setdefault("classes", onrc.parse_classes("dentist"))
+async def run(state, files, *, words="dentist", county="BV", locality="", status="",
+              barred=(), create=True, take=True):
+    """A Find-contacts selection of the registry (launch.registry_selection),
+    with the registry loaded from the files beside the database: the firms
+    selected get their records by SQL over it and, with ``take``, take
+    their registry entries as their work starts (StateManager.
+    take_from_registry). ``barred``: the do-not-contact list's domains.
+    Returns the selection's counts, with "taken" and "shared_domain"."""
     slim.registry_beside(state, {k: v for k, v in files.items() if v.exists()}, DATASET)
-    return await runs.import_registry(state, files, DATASET, **kw)
+    filters = {"words": words, "county": county, "locality": locality, "status": status}
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(launch, "_barred_domains", lambda: list(barred))
+        out = await launch.registry_selection(state, filters, force=True, create=create)
+    out["taken"] = out["shared_domain"] = 0
+    for cid in (out["ids"] if create and take else []):
+        took = await state.take_from_registry(cid, run_id="find")
+        out["taken"] += bool(took)
+        out["shared_domain"] += bool(took.get("shared_domain"))
+    return out
+
+
+def count(state, words="dentist", **kw) -> int:
+    """How many firms of the loaded registry a search selects."""
+    con = registry.connect(slim.folder(state) / "registry.db")
+    try:
+        return registry.count(con, registry.resolve(con, words, **kw))
+    finally:
+        con.close()
 
 
 async def obs(state, code):
@@ -214,19 +238,17 @@ def test_malformed_rows_are_skipped(tmp_path):
     assert list(onrc.read_rows(path, ("B",))) == [("2",)]
 
 
-# ── The import ──
+# ── Selecting firms, and what their records hold ──
 
 @pytest.mark.asyncio
-async def test_import_filters_and_counts(state, files):
+async def test_a_selection_filters_and_counts(state, files):
     report = await run(state, files)
-    assert not report.errors
     # A B C D G H are authorised (E's code is pre-2008, F is a pharmacy) ...
-    assert report.authorised == 6
+    assert count(state, all_statuses=True) == 6
     # ... A B D H operate (C is struck off, G dissolved) ...
-    assert report.active == 4
+    assert count(state) == 4
     # ... and A B H are in Brașov.
-    assert report.in_area == 3
-    assert (report.new_companies, report.known_companies) == (3, 0)
+    assert (report["selected"], report["created"], report["existing"]) == (3, 3, 0)
 
     a = await state.get_company_by_cui("90000017")
     assert a.name == "ZÂMBET EXEMPLU SRL"
@@ -236,7 +258,7 @@ async def test_import_filters_and_counts(state, files):
     assert a.website == "https://zambet-exemplu.example.ro"
     assert a.location == "Brașov, Romania"
     # The industry its first current class names, read from the registry
-    # (which class a pull asked for isn't kept).
+    # (which class the selection asked for isn't kept).
     assert a.industry == "Specialist medical practice"
     # Street and number, no block, staircase, floor or flat.
     assert a.address == "Str. Exemplului 12, 500123"
@@ -274,16 +296,15 @@ async def test_no_personal_data_is_stored(state, files):
 
 
 @pytest.mark.asyncio
-async def test_rerun_updates_without_duplicating(state, files):
+async def test_the_same_selection_again_makes_no_second_record(state, files):
     first = await run(state, files)
     again = await run(state, files)
-    assert (first.new_companies, first.known_companies) == (3, 0)
-    assert (again.new_companies, again.known_companies) == (0, 3)
-    # The registry's facts are read in place: neither run stores any.
-    assert again.observations == first.observations == 0
+    assert (first["created"], first["existing"], first["taken"]) == (3, 0, 3)
+    assert (again["created"], again["existing"], again["taken"]) == (0, 3, 0)
+    # The registry's facts are read in place: nothing stores any.
     assert slim.one(state, "SELECT COUNT(*) FROM firm") == 3
     assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
-    assert slim.one(state, "SELECT COUNT(*) FROM runs WHERE stage = 'import'") == 2
+    assert slim.one(state, "SELECT COUNT(*) FROM firm_source") == 3
 
 
 @pytest.mark.asyncio
@@ -294,12 +315,12 @@ async def test_a_shared_website_is_never_a_merge(state, files):
         name="Clinica Zâmbet", domain="zambet-exemplu.example.ro",
         source="discover:osm", location="Brașov, Romania"))
     report = await run(state, files)
-    assert (report.new_companies, report.known_companies) == (3, 0)
-    assert report.shared_domain == 1
-    registry = await state.get_company_by_cui("90000017")
-    assert registry.id != known
-    assert registry.domain == ""
-    assert registry.website == "https://zambet-exemplu.example.ro"
+    assert (report["created"], report["existing"]) == (3, 0)
+    assert report["shared_domain"] == 1
+    registry_firm = await state.get_company_by_cui("90000017")
+    assert registry_firm.id != known
+    assert registry_firm.domain == ""
+    assert registry_firm.website == "https://zambet-exemplu.example.ro"
     other = await state.get_company_by_domain("zambet-exemplu.example.ro")
     assert other.id == known and other.cui == "" and other.address == ""
     assert other.name == "Clinica Zâmbet"
@@ -307,42 +328,42 @@ async def test_a_shared_website_is_never_a_merge(state, files):
 
 
 @pytest.mark.asyncio
-async def test_merges_into_the_same_legal_company(state, files):
+async def test_a_firm_on_file_with_the_cui_is_the_same_legal_company(state, files):
     known = await state.add_company(Company(
         name="Clinica Zâmbet", cui="90000017", source="discover:osm",
         location="Brașov, Romania"))
     report = await run(state, files)
-    assert (report.new_companies, report.known_companies) == (2, 1)
-    merged = await state.get_company_by_cui("90000017")
-    assert merged.id == known
-    # The registry describes it now: its name and address are read from
-    # there (Harvey's own name for it would be a display name), the
-    # declared site is filled in.
-    assert merged.name == "ZÂMBET EXEMPLU SRL"
-    assert merged.address == "Str. Exemplului 12, 500123"
-    assert merged.domain == "zambet-exemplu.example.ro"
-    assert report.updated_companies == 1
+    assert (report["created"], report["existing"]) == (2, 1)
+    same = await state.get_company_by_cui("90000017")
+    assert same.id == known
+    # The registry describes it: its name and address are read from there
+    # (Harvey's own name for it would be a display name).
+    assert same.name == "ZÂMBET EXEMPLU SRL"
+    assert same.address == "Str. Exemplului 12, 500123"
+    # Another source brought it, so it takes no registry entry: the website
+    # the registry declares is left for its search to read.
+    assert report["taken"] == 2 and same.domain == ""
 
 
 @pytest.mark.asyncio
 async def test_locality_filter(state, files):
     report = await run(state, files, locality="Cristian")
-    assert report.in_area == 1
+    assert report["selected"] == 1
     assert await state.get_company_by_cui("90000025")
     assert await state.get_company_by_cui("90000017") is None
 
 
 @pytest.mark.asyncio
-async def test_include_inactive(state, files):
-    report = await run(state, files, active_only=False)
-    assert report.in_area == 5        # A B C G H
+async def test_every_status(state, files):
+    report = await run(state, files, status="all")
+    assert report["selected"] == 5        # A B C G H
 
 
 @pytest.mark.asyncio
 async def test_old_nomenclature_never_matches(state, files):
     # 8623 in the pre-2008 nomenclature isn't dental; E carries it.
-    report = await run(state, files, classes=[("8623", None)])
-    assert report.authorised == 6
+    slim.registry_beside(state, files, DATASET)
+    assert count(state, "8623", all_statuses=True) == 6
 
 
 @pytest.mark.asyncio
@@ -357,22 +378,21 @@ async def test_an_old_installs_proposed_signals_dont_hold_the_read(state, files)
                     "('ACTIVITY_CODE', 'CONTACT_FOUND', 'DECISION_MAKER_TITLE')")
     con.close()
     report = await run(state, files)
-    assert report.new_companies == 3 and report.administrators > 0
-    assert not hasattr(report, "unconfirmed")
+    assert report["created"] == 3 and await obs(state, "CONTACT_FOUND")
 
 
 @pytest.mark.asyncio
-async def test_dry_run_saves_nothing(state, files):
-    report = await run(state, files, dry_run=True)
-    assert (report.in_area, report.new_companies, report.administrators) == (3, 3, 2)
+async def test_an_estimate_saves_nothing(state, files):
+    report = await run(state, files, create=False)
+    assert (report["selected"], report["to_create"]) == (3, 3)
     assert slim.one(state, "SELECT COUNT(*) FROM firm") == 0
     assert slim.one(state, "SELECT COUNT(*) FROM runs") == 0
 
 
 @pytest.mark.asyncio
 async def test_do_not_contact_is_skipped(state, files):
-    report = await run(state, files, do_not_contact=["example.ro"])
-    assert report.excluded == 1 and report.new_companies == 2
+    report = await run(state, files, barred=["example.ro"])
+    assert report["excluded"] == 1 and report["created"] == 2
 
 
 @pytest.mark.asyncio
@@ -468,9 +488,20 @@ def test_any_closing_status_outranks_operating(tmp_path):
         if extra:
             rows.append((reg, extra, ""))
     rows.append(("J08/7/2020", "2069", ""))          # no 1048 at all
-    path = write(tmp_path / "status.csv", rows)
-    regs = {r[0] for r in rows[1:]}
-    assert onrc.active_registrations(path, regs) == {"J08/5/2020", "J08/6/2020"}
+    regs = sorted({r[0] for r in rows[1:]})
+    files = {"status": write(tmp_path / "status.csv", rows),
+             "caen": write(tmp_path / "caen.csv", [CAEN[0]] + [(r, "8623", "3") for r in regs]),
+             "firms": write(tmp_path / "firms.csv", [FIRM_HEADER] + [
+                 firm(f"EXEMPLU {n} SRL", str(90001000 + n), r, "SRL", "Braşov",
+                      "Municipiul Braşov") for n, r in enumerate(regs, 1)])}
+    path = tmp_path / "registry.db"
+    registry.build(files, DATASET, path)
+    con = registry.connect(path)
+    try:
+        operating = {r for (r,) in con.execute("SELECT reg FROM firms WHERE operating")}
+    finally:
+        con.close()
+    assert operating == {"J08/5/2020", "J08/6/2020"}
 
 
 # ── Labels, revisions and Rev.2's catch-all ──
@@ -482,10 +513,9 @@ def test_class_labels_name_each_code_once():
 
 
 @pytest.mark.asyncio
-async def test_a_catch_all_only_firm_is_counted_and_named_by_it(state, files):
-    report = await run(state, files, classes=onrc.parse_classes("kinetoterapeut"))
-    assert report.in_area == 3                      # P Q R
-    assert report.catch_all_only == 1               # P
+async def test_a_catch_all_only_firm_is_selected_and_named_by_it(state, files):
+    report = await run(state, files, words="kinetoterapeut")
+    assert report["selected"] == 3                  # P Q R
     p = await state.get_company_by_cui("90000082")
     assert p.industry == "Other human health activities (labs, imaging, physio, psychologists)"
     r = await state.get_company_by_cui("90000104")
@@ -495,10 +525,9 @@ async def test_a_catch_all_only_firm_is_counted_and_named_by_it(state, files):
 
 
 @pytest.mark.asyncio
-async def test_a_catch_all_asked_for_by_code_is_no_catch_all_only(state, files):
-    report = await run(state, files, classes=onrc.parse_classes("", "8690"))
-    assert report.catch_all_only == 0
-    assert report.in_area == 2                      # P R
+async def test_a_catch_all_asked_for_by_code_selects_only_its_firms(state, files):
+    report = await run(state, files, words="8690")
+    assert report["selected"] == 2                  # P R
 
 
 def test_activity_value_reads_back_with_its_revision():
@@ -557,20 +586,20 @@ def test_county_list_and_whole_country():
 @pytest.mark.asyncio
 async def test_whole_country_and_several_counties(state, files):
     report = await run(state, files, county="")
-    assert report.in_area == 4        # A B H in Brașov, D in Cluj
+    assert report["selected"] == 4    # A B H in Brașov, D in Cluj
     assert await state.get_company_by_cui("90000041")
 
 
 @pytest.mark.asyncio
 async def test_several_counties(state, files):
     report = await run(state, files, county="BV, CJ")
-    assert report.in_area == 4
+    assert report["selected"] == 4
 
 
 @pytest.mark.asyncio
 async def test_several_localities(state, files):
     report = await run(state, files, locality="Cristian, Cluj-Napoca", county="")
-    assert report.in_area == 2        # B in Cristian, D in Cluj-Napoca
+    assert report["selected"] == 2    # B in Cristian, D in Cluj-Napoca
 
 
 # ── Activities: every class of a kept company, searchable ──
@@ -584,11 +613,11 @@ async def activities(state, cid):
 @pytest.mark.asyncio
 async def test_every_authorised_class_of_a_kept_company_is_read(state, files):
     # Asked for dentists; A is also authorised for specialist practice.
-    report = await run(state, files)
+    await run(state, files)
     a = await state.get_company_by_cui("90000017")
     assert await activities(state, a.id) == [("8622", 2), ("8623", 2)]
     # Read from the registry, never copied.
-    assert report.activities == 0
+    assert slim.one(state, "SELECT COUNT(*) FROM obs") == 0
     total, rows = await state.search_companies("8622")
     assert [r["cui"] for r in rows] == ["90000017"] and total == 1
 
@@ -598,10 +627,6 @@ async def test_activities_are_read_and_searchable(state, files):
     await run(state, files)
     b = await state.get_company_by_cui("90000025")
     assert await activities(state, b.id) == [("8623", 3)]
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -614,12 +639,10 @@ async def test_a_class_the_registry_drops_is_dropped(state, files, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_activity_imports_everything_operating_in_the_area(state, files):
-    report = await run(state, files, classes=[])
+async def test_no_activity_selects_everything_operating_in_the_area(state, files):
+    report = await run(state, files, words="")
     # Brașov registrations: A B C E F G H P Q R; C struck off, G dissolved.
-    assert report.classes == []
-    assert report.authorised == 10 and report.active == 8 and report.in_area == 8
-    assert report.new_companies == 8
+    assert (report["selected"], report["created"]) == (8, 8)
     pharmacy = await state.get_company_by_cui("90000066")
     assert pharmacy.industry == "Pharmacies"
     assert await activities(state, pharmacy.id) == [("4773", 2)]
@@ -631,69 +654,29 @@ async def test_no_activity_imports_everything_operating_in_the_area(state, files
 
 
 @pytest.mark.asyncio
-async def test_an_import_is_the_registry_modules_and_says_so(state, files):
+async def test_a_firm_taken_is_the_registry_modules_and_says_so(state, files):
     report = await run(state, files)
-    assert report.new_companies == 3 and not report.errors
+    assert report["taken"] == 3
     assert slim.q(state, "SELECT DISTINCT s.name FROM firm_source fs "
                          "JOIN source s ON s.id = fs.source") == [("registry:onrc",)]
-    assert slim.one(state, "SELECT params_json FROM runs WHERE provider = 'onrc'")
-
-
-@pytest.mark.asyncio
-async def test_progress_is_reported_while_saving(state, files, monkeypatch):
-    from harvey.overlay import store
-
-    monkeypatch.setattr(store, "PULL_CHUNK", 3)
-    seen = []
-    await run(state, files, classes=[], progress=lambda done, total: seen.append((done, total)))
-    assert seen == [(3, 8), (6, 8), (8, 8)]
 
 
 @pytest.mark.asyncio
 async def test_no_activity_and_no_area_is_refused(state, files):
-    with pytest.raises(ValueError, match="needs an area"):
-        await run(state, files, classes=[], county="")
+    with pytest.raises(ValueError, match="needs an activity, an area or a filter"):
+        await run(state, files, words="", county="")
 
 
 @pytest.mark.asyncio
 async def test_no_activity_in_one_locality(state, files):
-    report = await run(state, files, classes=None, county="", locality="Cristian")
-    assert report.in_area == 1 and await state.get_company_by_cui("90000025")
+    report = await run(state, files, words="", county="", locality="Cristian")
+    assert report["selected"] == 1 and await state.get_company_by_cui("90000025")
 
 
 @pytest.mark.asyncio
-async def test_administrators_none_reads_no_representatives(state, files):
-    files["people"].unlink()        # proves the file isn't opened
-    report = await run(state, files, with_administrators=False)
-    assert report.administrators == 0 and not report.errors
-    assert report.new_companies == 3
+async def test_a_registry_loaded_without_its_people_file_selects_the_same(state, files):
+    files["people"].unlink()        # proves the file isn't needed
+    report = await run(state, files)
+    assert report["created"] == 3
+    assert await obs(state, "CONTACT_FOUND") == []
 
-
-def test_authorised_codes_reads_only_the_registrations_asked_for(files):
-    got = onrc.authorised_codes(files["caen"], {"J08/920/2012", "J08/500/1999"})
-    assert got == {"J08/920/2012": [("8690", 2), ("8695", 3)],
-                   "J08/500/1999": [("8623", 1)]}
-
-
-def test_registrations_in_area(files):
-    assert onrc.registrations_in_area(files["firms"], ["Cluj"]) == {"J12/400/2012"}
-    assert onrc.registrations_in_area(files["firms"], None, "Cristian") == {"J2025000200088"}
-
-
-def test_cli_every_firm_in_the_country_is_never_imported(monkeypatch, capsys, tmp_path):
-    import sys
-
-    import harvey.state as state_mod
-    from harvey import cli
-
-    monkeypatch.setattr(state_mod, "DB_PATH", tmp_path / "harvey.db")
-    for flags in ([], ["--whole-country"]):
-        monkeypatch.setattr(sys, "argv", ["harvey", "import-onrc", "--administrators", "none",
-                                          *flags])
-        with pytest.raises(SystemExit) as exit_:
-            cli.main()
-        assert exit_.value.code == 2
-        # The registry is read where it is: the Companies page lists it, and
-        # contacts are found from a selection of it.
-        out = capsys.readouterr().out
-        assert "Companies page" in out and "harvey contacts find --registry" in out

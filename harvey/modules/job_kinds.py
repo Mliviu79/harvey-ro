@@ -3,9 +3,9 @@
 Every long run is a job (harvey/modules/jobs.py) on the lane of the source
 it calls: a discovery search on its search module's lane (one job per
 search, so a run over five cities is five jobs), each company's site read
-on the website reader's lane, a registry load or pull on the registry's,
-a load of the financial statements or the taxpayer file on theirs, and
-the checks at ANAF a hundred companies a job on ANAF's. Each kind calls the
+on the website reader's lane, a registry load on the registry's, a load
+of the financial statements or the taxpayer file on theirs, and the
+checks at ANAF a thousand CUIs a job on ANAF's. Each kind calls the
 same run code as before (harvey/modules/runs.py); the job adds the queue,
 the progress, the resume and the spend reservation.
 
@@ -19,7 +19,6 @@ inside the day's budget the user set.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -29,8 +28,8 @@ from pathlib import Path
 
 from harvey.modules import jobs
 from harvey.modules.jobs import JobError, LaneExhausted, SpendLimit, Transient
-# Firms a pull may name one by one (a selection on the Registry page): the
-# registry adapter's bound, also read from here.
+# Firms a registry selection may name one by one (rows ticked on All
+# firms): the registry adapter's bound, also read from here.
 from harvey.modules.ro.onrc.queries import REGS_MAX
 
 logger = logging.getLogger("harvey.jobs")
@@ -108,7 +107,7 @@ WEBSITES_POOL = "websites"
 # The website lookups one Discover run queues beyond what its websites
 # amount pays for, when a free search can take them: about an hour of
 # TinyFish's free searches. The contacts lane runs its jobs in order, so a
-# county-wide registry pull must not fill it for days; the companies left
+# county-wide Discover run must not fill it for days; the companies left
 # over wait for the background's walk, which looks up every company with
 # no contact inside the free allowances' share.
 WEBSITE_LOOKUPS_FREE_PER_RUN = 500
@@ -131,9 +130,7 @@ async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sit
                           label: str = "", find_websites: float | None = None,
                           classify_max_spend: float | None = None):
     """One Discover run over several sources: one batch, one spend cap
-    shared by all, a job per search (``{"provider", "queries"}``) and per
-    registry pull (``{"source": "<module>.<capability>", "job": kind,
-    "params": {...}}``, queued on its module's lane). ``find_websites``
+    shared by all, a job per search (``{"provider", "queries"}``). ``find_websites``
     (dollars; None: off) also looks up a website for each company the run
     saves with none, in the same batch: free searches always, paid ones up
     to that amount, kept apart from the searches' ``max_spend`` (the
@@ -144,17 +141,8 @@ async def enqueue_sources(state, plan: list[dict], *, max_spend: float, read_sit
     specs: list[dict] = []
     sources = []
     for part in plan:
-        if part.get("provider"):
-            specs += _search_specs(part["provider"], part["queries"], read_sites)
-            sources.append(part["provider"])
-            continue
-        module, _, cap = part["source"].partition(".")
-        specs.append(dict(kind=part["job"], lane=module, module=module, capability=cap,
-                          label=part.get("label") or part["source"],
-                          params={**part["params"], "source": part["source"],
-                                  "pool": SEARCH_POOL},
-                          dedupe_key=f"{part['job']}:{_key(part['params'])}"))
-        sources.append(part["source"])
+        specs += _search_specs(part["provider"], part["queries"], read_sites)
+        sources.append(part["provider"])
     params = {"sources": sources, "provider": sources[0] if len(sources) == 1 else "",
               "queries": [s["label"] for s in specs], "read_sites": read_sites}
     if classify_max_spend is not None:
@@ -391,83 +379,6 @@ def _filters(p: dict):
     return fin, tax
 
 
-class _Saved:
-    """Collects the companies a pull saved (registry_pull's follow_up)."""
-
-    def __init__(self):
-        self.ids: list[str] = []
-
-    def add(self, ids) -> None:
-        self.ids += [i for i in ids if i]
-
-
-@jobs.kind("registry_pull")
-async def run_registry_pull(ctx) -> dict:
-    from harvey import registry
-    from harvey.config import live_do_not_contact
-    from harvey.modules.runs import ensure_registry, registry_pull
-
-    p = ctx.params
-    path = Path(p["path"])
-    meta = None
-    if p.get("ensure_latest"):
-        meta = await ensure_registry(path, Path(p["data_dir"]), "latest",
-                                     with_people=p.get("with_administrators", True),
-                                     offline_ok=True, say=ctx.say)
-    try:
-        con = await asyncio.to_thread(registry.connect, path)
-    except FileNotFoundError:
-        raise JobError(f"No registry loaded at {path}. Run harvey registry load first "
-                       "(downloads ~1.5 GB once per dataset).", code=2)
-    meta = meta or await asyncio.to_thread(registry.status, path) or {}
-    fin, tax = _filters(p)
-
-    def resolve():
-        # Reading the registry is synchronous: in a thread, off the loop.
-        q = registry.resolve(con, p.get("words") or "",
-                             classes=[tuple(c) for c in p.get("classes") or []] or None,
-                             counties=p.get("counties") or None,
-                             localities=p.get("localities") or None,
-                             all_statuses=bool(p.get("all_statuses")), fin=fin, tax=tax,
-                             regs=p.get("regs"))
-        registry.count(con, q, 1)
-        return q
-
-    try:
-        q = await asyncio.to_thread(resolve)
-    except FileNotFoundError as e:
-        raise JobError(f"{e} (the filter needs it).", code=2)
-    dry_run = bool(p.get("dry_run"))
-    verb = "checked" if dry_run else "saved"
-
-    def progress(done, total):
-        ctx.say_soon(f"  {verb} {done:,} of {total:,}...")
-
-    saved = _Saved()
-    config = _config()
-    report = await registry_pull(
-        ctx.state, con, q, limit=p.get("limit"),
-        with_administrators=bool(p.get("with_administrators", True)), dry_run=dry_run,
-        do_not_contact=live_do_not_contact(config) if config is not None else None,
-        progress=progress, area=p.get("area") or "", follow_up=saved)
-    queued = finding = 0
-    if saved.ids and not dry_run:
-        await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
-    if saved.ids and not dry_run and not report.errors:
-        # The contact finder follows the checks (their phones are on file
-        # by then, so no search is paid for a firm they already reach).
-        queued = await enqueue_follow_up_checks(ctx.state, saved.ids, batch_id=ctx.job.batch_id,
-                                                parent_id=ctx.id, then_find=True)
-        if queued:
-            await ctx.say(f"  {queued:,} check{'' if queued == 1 else 's'} of the saved firms "
-                          "queued (ANAF: one request a second, 100 firms each)")
-        else:
-            finding = await enqueue_finder_follow_ups(ctx.state, saved.ids,
-                                                      batch_id=ctx.job.batch_id, parent_id=ctx.id)
-    return {"report": report.as_dict(), "meta": meta, "follow_up_jobs": queued,
-            "finder_jobs": finding}
-
-
 # ── A source's local copy: check what is published, load it ──
 
 def _sync_progress(ctx):
@@ -497,8 +408,10 @@ def _source_failure(e: Exception) -> JobError | None:
 @jobs.kind("source_sync")
 async def run_source_sync(ctx) -> dict:
     """Download what is missing and load it (a source module's sync
-    capability), then record what it knows about the companies on file."""
-    from harvey.modules.runs import lookup_by_id, sync_source
+    capability), then count the register signals again over the firms in
+    Harvey. Nothing of it is copied into harvey.db: a firm's register
+    phones become its contacts when work starts for it."""
+    from harvey.modules.runs import sync_source
 
     p = ctx.params
     module = p["module"]
@@ -519,15 +432,10 @@ async def run_source_sync(ctx) -> dict:
     from harvey.modules import switches
 
     # A gazetteer's load (the boundaries) describes places, not companies:
-    # there is nothing to count or look up after it.
+    # there is nothing to count after it.
     describes_firms = getattr(switches.by_id().get(module), "kind", "source") == "source"
     if describes_firms and not values.get("unchanged"):
         await enqueue_register_counts(ctx.state, batch_id=ctx.job.batch_id, parent_id=ctx.id)
-    if describes_firms and p.get("lookup", True) and not (p.get("auto") and values.get("unchanged")):
-        found = await lookup_by_id(ctx.state, progress=lambda done, total: ctx.say_soon(
-            f"    companies on file: {done:,} of {total:,}..."))
-        out.update(companies=found["companies"], observations=found["observations"],
-                   errors=found["errors"][:3])
     return out
 
 
@@ -615,20 +523,15 @@ async def enqueue_due_sources(state) -> list[str]:
 # ── Checks by legal identifier at an outside service (ANAF) ──
 
 # Calls of the capability a check job makes (ANAF: ten requests of 100
-# companies, about 11 s): enough that each request goes out while the last
-# batch is saved (runs.check_by_id), few enough that a pause or a cancel
+# CUIs, about 11 s): enough that each request goes out while the last
+# answers are kept (runs.check_cuis), few enough that a pause or a cancel
 # takes effect within seconds and the queue shows progress as it goes.
 ID_CHECK_BATCHES = 10
 
 
-async def enqueue_id_checks(state, module_id: str, capability: str, company_ids=None, *,
-                            missing_only: bool = False, batch_id: str = "",
-                            parent_id: str = "", label: str = "",
-                            then_find: bool = False) -> tuple[list[str], list]:
-    """Queue checks of these companies (every one with the identifier when
-    None), ID_CHECK_BATCHES times as many per job as the capability asks
-    about at once (ANAF: 1,000, ten requests). Returns (new job ids, jobs
-    already waiting for the same ones)."""
+def _id_check_cap(module_id: str, capability: str) -> tuple:
+    """(the module's manifest, the capability, the identifier it asks by:
+    "cui"). ValueError for one that doesn't look up by an identifier."""
     from harvey.modules import switches
 
     manifest = switches.by_id()[module_id]
@@ -637,32 +540,40 @@ async def enqueue_id_checks(state, module_id: str, capability: str, company_ids=
              if len(need) == 1 and need[0].startswith("id:")]
     if not kinds:
         raise ValueError(f"{module_id}.{capability} doesn't look companies up by an identifier")
-    from harvey.modules.runs import _batches
+    return manifest, cap, kinds[0]
 
-    rows = await state.companies_with_id(kinds[0], company_ids)
+
+async def enqueue_id_checks(state, module_id: str, capability: str, selection: dict, *,
+                            missing_only: bool = False, batch_id: str = "",
+                            parent_id: str = "", label: str = "",
+                            then_find: bool = False) -> tuple[list[str], list]:
+    """Queue checks of identifiers (CUIs) at an outside service, chosen by
+    ``selection`` (Store.queue_id_checks: {"keys": [...]}, {"all": true},
+    {"missing": true} or {"firms": [ids]}), ID_CHECK_BATCHES times as many
+    per job as the capability asks about at once (ANAF: 1,000, ten
+    requests), in key order, queued by SQL in one write. ``then_find``:
+    each job queues the contact finder for the firms its keys were picked
+    for when it is done (a {"firms"} selection only). Returns (new job ids,
+    jobs already waiting for the same keys)."""
+    manifest, cap, kind = _id_check_cap(module_id, capability)
     size = max(1, int(cap.get("batch") or 1)) * ID_CHECK_BATCHES
-    lane = cap.get("lane") or module_id
-    specs = []
-    # A company known by two identifiers is in one job, once.
-    for part in _batches(rows, size):
-        ids = list(dict.fromkeys(r["id"] for r in part))
-        specs.append(dict(
-            kind="id_check", lane=lane, module=module_id, capability=capability,
-            label=label or f"{manifest.name or module_id}: {len(ids)} "
-                           f"compan{'y' if len(ids) == 1 else 'ies'}",
-            params={"module": module_id, "capability": capability, "company_ids": ids,
-                    "missing_only": missing_only, **({"then_find": True} if then_find else {})},
-            dedupe_key=f"id_check:{module_id}:{capability}:{_key(sorted(ids), missing_only)}"))
-    return await jobs.enqueue_many(state, specs, batch_id=batch_id, parent_id=parent_id)
+    new, dupes = await state.queue_id_checks(
+        selection, kind=kind, module=module_id, capability=capability,
+        lane=cap.get("lane") or module_id, size=size, label=label or manifest.name or module_id,
+        missing_only=missing_only, then_find=then_find, batch_id=batch_id, parent_id=parent_id)
+    if new:
+        jobs.notify()
+    return new, await jobs.get_many(state, dupes)
 
 
 async def enqueue_follow_up_checks(state, company_ids, *, batch_id: str = "",
                                    parent_id: str = "", then_find: bool = False) -> int:
-    """The checks a source's new companies get (every enricher capability
-    marked ``after_source`` whose module is on and has a signal to record:
-    ANAF's; free lookups only, id_enrichers), queued on their own lanes. ``then_find``: each
-    check queues the contact finder for its companies when it is done (the
-    first module's checks only). Returns how many jobs."""
+    """The checks a Find-contacts run's new records get (every enricher
+    capability marked ``after_source`` whose module is on and has a signal
+    to record: ANAF's; free lookups only, id_enrichers), queued on their
+    own lanes, over the CUIs those firms hold. ``then_find``: each check
+    queues the contact finder for its firms when it is done (the first
+    module's checks only). Returns how many jobs."""
     from harvey.modules.runs import _enabled, _wanted, id_enrichers
 
     wanted = await state.collected_signal_codes()
@@ -670,7 +581,8 @@ async def enqueue_follow_up_checks(state, company_ids, *, batch_id: str = "",
     for m, cap, _ in id_enrichers(await _enabled(state), after_source=True):
         if not _wanted(cap, wanted):
             continue
-        ids, _dupes = await enqueue_id_checks(state, m.id, cap["id"], company_ids,
+        ids, _dupes = await enqueue_id_checks(state, m.id, cap["id"],
+                                              {"firms": list(company_ids)},
                                               batch_id=batch_id, parent_id=parent_id,
                                               then_find=then_find and not queued)
         queued += len(ids)
@@ -679,44 +591,54 @@ async def enqueue_follow_up_checks(state, company_ids, *, batch_id: str = "",
 
 @jobs.kind("id_check", stoppable=True)
 async def run_id_check(ctx) -> dict:
-    """Check the job's companies a batch at a time, in the order of their
-    ids. After each batch is saved the job's progress says how far it got
-    (``after``: the last company id done, ``done``, ``total`` and the
+    """Check the job's CUIs a batch at a time, in key order. Each batch's
+    answers are kept in the service's own file (ANAF's anaf.db); nothing is
+    written to harvey.db. After each batch the job's progress says how far
+    it got (``after``: the last CUI done, ``done``, ``total`` and the
     report so far), so a job paused, cancelled part way, stopped with the
-    worker or tried again after a failure goes on from there. Progress
-    only moves over companies with none left unchecked before them: after
-    a batch that failed (or a save that did), the companies after it are
-    asked again on the next try (the service's kept answers make that
-    cheap) rather than the failed ones skipped. A job with any company
-    left unchecked never ends done."""
-    from harvey.modules.runs import check_by_id
+    worker or tried again after a failure goes on from there. Progress only
+    moves over CUIs with none left unchecked before them: after a batch
+    that failed, the CUIs after it are asked again on the next try (the
+    service's kept answers make that cheap) rather than the failed ones
+    skipped. A job with any CUI left unchecked never ends done.
+
+    A job queued before checks went by CUI names its companies
+    (``company_ids``) instead: their CUIs are read when it starts."""
+    from harvey.modules.runs import check_cuis
 
     p = ctx.params
-    ids = sorted(set(p.get("company_ids") or ()))
-    after = str(ctx.progress.get("after") or "")
-    todo = [i for i in ids if i > after] if after else ids
-    if p.get("company_ids") is None:
-        todo = None                     # every company with the identifier
-    so_far = dict(ctx.progress.get("report") or {})
-    done_before = int(ctx.progress.get("done") or 0)
+    progress = ctx.progress
+    if p.get("cuis") is not None:
+        cuis = sorted({int(c) for c in p["cuis"]})
+    else:
+        _, _, kind = _id_check_cap(p["module"], p["capability"])
+        cuis = await ctx.state.id_keys_of(kind, p.get("company_ids") or [])
+        # (Its progress counted companies: it starts over, the kept
+        # answers making that cheap.)
+        progress = {} if progress.get("cuis_from") != "companies" else progress
+    after = progress.get("after")
+    todo = [c for c in cuis if c > int(after)] if after is not None else cuis
+    so_far = dict(progress.get("report") or {})
+    done_before = int(progress.get("done") or 0)
     saved_now = [0]
 
-    async def saved(batch_ids, report_so_far):
+    async def saved(batch_cuis, report_so_far):
         if report_so_far.get("errors"):
-            # A batch before this one failed: its companies are still to
-            # check, so progress stays in front of them.
+            # A batch before this one failed: its CUIs are still to check,
+            # so progress stays in front of them.
             return
-        saved_now[0] += len(batch_ids)
-        await ctx.save(after=max(batch_ids), done=done_before + saved_now[0], total=len(ids),
-                       report=_added(so_far, report_so_far), busy=0)
+        saved_now[0] += len(batch_cuis)
+        await ctx.save(after=max(batch_cuis), done=done_before + saved_now[0], total=len(cuis),
+                       report=_added(so_far, report_so_far), busy=0,
+                       **({} if p.get("cuis") is not None else {"cuis_from": "companies"}))
 
     async def stop():
         return bool(await ctx.stop_reason())
 
-    report = await check_by_id(ctx.state, p["module"], p["capability"], todo,
-                               missing_only=bool(p.get("missing_only")), stop=stop, saved=saved)
+    report = await check_cuis(ctx.state, p["module"], p["capability"], todo,
+                              missing_only=bool(p.get("missing_only")), stop=stop, saved=saved)
     total = _added(so_far, report)
-    total["companies"] = len(ids) if p.get("company_ids") is not None else report["companies"]
+    total["cuis"] = len(cuis)
     if ctx.outcome:
         # Paused, cancelled or handed back: what it did is in its progress.
         return total
@@ -979,7 +901,7 @@ async def enqueue_contact_search(state, selected: list[str], *, max_spend: float
     and each check queues their search in this batch when it is done; one
     no check takes (no identifier it asks by, its module off) is searched
     at once. The register signals are counted again over the firms in
-    Harvey (enqueue_register_counts), as after a pull that saved firms.
+    Harvey (enqueue_register_counts), as after any write of new firms.
     ``checks`` (a dict) is filled with {"jobs": checks queued,
     "companies": the companies whose search waits for one}.
 
@@ -1383,28 +1305,29 @@ async def enqueue_backlog(state) -> int:
     return len(new)
 
 
-# ── Sources Discover runs as a job of their own (the registry) ──
+# ── The trade registry Find contacts selects firms from ──
 
-def discover_sources(enabled=None) -> list[dict]:
-    """Every query capability that records companies and says how Discover
-    runs it as a job (``discover = "<job kind>"`` in its manifest), with
-    the filters it declares and whether its module is on: the registry
-    today, read from the manifests, never a list here."""
-    from harvey.modules import api, switches
+def registry_source(enabled=None) -> dict | None:
+    """The trade registry firms are selected from: the register module
+    whose [register] declares selection filters (its manifest, never a
+    list here), as {module, key ("<module>.registry"), label, blurb,
+    attribution, filters, enabled}. A filter reading another module's
+    data is offered only while that module is on (``enabled``: the ids
+    on; None offers every filter and counts the module on). None when no
+    module declares one."""
+    from harvey.modules import switches
 
-    out = []
-    for m, cap in api.declared(switches.by_id()):
-        if (cap.get("op") != "query" or (cap.get("outputs") or {}).get("records") != "companies"
-                or not cap.get("discover") or cap.get("provider")):
+    for m in switches.by_id().values():
+        reg = m.register or {}
+        if not reg.get("filters"):
             continue
-        filters = [dict(f) for f in cap.get("filters") or ()
+        filters = [dict(f) for f in reg["filters"]
                    if enabled is None or not f.get("module") or f["module"] in enabled]
-        out.append({"key": f"{m.id}.{cap['id']}", "module": m.id, "capability": cap["id"],
-                    "job": cap["discover"], "label": cap.get("label") or m.name or m.id,
-                    "blurb": m.description, "attribution": getattr(m, "attribution", "") or "",
-                    "filters": filters, "kind": "registry", "configured": True,
-                    "enabled": enabled is None or m.id in enabled})
-    return out
+        return {"key": f"{m.id}.registry", "module": m.id,
+                "label": reg.get("label") or m.name or m.id, "blurb": m.description,
+                "attribution": getattr(m, "attribution", "") or "", "filters": filters,
+                "enabled": enabled is None or m.id in enabled}
+    return None
 
 
 def _number(value):
@@ -1415,9 +1338,10 @@ def _number(value):
 
 
 def registry_plan(filters: dict) -> dict:
-    """A registry pull's parameters from the filters its Discover panel (or
-    the Registry page) sent. ValueError when they say nothing (that would
-    be every firm in Romania) or name an unknown county."""
+    """A registry selection's parameters from the filters the All firms
+    list (or a Find-contacts request) sent. ValueError when they say
+    nothing (that would be every firm in Romania) or name an unknown
+    county."""
     params = registry_params(filters)
     if not (params["regs"] or params["words"] or params["counties"] or params["localities"]
             or params["fin"] or params["tax"]):
@@ -1431,13 +1355,12 @@ def registry_params(filters: dict) -> dict:
     declares in its manifest (words, county, locality, status, turnover and
     headcount bounds, unknown, employer, vat, micro), or ``regs``: firms
     chosen by registration number, and nothing else. Saying nothing is
-    allowed here (the Registry page lists every operating firm then);
-    registry_plan refuses it for a pull. ValueError for an unknown county
+    allowed here (All firms lists every operating firm then);
+    registry_plan refuses it for a selection to find contacts in. ValueError for an unknown county
     or too many firms chosen."""
     from harvey.collectors import onrc
     from harvey.modules.ro.mf_financials.store import Filter as FinFilter
     from harvey.modules.ro.mf_taxpayers.store import Filter as TaxFilter
-    from harvey.paths import PROJECT_ROOT
     from harvey import registry
     from harvey.registry import REGISTRY_PATH
 
@@ -1468,8 +1391,7 @@ def registry_params(filters: dict) -> dict:
                              "use the filter instead")
     all_statuses = str(f.get("status") or "") == "all"
     where = ", ".join(localities + counties) or "Romania"
-    base = {"path": str(REGISTRY_PATH), "data_dir": str(PROJECT_ROOT / "data" / "onrc"),
-            "ensure_latest": True, "with_administrators": True, "dry_run": False}
+    base = {"path": str(REGISTRY_PATH)}
     if regs:
         return {**base, "words": "", "classes": [], "counties": [], "localities": [],
                 "all_statuses": True, "fin": None, "tax": None, "regs": regs,
@@ -1481,25 +1403,3 @@ def registry_params(filters: dict) -> dict:
             "tax": asdict(tax) if tax.active() else None, "regs": None, "area": where,
             "label": f"{words or 'every activity'} in {where}"
                      + (" (every status)" if all_statuses else "")}
-
-
-def registry_count(params: dict) -> int | None:
-    """How many firms a registry pull would save (free, read locally);
-    None when no registry is loaded yet (the pull loads it first)."""
-    from harvey import registry
-
-    try:
-        con = registry.connect(Path(params["path"]))
-    except FileNotFoundError:
-        return None
-    try:
-        fin, tax = _filters(params)
-        q = registry.resolve(con, params.get("words") or "",
-                             counties=params.get("counties") or None,
-                             localities=params.get("localities") or None,
-                             all_statuses=bool(params.get("all_statuses")), fin=fin, tax=tax,
-                             regs=params.get("regs"))
-        return registry.count(con, q)
-    finally:
-        con.close()
-

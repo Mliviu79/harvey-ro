@@ -52,6 +52,12 @@ PAUSED_BY_HAND = "paused"
 # its lane over while this one was stuck), so it stops and writes nothing.
 STOP_CANCEL, STOP_PAUSE, LOST = "cancel", "pause", "lost"
 
+# Kinds of job no code runs any more, with the code their rows end with:
+# a row left queued, paused or running from an earlier release is
+# cancelled with it (cancel_retired, the worker), never failed, and can't
+# be retried or resumed. Finished rows stay as history.
+RETIRED = {"registry_pull": "retired"}
+
 # A job that hits a passing problem (the network, a 5xx, a 429) is tried
 # this many times in all, waiting longer each time, then fails.
 MAX_ATTEMPTS = 4
@@ -943,6 +949,18 @@ async def get(state, job_id: str) -> Job | None:
         return await _fetch_job(db, job_id)
 
 
+async def get_many(state, job_ids) -> list[Job]:
+    """The jobs of these ids that are on file, in the order given, read
+    over one connection."""
+    out = []
+    async with state._connect() as db:
+        for job_id in job_ids:
+            job = await _fetch_job(db, job_id)
+            if job is not None:
+                out.append(job)
+    return out
+
+
 async def find(state, ref: str) -> Job | None:
     """A job by its id, or by the start of it (as the CLI prints them)."""
     ref = (ref or "").strip()
@@ -1020,6 +1038,13 @@ async def _act(state, job_id: str, act) -> Job:
     raise Refused(f"Job {job_id} keeps changing; try again.")
 
 
+async def _found(state, job_id: str) -> Job:
+    job = await get(state, job_id)
+    if job is None:
+        raise Refused(f"There is no job {job_id}.")
+    return job
+
+
 async def cancel(state, job_id: str) -> Job:
     """Cancel a job. One waiting is cancelled at once; a running search
     stops after the page it is on (what it found so far is kept). A
@@ -1042,8 +1067,29 @@ async def pause(state, job_id: str) -> Job:
     return await _act(state, job_id, act)
 
 
+def _refuse_retired(job: Job) -> None:
+    if job.kind in RETIRED:
+        raise Refused(f"Job {job.id} is a kind of job that is retired: no code runs it "
+                      "any more.", code=RETIRED[job.kind])
+
+
+async def cancel_retired(state) -> int:
+    """Cancel every queued or paused job of a retired kind, its error the
+    kind's code (RETIRED): one write, when a worker starts. How many."""
+    import harvey.overlay.queries  # noqa: F401  (registers the named statements)
+    from harvey import queries
+
+    async with state._connect() as db:
+        cur = await db.execute(queries.sql("overlay.jobs.cancel_retired"),
+                               (json.dumps(RETIRED),))
+        await db.commit()
+        return cur.rowcount
+
+
 async def resume(state, job_id: str) -> Job:
-    """Put a paused job back in the queue; it carries on from where it stopped."""
+    """Put a paused job back in the queue; it carries on from where it
+    stopped. Refused for a kind that is retired."""
+    _refuse_retired(await _found(state, job_id))
     job = await _act(state, job_id, lambda j: _set_status(
         state, j, QUEUED, allowed=(PAUSED,),
         extra=", paused_reason = '', error = '', not_before = NULL"))
@@ -1054,9 +1100,11 @@ async def resume(state, job_id: str) -> Job:
 
 async def retry(state, job_id: str) -> Job:
     """Queue a failed or cancelled job again, from where it got to.
-    Refused when the same work is already waiting."""
+    Refused when the same work is already waiting, and for a kind that is
+    retired."""
     import sqlite3
 
+    _refuse_retired(await _found(state, job_id))
     try:
         job = await _act(state, job_id, lambda j: _set_status(
             state, j, QUEUED, allowed=(FAILED, CANCELLED),

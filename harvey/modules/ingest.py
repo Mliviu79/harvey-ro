@@ -16,7 +16,7 @@ Here is where a draft becomes rows, under the rules no module can skip:
   is what lets undoing an automatic merge take back exactly its facts.
 
 ``store`` is a StateManager, or its Batch for many records on one
-connection (a registry pull). Run bookkeeping (the runs log, a company's
+connection. Run bookkeeping (the runs log, a company's
 "profiled" mark) stays with the run that does it (harvey/modules/runs.py).
 """
 
@@ -179,7 +179,7 @@ _declared_cache: list = [None, {}]
 
 def _declared_facts() -> dict[tuple[str, str], frozenset[str]]:
     """The facts each capability declares in its manifest's ``outputs``
-    (worked out once per set of manifests: a registry pull asks per firm)."""
+    (worked out once per set of manifests: a register's entry asks per firm)."""
     from harvey.modules import api, switches
 
     mans = switches.manifests()
@@ -303,61 +303,6 @@ def _new_readings(found: list[dict], latest: dict, ever: set, many: frozenset[st
             if latest.get(code) == value:
                 continue
             latest[code] = value
-        out.append(row)
-    return out
-
-
-async def checked(batch, module: str, found: dict[str, tuple[list[Fact], list]], *,
-                  run_id: str, wanted, many: frozenset[str] | None = None) -> dict:
-    """What a lookup by identifier answered for many companies at once
-    (``found``: {company_id: (facts, contacts)}), saved on one batch the
-    way ``changed``, ``write`` and ``company_phones`` save one company's,
-    with a statement for the lot instead of several each: each fact of a
-    signal collected (``wanted``), written only when it says something new; every
-    number a contact of its company (with its source and trust), and the
-    first one the company's phone when it has none. Returns
-    {"observations", "updated", "phones_set"}: rows written, companies with
-    a new reading, phones set."""
-    many = many_codes() if many is None else many
-    rows_of = {cid: _one_each(rows(facts, run_id=run_id, wanted=wanted,
-                                   records={cid: Saved(cid, cid)}), many)
-               for cid, (facts, _) in found.items()}
-    readings = await batch.module_readings_of([cid for cid, r in rows_of.items() if r], module)
-    fresh: list[dict] = []
-    updated = 0
-    for cid, found_rows in rows_of.items():
-        if found_rows:
-            new = _new_readings(found_rows, *readings[cid], many)
-            fresh += new
-            updated += bool(new)
-    items, phones = [], []
-    for cid, (_, contacts_) in found.items():
-        items += _contact_items(cid, contacts_)
-        if any(c.kind == "phone" and (c.display or c.value) for c in contacts_ or ()):
-            phones.append(cid)
-    # The companies whose first phone this is (asked before anything is
-    # written: a phone reading or a number linked gives them one).
-    phoneless = await batch.phoneless(phones) if phones else []
-    written = await write(batch, fresh, run_id)
-    if items:
-        await batch.add_contact_list(items)
-    set_ = set(phoneless) - set(await batch.phoneless(phoneless)) if phoneless else set()
-    return {"observations": written, "updated": updated, "phones_set": len(set_)}
-
-
-def _one_each(found: list[dict], many: frozenset[str]) -> list[dict]:
-    """A company's rows with one reading of each single-valued signal, the
-    first (its identifiers come in order, so always the same one): a
-    company known by two identifiers that answer differently would
-    otherwise write both on every check, each one "new" against the other."""
-    seen: set[str] = set()
-    out = []
-    for row in found:
-        code = row["signal_code"]
-        if code not in many:
-            if code in seen:
-                continue
-            seen.add(code)
         out.append(row)
     return out
 

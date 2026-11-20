@@ -211,12 +211,10 @@ global.api = (path, opts) => { calls.push([path, JSON.parse(opts.body)]);
                                return new Promise(r => { releases.push(r); }); };
 vm.runInThisContext(pick('const REGISTRY_SOURCE', 'const REGISTRY_SORTS'));
 vm.runInThisContext(pick('function registryFilter()', 'function registryParams()'));
-vm.runInThisContext(pick('// Draw the list on the page named', 'async function loadRegistry()'));
 vm.runInThisContext(pick('// A filter change starts over', 'function registryReloadSoon'));
-vm.runInThisContext(pick('// The contact finder for the ticked firms or the filter', '// Pull the ticked firms or the whole list into Harvey'));
+vm.runInThisContext(pick('// The contact finder for the ticked firms or the filter', "// ── A registry firm's panel ──"));
 global.registryReloadNow = async () => {};
 global.loadRegistry = async () => {};
-global.closeRegistryPull = () => {};
 global.renderRegistrySelbar = () => {}; global.renderRegistryActions = () => {};
 const est = n => ({companies: 0, with_site: 0, to_look_up: 0, estimated_cost: 0, most: 0, searchers: [],
                    checks: {checks: 0}, classifier: {calls: 0},
@@ -225,7 +223,6 @@ const tick = () => new Promise(r => setTimeout(r, 5));
 const card = () => els['registry-finder'].innerHTML;
 (async () => {
   const out = {};
-  _rg.host = 'companies';
   el('registry-finder'); el('companies-registry');
   // 1. The filter changes while the estimate is priced: no card for the old one.
   _rg.q = 'dentist'; _rg.f = {county: 'BV'};
@@ -240,13 +237,7 @@ const card = () => els['registry-finder'].innerHTML;
   closeRegistryFinder();
   releases.shift()(est(1)); await p; await tick();
   out.tick = {card: card(), finder: _finder};
-  // 3. The page the list is drawn on changes.
-  p = findForRegistry(false); await tick();
-  registryOn('registry');
-  releases.shift()(est(7)); await p; await tick();
-  out.host = {card: card(), finder: _finder};
-  // 4. A second estimate asked before the first answers: only the second is drawn.
-  _rg.host = 'companies';
+  // 3. A second estimate asked before the first answers: only the second is drawn.
   _rg.q = 'dentist'; _rg.f = {county: 'BV'};
   const a = findForRegistry(false); await tick();
   _rg.q = 'frizerie'; _rg.f = {county: 'CJ'};
@@ -261,7 +252,7 @@ const card = () => els['registry-finder'].innerHTML;
 
 def test_an_estimate_still_priced_when_the_list_changes_draws_no_card():
     out = _js(RACE, "en", "")
-    for case in ("filter", "tick", "host"):
+    for case in ("filter", "tick"):
         assert out[case]["card"] == "" and out[case]["finder"] is None, (case, out[case])
     assert out["filter"]["pending"] is None
     # The newest estimate is the one drawn, and the one Run sends.

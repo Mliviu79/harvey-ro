@@ -2,8 +2,8 @@
 bulk mode.
 
 Row-at-a-time writes (the finder, a Discover listing, a person found) keep
-every value through these triggers. Bulk writes (a registry pull, a
-migration, a merge) run in ``bulk()``: the kept-value triggers are dropped
+every value through these triggers. Bulk writes (a migration, a merge,
+a removal) run in ``bulk()``: the kept-value triggers are dropped
 inside the transaction, lightweight temporary triggers note which rows were
 touched, and the touched values are recounted from base rows before the
 triggers come back and the transaction commits. The same recount is

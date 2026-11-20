@@ -394,7 +394,7 @@ def address(row: dict) -> str:
     return ", ".join(out)
 
 
-# ── Filtering a registry search before anything is pulled ──
+# ── Filtering a registry search before any firm gets a record ──
 
 @dataclass
 class Filter:

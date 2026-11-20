@@ -10,7 +10,7 @@ SQLite database, data/financials.db, beside the working one:
                 the figures under Harvey's own names (turnover, employees,
                 equity, ...). An empty cell is NULL (not reported), never 0.
     latest      per CUI, its latest year's turnover and headcount: what a
-                registry search filters on before anything is pulled
+                registry search filters on before any firm gets a record
     files       which published file each year and form came from (its
                 address, publication date and licence)
     meta        when it was loaded, how long it took, counts
@@ -404,7 +404,7 @@ def file_urls(con) -> dict[int, str]:
     return out
 
 
-# ── Filtering a registry search before anything is pulled ──
+# ── Filtering a registry search before any firm gets a record ──
 
 @dataclass
 class Filter:

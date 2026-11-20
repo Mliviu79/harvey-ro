@@ -180,8 +180,8 @@ when_known = "source"
 id = "company_check"
 op = "lookup"
 inputs = [["id:cui"]]
-# Up to this many companies a call (one request); runs again for the
-# companies a registry pull brings in.
+# Up to this many CUIs a call (one request); runs first for the records
+# a Find-contacts run makes from the registry.
 batch = 100
 after_source = true
 lane = "anaf"
