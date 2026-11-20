@@ -22,6 +22,8 @@ import math
 import sqlite3
 from pathlib import Path
 
+from harvey import registers
+
 # A Find-contacts run takes at most this many companies (the newest first);
 # a wider filter is taken in more runs.
 FIND_MAX = 50_000
@@ -414,6 +416,8 @@ async def find_selection(state, body: dict, *, create: bool = False) -> tuple[li
             chosen = await registry_selection(state, body["registry"], limit=limit,
                                               force=bool(body.get("force")), create=create)
         except (ValueError, FileNotFoundError, RuntimeError) as e:
+            if isinstance(e, registers.Refused):
+                body["_error_code"] = e.code   # (for the page's own words)
             return [], str(e)
         except sqlite3.OperationalError as e:
             # (The write waited its 30 s for another writer and gave up.)
@@ -509,8 +513,9 @@ async def registry_selection(state, chosen, *, limit: int = FIND_MAX, force: boo
         raise ValueError("registry is the Registry page's filters, or {\"regs\": [...]}")
     params = registry_plan(chosen)
     if not _positive(params):
-        raise ValueError("the registry selection only excludes: name an activity, an area, a "
-                         "word or a financial or taxpayer condition the firms are taken by")
+        raise registers.Refused("the registry selection only excludes: name an activity, an "
+                                "area, a word or a financial or taxpayer condition the firms "
+                                "are taken by", "registry_only_excludes")
 
     def resolved():
         con = registry.connect(Path(params["path"]))

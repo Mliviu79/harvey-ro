@@ -2573,10 +2573,9 @@ async def estimate_find_contacts(request: Request):
     body = await _json_body(request)
     state, selected, error = await _find_selection(body)
     if error:
-        # (The registry refusals a filter on the page can reach, as codes it
-        # says in the reader's language.)
-        code = ("registry_only_excludes" if "only excludes" in error
-                else "registry_every_status" if "isn't taken yet" in error else None)
+        # (A register's refusal carries a code the page says in the reader's
+        # language: registers.Refused.)
+        code = body.get("_error_code")
         return JSONResponse({"error": error, **({"code": code} if code else {})},
                             status_code=400)
     return {**await launch.find_estimate(state, selected, bool(body.get("force"))),
@@ -2631,7 +2630,9 @@ async def find_contacts(request: Request):
                             status_code=400)
     state, selected, error = await _find_selection(body, create=True)
     if error:
-        return JSONResponse({"success": False, "message": error}, status_code=400)
+        code = body.get("_error_code")
+        return JSONResponse({"success": False, "message": error,
+                             **({"code": code} if code else {})}, status_code=400)
     if not selected:
         return {"success": True, "queued": 0, "companies": 0, "force": bool(body.get("force")),
                 **_registry_counts(body)}

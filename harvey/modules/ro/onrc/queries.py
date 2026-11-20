@@ -22,7 +22,7 @@ from functools import lru_cache
 from harvey import queries
 from harvey.modules.ro.onrc.derived import CUI_OK
 from harvey.registers import Adapter as Base
-from harvey.registers import Read, Stale, chunks
+from harvey.registers import Read, Refused, Stale, chunks
 
 MODULE = "onrc"
 DATASET_DATE = "(SELECT value FROM {alias}.meta WHERE key = 'date')"
@@ -612,10 +612,10 @@ class Adapter(Base):
                 raise ValueError("the registry query names no activity, area or filter: "
                                  "nothing to select by")
             if query.match == registry.EVERY:
-                raise ValueError("a registry query with nothing for the search index to match "
-                                 "(only exclusions, financial or taxpayer conditions, over "
-                                 "every status) isn't taken yet: name an activity, an area or "
-                                 "a word, or keep to operating firms")
+                raise Refused("a registry query with nothing for the search index to match "
+                              "(only exclusions, financial or taxpayer conditions, over "
+                              "every status) isn't taken yet: name an activity, an area or "
+                              "a word, or keep to operating firms", "registry_every_status")
         if con.execute(self.sql("records.ready")).fetchone()[0] != 3:
             raise Stale("the registry's key tables (firm_by_cui, firm_key, place_rank) aren't "
                         "all built: run harvey registry load --force")

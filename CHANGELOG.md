@@ -42,7 +42,9 @@ minor versions can still change behaviour.
   `excluded`, whose declared website is on the do-not-contact list and
   which get no record, and `unkeyable`, whose CUI Harvey can't key by;
   the card and the terminal say them when there are any). A filter that
-  only excludes (words with a leading `-` and nothing else) is refused,
+  only excludes (words with a leading `-` and nothing else) is refused
+  (`code` `registry_only_excludes`, said in the page's language, on the
+  estimate and the run alike),
   and so are `--registry` with `--limit` below 1 and words given to
   `harvey contacts find` without `--registry`. The Overview's registry
   tip, the Companies empty state and Help's "Getting started" now point

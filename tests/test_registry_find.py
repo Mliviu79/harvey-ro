@@ -448,9 +448,15 @@ def test_the_estimates_registry_refusals_carry_a_code_for_the_page(client, world
                         json={"registry": {"status": "all", "employer": "yes"}})
     assert every.status_code == 400, every.text
     assert every.json()["code"] == "registry_every_status" and "isn't taken yet" in every.text
+    # A run refused the same way carries the same code, and makes nothing.
+    ran = client.post("/api/contacts/find", json={"registry": {"words": "-dentist"}})
+    assert ran.status_code == 400 and ran.json()["code"] == "registry_only_excludes"
+    assert queued(client.db) == []
     # Any other refusal: the server's words alone.
     other = client.post("/api/contacts/find/estimate", json={"registry": {"county": "Atlantis"}})
     assert other.status_code == 400 and "code" not in other.json()
+    ran = client.post("/api/contacts/find", json={"registry": {"county": "Atlantis"}})
+    assert ran.status_code == 400 and "code" not in ran.json()
     assert firms(client.db) == 0
 
 

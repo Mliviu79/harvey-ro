@@ -7087,7 +7087,9 @@ async function runFinder(btn) {
     if (ran) registryFinderRan();
   } else {
     btn.disabled = false;
-    showToast(failMsg(data, t('cl.find_failed')), 'error');
+    // (A register's refusal carries a code said in the page's own words.)
+    const why = data && data.code && hasKey('en', 'finder.why.' + data.code) ? t('finder.why.' + data.code) : '';
+    showToast(why || failMsg(data, t('cl.find_failed')), 'error');
   }
 }
 

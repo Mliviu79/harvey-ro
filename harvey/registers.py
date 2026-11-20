@@ -80,6 +80,15 @@ class Stale(RuntimeError):
     it (the register's reindex) before reading it."""
 
 
+class Refused(ValueError):
+    """A selection a register won't take, with ``code``: what a page says
+    in its own words (``finder.why.<code>``), whatever the message's."""
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
 class Adapter:
     """A register module's adapter. Subclasses set ``module`` and
     ``reads`` and may add describe() and resolve()."""
